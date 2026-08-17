@@ -72,9 +72,11 @@
 
 每個 domain 由 WGS84 polygon 與一個局地 metric CRS 組成。建議以 domain 中心建立 Azimuthal Equidistant CRS，避免連江 domain 跨 UTM zone 邊界時出現不必要的分區。正式 CRS 保存 PROJJSON/WKT、中心、轉換版本與 round-trip 誤差。
 
-`flow_domain`、`receptor`、`open_boundary_segment` 與 `reporting_region` 是不同物件：
+`flow_domain`、`study_site`、`local_domain`、`receptor`、`open_boundary_segment` 與 `reporting_region` 是不同物件：
 
 - `flow_domain`：forcing 支撐與停止邊界。
+- `study_site`：情境、seed、事件與成果的第一層獨立統計單元；貢寮與龜山島可共用 flow domain 而不共用情境。
+- `local_domain`：辨識移入關注海域入口的巢狀邊界；貢寮／龜山島採 anchor 半徑 25 km 與有效海域的交集，兩者允許重疊。
 - `receptor`：終端觀測位置／小 polygon、深度及不確定性。
 - `open_boundary_segment`：排除海岸後可穿越的命名邊界，用於 first crossing 與弧長密度。
 - `reporting_region`：下游彙整單元，不改變 forcing 或軌跡。
@@ -118,7 +120,7 @@ OCM 與 NWW3 缺值政策分開：
 |---|---|
 | `config` | Pydantic/YAML schema、標準化 JSON、hash 與決策狀態 gate |
 | `preflight` | SERVER 路徑、月份、metadata、shape、time、coverage、磁碟與資源 inventory |
-| `geometry` | CRS、domain/receptor/open-boundary 幾何與 crossing |
+| `geometry` | CRS、flow/local domain、receptor、open-boundary 幾何與 crossing |
 | `mesh` | SCHISM face triangulation、spatial index、barycentric locator |
 | `forcing.ocm` | OCM month window、4D current/z/elev/diffusivity sampler |
 | `forcing.nww3` | NWW3 analysis-grid time/space sampler 與 QC |
@@ -126,7 +128,7 @@ OCM 與 NWW3 缺值政策分開：
 | `physics.diffusion` | Smagorinsky Kh、Kz、gradient drift 與 stochastic increment |
 | `integrators` | NumPy reference RK4、stochastic split、CFL/dt controller |
 | `boundaries` | 海面、海床、海岸、開放邊界、data-gap 與 first-crossing event |
-| `scenarios` | A-D 每區 material/receptor/arrival 的 10×20×50 完整矩陣、member 配置與 seed 派生 |
+| `scenarios` | 五站點各自 material/receptor/arrival 的 10×20×50 完整矩陣、member 配置與 seed 派生 |
 | `engine` | 分片執行、checkpoint、restart、Numba production kernel |
 | `outputs` | trajectory/event column arrays、manifest、checksum、原子發布 |
 | `aggregation` | exit/pathway/residence/bottom-contact、KDE/HDR、bootstrap |
@@ -148,7 +150,9 @@ OCM 與 NWW3 缺值政策分開：
 
 ### 7.2 Receptor manifest
 
-每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、`z_m` 或 `height_above_bed_m`、垂向誤差、調查時間來源、`analysis_region_id`（限 A-D）、`survey_location_label`、版本、核定者與狀態。A-D 分別為東北角、新竹外海、後灣與連江四個分析海域；每區必須恰有 20 個 receptors，全案共 80 個。A 區可同時包含貢寮與龜山島子地點，但兩者合計仍須為 20。
+每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、目標水柱比例、實際 `z_m`／`height_above_bed_m`、垂向誤差、`study_site_id`、`analysis_region_id`、source face、版本與生成狀態。五站點各有 20 個、全案共 100 個；貢寮與龜山島各自完整保留 20 個，不共享 ID 或在 A 區內分配。
+
+每站點 20 個受體由 5 個水平位置 × 4 個垂向層位產生。貢寮／龜山島的水平候選限於 anchor 半徑 12.5 km receptor core，其餘站點限於 flow/local domain；第一點由 anchor 或 flow-domain center snap 至 persistent-wet mesh，其餘使用固定 tie-break 的 metric maximin。垂向目標為海面下 `0.10H`、`0.40H`、`0.70H` 與最低有效 OCM layer 中心；實際位置必須對五十個到達時間均有合法 `zcor` 支撐。
 
 ### 7.3 Arrival-time manifest
 
@@ -156,18 +160,19 @@ OCM 與 NWW3 缺值政策分開：
 
 ### 7.4 Scenario 與 member
 
-基礎 `scenario_id = hash(analysis_region_id, material_id, receptor_id, arrival_time_id, design_version)`。每區三因子完整交叉必須恰好產生 10,000 個唯一 ID，四區聯集必須恰有 40,000 個。no-Stokes、Kh/Kz、domain 等敏感度由 `experiment_case_id` 區分；它們不能暗中改變基礎情境的定義。
+基礎 `scenario_id = hash(study_site_id, material_id, receptor_id, arrival_time_id, design_version)`。五站點各自的三因子完整交叉必須恰好產生 10,000 個唯一 ID；A 區兩站聯集為 20,000，全案聯集恰有 50,000 個。no-Stokes、Kh/Kz、domain 等敏感度由 `experiment_case_id` 區分；它們不能暗中改變基礎情境的定義。
 
 每個基礎情境可有 `member_id = 0..M_s-1`，seed 由 master seed、`scenario_id`、`experiment_case_id` 與 `member_id` 派生。`M_s` 是同一固定參數組合下的獨立隨機實現數，不是第四個計畫書因子：
 
 ```text
-N_base_per_region = 10 × 20 × 50 = 10,000
-N_base_total = 4 × N_base_per_region = 40,000
+N_base_per_site = 10 × 20 × 50 = 10,000
+N_base_region_A = 2 × N_base_per_site = 20,000
+N_base_total = 5 × N_base_per_site = 50,000
 N_trajectory_total_per_experiment = sum_s(M_s)
-N_trajectory_total_per_experiment = 40,000 × M  # 僅在所有 M_s 相同時
+N_trajectory_total_per_experiment = 50,000 × M  # 僅在所有 M_s 相同時
 ```
 
-完全確定性試驗使用 `M_s=1`；隨機擴散或 forcing／受體微擾試驗的正式 `M` 必須由收斂測試決定。`scenario_table`、`seed_table` 與 run manifest 需同時保存 region、每區及全案基礎情境數、各情境 member 數及 experiment case，避免以「系集數」一詞混用不同數量。
+完全確定性試驗使用 `M_s=1`；隨機擴散或 forcing／受體微擾試驗的正式 `M` 必須由收斂測試決定。`scenario_table`、`seed_table` 與 run manifest 需同時保存 site、region、每站點／A 區／全案基礎情境數、各情境 member 數及 experiment case，避免以「系集數」一詞混用不同數量。
 
 ## 8. 輸出資料契約
 
@@ -192,6 +197,9 @@ $LBT_OUTPUT_ROOT/particles/<run_id>/
 │       └── checksums.sha256
 ├── aggregates/
 │   ├── boundary_exit_points.parquet
+│   ├── local_domain_entry_crossings.parquet
+│   ├── local_boundary_arclength_density.parquet
+│   ├── local_entry_kde.npy
 │   ├── boundary_arclength_density.parquet
 │   ├── boundary_exit_kde.npy
 │   ├── pathway_density.npy
@@ -211,8 +219,8 @@ $LBT_OUTPUT_ROOT/particles/<run_id>/
 
 ### 8.1 必要事件欄位
 
-- `particle_id`, `scenario_id`, `member_id`, `receptor_id`。
-- `event_type`：open_boundary_exit / coast_contact / surface_contact / bed_contact / deposited / data_gap / max_age / forcing_start / numerical_failure。
+- `particle_id`, `scenario_id`, `member_id`, `study_site_id`, `analysis_region_id`, `receptor_id`。
+- `event_type`：local_domain_first_exit / flow_domain_open_exit / coast_contact / surface_contact / surface_regime_exit / bed_contact / deposited / data_gap / max_age / forcing_start / numerical_failure。
 - event 前後的 `time_utc_ns`, `x_m`, `y_m`, `z_m` 與內插 crossing 座標。
 - `boundary_segment_id`, `boundary_s_m`（適用時）。
 - `source_face_id`, `triangle_id`, `forcing_month_id` 與 QC flags。

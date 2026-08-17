@@ -9,7 +9,7 @@
 本專案負責：
 
 - 讀取 SERVER 上已前處理完成的 2024-2025 OCM `ocm_native` 與 NWW3 `nww3_analysis`。
-- 對 A-D 四個分析海域分別建立 10 種浮沉／物性、20 個受體位置與深度、50 個到達時間的完整情境設計；全案共 80 個 receptors。
+- 沿用 A-D 四個 OCM/NWW forcing flow domains，對貢寮、龜山島、新竹、後灣與連江五個獨立研究站點，各建立 10 種浮沉行為、20 個三維受體與 50 個到達時間的完整情境設計；全案共 100 個 receptors。
 - 實作三維 OCM 速度內插、有限水深 bulk Stokes drift、浮沉、水平與垂向擴散、逆時間積分及邊界事件。
 - 產出軌跡、停止事件、邊界穿越、路徑密度、停留時間、底部接觸與 KDE/HDR 等可追溯產品。
 - 以解析場、統計性質、正向-逆向合成案例、時步／系集／domain 敏感度與 checkpoint 重啟測試完成驗收。
@@ -41,46 +41,46 @@ LBT_OUTPUT_ROOT=<具足夠容量且經 preflight 確認的本機或 SERVER 路�
 
 以上是目前相鄰專案記錄的路徑基線；第一次 SERVER preflight 必須以實際目錄、月份、metadata、checksum、容量及權限重新確認。
 
-## 四個研究區域
+## 四個 flow domains、五個獨立研究站點
 
-依期中報告圖 2-17，本專案的正式分析單元是 **4 個研究區域**，不是 5 個。圖中紅圈 1-5 代表 5 個調查位置；其中貢寮與龜山島因水動力機制相近，合併為東北角分析海域 A。
+期中報告圖 2-17 與 `OCM-SVD-Analysis` 水柱聯合 SVD 使用 A-D 四個流場域；這是 forcing 與外層停止邊界的數量，不是本工項必須合併情境統計的理由。依使用者最終裁決，貢寮與龜山島雖共用 A 區 forcing，仍各自是完整且獨立的研究站點。
 
-| 分析區 | 研究區域 | 對應調查位置 | 正式 forcing domain |
+| 站點 | region | 正式 forcing domain | 站點 local domain |
 |---|---|---|---|
-| A | 東北角海域 | 貢寮、龜山島 | `northeast_taiwan_common_cache_v3` |
-| B | 新竹外海 | 新竹 | `hsinchu_cache_v3` |
-| C | 後灣海域 | 後灣海生館 | `houwan_nmmba_cache_v3` |
-| D | 連江海域 | 連江（分析範圍整合南竿、北竿） | `lienchiang_common_cache_v3` |
+| 貢寮 | A | `northeast_taiwan_common_cache_v3` | anchor 半徑 25 km 與有效海域的交集；受體核心半徑 12.5 km |
+| 龜山島西側 | A | `northeast_taiwan_common_cache_v3` | anchor 半徑 25 km 與有效海域的交集；受體核心半徑 12.5 km |
+| 新竹外海 | B | `hsinchu_cache_v3` | 與 flow domain 相同 |
+| 後灣海生館 | C | `houwan_nmmba_cache_v3` | 與 flow domain 相同 |
+| 連江 | D | `lienchiang_common_cache_v3` | 與 flow domain 相同 |
 
-計畫書的情境矩陣位於「針對每一處開放海域」的敘述之下，因此 20 個 receptors 是**每一分析海域各 20 個**，不是四區合計 20 個。全案 receptor manifest 必須恰有 80 個有效 receptors；A 區雖含貢寮與龜山島兩個調查位置，20 個受體如何分配於兩個子地點仍須由研究團隊核定。
+因此不是「A 區 20 個 receptors 如何分配」，而是**貢寮 20 個、龜山島 20 個**，其餘三站點亦各 20 個，全案 receptor manifest 恰有 100 個三維 receptors。舊 SVD 候選框只保留 anchor provenance，不作正式 local domain；25 km local domains 允許重疊，但四套 forcing 不重複儲存或運算，情境、seed、事件、聚合與圖表仍以 `study_site_id` 分開。完整幾何、受體、物性、時間與停止條件見 [五站點情境與巢狀邊界設計基線](docs/08_design_baseline_and_derived_gates.md)。
 
 ## 核心方法決策
 
-1. 每一分析海域採完整交叉：10 種浮沉／物性 × 20 個受體 × 50 個到達時間，恰為 **每區 10,000 個、四區合計 40,000 個基礎情境**；計畫書每區「1,000 組」依使用者裁決視為誤植，不再列為可選設計。
+1. 五個站點各自採完整交叉：10 種浮沉行為 × 20 個三維受體 × 50 個到達時間，恰為 **每站點 10,000 個、A 區兩站合計 20,000 個、全案合計 50,000 個基礎情境**；計畫書「1,000 組」依使用者裁決視為誤植，不再列為可選設計。
 2. OCM 以 native unstructured mesh 為正式三維 forcing，不另複製一套龐大的 48 層規則格網。水平內插使用 SCHISM face connectivity 的顯式三角形，不把 surface cache 的 SciPy Delaunay simplex ID 誤當原始 face ID。
 3. 每個 flow domain 使用固定的公尺制局地投影；粒子步進、CFL、梯度、距離與 KDE 均在該投影計算，經緯度只作交換與展示。
 4. 確定性 OCM + Stokes + 浮沉使用向量化 RK4；隨機擴散以獨立 operator split 的 Euler-Maruyama／Milstein 路徑處理，不把隨機增量塞入 RK4 stage。
 5. backward baseline 對確定性 drift 作逆時間積分，擴散維持正變異；結果稱為 conditional footprint。嚴格 reversed-time SDE 僅能在獨立方法驗證後作敏感度版本。
 6. Stokes drift 以 `Hs`、`Tp=1/fp`、峰值波向與有限水深分散關係計算 monochromatic bulk profile；深水公式須回復附檔式 (7)，並以 no-Stokes、深水式與有限水深式做敏感度。
-7. 停止條件除首次離開關注域外，還包括 forcing 起始時間、核定最大回溯期、資料缺口、無法定位的海陸／網格狀態及數值失敗，避免封閉流線無限運算。
+7. 貢寮／龜山島採巢狀邊界：首次離開 local domain 時記錄關注海域入口但繼續回溯，首次離開 A 區 flow domain 才停止；另以海岸、海床沉積、上浮至海面而超出完全沉沒模型、forcing 起始、資料缺口、最大回溯期及數值失敗作明確事件／停止條件。
 
 ## 情境與軌跡計數
 
-計畫書列出的三因子套用於每一分析海域：
+計畫書列出的三因子套用於每一獨立研究站點：
 
 ```text
-N_base_per_region = N_material × N_receptor_per_region × N_arrival_time
-                  = 10 × 20 × 50
-                  = 10,000
+N_base_per_site = N_material × N_receptor_per_site × N_arrival_time
+                = 10 × 20 × 50
+                = 10,000
 
-N_base_total = N_region × N_base_per_region
-             = 4 × 10,000
-             = 40,000
+N_base_region_A = 2 × 10,000 = 20,000
+N_base_total    = 5 × 10,000 = 50,000
 ```
 
-`M_s` 是實作時為第 `s` 個基礎情境配置的獨立隨機實現數，不是計畫書另外指定的情境因子。若使用隨機擴散、受體位置微擾或 forcing ensemble，每一個 member 會產生一條可識別的粒子軌跡；全案總軌跡數為 `sum(M_s)`。所有情境使用相同 `M` 時，每區為 `10,000 × M`、四區合計為 `40,000 × M`；完全確定性試驗則 `M=1`。正式 `M` 必須由主要統計量的 member-convergence 曲線決定，不能用 1,000 的敘述反推。
+`M_s` 是實作時為第 `s` 個基礎情境配置的獨立隨機實現數，不是計畫書另外指定的情境因子。若使用隨機擴散、受體位置微擾或 forcing ensemble，每一個 member 會產生一條可識別的粒子軌跡；全案總軌跡數為 `sum(M_s)`。所有情境使用相同 `M` 時，每站點為 `10,000 × M`、A 區為 `20,000 × M`、全案為 `50,000 × M`；完全確定性試驗則 `M=1`。正式 `M` 由主要統計量的 member-convergence 曲線決定，不能用 1,000 的敘述反推。
 
-no-Stokes、不同擴散係數、domain 擴張等敏感度試驗以 `experiment_case_id` 另行編號，不混入上述每區 10,000／全案 40,000 個基礎情境；完整運算成本須另乘實際執行的實驗案例數。
+no-Stokes、不同擴散係數、domain 擴張等敏感度試驗以 `experiment_case_id` 另行編號，不混入上述每站點 10,000／全案 50,000 個基礎情境；完整運算成本須另乘實際執行的實驗案例數。
 
 ## 資料流
 
@@ -88,7 +88,7 @@ no-Stokes、不同擴散係數、domain 擴張等敏感度試驗以 `experiment_
 flowchart LR
     O["OCM native schema 3\n3D current and mesh"] --> P["Preflight and forcing adapter"]
     W["NWW3 analysis schema 1\nHs, fp, DP and QC"] --> P
-    R["Receptors, arrival times\nand material classes"] --> S["Scenario builder"]
+    R["Five-site receptors, arrival times\nand behavior classes"] --> S["Scenario builder"]
     P --> E["Backward ensemble engine\nRK4 plus stochastic split"]
     S --> E
     E --> T["Trajectory and event shards"]
@@ -111,7 +111,8 @@ flowchart LR
     ├── 04_implementation_plan.md
     ├── 05_decisions_and_risks.md
     ├── 06_server_runbook_plan.md
-    └── 07_results_visualization_plan.md
+    ├── 07_results_visualization_plan.md
+    └── 08_design_baseline_and_derived_gates.md
 ```
 
 預定實作階段才新增 `src/lagrangian_backtracking/`、`tests/`、`scripts/`、`pyproject.toml` 與 `uv.lock`。依賴版本應在第一個可執行切片完成後鎖定，避免規劃文件先製造未驗證的環境契約。
@@ -120,19 +121,19 @@ flowchart LR
 
 | Gate | 優先序 | 通過條件 |
 |---|---:|---|
-| G0 輸入閘門 | P0，立即並行 | SERVER inventory、schema、月份、時間、單位、方向、磁碟，以及 receptor／material 待決事項均有可稽核結果 |
+| G0 輸入閘門 | P0，立即並行 | SERVER inventory、schema、月份、時間、單位、方向與磁碟可稽核；依既定演算法產生 local-domain、receptor、material 與 arrival manifests |
 | G1 forcing sampler | P0 | 4D OCM 與 NWW3/Stokes 取樣通過解析場、遮罩、垂向、方向與邊界測試 |
 | G2 數值核心 | P0，與 G1 可並行開發 | RK4、擴散、浮沉、海面／海床／海岸／開放邊界測試與 dt 收斂通過 |
 | G3 模式完成 | P0 | backward ensemble、checkpoint、manifest、NumPy/Numba 一致性及已知來源合成驗證通過 |
-| G4 全期批次 | P1，G3 後立即啟動 | 四區各 10,000、合計 40,000 個基礎情境、核定 `M` 及核心敏感度完成；失敗清單為零或具核准排除理由 |
+| G4 全期批次 | P1，G3 後立即啟動 | 五站點各 10,000、合計 50,000 個基礎情境、資料衍生 `M` 及核心敏感度完成；失敗清單為零或具核准排除理由 |
 | G5 分析交接 | P1，隨完成 shard 流式啟動 | conditional footprint、KDE/HDR、pathway、travel time、connectivity、bottom contact 與不確定性產品可供後續工項讀取 |
 
-詳細工作拆解見 [快速實作計畫](docs/04_implementation_plan.md)，資料介面見 [架構與資料契約](docs/02_architecture_and_data_contract.md)，數值定義與驗證見 [科學方法與驗證](docs/03_scientific_method_and_validation.md)，文獻支持的圖表組合見 [成果呈現與學術視覺化規格](docs/07_results_visualization_plan.md)。
+詳細工作拆解見 [快速實作計畫](docs/04_implementation_plan.md)，資料介面見 [架構與資料契約](docs/02_architecture_and_data_contract.md)，數值定義與驗證見 [科學方法與驗證](docs/03_scientific_method_and_validation.md)，文獻支持的圖表組合見 [成果呈現與學術視覺化規格](docs/07_results_visualization_plan.md)，最終設計裁決與不需再詢問使用者的衍生閘門見 [設計基線](docs/08_design_baseline_and_derived_gates.md)。
 
 ## 立即下一步
 
-1. 同時啟動 SERVER 唯讀 preflight、四區各 20 個／合計 80 個 receptor manifest 與 10 個 material manifest 的核定；三者互不等待。
+1. 同時啟動 SERVER 唯讀 preflight，並依固定演算法產生五站點各 20 個／合計 100 個 receptor manifest、10 個 behavior classes 與五站點各 50 個 arrival-time manifest；三者互不等待。
 2. 立即完成純 NumPy 的單 domain、單日、單 receptor 垂直切片與解析測試；不等待正式 receptor 才開始工程實作。
 3. forcing sampler 與 RK4／擴散／邊界核心分成獨立工作流並行，介面以合成 fixture 固定。
-4. 第一個端到端 pilot 通過後立即量測 member convergence，以最小合格 `M` 建立四區合計 40,000 情境的 shard 計畫並啟動 SERVER 批次。
+4. 第一個端到端 pilot 通過後立即量測 member convergence，以最小合格 `M` 建立五站點合計 50,000 情境的 shard 計畫並啟動 SERVER 批次。
 5. 聚合與圖表採流式處理已完成 shard，不等待所有情境結束才開始成果製作。

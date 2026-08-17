@@ -1,8 +1,10 @@
-# 本檔只示範正式設定應具有的結構；planning_example 不得用於科學批次。
-# 受體、浮沉速度、arrival times、每情境 member 數與 SERVER 輸出路徑尚待核定，因此以 null
-# 或外部 manifest 位置表示，避免用虛構數值產生看似正式的成果。
-schema_version: "0.1.0"
-config_status: planning_example
+# 本檔固定 design_baseline_v1 的科學與工程規則，但仍不是可直接送入正式批次的 release config。
+# local-domain polygon、受體座標、50 個 UTC、M、擴散係數與 SERVER 路徑必須依已決定的
+# 演算法由實際網格、forcing 與先導試驗衍生；null 表示「尚未產出衍生 manifest」，不是
+# 等待研究人員任意選值。正式批次只接受所有 derived gate 均通過的 approved release config。
+schema_version: "0.2.0"
+config_status: design_baseline_example
+design_version: design_baseline_v1
 project_id: lagrangian_ensemble_backtracking
 time_standard: UTC
 
@@ -51,43 +53,102 @@ inputs:
     maximum_time_gap_hours: 1.5
 
 study_area:
-  # 正式統計與圖表的第一層空間單元是 A-D 四個分析海域；5 只代表期中報告
-  # 圖 2-17 的調查位置標記數。這兩個計數分開保存，以便 preflight 在設定錯誤時
-  # 立即拒絕執行，而不是等到聚合階段才發現區域維度不一致。
+  # A-D 是四個 forcing flow domains；正式情境與成果的第一層單元則是五個 study sites。
+  # 貢寮與龜山島共用 A 區 forcing，但 receptor、scenario、seed、event 與 aggregate 必須分開。
+  expected_flow_domain_count: 4
   expected_analysis_region_count: 4
-  expected_survey_location_count: 5
-  primary_analysis_unit: analysis_region
+  expected_study_site_count: 5
+  primary_analysis_unit: study_site
+  secondary_aggregation_unit: analysis_region
+  # 兩個 anchor-centered local domains 可反映相連水動力環境而互相重疊；不得為了
+  # 強迫互斥而以任意 Voronoi 或緯度線切割，亦不得在聚合時把重疊區自動扣除。
+  allow_overlapping_local_domains: true
 
 domains:
-  # 期中報告圖 2-17 將 5 個調查位置依水動力機制歸併為 4 個分析海域；
-  # 因此本清單的每一列對應一個正式研究／分析區域。A 區同時包含貢寮與
-  # 龜山島兩個調查位置，不可因圖上有 5 個紅圈而把研究區域數設為 5。
+  # 四列只定義 forcing 支撐、metric CRS 與外層停止邊界；情境數由下方五個
+  # study_sites 決定。bbox/center 沿用 OCM-Data-Preprocessing flow-domain v3。
   - analysis_region_id: A
     analysis_region_name_zh: 東北角海域
-    survey_location_labels: [貢寮, 龜山島]
     flow_domain_id: northeast_taiwan_common_cache_v3
+    center_lonlat: [122.05, 25.05]
+    bbox_lon_lat: [121.306315, 122.793685, 24.600844, 25.499156]
     metric_crs_policy: local_azimuthal_equidistant
   - analysis_region_id: B
     analysis_region_name_zh: 新竹外海
-    survey_location_labels: [新竹]
     flow_domain_id: hsinchu_cache_v3
+    center_lonlat: [120.45, 24.75]
+    bbox_lon_lat: [119.70812, 121.19188, 24.300844, 25.199156]
     metric_crs_policy: local_azimuthal_equidistant
   - analysis_region_id: C
     analysis_region_name_zh: 後灣海域
-    survey_location_labels: [後灣海生館]
     flow_domain_id: houwan_nmmba_cache_v3
+    center_lonlat: [120.893355, 22.0]
+    bbox_lon_lat: [120.16671, 121.62, 21.550844, 22.449156]
     metric_crs_policy: local_azimuthal_equidistant
   - analysis_region_id: D
     analysis_region_name_zh: 連江海域
-    survey_location_labels: [連江]
     flow_domain_id: lienchiang_common_cache_v3
+    center_lonlat: [119.95, 26.2]
+    bbox_lon_lat: [119.19912, 120.70088, 25.750844, 26.649156]
     metric_crs_policy: local_azimuthal_equidistant
 
+study_sites:
+  # 貢寮與龜山島不沿用過小的 surface-SVD candidate bbox。兩站均以 anchor 為中心，
+  # 在 Azimuthal Equidistant CRS 產生半徑 12.5 km 受體核心與 25 km local domain，
+  # 再與 A 區固定 OCM ocean polygon 相交。動態 wet/dry 只篩受體與 forcing stage，
+  # 不得使 boundary 隨 arrival time 改變；20/35 km 是預先登錄的尺度敏感度。
+  - study_site_id: gongliao
+    study_site_name_zh: 貢寮
+    analysis_region_id: A
+    flow_domain_id: northeast_taiwan_common_cache_v3
+    anchor_lonlat: [121.92807, 25.11245]
+    receptor_core_radius_m: 12500
+    local_domain_baseline_radius_m: 25000
+    local_domain_sensitivity_radii_m: [20000, 35000]
+    minimum_flow_domain_margin_local_grid_scales: 2
+    radius_35000_requires_expanded_flow_domain: true
+    geometry_generator: anchor_centered_azimuthal_equidistant_buffer_intersect_static_ocm_ocean_polygon
+    local_domain_overlap_policy: allowed_preserve_site_identity
+    legacy_candidate_bbox_lon_lat_provenance_only: [121.91, 122.06, 25.00, 25.15]
+  - study_site_id: guishan
+    study_site_name_zh: 龜山島西側
+    analysis_region_id: A
+    flow_domain_id: northeast_taiwan_common_cache_v3
+    anchor_lonlat: [121.951606, 24.843127]
+    receptor_core_radius_m: 12500
+    local_domain_baseline_radius_m: 25000
+    local_domain_sensitivity_radii_m: [20000, 35000]
+    minimum_flow_domain_margin_local_grid_scales: 2
+    radius_35000_requires_expanded_flow_domain: true
+    geometry_generator: anchor_centered_azimuthal_equidistant_buffer_intersect_static_ocm_ocean_polygon
+    local_domain_overlap_policy: allowed_preserve_site_identity
+    legacy_candidate_bbox_lon_lat_provenance_only: [121.81, 121.97, 24.76, 24.92]
+  - study_site_id: hsinchu
+    study_site_name_zh: 新竹外海
+    analysis_region_id: B
+    flow_domain_id: hsinchu_cache_v3
+    anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
+    local_domain_policy: same_as_flow_domain
+  - study_site_id: houwan
+    study_site_name_zh: 後灣海生館
+    analysis_region_id: C
+    flow_domain_id: houwan_nmmba_cache_v3
+    anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
+    local_domain_policy: same_as_flow_domain
+  - study_site_id: lienchiang
+    study_site_name_zh: 連江
+    analysis_region_id: D
+    flow_domain_id: lienchiang_common_cache_v3
+    anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
+    local_domain_policy: same_as_flow_domain
+
 geometry:
-  # 正式 domain/open-boundary/receptor geometry 需版本化；null 表示目前不得執行正式 run。
+  # 幾何生成規則已決定；null 表示尚未以 SERVER OCM mesh 實際產出與驗證 polygon/受體。
   domain_manifest: null
+  local_domain_manifest: null
   receptor_manifest: null
   reporting_region_manifest: null
+  geometry_decision_status: decided_generation_pending_server_mesh
   reject_invalid_geometry: true
   coordinate_round_trip_tolerance_m: 0.05
 
@@ -102,7 +163,7 @@ forcing:
     hvel_unit: m_per_s
     vertical_velocity_unit: m_per_s
     diffusivity_unit: m2_per_s
-    wetdry_semantics_decision_status: open
+    wetdry_semantics_decision_status: derived_pending_server_preflight
 
   nww3:
     horizontal_interpolation: mask_aware_bilinear_require_all_corners
@@ -131,15 +192,30 @@ physics:
       - finite_depth_bulk
 
   settling:
-    # 外部 manifest 應含恰好 10 個類別；速度以 z positive-up 表示。
+    # 未有材質、粒徑、密度或生物附著量測，因此十類是涵蓋三個數量級的垂向行為
+    # 敏感度基線，不是十種具名廢棄物的校準值。正式 material manifest 必須由本表
+    # 確定性生成並保存 design_version，不得在 batch 前任意改值。
     material_manifest: null
     expected_material_count: 10
     settling_negative_rising_positive: true
+    velocity_unit: m_per_s
+    design_decision_status: decided_behavior_classes
+    behavior_classes:
+      - {material_id: sink_100mmps, settling_velocity_mps: -0.100, behavior_class: sinking}
+      - {material_id: sink_030mmps, settling_velocity_mps: -0.030, behavior_class: sinking}
+      - {material_id: sink_010mmps, settling_velocity_mps: -0.010, behavior_class: sinking}
+      - {material_id: sink_003mmps, settling_velocity_mps: -0.003, behavior_class: sinking}
+      - {material_id: sink_001mmps, settling_velocity_mps: -0.001, behavior_class: sinking}
+      - {material_id: neutral_000mmps, settling_velocity_mps: 0.000, behavior_class: suspended}
+      - {material_id: rise_001mmps, settling_velocity_mps: 0.001, behavior_class: rising}
+      - {material_id: rise_003mmps, settling_velocity_mps: 0.003, behavior_class: rising}
+      - {material_id: rise_010mmps, settling_velocity_mps: 0.010, behavior_class: rising}
+      - {material_id: rise_030mmps, settling_velocity_mps: 0.030, behavior_class: rising}
 
   horizontal_diffusion:
     # 常數 Kh 是解析／統計 reference；Smagorinsky 需通過空變 K 與 well-mixed 測試。
     reference_method: constant
-    baseline_method_decision_status: open
+    baseline_method_decision_status: decided_constant_value_pending_validation_pilot
     constant_kh_m2ps: null
     smagorinsky:
       formula: proposal_equation_10_metric_triangle_gradient
@@ -154,14 +230,16 @@ physics:
     reference_method: constant
     constant_kz_m2ps: null
     ocm_candidate_array: diffusivity.npy
-    baseline_method_decision_status: open
+    baseline_method_decision_status: decided_constant_value_pending_validation_pilot
     variable_diffusivity_gradient_drift_required: true
 
 integration:
   deterministic_method: rk4
   # 速度函式永遠回傳物理時間向前的速度；backward 只由負 dt 表示，禁止雙重反號。
   time_direction: backward_negative_dt
-  stochastic_method: operator_split_decision_required
+  # RK4 只處理確定性 drift；常數 K reference 的隨機增量以獨立 Euler-Maruyama
+  # operator split 加入。split 順序須由解析／統計測試固定，但不再詢問使用者選項。
+  stochastic_method: operator_split_euler_maruyama_reference
   stochastic_variance_uses_absolute_dt: true
   output_interval_seconds: null
   dt_min_seconds: null
@@ -172,14 +250,22 @@ integration:
   forcing_time_boundary_substep: true
 
 boundaries:
-  open_domain: stop_at_first_crossing
+  # 巢狀 local boundary 用於回答「如何移入關注海域」；東北角兩站離開 local domain
+  # 只記錄事件並繼續回溯，直到外層 flow domain。B/C/D 兩層重合時只寫一個 crossing。
+  local_domain_first_exit: record_first_crossing_and_continue
+  local_open_boundary_segment_policy: metric_circle_arcs_connected_to_valid_ocean_exclude_coastline
+  flow_domain_open_boundary: stop_at_first_crossing
   coast_baseline: stop_and_record_contact
-  surface_baseline: reflect_for_submerged_suspended
-  bed_baseline: reflect_for_suspended_record_contact
-  near_bed_baseline: deposit_on_first_contact
+  surface_suspended_or_sinking: reflect_and_record_contact
+  surface_rising: stop_as_surface_regime_exit
+  bed_suspended: reflect_and_record_contact
+  bed_sinking_or_near_bed: deposit_on_first_contact_and_stop
   stop_at_forcing_start: true
   stop_at_data_gap: true
+  # 最大回溯期不是任意人工選值；比較 7/14/30/60 日後，取主要統計最小穩定尺度。
   max_backtrack_days: null
+  max_backtrack_candidate_days: [7, 14, 30, 60]
+  max_backtrack_decision_status: derived_by_horizon_stability_pilot
   maximum_step_count: null
   required_sensitivity_cases:
     - coast_reflect
@@ -189,44 +275,63 @@ boundaries:
 
 scenarios:
   receptor_manifest: null
-  # 計畫書先限定「針對每一處開放海域」，再定義 20 個 receptor locations；
-  # 因此 A-D 每區皆須恰有 20 個受體，全案共 80 個。A 區內貢寮／龜山島
-  # 的子地點分配由 receptor manifest 記錄，但不得把 A 區總數降為 5。
-  expected_receptor_count_per_region: 20
-  expected_receptor_count: 80
+  # 五個站點各以 5 個 deterministic maximin 水平位置 × 4 個垂向層位形成 20 個
+  # 三維 receptors；貢寮／龜山島各有完整 20 個，不在 A 區內分配或共用。
+  expected_receptor_count_per_site: 20
+  expected_receptor_count: 100
+  horizontal_receptor_count_per_site: 5
+  vertical_receptor_count_per_horizontal_location: 4
+  horizontal_selector: anchor_first_then_deterministic_metric_maximin_on_persistent_wet_mesh
+  northeast_receptor_candidate_domain: site_receptor_core_12500m
+  other_site_receptor_candidate_domain: site_flow_domain
+  vertical_targets:
+    - {vertical_id: upper_water_column, fraction_below_surface: 0.10}
+    - {vertical_id: mid_upper_water_column, fraction_below_surface: 0.40}
+    - {vertical_id: mid_lower_water_column, fraction_below_surface: 0.70}
+    - {vertical_id: near_bed, policy: lowest_valid_ocm_layer_center}
+  receptor_design_decision_status: decided_coordinates_pending_server_mesh
   arrival_time_manifest: null
-  # 每區皆須有 50 個 arrival-time 條件；不同區域可重用同一 UTC，但季節／
-  # 大小潮標籤仍須依各區潮汐與 forcing 狀態驗證，不能只檢查全案唯一時間數。
-  expected_arrival_time_count_per_region: 50
+  # 每站點皆須有 50 個 arrival-time 條件；貢寮／龜山島優先配對 UTC，但潮位相位、
+  # forcing coverage 與極端事件標籤仍逐站點計算。
+  expected_arrival_time_count_per_site: 50
   material_manifest: null
   expected_material_count: 10
 
-  # 每一分析海域都採計畫書三個因子的完整交叉；使用者已裁決每區敘述中的
-  # 1,000 為誤植。每區 10,000 = 10 種物性 × 20 個受體 × 50 個到達時間，
-  # 四區基準合計 40,000；兩者都不包含 no-Stokes 等 experiment case，
-  # 也不包含每個基礎情境內的隨機重複實現。
-  design: four_regions_each_full_factorial_10x20x50
-  scenario_count_per_region: 10000
-  scenario_count: 40000
+  # 每站點 10,000 = 10×20×50；A 區含兩個獨立站點，故為 20,000；全案五站點
+  # 合計 50,000。這些數量不含 no-Stokes 等 experiment cases 或 stochastic members。
+  design: five_independent_sites_each_full_factorial_10x20x50
+  scenario_count_per_site: 10000
+  scenario_count_region_A: 20000
+  scenario_count: 50000
   scenario_count_decision_status: decided
+  scenario_id_fields:
+    - study_site_id
+    - material_id
+    - receptor_id
+    - arrival_time_id
+    - design_version
 
   # `members_per_scenario` 代表同一組固定參數下，以不同亂數種子或 forcing 擾動
-  # 產生的獨立軌跡數。若所有情境使用相同 M，每區軌跡數為 10,000 × M、
-  # 全案為 40,000 × M。完全確定性案例 M=1。null 表示正式 M 尚須由
-  # member-convergence 曲線決定，
+  # 產生的獨立軌跡數。若所有情境使用相同 M，每站點為 10,000 × M、
+  # A 區為 20,000 × M、全案為 50,000 × M。完全確定性案例 M=1。null 表示
+  # 正式 M 尚須由 member-convergence 曲線決定，
   # 不得把計畫書中的 1,000 當成 M，也不得用未驗證的任意值啟動正式批次。
   members_per_scenario: null
-  members_decision_status: open_pending_convergence
+  members_decision_status: derived_by_registered_convergence
   master_seed: null
   seed_policy: hash_master_scenario_member
 
 arrival_time_selection:
-  # 建議的 48+2 只作可審查起點；正式 tidal classifier 與極端門檻仍需決策。
-  proposed_core_design: two_years_by_four_seasons_by_two_tide_classes_by_three_replicates
-  proposed_core_count: 48
-  proposed_event_supplement_count: 2
-  selection_seed: null
-  decision_status: open
+  # 48+2 的分層與選取演算法已決定；確切 UTC 只能從 SERVER forcing 與潮位序列
+  # 衍生。三個相位是潮位導數 proxy，不宣稱為現場量測的三維最大漲／退潮流。
+  core_design: two_years_by_four_seasons_by_spring_neap_by_three_tidal_phase_proxies
+  core_count: 48
+  tidal_phase_proxies: [fastest_rising, fastest_falling, slack]
+  event_supplement_count: 2
+  event_supplements: [local_high_wave, local_strong_current]
+  deterministic_tie_break: forcing_completeness_then_boundary_safety_then_earliest_utc
+  northeast_pair_utc_when_coverage_allows: true
+  decision_status: decided_algorithm_timestamps_pending_server_data
 
 execution:
   reference_backend: numpy
@@ -245,6 +350,9 @@ outputs:
   scenario_table_format: parquet
   checksum_algorithm: sha256
   required_aggregates:
+    - local_domain_entry_crossings
+    - local_boundary_arclength_density
+    - local_entry_kde
     - boundary_exit_points
     - boundary_arclength_density
     - boundary_exit_kde
@@ -264,6 +372,7 @@ aggregation:
   bandwidth_policy: three_scale_sensitivity
   hdr_levels: [0.50, 0.75, 0.90]
   bootstrap_strata:
+    - study_site
     - analysis_region
     - receptor
     - arrival_time
@@ -286,6 +395,9 @@ reporting:
   # 核心圖表及 caption/data sidecar 的統計定義以文件 07 為準；設定檔只固定
   # 機器可驗證的識別碼，避免繪圖腳本自行選擇一套不同的成果口徑。
   visualization_spec: docs/07_results_visualization_plan.md
+  design_baseline_spec: docs/08_design_baseline_and_derived_gates.md
+  primary_reporting_level: study_site
+  region_A_pooled_product_policy: secondary_equal_site_weight_preserve_site_denominators
   permitted_primary_term_zh: 條件式來源足跡
   prohibited_without_prior_likelihood_observation:
     - 絕對來源機率

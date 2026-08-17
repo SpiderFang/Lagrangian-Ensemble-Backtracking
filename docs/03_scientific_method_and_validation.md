@@ -21,6 +21,8 @@ V_det = (u_ocm + u_stokes, v_ocm + v_stokes, w_ocm + w_b)
 - 完全沉沒 baseline 不含 windage。
 - 每一項都以 m/s 表示；任一單位 gate 未通過時不得正式運算。
 
+在沒有特定材質量測的前提下，十個 `w_b` 行為類別固定為 `[-0.100, -0.030, -0.010, -0.003, -0.001, 0, +0.001, +0.003, +0.010, +0.030] m/s`。這是跨三個數量級的敏感度設計，不是對十種具名廢棄物的量測校準；符號、ID 與限制詳見文件 08。
+
 ## 2. OCM 四維速度
 
 OCM 速度由 native unstructured mesh 直接取樣：
@@ -143,10 +145,11 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 
 | 邊界／狀態 | 基線 | 必要敏感度或備註 |
 |---|---|---|
-| 開放 domain boundary | 計算線段 first crossing，記錄 segment 與弧長後停止 | 擴域前後比較 exit time、HDR 與 ranking |
+| 貢寮／龜山島 local boundary | anchor 半徑 25 km 圓周中連接有效外海的 arc first crossing，記錄 segment、弧長與 backward age 後繼續；岸線不計入 | 20/35 km 半徑敏感度；兩站 local domains 可重疊但事件分站保存 |
+| flow-domain open boundary | 計算線段 first crossing，記錄 segment 與弧長後停止 | 擴域前後比較 exit time、HDR 與 ranking |
 | 海岸／陸地 | 不允許跨越；記錄 coast contact 並停止 | reflect 作敏感度，不混入基準 |
-| 海面 | suspended 類反射；若狀態改為 surface-constrained，需新類別 | 完全沉沒 baseline 不加 windage |
-| 海床 | 記錄 first contact；suspended 反射，near-bed 可 deposit | 無再懸浮參數時不宣稱完整底床交換 |
+| 海面 | neutral／sinking 類擴散越界時反射；rising 類到達海面以 `surface_regime_exit` 停止 | 完全沉沒 baseline 不加 windage，故不得在海面繼續當表面漂流 |
+| 海床 | 記錄 first contact；suspended 反射，sinking／near-bed 首次接觸即 deposit 並停止 | 無再懸浮參數時不宣稱完整底床交換 |
 | forcing start | 到 2024-01-01 或實際最早可用時次停止 | 不能環回或外插 |
 | data gap | 超過核定間距或必要 forcing 缺值即停止 | no-Stokes 是另一個 physics case |
 | max age | 到核定最大回溯期停止 | 與 exit 分開統計 |
@@ -156,33 +159,35 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 
 ## 7. 情境與 ensemble
 
-四個分析海域各自採三因子完整交叉，不再保留每區 1,000 分層抽樣或四區共用 20 個 receptors 的選項：
+貢寮、龜山島、新竹、後灣與連江五個研究站點各自採三因子完整交叉，不再保留每站 1,000 分層抽樣、四區共用 20 個 receptors 或 A 區兩站共用 20 個 receptors 的選項：
 
 \[
-N_{\mathrm{base,region}}=N_{\mathrm{material}}N_{\mathrm{receptor,region}}N_{\mathrm{arrival}}
+N_{\mathrm{base,site}}=N_{\mathrm{material}}N_{\mathrm{receptor,site}}N_{\mathrm{arrival}}
 =10\times20\times50=10{,}000.
 \]
 
 \[
-N_{\mathrm{base,total}}=4\times N_{\mathrm{base,region}}=40{,}000.
+N_{\mathrm{base,A}}=2\times N_{\mathrm{base,site}}=20{,}000,
+\qquad
+N_{\mathrm{base,total}}=5\times N_{\mathrm{base,site}}=50{,}000.
 \]
 
 此處的「情境」是固定物性、受體與到達時間的一組參數。物理敏感度案例另以 `experiment_case_id` 表示，以免把 no-Stokes 等重跑錯算成計畫書的基礎情境。
 
-每個分析海域的 50 個 arrival-time 條件均由同一套可重現分層設計建立：
+每個研究站點的 50 個 arrival-time 條件均由同一套可重現分層設計建立：
 
-- 48 個核心：`2 年 × 4 季 × 2 潮汐類別 × 3 重複`。
-- 2 個補充：在 forcing 完整前提下，選取預先定義的高波或極端流況案例。
+- 48 個核心：`2 年 × 4 季 × 2 大／小潮類別 × 3 潮內相位 proxy`；三相位為最快上升、最快下降與 slack。
+- 2 個補充：在 forcing 完整前提下，分別選取 local-domain 高波與強流案例。
 
-這只是可審查的預設；正式 tidal classifier、季節界線與極端門檻需由研究團隊核定，且大／小潮與 forcing availability 必須逐區判定。各區可重用同一 UTC 集合，但仍須各自通過 50 條 coverage；受體時間若有真實調查日期，應另建立 observation-conditioned scenario，不應用分層 50 時次取代現場資訊。
+分層與 deterministic tie-break 已定案；確切 UTC、潮位分類門檻與事件值由 2024-2025 SERVER 資料衍生，不再等待人工任選。貢寮／龜山島在 coverage 允許時使用配對 UTC，但仍各自通過 50 條 coverage。潮位導數相位只是 tide-phase proxy，不宣稱為現場三維最大漲／退潮流；若未來取得真實調查日期，另建立 observation-conditioned experiment，不改寫 baseline。
 
 若同一情境包含隨機擴散、受體位置／深度微擾、forcing ensemble 或其他隨機項，需以不同 seed 產生獨立實現。第 `s` 個情境的 member 數記為 `M_s`，故單一 experiment case 的總軌跡數為：
 
 \[
-N_{\mathrm{trajectory,total}}=\sum_{s=1}^{40{,}000}M_s.
+N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 \]
 
-只有所有情境採相同 `M_s=M` 時，才是每區 `10,000×M`、全案 `40,000×M`；完全確定性試驗為 `M=1`。`M` 是本專案為估計 stochastic footprint 所需的實作參數，並非計畫書明列的第四個因子，也不能由「1,000」反推。
+只有所有情境採相同 `M_s=M` 時，才是每站點 `10,000×M`、A 區 `20,000×M`、全案 `50,000×M`；完全確定性試驗為 `M=1`。`M` 是本專案為估計 stochastic footprint 所需的實作參數，並非計畫書明列的第四個因子，也不能由「1,000」反推。
 
 正式 baseline 原則上使用一致的 `M`，以使 receptor、material 與 arrival-time 間的 Monte Carlo 誤差可比較。先對代表性情境依序增加 members，觀察 boundary-exit ranking、50/75/90% HDR 面積與重疊、median travel time、pathway density 及 bootstrap interval；只有這些量在預先登錄門檻內穩定後，才固定最小合格 `M`。seed 以 master seed、scenario hash、experiment case 與 member ID 經可重現算法派生；分片、worker 數與 restart 不得改變 seed。
 
@@ -239,7 +244,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{40{,}000}M_s.
 | checkpoint/restart | 同 config/seed 分片中斷續跑後 row count、ID、event 與 checksum 等價 |
 | dt convergence | dt 減半後 exit ranking、90% HDR、median travel time 與 path density 變化低於預先登錄值 |
 | ensemble convergence | 隨 members 增加，主要統計與 bootstrap interval 穩定；由曲線決定正式 M |
-| domain adequacy | 候選域外擴後，主要 exit/path/HDR 指標變化預設低於 10%，否則擴域 |
+| domain adequacy | 貢寮／龜山島 20/25/35 km local boundary 與 flow-domain expansion 比較後，主要 entry/exit/path/HDR 指標變化預設低於 10%，否則報告尺度依賴性或調整 domain version |
 | known-source synthetic | 正向已知來源到受體案例，其來源落入逆向 footprint 的核定 HDR，並量化 coverage |
 | forcing ablation | current-only、no-Stokes、deep/finite Stokes、Kh/Kz cases 可比較且命名不混淆 |
 

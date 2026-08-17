@@ -19,7 +19,7 @@
 | [Hammoud et al. (2021), *Moving source identification in an uncertain marine flow...*](https://doi.org/10.1016/j.oceaneng.2020.108435) | ensemble 流場產生 forward probability map，再由 backward inverse maps 與目標函數辨識來源位置／時間，並檢查觀測面積、觀測時間與流場變異等敏感度 | 逆向 footprint 必須伴隨來源時間與物理參數敏感度；若日後有已知候選來源，可另建 objective/ranking，而非只靠目視熱區 |
 | [Assessing ocean ensemble drift predictions by comparison with observed oil slicks (2023)](https://doi.org/10.3389/fmars.2023.1122192) | 以 rank histogram 與 spread–error relationship 驗證 ensemble 是否能表達 forcing 不確定性 | 若導入 forcing ensemble，需額外報告 reliability／spread–error，不能只畫 ensemble 外包絡 |
 
-文獻的共同結構是「代表軌跡說明傳輸機制，統計密度或連通矩陣承載主結論，旅行時間與不確定性限制解讀」。因此本專案不將每區 `10,000×M`、全案 `40,000×M` 條軌跡全部疊在單張圖上；大量軌跡以聚合統計呈現，原始軌跡仍保留供追溯。
+文獻的共同結構是「代表軌跡說明傳輸機制，統計密度或連通矩陣承載主結論，旅行時間與不確定性限制解讀」。因此本專案不將每站 `10,000×M`、全案 `50,000×M` 條軌跡全部疊在單張圖上；大量軌跡以聚合統計呈現，原始軌跡仍保留供追溯。
 
 ## 3. 名詞與統計量的呈現界線
 
@@ -45,31 +45,33 @@
 
 ### F01 研究範圍、forcing 與受體設計圖
 
-- A-D 四個分析海域、對應的四個 forcing domains、每區 20／全案 80 個 receptors、受體深度／HAB、開放邊界段、海岸與水深。可另以次要符號標示貢寮、龜山島、新竹、後灣海生館與連江五個調查位置，但不得把它們畫成五個研究區域。
+- A-D 四個 forcing domains 與貢寮、龜山島、新竹、後灣、連江五個獨立站點；每站 20／全案 100 個 receptors、受體深度／HAB、開放邊界段、海岸與水深均須呈現。
+- 貢寮／龜山島 panel 疊加 12.5 km receptor core、25 km baseline local domain 及 20/35 km sensitivity outlines；兩個 local domains 的重疊區照實繪出，不以裁切或透明度處理暗示互斥。
 - inset 顯示台灣周邊相對位置；局部圖以各 domain 的 metric CRS 呈現。
-- 圖例與表格確認 A-D 各有 20 個受體，並列出 A 區 20 個受體在貢寮／龜山島子地點間的實際分配。
+- 圖例與表格確認五站點各有 20 個受體；A 區合計 40 個，但貢寮與龜山島各自的分母、ID 與圖層保持獨立。
 - companion panel 顯示 2024-2025 forcing 可用率與缺口，不將資料缺口區畫成低來源區。
 
 ### F02 方法、情境矩陣與計數圖
 
 - 概念圖顯示 OCM current、NWW3-derived Stokes、浮沉速度、Kh/Kz、反向時間、海面／海床／海岸／開放邊界事件。
-- 情境方塊明列每區 `10 materials × 20 receptors × 50 arrival times = 10,000 base scenarios`，以及四區合計 `4 × 10,000 = 40,000`。
-- 另列 `M` 為每情境隨機 members；單一 experiment case 的總軌跡數為 `sum(M_s)`，一致 M 時為每區 `10,000×M`、全案 `40,000×M`。
+- 情境方塊明列每站 `10 behaviors × 20 receptors × 50 arrival times = 10,000 base scenarios`、A 區兩站 `20,000`，以及五站合計 `50,000`。
+- 另列 `M` 為每情境隨機 members；單一 experiment case 的總軌跡數為 `sum(M_s)`，一致 M 時為每站 `10,000×M`、A 區 `20,000×M`、全案 `50,000×M`。
 - no-Stokes、domain expansion 等以獨立 experiment cases 顯示，不混入基礎情境數。
 
 ### F03 代表性三維逆向軌跡
 
-每個分析海域選少量預先登錄的代表案例；A 區必要時分列貢寮與龜山島子地點。每個案例至少使用兩個同步 panel：
+五個研究站點各選少量預先登錄的代表案例；貢寮與龜山島不得只以 A 區 pooled path 取代。每個案例至少使用兩個同步 panel：
 
 1. plan-view 地圖：軌跡按 backward age 著色，受體以星號、first exit／停止點以不同符號表示；背景含水深與主要流向。
 2. depth–time 或沿軌跡距離–深度剖面：顯示海面、海床、粒子 `z`、浮沉類別、first bed contact 與有效水深。
 
 可附 3D 透視圖作補充，但不能作唯一三維成果，因透視遮蔽與視角會妨礙定量比較。全體軌跡只畫經固定 seed 或分位數規則抽出的代表 subset，圖說標示抽樣規則與 `n/N`。
 
-### F04 邊界條件式來源足跡
+### F04 關注海域入口與外層來源足跡
 
-- 主圖疊加 raw first-exit points、2D KDE／訪格比例與 50%、75%、90% HDR contours。
-- companion panel 沿 open-boundary arc length 顯示 1D density／比例，標註 boundary segment 與 bootstrap CI。
+- 第一組主圖疊加 local-domain raw first-exit points、2D KDE／訪格比例與 50%、75%、90% HDR contours，直接呈現正向時間移入關注海域的主要入口方向。
+- 第二組或 inset 顯示 flow-domain raw first exits 與外層條件式潛在來源；不得把 local entry 與 outer exit 混成同一分母。
+- companion panel 分別沿 local／flow open-boundary arc length 顯示 1D density／比例，標註 boundary segment 與 bootstrap CI。
 - 至少比較三種 bandwidth；正文使用預先核定者，補充資料呈現敏感度。
 - 圖說列出分母（所有有效 members 或成功 exits）、raw `n`、成功率、bandwidth、格網解析度、experiment case 與回溯上限。
 
@@ -82,7 +84,7 @@
 
 ### F06 來源—受體連通矩陣
 
-- rows 為 receptor 或 receptor group，columns 為 boundary/source segments；cell 為在該受體條件下到達該來源段的相對權重或比例。
+- rows 為 study site、receptor 或 receptor group，columns 為 local-entry／outer-source segments；cell 為在該受體條件下到達該來源段的相對權重或比例。
 - baseline 使用 receptor-row normalization，使每列分母清楚；另表保存 raw count 與有效 member 數。
 - 若比較 10 種物性、季節或潮況，使用 small multiples 或差異矩陣，不將所有維度塞入單張 unreadable heatmap。
 - 可依地理弧長排序 source segments，避免聚類排序破壞空間連續性；若採 clustering，須另保留地理順序版本。
@@ -98,7 +100,7 @@
 
 - 以四季 × 大／小潮建立固定 4×2 small multiples；同一比較組使用共同 extent、色階範圍、bandwidth 與 denominator 定義。
 - 每 panel 顯示來源足跡或來源段相對權重，並標示實際 arrival-time 數、members 與 forcing coverage。
-- 每區 50 個到達時間的個別結果保留在 supplement／scenario browser；正文以分區分層摘要與代表個案呈現。
+- 每站 50 個到達時間的個別結果保留在 supplement／scenario browser；正文以站點分層摘要與代表個案呈現。
 
 ### F09 物性、垂向行為、停留與底部接觸
 
@@ -109,13 +111,13 @@
 
 ### F10 停止結果、資料品質與失敗圖
 
-- 以 stacked bars 顯示 open exit、coast contact、bed deposition、forcing start、max age、data gap、numerical failure 的比例及 raw count。
+- 以 stacked bars 分開顯示 local entry、flow-domain open exit、coast contact、surface-regime exit、bed deposition、forcing start、max age、data gap、numerical failure 的比例及 raw count。
 - 另畫 data-gap／numerical-failure density，使空間集中失敗可被辨識。
 - 按 domain、receptor、material、arrival strata 分層；任何一層的成功率顯著較低時，主要 footprint 必須附 reliability 警示。
 
 ### F11 物理敏感度與不確定性
 
-- no-Stokes、deep-water、finite-depth、Kh/Kz、dt、domain 與 boundary policy 以 baseline map、difference map 及來源排名變化並列。
+- no-Stokes、deep-water、finite-depth、Kh/Kz、dt、20/25/35 km local domain、flow-domain expansion 與 boundary policy 以 baseline map、difference map 及來源排名變化並列。
 - difference map 使用以 0 為中心的 diverging palette；每個 panel 使用相同上／下限。
 - 來源段權重以 point-range／forest plot 顯示 bootstrap interval；另報 top-k rank stability 或 HDR overlap。
 - 若使用 forcing ensemble，加入 rank histogram 與 spread–error；隨機 member spread 不能被誤稱為所有模式誤差。
@@ -132,7 +134,7 @@
 | 表號 | 內容 | 必要欄位 |
 |---|---|---|
 | T01 | forcing 與研究範圍 inventory | domain、month、time span、resolution、units、coverage、gap、schema/checksum |
-| T02 | 四區各 10×20×50 情境設計與 coverage | region、每區 receptor=20、全案 receptor=80、每區組合數 10,000、全案組合數 40,000、缺列／重列數、experiment cases、M |
+| T02 | 五站各 10×20×50 情境設計與 coverage | site、region、每站 receptor=20、全案 receptor=100、每站組合數 10,000、A 區 20,000、全案 50,000、缺列／重列數、experiment cases、M |
 | T03 | run 與停止結果摘要 | released/effective/completed、各 event raw count/percentage、wall time、particle steps、I/O、failure rate |
 | T04 | 來源段／受體排名 | receptor、source segment、raw n、有效分母、relative weight、bootstrap CI、median travel time、rank stability |
 | T05 | 物理敏感度 | case、參數、HDR overlap、排名變化、travel-time 差、bottom-contact 差、限制 |
@@ -181,7 +183,8 @@ figures/
 
 正式報告送審前逐項確認：
 
-- [ ] 每區 10,000、全案 40,000 是基礎情境數；`M`、experiment case、每區與全案總軌跡數分欄呈現。
+- [ ] 每站 10,000、A 區 20,000、全案 50,000 是基礎情境數；`M`、experiment case、每站、region 與全案總軌跡數分欄呈現。
+- [ ] 貢寮／龜山島 12.5 km receptor core、25 km local domain、20/35 km sensitivity 與重疊區均正確標示，且 local entry 與 flow-domain exit 分母分開。
 - [ ] 沒有以全軌跡疊圖取代密度、連通、時間與不確定性分析。
 - [ ] pathway visit fraction、residence time 與 first-passage time 的定義和單位分開。
 - [ ] 所有比例／KDE/HDR 標明 raw `n`、有效分母、成功率與 bandwidth。

@@ -19,6 +19,8 @@
 | `/Users/mustlab/Workspace/工作項目3.pdf` | 1,146,762 bytes | `ee3ab964436aced8e3f831fb99f9cd6e7b4209922167477e8ee21ae47d810471` | 紅框工項、情境、公式 (6)-(11) 與成果範圍 |
 | `/Users/mustlab/Workspace/timeline.txt` | 253 bytes | `17f8c02a59563e11feb76b583d88bc50344beadddf411a2b873680f399ef5e45` | 原提案工作銜接背景；不作本專案完成期限 |
 | `/Users/mustlab/Workspace/OCM-SVD-Analysis/outputs/report/期中報告(0814)全.pdf` | 10,892,143 bytes | `d3e9d931e4df93c3dc9eecffd1a3f47b5ee74e303150c22de4de07d6e819e21d` | 表 2-9、圖 2-17 的四個分析海域定義及五個調查位置對應 |
+| `/Users/mustlab/Workspace/OCM-Data-Preprocessing/configs/ocm_flow_domains.json` | 依 Git 版本 | `b8db61c38138d5690d203bf1b3785c6b2e581572d08f097573772c554ef373b3` | 四個 flow domain 的正式 bbox、中心與研究區對應 |
+| `/Users/mustlab/Workspace/OCM-SVD-Analysis/configs/guishan_gongliao_northeast_taiwan_flow_domain_water_column_svd_available_2024_2025.json` | 依 Git 版本 | `daeb9f876eb8a62996b2f7b762e5cee0e03298adf010c802f03261527bdf67e0` | 證明貢寮／龜山島共用 A 區完整水柱 forcing，而非合併情境單元 |
 
 ## 2. 原始需求到實作的映射
 
@@ -26,10 +28,10 @@
 |---|---|---|---|
 | REQ-001 | 完全沉沒於三維水體，含懸浮與底床沉積 | 粒子狀態使用 `z_m_positive_up`，至少支援 suspended、sinking/rising、near-bed 三類；完全沉沒基線不含 windage | 垂向取樣、浮沉、海面與海床解析測試 |
 | REQ-002 | 10 種沉降／上升速度 | 由版本化 material manifest 提供 10 個 `settling_velocity_mps`；沉降為負、上浮為正 | schema 驗證、10 類覆蓋表、沉降解析解 |
-| REQ-003 | 每一海域設定 20 個到達地點，可在任意懸浮深度 | A-D 每區各 20 個、全案 80 個 receptors；使用 GeoJSON geometry + 深度／HAB + 空間與垂向誤差並綁定分析海域，不把點位硬編碼於程式 | receptor manifest、四區幾何圖、每區 20／全案 80 個 ID coverage 表 |
-| REQ-004 | 每一海域 50 個到達時間，涵蓋四季與大／小潮 | A-D 每區均須有 50 個條件；採相同分層規則，但潮汐分類與 forcing availability 逐區驗證。相同 UTC 可重用，不代表只需檢查全案 50 個唯一時間 | 每區 50 時次 coverage matrix、forcing availability、選取演算法與 seed |
-| REQ-005 | 每一海域敘述寫高達 1000 組，但矩陣明列 10×20×50 | 依使用者裁決，每區採完整交叉 10,000 個基礎情境；四區合計 40,000，1,000 視為計畫書誤植。每情境 stochastic members `M` 另由收斂測試決定 | 決策 D004、每區 10,000／全案 40,000 列的 coverage 表、member-convergence 曲線與 seed 表 |
-| REQ-006 | 離開關注區域即停止 | 首次穿越版本化 domain polygon 的開放邊界時記錄 crossing；另設資料起點、最大回溯期、資料缺口及數值失敗停止條件 | event table、穿越位置次時步內插測試、停止原因覆蓋 |
+| REQ-003 | 每一海域設定 20 個到達地點，可在任意懸浮深度 | 五個獨立站點各 20 個、全案 100 個 receptors；每站採 5 個 metric maximin 水平位置 × 4 個有效垂向層位，並綁定 `study_site_id` | receptor manifest、五站點幾何圖、每站 20／全案 100 個 ID coverage 表 |
+| REQ-004 | 每一海域 50 個到達時間，涵蓋四季與大／小潮 | 五站點各有 50 個條件；固定採 48 個年份×季節×大／小潮×潮內相位，加 2 個局地高波／強流事件。確切 UTC 由資料決定 | 每站 50 時次 coverage matrix、forcing availability 與可重現選取紀錄 |
+| REQ-005 | 每一海域敘述寫高達 1000 組，但矩陣明列 10×20×50 | 依使用者裁決，每站點採完整交叉 10,000 個基礎情境；五站點合計 50,000，1,000 視為計畫書誤植。每情境 stochastic members `M` 另由收斂測試決定 | 決策 D004、每站 10,000／全案 50,000 列的 coverage 表、member-convergence 曲線與 seed 表 |
+| REQ-006 | 離開關注區域即停止 | 貢寮／龜山島離開 25 km local domain 時先記錄入口 crossing 並繼續，離開 A 區 flow domain 才停止；另設海岸、海床、海面 regime、資料起點、最大回溯期、缺口及數值失敗事件 | local/outer event table、步內 crossing 測試、停止原因覆蓋 |
 | REQ-007 | `v_total = v_current + v_stokes + v_falling` | OCM 三維速度、有限水深 bulk Stokes 水平速度與浮沉垂向速度使用一致 SI 單位及正向 | 分項速度輸出、關閉單項敏感度、單位 gate |
 | REQ-008 | 由 `Hs/Tp/θ/L` 計算 Stokes drift | `Tp=1/fp`，解有限水深 dispersion 得 k/L；波向由 wave-from 轉 propagation-to；深水極限回復附檔式 (7) | 深水／淺水極限、cardinal direction、no-Stokes 對照 |
 | REQ-009 | 四階 Runge-Kutta 進行軌跡積分 | RK4 只積分確定性 drift；signed time step 處理 backward，不在 caller 與 velocity 內重複取負號 | 常流、旋轉、剪切、正反向 closure 與四階收斂 |
@@ -42,15 +44,15 @@
 
 ### 3.1 每區 1,000 與 10,000：已裁決每區採 10,000
 
-附檔先寫「針對每一處開放海域」執行高達 1,000 組情境，緊接著在同一工項下定義 10 種速度、20 個 receptor locations 與 50 個 arrival times。其自然作用域是每一海域，因此 `10 × 20 × 50 = 10,000` 也是每區矩陣。使用者已裁決四個分析海域均採完整交叉，正式契約如下：
+附檔先寫「針對每一處開放海域」執行高達 1,000 組情境，緊接著在同一工項下定義 10 種速度、20 個 receptor locations 與 50 個 arrival times。其自然作用域是每一獨立研究站點，因此 `10 × 20 × 50 = 10,000` 是每站點矩陣。使用者另裁決貢寮與龜山島雖共用 forcing，情境須各自完整建立，正式契約如下：
 
-- A-D 每區均有 10 種物性、20 個受體與 50 個到達時間的完整交叉，每區 `scenario_count` 恰為 10,000。
-- 四區共 80 個 receptors，基準情境合計 `4 × 10,000 = 40,000`；「四區合計 20 個、每區 5 個」沒有原文依據，已撤銷。
-- 第 `s` 個情境的獨立隨機實現數記為 `M_s`，因此全案單一 experiment case 的總軌跡數為 `sum(M_s)`；只有所有情境採相同 `M` 時，才等於 `40,000 × M`，每區則為 `10,000 × M`。
+- 貢寮、龜山島、新竹、後灣與連江各有 10 種行為、20 個受體與 50 個到達時間的完整交叉，每站點 `scenario_count` 恰為 10,000。
+- 五站點共 100 個 receptors，A 區兩站合計 20,000 個基礎情境，全案合計 `5 × 10,000 = 50,000`；「四區合計 20 個、每區 5 個」及「A 區兩站共用 20 個」均已撤銷。
+- 第 `s` 個情境的獨立隨機實現數記為 `M_s`，因此全案單一 experiment case 的總軌跡數為 `sum(M_s)`；只有所有情境採相同 `M` 時，才等於 `50,000 × M`，每站點則為 `10,000 × M`。
 - `M` 並非附檔指定值。確定性案例為 `M=1`；隨機擴散或 forcing／初始條件擾動時，正式 `M` 由 exit ranking、HDR、travel-time 等統計量的收斂曲線決定。
 - no-Stokes、Kh/Kz、domain 與邊界等敏感度以獨立 `experiment_case_id` 管理，不加入基礎情境數，但會增加實際總運算量。
 
-代表性 benchmark 的用途改為決定 `M`、shard 大小、並行度、RAM、scratch、輸出量與 checkpoint 策略；不得再用 benchmark 把任一區的完整交叉靜默降為 1,000，或把四區合併為單一 10,000 矩陣。
+代表性 benchmark 的用途改為決定 `M`、shard 大小、並行度、RAM、scratch、輸出量與 checkpoint 策略；不得再用 benchmark 把任一站點的完整交叉靜默降為 1,000，或把五站點合併為單一 10,000 矩陣。
 
 ### 3.2 「SDE 採 RK4」需拆成兩個數值步驟
 
@@ -77,18 +79,18 @@
 
 所有停止原因分欄保存，不能混成 `exited`。
 
-### 3.5 五個調查位置歸併為四個分析海域
+### 3.5 四個 forcing domains 與五個情境站點分層保存
 
-期中報告表 2-9 與圖 2-17 明定，本研究先有 5 個調查位置，再依水動力機制歸併為 4 個正式分析海域。後續程式、圖表與統計分層一律以 A-D 四區為第一層研究單元；調查位置只作 provenance／子地點欄位。
+期中報告表 2-9 與圖 2-17 將 5 個調查位置依水動力機制對應至 4 個分析流場；`OCM-SVD-Analysis` 亦讓貢寮與龜山島共用完整 A 區水柱矩陣，避免重複計算相同 forcing。這只能決定 forcing 層，不能取消兩個站點各自的受體與完整情境。後續程式與圖表以 `study_site_id` 為第一層、`analysis_region_id` 為次要彙整層。
 
-| 分析海域 | 經度範圍（°E） | 緯度範圍（°N） | 調查位置／說明 | forcing domain |
+| region | 經度範圍（°E） | 緯度範圍（°N） | 獨立站點 | forcing domain |
 |---|---:|---:|---|---|
 | A 東北角海域 | 121.30-122.79 | 24.60-25.49 | 貢寮、龜山島 | `northeast_taiwan_common_cache_v3` |
 | B 新竹外海 | 119.70-121.19 | 24.30-25.19 | 新竹 | `hsinchu_cache_v3` |
 | C 後灣海域 | 120.16-121.62 | 21.55-22.44 | 後灣海生館周邊 | `houwan_nmmba_cache_v3` |
 | D 連江海域 | 119.19-120.70 | 25.75-26.64 | 分析範圍整合南竿、北竿 | `lienchiang_common_cache_v3` |
 
-四個 forcing domains 在本專案中恰好對應四個分析海域；每區必須各有 20 個 receptors，全案共 80 個。A 區 20 個受體在貢寮與龜山島間的子地點分配仍由 receptor manifest 核定，不能從調查位置數平均推定。
+四個 forcing domains 供五站點使用：A 區包含貢寮與龜山島兩套各 20 個 receptors，其餘 B-D 各一套 20 個，全案共 100 個。貢寮／龜山島舊 SVD 候選框因尺度過小，只保留 anchor provenance；正式 local domain 為 anchor-centered 25 km metric buffer 與有效海域的交集，兩者允許重疊。詳細規則見文件 08。
 
 ## 4. 可交付成果
 
@@ -96,7 +98,7 @@
 
 1. 安裝與 SERVER runbook、鎖定環境、設定 schema 及資料 preflight 報告。
 2. 純 NumPy reference 與 Numba production 粒子核心。
-3. A-D 每區 10×20×50、各 10,000 列且全案恰好 40,000 列的完整基礎設計表，以及各 `experiment_case_id`、實際 `M` 與覆蓋證據。
+3. 五站點各 10×20×50、各 10,000 列且全案恰好 50,000 列的完整基礎設計表，以及各 `experiment_case_id`、實際 `M` 與覆蓋證據。
 4. 每個 immutable run 的 config、manifest、seed、forcing、scenario、trajectory shard、event、checksum 與 QC。
 5. no-Stokes、deep/finite-depth、Kh/Kz、dt、ensemble、domain、海岸／海床邊界的核心敏感度。
 6. 邊界來源足跡、路徑、停留、旅行時間、來源—受體連通性、底部接觸、不確定性與失敗率產品，及可供後續熱區分析讀取的 release manifest。

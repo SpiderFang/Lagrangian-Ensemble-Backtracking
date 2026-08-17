@@ -48,7 +48,8 @@ find "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT" \
 
 此輸出需保存為 G0 evidence，但它還不能取代 `time_utc_ns.npy` 的逐值檢查。正式 `lbt-preflight` 會另外驗證：
 
-- 設定恰有 A-D 四個 `analysis_region_id`，各自唯一對應一個 `flow_domain_id`；5 個調查位置標籤只作子地點 provenance，不另增研究區域維度。
+- 設定恰有 A-D 四個 `analysis_region_id`／`flow_domain_id` 與五個唯一 `study_site_id`；貢寮、龜山島均對應 A 區，但情境與輸出不可合併。
+- 貢寮／龜山島以 anchor 產生 12.5 km receptor core、25 km local domain 及 20/35 km 敏感度 polygon，與固定 OCM ocean polygon 相交；兩個 local domains 重疊時須完整保留，不作 Voronoi 切割。圓周外海 arc 與岸線必須分段，只有前者可計入 local-entry KDE。
 - 嚴格遞增與唯一 UTC。
 - 實際 start/end、間距、缺口與跨月銜接。
 - array shape/dtype 與 metadata 相符。
@@ -121,11 +122,11 @@ uv run lbt-validate-run "$LBT_SCRATCH_ROOT/pilots/<run_id>"
 uv run lbt-benchmark-report "$LBT_SCRATCH_ROOT/pilots/<run_id>"
 ```
 
-Pilot 報告需以 A-D 每區固定 10,000、全案 40,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time。此 benchmark 用於選擇最小收斂 `M`、shard、並行度與儲存策略，不得據此把任一區完整交叉改回 1,000 或把四區合併為 10,000。
+Pilot 報告需以五站點各固定 10,000、A 區 20,000、全案 50,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time；並比較 7/14/30/60 日 horizon 及貢寮／龜山島 20/25/35 km local boundary。benchmark 用於衍生最小收斂 `M`、horizon、shard、並行度與儲存策略，不得據此把任一站完整交叉改回 1,000 或把五站合併為 10,000。
 
 ### 5.4 正式 batch
 
-正式 run 只能使用 `decision_status=approved` 的 config、material、每區 20／全案 80 receptor、arrival-time、每區 10,000／全案 40,000 情境 coverage 與 member-convergence manifests：
+正式 run 只能使用 `status=approved` 的 config、behavior、local-domain、每站 20／全案 100 receptor、每站 arrival-time、每站 10,000／全案 50,000 情境 coverage 與 member-convergence manifests：
 
 ```bash
 uv run lbt-run \
