@@ -18,6 +18,7 @@
 |---|---:|---|---|
 | `/Users/mustlab/Workspace/工作項目3.pdf` | 1,146,762 bytes | `ee3ab964436aced8e3f831fb99f9cd6e7b4209922167477e8ee21ae47d810471` | 紅框工項、情境、公式 (6)-(11) 與成果範圍 |
 | `/Users/mustlab/Workspace/timeline.txt` | 253 bytes | `17f8c02a59563e11feb76b583d88bc50344beadddf411a2b873680f399ef5e45` | 原提案工作銜接背景；不作本專案完成期限 |
+| `/Users/mustlab/Workspace/OCM-SVD-Analysis/outputs/report/期中報告(0814)全.pdf` | 10,892,143 bytes | `d3e9d931e4df93c3dc9eecffd1a3f47b5ee74e303150c22de4de07d6e819e21d` | 表 2-9、圖 2-17 的四個分析海域定義及五個調查位置對應 |
 
 ## 2. 原始需求到實作的映射
 
@@ -25,7 +26,7 @@
 |---|---|---|---|
 | REQ-001 | 完全沉沒於三維水體，含懸浮與底床沉積 | 粒子狀態使用 `z_m_positive_up`，至少支援 suspended、sinking/rising、near-bed 三類；完全沉沒基線不含 windage | 垂向取樣、浮沉、海面與海床解析測試 |
 | REQ-002 | 10 種沉降／上升速度 | 由版本化 material manifest 提供 10 個 `settling_velocity_mps`；沉降為負、上浮為正 | schema 驗證、10 類覆蓋表、沉降解析解 |
-| REQ-003 | 20 個到達地點，可在任意懸浮深度 | receptor 使用 GeoJSON geometry + 深度／HAB + 空間與垂向誤差，不把點位硬編碼於程式 | receptor manifest、幾何圖、20 個 ID 覆蓋表 |
+| REQ-003 | 20 個到達地點，可在任意懸浮深度 | receptor 使用 GeoJSON geometry + 深度／HAB + 空間與垂向誤差，並綁定 A-D 四個分析海域之一；不把點位或區域分配硬編碼於程式 | receptor manifest、四區幾何圖、20 個 ID 與 A-D coverage 表 |
 | REQ-004 | 50 個到達時間，涵蓋四季與大／小潮 | 使用共同的版本化 arrival-time manifest；建議 48 個年份×季節×大／小潮分層樣本，加 2 個高波或極端流況案例 | 50 時次 coverage matrix、forcing availability、選取演算法與 seed |
 | REQ-005 | 敘述寫高達 1000 組，但矩陣明列 10×20×50 | 依使用者裁決，以完整交叉的 10,000 個基礎情境為正式範圍；1,000 視為計畫書誤植。每情境 stochastic members `M` 是另由收斂測試決定的實作參數 | 決策 D004、恰好 10,000 列的 coverage 表、member-convergence 曲線與 seed 表 |
 | REQ-006 | 離開關注區域即停止 | 首次穿越版本化 domain polygon 的開放邊界時記錄 crossing；另設資料起點、最大回溯期、資料缺口及數值失敗停止條件 | event table、穿越位置次時步內插測試、停止原因覆蓋 |
@@ -44,7 +45,7 @@
 附檔敘述寫「高達 1,000 組情境」，但緊接的三因子矩陣明列 `10 × 20 × 50 = 10,000`。使用者已裁決完整交叉才是預期設計，因此正式契約如下：
 
 - 10 種物性、20 個受體與 50 個到達時間均作完整交叉，基礎 `scenario_count` 恰為 10,000。
-- 本契約把 20 個受體解讀為整個研究範圍合計 20 個；若日後改為「每一研究地點各 20 個」，即屬範圍變更，每地點會各有 10,000 個基礎情境。
+- 本契約把 20 個受體解讀為 A-D 四個分析海域合計 20 個；若日後改為「每一分析海域各 20 個」，即屬範圍變更，每區會各有 10,000 個基礎情境。
 - 第 `s` 個情境的獨立隨機實現數記為 `M_s`，因此總軌跡數為 `sum(M_s)`；只有所有情境採相同 `M` 時，才等於 `10,000 × M`。
 - `M` 並非附檔指定值。確定性案例為 `M=1`；隨機擴散或 forcing／初始條件擾動時，正式 `M` 由 exit ranking、HDR、travel-time 等統計量的收斂曲線決定。
 - no-Stokes、Kh/Kz、domain 與邊界等敏感度以獨立 `experiment_case_id` 管理，不加入基礎情境數，但會增加實際總運算量。
@@ -76,9 +77,18 @@
 
 所有停止原因分欄保存，不能混成 `exited`。
 
-### 3.5 五處研究地點與四個 forcing domain 不衝突
+### 3.5 五個調查位置歸併為四個分析海域
 
-`flow_domain` 是 forcing 支撐範圍，不等於 receptor 或報告地點。東北台灣與連江可由一個共用 domain 支援多個受體；正式地點數以 receptor manifest 為準，不能從 cache 目錄數反推研究地點數。
+期中報告表 2-9 與圖 2-17 明定，本研究先有 5 個調查位置，再依水動力機制歸併為 4 個正式分析海域。後續程式、圖表與統計分層一律以 A-D 四區為第一層研究單元；調查位置只作 provenance／子地點欄位。
+
+| 分析海域 | 經度範圍（°E） | 緯度範圍（°N） | 調查位置／說明 | forcing domain |
+|---|---:|---:|---|---|
+| A 東北角海域 | 121.30-122.79 | 24.60-25.49 | 貢寮、龜山島 | `northeast_taiwan_common_cache_v3` |
+| B 新竹外海 | 119.70-121.19 | 24.30-25.19 | 新竹 | `hsinchu_cache_v3` |
+| C 後灣海域 | 120.16-121.62 | 21.55-22.44 | 後灣海生館周邊 | `houwan_nmmba_cache_v3` |
+| D 連江海域 | 119.19-120.70 | 25.75-26.64 | 分析範圍整合南竿、北竿 | `lienchiang_common_cache_v3` |
+
+四個 forcing domains 在本專案中恰好對應四個分析海域；每區仍可包含多個 receptors。20 個受體的四區分配以 receptor manifest 為準，不能從調查位置數或 cache 目錄自行推定。
 
 ## 4. 可交付成果
 

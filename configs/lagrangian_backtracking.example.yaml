@@ -50,15 +50,37 @@ inputs:
     # 並在任一 stage 超過實際允許 gap 時停止，不作最近時次外插。
     maximum_time_gap_hours: 1.5
 
+study_area:
+  # 正式統計與圖表的第一層空間單元是 A-D 四個分析海域；5 只代表期中報告
+  # 圖 2-17 的調查位置標記數。這兩個計數分開保存，以便 preflight 在設定錯誤時
+  # 立即拒絕執行，而不是等到聚合階段才發現區域維度不一致。
+  expected_analysis_region_count: 4
+  expected_survey_location_count: 5
+  primary_analysis_unit: analysis_region
+
 domains:
-  # 一個 forcing domain 可以支援多個 receptor／報告地點；domain 數不等於研究地點數。
-  - flow_domain_id: northeast_taiwan_common_cache_v3
+  # 期中報告圖 2-17 將 5 個調查位置依水動力機制歸併為 4 個分析海域；
+  # 因此本清單的每一列對應一個正式研究／分析區域。A 區同時包含貢寮與
+  # 龜山島兩個調查位置，不可因圖上有 5 個紅圈而把研究區域數設為 5。
+  - analysis_region_id: A
+    analysis_region_name_zh: 東北角海域
+    survey_location_labels: [貢寮, 龜山島]
+    flow_domain_id: northeast_taiwan_common_cache_v3
     metric_crs_policy: local_azimuthal_equidistant
-  - flow_domain_id: hsinchu_cache_v3
+  - analysis_region_id: B
+    analysis_region_name_zh: 新竹外海
+    survey_location_labels: [新竹]
+    flow_domain_id: hsinchu_cache_v3
     metric_crs_policy: local_azimuthal_equidistant
-  - flow_domain_id: houwan_nmmba_cache_v3
+  - analysis_region_id: C
+    analysis_region_name_zh: 後灣海域
+    survey_location_labels: [後灣海生館]
+    flow_domain_id: houwan_nmmba_cache_v3
     metric_crs_policy: local_azimuthal_equidistant
-  - flow_domain_id: lienchiang_common_cache_v3
+  - analysis_region_id: D
+    analysis_region_name_zh: 連江海域
+    survey_location_labels: [連江]
+    flow_domain_id: lienchiang_common_cache_v3
     metric_crs_policy: local_azimuthal_equidistant
 
 geometry:

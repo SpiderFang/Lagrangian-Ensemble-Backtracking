@@ -34,7 +34,7 @@ A、B、C、D 四條工作流立即同時啟動。真正不可跳過的關鍵路
 | LBT-000 | P0 | repository 與規格基線 | README、需求、架構、科學方法、快速計畫、風險、SERVER runbook、視覺化規格與 example config 一致 | 已完成規劃骨架 |
 | LBT-001 | P0 | SERVER 唯讀 inventory | 逐 domain/month 列出 2024-2025 metadata、shape、dtype、time、coverage、bytes、status/cache kind 與 checksum 摘要 | 需要 SERVER 認證；與其餘工作並行 |
 | LBT-002 | P0 | forcing 語意核對 | OCM `hvel/w/zcor/elev/wetdry/diffusivity` 與 NWW3 `Hs/fp/DP` 的單位、方向、mask、gap 與時間對位有證據 | LBT-001，可先讀相鄰專案契約 |
-| LBT-003 | P0 | 科學 manifests | 恰好 10 個 material、20 個 receptor、50 個 arrival time；每列含來源、版本、UTC、深度基準、不確定性與核定狀態 | 研究團隊；schema 可先行 |
+| LBT-003 | P0 | 科學 manifests | 恰好 10 個 material、20 個 receptor、50 個 arrival time；receptor 完整覆蓋 A-D 四個分析海域，每列含來源、版本、UTC、深度基準、不確定性與核定狀態 | 研究團隊；schema 可先行 |
 | LBT-004 | P0 | 運算與儲存 preflight | 核定 output/scratch、檔案系統、可用 CPU/RAM、配額與原子發布方法 | LBT-001；不阻塞合成開發 |
 
 **G0 完成條件：** 正式根路徑與輸入契約可稽核；未核定科學欄位會被 config validator 拒絕。G0 未完成仍可實作與測試，但不得啟動正式科學批次。

@@ -48,6 +48,7 @@ find "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT" \
 
 此輸出需保存為 G0 evidence，但它還不能取代 `time_utc_ns.npy` 的逐值檢查。正式 `lbt-preflight` 會另外驗證：
 
+- 設定恰有 A-D 四個 `analysis_region_id`，各自唯一對應一個 `flow_domain_id`；5 個調查位置標籤只作子地點 provenance，不另增研究區域維度。
 - 嚴格遞增與唯一 UTC。
 - 實際 start/end、間距、缺口與跨月銜接。
 - array shape/dtype 與 metadata 相符。

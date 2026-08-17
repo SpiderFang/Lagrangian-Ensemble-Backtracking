@@ -17,7 +17,7 @@
 | D002 | provisional | G0/G1 | SCHISM 參考文件支持 hvel/w 為 m/s、diffusivity 為 m²/s、z positive-up；`wetdry_elem` 0/1 與 SERVER metadata 仍需確認 | 未確認欄位不得被靜默轉換；濕乾事件正式 run blocked | 海洋數值人員 |
 | D003 | provisional | G1 | NWW 相鄰專案採 `DP` wave-from、第一／第二 wind component east/north 的事件推定慣例；本工項只需 DP，仍須在 config 明示 | 可做有標記的 pilot；正式報告需保留 inferred 限制 | 海洋數值人員 |
 | D004 | decided | 情境基線 | 使用者裁決矩陣的 `10×20×50=10,000` 為正式完整交叉，敘述中的 1,000 為誤植。`M` 是每情境獨立隨機實現數，由 member convergence 另定 | 不得把 baseline 分層縮為 1,000；未決 `M` 時只能跑 deterministic／pilot | 研究團隊／數值／系統 |
-| D005 | open | G0/G3 | 20 個 receptor 的 geometry、z/HAB、空間／垂向／時間誤差與現場依據 | 可用合成 receptor 測試；不得凍結正式 scenario matrix | 研究／現場團隊 |
+| D005 | open | G0/G3 | 20 個 receptor 在 A-D 四個分析海域的分配、geometry、z/HAB、空間／垂向／時間誤差與現場依據 | 可用合成 receptor 測試；不得凍結正式 scenario matrix | 研究／現場團隊 |
 | D006 | open | G0/G3 | 10 個浮沉速度／物性類別、符號、分布與文獻依據 | 可用解析測試值；不得產科學結果 | 研究團隊 |
 | D007 | provisional | G0/G3 | 50 arrival times 建議 48 個年份×季節×大／小潮×3，加 2 個事件；潮汐分類與事件門檻待核定 | 可實作 selector；正式 50 時次 blocked | 研究／統計 |
 | D008 | open | G2/G4 | `max_backtrack_days`、open boundary、coast/bed/surface policy | 可用合成預設；正式 travel-time 統計 blocked | 研究／海洋數值 |

@@ -148,7 +148,7 @@ OCM 與 NWW3 缺值政策分開：
 
 ### 7.2 Receptor manifest
 
-每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、`z_m` 或 `height_above_bed_m`、垂向誤差、調查時間來源、site/reporting region、版本、核定者與狀態。
+每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、`z_m` 或 `height_above_bed_m`、垂向誤差、調查時間來源、`analysis_region_id`（限 A-D）、`survey_location_label`、版本、核定者與狀態。A-D 分別為東北角、新竹外海、後灣與連江四個分析海域；A 區可同時包含貢寮與龜山島子地點。
 
 ### 7.3 Arrival-time manifest
 
