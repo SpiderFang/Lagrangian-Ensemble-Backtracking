@@ -1,0 +1,279 @@
+# 本檔只示範正式設定應具有的結構；planning_example 不得用於科學批次。
+# 受體、浮沉速度、arrival times、每情境 member 數與 SERVER 輸出路徑尚待核定，因此以 null
+# 或外部 manifest 位置表示，避免用虛構數值產生看似正式的成果。
+schema_version: "0.1.0"
+config_status: planning_example
+project_id: lagrangian_ensemble_backtracking
+time_standard: UTC
+
+inputs:
+  # 路徑由環境變數注入；程式不得把本機或 SERVER 絕對路徑寫死在原始碼。
+  ocm_native_root_env: OCM_NATIVE_ROOT
+  ocm_surface_root_env: OCM_SURFACE_ROOT
+  nww_analysis_root_env: NWW_ANALYSIS_ROOT
+  years: [2024, 2025]
+
+  ocm_contract:
+    required_schema_major: 3
+    required_status: ready
+    # 完整月份為基準；若要納入 partial month，必須另立 approved release config，
+    # 並把缺日及其對 arrival times 的影響寫入 run manifest。
+    accepted_cache_kinds: [standard_month]
+    required_month_arrays:
+      - time_utc_ns.npy
+      - hvel.npy
+      - vertical_velocity.npy
+      - zcor.npy
+      - elev.npy
+      - wetdry_elem.npy
+      - diffusivity.npy
+    required_grid_arrays:
+      - source_lon.npy
+      - source_lat.npy
+      - source_face_nodes_local.npy
+      - source_face_node_count.npy
+      - source_depth_m.npy
+      - source_node_bottom_index.npy
+      - source_face_global_index.npy
+
+  nww_contract:
+    required_schema_major: 1
+    required_status: ready
+    required_arrays:
+      - time_utc_ns.npy
+      - significant_wave_height.npy
+      - peak_frequency.npy
+      - peak_direction_raw_deg.npy
+      - valid_mask_wave.npy
+      - qc_flags.npy
+    # 上游 analysis 產品以 1.5 小時作線性時間支撐；本專案仍需逐月讀 metadata，
+    # 並在任一 stage 超過實際允許 gap 時停止，不作最近時次外插。
+    maximum_time_gap_hours: 1.5
+
+domains:
+  # 一個 forcing domain 可以支援多個 receptor／報告地點；domain 數不等於研究地點數。
+  - flow_domain_id: northeast_taiwan_common_cache_v3
+    metric_crs_policy: local_azimuthal_equidistant
+  - flow_domain_id: hsinchu_cache_v3
+    metric_crs_policy: local_azimuthal_equidistant
+  - flow_domain_id: houwan_nmmba_cache_v3
+    metric_crs_policy: local_azimuthal_equidistant
+  - flow_domain_id: lienchiang_common_cache_v3
+    metric_crs_policy: local_azimuthal_equidistant
+
+geometry:
+  # 正式 domain/open-boundary/receptor geometry 需版本化；null 表示目前不得執行正式 run。
+  domain_manifest: null
+  receptor_manifest: null
+  reporting_region_manifest: null
+  reject_invalid_geometry: true
+  coordinate_round_trip_tolerance_m: 0.05
+
+forcing:
+  ocm:
+    horizontal_mesh: native_schism_faces
+    quad_split_policy: deterministic_quality_diagonal
+    horizontal_interpolation: barycentric_require_all_vertices
+    vertical_interpolation: linear_bracketing_finite_zcor_no_extrapolation
+    time_interpolation: linear_no_extrapolation
+    z_coordinate: m_positive_up
+    hvel_unit: m_per_s
+    vertical_velocity_unit: m_per_s
+    diffusivity_unit: m2_per_s
+    wetdry_semantics_decision_status: open
+
+  nww3:
+    horizontal_interpolation: mask_aware_bilinear_require_all_corners
+    time_interpolation: linear_no_extrapolation
+    peak_period_source: reciprocal_of_peak_frequency
+    direction_convention: wave_from_north_clockwise
+    propagation_conversion: add_180_degrees
+    convention_evidence_status: adopted_inferred
+
+physics:
+  # 本工項以完全沉沒物體為基線，因此不加入 windage。
+  include_windage: false
+
+  stokes:
+    enabled: true
+    formulation: finite_depth_monochromatic_bulk
+    wave_height_source: significant_wave_height
+    period_source: peak_frequency
+    direction_source: peak_direction_raw_deg
+    dispersion_relation: omega_squared_equals_gk_tanh_kh
+    gravity_mps2: 9.80665
+    invalid_wave_policy: stop_with_wave_data_gap
+    required_sensitivity_cases:
+      - no_stokes
+      - deep_water_bulk
+      - finite_depth_bulk
+
+  settling:
+    # 外部 manifest 應含恰好 10 個類別；速度以 z positive-up 表示。
+    material_manifest: null
+    expected_material_count: 10
+    settling_negative_rising_positive: true
+
+  horizontal_diffusion:
+    # 常數 Kh 是解析／統計 reference；Smagorinsky 需通過空變 K 與 well-mixed 測試。
+    reference_method: constant
+    baseline_method_decision_status: open
+    constant_kh_m2ps: null
+    smagorinsky:
+      formula: proposal_equation_10_metric_triangle_gradient
+      cs_sensitivity: [0.10, 0.15, 0.20]
+      delta_policy: sqrt_local_triangle_area_m
+      kh_floor_m2ps: null
+      kh_cap_m2ps: null
+      variable_diffusivity_gradient_drift_required: true
+      enable_only_after_well_mixed_validation: true
+
+  vertical_diffusion:
+    reference_method: constant
+    constant_kz_m2ps: null
+    ocm_candidate_array: diffusivity.npy
+    baseline_method_decision_status: open
+    variable_diffusivity_gradient_drift_required: true
+
+integration:
+  deterministic_method: rk4
+  # 速度函式永遠回傳物理時間向前的速度；backward 只由負 dt 表示，禁止雙重反號。
+  time_direction: backward_negative_dt
+  stochastic_method: operator_split_decision_required
+  stochastic_variance_uses_absolute_dt: true
+  output_interval_seconds: null
+  dt_min_seconds: null
+  dt_max_seconds: null
+  maximum_horizontal_cfl_fraction: 0.25
+  maximum_vertical_layer_fraction: 0.25
+  maximum_diffusive_rms_fraction: 0.25
+  forcing_time_boundary_substep: true
+
+boundaries:
+  open_domain: stop_at_first_crossing
+  coast_baseline: stop_and_record_contact
+  surface_baseline: reflect_for_submerged_suspended
+  bed_baseline: reflect_for_suspended_record_contact
+  near_bed_baseline: deposit_on_first_contact
+  stop_at_forcing_start: true
+  stop_at_data_gap: true
+  max_backtrack_days: null
+  maximum_step_count: null
+  required_sensitivity_cases:
+    - coast_reflect
+    - bed_reflect
+    - near_bed_deposit
+    - expanded_domain
+
+scenarios:
+  receptor_manifest: null
+  expected_receptor_count: 20
+  arrival_time_manifest: null
+  expected_arrival_time_count: 50
+  material_manifest: null
+  expected_material_count: 10
+
+  # 基礎情境採計畫書三個因子的完整交叉；使用者已裁決敘述中的 1,000 為誤植。
+  # 此處的 10,000 僅代表 10 種物性 × 20 個受體 × 50 個到達時間，不包含
+  # no-Stokes 等 experiment case，也不包含每個基礎情境內的隨機重複實現。
+  design: full_factorial_10x20x50
+  scenario_count: 10000
+  scenario_count_decision_status: decided
+
+  # `members_per_scenario` 代表同一組固定參數下，以不同亂數種子或 forcing 擾動
+  # 產生的獨立軌跡數。若所有情境使用相同 M，總軌跡數才是 10,000 × M；
+  # 完全確定性案例 M=1。null 表示正式 M 尚須由 member-convergence 曲線決定，
+  # 不得把計畫書中的 1,000 當成 M，也不得用未驗證的任意值啟動正式批次。
+  members_per_scenario: null
+  members_decision_status: open_pending_convergence
+  master_seed: null
+  seed_policy: hash_master_scenario_member
+
+arrival_time_selection:
+  # 建議的 48+2 只作可審查起點；正式 tidal classifier 與極端門檻仍需決策。
+  proposed_core_design: two_years_by_four_seasons_by_two_tide_classes_by_three_replicates
+  proposed_core_count: 48
+  proposed_event_supplement_count: 2
+  selection_seed: null
+  decision_status: open
+
+execution:
+  reference_backend: numpy
+  production_backend: numba
+  shard_scenario_count: null
+  checkpoint_interval_output_steps: null
+  fail_if_dirty_git: true
+  atomic_publish: true
+  input_change_policy: reject_resume
+
+outputs:
+  output_root_env: LBT_OUTPUT_ROOT
+  scratch_root_env: LBT_SCRATCH_ROOT
+  trajectory_layout: ragged_numpy_columns_with_offsets
+  event_table_format: parquet
+  scenario_table_format: parquet
+  checksum_algorithm: sha256
+  required_aggregates:
+    - boundary_exit_points
+    - boundary_arclength_density
+    - boundary_exit_kde
+    - pathway_particle_count
+    - residence_time_seconds
+    - first_passage_time
+    - source_receptor_connectivity
+    - bottom_first_contact_density
+    - bottom_repeated_contact_density
+    - run_outcome_summary
+    - failure_density
+
+aggregation:
+  metric_crs_required: true
+  boundary_density: one_dimensional_arclength_primary
+  map_kde: two_dimensional_gaussian_compatibility_product
+  bandwidth_policy: three_scale_sensitivity
+  hdr_levels: [0.50, 0.75, 0.90]
+  bootstrap_strata:
+    - receptor
+    - arrival_time
+    - material
+  denominator_must_be_explicit: true
+
+validation:
+  require_numpy_numba_consistency: true
+  require_constant_rotation_shear_tests: true
+  require_stokes_deep_limit_test: true
+  require_brownian_mean_variance_test: true
+  require_variable_diffusivity_well_mixed_test_before_baseline: true
+  require_forward_backward_synthetic_test: true
+  require_dt_halving_convergence: true
+  require_ensemble_convergence: true
+  require_domain_expansion_sensitivity: true
+  require_checkpoint_restart_equivalence: true
+
+reporting:
+  # 核心圖表及 caption/data sidecar 的統計定義以文件 07 為準；設定檔只固定
+  # 機器可驗證的識別碼，避免繪圖腳本自行選擇一套不同的成果口徑。
+  visualization_spec: docs/07_results_visualization_plan.md
+  permitted_primary_term_zh: 條件式來源足跡
+  prohibited_without_prior_likelihood_observation:
+    - 絕對來源機率
+    - 確定來源
+    - 因果歸因
+  figure_formats: [pdf, svg, png]
+  raster_dpi: 300
+  caption_sidecar_required: true
+  data_sidecar_required: true
+  figure_registry_required: true
+  required_core_figure_ids:
+    - F01
+    - F02
+    - F03
+    - F04
+    - F05
+    - F06
+    - F07
+    - F08
+    - F09
+    - F10
+    - F11
+    - F12

@@ -1,0 +1,26 @@
+# Python 與測試工具產生的本機快取不得進入版本控制。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 虛擬環境與套件管理器快取會依主機重建，不屬於研究成果。
+.venv/
+.uv-cache/
+
+# 大型 forcing、軌跡、檢查點與伺服器運算成果只以 manifest 追溯。
+data/
+work/
+outputs/
+checkpoints/
+logs/*.log
+logs/*.jsonl
+
+# 作業系統與編輯器暫存檔。
+.DS_Store
+*.swp
+*.tmp
