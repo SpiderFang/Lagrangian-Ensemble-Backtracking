@@ -19,7 +19,7 @@
 | [Hammoud et al. (2021), *Moving source identification in an uncertain marine flow...*](https://doi.org/10.1016/j.oceaneng.2020.108435) | ensemble 流場產生 forward probability map，再由 backward inverse maps 與目標函數辨識來源位置／時間，並檢查觀測面積、觀測時間與流場變異等敏感度 | 逆向 footprint 必須伴隨來源時間與物理參數敏感度；若日後有已知候選來源，可另建 objective/ranking，而非只靠目視熱區 |
 | [Assessing ocean ensemble drift predictions by comparison with observed oil slicks (2023)](https://doi.org/10.3389/fmars.2023.1122192) | 以 rank histogram 與 spread–error relationship 驗證 ensemble 是否能表達 forcing 不確定性 | 若導入 forcing ensemble，需額外報告 reliability／spread–error，不能只畫 ensemble 外包絡 |
 
-文獻的共同結構是「代表軌跡說明傳輸機制，統計密度或連通矩陣承載主結論，旅行時間與不確定性限制解讀」。因此本專案不將 10,000×M 條軌跡全部疊在單張圖上；大量軌跡以聚合統計呈現，原始軌跡仍保留供追溯。
+文獻的共同結構是「代表軌跡說明傳輸機制，統計密度或連通矩陣承載主結論，旅行時間與不確定性限制解讀」。因此本專案不將每區 `10,000×M`、全案 `40,000×M` 條軌跡全部疊在單張圖上；大量軌跡以聚合統計呈現，原始軌跡仍保留供追溯。
 
 ## 3. 名詞與統計量的呈現界線
 
@@ -45,16 +45,16 @@
 
 ### F01 研究範圍、forcing 與受體設計圖
 
-- A-D 四個分析海域、對應的四個 forcing domains、20 個 receptors、受體深度／HAB、開放邊界段、海岸與水深。可另以次要符號標示貢寮、龜山島、新竹、後灣海生館與連江五個調查位置，但不得把它們畫成五個研究區域。
+- A-D 四個分析海域、對應的四個 forcing domains、每區 20／全案 80 個 receptors、受體深度／HAB、開放邊界段、海岸與水深。可另以次要符號標示貢寮、龜山島、新竹、後灣海生館與連江五個調查位置，但不得把它們畫成五個研究區域。
 - inset 顯示台灣周邊相對位置；局部圖以各 domain 的 metric CRS 呈現。
-- 圖例與表格列出 20 個受體在 A-D 四區的實際數量，避免把「20 個合計」誤讀為「每區 20 個」。
+- 圖例與表格確認 A-D 各有 20 個受體，並列出 A 區 20 個受體在貢寮／龜山島子地點間的實際分配。
 - companion panel 顯示 2024-2025 forcing 可用率與缺口，不將資料缺口區畫成低來源區。
 
 ### F02 方法、情境矩陣與計數圖
 
 - 概念圖顯示 OCM current、NWW3-derived Stokes、浮沉速度、Kh/Kz、反向時間、海面／海床／海岸／開放邊界事件。
-- 情境方塊明列 `10 materials × 20 receptors × 50 arrival times = 10,000 base scenarios`。
-- 另列 `M` 為每情境隨機 members；單一 experiment case 的總軌跡數為 `sum(M_s)`，一致 M 時才為 `10,000×M`。
+- 情境方塊明列每區 `10 materials × 20 receptors × 50 arrival times = 10,000 base scenarios`，以及四區合計 `4 × 10,000 = 40,000`。
+- 另列 `M` 為每情境隨機 members；單一 experiment case 的總軌跡數為 `sum(M_s)`，一致 M 時為每區 `10,000×M`、全案 `40,000×M`。
 - no-Stokes、domain expansion 等以獨立 experiment cases 顯示，不混入基礎情境數。
 
 ### F03 代表性三維逆向軌跡
@@ -98,7 +98,7 @@
 
 - 以四季 × 大／小潮建立固定 4×2 small multiples；同一比較組使用共同 extent、色階範圍、bandwidth 與 denominator 定義。
 - 每 panel 顯示來源足跡或來源段相對權重，並標示實際 arrival-time 數、members 與 forcing coverage。
-- 50 個到達時間的個別結果保留在 supplement／scenario browser；正文以分層摘要與代表個案呈現。
+- 每區 50 個到達時間的個別結果保留在 supplement／scenario browser；正文以分區分層摘要與代表個案呈現。
 
 ### F09 物性、垂向行為、停留與底部接觸
 
@@ -132,7 +132,7 @@
 | 表號 | 內容 | 必要欄位 |
 |---|---|---|
 | T01 | forcing 與研究範圍 inventory | domain、month、time span、resolution、units、coverage、gap、schema/checksum |
-| T02 | 10×20×50 情境設計與 coverage | material/receptor/arrival counts、唯一組合數 10,000、缺列／重列數、experiment cases、M |
+| T02 | 四區各 10×20×50 情境設計與 coverage | region、每區 receptor=20、全案 receptor=80、每區組合數 10,000、全案組合數 40,000、缺列／重列數、experiment cases、M |
 | T03 | run 與停止結果摘要 | released/effective/completed、各 event raw count/percentage、wall time、particle steps、I/O、failure rate |
 | T04 | 來源段／受體排名 | receptor、source segment、raw n、有效分母、relative weight、bootstrap CI、median travel time、rank stability |
 | T05 | 物理敏感度 | case、參數、HDR overlap、排名變化、travel-time 差、bottom-contact 差、限制 |
@@ -181,7 +181,7 @@ figures/
 
 正式報告送審前逐項確認：
 
-- [ ] 10,000 是基礎情境數，`M`、experiment case 與總軌跡數分欄呈現。
+- [ ] 每區 10,000、全案 40,000 是基礎情境數；`M`、experiment case、每區與全案總軌跡數分欄呈現。
 - [ ] 沒有以全軌跡疊圖取代密度、連通、時間與不確定性分析。
 - [ ] pathway visit fraction、residence time 與 first-passage time 的定義和單位分開。
 - [ ] 所有比例／KDE/HDR 標明 raw `n`、有效分母、成功率與 bandwidth。

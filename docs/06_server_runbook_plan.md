@@ -121,11 +121,11 @@ uv run lbt-validate-run "$LBT_SCRATCH_ROOT/pilots/<run_id>"
 uv run lbt-benchmark-report "$LBT_SCRATCH_ROOT/pilots/<run_id>"
 ```
 
-Pilot 報告需以固定的 10,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time。此 benchmark 用於選擇最小收斂 `M`、shard、並行度與儲存策略，不得據此把完整交叉改回 1,000。
+Pilot 報告需以 A-D 每區固定 10,000、全案 40,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time。此 benchmark 用於選擇最小收斂 `M`、shard、並行度與儲存策略，不得據此把任一區完整交叉改回 1,000 或把四區合併為 10,000。
 
 ### 5.4 正式 batch
 
-正式 run 只能使用 `decision_status=approved` 的 config、material、receptor、arrival-time、固定 10,000 情境 coverage 與 member-convergence manifests：
+正式 run 只能使用 `decision_status=approved` 的 config、material、每區 20／全案 80 receptor、arrival-time、每區 10,000／全案 40,000 情境 coverage 與 member-convergence manifests：
 
 ```bash
 uv run lbt-run \

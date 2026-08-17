@@ -12,18 +12,18 @@
 flowchart LR
     A["A：SERVER 輸入盤點"] --> F["G1：forcing sampler"]
     B["B：合成場數值核心"] --> N["G2：verified kernel"]
-    C["C：material／receptor／arrival manifests"] --> S["10×20×50 scenario builder"]
+    C["C：material／四區各 20 receptors／arrival manifests"] --> S["4×(10×20×50) scenario builder"]
     F --> E["G3：ensemble engine"]
     N --> E
     S --> E
     D["D：輸出 schema／圖表骨架"] --> E
     E --> M["pilot：決定最小收斂 M 與 shard"]
-    M --> R["G4：10,000 情境正式批次"]
+    M --> R["G4：四區合計 40,000 情境正式批次"]
     R --> A2["流式 aggregate／QC"]
     A2 --> H["G5：學術圖表與下游交接"]
 ```
 
-A、B、C、D 四條工作流立即同時啟動。真正不可跳過的關鍵路徑為：可讀 forcing → 經驗證的 sampler／kernel → 可重啟的 ensemble engine → member convergence → 10,000 情境正式批次 → 聚合與驗收。正式 receptor 或 SERVER inventory 尚未完成時，B、D 使用小型合成 fixture 前進，避免等待。
+A、B、C、D 四條工作流立即同時啟動。真正不可跳過的關鍵路徑為：可讀 forcing → 經驗證的 sampler／kernel → 可重啟的 ensemble engine → member convergence → 四區合計 40,000 情境正式批次 → 聚合與驗收。正式 receptor 或 SERVER inventory 尚未完成時，B、D 使用小型合成 fixture 前進，避免等待。
 
 ## 3. 工作分解與完成條件
 
@@ -34,7 +34,7 @@ A、B、C、D 四條工作流立即同時啟動。真正不可跳過的關鍵路
 | LBT-000 | P0 | repository 與規格基線 | README、需求、架構、科學方法、快速計畫、風險、SERVER runbook、視覺化規格與 example config 一致 | 已完成規劃骨架 |
 | LBT-001 | P0 | SERVER 唯讀 inventory | 逐 domain/month 列出 2024-2025 metadata、shape、dtype、time、coverage、bytes、status/cache kind 與 checksum 摘要 | 需要 SERVER 認證；與其餘工作並行 |
 | LBT-002 | P0 | forcing 語意核對 | OCM `hvel/w/zcor/elev/wetdry/diffusivity` 與 NWW3 `Hs/fp/DP` 的單位、方向、mask、gap 與時間對位有證據 | LBT-001，可先讀相鄰專案契約 |
-| LBT-003 | P0 | 科學 manifests | 恰好 10 個 material、20 個 receptor、50 個 arrival time；receptor 完整覆蓋 A-D 四個分析海域，每列含來源、版本、UTC、深度基準、不確定性與核定狀態 | 研究團隊；schema 可先行 |
+| LBT-003 | P0 | 科學 manifests | 恰好 10 個 material、每區 20／全案 80 個 receptors、每區 50 個 arrival-time 條件；每列含來源、region、版本、UTC、深度基準、不確定性與核定狀態 | 研究團隊；schema 可先行 |
 | LBT-004 | P0 | 運算與儲存 preflight | 核定 output/scratch、檔案系統、可用 CPU/RAM、配額與原子發布方法 | LBT-001；不阻塞合成開發 |
 
 **G0 完成條件：** 正式根路徑與輸入契約可稽核；未核定科學欄位會被 config validator 拒絕。G0 未完成仍可實作與測試，但不得啟動正式科學批次。
@@ -69,7 +69,7 @@ A、B、C、D 四條工作流立即同時啟動。真正不可跳過的關鍵路
 
 | ID | 優先序 | 工作 | 完成條件 | 依賴 |
 |---|---:|---|---|---|
-| LBT-301 | P0 | scenario builder | 10×20×50 完整交叉恰好 10,000 個唯一 `scenario_id`；缺列、重列或未核定 manifest 立即失敗 | LBT-003 |
+| LBT-301 | P0 | scenario builder | A-D 每區 10×20×50 恰好 10,000 個、全案恰好 40,000 個唯一 `scenario_id`；缺列、重列或未核定 manifest 立即失敗 | LBT-003 |
 | LBT-302 | P0 | member/seed contract | `scenario_id`、`experiment_case_id`、`member_id` 分離；seed 與 worker/shard/restart 無關 | LBT-301 |
 | LBT-303 | P0 | vectorized ensemble engine | chunked particle stepping、事件、ragged output 與一致的有效分母 | G1、G2、LBT-302 |
 | LBT-304 | P0 | checkpoint/restart/merge | config/input/seed 綁定；中斷續跑不重複或遺漏 ID，合併前後等價 | LBT-303 |
@@ -85,21 +85,21 @@ A、B、C、D 四條工作流立即同時啟動。真正不可跳過的關鍵路
 |---|---:|---|---|---|
 | LBT-401 | P0 | 代表性 pilot | 涵蓋 domain、季節／潮況、material、短／長 travel time；記錄 particle-step/s、CPU、RAM、read/write bytes 與失敗率 | G2；可先於完整 G3 執行 |
 | LBT-402 | P0 | member convergence | 隨 `M` 增加，exit ranking、HDR、median travel time、path density 與 CI 在預先登錄門檻內穩定 | LBT-401 |
-| LBT-403 | P0 | shard/checkpoint sizing | 以 10,000×M 外推 wall time、scratch、正式輸出、checkpoint 與 publish 成本；保留容量安全緩衝 | LBT-401/402、LBT-004 |
+| LBT-403 | P0 | shard/checkpoint sizing | 以全案 40,000×M 外推 wall time、scratch、正式輸出、checkpoint 與 publish 成本；同時分列每區 10,000×M，保留容量安全緩衝 | LBT-401/402、LBT-004 |
 | LBT-404 | P1 | 圖表垂直切片 | 代表 pilot 可生成 figure registry、核心圖、表與 sidecar，確認全期不需重讀不必要的原始軌跡 | LBT-401、視覺化規格 |
 
-Pilot 只決定 `M` 與工程配置，不能把 10,000 個基礎情境降為 1,000。正式 baseline 原則上使用一致且已收斂的 `M`；若不同情境使用不同 `M_s`，必須預先登錄停止規則與統計權重，且證明不會扭曲跨情境比較。
+Pilot 只決定 `M` 與工程配置，不能把任一區 10,000 個基礎情境降為 1,000，也不能把四區合併成一套 10,000。正式 baseline 原則上使用一致且已收斂的 `M`；若不同情境使用不同 `M_s`，必須預先登錄停止規則與統計權重，且證明不會扭曲跨情境比較。
 
 ### G4：2024-2025 正式批次與敏感度
 
 | ID | 優先序 | 工作 | 完成條件 | 依賴 |
 |---|---:|---|---|---|
-| LBT-501 | P0 | release config freeze | 10×20×50 覆蓋、`M`、forcing、物理、邊界、seed、shard、容量與輸出版本全數 approved | G0、G3、Pilot |
-| LBT-502 | P0 | baseline 10,000 情境 | 每個 scenario/member 均 completed 或有核准排除理由；checkpoint、資源與 failure manifest 完整 | LBT-501 |
+| LBT-501 | P0 | release config freeze | 四區各 10×20×50 覆蓋、`M`、forcing、物理、邊界、seed、shard、容量與輸出版本全數 approved | G0、G3、Pilot |
+| LBT-502 | P0 | baseline 40,000 情境 | 每區 10,000 且每個 scenario/member 均 completed 或有核准排除理由；checkpoint、資源與 failure manifest 完整 | LBT-501 |
 | LBT-503 | P1 | 核心敏感度 | no/deep/finite Stokes、Kh/Kz、dt、domain、coast/bed policy 依預先登錄矩陣完成 | LBT-502 可按已完成 shard 交錯執行 |
 | LBT-504 | P0 | run validation | schema、coverage、row/event count、checksum、seed、NaN/QC、停止原因與 denominator 全數驗收 | LBT-502/503 |
 
-**G4 完成條件：** 10,000 個基礎情境與核定 `M` 的正式 baseline 完成；核心敏感度與所有失敗／排除均可追溯。不得以單日、單 receptor 或未收斂 member 的 trial 代替。
+**G4 完成條件：** A-D 每區 10,000、全案 40,000 個基礎情境與核定 `M` 的正式 baseline 完成；核心敏感度與所有失敗／排除均可追溯。不得以單日、單 receptor 或未收斂 member 的 trial 代替。
 
 ### G5：流式聚合、學術成果與交接
 
@@ -135,9 +135,9 @@ Pilot 只決定 `M` 與工程配置，不能把 10,000 個基礎情境降為 1,0
 
 ## 6. 資源不足時的處理順序
 
-10,000 個基礎情境已是正式範圍，不因 benchmark 結果自動改為 1,000。資源不足時依序採取：
+每區 10,000、全案 40,000 個基礎情境已是正式範圍，不因 benchmark 結果自動改為每區 1,000 或全案 10,000。資源不足時依序採取：
 
 1. 增加合理的 shard 並行度、向量化與 Numba 優化，並把 active I/O 放在本機 scratch。
 2. 依已驗證的 output interval 降低儲存頻率，保留事件與聚合所需資訊；不得放寬積分 dt 或科學精度。
 3. 先完成 baseline 與核心敏感度，將非核心動畫、探索性圖面及額外物理案例列為後續項目。
-4. 若即使如此仍無法完成，由研究團隊明確變更範圍並建立新版 decision record；舊的 10,000 情境要求不得被靜默改寫。
+4. 若即使如此仍無法完成，由研究團隊明確變更範圍並建立新版 decision record；舊的每區 10,000／全案 40,000 情境要求不得被靜默改寫。

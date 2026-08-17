@@ -156,29 +156,33 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 
 ## 7. 情境與 ensemble
 
-基礎情境採三因子完整交叉，不再保留 1,000 分層抽樣選項：
+四個分析海域各自採三因子完整交叉，不再保留每區 1,000 分層抽樣或四區共用 20 個 receptors 的選項：
 
 \[
-N_{\mathrm{base}}=N_{\mathrm{material}}N_{\mathrm{receptor}}N_{\mathrm{arrival}}
+N_{\mathrm{base,region}}=N_{\mathrm{material}}N_{\mathrm{receptor,region}}N_{\mathrm{arrival}}
 =10\times20\times50=10{,}000.
+\]
+
+\[
+N_{\mathrm{base,total}}=4\times N_{\mathrm{base,region}}=40{,}000.
 \]
 
 此處的「情境」是固定物性、受體與到達時間的一組參數。物理敏感度案例另以 `experiment_case_id` 表示，以免把 no-Stokes 等重跑錯算成計畫書的基礎情境。
 
-建議 50 個共同 arrival times 由可重現分層設計建立：
+每個分析海域的 50 個 arrival-time 條件均由同一套可重現分層設計建立：
 
 - 48 個核心：`2 年 × 4 季 × 2 潮汐類別 × 3 重複`。
 - 2 個補充：在 forcing 完整前提下，選取預先定義的高波或極端流況案例。
 
-這只是可審查的預設；正式 tidal classifier、季節界線與極端門檻需由研究團隊核定。受體時間若有真實調查日期，應另建立 observation-conditioned scenario，不應用共同 50 時次取代現場資訊。
+這只是可審查的預設；正式 tidal classifier、季節界線與極端門檻需由研究團隊核定，且大／小潮與 forcing availability 必須逐區判定。各區可重用同一 UTC 集合，但仍須各自通過 50 條 coverage；受體時間若有真實調查日期，應另建立 observation-conditioned scenario，不應用分層 50 時次取代現場資訊。
 
 若同一情境包含隨機擴散、受體位置／深度微擾、forcing ensemble 或其他隨機項，需以不同 seed 產生獨立實現。第 `s` 個情境的 member 數記為 `M_s`，故單一 experiment case 的總軌跡數為：
 
 \[
-N_{\mathrm{trajectory}}=\sum_{s=1}^{10{,}000}M_s.
+N_{\mathrm{trajectory,total}}=\sum_{s=1}^{40{,}000}M_s.
 \]
 
-只有所有情境採相同 `M_s=M` 時才是 `10,000×M`；完全確定性試驗為 `M=1`。`M` 是本專案為估計 stochastic footprint 所需的實作參數，並非計畫書明列的第四個因子，也不能由「1,000」反推。
+只有所有情境採相同 `M_s=M` 時，才是每區 `10,000×M`、全案 `40,000×M`；完全確定性試驗為 `M=1`。`M` 是本專案為估計 stochastic footprint 所需的實作參數，並非計畫書明列的第四個因子，也不能由「1,000」反推。
 
 正式 baseline 原則上使用一致的 `M`，以使 receptor、material 與 arrival-time 間的 Monte Carlo 誤差可比較。先對代表性情境依序增加 members，觀察 boundary-exit ranking、50/75/90% HDR 面積與重疊、median travel time、pathway density 及 bootstrap interval；只有這些量在預先登錄門檻內穩定後，才固定最小合格 `M`。seed 以 master seed、scenario hash、experiment case 與 member ID 經可重現算法派生；分片、worker 數與 restart 不得改變 seed。
 

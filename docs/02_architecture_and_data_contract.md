@@ -126,7 +126,7 @@ OCM 與 NWW3 缺值政策分開：
 | `physics.diffusion` | Smagorinsky Kh、Kz、gradient drift 與 stochastic increment |
 | `integrators` | NumPy reference RK4、stochastic split、CFL/dt controller |
 | `boundaries` | 海面、海床、海岸、開放邊界、data-gap 與 first-crossing event |
-| `scenarios` | material/receptor/arrival 的 10×20×50 完整矩陣、member 配置與 seed 派生 |
+| `scenarios` | A-D 每區 material/receptor/arrival 的 10×20×50 完整矩陣、member 配置與 seed 派生 |
 | `engine` | 分片執行、checkpoint、restart、Numba production kernel |
 | `outputs` | trajectory/event column arrays、manifest、checksum、原子發布 |
 | `aggregation` | exit/pathway/residence/bottom-contact、KDE/HDR、bootstrap |
@@ -148,7 +148,7 @@ OCM 與 NWW3 缺值政策分開：
 
 ### 7.2 Receptor manifest
 
-每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、`z_m` 或 `height_above_bed_m`、垂向誤差、調查時間來源、`analysis_region_id`（限 A-D）、`survey_location_label`、版本、核定者與狀態。A-D 分別為東北角、新竹外海、後灣與連江四個分析海域；A 區可同時包含貢寮與龜山島子地點。
+每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、`z_m` 或 `height_above_bed_m`、垂向誤差、調查時間來源、`analysis_region_id`（限 A-D）、`survey_location_label`、版本、核定者與狀態。A-D 分別為東北角、新竹外海、後灣與連江四個分析海域；每區必須恰有 20 個 receptors，全案共 80 個。A 區可同時包含貢寮與龜山島子地點，但兩者合計仍須為 20。
 
 ### 7.3 Arrival-time manifest
 
@@ -156,17 +156,18 @@ OCM 與 NWW3 缺值政策分開：
 
 ### 7.4 Scenario 與 member
 
-基礎 `scenario_id = hash(material_id, receptor_id, arrival_time_id, design_version)`，三個因子的完整交叉必須恰好產生 10,000 個唯一 ID。no-Stokes、Kh/Kz、domain 等敏感度由 `experiment_case_id` 區分；它們不能暗中改變基礎情境的定義。
+基礎 `scenario_id = hash(analysis_region_id, material_id, receptor_id, arrival_time_id, design_version)`。每區三因子完整交叉必須恰好產生 10,000 個唯一 ID，四區聯集必須恰有 40,000 個。no-Stokes、Kh/Kz、domain 等敏感度由 `experiment_case_id` 區分；它們不能暗中改變基礎情境的定義。
 
 每個基礎情境可有 `member_id = 0..M_s-1`，seed 由 master seed、`scenario_id`、`experiment_case_id` 與 `member_id` 派生。`M_s` 是同一固定參數組合下的獨立隨機實現數，不是第四個計畫書因子：
 
 ```text
-N_base_scenario = 10 × 20 × 50 = 10,000
-N_trajectory_per_experiment = sum_s(M_s)
-N_trajectory_per_experiment = 10,000 × M   # 僅在所有 M_s 相同時
+N_base_per_region = 10 × 20 × 50 = 10,000
+N_base_total = 4 × N_base_per_region = 40,000
+N_trajectory_total_per_experiment = sum_s(M_s)
+N_trajectory_total_per_experiment = 40,000 × M  # 僅在所有 M_s 相同時
 ```
 
-完全確定性試驗使用 `M_s=1`；隨機擴散或 forcing／受體微擾試驗的正式 `M` 必須由收斂測試決定。`scenario_table`、`seed_table` 與 run manifest 需同時保存基礎情境數、各情境 member 數及 experiment case，避免以「系集數」一詞混用三種數量。
+完全確定性試驗使用 `M_s=1`；隨機擴散或 forcing／受體微擾試驗的正式 `M` 必須由收斂測試決定。`scenario_table`、`seed_table` 與 run manifest 需同時保存 region、每區及全案基礎情境數、各情境 member 數及 experiment case，避免以「系集數」一詞混用不同數量。
 
 ## 8. 輸出資料契約
 

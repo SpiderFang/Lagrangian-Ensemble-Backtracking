@@ -189,22 +189,31 @@ boundaries:
 
 scenarios:
   receptor_manifest: null
-  expected_receptor_count: 20
+  # 計畫書先限定「針對每一處開放海域」，再定義 20 個 receptor locations；
+  # 因此 A-D 每區皆須恰有 20 個受體，全案共 80 個。A 區內貢寮／龜山島
+  # 的子地點分配由 receptor manifest 記錄，但不得把 A 區總數降為 5。
+  expected_receptor_count_per_region: 20
+  expected_receptor_count: 80
   arrival_time_manifest: null
-  expected_arrival_time_count: 50
+  # 每區皆須有 50 個 arrival-time 條件；不同區域可重用同一 UTC，但季節／
+  # 大小潮標籤仍須依各區潮汐與 forcing 狀態驗證，不能只檢查全案唯一時間數。
+  expected_arrival_time_count_per_region: 50
   material_manifest: null
   expected_material_count: 10
 
-  # 基礎情境採計畫書三個因子的完整交叉；使用者已裁決敘述中的 1,000 為誤植。
-  # 此處的 10,000 僅代表 10 種物性 × 20 個受體 × 50 個到達時間，不包含
-  # no-Stokes 等 experiment case，也不包含每個基礎情境內的隨機重複實現。
-  design: full_factorial_10x20x50
-  scenario_count: 10000
+  # 每一分析海域都採計畫書三個因子的完整交叉；使用者已裁決每區敘述中的
+  # 1,000 為誤植。每區 10,000 = 10 種物性 × 20 個受體 × 50 個到達時間，
+  # 四區基準合計 40,000；兩者都不包含 no-Stokes 等 experiment case，
+  # 也不包含每個基礎情境內的隨機重複實現。
+  design: four_regions_each_full_factorial_10x20x50
+  scenario_count_per_region: 10000
+  scenario_count: 40000
   scenario_count_decision_status: decided
 
   # `members_per_scenario` 代表同一組固定參數下，以不同亂數種子或 forcing 擾動
-  # 產生的獨立軌跡數。若所有情境使用相同 M，總軌跡數才是 10,000 × M；
-  # 完全確定性案例 M=1。null 表示正式 M 尚須由 member-convergence 曲線決定，
+  # 產生的獨立軌跡數。若所有情境使用相同 M，每區軌跡數為 10,000 × M、
+  # 全案為 40,000 × M。完全確定性案例 M=1。null 表示正式 M 尚須由
+  # member-convergence 曲線決定，
   # 不得把計畫書中的 1,000 當成 M，也不得用未驗證的任意值啟動正式批次。
   members_per_scenario: null
   members_decision_status: open_pending_convergence
@@ -255,6 +264,7 @@ aggregation:
   bandwidth_policy: three_scale_sensitivity
   hdr_levels: [0.50, 0.75, 0.90]
   bootstrap_strata:
+    - analysis_region
     - receptor
     - arrival_time
     - material

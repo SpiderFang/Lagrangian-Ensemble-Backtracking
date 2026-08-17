@@ -16,10 +16,10 @@
 | D001 | provisional | G0 | 使用者確認 2024-2025 OCM/NWW 已前處理完成；路徑基線來自相鄰 runbook。本執行環境唯讀 SSH 因無可用認證未成功 | 可寫程式與本機 trial；正式 inventory、run blocked | 資料管理者 |
 | D002 | provisional | G0/G1 | SCHISM 參考文件支持 hvel/w 為 m/s、diffusivity 為 m²/s、z positive-up；`wetdry_elem` 0/1 與 SERVER metadata 仍需確認 | 未確認欄位不得被靜默轉換；濕乾事件正式 run blocked | 海洋數值人員 |
 | D003 | provisional | G1 | NWW 相鄰專案採 `DP` wave-from、第一／第二 wind component east/north 的事件推定慣例；本工項只需 DP，仍須在 config 明示 | 可做有標記的 pilot；正式報告需保留 inferred 限制 | 海洋數值人員 |
-| D004 | decided | 情境基線 | 使用者裁決矩陣的 `10×20×50=10,000` 為正式完整交叉，敘述中的 1,000 為誤植。`M` 是每情境獨立隨機實現數，由 member convergence 另定 | 不得把 baseline 分層縮為 1,000；未決 `M` 時只能跑 deterministic／pilot | 研究團隊／數值／系統 |
-| D005 | open | G0/G3 | 20 個 receptor 在 A-D 四個分析海域的分配、geometry、z/HAB、空間／垂向／時間誤差與現場依據 | 可用合成 receptor 測試；不得凍結正式 scenario matrix | 研究／現場團隊 |
+| D004 | decided | 情境基線 | 使用者裁決矩陣 `10×20×50=10,000` 套用於每一分析海域；A-D 每區 10,000、全案 40,000，敘述中的每區 1,000 為誤植。`M` 是每情境獨立隨機實現數，由 member convergence 另定 | 不得把任一區 baseline 縮為 1,000 或把四區合併為 10,000；未決 `M` 時只能跑 deterministic／pilot | 研究團隊／數值／系統 |
+| D005 | open | G0/G3 | A-D 每區各 20、全案 80 個 receptors 的 geometry、A 區子地點分配、z/HAB、空間／垂向／時間誤差與現場依據 | 可用合成 receptor 測試；不得凍結正式 scenario matrix | 研究／現場團隊 |
 | D006 | open | G0/G3 | 10 個浮沉速度／物性類別、符號、分布與文獻依據 | 可用解析測試值；不得產科學結果 | 研究團隊 |
-| D007 | provisional | G0/G3 | 50 arrival times 建議 48 個年份×季節×大／小潮×3，加 2 個事件；潮汐分類與事件門檻待核定 | 可實作 selector；正式 50 時次 blocked | 研究／統計 |
+| D007 | provisional | G0/G3 | 每區 50 arrival-time 條件，均建議 48 個年份×季節×當地大／小潮×3，加 2 個事件；逐區潮汐分類與事件門檻待核定 | 可實作 selector；任一區未滿 50 時正式矩陣 blocked | 研究／統計 |
 | D008 | open | G2/G4 | `max_backtrack_days`、open boundary、coast/bed/surface policy | 可用合成預設；正式 travel-time 統計 blocked | 研究／海洋數值 |
 | D009 | provisional | G2 | 常數 Kh/Kz 作 reference；Smagorinsky + gradient drift 通過 PDE/well-mixed 測試後升為基準或敏感度 | 未通過時不得把空變 K 當正式基準 | 海洋數值／統計 |
 | D010 | provisional | G3 | 軌跡採 ragged NumPy columns、事件／scenario 採 Parquet、immutable shards | benchmark 若顯示 I/O 不合適，需新 schema minor/major 決策 | 開發／系統 |
@@ -62,8 +62,8 @@ Supersedes:
 | R009 | bulk Stokes 在近岸、淺水或混合風浪下偏差大 | H/H | finite/deep/no-Stokes、kh/steepness QC、方向與 mean wavelength 對照 | ranking 對 formulation 高敏感：列主要不確定性，不給單一結論 |
 | R010 | OCM 已含波流耦合效應，額外 Stokes 可能重複 | M/H | 查 OCM 產品說明與模式設定；將 no-Stokes 設為核心對照 | 無法確認：報告明載可能 double counting，不作精確量值歸因 |
 | R011 | domain 太小，人工邊界主導 exit KDE | M/H | 7-14 日擴域 pilot、早期 exit 比例、HDR/ranking 比較 | 主要指標變化 >10% 或大量短時同邊退出：擴域或限制結論 |
-| R012 | domain 擴大或 `10,000×M×experiment cases` 導致計算／儲存爆量 | H/H | particle-step benchmark、最小收斂 M、向量化/Numba、shard/checkpoint、流式聚合與容量緩衝 | 超出資源時先增加合理並行、降低已驗證的儲存頻率並延後非核心案例；不得把 baseline 靜默縮為 1,000 |
-| R013 | 20 receptor／50 times 尚未核定，假資料產生看似正式成果 | H/H | schema 與 synthetic test 可先行；正式 config 驗證 `decision_status=approved` | 未核定不得啟動 G4，輸出必須標 TRIAL |
+| R012 | domain 擴大或 `40,000×M×experiment cases` 導致計算／儲存爆量 | H/H | particle-step benchmark、最小收斂 M、向量化/Numba、shard/checkpoint、流式聚合與容量緩衝 | 超出資源時先增加合理並行、降低已驗證的儲存頻率並延後非核心案例；不得把任一區 baseline 靜默縮為 1,000 |
+| R013 | 每區 20／全案 80 receptors 或 50 times 尚未核定，假資料產生看似正式成果 | H/H | schema 與 synthetic test 可先行；正式 config 驗證 `decision_status=approved` | 未核定不得啟動 G4，輸出必須標 TRIAL |
 | R014 | 粒子停留不出界，模擬無限延長 | M/H | forcing start、max age、step limit、data gap 停止；各原因分開統計 | max-age 比例過高：調整研究問題/domain/horizon，不把它當 exit |
 | R015 | dt 過大漏掉窄通道、海岸或 crossing | M/H | advective/vertical/diffusive CFL、step-interpolated crossing、dt halving | ranking/HDR 未收斂：縮 dt 並重跑受影響 cases |
 | R016 | checkpoint、worker 或 shard 改變 seed | M/H | hash-derived seed、seed table、restart/merge 等價測試 | checksum/ID 不一致為 G3 blocker，禁止只重跑「看起來失敗」的 member |
@@ -78,6 +78,6 @@ Supersedes:
 
 1. 先增加合理的 shard 並行度、向量化／Numba、local scratch 與流式聚合，並以 benchmark 選擇最小收斂 `M`。
 2. 在不改變積分精度與事件偵測的前提下，降低經驗證的軌跡儲存頻率；raw events、聚合量、失敗資訊與可重現 manifest 不得刪除。
-3. 延後非核心動畫、額外探索圖面與未列入核心矩陣的物理案例；baseline 10,000 情境、核心敏感度與驗證仍保留。
-4. 若需改變 10,000 個基礎情境，必須由使用者／研究團隊建立明確的新版範圍決策；不得自行恢復 1,000 分層設計，也不得把代表期間結果命名為 2024-2025 全期成果。
+3. 延後非核心動畫、額外探索圖面與未列入核心矩陣的物理案例；每區 10,000／全案 40,000 baseline、核心敏感度與驗證仍保留。
+4. 若需改變每區 10,000 或全案 40,000 個基礎情境，必須由使用者／研究團隊建立明確的新版範圍決策；不得自行恢復每區 1,000、四區共用 20 receptors 的設計，也不得把代表期間結果命名為 2024-2025 全期成果。
 5. 任何情況均不得省略 schema/單位/方向 gate、合成測試、dt/member 收斂、失敗率、seed/checksum、有效分母或限制措辭。
