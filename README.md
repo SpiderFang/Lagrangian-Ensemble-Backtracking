@@ -33,27 +33,29 @@
 正式路徑一律由環境變數或設定注入，程式內不得硬編碼：
 
 ```text
-OCM_NATIVE_ROOT=/home/mustlab/data/OCM-Preprocessed-Data/preprocessed/ocm_native
-OCM_SURFACE_ROOT=/home/mustlab/data/OCM-Preprocessed-Data/preprocessed/ocm_surface
-NWW_ANALYSIS_ROOT=/home/mustlab/data/NWW-Preprocessed-Data/preprocessed/available_samples_v1/nww3_analysis
+OCM_NATIVE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_native
+OCM_SURFACE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_surface
+NWW_ANALYSIS_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_analysis
 LBT_OUTPUT_ROOT=<具足夠容量且經 preflight 確認的本機或 SERVER 路徑>
 ```
 
-以上是目前相鄰專案記錄的路徑基線；第一次 SERVER preflight 必須以實際目錄、月份、metadata、checksum、容量及權限重新確認。
+以上路徑已由 2026-08-17 SERVER 唯讀 preflight 確認；正式 release 仍須逐次保存實際目錄、月份、metadata、input fingerprint、容量及權限結果，避免已更新的上游資料被未察覺地混入續跑。
 
 ## 四個 flow domains、五個獨立研究站點
 
 期中報告圖 2-17 與 `OCM-SVD-Analysis` 水柱聯合 SVD 使用 A-D 四個流場域；這是 forcing 與外層停止邊界的數量，不是本工項必須合併情境統計的理由。依使用者最終裁決，貢寮與龜山島雖共用 A 區 forcing，仍各自是完整且獨立的研究站點。
 
-| 站點 | region | 正式 forcing domain | 站點 local domain |
+| 站點 | region | 共用 forcing／outer domain | 站點 local domain |
 |---|---|---|---|
-| 貢寮 | A | `northeast_taiwan_common_cache_v3` | anchor 半徑 25 km 與有效海域的交集；受體核心半徑 12.5 km |
-| 龜山島西側 | A | `northeast_taiwan_common_cache_v3` | anchor 半徑 25 km 與有效海域的交集；受體核心半徑 12.5 km |
+| 貢寮 | A | pilot 讀取 `northeast_taiwan_common_cache_v3`；正式版共用通過南擴閘門的新 domain version | anchor 半徑 25 km 與有效海域的交集；受體核心半徑 12.5 km |
+| 龜山島西側 | A | pilot 讀取 `northeast_taiwan_common_cache_v3`；正式版共用通過南擴閘門的新 domain version | anchor 半徑 25 km 與有效海域的交集；受體核心半徑 12.5 km |
 | 新竹外海 | B | `hsinchu_cache_v3` | 與 flow domain 相同 |
 | 後灣海生館 | C | `houwan_nmmba_cache_v3` | 與 flow domain 相同 |
 | 連江 | D | `lienchiang_common_cache_v3` | 與 flow domain 相同 |
 
-因此不是「A 區 20 個 receptors 如何分配」，而是**貢寮 20 個、龜山島 20 個**，其餘三站點亦各 20 個，全案 receptor manifest 恰有 100 個三維 receptors。舊 SVD 候選框只保留 anchor provenance，不作正式 local domain；25 km local domains 允許重疊，但四套 forcing 不重複儲存或運算，情境、seed、事件、聚合與圖表仍以 `study_site_id` 分開。完整幾何、受體、物性、時間與停止條件見 [五站點情境與巢狀邊界設計基線](docs/08_design_baseline_and_derived_gates.md)。
+因此不是「A 區 20 個 receptors 如何分配」，而是**貢寮 20 個、龜山島 20 個**，其餘三站點亦各 20 個，全案 receptor manifest 恰有 100 個三維 receptors。舊 SVD 候選框只保留 anchor provenance，不作正式 local domain；25 km local domains 允許重疊，但四套 forcing 不重複儲存或運算，情境、seed、事件、聚合與圖表仍以 `study_site_id` 分開。貢寮或龜山島的軌跡離開自己的 local domain 後只記錄主要入口事件並繼續使用共用 A 區 forcing；穿越另一站 local domain 不停止、不轉移 scenario 所屬，只另存為跨站連通診斷。兩站的最外層停止邊界始終是同一個 A 區 flow-domain open boundary。
+
+SERVER preflight 顯示龜山島 25 km local boundary 到現行 A 區名目南界僅餘約 1.64 km，小於兩個約 1 km OCM surface／NWW 格點的預登錄餘裕。現行 v3 可供程式開發與 pilot，但正式 25 km baseline 與 35 km 敏感度須建立新的 A 區 forcing domain version，目標南界不北於約 `24.50°N`，且以實際 OCM、NWW 有效格網證明至少兩格 margin；不得只修改 bbox 名稱或利用無波浪支撐的 OCM source margin。完整幾何、受體、物性、時間與停止條件見 [五站點情境與巢狀邊界設計基線](docs/08_design_baseline_and_derived_gates.md)。
 
 ## 核心方法決策
 
@@ -63,7 +65,7 @@ LBT_OUTPUT_ROOT=<具足夠容量且經 preflight 確認的本機或 SERVER 路�
 4. 確定性 OCM + Stokes + 浮沉使用向量化 RK4；隨機擴散以獨立 operator split 的 Euler-Maruyama／Milstein 路徑處理，不把隨機增量塞入 RK4 stage。
 5. backward baseline 對確定性 drift 作逆時間積分，擴散維持正變異；結果稱為 conditional footprint。嚴格 reversed-time SDE 僅能在獨立方法驗證後作敏感度版本。
 6. Stokes drift 以 `Hs`、`Tp=1/fp`、峰值波向與有限水深分散關係計算 monochromatic bulk profile；深水公式須回復附檔式 (7)，並以 no-Stokes、深水式與有限水深式做敏感度。
-7. 貢寮／龜山島採巢狀邊界：首次離開 local domain 時記錄關注海域入口但繼續回溯，首次離開 A 區 flow domain 才停止；另以海岸、海床沉積、上浮至海面而超出完全沉沒模型、forcing 起始、資料缺口、最大回溯期及數值失敗作明確事件／停止條件。
+7. 貢寮／龜山島採巢狀邊界：首次離開自己的 local domain 時記錄關注海域入口但繼續回溯，首次離開共用 A 區 flow domain 才停止；穿越另一站 local domain 只作非終止的跨站連通診斷。另以海岸、海床沉積、上浮至海面而超出完全沉沒模型、forcing 起始、資料缺口、最大回溯期及數值失敗作明確事件／停止條件。
 
 ## 情境與軌跡計數
 

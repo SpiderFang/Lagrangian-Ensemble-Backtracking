@@ -74,12 +74,24 @@
 
 `flow_domain`、`study_site`、`local_domain`、`receptor`、`open_boundary_segment` 與 `reporting_region` 是不同物件：
 
-- `flow_domain`：forcing 支撐與停止邊界。
-- `study_site`：情境、seed、事件與成果的第一層獨立統計單元；貢寮與龜山島可共用 flow domain 而不共用情境。
-- `local_domain`：辨識移入關注海域入口的巢狀邊界；貢寮／龜山島採 anchor 半徑 25 km 與有效海域的交集，兩者允許重疊。
+- `flow_domain`：forcing 支撐與最外層停止邊界；貢寮與龜山島共用同一個 A 區 domain version 及 outer boundary，以保留兩地互通的水動力背景。
+- `study_site`：情境、seed、主要 local event 與成果的第一層獨立統計單元；貢寮與龜山島可共用 flow domain 而不共用情境。
+- `local_domain`：辨識移入關注海域入口的巢狀邊界；貢寮／龜山島採 anchor 半徑 25 km 與有效海域的交集，兩者允許重疊。每條軌跡只以自己的 local domain 產生主要 first-exit，另一站 local domain 的 crossing 只屬非終止連通診斷。
 - `receptor`：終端觀測位置／小 polygon、深度及不確定性。
 - `open_boundary_segment`：排除海岸後可穿越的命名邊界，用於 first crossing 與弧長密度。
 - `reporting_region`：下游彙整單元，不改變 forcing 或軌跡。
+
+### 3.1 A 區 domain version 契約
+
+現行 `northeast_taiwan_common_cache_v3` 的 bbox 南界為 `24.600844°N`。SERVER preflight 顯示龜山島 25 km local boundary 至該南界僅餘約 1.64 km，未達兩個約 1 km OCM surface／NWW 共同格點，因此它的 `domain_role` 固定為 `development_and_pilot`。正式 release 不得就地改寫此上游識別碼或 metadata，而須引用新的 expanded `flow_domain_id`。
+
+expanded A 區的機器可驗證契約至少包含：
+
+- 目標南界不北於約 `24.50°N`，但正式 bbox 以實際可建立的共同有效格網為準，不把近似建議值冒充已生成產品；
+- OCM native triangle、OCM surface 與 NWW analysis 對 25 km baseline 及 35 km sensitivity 的 open-water arcs 均至少保留兩個共同有效格點；
+- OCM/NWW 的 grid、month、time、mask、schema、status、input fingerprint 與方向／單位決策均重新進入 G0/G1，而不是沿用舊 domain 的通過紀錄；
+- 含 Stokes baseline 不得只利用已延伸的 OCM native source margin，因現行 NWW analysis 並未覆蓋該 margin；
+- `flow_domain_id` 與 outer-boundary segment IDs 隨新版本建立，所有 scenario 仍保留原本的五站點與 50,000 基礎情境定義。
 
 ## 4. OCM native mesh 取樣器
 
@@ -120,7 +132,7 @@ OCM 與 NWW3 缺值政策分開：
 |---|---|
 | `config` | Pydantic/YAML schema、標準化 JSON、hash 與決策狀態 gate |
 | `preflight` | SERVER 路徑、月份、metadata、shape、time、coverage、磁碟與資源 inventory |
-| `geometry` | CRS、flow/local domain、receptor、open-boundary 幾何與 crossing |
+| `geometry` | CRS、共用 flow outer domain、站點 local domain、receptor、open-boundary 幾何與 own/foreign crossing |
 | `mesh` | SCHISM face triangulation、spatial index、barycentric locator |
 | `forcing.ocm` | OCM month window、4D current/z/elev/diffusivity sampler |
 | `forcing.nww3` | NWW3 analysis-grid time/space sampler 與 QC |
@@ -131,7 +143,7 @@ OCM 與 NWW3 缺值政策分開：
 | `scenarios` | 五站點各自 material/receptor/arrival 的 10×20×50 完整矩陣、member 配置與 seed 派生 |
 | `engine` | 分片執行、checkpoint、restart、Numba production kernel |
 | `outputs` | trajectory/event column arrays、manifest、checksum、原子發布 |
-| `aggregation` | exit/pathway/residence/bottom-contact、KDE/HDR、bootstrap |
+| `aggregation` | exit/pathway/residence/bottom-contact、KDE/HDR、跨站 local-domain connectivity、bootstrap |
 | `visualization` | 學術地圖、比較圖、caption/provenance sidecar |
 
 ## 7. 設定與情境契約
@@ -161,6 +173,8 @@ OCM 與 NWW3 缺值政策分開：
 ### 7.4 Scenario 與 member
 
 基礎 `scenario_id = hash(study_site_id, material_id, receptor_id, arrival_time_id, design_version)`。五站點各自的三因子完整交叉必須恰好產生 10,000 個唯一 ID；A 區兩站聯集為 20,000，全案聯集恰有 50,000 個。no-Stokes、Kh/Kz、domain 等敏感度由 `experiment_case_id` 區分；它們不能暗中改變基礎情境的定義。
+
+貢寮與龜山島 scenario 共用相同 A 區 forcing adapter、time-window cache 與 outer-boundary geometry，但不得因此共用 receptor ID、local-boundary state 或統計分母。若軌跡穿越另一站 local domain，事件列保存 `related_study_site_id` 與 crossing direction；原始 `study_site_id`、`scenario_id`、seed 與 primary local-exit state 全程不變。這使實作可以重用昂貴的 OCM/NWW I/O，又不會把兩個條件式受體問題混成同一情境。
 
 每個基礎情境可有 `member_id = 0..M_s-1`，seed 由 master seed、`scenario_id`、`experiment_case_id` 與 `member_id` 派生。`M_s` 是同一固定參數組合下的獨立隨機實現數，不是第四個計畫書因子：
 
@@ -206,6 +220,8 @@ $LBT_OUTPUT_ROOT/particles/<run_id>/
 │   ├── residence_time_s.npy
 │   ├── travel_time_summary.parquet
 │   ├── source_receptor_connectivity.parquet
+│   ├── cross_site_local_domain_connectivity.parquet
+│   ├── cross_site_pathway_hdr_overlap.parquet
 │   ├── bottom_contact_density.npy
 │   ├── run_outcome_summary.parquet
 │   ├── aggregate_grid.json
@@ -220,7 +236,8 @@ $LBT_OUTPUT_ROOT/particles/<run_id>/
 ### 8.1 必要事件欄位
 
 - `particle_id`, `scenario_id`, `member_id`, `study_site_id`, `analysis_region_id`, `receptor_id`。
-- `event_type`：local_domain_first_exit / flow_domain_open_exit / coast_contact / surface_contact / surface_regime_exit / bed_contact / deposited / data_gap / max_age / forcing_start / numerical_failure。
+- `event_type`：local_domain_first_exit / other_site_local_domain_enter / other_site_local_domain_exit / flow_domain_open_exit / coast_contact / surface_contact / surface_regime_exit / bed_contact / deposited / data_gap / max_age / forcing_start / numerical_failure。
+- `related_study_site_id`：只供 foreign-local crossing 使用；不得覆寫原始 `study_site_id`，主要事件則為 null。
 - event 前後的 `time_utc_ns`, `x_m`, `y_m`, `z_m` 與內插 crossing 座標。
 - `boundary_segment_id`, `boundary_s_m`（適用時）。
 - `source_face_id`, `triangle_id`, `forcing_month_id` 與 QC flags。

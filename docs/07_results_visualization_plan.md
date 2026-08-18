@@ -45,8 +45,9 @@
 
 ### F01 研究範圍、forcing 與受體設計圖
 
-- A-D 四個 forcing domains 與貢寮、龜山島、新竹、後灣、連江五個獨立站點；每站 20／全案 100 個 receptors、受體深度／HAB、開放邊界段、海岸與水深均須呈現。
+- A-D 四個 forcing domains 與貢寮、龜山島、新竹、後灣、連江五個獨立站點；每站 20／全案 100 個 receptors、受體深度／HAB、開放邊界段、海岸與水深均須呈現。A 區 panel 必須明示貢寮與龜山島共用 forcing 與 outer boundary，但保留各自的 `study_site_id`、local domain 與受體集合。
 - 貢寮／龜山島 panel 疊加 12.5 km receptor core、25 km baseline local domain 及 20/35 km sensitivity outlines；兩個 local domains 的重疊區照實繪出，不以裁切或透明度處理暗示互斥。
+- 現行 `northeast_taiwan_common_cache_v3` 以虛線及 `PILOT_ONLY` 標示；正式南向擴充 A 區以另一線型呈現，並在圖說列出兩者的 domain ID、bbox、OCM/NWW 共同有效遮罩與龜山島 25/35 km local domain 至 outer boundary 的最小公尺距離。
 - inset 顯示台灣周邊相對位置；局部圖以各 domain 的 metric CRS 呈現。
 - 圖例與表格確認五站點各有 20 個受體；A 區合計 40 個，但貢寮與龜山島各自的分母、ID 與圖層保持獨立。
 - companion panel 顯示 2024-2025 forcing 可用率與缺口，不將資料缺口區畫成低來源區。
@@ -62,15 +63,16 @@
 
 五個研究站點各選少量預先登錄的代表案例；貢寮與龜山島不得只以 A 區 pooled path 取代。每個案例至少使用兩個同步 panel：
 
-1. plan-view 地圖：軌跡按 backward age 著色，受體以星號、first exit／停止點以不同符號表示；背景含水深與主要流向。
+1. plan-view 地圖：軌跡按 backward age 著色，受體以星號、自站 local first exit、他站 local-domain enter/exit 與 A 區 outer exit 以不同符號表示；他站穿越只作水動力連通診斷，不使用終止符號。背景含水深與主要流向。
 2. depth–time 或沿軌跡距離–深度剖面：顯示海面、海床、粒子 `z`、浮沉類別、first bed contact 與有效水深。
 
 可附 3D 透視圖作補充，但不能作唯一三維成果，因透視遮蔽與視角會妨礙定量比較。全體軌跡只畫經固定 seed 或分位數規則抽出的代表 subset，圖說標示抽樣規則與 `n/N`。
 
 ### F04 關注海域入口與外層來源足跡
 
-- 第一組主圖疊加 local-domain raw first-exit points、2D KDE／訪格比例與 50%、75%、90% HDR contours，直接呈現正向時間移入關注海域的主要入口方向。
+- 第一組主圖只以該 `study_site_id` 自身 local-domain raw first-exit points、2D KDE／訪格比例與 50%、75%、90% HDR contours，直接呈現正向時間移入該關注海域的主要入口方向。
 - 第二組或 inset 顯示 flow-domain raw first exits 與外層條件式潛在來源；不得把 local entry 與 outer exit 混成同一分母。
+- 進入或離開另一站 local domain 的事件另以 cross-site diagnostic overlay／inset 呈現，不併入自站 local first-exit KDE、成功率或主要來源排名；圖說須明示此事件不終止軌跡。
 - companion panel 分別沿 local／flow open-boundary arc length 顯示 1D density／比例，標註 boundary segment 與 bootstrap CI。
 - 至少比較三種 bandwidth；正文使用預先核定者，補充資料呈現敏感度。
 - 圖說列出分母（所有有效 members 或成功 exits）、raw `n`、成功率、bandwidth、格網解析度、experiment case 與回溯上限。
@@ -88,6 +90,8 @@
 - baseline 使用 receptor-row normalization，使每列分母清楚；另表保存 raw count 與有效 member 數。
 - 若比較 10 種物性、季節或潮況，使用 small multiples 或差異矩陣，不將所有維度塞入單張 unreadable heatmap。
 - 可依地理弧長排序 source segments，避免聚類排序破壞空間連續性；若採 clustering，須另保留地理順序版本。
+- A 區另製方向性 2×2 cross-site local-domain connectivity matrix，分開呈現「貢寮釋放條件軌跡穿越龜山島 local domain」與反方向事件；分母固定為原始站點該分層的有效 members，不得以穿越成功者或 A 區 pooled members 重新正規化。
+- 同一 UTC 到達時間、物性與 experiment case 的貢寮／龜山島結果，可加 pathway visit fraction／HDR overlap 作共享水動力背景下的路徑相似度；此為條件式連通診斷，不得宣稱兩站間的絕對交換機率或實際通量。
 
 ### F07 旅行時間分布
 
@@ -117,7 +121,7 @@
 
 ### F11 物理敏感度與不確定性
 
-- no-Stokes、deep-water、finite-depth、Kh/Kz、dt、20/25/35 km local domain、flow-domain expansion 與 boundary policy 以 baseline map、difference map 及來源排名變化並列。
+- no-Stokes、deep-water、finite-depth、Kh/Kz、dt、20/25/35 km local domain、現行 A 區 `PILOT_ONLY` 與正式南向擴充 outer domain、boundary policy 以 baseline map、difference map 及來源排名變化並列；A 區比較只使用 OCM 與 NWW 共同有效 forcing mask。
 - difference map 使用以 0 為中心的 diverging palette；每個 panel 使用相同上／下限。
 - 來源段權重以 point-range／forest plot 顯示 bootstrap interval；另報 top-k rank stability 或 HDR overlap。
 - 若使用 forcing ensemble，加入 rank histogram 與 spread–error；隨機 member spread 不能被誤稱為所有模式誤差。
@@ -165,6 +169,7 @@ figures/
 │   ├── F04_conditional_source_footprint.*
 │   ├── F05_pathway_and_first_passage_time.*
 │   ├── F06_source_receptor_connectivity.*
+│   ├── F06b_cross_site_local_connectivity.*
 │   ├── F07_travel_time_distribution.*
 │   ├── F08_season_tide_small_multiples.*
 │   ├── F09_vertical_and_bed_contact.*
@@ -185,6 +190,9 @@ figures/
 
 - [ ] 每站 10,000、A 區 20,000、全案 50,000 是基礎情境數；`M`、experiment case、每站、region 與全案總軌跡數分欄呈現。
 - [ ] 貢寮／龜山島 12.5 km receptor core、25 km local domain、20/35 km sensitivity 與重疊區均正確標示，且 local entry 與 flow-domain exit 分母分開。
+- [ ] A 區圖面明確區分現行 `PILOT_ONLY` 與正式南向擴充 domain，並揭露 OCM/NWW 共同有效遮罩及 local-to-outer 最小距離。
+- [ ] 自站 local first exit 與他站 local-domain enter/exit 使用不同事件與圖層；他站穿越不終止軌跡，也不混入自站主要來源分母。
+- [ ] 貢寮→龜山島與龜山島→貢寮的方向性連通分開呈現，分母是原始站點有效 members，且未被解讀為絕對交換機率。
 - [ ] 沒有以全軌跡疊圖取代密度、連通、時間與不確定性分析。
 - [ ] pathway visit fraction、residence time 與 first-passage time 的定義和單位分開。
 - [ ] 所有比例／KDE/HDR 標明 raw `n`、有效分母、成功率與 bandwidth。

@@ -27,7 +27,8 @@
 | D011 | derived_pending | Pilot/G4 | 正式 output root、local scratch、NFS publish、備份與配額由容量／檔案系統 preflight 決定 | 未通過不得啟動大批次或把半成品寫入正式路徑 | 系統 preflight／管理者 |
 | D012 | provisional | G5 | 結果措辭限定 conditional footprint／relative source weight；absolute probability 需 prior/likelihood/observations | 未補證據不得升級措辭 | 研究團隊 |
 | D013 | decided | G5 | 成果採文獻支持的代表軌跡、條件式密度／HDR、來源—受體矩陣、旅行時間分布、季節／潮況小多圖與不確定性／敏感度圖組；規格見文件 07 | 核心圖與統計表不得以單一動畫或全軌跡疊圖取代 | 研究團隊／開發 |
-| D014 | decided | G0/G5 | 貢寮／龜山島舊候選 bbox 過小，不作 local domain；兩站各以 anchor 半徑 12.5 km receptor core、25 km local domain，並比較 20/35 km。local domains 允許重疊且不作 Voronoi 切割；35 km 需 expanded forcing domain | 重疊不合併 scenario 或 denominator；25 km 需保留至少兩格 outer margin，尺度敏感時報告範圍 | 使用者／研究方法基線 |
+| D014 | decided | G0/G5 | 貢寮／龜山島舊候選 bbox 過小，不作 local domain；兩站各以 anchor 半徑 12.5 km receptor core、25 km local domain，並比較 20/35 km。local domains 允許重疊且不作 Voronoi 切割；兩站共用同一 A 區 forcing 與 outer boundary。軌跡只以 own local domain 定義主要入口，foreign-local crossing 非終止且只作連通診斷 | 重疊不合併 scenario 或 denominator；不得因穿越另一站 local domain 而轉移 site、停止或重設 seed | 使用者／研究方法基線 |
+| D015 | derived_pending | G0/G1/G4 | SERVER preflight 顯示龜山島 25 km local boundary 到現行 A 區南界僅餘約 1.64 km，未達兩個約 1 km OCM surface/NWW 共同格點。現行 v3 固定為 pilot；正式 A 區建立新 domain version，目標南界不北於約 `24.50°N`，同時支援 25 km baseline 與 35 km sensitivity | expanded OCM native/surface/NWW 與共同 mask/margin 未通過前，不得把現行 v3 用於龜山島 25 km 正式 baseline，亦不得只引用 native source margin | geometry／forcing preflight |
 
 ## 3. 決策紀錄模板
 
@@ -63,7 +64,7 @@ Supersedes:
 | R008 | 空變 K 缺 gradient drift，造成人工聚集或穿障壁 | H/H | 常數 K reference、PDE/well-mixed/障壁測試、Milstein sensitivity | 測試失敗：Smagorinsky 不進 baseline，只保留工程診斷 |
 | R009 | bulk Stokes 在近岸、淺水或混合風浪下偏差大 | H/H | finite/deep/no-Stokes、kh/steepness QC、方向與 mean wavelength 對照 | ranking 對 formulation 高敏感：列主要不確定性，不給單一結論 |
 | R010 | OCM 已含波流耦合效應，額外 Stokes 可能重複 | M/H | 查 OCM 產品說明與模式設定；將 no-Stokes 設為核心對照 | 無法確認：報告明載可能 double counting，不作精確量值歸因 |
-| R011 | local/flow domain 太小，人工邊界主導 entry/exit KDE | M/H | 舊候選 bbox 已撤銷；貢寮／龜山島比較 20/25/35 km，另作 flow-domain expansion、早期 exit、HDR/ranking 比較 | 主要指標變化 >10% 或大量短時同邊退出：報告尺度依賴性並建立新版 domain |
+| R011 | local/flow domain 太小，人工邊界主導 entry/exit KDE | M/H | 舊候選 bbox 已撤銷；現行 A v3 只作 pilot，正式新版本南界目標不北於約 `24.50°N`；比較 20/25/35 km、早期 exit、HDR/ranking 與共同 forcing margin | 共同 margin 少於兩格、主要指標變化 >10% 或大量短時同邊退出：阻擋該版本並繼續擴域，不縮回舊框 |
 | R012 | domain 擴大或 `50,000×M×experiment cases` 導致計算／儲存爆量 | H/H | particle-step benchmark、最小收斂 M、向量化/Numba、shard/checkpoint、流式聚合與容量緩衝 | 超出資源時先增加合理並行、降低已驗證的儲存頻率並延後非核心案例；不得把任一站 baseline 靜默縮為 1,000 |
 | R013 | 每站 20／全案 100 receptors 或每站 50 times 的衍生 manifest 尚未產出，trial 資料被誤當正式成果 | H/H | schema 與 synthetic test 可先行；正式 config 驗證 derived gate 與 `status=approved` | 未通過不得啟動 G4，輸出必須標 TRIAL |
 | R014 | 粒子停留不出界，模擬無限延長 | M/H | forcing start、max age、step limit、data gap 停止；各原因分開統計 | max-age 比例過高：調整研究問題/domain/horizon，不把它當 exit |
@@ -73,6 +74,8 @@ Supersedes:
 | R018 | 失敗／缺值區被誤讀為低來源或低路徑密度 | M/H | failure density、有效分母、forcing coverage 與成功率地圖 | 空間失敗集中時先修資料／sampler；不發布未校正密度 |
 | R019 | 大型資料或私密 SERVER path 誤提交 Git | L/H | `.gitignore`、root token、secret/path scan、只提交 schema 與小 fixture | 發現即停止發布，移除敏感歷史並重建乾淨 release |
 | R020 | 中文註解、README、schema 與程式行為不同步 | M/M | PR checklist、docstring/README/tests 同任務更新、每週文件檢查 | 行為已變但文件未更新：不得合併或通過 gate |
+| R021 | local domains 重疊造成 site 歸屬、事件或分母混用 | M/H | own-local first-exit 與 foreign-local diagnostic 使用不同 event types；`study_site_id` immutable；跨站比例按原站有效 members 正規化 | foreign crossing 改變 scenario/site/seed/停止狀態或進入主要入口分母時，視為 G2/G5 blocker |
+| R022 | 只利用 OCM native source margin 擴域，含 Stokes 軌跡卻超出 NWW analysis 支撐 | M/H | expanded domain 同時驗證 OCM native、OCM surface、NWW analysis 與逐時 mask；含 Stokes baseline 取三者交集 | 任一必要 forcing 在 local/outer margin 無效即阻擋 expanded version，不以 current-only 結果冒充 baseline |
 
 ## 5. 資源不足時的裁決順序
 

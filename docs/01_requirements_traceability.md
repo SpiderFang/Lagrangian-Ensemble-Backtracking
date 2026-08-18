@@ -31,7 +31,7 @@
 | REQ-003 | 每一海域設定 20 個到達地點，可在任意懸浮深度 | 五個獨立站點各 20 個、全案 100 個 receptors；每站採 5 個 metric maximin 水平位置 × 4 個有效垂向層位，並綁定 `study_site_id` | receptor manifest、五站點幾何圖、每站 20／全案 100 個 ID coverage 表 |
 | REQ-004 | 每一海域 50 個到達時間，涵蓋四季與大／小潮 | 五站點各有 50 個條件；固定採 48 個年份×季節×大／小潮×潮內相位，加 2 個局地高波／強流事件。確切 UTC 由資料決定 | 每站 50 時次 coverage matrix、forcing availability 與可重現選取紀錄 |
 | REQ-005 | 每一海域敘述寫高達 1000 組，但矩陣明列 10×20×50 | 依使用者裁決，每站點採完整交叉 10,000 個基礎情境；五站點合計 50,000，1,000 視為計畫書誤植。每情境 stochastic members `M` 另由收斂測試決定 | 決策 D004、每站 10,000／全案 50,000 列的 coverage 表、member-convergence 曲線與 seed 表 |
-| REQ-006 | 離開關注區域即停止 | 貢寮／龜山島離開 25 km local domain 時先記錄入口 crossing 並繼續，離開 A 區 flow domain 才停止；另設海岸、海床、海面 regime、資料起點、最大回溯期、缺口及數值失敗事件 | local/outer event table、步內 crossing 測試、停止原因覆蓋 |
+| REQ-006 | 離開關注區域即停止 | 各站離開自身 local domain 時記錄 primary first-exit；貢寮／龜山島的 baseline local radius 為 25 km，事件後繼續至共用 A 區 outer boundary，B-D 因 local 與 flow domain 重合而於同一 crossing 停止。貢寮／龜山島穿越對方 local domain 僅記錄非終止的 cross-site diagnostic event。另設海岸、海床、海面 regime、資料起點、最大回溯期、缺口及數值失敗事件 | own-local／foreign-local／outer event table、重合邊界去重與步內 crossing 測試、跨站事件不改變粒子狀態測試、停止原因覆蓋 |
 | REQ-007 | `v_total = v_current + v_stokes + v_falling` | OCM 三維速度、有限水深 bulk Stokes 水平速度與浮沉垂向速度使用一致 SI 單位及正向 | 分項速度輸出、關閉單項敏感度、單位 gate |
 | REQ-008 | 由 `Hs/Tp/θ/L` 計算 Stokes drift | `Tp=1/fp`，解有限水深 dispersion 得 k/L；波向由 wave-from 轉 propagation-to；深水極限回復附檔式 (7) | 深水／淺水極限、cardinal direction、no-Stokes 對照 |
 | REQ-009 | 四階 Runge-Kutta 進行軌跡積分 | RK4 只積分確定性 drift；signed time step 處理 backward，不在 caller 與 velocity 內重複取負號 | 常流、旋轉、剪切、正反向 closure 與四階收斂 |
@@ -85,12 +85,14 @@
 
 | region | 經度範圍（°E） | 緯度範圍（°N） | 獨立站點 | forcing domain |
 |---|---:|---:|---|---|
-| A 東北角海域 | 121.30-122.79 | 24.60-25.49 | 貢寮、龜山島 | `northeast_taiwan_common_cache_v3` |
+| A 東北角海域 | 現行 121.30-122.79；正式版由共同有效格推導 | 現行 24.60-25.49；正式南界目標不北於約 24.50 | 貢寮、龜山島 | 現行 `northeast_taiwan_common_cache_v3` 僅供開發／pilot；正式 run 使用新版本 ID |
 | B 新竹外海 | 119.70-121.19 | 24.30-25.19 | 新竹 | `hsinchu_cache_v3` |
 | C 後灣海域 | 120.16-121.62 | 21.55-22.44 | 後灣海生館周邊 | `houwan_nmmba_cache_v3` |
 | D 連江海域 | 119.19-120.70 | 25.75-26.64 | 分析範圍整合南竿、北竿 | `lienchiang_common_cache_v3` |
 
-四個 forcing domains 供五站點使用：A 區包含貢寮與龜山島兩套各 20 個 receptors，其餘 B-D 各一套 20 個，全案共 100 個。貢寮／龜山島舊 SVD 候選框因尺度過小，只保留 anchor provenance；正式 local domain 為 anchor-centered 25 km metric buffer 與有效海域的交集，兩者允許重疊。詳細規則見文件 08。
+四個 forcing domains 供五站點使用：A 區包含貢寮與龜山島兩套各 20 個 receptors，其餘 B-D 各一套 20 個，全案共 100 個。貢寮／龜山島舊 SVD 候選框因尺度過小，只保留 anchor provenance；正式 local domain 為 anchor-centered 25 km metric buffer 與有效海域的交集，兩者允許重疊。兩站共用同一 A 區 forcing cache 與 outer boundary，以保留相近海域的共同水動力影響；自身 local crossing 是主要入口事件，穿越另一站 local domain 則為不終止的方向性連通診斷，所有 ID、狀態與分母仍按原始站點分開。
+
+SERVER preflight 顯示龜山島 anchor 至現行 A 區南界約 26.64 km，扣除 25 km baseline local radius 後僅餘約 1.64 km，低於約兩個常用 1 km OCM surface/NWW 共同格。故 `northeast_taiwan_common_cache_v3` 不得直接用於正式 25/35 km A 區實驗；正式 run 前須由 OCM native、OCM surface 與 NWW3 的共同有效格建立新的南向擴充 domain，南界目標不北於約 24.50°N，並驗證整個時段的共同 margin、海陸遮罩與缺值覆蓋。若任一 forcing 產品無法支援相同空間範圍，應縮回共同有效 bbox 或阻擋正式發布，不得只擴 OCM 後外插波浪。詳細規則見文件 08。
 
 ## 4. 可交付成果
 

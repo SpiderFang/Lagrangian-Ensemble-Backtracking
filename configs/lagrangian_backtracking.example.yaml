@@ -2,7 +2,7 @@
 # local-domain polygon、受體座標、50 個 UTC、M、擴散係數與 SERVER 路徑必須依已決定的
 # 演算法由實際網格、forcing 與先導試驗衍生；null 表示「尚未產出衍生 manifest」，不是
 # 等待研究人員任意選值。正式批次只接受所有 derived gate 均通過的 approved release config。
-schema_version: "0.2.0"
+schema_version: "0.3.0"
 config_status: design_baseline_example
 design_version: design_baseline_v1
 project_id: lagrangian_ensemble_backtracking
@@ -63,6 +63,12 @@ study_area:
   # 兩個 anchor-centered local domains 可反映相連水動力環境而互相重疊；不得為了
   # 強迫互斥而以任意 Voronoi 或緯度線切割，亦不得在聚合時把重疊區自動扣除。
   allow_overlapping_local_domains: true
+  # 貢寮與龜山島的水動力互通由同一 A 區 forcing 表達。每條軌跡仍只以自己的
+  # local domain 定義主要入口；穿越另一站 local domain 只寫非終止診斷事件，
+  # 不改變 study_site_id、scenario 歸屬、停止條件或主要統計分母。
+  shared_forcing_domain_preserves_hydrodynamic_connectivity: true
+  primary_local_boundary_scope: own_study_site_only
+  other_site_local_domain_crossing_policy: record_nonterminating_diagnostic_only
 
 domains:
   # 四列只定義 forcing 支撐、metric CRS 與外層停止邊界；情境數由下方五個
@@ -73,6 +79,17 @@ domains:
     center_lonlat: [122.05, 25.05]
     bbox_lon_lat: [121.306315, 122.793685, 24.600844, 25.499156]
     metric_crs_policy: local_azimuthal_equidistant
+    # SERVER preflight 顯示龜山島 25 km local boundary 至本 bbox 南界只餘約 1.64 km，
+    # 小於兩個約 1 km OCM surface/NWW 共同格點。現行 v3 可作開發與 pilot，正式
+    # release 必須使用不覆寫 v3 的 expanded domain；新識別碼由產物生成後填入。
+    current_domain_role: development_and_pilot
+    formal_release_flow_domain_id: null
+    formal_release_domain_status: expanded_domain_generation_required
+    expanded_south_boundary_at_or_south_of_deg: 24.50
+    minimum_common_forcing_margin_grid_cells: 2
+    margin_required_for_forcings: [ocm_native, ocm_surface, nww3_analysis]
+    radius_25000_formal_requires_expanded_domain: true
+    radius_35000_formal_requires_expanded_domain: true
   - analysis_region_id: B
     analysis_region_name_zh: 新竹外海
     flow_domain_id: hsinchu_cache_v3
@@ -253,6 +270,11 @@ boundaries:
   # 巢狀 local boundary 用於回答「如何移入關注海域」；東北角兩站離開 local domain
   # 只記錄事件並繼續回溯，直到外層 flow domain。B/C/D 兩層重合時只寫一個 crossing。
   local_domain_first_exit: record_first_crossing_and_continue
+  # `local_domain_first_exit` 只屬於 scenario 自己的站點。foreign-local crossing 用來
+  # 描述共享傳輸走廊，不得觸發停止、改變 scenario 所屬或混入主要入口 KDE 分母。
+  other_site_local_domain_enter: record_diagnostic_and_continue
+  other_site_local_domain_exit: record_diagnostic_and_continue
+  other_site_local_domain_changes_study_site: false
   local_open_boundary_segment_policy: metric_circle_arcs_connected_to_valid_ocean_exclude_coastline
   flow_domain_open_boundary: stop_at_first_crossing
   coast_baseline: stop_and_record_contact
@@ -360,6 +382,8 @@ outputs:
     - residence_time_seconds
     - first_passage_time
     - source_receptor_connectivity
+    - cross_site_local_domain_connectivity
+    - cross_site_pathway_hdr_overlap
     - bottom_first_contact_density
     - bottom_repeated_contact_density
     - run_outcome_summary

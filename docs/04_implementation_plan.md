@@ -36,6 +36,7 @@ A、B、C、D 四條工程工作流立即同時啟動。真正不可跳過的關
 | LBT-002 | P0 | forcing 語意核對 | OCM `hvel/w/zcor/elev/wetdry/diffusivity` 與 NWW3 `Hs/fp/DP` 的單位、方向、mask、gap 與時間對位有證據 | LBT-001，可先讀相鄰專案契約 |
 | LBT-003 | P0 | 科學 manifests | 依文件 08 生成恰好 10 個 behavior classes、每站 20／全案 100 個 receptors、每站 50 個 arrival-time 條件；每列含 site、region、版本、UTC、深度基準與衍生證據 | SERVER 資料與既定演算法；schema 可先行 |
 | LBT-004 | P0 | 運算與儲存 preflight | 核定 output/scratch、檔案系統、可用 CPU/RAM、配額與原子發布方法 | LBT-001；不阻塞合成開發 |
+| LBT-005 | P0 | A 區 expanded forcing 規格與產物 | 現行 v3 固定為 pilot；建立新 domain version，目標南界不北於約 `24.50°N`，並證明 OCM native／surface 與 NWW analysis 對龜山島 25/35 km 邊界至少保留兩個共同有效格點 | LBT-001/002；可先定 schema，正式產物屬 G1 gate |
 
 **G0 完成條件：** 正式根路徑與輸入契約可稽核；未通過文件 08 衍生閘門的欄位會被 config validator 拒絕。G0 未完成仍可實作與測試，但不得啟動正式科學批次；這些 gate 由資料與測試產出，不需再向使用者徵詢方案。
 
@@ -44,7 +45,7 @@ A、B、C、D 四條工程工作流立即同時啟動。真正不可跳過的關
 | ID | 優先序 | 工作 | 完成條件 | 依賴 |
 |---|---:|---|---|---|
 | LBT-101 | P0 | config/preflight CLI | normalized config hash、input inventory、decision-status 檢查與小記憶體讀取 | LBT-001/002；可先用 fixture |
-| LBT-102 | P0 | CRS 與 geometry | 公尺制投影 round-trip、四個 flow domains、貢寮／龜山島 12.5/25 km wet-ocean polygons、重疊保留、boundary segment/arclength 與 receptor 深度 schema 測試 | LBT-003 schema |
+| LBT-102 | P0 | CRS 與 geometry | 公尺制投影 round-trip、四個 flow domains、貢寮／龜山島 12.5/25 km wet-ocean polygons、重疊保留、共用 A outer boundary、own/foreign local crossing、boundary segment/arclength 與 receptor 深度 schema 測試 | LBT-003/005 schema |
 | LBT-103 | P0 | SCHISM mesh locator | tri/quad 拆分、orientation、spatial index、barycentric 權重、coast/wetdry 支撐與 face provenance | OCM grid fixture |
 | LBT-104 | P0 | OCM 4D sampler | x/y/z/t 線性場精確；surface/bed、layer bottom index、month window、gap 與無外插測試通過 | LBT-103、LBT-002 |
 | LBT-105 | P0 | NWW3 sampler | mask-aware x/y/t 取樣、DP wave-from→propagation-to、Hs/fp QC 與 gap policy 通過 | LBT-002、LBT-102 |
@@ -60,7 +61,7 @@ A、B、C、D 四條工程工作流立即同時啟動。真正不可跳過的關
 | LBT-202 | P0 | signed-time RK4 | constant/rotation/shear、沉降／上浮、forward-backward closure 與預期階數通過 | 合成 velocity API |
 | LBT-203 | P0 | stochastic split | constant Kh/Kz Brownian mean/variance、seed reproducibility、障壁處理通過 | LBT-202 |
 | LBT-204 | P1 | 空變 diffusivity | Smagorinsky、K gradient drift、well-mixed/PDE 對照通過後才可升為 baseline | LBT-104、LBT-203 |
-| LBT-205 | P0 | 邊界與粒子狀態 | local-entry/flow-exit/surface-regime/bed/coast/data-gap/max-age/numerical events 與步內 first crossing 通過 | LBT-102/103、LBT-202/203 |
+| LBT-205 | P0 | 邊界與粒子狀態 | own-local entry、foreign-local 非終止 crossing、共用 A flow-exit、surface-regime/bed/coast/data-gap/max-age/numerical events 與步內 first crossing 通過；foreign crossing 不改變 site/scenario/seed/停止狀態 | LBT-102/103、LBT-202/203 |
 | LBT-206 | P0 | dt controller | advective、vertical-layer、diffusive限制及 forcing-boundary substep；dt 減半指標收斂 | LBT-201..205 |
 
 **G2 完成條件：** NumPy reference kernel 的解析、統計與邊界測試通過。空變 K 若尚未通過，只保留為敏感度，不阻塞已驗證的常數 K 基線。
@@ -85,7 +86,7 @@ A、B、C、D 四條工程工作流立即同時啟動。真正不可跳過的關
 |---|---:|---|---|---|
 | LBT-401 | P0 | 代表性 pilot | 涵蓋 domain、季節／潮況、material、短／長 travel time；記錄 particle-step/s、CPU、RAM、read/write bytes 與失敗率 | G2；可先於完整 G3 執行 |
 | LBT-402 | P0 | member convergence | 隨 `M` 增加，exit ranking、HDR、median travel time、path density 與 CI 在預先登錄門檻內穩定 | LBT-401 |
-| LBT-403 | P0 | shard/checkpoint sizing | 以全案 50,000×M 外推 wall time、scratch、正式輸出、checkpoint 與 publish 成本；同時分列每站 10,000×M 與 A 區 20,000×M，保留容量安全緩衝 | LBT-401/402、LBT-004 |
+| LBT-403 | P0 | shard/checkpoint sizing | 以全案 50,000×M 外推 wall time、scratch、正式輸出、checkpoint 與 publish 成本；同時分列每站 10,000×M 與 A 區 20,000×M，並驗證 A 區 paired-UTC shards 共用 forcing window cache 而不重複跨 NFS 讀取 | LBT-401/402、LBT-004 |
 | LBT-404 | P1 | 圖表垂直切片 | 代表 pilot 可生成 figure registry、核心圖、表與 sidecar，確認全期不需重讀不必要的原始軌跡 | LBT-401、視覺化規格 |
 
 Pilot 決定 `M`、7/14/30/60 日最小穩定 horizon、Kh/Kz 與工程配置，不能把任一站點 10,000 個基礎情境降為 1,000，也不能把五站合併成一套 10,000。正式 baseline 原則上使用一致且已收斂的 `M`；若不同情境使用不同 `M_s`，必須預先登錄停止規則與統計權重，且證明不會扭曲跨情境比較。
@@ -94,7 +95,7 @@ Pilot 決定 `M`、7/14/30/60 日最小穩定 horizon、Kh/Kz 與工程配置，
 
 | ID | 優先序 | 工作 | 完成條件 | 依賴 |
 |---|---:|---|---|---|
-| LBT-501 | P0 | release config freeze | 五站各 10×20×50 覆蓋、`M`、forcing、物理、巢狀邊界、seed、shard、容量與輸出版本全數 approved | G0、G3、Pilot |
+| LBT-501 | P0 | release config freeze | 五站各 10×20×50 覆蓋、`M`、forcing、物理、巢狀邊界、seed、shard、容量與輸出版本全數 approved；A 區正式 config 不得引用只供 pilot 的現行 v3，且兩站須引用同一 expanded flow-domain ID／outer boundary | G0、G3、Pilot |
 | LBT-502 | P0 | baseline 50,000 情境 | 每站 10,000、A 區 20,000，且每個 scenario/member 均 completed 或有核准排除理由；checkpoint、資源與 failure manifest 完整 | LBT-501 |
 | LBT-503 | P1 | 核心敏感度 | no/deep/finite Stokes、Kh/Kz、dt、domain、coast/bed policy 依預先登錄矩陣完成 | LBT-502 可按已完成 shard 交錯執行 |
 | LBT-504 | P0 | run validation | schema、coverage、row/event count、checksum、seed、NaN/QC、停止原因與 denominator 全數驗收 | LBT-502/503 |
@@ -107,7 +108,7 @@ Pilot 決定 `M`、7/14/30/60 日最小穩定 horizon、Kh/Kz 與工程配置，
 |---|---:|---|---|---|
 | LBT-601 | P0 | raw aggregate | pathway unique-particle count、residence time、travel time、first/repeated bed contact、exit 與 failure density | 已完成且驗收的 shards 即可流式開始 |
 | LBT-602 | P0 | conditional footprint | boundary segment/arclength、raw exit points、2D KDE、50/75/90% HDR、三 bandwidth 與質量 QC | LBT-601 |
-| LBT-603 | P0 | connectivity 與不確定性 | source—receptor matrix、bootstrap CI、ranking stability、physics difference 與 convergence 結果 | LBT-601/602、LBT-503 |
+| LBT-603 | P0 | connectivity 與不確定性 | source—receptor matrix、foreign-local crossing、貢寮—龜山島 paired-UTC pathway/HDR overlap、共享走廊、bootstrap CI、ranking stability、physics difference 與 convergence 結果；所有跨站比例保留原站有效 member 分母 | LBT-601/602、LBT-503 |
 | LBT-604 | P0 | 學術圖表與統計表 | 完成視覺化規格的核心圖表；固定尺度、分母、`n`、期間、單位、限制與 sidecar | LBT-601..603 |
 | LBT-605 | P0 | immutable handoff | release manifest、schema、範例 reader、checksums、圖表 registry 與後續熱區工項輸入說明 | LBT-604 |
 

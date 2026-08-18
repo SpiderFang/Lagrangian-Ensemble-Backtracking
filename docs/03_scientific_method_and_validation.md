@@ -145,8 +145,9 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 
 | 邊界／狀態 | 基線 | 必要敏感度或備註 |
 |---|---|---|
-| 貢寮／龜山島 local boundary | anchor 半徑 25 km 圓周中連接有效外海的 arc first crossing，記錄 segment、弧長與 backward age 後繼續；岸線不計入 | 20/35 km 半徑敏感度；兩站 local domains 可重疊但事件分站保存 |
-| flow-domain open boundary | 計算線段 first crossing，記錄 segment 與弧長後停止 | 擴域前後比較 exit time、HDR 與 ranking |
+| 貢寮／龜山島 own local boundary | anchor 半徑 25 km 圓周中連接有效外海的 arc first crossing，記錄 segment、弧長與 backward age 後繼續；岸線不計入 | 20/35 km 半徑敏感度；兩站 local domains 可重疊但主要事件與分母依 `study_site_id` 保存 |
+| 另一站 local boundary | 穿越時寫 `other_site_local_domain_enter/exit` 後繼續；不得停止、改變 scenario 所屬或取代 own first-exit | 跨站穿越率、配對 UTC pathway/HDR overlap 與共享傳輸走廊診斷 |
+| A 區共用 flow-domain open boundary | 貢寮與龜山島使用同一 outer boundary；計算線段 first crossing，記錄 segment 與弧長後停止 | 擴域前後比較 exit time、HDR 與 ranking；避免用任意站界切斷水動力連通 |
 | 海岸／陸地 | 不允許跨越；記錄 coast contact 並停止 | reflect 作敏感度，不混入基準 |
 | 海面 | neutral／sinking 類擴散越界時反射；rising 類到達海面以 `surface_regime_exit` 停止 | 完全沉沒 baseline 不加 windage，故不得在海面繼續當表面漂流 |
 | 海床 | 記錄 first contact；suspended 反射，sinking／near-bed 首次接觸即 deposit 並停止 | 無再懸浮參數時不宣稱完整底床交換 |
@@ -244,7 +245,8 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | checkpoint/restart | 同 config/seed 分片中斷續跑後 row count、ID、event 與 checksum 等價 |
 | dt convergence | dt 減半後 exit ranking、90% HDR、median travel time 與 path density 變化低於預先登錄值 |
 | ensemble convergence | 隨 members 增加，主要統計與 bootstrap interval 穩定；由曲線決定正式 M |
-| domain adequacy | 貢寮／龜山島 20/25/35 km local boundary 與 flow-domain expansion 比較後，主要 entry/exit/path/HDR 指標變化預設低於 10%，否則報告尺度依賴性或調整 domain version |
+| domain adequacy | 現行 A v3 僅作 pilot；正式 A 區南界目標不北於約 `24.50°N`，且 OCM native、OCM surface、NWW analysis 對貢寮／龜山島 25/35 km local boundary 均保留至少兩個共同有效格點；擴域前後主要 entry/exit/path/HDR 指標變化預設低於 10%，否則報告尺度依賴性或調整 domain version |
+| cross-site semantics | 軌跡穿越 foreign local domain 前後位置、時間與方向可重現；`study_site_id`、scenario、seed、own-local first-exit 與 outer-stop state 不變；跨站比例以原站有效 members 為分母，不把兩站先合併 |
 | known-source synthetic | 正向已知來源到受體案例，其來源落入逆向 footprint 的核定 HDR，並量化 coverage |
 | forcing ablation | current-only、no-Stokes、deep/finite Stokes、Kh/Kz cases 可比較且命名不混淆 |
 

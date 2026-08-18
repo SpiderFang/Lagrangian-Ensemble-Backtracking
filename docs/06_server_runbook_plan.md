@@ -4,15 +4,15 @@
 
 本文件定義未來程式完成後的 SERVER 部署、preflight、pilot、正式 batch、checkpoint、QC 與發布程序。標示為「預定 CLI」的命令在目前 `planning` 狀態尚不可執行；正式實作時需同步更新 README 與此文件。
 
-本次規劃環境嘗試以唯讀 SSH 連線時，因沒有可用的 public key 或互動式密碼代理而未完成認證。應由使用者在既有已登入終端執行下列唯讀盤點；不得把密碼、private key 或 token 寫入 repository 或聊天紀錄。
+2026-08-17 已完成一次唯讀 SSH preflight，確認四個 domain、2024–2025 各 24 個月份、SERVER runtime、容量與 NFS I/O。後續 release 仍須以正式 CLI 重跑並保存 machine-readable evidence；不得把密碼、private key 或 token 寫入 repository、設定、命令紀錄或報告。
 
 ## 2. 預定路徑變數
 
 ```bash
 export LBT_PROJECT_ROOT=/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking
-export OCM_NATIVE_ROOT=/home/mustlab/data/OCM-Preprocessed-Data/preprocessed/ocm_native
-export OCM_SURFACE_ROOT=/home/mustlab/data/OCM-Preprocessed-Data/preprocessed/ocm_surface
-export NWW_ANALYSIS_ROOT=/home/mustlab/data/NWW-Preprocessed-Data/preprocessed/available_samples_v1/nww3_analysis
+export OCM_NATIVE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_native
+export OCM_SURFACE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_surface
+export NWW_ANALYSIS_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_analysis
 
 # 正式值需在容量與檔案系統檢查後核定；不可直接假設專案目錄有足夠空間。
 export LBT_OUTPUT_ROOT=/path/to/approved/lagrangian-results
@@ -50,6 +50,8 @@ find "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT" \
 
 - 設定恰有 A-D 四個 `analysis_region_id`／`flow_domain_id` 與五個唯一 `study_site_id`；貢寮、龜山島均對應 A 區，但情境與輸出不可合併。
 - 貢寮／龜山島以 anchor 產生 12.5 km receptor core、25 km local domain 及 20/35 km 敏感度 polygon，與固定 OCM ocean polygon 相交；兩個 local domains 重疊時須完整保留，不作 Voronoi 切割。圓周外海 arc 與岸線必須分段，只有前者可計入 local-entry KDE。
+- 貢寮／龜山島引用同一 A 區 forcing-domain ID 與 outer-boundary geometry；每條軌跡只以 own local domain 產生主要 first-exit。foreign-local crossing 必須是非終止診斷事件，不得改變 `study_site_id`、scenario、seed 或主要入口分母。
+- 現行 A v3 bbox 南界 `24.600844°N` 只允許 `development_and_pilot`。正式 config 必須引用新 expanded domain，目標南界不北於約 `24.50°N`，並對 OCM native、OCM surface、NWW analysis 逐一證明 25/35 km local boundary 至 outer boundary 至少兩個共同有效格點。
 - 嚴格遞增與唯一 UTC。
 - 實際 start/end、間距、缺口與跨月銜接。
 - array shape/dtype 與 metadata 相符。
@@ -94,7 +96,7 @@ uv run lbt-preflight \
   --output "$LBT_SCRATCH_ROOT/preflight/input_inventory.json"
 ```
 
-Preflight 必須唯讀，不建立 forcing 副本。輸出至少包含 path token、schema、月份、time gap、array bytes、coverage、unit/direction decision、CRS/mesh QC、預估 working set 與輸出空間。
+Preflight 必須唯讀，不建立 forcing 副本。輸出至少包含 path token、schema、月份、time gap、array bytes、coverage、unit/direction decision、CRS/mesh QC、domain role、own/foreign local-domain topology、各必要 forcing 的共同 margin、預估 working set 與輸出空間。若 A 區仍為現行 v3，輸出必須明示 `PILOT_ONLY`，config validator 不得只因 metadata `status=ready` 就允許正式龜山島 25 km baseline。
 
 ### 5.2 單日 smoke test
 
@@ -122,11 +124,11 @@ uv run lbt-validate-run "$LBT_SCRATCH_ROOT/pilots/<run_id>"
 uv run lbt-benchmark-report "$LBT_SCRATCH_ROOT/pilots/<run_id>"
 ```
 
-Pilot 報告需以五站點各固定 10,000、A 區 20,000、全案 50,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time；並比較 7/14/30/60 日 horizon 及貢寮／龜山島 20/25/35 km local boundary。benchmark 用於衍生最小收斂 `M`、horizon、shard、並行度與儲存策略，不得據此把任一站完整交叉改回 1,000 或把五站合併為 10,000。
+Pilot 報告需以五站點各固定 10,000、A 區 20,000、全案 50,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time；並比較 7/14/30/60 日 horizon 及貢寮／龜山島 20/25/35 km local boundary。A 區 paired-UTC shards 應共用同一 staged forcing time window，報告須證明沒有為兩站各自重複跨 NFS 載入同一 OCM/NWW 月窗。benchmark 用於衍生最小收斂 `M`、horizon、shard、並行度與儲存策略，不得據此把任一站完整交叉改回 1,000 或把五站合併為 10,000。
 
 ### 5.4 正式 batch
 
-正式 run 只能使用 `status=approved` 的 config、behavior、local-domain、每站 20／全案 100 receptor、每站 arrival-time、每站 10,000／全案 50,000 情境 coverage 與 member-convergence manifests：
+正式 run 只能使用 `status=approved` 的 config、behavior、local-domain、每站 20／全案 100 receptor、每站 arrival-time、每站 10,000／全案 50,000 情境 coverage 與 member-convergence manifests。A 區貢寮與龜山島必須引用同一個已通過共同 forcing margin 的 expanded flow-domain ID；現行 `northeast_taiwan_common_cache_v3` 不得出現在正式 release config：
 
 ```bash
 uv run lbt-run \
@@ -170,7 +172,7 @@ Checkpoint 至少綁定：
 每個 run 依序完成：
 
 1. `lbt-validate-run`：schema、ID、time、status、event、row count、checksum、NaN/QC、scenario coverage。
-2. `lbt-aggregate`：raw counts、有效分母、KDE/HDR、sensitivity，不修改 trajectory shards。
+2. `lbt-aggregate`：raw counts、有效分母、KDE/HDR、sensitivity、foreign-local crossing 與 paired-UTC cross-site overlap，不修改 trajectory shards；跨站比例按原站有效 members 正規化。
 3. `lbt-validate-aggregate`：質量、邊界弧長、raster sum、bandwidth、bootstrap、failure density。
 4. 第二次 publish dry-run，確認 source/destination 清單一致。
 5. 傳至 `.incoming/<run_id>`，在遠端重驗 manifest/checksum後原子發布。
