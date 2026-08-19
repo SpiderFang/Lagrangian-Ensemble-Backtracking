@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lagrangian-ensemble-backtracking"
+version = "0.1.0"
+description = "CWA OCM/NWW3 三維 Lagrangian 系集逆向溯源與條件式來源足跡"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numba>=0.61",
+    "numpy>=2.0",
+    "pyarrow>=18",
+    "pydantic>=2.10",
+    "pyproj>=3.7",
+    "PyYAML>=6.0.2",
+    "scipy>=1.15",
+    "shapely>=2.0",
+]
+
+[project.scripts]
+lbt = "lagrangian_backtracking.cli:main"
+lbt-config-check = "lagrangian_backtracking.cli:config_check_main"
+lbt-preflight = "lagrangian_backtracking.cli:preflight_main"
+lbt-synthetic-smoke = "lagrangian_backtracking.cli:synthetic_smoke_main"
+lbt-validate-shard = "lagrangian_backtracking.cli:validate_shard_main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.11",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lagrangian_backtracking"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.coverage.run]
+branch = true
+source = ["lagrangian_backtracking"]
+
+[tool.uv]
+package = true

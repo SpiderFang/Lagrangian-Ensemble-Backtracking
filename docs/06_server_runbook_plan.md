@@ -1,10 +1,18 @@
-# SERVER 執行手冊規劃
+# SERVER 執行手冊
 
 ## 1. 適用範圍
 
-本文件定義未來程式完成後的 SERVER 部署、preflight、pilot、正式 batch、checkpoint、QC 與發布程序。標示為「預定 CLI」的命令在目前 `planning` 狀態尚不可執行；正式實作時需同步更新 README 與此文件。
+本文件定義 SERVER 部署、preflight、pilot、正式 batch、checkpoint、QC 與發布程序。
+`config-check`、`preflight`、`behavior-manifest`、`synthetic-smoke` 與 `validate-shard` 已可
+執行；標示為「G3 待實作」的 `lbt-run`、run-level validator 與 aggregate/release CLI
+不得在 production backend 與資料 gate 完成前使用不存在的介面替代。
 
-2026-08-17 已完成一次唯讀 SSH preflight，確認四個 domain、2024–2025 各 24 個月份、SERVER runtime、容量與 NFS I/O。後續 release 仍須以正式 CLI 重跑並保存 machine-readable evidence；不得把密碼、private key 或 token 寫入 repository、設定、命令紀錄或報告。
+2026-08-19 已以目前 CLI 完成一次唯讀全期 preflight：192 筆 inventory 可讀，但因 NWW
+96 筆 `trial_ready`、68 筆月內超限時間缺口、8 筆跨月超限時間缺口與 OCM 16 筆
+partial-month cache finding，共 188 項，結果為 `formal_ready=false`。細節見
+[實作稽核](09_implementation_audit_2026-08-19.md)。後續 release
+仍須重跑並保存 machine-readable evidence；不得把密碼、private key 或 token 寫入
+repository、設定、命令紀錄或報告。
 
 ## 2. 預定路徑變數
 
@@ -68,7 +76,7 @@ findmnt -T "$LBT_SCRATCH_ROOT"
 
 若 output 在 NFS/NAS，checkpoint 與 active shard 優先寫本機 scratch；完成 checksum 後以單一 publisher 傳到同一遠端檔案系統的 `.incoming/<run_id>/`，最後原子改名。不得讓下游看到半套正式 run。
 
-## 4. 環境建立（預定）
+## 4. 環境建立
 
 ```bash
 cd "$LBT_PROJECT_ROOT"
@@ -77,41 +85,42 @@ export UV_PROJECT_ENVIRONMENT="$LBT_SCRATCH_ROOT/venv"
 export MPLCONFIGDIR="$LBT_MPL_CACHE_ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 
-uv sync --frozen --python 3.12 --managed-python
-uv run python3 -m pytest -q
+uv sync --frozen
+uv run pytest -q -p no:cacheprovider
 ```
 
 實作時鎖定具體 Python patch 版本並保存於 run manifest。Numba、NumPy 與 SciPy 版本變更可能改變浮點/JIT 行為；正式 release 只使用 `uv.lock`，不在 batch 中臨時更新套件。
 
-## 5. 預定 CLI 流程
+## 5. CLI 流程
 
-以下名稱是實作目標，不代表目前已有命令。
+5.1–5.2 是目前可直接執行的命令；5.3–5.4 的 `lbt-run` 是 G3 待實作介面。
 
 ### 5.1 Preflight
 
 ```bash
 uv run lbt-preflight \
-  --config configs/lagrangian_backtracking.server.yaml \
-  --years 2024 2025 \
+  --config configs/lagrangian_backtracking.example.yaml \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
   --output "$LBT_SCRATCH_ROOT/preflight/input_inventory.json"
 ```
 
 Preflight 必須唯讀，不建立 forcing 副本。輸出至少包含 path token、schema、月份、time gap、array bytes、coverage、unit/direction decision、CRS/mesh QC、domain role、own/foreign local-domain topology、各必要 forcing 的共同 margin、預估 working set 與輸出空間。若 A 區仍為現行 v3，輸出必須明示 `PILOT_ONLY`，config validator 不得只因 metadata `status=ready` 就允許正式龜山島 25 km baseline。
 
-### 5.2 單日 smoke test
+### 5.2 合成端到端 smoke test
 
 ```bash
-uv run lbt-run \
-  --config configs/lagrangian_backtracking.server.yaml \
-  --domain houwan_nmmba_cache_v3 \
-  --scenario-manifest configs/trials/single_receptor_single_day.json \
-  --output-root "$LBT_SCRATCH_ROOT/trials" \
-  --label TRIAL-single-day
+uv run lbt synthetic-smoke \
+  --output "$LBT_SCRATCH_ROOT/trials/synthetic-constant-flow"
+uv run lbt validate-shard \
+  "$LBT_SCRATCH_ROOT/trials/synthetic-constant-flow"
 ```
 
-試跑只能寫 `TRIAL` namespace，圖面與 metadata 必須含 trial 標記。單日結果只驗證 I/O、速度、事件與資源，不得作為 2024-2025 科學成果。
+此命令不讀 SERVER forcing，只驗證 CLI、signed-time RK4、巢狀事件、ragged arrays、
+Parquet、manifest 與 checksum。metadata 固定標示 `synthetic_smoke_not_scientific_result`，
+不得作為 2024–2025 科學成果。接通實值單月 reference pilot 是 G3 下一切片。
 
-### 5.3 代表性 pilot
+### 5.3 代表性 pilot（G3 待實作 CLI）
 
 ```bash
 uv run lbt-run \
@@ -126,7 +135,7 @@ uv run lbt-benchmark-report "$LBT_SCRATCH_ROOT/pilots/<run_id>"
 
 Pilot 報告需以五站點各固定 10,000、A 區 20,000、全案 50,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time；並比較 7/14/30/60 日 horizon 及貢寮／龜山島 20/25/35 km local boundary。A 區 paired-UTC shards 應共用同一 staged forcing time window，報告須證明沒有為兩站各自重複跨 NFS 載入同一 OCM/NWW 月窗。benchmark 用於衍生最小收斂 `M`、horizon、shard、並行度與儲存策略，不得據此把任一站完整交叉改回 1,000 或把五站合併為 10,000。
 
-### 5.4 正式 batch
+### 5.4 正式 batch（G3/G4 待實作 CLI）
 
 正式 run 只能使用 `status=approved` 的 config、behavior、local-domain、每站 20／全案 100 receptor、每站 arrival-time、每站 10,000／全案 50,000 情境 coverage 與 member-convergence manifests。A 區貢寮與龜山島必須引用同一個已通過共同 forcing margin 的 expanded flow-domain ID；現行 `northeast_taiwan_common_cache_v3` 不得出現在正式 release config：
 

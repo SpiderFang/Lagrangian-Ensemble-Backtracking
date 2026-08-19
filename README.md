@@ -2,7 +2,12 @@
 
 本專案實作「三、Lagrangian 系集逆向溯源」：針對完全沉沒於三維水體中的懸浮、沉降、上浮與近底廢棄物，以 CWA-OCM 三維海流、CWA-NWW3 波浪衍生的 Stokes drift、浮沉速度及次網格擴散，從受體位置與到達時間向過去建立條件式來源足跡。
 
-目前狀態為 `planning`。本次建立的是可直接進入實作的專案骨架、資料契約、科學方法、驗證矩陣、快速執行關鍵路徑與風險閘門；尚未宣稱粒子模式或兩年正式模擬已完成。交付優先原則是「在不省略科學驗證與可重現性閘門的前提下，儘速完成」，不以日曆日期作為工作排序依據。
+目前狀態為 `reference_core_implemented_pilot_gated`。設定/preflight、native forcing adapters、
+signed-time RK4、Stokes、擴散、巢狀邊界、scenario×member 分片、不可變 shard/checkpoint 與
+核心聚合均已有可執行實作及測試；本機與 SERVER 均為 50 項測試通過，SERVER synthetic
+shard 驗證成功。2024–2025 正式模擬尚未宣稱完成，因全期 preflight 已證實 NWW
+`trial_ready`、17 個月份的時間缺口、4 個 partial OCM 月份及 expanded A/衍生 pilot gate
+仍待處理。詳細證據見 [2026-08-19 實作稽核](docs/09_implementation_audit_2026-08-19.md)。
 
 ## 工項邊界
 
@@ -110,8 +115,16 @@ flowchart LR
 .
 ├── AGENTS.md
 ├── README.md
+├── pyproject.toml
+├── uv.lock
 ├── configs/
 │   └── lagrangian_backtracking.example.yaml
+├── src/lagrangian_backtracking/
+│   ├── forcing.py, mesh.py, stokes.py
+│   ├── integrators.py, diffusion.py, engine.py, boundaries.py
+│   ├── scenarios.py, runner.py, receptors.py, arrival_times.py
+│   └── outputs.py, checkpoint.py, aggregation.py, preflight.py, cli.py
+├── tests/
 └── docs/
     ├── 01_requirements_traceability.md
     ├── 02_architecture_and_data_contract.md
@@ -120,10 +133,33 @@ flowchart LR
     ├── 05_decisions_and_risks.md
     ├── 06_server_runbook_plan.md
     ├── 07_results_visualization_plan.md
-    └── 08_design_baseline_and_derived_gates.md
+    ├── 08_design_baseline_and_derived_gates.md
+    └── 09_implementation_audit_2026-08-19.md
 ```
 
-預定實作階段才新增 `src/lagrangian_backtracking/`、`tests/`、`scripts/`、`pyproject.toml` 與 `uv.lock`。依賴版本應在第一個可執行切片完成後鎖定，避免規劃文件先製造未驗證的環境契約。
+## 安裝與目前可用命令
+
+```bash
+uv sync --frozen
+uv run pytest -q -p no:cacheprovider
+uv run lbt config-check --config configs/lagrangian_backtracking.example.yaml
+uv run lbt synthetic-smoke --output /private/tmp/lbt-synthetic-smoke
+uv run lbt validate-shard /private/tmp/lbt-synthetic-smoke
+```
+
+SERVER 唯讀全期 inventory：
+
+```bash
+uv run lbt preflight \
+  --config configs/lagrangian_backtracking.example.yaml \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --output "$LBT_PROJECT_ROOT/work/input-inventory.json"
+```
+
+`behavior-manifest` 可產生已裁決的 10 種行為表。`lbt-run`、production Numba batch 與正式
+aggregate/release CLI 尚受實作稽核第 4 節的資料、幾何與 pilot gate 約束，不能以目前
+reference/synthetic CLI 取代。
 
 ## 完成閘門與快速執行順序
 
@@ -140,8 +176,12 @@ flowchart LR
 
 ## 立即下一步
 
-1. 同時啟動 SERVER 唯讀 preflight，並依固定演算法產生五站點各 20 個／合計 100 個 receptor manifest、10 個 behavior classes 與五站點各 50 個 arrival-time manifest；三者互不等待。
-2. 立即完成純 NumPy 的單 domain、單日、單 receptor 垂直切片與解析測試；不等待正式 receptor 才開始工程實作。
-3. forcing sampler 與 RK4／擴散／邊界核心分成獨立工作流並行，介面以合成 fixture 固定。
-4. 第一個端到端 pilot 通過後立即量測 member convergence，以最小合格 `M` 建立五站點合計 50,000 情境的 shard 計畫並啟動 SERVER 批次。
-5. 聚合與圖表採流式處理已完成 shard，不等待所有情境結束才開始成果製作。
+1. 依 SERVER preflight 修復或正式審查 17 個缺口月份、4 個 partial OCM 月份與 NWW
+   `trial_ready`/波向證據；不得以跨 24–72 小時線性內插通過。
+2. 建立 expanded A forcing version，並由 native mesh 生成五站 local/open-boundary 與各站
+   20 個 receptors；貢寮、龜山島維持獨立 10,000 情境但共用 A forcing/outer boundary。
+3. 在有效 coverage 上衍生五站各 50 個 arrival UTC，接通實值 reference pilot，完成
+   wetdry/Kz、方向、dt/horizon/member convergence 與 known-source 驗證。
+4. 補齊 chunked Numba production engine、mid-run checkpoint/restart 與 benchmark；通過
+   NumPy 等價後才啟動五站 `50,000×M` baseline。
+5. 已驗收 shard 隨完成隨即流式聚合，最後依既定學術視覺化規格產出圖表與 sidecar。

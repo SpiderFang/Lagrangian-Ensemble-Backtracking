@@ -81,6 +81,12 @@
 - `open_boundary_segment`：排除海岸後可穿越的命名邊界，用於 first crossing 與弧長密度。
 - `reporting_region`：下游彙整單元，不改變 forcing 或軌跡。
 
+正式 geometry manifest 必須分別保存每個 local/flow polygon、其 exterior 中可交換水體的
+`open_boundary_segment` LineString/MultiLineString，以及剩餘海岸段。執行器只把交點落在
+命名 open-water 線段上的 crossing 分類為 `local_domain_first_exit` 或
+`flow_domain_open_exit`；其他 polygon exit 一律是終止性的 `coast_contact`。只提供 polygon
+而未提供 open-boundary 子集合的相容模式僅限合成測試，不得通過正式發布閘門。
+
 ### 3.1 A 區 domain version 契約
 
 現行 `northeast_taiwan_common_cache_v3` 的 bbox 南界為 `24.600844°N`。SERVER preflight 顯示龜山島 25 km local boundary 至該南界僅餘約 1.64 km，未達兩個約 1 km OCM surface／NWW 共同格點，因此它的 `domain_role` 固定為 `development_and_pilot`。正式 release 不得就地改寫此上游識別碼或 metadata，而須引用新的 expanded `flow_domain_id`。

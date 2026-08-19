@@ -163,6 +163,8 @@ geometry:
   # 幾何生成規則已決定；null 表示尚未以 SERVER OCM mesh 實際產出與驗證 polygon/受體。
   domain_manifest: null
   local_domain_manifest: null
+  # 需保存 local/flow polygon exterior 中的 open-water 線段；其餘邊界才可分類為海岸。
+  open_boundary_manifest: null
   receptor_manifest: null
   reporting_region_manifest: null
   geometry_decision_status: decided_generation_pending_server_mesh

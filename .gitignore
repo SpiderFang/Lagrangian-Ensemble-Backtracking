@@ -7,18 +7,25 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+*.egg-info/
+build/
+dist/
 
 # 虛擬環境與套件管理器快取會依主機重建，不屬於研究成果。
 .venv/
 .uv-cache/
 
-# 大型 forcing、軌跡、檢查點與伺服器運算成果只以 manifest 追溯。
+# 大型 forcing、軌跡、checkpoint 與聚合成果體積龐大且可能含 SERVER 路徑；
+# repository 只保存 schema、小型合成 fixture、程式與不可變 manifest 範例。
 data/
 work/
 outputs/
 checkpoints/
 logs/*.log
 logs/*.jsonl
+*.parquet
+*.npy
+*.npz
 
 # 作業系統與編輯器暫存檔。
 .DS_Store
