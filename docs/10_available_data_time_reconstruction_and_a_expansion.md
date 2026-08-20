@@ -68,18 +68,26 @@ native 產品與靜態 OCM 共同格網重建完整 17,544 小時，不對 Hs、
 4. 以 blocked cross-validation 決定模式數、模型階數與誤差。
 
 不可直接沿用：SVD 可把各 UTC 當作獨立樣本，移除不完整時次後仍能求模態；Lagrangian
-積分則需要粒子沿途每一個 RK stage 都有連續場。更重要的是，Beckers 與 Rixen 的原始
-DINEOF 研究明確指出：若某一時刻的整個空間場都沒有資料，純 EOF gap filling 沒有該時刻
-的相關資訊可估計其係數。因此，本案不能只把 24–49 個完全缺失的 OCM snapshots 填成零
-異常後反覆做 DINEOF。
+積分則需要粒子沿途每一個 RK stage 都有連續場。先前「整張場完全缺失時 DINEOF 完全
+不能重建」的說法過度絕對，現已校正：Alvera-Azcárate et al. (2009) 顯示，若相鄰時次仍
+提供資訊，具時間共變異處理的 EOF 重建可以估計某張完全缺失影像的特徵。然而，這不
+等於可將未驗證的純 DINEOF 自動套用於 24–49 個連續 OCM snapshots；Hernández-Carrasco
+et al. (2018) 的持續嚴重缺口案例顯示，Eulerian 流場看似可接受並不足以保證 Lagrangian
+結果可靠。因此本案以多變量 EOF-harmonic-state-space smoother 作候選，並以實際缺口形狀
+的 blocked cross-validation 與 trajectory 指標共同決定是否採用；絕不以填零異常冒充重建。
 
 相關方法依據：
 
-- [Beckers and Rixen (2003), EOF Calculations and Data Filling from Incomplete Oceanographic Datasets](https://doi.org/10.1175/1520-0426(2003)020%3C1839:ECADFF%3E2.0.CO;2)：DINEOF、交叉驗證及整張場缺失的限制。
-- [Alvera-Azcárate et al. (2009), Enhancing temporal correlations in EOF expansions](https://doi.org/10.5194/os-5-475-2009)：在 EOF 重建中明示加入時間相關。
+- [Beckers and Rixen (2003), EOF Calculations and Data Filling from Incomplete Oceanographic Datasets](https://doi.org/10.1175/1520-0426(2003)020%3C1839:ECADFF%3E2.0.CO;2)：DINEOF、迭代 EOF 重建與交叉驗證選取有效 mode 數。
+- [Alvera-Azcárate et al. (2009), Enhancing temporal correlations in EOF expansions](https://doi.org/10.5194/os-5-475-2009)：在 EOF 重建中加入時間相關；顯示時間濾波能降低不連續，並可利用相鄰資訊處理某張完全缺失影像。
 - [Frolov et al. (2012), Improved statistical prediction of surface currents based on historic HF-radar observations](https://doi.org/10.1007/s10236-012-0553-5)：以 EOF 表達空間場、以線性自迴歸預測 EOF 時間係數，並以粒子分離誤差驗證 48 h 流場預測。
-- [Hernández-Carrasco et al. (2018), Impact of HF radar current gap-filling methodologies on the Lagrangian assessment of coastal dynamics](https://doi.org/10.5194/os-14-827-2018)：同時比較 Eulerian 與 trajectory、LCS、residence-time 誤差，證明流場 RMSE 最低不必然代表 Lagrangian 結果最佳。
+- [Hernández-Carrasco et al. (2018), Impact of HF radar current gap-filling methodologies on the Lagrangian assessment of coastal dynamics](https://doi.org/10.5194/os-14-827-2018)：同時比較 Eulerian 與 trajectory、LCS、residence-time 誤差；持續嚴重缺口不可因單一 Eulerian 指標合格而自動放行。
 - [Delandmeter and van Sebille (2019), The Parcels v2.0 Lagrangian framework](https://doi.org/10.5194/gmd-12-3571-2019)：Lagrangian 計算須先在粒子位置內插 Eulerian 場，再積分粒子 ODE，支持將 forcing 重建與數值積分分層驗證。
+
+上述四篇核心文獻的 DOI、原文頁碼及紅框短摘錄備存於
+[`data/time_reconstruction_literature/`](../data/time_reconstruction_literature/README.md)。紅框只標記本案
+實際採用的段落；本案的潮汐項、VAR 正則化、雙向 smoother、member 數與 acceptance threshold
+均為資料驅動的實作選擇，不能被誤稱為文獻直接給定的通用參數。
 
 ## 4. 正式時間處理方法版本
 

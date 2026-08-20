@@ -99,6 +99,15 @@ no-Stokes、不同擴散係數、domain 擴張等敏感度試驗以 `experiment_
 
 文獻支持「因子應被明確、可重現地分開處理」，不規定本計畫書的 10 個行為、20 個三維受體或 50 個到達時間必須採用的離散數目；這些數目與分層演算法仍以本專案已核定的設計基線為準。
 
+## 缺時重建與 Lagrangian 驗證文獻備查
+
+全期 OCM 缺時的正式方法不是未驗證的「填零」或單一純 DINEOF，而是以時間相關 EOF、
+EOF 係數自迴歸／state-space 與雙向資訊為候選，通過 blocked cross-validation 的 Eulerian 與
+Lagrangian 指標後才可使用。四篇核心方法文獻的紅框短摘錄、精確頁碼、永久來源與全文收檔
+驗證規則存於[缺時重建與 Lagrangian 驗證文獻備查](data/time_reconstruction_literature/README.md)。
+其中 Alvera-Azcárate et al. (2009) 也校正了「整張場完全缺失必然不可重建」的過度絕對表述：
+有相鄰時間資訊時可形成重建候選，但是否可用於本案粒子 forcing 仍完全取決於本案的雙層驗證。
+
 ## 資料流
 
 ```mermaid
