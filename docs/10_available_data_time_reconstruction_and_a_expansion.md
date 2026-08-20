@@ -44,6 +44,14 @@
 8 個跨月 finding，並報出未經全期去重的 72 h 最大值。正式報告改以 canonical 全期軸為
 唯一時間母體；月份 metadata 仍保留作 provenance，不再用 finding 數量代表缺口數。
 
+OCM 上游另有一層不可省略的時間 provenance：部分 raw 日檔的 `time` 座標整檔錯置時，
+前處理器會依 `YYYYMMDD_schout.nc` 檔名日期重新錨定該檔輸出 UTC、保留檔內相對 offset，
+並在跨日重疊時只保留嚴格晚於前一已寫入 UTC 的 slice；完全沒有新增 UTC 的日檔記為
+`zero_kept`。這是對時間座標的版本化修復，不是對 u/v/w 等流場值做插補。正式 preflight
+須逐月保存 `timestamp_repair_file_count`、`zero_kept_file_count`、
+`skipped_overlap_time_step_count` 與 `missing_day_count`，blocked validation 也須把高修復率
+期間列為獨立子集，避免 canonical 軸看似連續就掩蓋來源時間標籤的不確定性。
+
 NWW3 則須分開判讀。SERVER 的 `nww3_native/ww3_grd3_253x237` 已完整涵蓋
 `2024-01-01 00:00` 至 `2025-12-31 23:00 UTC`，恰有 17,544 個唯一逐時 UTC，最大間距
 1 h，沒有時間缺口。現行 `nww3_analysis` 的 17,124 筆時間只是因產製時把 OCM surface

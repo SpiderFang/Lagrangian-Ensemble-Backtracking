@@ -145,7 +145,7 @@
 
 | 表號 | 內容 | 必要欄位 |
 |---|---|---|
-| T01 | forcing 與研究範圍 inventory | domain、month、raw/canonical rows、duplicate count、time span、resolution、units、observed/reconstructed/unsupported coverage、gap shapes、NWW full-hour rebuild、schema/checksum |
+| T01 | forcing 與研究範圍 inventory | domain、month、raw/canonical rows、duplicate count、timestamp-repaired/zero-kept raw file count、skipped overlap steps、missing days、time span、resolution、units、observed/reconstructed/unsupported coverage、gap shapes、NWW full-hour rebuild、schema/checksum |
 | T02 | 五站各 10×20×50 情境設計與 coverage | site、region、每站 receptor=20、全案 receptor=100、每站組合數 10,000、A 區 20,000、全案 50,000、缺列／重列數、experiment cases、M |
 | T03 | run 與停止結果摘要 | released/effective/completed、各 event raw count/percentage、wall time、particle steps、I/O、failure rate |
 | T04 | 來源段／受體排名 | receptor、source segment、raw n、有效分母、relative weight、bootstrap CI、median travel time、rank stability |

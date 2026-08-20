@@ -37,7 +37,13 @@ class Finding:
 
 @dataclass(slots=True)
 class MonthInventory:
-    """單一產品、domain 與月份的低記憶體契約摘要。"""
+    """單一產品、domain 與月份的低記憶體契約摘要。
+
+    OCM 額外保存 raw 日檔時間座標的處理 provenance：缺日數、依檔名日期重新錨定的
+    檔數、完全沒有新增 canonical slice 的日檔數，以及跨日跳過的重疊時次。這些欄位
+    不代表流場數值被插補，但會影響 UTC 的可信度與後續重建驗證，不能只留在上游
+    metadata 而不進正式 input inventory。NWW 沒有對應欄位時保持 ``None``。
+    """
 
     product: str
     flow_domain_id: str
@@ -50,6 +56,10 @@ class MonthInventory:
     time_end_utc: str | None
     maximum_gap_seconds: float | None
     required_arrays_present: bool
+    source_missing_day_count: int | None
+    source_timestamp_repair_file_count: int | None
+    source_zero_kept_file_count: int | None
+    source_skipped_overlap_time_step_count: int | None
     path_token: str
 
 
@@ -532,6 +542,67 @@ def _inspect_month(
             )
         )
 
+    source_missing_day_count: int | None = None
+    source_timestamp_repair_file_count: int | None = None
+    source_zero_kept_file_count: int | None = None
+    source_skipped_overlap_time_step_count: int | None = None
+    if product == "ocm_native":
+        # 這些數字是上游以 raw 日檔小型 time 變數產生的 audit，不需要讀取大型 hvel。
+        # 欄位不存在時保留 None，讓舊 schema 與「明確為零」可被區分；存在但型別錯誤
+        # 則由安全轉換記為 metadata error，避免負值或字串被誤當成正式 provenance。
+        source_day_coverage = metadata.get("source_day_coverage")
+        source_time_axis = metadata.get("source_time_axis")
+
+        def optional_nonnegative_count(container: object, key: str) -> int | None:
+            """由 metadata object 讀非負整數；缺欄位回傳 None，非法值直接拒絕。"""
+
+            if not isinstance(container, dict) or key not in container:
+                return None
+            value = int(container[key])
+            if value < 0:
+                raise ValueError(f"{key} 不得為負")
+            return value
+
+        try:
+            source_missing_day_count = optional_nonnegative_count(
+                source_day_coverage,
+                "missing_day_count",
+            )
+            source_timestamp_repair_file_count = optional_nonnegative_count(
+                source_time_axis,
+                "timestamp_repair_file_count",
+            )
+            source_zero_kept_file_count = optional_nonnegative_count(
+                source_time_axis,
+                "zero_kept_file_count",
+            )
+            source_skipped_overlap_time_step_count = optional_nonnegative_count(
+                source_time_axis,
+                "skipped_overlap_time_step_count",
+            )
+        except (TypeError, ValueError) as exc:
+            findings.append(
+                Finding(
+                    "error",
+                    "OCM_SOURCE_TIME_PROVENANCE_INVALID",
+                    location,
+                    str(exc),
+                )
+            )
+        if (source_timestamp_repair_file_count or 0) > 0 or (source_zero_kept_file_count or 0) > 0:
+            findings.append(
+                Finding(
+                    "info",
+                    "OCM_SOURCE_TIME_COORDINATE_REPAIRED",
+                    location,
+                    (
+                        f"timestamp-repaired raw files={source_timestamp_repair_file_count or 0}，"
+                        f"zero-kept raw files={source_zero_kept_file_count or 0}，"
+                        "這是時間座標 provenance，不代表流場值已重建"
+                    ),
+                )
+            )
+
     arrays_present = True
     time_count: int | None = None
     start: str | None = None
@@ -601,6 +672,10 @@ def _inspect_month(
         time_end_utc=end,
         maximum_gap_seconds=maximum_gap_seconds,
         required_arrays_present=arrays_present,
+        source_missing_day_count=source_missing_day_count,
+        source_timestamp_repair_file_count=source_timestamp_repair_file_count,
+        source_zero_kept_file_count=source_zero_kept_file_count,
+        source_skipped_overlap_time_step_count=source_skipped_overlap_time_step_count,
         path_token=location,
     )
 

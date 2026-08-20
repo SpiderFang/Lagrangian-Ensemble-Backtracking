@@ -33,6 +33,7 @@ def _write_month(
     status: str,
     month: str = "202401",
     times: np.ndarray | None = None,
+    source_time_axis: dict[str, int] | None = None,
 ) -> None:
     """建立不含大型物理值的小型月份契約；所有必要陣列只寫 shape 正確的占位值。"""
 
@@ -72,6 +73,10 @@ def _write_month(
         np.save(month_dir / name, np.zeros((2, 1), dtype=dtype), allow_pickle=False)
         arrays[name] = {"shape": [2, 1], "dtype": str(np.dtype(dtype))}
     metadata = {schema_key: schema_value, "status": status, "cache_kind": cache_kind, "arrays": arrays}
+    if product == "ocm_native":
+        metadata["source_day_coverage"] = {"missing_day_count": 0}
+        if source_time_axis is not None:
+            metadata["source_time_axis"] = source_time_axis
     (month_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
 
@@ -220,3 +225,35 @@ def test_preflight_checks_cross_month_time_gap(tmp_path: Path) -> None:
     assert all(gap.gap_hours == 10.0 and gap.missing_step_count == 9 for gap in matching)
     assert report.formal_ready
     assert not any(finding.code.startswith("CROSS_MONTH") for finding in report.findings)
+
+
+def test_preflight_preserves_ocm_source_time_repair_provenance(tmp_path: Path) -> None:
+    """時間座標重錨不是流場補值，但檔數與重疊刪除必須進入正式 inventory。"""
+
+    config = _small_config()
+    ocm_root = tmp_path / "ocm"
+    nww_root = tmp_path / "nww"
+    provenance = {
+        "timestamp_repair_file_count": 3,
+        "zero_kept_file_count": 1,
+        "skipped_overlap_time_step_count": 25,
+    }
+    for domain in config.domains:
+        _write_grid(ocm_root, domain.flow_domain_id, product="ocm_native")
+        _write_grid(nww_root, domain.flow_domain_id, product="nww3_analysis")
+        _write_month(
+            ocm_root,
+            domain.flow_domain_id,
+            product="ocm_native",
+            status="ready",
+            source_time_axis=provenance,
+        )
+        _write_month(nww_root, domain.flow_domain_id, product="nww3_analysis", status="ready")
+    report = run_preflight(config, ocm_native_root=ocm_root, nww_analysis_root=nww_root, months=["202401"])
+    ocm = [item for item in report.inventories if item.product == "ocm_native"]
+    assert all(item.source_timestamp_repair_file_count == 3 for item in ocm)
+    assert all(item.source_zero_kept_file_count == 1 for item in ocm)
+    assert all(item.source_skipped_overlap_time_step_count == 25 for item in ocm)
+    assert len(
+        [item for item in report.findings if item.code == "OCM_SOURCE_TIME_COORDINATE_REPAIRED"]
+    ) == 4
