@@ -35,7 +35,7 @@ readonly NWW_NATIVE_GRID_ID="${LBT_NWW_NATIVE_GRID_ID:-ww3_grd3_253x237}"
 
 # uv cache 使用本工項專屬名稱，避免依賴登入帳號的預設 cache；Python bytecode 不寫回
 # Git worktree，使 SERVER 部署目錄在 dry-run 與正式批次後仍可稽核 dirty state。
-export UV_CACHE_DIR="${LBT_WORKSPACE_UV_CACHE_ROOT:-/private/tmp/lbt-a-v4-uv-cache}"
+export UV_CACHE_DIR="${LBT_WORKSPACE_UV_CACHE_ROOT:-/tmp/lbt-a-v4-uv-cache}"
 export PYTHONDONTWRITEBYTECODE=1
 
 require_file() {
