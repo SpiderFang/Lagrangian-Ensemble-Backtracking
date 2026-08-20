@@ -7,12 +7,15 @@
 執行；標示為「G3 待實作」的 `lbt-run`、run-level validator 與 aggregate/release CLI
 不得在 production backend 與資料 gate 完成前使用不存在的介面替代。
 
-2026-08-19 已以目前 CLI 完成一次唯讀全期 preflight：192 筆 inventory 可讀，但因 NWW
-96 筆 `trial_ready`、68 筆月內超限時間缺口、8 筆跨月超限時間缺口與 OCM 16 筆
-partial-month cache finding，共 188 項，結果為 `formal_ready=false`。細節見
-[實作稽核](09_implementation_audit_2026-08-19.md)。後續 release
-仍須重跑並保存 machine-readable evidence；不得把密碼、private key 或 token 寫入
-repository、設定、命令紀錄或報告。
+2026-08-19 的舊版 preflight 曾把 NWW `trial_ready`、OCM partial month 與已知缺時合計成
+188 項正式 blocker；此解釋已被 2026-08-20 available-data 決策取代。現有 OCM/NWW 即本
+研究可取得的完整 2024–2025 母體，供應者補件不是前置條件；NWW native 實測為 17,544 個
+連續逐時 UTC，OCM canonical 軸為 17,124 個 UTC、總缺 420 時次。後續 preflight 把前兩項
+記為 accepted provenance，把 OCM 缺口送入 reconstruction/gap-safe gate，不能再輸出「等待
+上游補資料」的建議。細節見[全部可得資料決策](10_available_data_time_reconstruction_and_a_expansion.md)
+與[更正後稽核](09_implementation_audit_2026-08-19.md)。每次 release 仍須重跑並保存
+machine-readable evidence；不得把密碼、private key 或 token 寫入 repository、設定、命令
+紀錄或報告。
 
 ## 2. 預定路徑變數
 
@@ -21,6 +24,7 @@ export LBT_PROJECT_ROOT=/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking
 export OCM_NATIVE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_native
 export OCM_SURFACE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_surface
 export NWW_ANALYSIS_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_analysis
+export NWW_NATIVE_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_native/ww3_grd3_253x237
 
 # 正式值需在容量與檔案系統檢查後核定；不可直接假設專案目錄有足夠空間。
 export LBT_OUTPUT_ROOT=/path/to/approved/lagrangian-results
@@ -59,14 +63,48 @@ find "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT" \
 - 設定恰有 A-D 四個 `analysis_region_id`／`flow_domain_id` 與五個唯一 `study_site_id`；貢寮、龜山島均對應 A 區，但情境與輸出不可合併。
 - 貢寮／龜山島以 anchor 產生 12.5 km receptor core、25 km local domain 及 20/35 km 敏感度 polygon，與固定 OCM ocean polygon 相交；兩個 local domains 重疊時須完整保留，不作 Voronoi 切割。圓周外海 arc 與岸線必須分段，只有前者可計入 local-entry KDE。
 - 貢寮／龜山島引用同一 A 區 forcing-domain ID 與 outer-boundary geometry；每條軌跡只以 own local domain 產生主要 first-exit。foreign-local crossing 必須是非終止診斷事件，不得改變 `study_site_id`、scenario、seed 或主要入口分母。
-- 現行 A v3 bbox 南界 `24.600844°N` 只允許 `development_and_pilot`。正式 config 必須引用新 expanded domain，目標南界不北於約 `24.50°N`，並對 OCM native、OCM surface、NWW analysis 逐一證明 25/35 km local boundary 至 outer boundary 至少兩個共同有效格點。
-- 嚴格遞增與唯一 UTC。
-- 實際 start/end、間距、缺口與跨月銜接。
+- 現行 A v3 bbox 南界 `24.600844°N` 只允許 `development_and_pilot`。正式候選採
+  `northeast_taiwan_common_cache_v4_lbt_south_expanded` 與 bbox
+  `[121.306315,122.793685,24.480000,25.499156]`，並對 OCM native、OCM surface、NWW
+  analysis 逐一證明 25/35 km local boundary 至 outer boundary 至少兩個共同有效格點。
+- 月份內原始 UTC 可含重複或亂序；先 stable sort/prefer-last，再驗證 canonical UTC 嚴格
+  遞增與唯一，並保存來源月份/local index。
+- 實際 start/end、正常間距、缺口長度與跨月銜接。已知 gap 是 reconstruction inventory，
+  不是要求原始供應者補件的 blocker。
 - array shape/dtype 與 metadata 相符。
-- OCM native/surface pair 及 NWW target grid/time 相容。
+- OCM native/surface pair 的空間相容，以及 NWW full-hour analysis 對 OCM observed 與
+  reconstructed UTC 的 superset 支撐；不得再要求 NWW 時間軸與舊 gappy OCM 軸逐值相等。
 - OCM 必要欄位與 NWW Hs/fp/DP/mask/QC 的存在及有限率。
 
-### 3.3 容量與檔案系統
+### 3.3 正式時間產品產製
+
+正式 batch 前依固定順序產製兩個不可變 manifest：
+
+1. 從 NWW native 24 個月份重採樣到每個正式 OCM 靜態格網，產生 17,544 個完整逐時
+   analysis slices；DP 在空間與時間均先轉成單位向量作圓形內插，再轉回角度。
+2. 對 OCM canonical 軸建立缺口遮罩，執行實際缺口形狀的 blocked cross-validation；通過
+   才產生 `observed/reconstructed_short/reconstructed_state_space` patch 與 posterior members。
+3. validation 未通過的長缺口不硬補；arrival selector 只選擇不跨缺口、且能支援該
+   horizon 的分層時窗。此 fallback 必須仍覆蓋兩年、四季、大小潮與三潮位相位 strata。
+4. preflight 驗證 manifest、checksum、方法版本、時間 origin 與 forcing member 完整後，
+   才將已知缺口視為可積分支撐；任何 runtime 臨時補值均禁止。
+
+A 區 v4 的 OCM/NWW 上游產製已封裝為可重啟入口；其 config hash 會進入 OCM metadata，
+OCM partial month 保留 coverage，NWW 則直接使用每月 native UTC 建 full-hour analysis：
+
+```bash
+cd "$LBT_PROJECT_ROOT"
+bash scripts/prepare_a_v4_forcing.sh dry-run
+bash scripts/prepare_a_v4_forcing.sh month 2025 1
+# 單月 OCM/NWW validator 與實際共同 margin 通過後才執行：
+bash scripts/prepare_a_v4_forcing.sh all
+```
+
+入口不使用 `--overwrite`。若新 domain 已有月份目錄，先由上游 validator 驗收；驗收失敗
+即停止並保留現場，不能自動刪除或重建。`dry-run` 不寫大型 forcing，可直接用於確認 raw
+月份、partial coverage、輸出路徑與參數。
+
+### 3.4 容量與檔案系統
 
 ```bash
 df -hT "$OCM_NATIVE_ROOT" "$NWW_ANALYSIS_ROOT" "$LBT_OUTPUT_ROOT" "$LBT_SCRATCH_ROOT"
@@ -105,7 +143,13 @@ uv run lbt-preflight \
   --output "$LBT_SCRATCH_ROOT/preflight/input_inventory.json"
 ```
 
-Preflight 必須唯讀，不建立 forcing 副本。輸出至少包含 path token、schema、月份、time gap、array bytes、coverage、unit/direction decision、CRS/mesh QC、domain role、own/foreign local-domain topology、各必要 forcing 的共同 margin、預估 working set 與輸出空間。若 A 區仍為現行 v3，輸出必須明示 `PILOT_ONLY`，config validator 不得只因 metadata `status=ready` 就允許正式龜山島 25 km baseline。
+Preflight 必須唯讀，不建立 forcing 副本。輸出至少包含 path token、schema、月份、raw 與
+canonical time inventory、duplicate source choice、gap shapes、reconstruction/NWW-full-hour
+manifest、array bytes、coverage、unit/direction decision、CRS/mesh QC、domain role、own/foreign
+local-domain topology、各必要 forcing 的共同 margin、預估 working set 與輸出空間。
+`trial_ready`/partial month 依 available-data contract 記錄為 accepted info，不得再當成等待外部
+補件的錯誤。若 A 區仍為現行 v3，輸出必須明示 `PILOT_ONLY`，config validator 不得只因
+metadata `status=ready` 就允許正式龜山島 25 km baseline。
 
 ### 5.2 合成端到端 smoke test
 
@@ -194,7 +238,7 @@ Checkpoint 至少綁定：
 | 類型 | 處理 |
 |---|---|
 | authentication/path | 不反覆猜密碼；由資料管理者提供已認證環境或 inventory |
-| input schema/time | 停止受影響 domain/month，建立差異報告，不跨缺口外插 |
+| input schema/time | manifest 外 schema/checksum/UTC 改變時停止受影響 domain/month；已知缺口則回到 reconstruction 或 gap-safe selector，不要求供應者補資料，也不在 runtime 臨時外插 |
 | disk quota | 停止啟動新 shard，保留完整 checkpoint；調整 output/scratch 後續跑 |
 | NFS I/O wait | active write 移至本機 scratch，單一 publisher；不並行灌 NAS |
 | numerical failure | 保存 particle/scenario/step/forcing/event 診斷，以相同 seed 最小化重現 |

@@ -1,9 +1,10 @@
 """上游 OCM/NWW3 月份產品的唯讀、低記憶體 preflight。
 
 preflight 只讀 metadata 與 ``time_utc_ns.npy`` 的 memory-map，不掃描完整四維速度或
-波浪陣列。它驗證 schema major、月份、status、必要檔案、metadata shape 與時間軸，
-並以 root token 取代報告中的實際絕對路徑。正式數值 QC 仍需抽樣讀取實值陣列；本模組
-的職責是先阻擋明確不相容或未驗收的產品。
+波浪陣列。它驗證 schema major、月份、status、必要檔案與 metadata shape；時間則先
+跨月份 stable sort、對重複 UTC 採 prefer-last，再以完整研究期間的逐時參考軸盤點缺口。
+這可避免把月份 halo、跨月倒序與同一缺口重複列成多個錯誤。報告以 root token 取代實際
+絕對路徑；正式數值 QC、缺口重建 skill 與軌跡敏感度仍由後續 manifest 驗證。
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from calendar import monthrange
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -20,6 +22,7 @@ from typing import Any
 import numpy as np
 
 from .config import ProjectConfig
+from .time_axis import CanonicalTimeAxis, TimeChunk, canonicalize_time_chunks
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +53,45 @@ class MonthInventory:
     path_token: str
 
 
+@dataclass(frozen=True, slots=True)
+class TimeGapInventory:
+    """研究期間逐時參考軸上的一段連續缺時。
+
+    內部缺口有左右可用端點，``gap_hours`` 是兩端時距；研究期間最前或最後的 boundary
+    缺時沒有雙側支撐，因此 ``gap_hours`` 為 ``None``，不能誤送進雙向重建器。
+    """
+
+    missing_start_utc: str
+    missing_end_utc: str
+    missing_step_count: int
+    before_utc: str | None
+    after_utc: str | None
+    gap_hours: float | None
+
+
+@dataclass(slots=True)
+class TimeAxisInventory:
+    """單一產品/domain 的跨月 canonical 時間軸與可用率摘要。"""
+
+    product: str
+    flow_domain_id: str
+    policy: str
+    expected_timestep_hours: float
+    input_time_count: int
+    canonical_time_count: int
+    reordered_time_step_count: int
+    dropped_duplicate_time_step_count: int
+    expected_period_time_count: int
+    available_period_time_count: int
+    missing_period_time_count: int
+    extra_halo_time_count: int
+    coverage_fraction: float
+    time_start_utc: str
+    time_end_utc: str
+    maximum_internal_gap_hours: float
+    gaps: list[TimeGapInventory] = field(default_factory=list)
+
+
 @dataclass(slots=True)
 class PreflightReport:
     """可直接寫入 JSON manifest 的完整 preflight 結果。"""
@@ -58,6 +100,7 @@ class PreflightReport:
     config_hash: str
     mode: str
     inventories: list[MonthInventory] = field(default_factory=list)
+    time_axes: list[TimeAxisInventory] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
 
     @property
@@ -75,6 +118,7 @@ class PreflightReport:
             "mode": self.mode,
             "formal_ready": self.formal_ready,
             "inventories": [asdict(item) for item in self.inventories],
+            "time_axes": [asdict(item) for item in self.time_axes],
             "findings": [asdict(item) for item in self.findings],
         }
 
@@ -193,127 +237,215 @@ def _inspect_grid(
             )
 
 
-def _compare_month_time_axes(
-    *,
-    ocm_root: Path,
-    nww_root: Path,
-    ocm_root_token: str,
-    nww_root_token: str,
-    flow_domain_id: str,
-    month: str,
-    maximum_nww_gap_hours: float,
-    findings: list[Finding],
-) -> None:
-    """確認 OCM 與 NWW target UTC 逐值一致，並檢查 NWW 最大時間缺口。
+def _expected_hourly_axis(months: Iterable[str], *, expected_timestep_hours: float) -> np.ndarray:
+    """建立所選曆月聯集的 UTC 參考軸，不把月份 cache halo 誤算為研究樣本。
 
-    每月時間軸只有約數百個 int64，逐值比較不會載入大型物理陣列。不同時間軸不可由
-    下游猜測 nearest time，因那會使 RK stage 的 current 與 wave 不同步。
+    正式設定目前為逐時資料。函式仍依設定步長建立每月 ``[month_start, next_month_start)``
+    軸，使單月 preflight、完整兩年 preflight 與未來不同固定步長使用同一計數定義。
     """
 
-    relative = Path(flow_domain_id) / "months" / month / "time_utc_ns.npy"
-    ocm_path = ocm_root / relative
-    nww_path = nww_root / relative
-    if not ocm_path.is_file() or not nww_path.is_file():
-        return
-    try:
-        ocm_time = np.load(ocm_path, mmap_mode="r", allow_pickle=False)
-        nww_time = np.load(nww_path, mmap_mode="r", allow_pickle=False)
-        if ocm_time.shape != nww_time.shape or not np.array_equal(ocm_time, nww_time):
-            findings.append(
-                Finding(
-                    "error",
-                    "OCM_NWW_TIME_MISMATCH",
-                    f"${ocm_root_token}/{relative.as_posix()} ↔ ${nww_root_token}/{relative.as_posix()}",
-                    "OCM 與 NWW target time 軸不是逐值一致",
-                )
+    step_ns = int(round(expected_timestep_hours * 3_600_000_000_000))
+    if step_ns <= 0:
+        raise ValueError("expected_timestep_hours 必須為正值")
+    pieces: list[np.ndarray] = []
+    for month in sorted(months):
+        year = int(month[:4])
+        month_number = int(month[4:])
+        start = datetime(year, month_number, 1, tzinfo=UTC)
+        day_count = monthrange(year, month_number)[1]
+        start_ns = int(start.timestamp() * 1_000_000_000)
+        end_ns = start_ns + day_count * 24 * 3_600_000_000_000
+        pieces.append(np.arange(start_ns, end_ns, step_ns, dtype=np.int64))
+    if not pieces:
+        raise ValueError("至少需要一個 YYYYMM 才能建立參考時間軸")
+    return np.concatenate(pieces)
+
+
+def _missing_runs(expected: np.ndarray, available: np.ndarray) -> list[TimeGapInventory]:
+    """把參考軸缺時轉成連續區段，保留雙側端點與 boundary 差異。
+
+    ``available`` 可含月份 halo；只要 UTC 出現在 ``expected`` 即視為該研究時次有來源。
+    缺口區段以參考軸索引判斷，不會因跨月目錄分片而重複列出同一事件。
+    """
+
+    present = np.isin(expected, available, assume_unique=False)
+    runs: list[TimeGapInventory] = []
+    start = 0
+    while start < present.size:
+        if present[start]:
+            start += 1
+            continue
+        stop = start + 1
+        while stop < present.size and not present[stop]:
+            stop += 1
+        before_ns = int(expected[start - 1]) if start > 0 and present[start - 1] else None
+        after_ns = int(expected[stop]) if stop < present.size and present[stop] else None
+        gap_hours = (
+            (after_ns - before_ns) / 3_600_000_000_000
+            if before_ns is not None and after_ns is not None
+            else None
+        )
+        runs.append(
+            TimeGapInventory(
+                missing_start_utc=_utc_from_ns(int(expected[start])),
+                missing_end_utc=_utc_from_ns(int(expected[stop - 1])),
+                missing_step_count=stop - start,
+                before_utc=_utc_from_ns(before_ns) if before_ns is not None else None,
+                after_utc=_utc_from_ns(after_ns) if after_ns is not None else None,
+                gap_hours=float(gap_hours) if gap_hours is not None else None,
             )
-        if nww_time.size >= 2:
-            maximum_gap_hours = float(np.max(np.diff(nww_time)) / 3_600_000_000_000)
-            if maximum_gap_hours > maximum_nww_gap_hours + 1e-12:
-                findings.append(
-                    Finding(
-                        "error",
-                        "NWW_TIME_GAP_EXCEEDED",
-                        f"${nww_root_token}/{relative.as_posix()}",
-                        f"最大 gap={maximum_gap_hours:.6g} h，限制={maximum_nww_gap_hours:.6g} h",
-                    )
-                )
-    except (OSError, TypeError, ValueError) as exc:
-        findings.append(Finding("error", "TIME_ALIGNMENT_UNREADABLE", f"{flow_domain_id}/{month}", str(exc)))
+        )
+        start = stop
+    return runs
 
 
-def _compare_cross_month_time_boundaries(
+def _inspect_canonical_time_axis(
     *,
-    nww_root: Path,
-    nww_root_token: str,
+    product: str,
+    root: Path,
+    root_token: str,
     flow_domain_id: str,
     months: Iterable[str],
-    maximum_gap_hours: float,
+    policy: str,
+    expected_timestep_hours: float,
     findings: list[Finding],
-) -> None:
-    """以曆月切換 UTC 檢查相鄰 cache 的共同時間支撐。
+) -> tuple[CanonicalTimeAxis, TimeAxisInventory] | None:
+    """載入小型月時間軸，建立跨月索引並量化完整期間 coverage。
 
-    OCM/NWW 每月時間軸已由 ``_compare_month_time_axes`` 逐值比對，因此只需讀一份 NWW
-    軸即可代表共同 forcing boundary。上游 monthly cache 可合法包含前後數日 halo，不能
-    用整個陣列的 first/last 判斷為 overlap error；函式改取前月在曆月界以前的最後支撐與
-    次月在曆月界以後的第一支撐。缺檔由月份 inventory 另報，這裡不重複 missing finding。
+    物理陣列不在此載入。若任一月時間檔缺失或不可讀，月份 inventory 已會指出檔案問題；
+    本函式另以單一 canonical error 說明無法形成完整來源索引，避免輸出誤導的 gap 統計。
     """
 
-    ordered = sorted(months)
-    for previous_month, current_month in zip(ordered[:-1], ordered[1:], strict=True):
-        previous_relative = Path(flow_domain_id) / "months" / previous_month / "time_utc_ns.npy"
-        current_relative = Path(flow_domain_id) / "months" / current_month / "time_utc_ns.npy"
-        previous_path = nww_root / previous_relative
-        current_path = nww_root / current_relative
-        if not previous_path.is_file() or not current_path.is_file():
-            continue
+    chunks: list[TimeChunk] = []
+    ordered_months = sorted(months)
+    for month in ordered_months:
+        relative = Path(flow_domain_id) / "months" / month / "time_utc_ns.npy"
+        path = root / relative
         try:
-            previous = np.load(previous_path, mmap_mode="r", allow_pickle=False)
-            current = np.load(current_path, mmap_mode="r", allow_pickle=False)
-            if previous.ndim != 1 or current.ndim != 1 or previous.size == 0 or current.size == 0:
-                continue
-            boundary = datetime(
-                int(current_month[:4]),
-                int(current_month[4:]),
-                1,
-                tzinfo=UTC,
-            )
-            boundary_ns = int(boundary.timestamp() * 1_000_000_000)
-            previous_support = previous[previous <= boundary_ns]
-            current_support = current[current >= boundary_ns]
-            location = (
-                f"${nww_root_token}/{previous_relative.as_posix()} ↔ "
-                f"${nww_root_token}/{current_relative.as_posix()}"
-            )
-            if previous_support.size == 0 or current_support.size == 0:
-                findings.append(
-                    Finding(
-                        "error",
-                        "CROSS_MONTH_BOUNDARY_UNSUPPORTED",
-                        location,
-                        f"曆月界 {boundary.isoformat()} 前後缺少可用時間支撐",
-                    )
-                )
-                continue
-            gap_hours = (int(current_support[0]) - int(previous_support[-1])) / 3_600_000_000_000
-            if gap_hours > maximum_gap_hours + 1.0e-12:
-                findings.append(
-                    Finding(
-                        "error",
-                        "CROSS_MONTH_TIME_GAP_EXCEEDED",
-                        location,
-                        f"跨月 gap={gap_hours:.6g} h，限制={maximum_gap_hours:.6g} h",
-                    )
-                )
+            chunks.append(TimeChunk(month, np.load(path, mmap_mode="r", allow_pickle=False)))
         except (OSError, TypeError, ValueError) as exc:
             findings.append(
                 Finding(
                     "error",
-                    "CROSS_MONTH_TIME_UNREADABLE",
-                    f"{flow_domain_id}/{previous_month}-{current_month}",
+                    "CANONICAL_TIME_AXIS_UNREADABLE",
+                    _tokenized_path(root_token, relative),
                     str(exc),
                 )
             )
+            return None
+    try:
+        canonical = canonicalize_time_chunks(
+            chunks,
+            policy=policy,  # type: ignore[arg-type]
+            expected_timestep_hours=expected_timestep_hours,
+        )
+        expected = _expected_hourly_axis(
+            ordered_months,
+            expected_timestep_hours=expected_timestep_hours,
+        )
+    except ValueError as exc:
+        findings.append(
+            Finding(
+                "error",
+                "CANONICAL_TIME_AXIS_INVALID",
+                f"${root_token}/{flow_domain_id}/months",
+                str(exc),
+            )
+        )
+        return None
+
+    available_mask = np.isin(expected, canonical.time_utc_ns, assume_unique=False)
+    available_count = int(np.count_nonzero(available_mask))
+    gaps = _missing_runs(expected, canonical.time_utc_ns)
+    internal_gap_hours = [item.gap_hours for item in gaps if item.gap_hours is not None]
+    inventory = TimeAxisInventory(
+        product=product,
+        flow_domain_id=flow_domain_id,
+        policy=canonical.policy,
+        expected_timestep_hours=expected_timestep_hours,
+        input_time_count=canonical.input_time_count,
+        canonical_time_count=int(canonical.time_utc_ns.size),
+        reordered_time_step_count=canonical.reordered_time_step_count,
+        dropped_duplicate_time_step_count=canonical.dropped_duplicate_time_step_count,
+        expected_period_time_count=int(expected.size),
+        available_period_time_count=available_count,
+        missing_period_time_count=int(expected.size - available_count),
+        extra_halo_time_count=int(np.count_nonzero(~np.isin(canonical.time_utc_ns, expected))),
+        coverage_fraction=available_count / int(expected.size),
+        time_start_utc=_utc_from_ns(int(canonical.time_utc_ns[0])),
+        time_end_utc=_utc_from_ns(int(canonical.time_utc_ns[-1])),
+        maximum_internal_gap_hours=max(internal_gap_hours, default=expected_timestep_hours),
+        gaps=gaps,
+    )
+    location = f"${root_token}/{flow_domain_id}/months"
+    if canonical.dropped_duplicate_time_step_count:
+        findings.append(
+            Finding(
+                "info",
+                "TIME_DUPLICATES_CANONICALIZED",
+                location,
+                (
+                    f"依 {canonical.policy} 去除 {canonical.dropped_duplicate_time_step_count} 筆重複 UTC；"
+                    f"重排計數={canonical.reordered_time_step_count}"
+                ),
+            )
+        )
+    if inventory.missing_period_time_count:
+        code = (
+            "OCM_TIME_RECONSTRUCTION_REQUIRED"
+            if product == "ocm_native"
+            else "NWW_ANALYSIS_FULL_HOURLY_REBUILD_REQUIRED"
+        )
+        findings.append(
+            Finding(
+                "warning",
+                code,
+                location,
+                (
+                    f"全部可得資料契約下缺 {inventory.missing_period_time_count}/"
+                    f"{inventory.expected_period_time_count} 個規則時次，連續缺口 {len(gaps)} 段，"
+                    f"最大內部端點時距 {inventory.maximum_internal_gap_hours:.6g} h；"
+                    "此 finding 要求重建／gap-safe manifest，不代表等待供應者補件"
+                ),
+            )
+        )
+    return canonical, inventory
+
+
+def _compare_canonical_time_support(
+    *,
+    ocm: CanonicalTimeAxis,
+    nww: CanonicalTimeAxis,
+    flow_domain_id: str,
+    findings: list[Finding],
+) -> None:
+    """確認 NWW 支援所有 OCM UTC；允許完整 hourly NWW 比 gappy OCM 多出時次。
+
+    NWW native 在 SERVER 上具有完整 17,544 個逐時時次，因此正式 analysis 將以靜態 OCM
+    grid 重建完整 hourly 產品。要求兩軸逐值相等反而會阻止這項修正；真正的耦合條件是
+    每一筆觀測或重建 OCM 時次都必須可取得同 UTC 波浪，不能以 nearest time 猜測。
+    """
+
+    unsupported = np.setdiff1d(ocm.time_utc_ns, nww.time_utc_ns, assume_unique=True)
+    if unsupported.size:
+        findings.append(
+            Finding(
+                "error",
+                "NWW_MISSING_OCM_TIME_SUPPORT",
+                flow_domain_id,
+                f"NWW canonical 軸缺少 {unsupported.size} 個 OCM UTC 支撐",
+            )
+        )
+    extra = np.setdiff1d(nww.time_utc_ns, ocm.time_utc_ns, assume_unique=True)
+    if extra.size:
+        findings.append(
+            Finding(
+                "info",
+                "NWW_EXTRA_HOURLY_SUPPORT",
+                flow_domain_id,
+                f"NWW 比原始 OCM 多 {extra.size} 個逐時時次，可供 OCM 缺口重建後同時取樣",
+            )
+        )
 
 
 def _inspect_month(
@@ -324,7 +456,7 @@ def _inspect_month(
     flow_domain_id: str,
     month: str,
     required_schema_major: int,
-    required_status: str,
+    accepted_statuses: set[str],
     required_arrays: Iterable[str],
     accepted_cache_kinds: set[str] | None,
     findings: list[Finding],
@@ -360,10 +492,26 @@ def _inspect_month(
                 f"預期 major={required_schema_major}，實際={schema_value}",
             )
         )
-    if status != required_status:
-        severity = "error" if required_status == "ready" else "warning"
+    if status not in accepted_statuses:
         findings.append(
-            Finding(severity, "STATUS_NOT_READY", location, f"預期 status={required_status}，實際={status}")
+            Finding(
+                "error",
+                "STATUS_REJECTED",
+                location,
+                f"status={status} 不在全部可得資料契約 {sorted(accepted_statuses)}",
+            )
+        )
+    elif status == "trial_ready":
+        # 上游名稱只表示 forecast-cycle 優先序不宣稱為最佳預報。研究團隊已決定資料
+        # 提供者不可考，故 LBT 以固定 lexical selection 與完整 audit 接受它；仍在報告留下
+        # info，防止成果文字把它誤寫成 provider-confirmed analysis cycle。
+        findings.append(
+            Finding(
+                "info",
+                "AVAILABLE_SAMPLE_STATUS_ACCEPTED",
+                location,
+                "接受 trial_ready 的全部可得樣本；不等待供應者確認，也不宣稱為最佳 forecast cycle",
+            )
         )
     if accepted_cache_kinds is not None and cache_kind not in accepted_cache_kinds:
         findings.append(
@@ -372,6 +520,15 @@ def _inspect_month(
                 "CACHE_KIND_REJECTED",
                 location,
                 f"cache_kind={cache_kind} 不在 {sorted(accepted_cache_kinds)}",
+            )
+        )
+    elif cache_kind == "standard_partial_month":
+        findings.append(
+            Finding(
+                "info",
+                "AVAILABLE_PARTIAL_MONTH_ACCEPTED",
+                location,
+                "依全部可得 2024–2025 契約納入 partial month；缺時由跨月 canonical coverage 統一處理",
             )
         )
 
@@ -458,9 +615,10 @@ def run_preflight(
 ) -> PreflightReport:
     """對所有設定 domain 執行 OCM/NWW 月份低記憶體 inventory。
 
-    若未指定 ``months``，依設定年份產生 24 個 ``YYYYMM``。開發模式仍使用正式 status
-    要求產生 error，但 caller 可保存報告並繼續合成/pilot；正式模式除輸入 error 外，
-    還會先驗證設定衍生閘門並於失敗時直接回報例外。
+    若未指定 ``months``，依設定年份產生 24 個 ``YYYYMM``。月份 status/cache kind 依
+    ``available_2024_2025`` 契約判定；partial 或 ``trial_ready`` 名稱本身不再是正式阻擋，
+    但仍以 info 保存其限制。正式模式除輸入 error 外，還會先驗證重建、幾何與收斂等
+    衍生 manifest，避免把「接受全部可得資料」誤解為「可略過科學驗證」。
     """
 
     if formal_release:
@@ -484,7 +642,25 @@ def run_preflight(
     nww_contract = config.inputs.nww_contract
     ocm_required = tuple(str(name) for name in ocm_contract["required_month_arrays"])
     nww_required = tuple(str(name) for name in nww_contract["required_arrays"])
-    accepted_kinds = {str(value) for value in ocm_contract.get("accepted_cache_kinds", [])}
+    ocm_accepted_kinds = {str(value) for value in ocm_contract.get("accepted_cache_kinds", [])}
+    nww_accepted_kinds = {str(value) for value in nww_contract.get("accepted_cache_kinds", [])}
+    ocm_accepted_statuses = {
+        str(value)
+        for value in ocm_contract.get(
+            "accepted_statuses",
+            [ocm_contract.get("required_status", "ready")],
+        )
+    }
+    nww_accepted_statuses = {
+        str(value)
+        for value in nww_contract.get(
+            "accepted_statuses",
+            [nww_contract.get("required_status", "ready")],
+        )
+    }
+    time_contract = config.inputs.time_axis_contract
+    policy = str(time_contract["canonicalization_policy"])
+    expected_timestep_hours = float(time_contract["expected_timestep_hours"])
     for domain in config.domains:
         resolved_domain_id = (
             domain.formal_release_flow_domain_id
@@ -518,9 +694,9 @@ def run_preflight(
                     flow_domain_id=resolved_domain_id,
                     month=month,
                     required_schema_major=int(ocm_contract["required_schema_major"]),
-                    required_status=str(ocm_contract["required_status"]),
+                    accepted_statuses=ocm_accepted_statuses,
                     required_arrays=ocm_required,
-                    accepted_cache_kinds=accepted_kinds,
+                    accepted_cache_kinds=ocm_accepted_kinds,
                     findings=report.findings,
                 )
             )
@@ -532,28 +708,41 @@ def run_preflight(
                     flow_domain_id=resolved_domain_id,
                     month=month,
                     required_schema_major=int(nww_contract["required_schema_major"]),
-                    required_status=str(nww_contract["required_status"]),
+                    accepted_statuses=nww_accepted_statuses,
                     required_arrays=nww_required,
-                    accepted_cache_kinds=None,
+                    accepted_cache_kinds=nww_accepted_kinds or None,
                     findings=report.findings,
                 )
             )
-            _compare_month_time_axes(
-                ocm_root=Path(ocm_native_root),
-                nww_root=Path(nww_analysis_root),
-                ocm_root_token=config.inputs.ocm_native_root_env,
-                nww_root_token=config.inputs.nww_analysis_root_env,
-                flow_domain_id=resolved_domain_id,
-                month=month,
-                maximum_nww_gap_hours=float(nww_contract["maximum_time_gap_hours"]),
-                findings=report.findings,
-            )
-        _compare_cross_month_time_boundaries(
-            nww_root=Path(nww_analysis_root),
-            nww_root_token=config.inputs.nww_analysis_root_env,
+        ocm_axis_result = _inspect_canonical_time_axis(
+            product="ocm_native",
+            root=Path(ocm_native_root),
+            root_token=config.inputs.ocm_native_root_env,
             flow_domain_id=resolved_domain_id,
             months=month_labels,
-            maximum_gap_hours=float(nww_contract["maximum_time_gap_hours"]),
+            policy=policy,
+            expected_timestep_hours=expected_timestep_hours,
             findings=report.findings,
         )
+        nww_axis_result = _inspect_canonical_time_axis(
+            product="nww3_analysis",
+            root=Path(nww_analysis_root),
+            root_token=config.inputs.nww_analysis_root_env,
+            flow_domain_id=resolved_domain_id,
+            months=month_labels,
+            policy=policy,
+            expected_timestep_hours=expected_timestep_hours,
+            findings=report.findings,
+        )
+        if ocm_axis_result is not None:
+            report.time_axes.append(ocm_axis_result[1])
+        if nww_axis_result is not None:
+            report.time_axes.append(nww_axis_result[1])
+        if ocm_axis_result is not None and nww_axis_result is not None:
+            _compare_canonical_time_support(
+                ocm=ocm_axis_result[0],
+                nww=nww_axis_result[0],
+                flow_domain_id=resolved_domain_id,
+                findings=report.findings,
+            )
     return report

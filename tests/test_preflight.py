@@ -118,8 +118,8 @@ def test_preflight_accepts_ready_fixture_and_tokenizes_paths(tmp_path: Path) -> 
     assert "$OCM_NATIVE_ROOT/" in serialized
 
 
-def test_preflight_blocks_trial_ready_nww(tmp_path: Path) -> None:
-    """SERVER 現況的 NWW ``trial_ready`` 只能供 pilot，正式 status gate 必須報錯。"""
+def test_preflight_accepts_trial_ready_under_available_data_contract(tmp_path: Path) -> None:
+    """供應者不可考後，trial_ready 依固定 lexical audit 正式採用，但仍留下 info。"""
 
     config = _small_config()
     ocm_root = tmp_path / "ocm"
@@ -130,9 +130,27 @@ def test_preflight_blocks_trial_ready_nww(tmp_path: Path) -> None:
         _write_month(ocm_root, domain.flow_domain_id, product="ocm_native", status="ready")
         _write_month(nww_root, domain.flow_domain_id, product="nww3_analysis", status="trial_ready")
     report = run_preflight(config, ocm_native_root=ocm_root, nww_analysis_root=nww_root, months=["202401"])
+    assert report.formal_ready
+    accepted = [finding for finding in report.findings if finding.code == "AVAILABLE_SAMPLE_STATUS_ACCEPTED"]
+    assert len(accepted) == 4
+    assert not any(finding.code == "STATUS_REJECTED" for finding in report.findings)
+
+
+def test_preflight_rejects_status_outside_available_contract(tmp_path: Path) -> None:
+    """接受 trial_ready 不代表任意狀態都可通過；未知或損毀狀態仍須 fail closed。"""
+
+    config = _small_config()
+    ocm_root = tmp_path / "ocm"
+    nww_root = tmp_path / "nww"
+    for domain in config.domains:
+        _write_grid(ocm_root, domain.flow_domain_id, product="ocm_native")
+        _write_grid(nww_root, domain.flow_domain_id, product="nww3_analysis")
+        _write_month(ocm_root, domain.flow_domain_id, product="ocm_native", status="ready")
+        _write_month(nww_root, domain.flow_domain_id, product="nww3_analysis", status="corrupt")
+    report = run_preflight(config, ocm_native_root=ocm_root, nww_analysis_root=nww_root, months=["202401"])
     assert not report.formal_ready
-    assert {finding.code for finding in report.findings} == {"STATUS_NOT_READY"}
-    assert len(report.findings) == 4
+    rejected = [finding for finding in report.findings if finding.code == "STATUS_REJECTED"]
+    assert len(rejected) == 4
 
 
 def test_preflight_checks_actual_npy_header_against_metadata(tmp_path: Path) -> None:
@@ -159,7 +177,7 @@ def test_preflight_checks_actual_npy_header_against_metadata(tmp_path: Path) -> 
 
 
 def test_preflight_checks_cross_month_time_gap(tmp_path: Path) -> None:
-    """各月內部皆為 1 小時仍不足；相鄰月份邊界的 10 小時缺口也必須被找出。"""
+    """月界 10 小時端點距離應在 canonical 軸記成缺 9 筆，而不是重複 blocker。"""
 
     config = _small_config()
     ocm_root = tmp_path / "ocm"
@@ -192,6 +210,13 @@ def test_preflight_checks_cross_month_time_gap(tmp_path: Path) -> None:
         nww_analysis_root=nww_root,
         months=["202402", "202401"],
     )
-    gaps = [finding for finding in report.findings if finding.code == "CROSS_MONTH_TIME_GAP_EXCEEDED"]
-    assert len(gaps) == 4
-    assert all("gap=10 h" in finding.message for finding in gaps)
+    matching = [
+        gap
+        for inventory in report.time_axes
+        for gap in inventory.gaps
+        if gap.before_utc == "2024-01-31T23:00:00Z" and gap.after_utc == "2024-02-01T09:00:00Z"
+    ]
+    assert len(matching) == 8
+    assert all(gap.gap_hours == 10.0 and gap.missing_step_count == 9 for gap in matching)
+    assert report.formal_ready
+    assert not any(finding.code.startswith("CROSS_MONTH") for finding in report.findings)

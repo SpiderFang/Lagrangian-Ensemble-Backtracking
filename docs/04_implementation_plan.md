@@ -36,7 +36,8 @@ A、B、C、D 四條工程工作流立即同時啟動。真正不可跳過的關
 | LBT-002 | P0 | forcing 語意核對 | OCM `hvel/w/zcor/elev/wetdry/diffusivity` 與 NWW3 `Hs/fp/DP` 的單位、方向、mask、gap 與時間對位有證據 | LBT-001，可先讀相鄰專案契約 |
 | LBT-003 | P0 | 科學 manifests | 依文件 08 生成恰好 10 個 behavior classes、每站 20／全案 100 個 receptors、每站 50 個 arrival-time 條件；每列含 site、region、版本、UTC、深度基準與衍生證據 | SERVER 資料與既定演算法；schema 可先行 |
 | LBT-004 | P0 | 運算與儲存 preflight | 核定 output/scratch、檔案系統、可用 CPU/RAM、配額與原子發布方法 | LBT-001；不阻塞合成開發 |
-| LBT-005 | P0 | A 區 expanded forcing 規格與產物 | 現行 v3 固定為 pilot；建立新 domain version，目標南界不北於約 `24.50°N`，並證明 OCM native／surface 與 NWW analysis 對龜山島 25/35 km 邊界至少保留兩個共同有效格點 | LBT-001/002；可先定 schema，正式產物屬 G1 gate |
+| LBT-005 | P0 | A 區 expanded forcing 規格與產物 | 現行 v3 固定為 pilot；產製 `northeast_taiwan_common_cache_v4_lbt_south_expanded`、bbox `[121.306315,122.793685,24.480000,25.499156]`，並證明 OCM native／surface 與 NWW analysis 對龜山島 25/35 km 邊界至少保留兩個共同有效格點 | LBT-001/002；正式產物屬 G1 gate，由本專案接續處理，不需使用者先擴域 |
+| LBT-006 | P0 | 全期 canonical 與 forcing 重建 | OCM stable sort/prefer-last、實際 gap-shape blocked validation、immutable reconstruction patch；NWW native 17,544 UTC 重建 full-hour analysis；未通過的 OCM 長缺口以 gap-safe arrival/horizon fallback | LBT-001/002；不等待供應者補件 |
 
 **G0 完成條件：** 正式根路徑與輸入契約可稽核；未通過文件 08 衍生閘門的欄位會被 config validator 拒絕。G0 未完成仍可實作與測試，但不得啟動正式科學批次；這些 gate 由資料與測試產出，不需再向使用者徵詢方案。
 
@@ -47,11 +48,12 @@ A、B、C、D 四條工程工作流立即同時啟動。真正不可跳過的關
 | LBT-101 | P0 | config/preflight CLI | normalized config hash、input inventory、decision-status 檢查與小記憶體讀取 | LBT-001/002；可先用 fixture |
 | LBT-102 | P0 | CRS 與 geometry | 公尺制投影 round-trip、四個 flow domains、貢寮／龜山島 12.5/25 km wet-ocean polygons、重疊保留、共用 A outer boundary、own/foreign local crossing、boundary segment/arclength 與 receptor 深度 schema 測試 | LBT-003/005 schema |
 | LBT-103 | P0 | SCHISM mesh locator | tri/quad 拆分、orientation、spatial index、barycentric 權重、coast/wetdry 支撐與 face provenance | OCM grid fixture |
-| LBT-104 | P0 | OCM 4D sampler | x/y/z/t 線性場精確；surface/bed、layer bottom index、month window、gap 與無外插測試通過 | LBT-103、LBT-002 |
-| LBT-105 | P0 | NWW3 sampler | mask-aware x/y/t 取樣、DP wave-from→propagation-to、Hs/fp QC 與 gap policy 通過 | LBT-002、LBT-102 |
+| LBT-104 | P0 | OCM 4D sampler | x/y/z/t 線性場精確；surface/bed、layer bottom index、canonical month window、observed/reconstructed origin 與 manifest 外無外插測試通過 | LBT-103、LBT-002/LBT-006 |
+| LBT-105 | P0 | NWW3 sampler | full-hour analysis 的 mask-aware x/y/t 取樣、DP wave-from→propagation-to、方向圓形內插、Hs/fp QC 與 manifest 外 gap policy 通過 | LBT-002/LBT-006、LBT-102 |
 | LBT-106 | P0 | 單日實值 QC | 速度／波向箭頭、垂向切片、有效率、海岸與缺值圖面無未解釋異常 | LBT-104/105、SERVER 資料 |
 
-**G1 完成條件：** 合成與實值 sampler 均不會跨陸地、海床、時間缺口或無效 wave mask 靜默外插。
+**G1 完成條件：** 合成與實值 sampler 均不會跨陸地、海床、未登錄時間缺口或無效 wave
+mask 靜默外插；每一重建時次及 forcing member 都能回溯方法、驗證與 checksum。
 
 ### G2：物理與數值核心
 

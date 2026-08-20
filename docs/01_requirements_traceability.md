@@ -73,7 +73,8 @@
 
 - 抵達 forcing 起始時間；
 - 達到核定 `max_backtrack_days`；
-- 遇到不可接受的資料缺口；
+- 遇到 manifest 外缺檔、checksum/I/O 損毀、空間必要欄位無效或重建失敗；已知 OCM
+  整時缺口須在 run 前由 approved reconstruction 或 gap-safe arrival/horizon 處理；
 - 進入無法物理解釋的海陸／海床以下狀態；
 - 超過步數、NaN 或定位失敗等數值保護條件。
 
@@ -85,14 +86,20 @@
 
 | region | 經度範圍（°E） | 緯度範圍（°N） | 獨立站點 | forcing domain |
 |---|---:|---:|---|---|
-| A 東北角海域 | 現行 121.30-122.79；正式版由共同有效格推導 | 現行 24.60-25.49；正式南界目標不北於約 24.50 | 貢寮、龜山島 | 現行 `northeast_taiwan_common_cache_v3` 僅供開發／pilot；正式 run 使用新版本 ID |
+| A 東北角海域 | 121.306315–122.793685 | 現行南界 24.600844；正式 v4 候選南界 24.480000 | 貢寮、龜山島 | 現行 `northeast_taiwan_common_cache_v3` 僅供開發／pilot；正式候選為 `northeast_taiwan_common_cache_v4_lbt_south_expanded` |
 | B 新竹外海 | 119.70-121.19 | 24.30-25.19 | 新竹 | `hsinchu_cache_v3` |
 | C 後灣海域 | 120.16-121.62 | 21.55-22.44 | 後灣海生館周邊 | `houwan_nmmba_cache_v3` |
 | D 連江海域 | 119.19-120.70 | 25.75-26.64 | 分析範圍整合南竿、北竿 | `lienchiang_common_cache_v3` |
 
 四個 forcing domains 供五站點使用：A 區包含貢寮與龜山島兩套各 20 個 receptors，其餘 B-D 各一套 20 個，全案共 100 個。貢寮／龜山島舊 SVD 候選框因尺度過小，只保留 anchor provenance；正式 local domain 為 anchor-centered 25 km metric buffer 與有效海域的交集，兩者允許重疊。兩站共用同一 A 區 forcing cache 與 outer boundary，以保留相近海域的共同水動力影響；自身 local crossing 是主要入口事件，穿越另一站 local domain 則為不終止的方向性連通診斷，所有 ID、狀態與分母仍按原始站點分開。
 
-SERVER preflight 顯示龜山島 anchor 至現行 A 區南界約 26.64 km，扣除 25 km baseline local radius 後僅餘約 1.64 km，低於約兩個常用 1 km OCM surface/NWW 共同格。故 `northeast_taiwan_common_cache_v3` 不得直接用於正式 25/35 km A 區實驗；正式 run 前須由 OCM native、OCM surface 與 NWW3 的共同有效格建立新的南向擴充 domain，南界目標不北於約 24.50°N，並驗證整個時段的共同 margin、海陸遮罩與缺值覆蓋。若任一 forcing 產品無法支援相同空間範圍，應縮回共同有效 bbox 或阻擋正式發布，不得只擴 OCM 後外插波浪。詳細規則見文件 08。
+SERVER preflight 顯示龜山島 anchor 至現行 A 區南界約 26.64 km，扣除 25 km baseline local
+radius 後僅餘約 1.64 km，低於約兩個常用 1 km OCM surface/NWW 共同格。故 v3 不得直接
+用於正式 25/35 km A 區實驗；正式候選 v4 bbox 為
+`[121.306315,122.793685,24.480000,25.499156]`，龜山島 35 km geodesic 南緣至名目南界
+約 5.22 km。產製後仍以 OCM native、OCM surface 與由完整 NWW native 重建的 analysis
+共同有效格驗證整個時段的 margin、海陸遮罩與缺值覆蓋；不得只擴 OCM 後外插波浪。
+詳細規則見文件 08。
 
 ## 4. 可交付成果
 
@@ -108,8 +115,11 @@ SERVER preflight 顯示龜山島 anchor 至現行 A 區南界約 26.64 km，扣�
 
 ## 5. 不可用來宣稱完成的替代品
 
-- 單日或少數日 `trial_ready` 結果不能取代兩年正式 run。
+- 單日或少數日結果不能取代兩年正式 run；但全期 NWW analysis 的 `trial_ready` 上游標籤
+  已由 available-data contract 接受，不能再誤稱為待供應者升版的 blocker。
 - 只有軌跡動畫，沒有 manifest、事件與統計驗證，不能算模式完成。
 - 只跑單一沉降速度、受體或季節，不能算情境矩陣完成。
-- 使用負 Kh、把 NaN 補 0、跨長缺口外插或把隨機項放入 RK4 stage 的結果不得發布。
+- 使用負 Kh、把 NaN 補 0、未經 blocked validation 跨長缺口外插或把隨機項放入 RK4
+  stage 的結果不得發布；通過門檻且保存 uncertainty/provenance 的 state-space reconstruction
+  不屬於此處禁止的臨時外插。
 - KDE 色階不能自行成為「來源機率」；必須同時保留 raw count、分母、樣本與不確定性。

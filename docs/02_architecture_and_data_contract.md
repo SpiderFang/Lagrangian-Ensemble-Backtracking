@@ -35,7 +35,11 @@
 | `diffusivity.npy` | `(time,node,layer)` | SCHISM tracer eddy diffusivity，目標單位 m²/s；作 Kz 候選而非無條件真值 |
 | `metadata.json`, `quality_report.json` | JSON | status、cache kind、source coverage、array schema 與 QC |
 
-正式 run 要求 schema major=3、`status=ready`。`standard_partial_month` 只有在缺日清單、影響期間與研究團隊核准均寫入 run manifest 時才可納入；粒子不得跨缺口外插。
+正式 run 要求 schema major=3、`status=ready`，並接受 `standard_month` 與
+`standard_partial_month`。後者不是待供應者補件的瑕疵版本，而是「2024–2025 全部可得
+資料」母體的一部分；原始標籤、缺時清單與 coverage 必須原樣保存。各月份 UTC 先以
+stable sort 與 `prefer_last` 去重建立 canonical 軸，再由版本化重建 patch 或 gap-safe
+arrival window 提供連續 forcing；不得覆寫上游快取，也不得在 runtime 臨時跨缺口外插。
 
 ### 2.2 NWW3 analysis schema 1
 
@@ -51,13 +55,25 @@
 | `qc_flags.npy` | `(time,y,x)` | 靜態無效、空間不支援、欄位缺失與時間不支援 |
 | `metadata.json`, `quality_report.json` | JSON | schema、target grid、native spacing、插值、方向限制與 coverage |
 
-正式 run 要求 schema major=1、`status=ready`，且 `flow_domain_id`、target grid geometry、target time source 與 OCM domain 相容。NWW3 是約 0.025° 原生波場重採樣到約 1 km OCM grid；重採樣不提升有效物理解析度，圖說與 metadata 必須保留此限制。
+正式 run 要求 schema major=1，並依本研究的 available-data contract 接受 `ready` 與
+`trial_ready`。這裡的 `trial_ready` 僅表示上游 lexical cycle selection 未宣稱供應者認定的
+最佳 forecast lead；在原始提供者與額外 metadata 已不可取得的條件下，不再把改寫上游
+status 當成正式成果阻擋。SERVER 的 `nww3_native` 已具有 2024-01-01 00:00 至
+2025-12-31 23:00 共 17,544 個連續逐時 UTC，故正式 analysis 由 native 產品重採樣到各
+OCM 靜態格網的完整逐時軸，不沿用舊 OCM target-time 缺口。`flow_domain_id`、target grid
+geometry 與正式 OCM domain 仍須相容。NWW3 是約 0.025° 原生波場重採樣到約 1 km OCM
+grid；重採樣不提升有效物理解析度，圖說與 metadata 必須保留此限制。
 
 ### 2.3 方向與單位基線
 
 - SCHISM 官方物理式使用 `z` positive-up，`hvel` 與 `vertical_velocity` 為 m/s；相鄰專案保存的 SCHISM 變數表亦記載 `elev [m]`、`wind_speed [m/s]`、`dahv [m/s]`、`vertical_velocity [m/s]`、`diffusivity [m²/s]` 與 `hvel [m/s]`。正式 preflight 必須把依據版本與檔案 hash 寫入 manifest。
-- NWW3 的已採用推定慣例是 `DP` 為自正北順時針的 wave-from；傳播去向 `theta_to=(DP+180°) mod 360°`。此慣例須以 config enum 明示，不能在讀檔器內隱藏。
-- 若 SERVER 正式 metadata 與上述基線衝突，停止正式 run、建立 decision record，不自動轉換。
+- NWW3 已採用 `nww3_dp_wnd_two_typhoon_adopted_v1`：`DP` 為自正北順時針的
+  wave-from，傳播去向 `theta_to=(DP+180°) mod 360°`；`.wnd` planes 1/2 分別為東向與
+  北向風分量。此結論由山陀兒與康芮兩個獨立颱風事件交叉判定，研究展示與後續計算均採
+  同一慣例，config/manifest 必須明示契約 ID，不能在讀檔器內隱藏。
+- 未知供應者欄位保持 `unknown`，不得虛構 provider confirmation。只有新的實證與上述
+  研究端契約直接衝突時才停止受影響 run、建立新版 decision record；「無法再詢問供應者」
+  本身不是阻擋。
 
 ## 3. Domain 與座標
 
@@ -93,7 +109,10 @@
 
 expanded A 區的機器可驗證契約至少包含：
 
-- 目標南界不北於約 `24.50°N`，但正式 bbox 以實際可建立的共同有效格網為準，不把近似建議值冒充已生成產品；
+- 新 ID 固定為 `northeast_taiwan_common_cache_v4_lbt_south_expanded`，候選 bbox 為
+  `[121.306315, 122.793685, 24.480000, 25.499156]`；龜山島 35 km geodesic 南緣約
+  `24.527152°N`，至名目南界約保留 5.22 km。bbox 是產製目標，正式驗收仍以實際共同
+  有效格網為準；
 - OCM native triangle、OCM surface 與 NWW analysis 對 25 km baseline 及 35 km sensitivity 的 open-water arcs 均至少保留兩個共同有效格點；
 - OCM/NWW 的 grid、month、time、mask、schema、status、input fingerprint 與方向／單位決策均重新進入 G0/G1，而不是沿用舊 domain 的通過紀錄；
 - 含 Stokes baseline 不得只利用已延伸的 OCM native source margin，因現行 NWW analysis 並未覆蓋該 margin；
@@ -115,7 +134,10 @@ expanded A 區的機器可驗證契約至少包含：
 
 對每個 `(x,y,z,t)`：
 
-1. 找到 OCM 前後兩個時間 slice；超出時間軸或跨越核定缺口即回報 `data_gap`，不外插。
+1. 在 canonical 軸找到前後兩個時間 slice；slice 可來自 immutable observed 月份或
+   approved reconstruction patch，且每一時次保存 origin label。若時間超出核定軸，或
+   manifest 聲稱可重建但 patch/checksum/支撐實際不存在，回報 `data_gap`；不得由 sampler
+   自行最近值填補或跨未登錄缺口外插。
 2. 找到 native triangle 與 source face；檢查動態濕乾狀態。
 3. 在三個 node 上，使用各自 `zcor` 找到包夾 z 的上下有效 layer，線性取樣 `hvel`、`vertical_velocity` 與候選 `diffusivity`；禁止海面以上、海床以下或單側外插。
 4. 三個 node 全部有效後以 barycentric 權重做水平內插；任一必要支撐缺值時保持無效。
@@ -125,12 +147,21 @@ expanded A 區的機器可驗證契約至少包含：
 
 ## 5. NWW3 與 Stokes 取樣器
 
-NWW3 `nww3_analysis` 已與 OCM surface grid/time 對位。粒子位置先轉成該 grid 的 `(y,x)`，以 mask-aware bilinear interpolation 取樣 Hs、fp、DP；四角只要有必要欄位缺值，該 stage 的 Stokes forcing 無效。基線不以最近格點補值。
+正式 NWW3 `nww3_analysis` 與 OCM 靜態 surface grid 對位，時間支撐則由完整 native 軸
+重建為 17,544 個逐時 UTC。粒子位置先轉成該 grid 的 `(y,x)`，以 mask-aware bilinear
+interpolation 取樣 Hs、fp、DP；方向採單位向量的圓形內插，不直接平均角度。四角只要有
+必要欄位缺值，該 stage 的 Stokes forcing 無效；基線不以最近格點補值。
 
 OCM 與 NWW3 缺值政策分開：
 
-- OCM 速度缺失：停止粒子並標 `current_data_gap`。
-- NWW3 缺失：基準含 Stokes run 標 `wave_data_gap`；另有 no-Stokes sensitivity 可繼續，但不得把它混入基準 run。
+- 已知 OCM 整時缺口在正式 run 前完成短缺口／EOF-state-space 重建與 blocked
+  cross-validation；若未達門檻，baseline 改用不跨缺口的分層 arrival windows 與最短已
+  收斂 horizon。已知缺口不能在正式 runtime 才讓全部粒子停止。
+- NWW 既有 analysis 的時間缺口只因舊版沿用 OCM target time；正式版由完整 native 軸
+  重建，無須對波浪時間作統計補值。空間必要欄位若仍無效，含 Stokes baseline 標
+  `wave_data_gap`；no-Stokes 是獨立 sensitivity，不能混入 baseline 分母。
+- `current_data_gap`／`wave_data_gap` 保留給 manifest 外缺檔、checksum 改變、局部重建
+  失敗、空間支撐無效或 I/O 損毀，並在成果中以 failure/coverage 圖揭露。
 
 ## 6. 預定 Python 套件分層
 
@@ -138,6 +169,8 @@ OCM 與 NWW3 缺值政策分開：
 |---|---|
 | `config` | Pydantic/YAML schema、標準化 JSON、hash 與決策狀態 gate |
 | `preflight` | SERVER 路徑、月份、metadata、shape、time、coverage、磁碟與資源 inventory |
+| `time_axis` | 跨月份 stable sort、prefer-last 去重、來源映射與缺口形狀盤點 |
+| `reconstruction` | OCM 短缺口與多變量 EOF-harmonic state-space patch、blocked validation、posterior forcing members 與 provenance |
 | `geometry` | CRS、共用 flow outer domain、站點 local domain、receptor、open-boundary 幾何與 own/foreign crossing |
 | `mesh` | SCHISM face triangulation、spatial index、barycentric locator |
 | `forcing.ocm` | OCM month window、4D current/z/elev/diffusivity sampler |

@@ -1,12 +1,19 @@
 # 實作與 SERVER 驗證稽核（2026-08-19）
 
+> **2026-08-20 更正。** 本文件原先把 NWW `trial_ready`、OCM partial month 與既有
+> analysis 時間缺口解讀成必須等上游／供應者修復的正式阻擋。研究團隊已裁決現有
+> OCM/NWW 為「2024–2025 全部可得資料」的完整正式母體，且供應者與額外 metadata 均
+> 不可能再取得；NWW 方向也已由兩個獨立颱風事件定案。以下第 3、4 節已依重新盤點的
+> canonical 時間軸改寫，舊 preflight JSON 只作歷史證據，不代表現行正式判準。
+
 ## 1. 結論
 
-本專案已由純規劃狀態進入「可執行 reference core、可進資料修復與 pilot」階段。本機與
-SERVER 均可由 `uv.lock` 重建環境、執行 50 項測試、產生 constant-flow backward
+本專案已由純規劃狀態進入「可執行 reference core、可進資料重建與 pilot」階段。本機與
+SERVER 均可由 `uv.lock` 重建環境、執行測試、產生 constant-flow backward
 synthetic shard，並獨立驗證 checksum、CSR、Parquet、時間方向與停止狀態。現階段不可
-啟動 2024–2025 正式 baseline；原因不是尚待使用者選擇科學設計，而是正式輸入、expanded
-A 區、資料衍生 manifests、數值收斂與 production backend gate 尚未完成。
+直接宣稱 2024–2025 baseline 已完成；原因不是缺資料或尚待使用者選擇，而是 OCM
+reconstruction、NWW full-hour analysis、expanded A 區、資料衍生 manifests、數值收斂與
+production backend 尚待由既定方法產製及驗證。
 
 使用者不需再提供額外科學數據或任意指定 `M`、Kh/Kz、dt、回溯期與 shard 大小；這些
 欄位依設計文件由實際資料 QC、代表性 pilot、dt/member/horizon convergence 與 benchmark
@@ -35,46 +42,55 @@ fraction=0 終止會產生同時刻重複 observation；foreign-local 的步末�
 
 部署位置為 `/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking`，不包含本機 `.git`、
 `.venv`、大型 `data/` 或任何認證資料。SERVER 安裝使用 uv 0.12.5、CPython 3.12.13 與
-專案 `uv.lock`；測試結果為 `50 passed`，synthetic shard 的獨立 validator 回報
+專案 `uv.lock`；當次測試結果為 `50 passed`，synthetic shard 的獨立 validator 回報
 `valid=true`。唯讀全期報告保存在 SERVER：
 
 ```text
 /home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking/work/preflight-20260819.json
 ```
 
-該報告只保存環境變數 path token 與相對路徑，不保存 SSH 密碼。報告涵蓋 4 domains ×
-24 months × OCM/NWW 兩類產品，共 192 筆 inventory；共 188 項 finding，未出現 schema
-major、必要陣列、實際 NPY header shape/dtype、domain ID 或 OCM/NWW time-axis mismatch：
+該報告只保存環境變數 path token 與相對路徑，不保存 SSH 密碼。舊報告涵蓋 4 domains ×
+24 months × OCM/NWW 兩類產品，共 192 筆 inventory；其中 188 項 finding 的原始計數如下，
+但現行解釋已更正：
 
 | finding | 數量 | 解釋 |
 |---|---:|---|
-| `STATUS_NOT_READY` | 96 | 四個 domain 的 24 個 NWW analysis 月份全為 `trial_ready`，不是正式要求的 `ready` |
-| `NWW_TIME_GAP_EXCEEDED` | 68 | 四個 domain 各 17 個月超過 1.5 h，最大 gap 72 h；四域月份集合相同 |
-| `CACHE_KIND_REJECTED` | 16 | 四個 domain 的 OCM 202503、202505、202507、202511 為 `standard_partial_month` |
-| `CROSS_MONTH_TIME_GAP_EXCEEDED` | 8 | 四個 domain 的 202403→202404 為 26 h、202404→202405 為 25 h |
+| `STATUS_NOT_READY` | 96 | 舊規則只接受 `ready`；現行 available-data contract 接受 `trial_ready`，並明示不宣稱 provider-confirmed best forecast cycle |
+| `NWW_TIME_GAP_EXCEEDED` | 68 | 舊 analysis 沿用 gappy OCM target times；NWW native 實際完整，不是波浪原始資料缺時 |
+| `CACHE_KIND_REJECTED` | 16 | 舊規則拒絕 partial month；現行視為全部可得資料的一部分，原標籤與 coverage 照實保存 |
+| `CROSS_MONTH_TIME_GAP_EXCEEDED` | 8 | 舊月份邊界檢查未先建立全期 canonical 軸；缺口現改由精確 missing-step inventory 與 reconstruction gate 處理 |
 
-超過 1.5 小時的 17 個月內時間軸為：202401–202406、202409–202412、202502、202503、
-202505–202507、202510、202511；此外還有上述兩個跨月界缺口。這些缺口在 OCM 與 NWW
-的對位時間軸上共同存在；執行器必須於缺口停止，不能內插 24–72 小時或用最近時次填補。
-因而「目錄中有兩年 24 個月份」不等於
-「可無條件執行連續兩年正式軌跡」。上游可選擇補齊缺時資料，或建立經審查的 coverage/
-arrival-time 排除 manifest；本專案不替上游偽造缺值。
+2026-08-20 重新以跨月份 stable sort／`prefer_last` 計算後，四個 OCM domains 的 canonical
+時間軸完全相同：raw 17,196 列、唯一 17,124 列、去除 72 個重複 UTC；相鄰最大間距為
+50 小時，而不是舊月內報表所稱 72 小時。全期 17,544 個理論逐時時次共缺 420 個，其中
+419 個位於內部、另 1 個是 2024-01-01 00:00 的左側邊界；內部缺口為 33 個單一缺時、
+1 個 23-step、11 個 24-step、2 個 25-step 與 1 個 49-step block。coverage 為 97.606%。
+
+NWW native 24 個月份則恰有 17,544 個唯一逐時 UTC，起訖為 2024-01-01 00:00 至
+2025-12-31 23:00、最大間距 1 小時且無缺口。故波浪正式 analysis 可由既有 native 資料與
+OCM 靜態格網直接重建完整逐時產品，不需統計補值。OCM 的 420 個缺時則依
+`ocm_multivariate_eof_harmonic_state_space_smoother_v1` 做 blocked validation，或使用
+gap-safe 分層 arrival windows；兩者都不需外部補件，也不會把所有軌跡在已知缺口停止。
 
 ## 4. 正式批次前的未完成閘門
 
-### 4.1 必須先處理的輸入與幾何
+### 4.1 必須由既有資料完成的輸入與幾何工作
 
-1. 將 NWW analysis 由 `trial_ready` 升版為具方向證據與完整 QC 的 `ready`；波向慣例目前
-   仍是 inferred/adopted，未達正式 `confirmed/approved`。
-2. 釐清並修復上述 17 個月份的 2–72 小時缺口；若 4 個 partial OCM 月份不可補齊，需
-   形成明示 coverage 與排除理由，而非沿用 `standard_month` 名義。
-3. 產生不覆寫現行 v3 的 expanded A flow domain；25 km baseline 與 35 km sensitivity
+1. 由完整 NWW native 產生四個 domain 各 17,544 UTC 的 full-hour analysis；上游
+   `trial_ready` 原樣保留並由 available-data contract 接受，不需也不得冒稱 provider 已確認
+   best forecast cycle。方向固定採已核定的 `nww3_dp_wnd_two_typhoon_adopted_v1`。
+2. 產生 OCM canonical time manifest，對實際 1/23/24/25/49-step gap shapes 進行
+   blocked validation；通過者輸出 immutable reconstruction patch 與 forcing members，未通過
+   者由 gap-safe arrival/horizon selector 迴避。這是專案內運算工作，不等待上游補資料。
+3. 產生不覆寫現行 v3 的 `northeast_taiwan_common_cache_v4_lbt_south_expanded`，候選 bbox
+   為 `[121.306315,122.793685,24.480000,25.499156]`；25 km baseline 與 35 km sensitivity
    對 OCM native、OCM surface、NWW analysis 都須有至少兩個共同有效格點的 outer margin。
 4. 由實際 native mesh 產生 domain、static ocean、local-domain、open-boundary 與 receptor
    manifests。貢寮、龜山島各保留 20 receptors，各自 10,000 基礎情境，僅共用 A forcing
    與 outer boundary；local domains 可重疊。
-5. 由有效 forcing coverage 產生五站各 50 個 arrival UTC；不能選在需跨未核准缺口的
-   區間，且 arrival 的完整回溯窗必須另行檢查。
+5. 由 observed/reconstructed forcing coverage 產生五站各 50 個 arrival UTC；若某種 gap
+   reconstruction 未通過，只在 gap-safe 支撐區間內選擇，且 arrival 的完整回溯窗必須另行
+   檢查。不得因使用 fallback 而刪除任何年份／季節／潮況 strata。
 
 ### 4.2 必須由 pilot 衍生的數值與工程值
 
@@ -97,7 +113,8 @@ arrival-time 排除 manifest；本專案不替上游偽造缺值。
 
 ## 5. 可立即進行的工作
 
-在不放寬 gate 的前提下，可立即使用已部署 reference core 進行單月/完整時段 no-Stokes 或
-已知缺口外的資料接線測試、產生實際 mesh/local/open-boundary/receptor manifests、抽樣核對
-OCM wetdry/Kz 與 NWW 方向，並準備 expanded A 上游產品。正式 config 必須繼續以
+在不放寬 gate 的前提下，可立即使用已部署 reference core 產生 canonical/reconstruction
+validation、NWW full-hour analysis、實際 mesh/local/open-boundary/receptor manifests，並產製
+expanded A 上游產品。NWW 方向無須再次抽樣裁決，只需在每一新版產品做一致性 QC。正式
+config 必須繼續以
 `--formal-release` fail closed；不得把 synthetic smoke 或 current-v3 pilot 描述為計畫成果。

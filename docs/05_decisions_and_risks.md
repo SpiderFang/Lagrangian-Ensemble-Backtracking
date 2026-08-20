@@ -14,13 +14,13 @@
 | ID | 狀態 | 必須完成的閘門 | 問題與目前處理 | 未決時的限制 | owner |
 |---|---|---|---|---|---|
 | D000 | decided | 範圍基線 | 專案只實作紅框「三、Lagrangian 系集逆向溯源」，前處理、SVD、TRAP 不在本 repo 重作 | 範圍擴充需新決策 | 研究團隊／開發 |
-| D001 | derived_pending | G0 | 使用者確認 2024-2025 OCM/NWW 已前處理完成；實際 SERVER inventory 依唯讀 preflight 產生 | 可寫程式與本機 trial；inventory 未通過前正式 run blocked | 資料管理／自動 preflight |
+| D001 | decided | G0 | 現有 OCM/NWW 定義為本研究「2024–2025 全部可得資料」的完整正式母體；原始提供者、額外 metadata 與補件均不可取得，未知欄位照實保存，不再等待外部確認 | 不得宣稱 provider-confirmed best forecast cycle 或虛構 metadata；專案內仍須完成 canonicalization、QC 與衍生產品 | 研究團隊／自動 preflight |
 | D002 | derived_pending | G0/G1 | SCHISM 參考文件支持 hvel/w 為 m/s、diffusivity 為 m²/s、z positive-up；`wetdry_elem` 0/1 由 metadata、實值 snapshot 與測試確認 | 未通過欄位不得被靜默轉換；不需人工任選語意 | 自動 preflight／海洋數值審查 |
-| D003 | derived_pending | G1 | NWW 相鄰專案採 `DP` wave-from；config 固定 `+180°` 轉 propagation-to，並以 cardinal arrow QC 驗證 | 若 metadata 衝突則停止並升版；不靜默猜測 | 自動 preflight／海洋數值審查 |
+| D003 | decided | G1 | 採 `nww3_dp_wnd_two_typhoon_adopted_v1`：由山陀兒與康芮兩個獨立事件判定 `DP` 為自正北順時針 wave-from、`+180°` 轉 propagation-to，`.wnd` planes 1/2 為東／北向風分量；後續產品做 cardinal/vector QC | 只有新實證直接反駁時才建立新版契約並重跑；供應者不可考不是未決項 | 研究團隊／海洋數值審查 |
 | D004 | decided | 情境基線 | `10×20×50=10,000` 套用於貢寮、龜山島、新竹、後灣、連江每一獨立站點；A 區 20,000、全案 50,000，1,000 為誤植。`M` 由 member convergence 衍生 | 不得把任一站 baseline 縮為 1,000、把 A 區兩站合併或把全案縮為 10,000 | 研究團隊／數值／系統 |
 | D005 | derived_pending | G0/G3 | 每站 5 個 deterministic maximin 水平位置 × `0.10H/0.40H/0.70H/near-bed` 四層，共 20；全案 100。實際座標由 OCM persistent-wet mesh 生成 | manifest 未通過前可用合成 receptor 測試，不得凍結正式 scenario table | geometry selector／數值審查 |
 | D006 | decided | G0/G3 | 十個垂向行為速度固定為 `-0.100,-0.030,-0.010,-0.003,-0.001,0,+0.001,+0.003,+0.010,+0.030 m/s`，作未校準行為敏感度類別 | 不得把類別名稱寫成有量測支持的特定材質 | 研究方法基線 |
-| D007 | derived_pending | G0/G3 | 每站 50 個 arrival times 採 48 個年份×季節×大／小潮×三潮位相位 proxy，加局地高波與強流各 1；確切 UTC 由 forcing selector 產生 | 任一站未滿 50 或 coverage 不足時正式矩陣 blocked | deterministic selector／統計審查 |
+| D007 | derived_pending | G0/G3 | 每站 50 個 arrival times 採 48 個年份×季節×大／小潮×三潮位相位 proxy，加局地高波與強流各 1；確切 UTC 由 observed/reconstructed forcing selector 產生，重建未過門檻時限於 gap-safe windows | 不得刪除 strata；若較長 horizon 無法支撐全部 strata，採最短已收斂且可完整覆蓋者並揭露限制 | deterministic selector／統計審查 |
 | D008 | derived_pending | G2/G4 | local first exit 記錄後續跑、flow-domain exit/coast/deposition/surface-regime 停止；`max_backtrack_days` 比較 7/14/30/60 日取最小穩定值 | horizon 未收斂前只可跑 pilot；邊界政策不再任意選擇 | 數值 pilot／方法審查 |
 | D009 | derived_pending | G2 | 常數 Kh/Kz 作 reference，實際值由 Brownian/well-mixed 與 pilot 決定；Smagorinsky + gradient drift 通過 PDE/well-mixed 測試後才可升為基準 | 未通過時不得把空變 K 當正式基準 | 數值驗證／統計 |
 | D010 | provisional | G3 | 軌跡採 ragged NumPy columns、事件／scenario 採 Parquet、immutable shards | benchmark 若顯示 I/O 不合適，需新 schema minor/major 決策 | 開發／系統 |
@@ -28,7 +28,9 @@
 | D012 | provisional | G5 | 結果措辭限定 conditional footprint／relative source weight；absolute probability 需 prior/likelihood/observations | 未補證據不得升級措辭 | 研究團隊 |
 | D013 | decided | G5 | 成果採文獻支持的代表軌跡、條件式密度／HDR、來源—受體矩陣、旅行時間分布、季節／潮況小多圖與不確定性／敏感度圖組；規格見文件 07 | 核心圖與統計表不得以單一動畫或全軌跡疊圖取代 | 研究團隊／開發 |
 | D014 | decided | G0/G5 | 貢寮／龜山島舊候選 bbox 過小，不作 local domain；兩站各以 anchor 半徑 12.5 km receptor core、25 km local domain，並比較 20/35 km。local domains 允許重疊且不作 Voronoi 切割；兩站共用同一 A 區 forcing 與 outer boundary。軌跡只以 own local domain 定義主要入口，foreign-local crossing 非終止且只作連通診斷 | 重疊不合併 scenario 或 denominator；不得因穿越另一站 local domain 而轉移 site、停止或重設 seed | 使用者／研究方法基線 |
-| D015 | derived_pending | G0/G1/G4 | SERVER preflight 顯示龜山島 25 km local boundary 到現行 A 區南界僅餘約 1.64 km，未達兩個約 1 km OCM surface/NWW 共同格點。現行 v3 固定為 pilot；正式 A 區建立新 domain version，目標南界不北於約 `24.50°N`，同時支援 25 km baseline 與 35 km sensitivity | expanded OCM native/surface/NWW 與共同 mask/margin 未通過前，不得把現行 v3 用於龜山島 25 km 正式 baseline，亦不得只引用 native source margin | geometry／forcing preflight |
+| D015 | derived_pending | G0/G1/G4 | 現行 v3 固定為 pilot；正式候選 ID 為 `northeast_taiwan_common_cache_v4_lbt_south_expanded`，bbox `[121.306315,122.793685,24.480000,25.499156]`。龜山島 35 km geodesic 南緣至名目南界約 5.22 km；實際仍驗證 OCM/NWW 共同 mask 與 25/35 km margin | expanded OCM native/surface/NWW 與共同 mask/margin 未通過前，不得把現行 v3 用於龜山島 25 km 正式 baseline，亦不得只引用 native source margin | geometry／forcing preflight |
+| D016 | decided | G0/G1 | OCM 24 月先 stable sort／`prefer_last` 建 canonical 軸；33 個單一缺時比較短缺口內插與 state-space，23–49-step 長缺口採多變量 EOF-harmonic state-space bidirectional smoother 與 posterior forcing members，並以實際缺口形狀做 Eulerian/Lagrangian blocked validation。pure DINEOF 不得單獨補整個缺失 snapshot | 方法未過門檻時 baseline 改用 gap-safe 分層 arrival windows；已知缺口不作正常 runtime terminal | 研究方法／數值驗證 |
+| D017 | decided | G0/G1 | NWW native 2024–2025 實測恰有 17,544 個連續逐時 UTC；正式 analysis 從 native 重採樣到 OCM 靜態格網，方向用單位向量作圓形內插，時間軸涵蓋 observed/reconstructed OCM UTC | 不對波浪時間作統計補值，也不沿用舊 gappy OCM target-time 軸 | forcing 產製／QC |
 
 ## 3. 決策紀錄模板
 
@@ -55,23 +57,23 @@ Supersedes:
 | ID | 風險 | L/I | 預防與緩解 | 觸發與應變 |
 |---|---|---|---|---|
 | R001 | SERVER 路徑、認證或資料權限阻塞 G0 | M/H | 只要求資料管理者在已登入終端跑唯讀 preflight；不透過聊天傳密碼；輸出 inventory 可離線審查 | inventory 未取得時維持本機合成開發，正式 run 標 blocked |
-| R002 | 「已前處理完成」仍含 partial month、時間缺口或 schema 差異 | M/H | 逐 domain/month 讀 metadata/time/QC，不以目錄存在判定 ready | 任一差異分版；arrival times 排除缺口或由研究團隊核准限制 |
+| R002 | OCM partial month、重複時次與完整 snapshot 缺時被誤當成連續 forcing | M/H | 逐 domain/month 盤點，stable sort/prefer-last canonicalization；實際 gap shapes 做 blocked reconstruction validation；保留 origin 與 exposure | 重建未過門檻即採 gap-safe 分層 arrival windows，不在 runtime 最近值填補，也不等待供應者補件 |
 | R003 | OCM wetdry、w 或 Kz 語意錯誤 | M/H | 參考文件、實值分布、海岸 snapshot、合成與局地診斷交叉檢查 | 無法確認則基準不用 wetdry/Kz 的物理解釋，相關 case 降級 |
-| R004 | NWW wave-from/to 解讀反向 | M/H | cardinal unit tests、事件慣例版本、傳播箭頭 QC、DP+180 對照 | 發現衝突立即 major method version，所有 Stokes run 重跑 |
+| R004 | 已核定的 NWW wave-from/to 契約在後續實作中被反向套用 | L/H | 固定 `nww3_dp_wnd_two_typhoon_adopted_v1`、cardinal unit tests、傳播箭頭 QC、DP+180 對照與 manifest contract ID | 新實證衝突或程式違反契約時立即 major method version，所有受影響 Stokes run 重跑 |
 | R005 | native face triangulation 在 quad、洞或海岸跨越錯誤 | M/H | 只用原生 connectivity、退化／orientation QC、coast mask、真實圖面抽查 | 任一跨陸地案例為 G1 blocker，禁止用全域 Delaunay 迴避 |
 | R006 | 垂向內插在陡坡或海床下製造有效速度 | H/H | 每 node 包夾、三 node 完整支撐、surface/bed event、invalid reason | data-gap/bed-contact 異常集中時回查 sampler，不以最近層填補 |
 | R007 | backward diffusion 被誤當真實歷史或機率 | H/H | conditional-footprint 命名、正向-逆向 synthetic、分母與 prior 欄位、措辭審查 | 未通過合成驗證禁止 probability／source attribution 字樣 |
 | R008 | 空變 K 缺 gradient drift，造成人工聚集或穿障壁 | H/H | 常數 K reference、PDE/well-mixed/障壁測試、Milstein sensitivity | 測試失敗：Smagorinsky 不進 baseline，只保留工程診斷 |
 | R009 | bulk Stokes 在近岸、淺水或混合風浪下偏差大 | H/H | finite/deep/no-Stokes、kh/steepness QC、方向與 mean wavelength 對照 | ranking 對 formulation 高敏感：列主要不確定性，不給單一結論 |
 | R010 | OCM 已含波流耦合效應，額外 Stokes 可能重複 | M/H | 查 OCM 產品說明與模式設定；將 no-Stokes 設為核心對照 | 無法確認：報告明載可能 double counting，不作精確量值歸因 |
-| R011 | local/flow domain 太小，人工邊界主導 entry/exit KDE | M/H | 舊候選 bbox 已撤銷；現行 A v3 只作 pilot，正式新版本南界目標不北於約 `24.50°N`；比較 20/25/35 km、早期 exit、HDR/ranking 與共同 forcing margin | 共同 margin 少於兩格、主要指標變化 >10% 或大量短時同邊退出：阻擋該版本並繼續擴域，不縮回舊框 |
+| R011 | local/flow domain 太小，人工邊界主導 entry/exit KDE | M/H | 舊候選 bbox 已撤銷；現行 A v3 只作 pilot，正式 v4 候選南界 `24.480000°N`；比較 20/25/35 km、早期 exit、HDR/ranking 與共同 forcing margin | 共同 margin 少於兩格、主要指標變化 >10% 或大量短時同邊退出：阻擋該版本並繼續擴域，不縮回舊框 |
 | R012 | domain 擴大或 `50,000×M×experiment cases` 導致計算／儲存爆量 | H/H | particle-step benchmark、最小收斂 M、向量化/Numba、shard/checkpoint、流式聚合與容量緩衝 | 超出資源時先增加合理並行、降低已驗證的儲存頻率並延後非核心案例；不得把任一站 baseline 靜默縮為 1,000 |
 | R013 | 每站 20／全案 100 receptors 或每站 50 times 的衍生 manifest 尚未產出，trial 資料被誤當正式成果 | H/H | schema 與 synthetic test 可先行；正式 config 驗證 derived gate 與 `status=approved` | 未通過不得啟動 G4，輸出必須標 TRIAL |
-| R014 | 粒子停留不出界，模擬無限延長 | M/H | forcing start、max age、step limit、data gap 停止；各原因分開統計 | max-age 比例過高：調整研究問題/domain/horizon，不把它當 exit |
+| R014 | 粒子停留不出界，模擬無限延長 | M/H | forcing start、max age、step limit與 manifest 外 data gap 停止；各原因分開統計 | max-age 比例過高：調整研究問題/domain/horizon，不把它當 exit；不得依賴已知缺口代替科學停止條件 |
 | R015 | dt 過大漏掉窄通道、海岸或 crossing | M/H | advective/vertical/diffusive CFL、step-interpolated crossing、dt halving | ranking/HDR 未收斂：縮 dt 並重跑受影響 cases |
 | R016 | checkpoint、worker 或 shard 改變 seed | M/H | hash-derived seed、seed table、restart/merge 等價測試 | checksum/ID 不一致為 G3 blocker，禁止只重跑「看起來失敗」的 member |
 | R017 | KDE bandwidth 與分母選擇主導結論 | H/M | raw exits、1D boundary + 2D map、三 bandwidth、HDR、bootstrap、分母 sidecar | ranking 翻轉：不得給單一來源排序，改報範圍與不穩定性 |
-| R018 | 失敗／缺值區被誤讀為低來源或低路徑密度 | M/H | failure density、有效分母、forcing coverage 與成功率地圖 | 空間失敗集中時先修資料／sampler；不發布未校正密度 |
+| R018 | observed/reconstructed/unsupported 區被混合，低 coverage 誤讀為低來源或低路徑密度 | M/H | origin mask、每軌跡 reconstructed exposure、failure density、有效分母、forcing coverage 與成功率地圖；並列 observed-only/gap-safe、reconstructed 與 forcing-member sensitivity | reconstruction exposure 主導或空間失敗集中時降級結論、改採 gap-safe baseline 或改善模型；不發布未校正密度 |
 | R019 | 大型資料或私密 SERVER path 誤提交 Git | L/H | `.gitignore`、root token、secret/path scan、只提交 schema 與小 fixture | 發現即停止發布，移除敏感歷史並重建乾淨 release |
 | R020 | 中文註解、README、schema 與程式行為不同步 | M/M | PR checklist、docstring/README/tests 同任務更新、每週文件檢查 | 行為已變但文件未更新：不得合併或通過 gate |
 | R021 | local domains 重疊造成 site 歸屬、事件或分母混用 | M/H | own-local first-exit 與 foreign-local diagnostic 使用不同 event types；`study_site_id` immutable；跨站比例按原站有效 members 正規化 | foreign crossing 改變 scenario/site/seed/停止狀態或進入主要入口分母時，視為 G2/G5 blocker |

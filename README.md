@@ -2,12 +2,14 @@
 
 本專案實作「三、Lagrangian 系集逆向溯源」：針對完全沉沒於三維水體中的懸浮、沉降、上浮與近底廢棄物，以 CWA-OCM 三維海流、CWA-NWW3 波浪衍生的 Stokes drift、浮沉速度及次網格擴散，從受體位置與到達時間向過去建立條件式來源足跡。
 
-目前狀態為 `reference_core_implemented_pilot_gated`。設定/preflight、native forcing adapters、
+目前狀態為 `reference_core_implemented_available_data_reconstruction_gated`。設定/preflight、native forcing adapters、
 signed-time RK4、Stokes、擴散、巢狀邊界、scenario×member 分片、不可變 shard/checkpoint 與
-核心聚合均已有可執行實作及測試；本機與 SERVER 均為 50 項測試通過，SERVER synthetic
-shard 驗證成功。2024–2025 正式模擬尚未宣稱完成，因全期 preflight 已證實 NWW
-`trial_ready`、17 個月份的時間缺口、4 個 partial OCM 月份及 expanded A/衍生 pilot gate
-仍待處理。詳細證據見 [2026-08-19 實作稽核](docs/09_implementation_audit_2026-08-19.md)。
+核心聚合均已有可執行實作及測試；SERVER synthetic shard 驗證成功。研究團隊已將現存
+OCM/NWW 凍結為正式的「2024–2025 全部可得資料」母體，`trial_ready`、partial month 與
+供應者 metadata 不再是等待外部補件的阻擋。正式模擬尚未宣稱完成，是因 OCM 缺時重建
+交叉驗證（或 gap-safe arrival/horizon manifest）、NWW 完整逐時 analysis、expanded A 與
+數值／幾何衍生 gate 仍在實作。修正後的
+證據與方法見[全部可得資料、時間重建與 A 區擴張決策](docs/10_available_data_time_reconstruction_and_a_expansion.md)。
 
 ## 工項邊界
 
@@ -21,7 +23,8 @@ shard 驗證成功。2024–2025 正式模擬尚未宣稱完成，因全期 pref
 
 本專案不負責：
 
-- 重做 OCM/NWW3 raw data 前處理，或直接讀取原始 NetCDF／transfer archive。
+- LBT runtime 不直接讀取原始 NetCDF／transfer archive；expanded A 與完整逐時 NWW analysis
+  仍由相鄰前處理專案的正式入口產製，本專案負責版本、驗證與唯讀接線。
 - 重做 `OCM-SVD-Analysis`，或實作 TRAP 分析。
 - 對完全沉沒物體加入 windage；若未來擴充表面漂浮類別，必須另立方法版本。
 - 在缺少先驗、觀測及調查努力量時，把條件式足跡宣稱為絕對來源機率、法律責任或因果歸因。
@@ -32,8 +35,8 @@ shard 驗證成功。2024–2025 正式模擬尚未宣稱完成，因全期 pref
 | 上游專案 | 正式輸入 | 本專案用途 |
 |---|---|---|
 | `OCM-Data-Preprocessing` | schema 3 `ocm_native/<flow_domain_id>/grid` 與 `months/YYYYMM` | 原生 SCHISM node/face/edge 拓撲、`hvel`、`vertical_velocity`、`zcor`、`elev`、`wetdry_elem`、`diffusivity` |
-| `NWW-Data-Preprocessing` | schema 1 `nww3_analysis/<flow_domain_id>/months/YYYYMM` | 已對位 OCM 時空格網的 `significant_wave_height`、`peak_frequency`、`peak_direction_raw_deg`、遮罩與 QC |
-| `OCM-SVD-Analysis` | 僅參考其資料載入、固定 z 垂向內插、run manifest 與 SERVER 執行慣例 | 不把 SVD 模態當作粒子 forcing，也不建立程式相依 |
+| `NWW-Data-Preprocessing` | schema 1 `nww3_analysis/<flow_domain_id>/months/YYYYMM` | 由完整 17,544 小時 native 軸對位靜態 OCM 格網的 `significant_wave_height`、`peak_frequency`、`peak_direction_raw_deg`、遮罩與 QC |
+| `OCM-SVD-Analysis` | 參考其全部可得資料 canonical time、固定 z 垂向內插與 run manifest | 不把既有 SVD 模態直接當粒子 forcing；LBT 的 EOF-state-space 重建另立版本與驗證 |
 
 正式路徑一律由環境變數或設定注入，程式內不得硬編碼：
 
@@ -60,7 +63,7 @@ LBT_OUTPUT_ROOT=<具足夠容量且經 preflight 確認的本機或 SERVER 路�
 
 因此不是「A 區 20 個 receptors 如何分配」，而是**貢寮 20 個、龜山島 20 個**，其餘三站點亦各 20 個，全案 receptor manifest 恰有 100 個三維 receptors。舊 SVD 候選框只保留 anchor provenance，不作正式 local domain；25 km local domains 允許重疊，但四套 forcing 不重複儲存或運算，情境、seed、事件、聚合與圖表仍以 `study_site_id` 分開。貢寮或龜山島的軌跡離開自己的 local domain 後只記錄主要入口事件並繼續使用共用 A 區 forcing；穿越另一站 local domain 不停止、不轉移 scenario 所屬，只另存為跨站連通診斷。兩站的最外層停止邊界始終是同一個 A 區 flow-domain open boundary。
 
-SERVER preflight 顯示龜山島 25 km local boundary 到現行 A 區名目南界僅餘約 1.64 km，小於兩個約 1 km OCM surface／NWW 格點的預登錄餘裕。現行 v3 可供程式開發與 pilot，但正式 25 km baseline 與 35 km 敏感度須建立新的 A 區 forcing domain version，目標南界不北於約 `24.50°N`，且以實際 OCM、NWW 有效格網證明至少兩格 margin；不得只修改 bbox 名稱或利用無波浪支撐的 OCM source margin。完整幾何、受體、物性、時間與停止條件見 [五站點情境與巢狀邊界設計基線](docs/08_design_baseline_and_derived_gates.md)。
+SERVER preflight 顯示龜山島 25 km local boundary 到現行 A 區名目南界僅餘約 1.64 km，小於兩個約 1 km OCM surface／NWW 格點的預登錄餘裕。現行 v3 可供程式開發與 pilot；正式版採新 ID `northeast_taiwan_common_cache_v4_lbt_south_expanded`，南界 `24.480000°N`。龜山島 35 km geodesic 南緣約 `24.527152°N`，名目餘裕約 5.22 km；最終仍以實際 OCM/NWW 共同有效格網證明，不得只修改 bbox 名稱。完整幾何見[五站點情境與巢狀邊界設計基線](docs/08_design_baseline_and_derived_gates.md)，產製與時間方法見[全部可得資料決策](docs/10_available_data_time_reconstruction_and_a_expansion.md)。
 
 ## 核心方法決策
 
@@ -70,7 +73,8 @@ SERVER preflight 顯示龜山島 25 km local boundary 到現行 A 區名目南�
 4. 確定性 OCM + Stokes + 浮沉使用向量化 RK4；隨機擴散以獨立 operator split 的 Euler-Maruyama／Milstein 路徑處理，不把隨機增量塞入 RK4 stage。
 5. backward baseline 對確定性 drift 作逆時間積分，擴散維持正變異；結果稱為 conditional footprint。嚴格 reversed-time SDE 僅能在獨立方法驗證後作敏感度版本。
 6. Stokes drift 以 `Hs`、`Tp=1/fp`、峰值波向與有限水深分散關係計算 monochromatic bulk profile；深水公式須回復附檔式 (7)，並以 no-Stokes、深水式與有限水深式做敏感度。
-7. 貢寮／龜山島採巢狀邊界：首次離開自己的 local domain 時記錄關注海域入口但繼續回溯，首次離開共用 A 區 flow domain 才停止；穿越另一站 local domain 只作非終止的跨站連通診斷。另以海岸、海床沉積、上浮至海面而超出完全沉沒模型、forcing 起始、資料缺口、最大回溯期及數值失敗作明確事件／停止條件。
+7. 貢寮／龜山島採巢狀邊界：首次離開自己的 local domain 時記錄關注海域入口但繼續回溯，首次離開共用 A 區 flow domain 才停止；穿越另一站 local domain 只作非終止的跨站連通診斷。已知 OCM 缺時先經 approved reconstruction 或 gap-safe arrival window 處理，不作正常 baseline 停止點；`data_gap` 只保留給 manifest 外缺檔、重建失敗或 I/O 損毀。
+8. 全期 UTC 先以 stable-sort/prefer-last canonicalization 去除 72 筆重複；OCM 17,124/17,544 個可用時次中的 420 個缺時，以單時次候選插值及 EOF-harmonic state-space smoother 做 blocked validation。NWW native 本身為 17,544/17,544 完整逐時資料，缺少的 analysis 時次直接重新格網化，不做統計補值。
 
 ## 情境與軌跡計數
 
@@ -118,9 +122,12 @@ flowchart LR
 ├── pyproject.toml
 ├── uv.lock
 ├── configs/
-│   └── lagrangian_backtracking.example.yaml
+│   ├── lagrangian_backtracking.example.yaml
+│   └── upstream/ocm_flow_domains_lbt_a_v4.json
+├── scripts/
+│   └── prepare_a_v4_forcing.sh
 ├── src/lagrangian_backtracking/
-│   ├── forcing.py, mesh.py, stokes.py
+│   ├── forcing.py, mesh.py, stokes.py, time_axis.py
 │   ├── integrators.py, diffusion.py, engine.py, boundaries.py
 │   ├── scenarios.py, runner.py, receptors.py, arrival_times.py
 │   └── outputs.py, checkpoint.py, aggregation.py, preflight.py, cli.py
@@ -134,7 +141,8 @@ flowchart LR
     ├── 06_server_runbook_plan.md
     ├── 07_results_visualization_plan.md
     ├── 08_design_baseline_and_derived_gates.md
-    └── 09_implementation_audit_2026-08-19.md
+    ├── 09_implementation_audit_2026-08-19.md
+    └── 10_available_data_time_reconstruction_and_a_expansion.md
 ```
 
 ## 安裝與目前可用命令
@@ -161,6 +169,17 @@ uv run lbt preflight \
 aggregate/release CLI 尚受實作稽核第 4 節的資料、幾何與 pilot gate 約束，不能以目前
 reference/synthetic CLI 取代。
 
+A 區 v4 不需由使用者先行擴域。以下入口會先以 OCM 上游 CLI 做 24 月唯讀 dry-run；
+確認後可用 `month 2025 1` 產製並驗證第一個完整月份，最後才以 `all` 逐月執行。NWW
+每月明確使用 native `time_utc_ns.npy`，因此輸出是完整逐時 analysis，而非再次沿用 OCM
+缺口。腳本不帶 `--overwrite`，既有月份只會先驗證後跳過。
+
+```bash
+bash scripts/prepare_a_v4_forcing.sh dry-run
+bash scripts/prepare_a_v4_forcing.sh month 2025 1
+bash scripts/prepare_a_v4_forcing.sh all
+```
+
 ## 完成閘門與快速執行順序
 
 | Gate | 優先序 | 通過條件 |
@@ -172,13 +191,13 @@ reference/synthetic CLI 取代。
 | G4 全期批次 | P1，G3 後立即啟動 | 五站點各 10,000、合計 50,000 個基礎情境、資料衍生 `M` 及核心敏感度完成；失敗清單為零或具核准排除理由 |
 | G5 分析交接 | P1，隨完成 shard 流式啟動 | conditional footprint、KDE/HDR、pathway、travel time、connectivity、bottom contact 與不確定性產品可供後續工項讀取 |
 
-詳細工作拆解見 [快速實作計畫](docs/04_implementation_plan.md)，資料介面見 [架構與資料契約](docs/02_architecture_and_data_contract.md)，數值定義與驗證見 [科學方法與驗證](docs/03_scientific_method_and_validation.md)，文獻支持的圖表組合見 [成果呈現與學術視覺化規格](docs/07_results_visualization_plan.md)，最終設計裁決與不需再詢問使用者的衍生閘門見 [設計基線](docs/08_design_baseline_and_derived_gates.md)。
+詳細工作拆解見[快速實作計畫](docs/04_implementation_plan.md)，資料介面見[架構與資料契約](docs/02_architecture_and_data_contract.md)，數值定義與驗證見[科學方法與驗證](docs/03_scientific_method_and_validation.md)，文獻支持的圖表組合見[成果呈現與學術視覺化規格](docs/07_results_visualization_plan.md)，最終設計裁決見[設計基線](docs/08_design_baseline_and_derived_gates.md)，缺時與擴區的最新方法基線見[全部可得資料決策](docs/10_available_data_time_reconstruction_and_a_expansion.md)。
 
 ## 立即下一步
 
-1. 依 SERVER preflight 修復或正式審查 17 個缺口月份、4 個 partial OCM 月份與 NWW
-   `trial_ready`/波向證據；不得以跨 24–72 小時線性內插通過。
-2. 建立 expanded A forcing version，並由 native mesh 生成五站 local/open-boundary 與各站
+1. 產生全期 canonical source index；由完整 NWW native 重建 17,544 小時 analysis，並以
+   實際缺口形狀完成 OCM EOF-state-space blocked validation。`trial_ready`/partial 不再等待補件。
+2. 產製 `northeast_taiwan_common_cache_v4_lbt_south_expanded`，並由 native mesh 生成五站 local/open-boundary 與各站
    20 個 receptors；貢寮、龜山島維持獨立 10,000 情境但共用 A forcing/outer boundary。
 3. 在有效 coverage 上衍生五站各 50 個 arrival UTC，接通實值 reference pilot，完成
    wetdry/Kz、方向、dt/horizon/member convergence 與 known-source 驗證。

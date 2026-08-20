@@ -20,7 +20,9 @@
 - 正式管線必須由 CLI 重建；Notebook 只能用於探索，不得成為唯一實作。
 - 先建立純 NumPy 參考核心與解析／統計測試，再加入 Numba 加速；兩者必須在明定誤差內一致。
 - 確定性平流與隨機擴散分開驗證。隨機位移不得插入 RK4 的 stage。
-- 任何跨月、跨網格或跨資料缺口的外插均預設禁止；若日後核准，必須建立新方法版本與敏感度實驗。
+- 任何未登錄的跨月、跨網格或跨資料缺口外插均禁止。已知缺時只能由版本化重建方法處理，
+  且必須保存 observed/reconstructed provenance、blocked cross-validation、Lagrangian
+  sensitivity 與不確定性；未通過時改採 gap-safe arrival window，不得以最近值或零值補齊。
 - 完成修改前必須檢查測試、文件、繁體中文註解、schema 與 README 是否一致。
 
 ## 專案維護

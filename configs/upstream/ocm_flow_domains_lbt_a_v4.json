@@ -1,0 +1,75 @@
+{
+  "schema_version": "3.0.0",
+  "grid_spacing_m": 1000,
+  "output_root": "preprocessed",
+  "products": [
+    "ocm_native",
+    "ocm_surface"
+  ],
+  "native_required_variables": [
+    "hvel",
+    "vertical_velocity",
+    "zcor",
+    "elev",
+    "temp",
+    "salt",
+    "water_density",
+    "diffusivity",
+    "dahv",
+    "wind_speed",
+    "wetdry_elem"
+  ],
+  "surface_required_arrays": [
+    "time_utc_ns.npy",
+    "u_surface_mps.npy",
+    "v_surface_mps.npy",
+    "surface_z.npy",
+    "eta_m.npy",
+    "valid_mask_surface.npy",
+    "qc_flags.npy",
+    "lon.npy",
+    "lat.npy",
+    "x_m.npy",
+    "y_m.npy",
+    "cell_area_m2.npy",
+    "bathymetry_m.npy",
+    "mask_static.npy",
+    "source_vertices.npy",
+    "source_weights.npy",
+    "source_face_index.npy",
+    "source_distance_m.npy"
+  ],
+  "surface_policy": {
+    "surface_layer_index": -1,
+    "selection": "for each time and source node, choose the highest finite zcor layer where hvel u and v are both finite",
+    "source_margin_deg": 0.08,
+    "missing_value_policy": "source absolute value >= 1e30 is converted to NaN; never fill missing current or elevation with zero"
+  },
+  "trial_policy": {
+    "days_output_root": "preprocessed/trials",
+    "status": "trial_ready",
+    "cache_kind": "trial_partial_month",
+    "formal_downstream_accepts_trial": false
+  },
+  "flow_domains": [
+    {
+      "flow_domain_id": "northeast_taiwan_common_cache_v4_lbt_south_expanded",
+      "name_zh": "Lagrangian 逆向溯源東北台灣共用南擴 flow cache",
+      "center": [
+        122.05,
+        25.05
+      ],
+      "bbox": [
+        121.306315,
+        122.793685,
+        24.48,
+        25.499156
+      ],
+      "research_regions": [
+        "新北市貢寮海域",
+        "宜蘭縣龜山島海域"
+      ],
+      "source_margin_deg": 0.08
+    }
+  ]
+}

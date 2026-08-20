@@ -15,12 +15,43 @@ inputs:
   nww_analysis_root_env: NWW_ANALYSIS_ROOT
   years: [2024, 2025]
 
+  # 研究團隊已裁決：現有 OCM/NWW 是可取得的全部正式資料，供應者不可考，不能把
+  # provider 補件或 metadata 確認列為 blocker。正式成果名稱必須寫成「2024–2025
+  # 全部可得資料」，並完整揭露 observed/reconstructed coverage。
+  available_data_contract:
+    status: decided
+    population_id: available_2024_2025_v1
+    interpretation: complete_formal_result_over_all_available_samples
+    provider_followup_required: false
+    unknown_provider_metadata_policy: preserve_unknown_and_use_versioned_project_contract
+    do_not_claim: provider_confirmed_best_forecast_cycle
+
+  # OCM-SVD-Analysis 已採相同的跨月 stable-sort/prefer-last 去重。LBT 另外要求連續
+  # forcing：單一缺時與整段缺時都必須先通過 blocked cross-validation，重建 provenance
+  # 逐時保存；未通過時改用 gap-safe arrival window，不把所有軌跡停在缺口。
+  time_axis_contract:
+    canonicalization_policy: sort_and_deduplicate_prefer_last
+    expected_timestep_hours: 1.0
+    short_gap_missing_steps: 1
+    short_gap_candidate_method: component_linear_interpolation
+    long_gap_candidate_method: multivariate_eof_harmonic_state_space_bidirectional_smoother
+    pure_dineof_for_whole_missing_snapshot_allowed: false
+    validation: blocked_mask_actual_gap_shapes_plus_eulerian_and_lagrangian_skill
+    baseline_fallback: gap_safe_stratified_arrival_windows
+    preserve_origin_labels: [observed, reconstructed_short, reconstructed_state_space]
+  # OCM 兩種時間支撐擇一，加上 NWW 完整逐時 manifest，均由 SERVER 實值驗證產生；
+  # null 是實作 gate，不是等待外部資料。
+  ocm_gap_reconstruction_manifest: null
+  # 若長缺口重建未達預登錄門檻，以此 manifest 證明 50 個分層時次及核定 horizon
+  # 全程不跨缺口；正式 release 接受兩種 OCM 時間支撐方案至少一種。
+  ocm_gap_safe_arrival_manifest: null
+  nww_full_hourly_analysis_manifest: null
+
   ocm_contract:
     required_schema_major: 3
-    required_status: ready
-    # 完整月份為基準；若要納入 partial month，必須另立 approved release config，
-    # 並把缺日及其對 arrival times 的影響寫入 run manifest。
-    accepted_cache_kinds: [standard_month]
+    accepted_statuses: [ready]
+    # partial month 是全部可得資料母體的一部分；缺日不能改名為完整月，但也不再等待補件。
+    accepted_cache_kinds: [standard_month, standard_partial_month]
     required_month_arrays:
       - time_utc_ns.npy
       - hvel.npy
@@ -40,7 +71,10 @@ inputs:
 
   nww_contract:
     required_schema_major: 1
-    required_status: ready
+    # trial_ready 僅表示 lexical cycle selection 不宣稱最佳 forecast lead；在供應者不可考
+    # 的前提下，研究端以固定選取與 audit 契約正式採用，不再要求改寫上游 status。
+    accepted_statuses: [ready, trial_ready]
+    accepted_cache_kinds: [ocm_analysis_grid_resample_from_nww3_native]
     required_arrays:
       - time_utc_ns.npy
       - significant_wave_height.npy
@@ -48,9 +82,12 @@ inputs:
       - peak_direction_raw_deg.npy
       - valid_mask_wave.npy
       - qc_flags.npy
-    # 上游 analysis 產品以 1.5 小時作線性時間支撐；本專案仍需逐月讀 metadata，
-    # 並在任一 stage 超過實際允許 gap 時停止，不作最近時次外插。
+    # 1.5 小時只限制完整逐時產品內的 RK stage 線性內插。SERVER nww3_native 已有
+    # 2024-01-01 00:00 至 2025-12-31 23:00 共 17,544 個連續逐時 UTC；analysis 將以
+    # 靜態 OCM grid 重建完整時間軸，不沿用 gappy OCM target times。
     maximum_time_gap_hours: 1.5
+    source_native_time_coverage: complete_17544_hourly_steps
+    analysis_time_support_policy: superset_of_ocm_observed_and_reconstructed_times
 
 study_area:
   # A-D 是四個 forcing flow domains；正式情境與成果的第一層單元則是五個 study sites。
@@ -85,7 +122,9 @@ domains:
     current_domain_role: development_and_pilot
     formal_release_flow_domain_id: null
     formal_release_domain_status: expanded_domain_generation_required
-    expanded_south_boundary_at_or_south_of_deg: 24.50
+    expanded_domain_candidate_id: northeast_taiwan_common_cache_v4_lbt_south_expanded
+    expanded_bbox_lon_lat: [121.306315, 122.793685, 24.480000, 25.499156]
+    expanded_south_boundary_at_or_south_of_deg: 24.48
     minimum_common_forcing_margin_grid_cells: 2
     margin_required_for_forcings: [ocm_native, ocm_surface, nww3_analysis]
     radius_25000_formal_requires_expanded_domain: true
@@ -190,7 +229,10 @@ forcing:
     peak_period_source: reciprocal_of_peak_frequency
     direction_convention: wave_from_north_clockwise
     propagation_conversion: add_180_degrees
-    convention_evidence_status: adopted_inferred
+    # WAVEWATCH III legacy 定義與山陀兒、康芮兩個獨立事件已形成研究端採用契約；
+    # 供應者不可考不影響此版本化決策，日後只有反證才另立新版。
+    convention_evidence_status: approved
+    convention_contract_id: nww3_dp_wnd_two_typhoon_adopted_v1
 
 physics:
   # 本工項以完全沉沒物體為基線，因此不加入 windage。
@@ -204,6 +246,8 @@ physics:
     direction_source: peak_direction_raw_deg
     dispersion_relation: omega_squared_equals_gk_tanh_kh
     gravity_mps2: 9.80665
+    # 完整逐時 analysis 產製後，這裡只處理空間必要欄位、manifest/checksum/I/O 或局部
+    # 取樣失敗；不能把舊 target-time 缺口留到 runtime 當作正常終止。
     invalid_wave_policy: stop_with_wave_data_gap
     required_sensitivity_cases:
       - no_stokes
@@ -285,6 +329,8 @@ boundaries:
   bed_suspended: reflect_and_record_contact
   bed_sinking_or_near_bed: deposit_on_first_contact_and_stop
   stop_at_forcing_start: true
+  # 已知 OCM 缺時必須在啟動前由 approved reconstruction 或 gap-safe arrival/horizon
+  # 消化；此開關只保留給 manifest 外缺檔、checksum/I/O 損毀、空間支撐或重建失敗。
   stop_at_data_gap: true
   # 最大回溯期不是任意人工選值；比較 7/14/30/60 日後，取主要統計最小穩定尺度。
   max_backtrack_days: null

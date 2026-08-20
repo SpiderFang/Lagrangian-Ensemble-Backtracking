@@ -1,9 +1,10 @@
 """YAML 設定載入、跨欄位科學契約與正式發布閘門。
 
 example config 同時保存已定案設計與尚待 SERVER／pilot 衍生的 ``null`` 欄位。開發模式
-允許這些欄位存在，以便合成測試與 pilot 前進；``formal_release=True`` 則必須拒絕
-``trial_ready``、未擴充 A 區、未核定 M/時步/回溯期等未完成狀態。這個分層防止工程
-開發被資料閘門卡死，也避免 trial 設定被誤送正式兩年批次。
+允許這些欄位存在，以便合成測試與 pilot 前進；``formal_release=True`` 接受研究團隊核定的
+全部可得 2024–2025 資料契約，但仍拒絕缺少重建驗證、expanded A、M/時步/回溯期等
+manifest 的設定。這個分層避免把上游 ``trial_ready`` 名稱誤作外部補件阻擋，也不會讓
+尚未驗證的缺口重建被直接送入正式兩年批次。
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ class StrictModel(BaseModel):
 
 
 class InputContract(StrictModel):
-    """上游 root 環境變數名稱與年份範圍。"""
+    """上游 root、全部可得資料決策、時間正規化與重建證據。"""
 
     ocm_native_root_env: str
     ocm_surface_root_env: str
@@ -32,6 +33,11 @@ class InputContract(StrictModel):
     years: list[int]
     ocm_contract: dict[str, Any]
     nww_contract: dict[str, Any]
+    available_data_contract: dict[str, Any]
+    time_axis_contract: dict[str, Any]
+    ocm_gap_reconstruction_manifest: str | None = None
+    ocm_gap_safe_arrival_manifest: str | None = None
+    nww_full_hourly_analysis_manifest: str | None = None
 
 
 class StudyAreaConfig(StrictModel):
@@ -223,13 +229,29 @@ class ProjectConfig(StrictModel):
     def assert_formal_release_ready(self) -> None:
         """拒絕尚含 pilot/derived-pending 欄位的正式批次設定。
 
-        這裡只驗證設定本身；上游月份的實際 ``status=ready``、schema 與 coverage 仍由
-        preflight 報告驗證。兩層 gate 都通過前，CLI 不得啟動正式 run。
+        這裡只驗證設定本身；上游月份的 schema、可用 coverage、canonical UTC 與物理
+        reconstruction skill 仍由 preflight／reconstruction manifests 驗證。兩層 gate 都
+        通過前，CLI 不得啟動正式 run。
         """
 
         blockers: list[str] = []
         if self.config_status != "approved":
             blockers.append("config_status 必須是 approved")
+        available_contract = self.inputs.available_data_contract
+        if available_contract.get("status") != "decided":
+            blockers.append("全部可得 2024–2025 資料契約尚未凍結")
+        time_contract = self.inputs.time_axis_contract
+        if time_contract.get("canonicalization_policy") != "sort_and_deduplicate_prefer_last":
+            blockers.append("正式時間軸必須使用 sort_and_deduplicate_prefer_last")
+        if not (
+            self.inputs.ocm_gap_reconstruction_manifest
+            or self.inputs.ocm_gap_safe_arrival_manifest
+        ):
+            blockers.append(
+                "OCM approved reconstruction 或 gap-safe arrival/horizon manifest 尚未產出"
+            )
+        if not self.inputs.nww_full_hourly_analysis_manifest:
+            blockers.append("NWW 完整逐時 analysis manifest 尚未產出")
         if self.scenarios.members_per_scenario is None or self.scenarios.members_per_scenario < 1:
             blockers.append("正式 members_per_scenario 尚未由收斂測試核定")
         if self.scenarios.master_seed is None or self.scenarios.master_seed < 0:

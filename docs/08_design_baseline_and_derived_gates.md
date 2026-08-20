@@ -44,7 +44,14 @@
 
 SERVER preflight 以龜山島 anchor-centered Azimuthal Equidistant CRS 重算後，anchor 至現行 A 區名目南界約為 26.64 km，25 km local boundary 僅餘約 1.64 km。雖然 OCM native source nodes 的局地間距小於 1 km，正式 Stokes forcing 使用的 OCM surface／NWW analysis grid 約為 1 km，故現行 v3 未通過「所有必要 forcing 至少保留兩個共同格點」的保守 margin gate。現行 `northeast_taiwan_common_cache_v3` 只可供程式開發、幾何驗證與明確標示的 pilot；不得直接升格為龜山島 25 km 正式 baseline。
 
-正式 A 區須建立不覆寫 v3 的新 flow-domain version，目標南界不北於約 `24.50°N`，並以實際 OCM native topology、OCM surface grid、NWW analysis mask 與所有必要時次重新驗證 25 km baseline 及 35 km sensitivity 均保有至少兩個共同有效格點。現有 OCM native source extent 約達 `24.492°N`，表示可能可以既有 native 陣列衍生擴區產品；但 OCM surface／NWW analysis 現行南界仍是 `24.600844°N`，所以不得只把 source margin 改名為正式 flow domain，也不得在缺少 NWW 支撐時繼續計算含 Stokes 的 baseline。35 km 案例只能在此 expanded domain 通過 G1 後執行；若擴區實測 margin 仍不足，應繼續擴張或阻擋該 domain version，不縮回舊候選框。
+正式 A 區建立不覆寫 v3 的
+`northeast_taiwan_common_cache_v4_lbt_south_expanded`，候選 bbox 固定為
+`[121.306315,122.793685,24.480000,25.499156]`。龜山島 35 km geodesic 南緣約
+`24.527152°N`，至候選南界名目距離約 5.22 km，比 `24.50°N` 約 3.01 km 的餘裕更保守，
+且預估 native 儲存只較 v3 增加約 13.5%（約 0.23 TB）。正式驗收仍須以實際 OCM native
+topology、OCM surface grid、由完整 NWW native 重建的 analysis mask 與所有必要時次，證明
+25 km baseline 及 35 km sensitivity 均保有至少兩個共同有效格點；不能只修改 bbox 名稱或
+只擴 OCM。若 v4 實測 margin 仍不足，應建立下一 domain version 繼續南擴，不縮回舊候選框。
 
 所有圓形距離都在以 anchor 為中心的 Azimuthal Equidistant CRS 計算，不以經緯度差近似公里。local-domain polygon 使用固定的 OCM native mesh／海岸拓撲建立 `static_ocm_ocean_polygon`，不得隨到達時間改變；陸地、島體及無有效三角形區域必須剔除。動態濕乾只用於受體與逐步 forcing 有效性 gate，避免讓 local boundary 因五十個時次的選取結果而循環改變。兩 anchor 的近似大圓距離約 30.0 km，故兩個半徑 25 km local domains 將自然形成重疊區；此重疊代表相連水動力環境，不代表情境合併，所有受體、scenario、seed、主要事件及統計仍由 `study_site_id` 隔離。
 
@@ -160,7 +167,7 @@ scenario_id = hash(
 | `surface_regime_exit` | rising 類到達海面時停止 | 表示已離開「完全沉沒」模型適用範圍；不得在未含 windage 時繼續當表面漂流 |
 | `surface_reflect` | neutral／sinking 類因擴散越過海面時反射並記錄 | 數值障壁處理，不改變物性類別 |
 | `forcing_start` | 到達可用 forcing 最早時次即 censor 並停止 | 禁止時間外插 |
-| `forcing_gap` | 任一必要 OCM／NWW 支撐超過核定 gap 即停止 | 避免把缺資料解讀為低來源 |
+| `forcing_gap` | 已知 OCM 缺時在 run 前由 approved reconstruction 或 gap-safe arrival/horizon 處理；正常 baseline 不在這些缺口停止 | 只有 manifest 外缺檔、checksum/I/O 損毀、空間必要欄位無效或局部重建失敗才停止，並以 origin/exposure/failure 圖避免誤讀 |
 | `max_age` | 到先導試驗核定的最大回溯日數即 censor 並停止 | 防止封閉流線無限計算 |
 | `numerical_failure` | NaN、定位失敗、步數上限或 CFL 無法滿足時停止 | 與物理停止原因分離 |
 
@@ -170,12 +177,14 @@ scenario_id = hash(
 
 | 衍生項目 | 決定方法 | 阻擋範圍 |
 |---|---|---|
-| SERVER 路徑、24 個月份、schema、方向、濕乾語意與容量 | 唯讀 preflight、metadata、實值 QC | 未通過前只可做合成測試與 TRIAL |
+| SERVER 路徑、24 個月份、schema、濕乾語意與容量 | 唯讀 preflight、metadata、實值 QC；現有資料為完整 available 母體，不要求供應者補件 | manifest 外 schema/checksum/I/O 異常未排除前只可做合成測試與 TRIAL |
+| OCM canonical 軸與缺時重建 | stable sort/prefer-last；依 1/23/24/25/49-step 實際缺口做多變量 EOF-harmonic state-space blocked validation與 Lagrangian skill 檢定 | 未通過者以 gap-safe arrival/horizon 作 baseline，不得 runtime 臨時補值 |
+| NWW full-hour analysis | 從 17,544/17,544 完整 native UTC 重採樣到四個 OCM 靜態格網；方向依既定契約作圓形內插 | 產物未通過時含 Stokes run 不啟動；不對波浪時間作統計填補 |
 | 12.5/25 km 巢狀 ocean polygons 與 100 個三維 receptor records | anchor-centered metric buffers、OCM static ocean polygon、50 時次 wet/dry gate 與 deterministic selector | 未產出前不可凍結正式 scenario table |
 | 五站點各 50 個確切 UTC | 到達時間 selector 與 forcing coverage gate | 未產出前不可啟動正式 batch |
 | 常數 `Kh/Kz` baseline | Brownian／well-mixed 驗證與文獻合理範圍 pilot | 未通過時只跑無擴散解析或標記 trial |
 | `M` | exit ranking、HDR、travel time、path density 的 member-convergence | 決定正式總軌跡數 |
-| A 區 expanded forcing domain | 建立新 domain version，目標南界不北於約 `24.50°N`；共同驗證 OCM native、OCM surface 與 NWW analysis 的空間、時間、mask、schema 及 input fingerprint | 現行 v3 可作 pilot；expanded version 未通過前阻擋龜山島 25 km 正式 baseline 與 35 km sensitivity |
+| A 區 expanded forcing domain | 產製 v4 候選 ID 與 bbox `[121.306315,122.793685,24.480000,25.499156]`；共同驗證 OCM native、OCM surface 與 NWW analysis 的空間、時間、mask、schema 及 input fingerprint | 現行 v3 可作 pilot；v4 未通過前不發布龜山島 25 km baseline 與 35 km sensitivity |
 | local/outer boundary margin | 以實際投影格網驗證 25/35 km local boundary 至 A 區外界對所有必要 forcing 均至少保留兩個共同有效格點 | margin 不足時阻擋該 domain version，不縮回舊候選框或只引用 native source margin |
 | `max_backtrack_days` | 比較 7、14、30、60 日的 exit/censor、HDR 與排名穩定性，取最小穩定值 | 決定正式 horizon，不改變 50,000 個基礎情境 |
 | `dt`、output interval、shard、checkpoint 與並行度 | dt 收斂、particle-step benchmark、RAM/I/O/容量 | 決定數值與工程配置 |

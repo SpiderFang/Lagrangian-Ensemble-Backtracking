@@ -50,7 +50,9 @@
 - 現行 `northeast_taiwan_common_cache_v3` 以虛線及 `PILOT_ONLY` 標示；正式南向擴充 A 區以另一線型呈現，並在圖說列出兩者的 domain ID、bbox、OCM/NWW 共同有效遮罩與龜山島 25/35 km local domain 至 outer boundary 的最小公尺距離。
 - inset 顯示台灣周邊相對位置；局部圖以各 domain 的 metric CRS 呈現。
 - 圖例與表格確認五站點各有 20 個受體；A 區合計 40 個，但貢寮與龜山島各自的分母、ID 與圖層保持獨立。
-- companion panel 顯示 2024-2025 forcing 可用率與缺口，不將資料缺口區畫成低來源區。
+- companion panel 顯示完整 17,544 小時時間軸，逐時區分 OCM observed、
+  reconstructed-short、reconstructed-state-space、boundary-unavailable，以及 NWW native／
+  rebuilt-analysis coverage；不將 unsupported 或 reconstruction failure 畫成低來源區。
 
 ### F02 方法、情境矩陣與計數圖
 
@@ -116,12 +118,18 @@
 ### F10 停止結果、資料品質與失敗圖
 
 - 以 stacked bars 分開顯示 local entry、flow-domain open exit、coast contact、surface-regime exit、bed deposition、forcing start、max age、data gap、numerical failure 的比例及 raw count。
-- 另畫 data-gap／numerical-failure density，使空間集中失敗可被辨識。
+- 已知 OCM 缺時不應在正式 baseline 成為常規 `data_gap`；另畫 origin timeline、每軌跡
+  reconstructed exposure fraction、reconstruction-failure／manifest外 data-gap／numerical-
+  failure density，使資料重建依賴與空間集中失敗可被辨識。
 - 按 domain、receptor、material、arrival strata 分層；任何一層的成功率顯著較低時，主要 footprint 必須附 reliability 警示。
 
 ### F11 物理敏感度與不確定性
 
 - no-Stokes、deep-water、finite-depth、Kh/Kz、dt、20/25/35 km local domain、現行 A 區 `PILOT_ONLY` 與正式南向擴充 outer domain、boundary policy 以 baseline map、difference map 及來源排名變化並列；A 區比較只使用 OCM 與 NWW 共同有效 forcing mask。
+- OCM 時間處理至少並列 observed-only gap-safe baseline、approved reconstruction mean 與
+  reconstruction posterior members；報告來源排名、HDR、旅行／停留時間、主要 exit 機率
+  與 reconstructed-exposure 分層差異。若長缺口未過 blocked validation，不得把重建案例
+  畫成 baseline，只能列 sensitivity。
 - difference map 使用以 0 為中心的 diverging palette；每個 panel 使用相同上／下限。
 - 來源段權重以 point-range／forest plot 顯示 bootstrap interval；另報 top-k rank stability 或 HDR overlap。
 - 若使用 forcing ensemble，加入 rank histogram 與 spread–error；隨機 member spread 不能被誤稱為所有模式誤差。
@@ -137,7 +145,7 @@
 
 | 表號 | 內容 | 必要欄位 |
 |---|---|---|
-| T01 | forcing 與研究範圍 inventory | domain、month、time span、resolution、units、coverage、gap、schema/checksum |
+| T01 | forcing 與研究範圍 inventory | domain、month、raw/canonical rows、duplicate count、time span、resolution、units、observed/reconstructed/unsupported coverage、gap shapes、NWW full-hour rebuild、schema/checksum |
 | T02 | 五站各 10×20×50 情境設計與 coverage | site、region、每站 receptor=20、全案 receptor=100、每站組合數 10,000、A 區 20,000、全案 50,000、缺列／重列數、experiment cases、M |
 | T03 | run 與停止結果摘要 | released/effective/completed、各 event raw count/percentage、wall time、particle steps、I/O、failure rate |
 | T04 | 來源段／受體排名 | receptor、source segment、raw n、有效分母、relative weight、bootstrap CI、median travel time、rank stability |
@@ -198,6 +206,9 @@ figures/
 - [ ] 所有比例／KDE/HDR 標明 raw `n`、有效分母、成功率與 bandwidth。
 - [ ] 季節、潮況、物性與敏感度比較使用共同 extent 與 color limits。
 - [ ] max-age、data-gap 與 numerical failure 沒有被當作低來源密度。
+- [ ] 已知 OCM 缺時沒有在 baseline 被當作常規停止點；逐時 origin、每軌跡
+  reconstructed exposure、blocked-validation skill 與 observed-only/reconstructed sensitivity
+  均可稽核。
 - [ ] 未具 prior/likelihood 時，不使用 posterior probability 或確定來源措辭。
 - [ ] member、dt、domain 與已知來源合成驗證均有定量圖表。
 - [ ] 每張圖具 registry、caption sidecar、data sidecar 與可重製命令。

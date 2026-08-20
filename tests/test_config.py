@@ -63,8 +63,19 @@ def test_rejects_reduced_scenario_count() -> None:
 def test_example_is_intentionally_blocked_for_formal_release() -> None:
     """design example 尚缺 M、時步、horizon 與 expanded A ID，正式模式必須 fail closed。"""
 
-    with pytest.raises(ValueError, match="正式發布設定未通過"):
+    with pytest.raises(ValueError, match="approved reconstruction 或 gap-safe"):
         load_config(EXAMPLE_CONFIG, formal_release=True)
+
+
+def test_formal_time_gate_accepts_either_ocm_support_manifest_name() -> None:
+    """重建未過門檻時可採 gap-safe baseline，設定 gate 不得強迫偽造重建成功。"""
+
+    payload = _payload()
+    payload["inputs"]["ocm_gap_safe_arrival_manifest"] = "manifests/ocm-gap-safe.json"
+    config = ProjectConfig.model_validate(payload)
+    with pytest.raises(ValueError) as exc_info:
+        config.assert_formal_release_ready()
+    assert "approved reconstruction 或 gap-safe" not in str(exc_info.value)
 
 
 def test_yaml_member_field_is_not_silently_ignored() -> None:

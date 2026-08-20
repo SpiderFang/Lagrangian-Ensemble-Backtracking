@@ -34,6 +34,32 @@ OCM 速度由 native unstructured mesh 直接取樣：
 
 若任一必要支撐 node 無法包夾 z，回傳具原因的 invalid sample，不重新正規化剩餘 node 權重。此保守政策避免在陡坡、海床以下或海岸缺值旁製造人工速度。
 
+### 2.1 時間去重與缺時重建
+
+SVD 可把每個完整 snapshot 視為獨立樣本，因此能在去重後捨棄不完整時次；Lagrangian
+積分則要求每個 RK stage 都有連續 forcing，不能直接照搬「刪除整個時次」。正式方法為：
+
+1. 將 24 個月份以 stable UTC sort 與 `prefer_last` 去重，保留每個 canonical UTC 回指
+   原月份與 local index 的映射；四個 OCM domains 實測皆由 17,196 列正規化為 17,124
+   個唯一 UTC，重複 72 列，時間軸完全相同。
+2. 對 33 個單一缺時候選，以分量線性內插與 state-space 模型作 blocked validation 後選擇；
+   不因缺口短就免除驗證。
+3. 對 23–49 個連續缺時，以多變量、面積／水層加權 EOF 壓縮空間場，在係數域分離
+   潮汐／日週期 harmonic 與 regularized VAR state-space residual，使用缺口兩側資料作
+   bidirectional Kalman smoother；輸出 posterior forcing members，而不是單一無誤差補值。
+4. pure DINEOF 不得單獨用於整個 snapshot 都缺失的時次，因該時刻沒有任何空間觀測可
+   提供相關資訊；模型必須顯式利用時間動力與兩側條件。
+5. 重建只作用於兩端皆濕且屬 persistent-wet 的 node/face，並維持 `zcor` 垂向單調、Kz
+   非負及物理範圍；任何失敗格點保持 unsupported，不能補零。
+
+blocked validation 遮蔽實際缺口形狀（1、23、24、25、49 個 missing steps），跨年、季節、
+潮況與極端流況比較 persistence、端點線性、harmonic-only 及 EOF-state-space。除流速向量
+RMSE／相關外，必須以來源邊界排序、HDR weighted Jaccard、主要 exit probability、旅行／
+停留時間及 90% posterior interval coverage 驗證 Lagrangian skill。若長缺口模型未通過，
+正式 baseline 使用 gap-safe 分層 arrival windows 與可涵蓋全部 strata 的最短已收斂 horizon；
+因此研究仍有完整的基礎情境結果，只是不對資料不存在的區段作未驗證推論。完整門檻、
+文獻與 SERVER 數量見[全部可得資料、時間重建與 A 區擴域決策](10_available_data_time_reconstruction_and_a_expansion.md)。
+
 ## 3. 有限水深 bulk Stokes drift
 
 ### 3.1 輸入與方向
@@ -45,7 +71,10 @@ theta_to = (peak_direction_raw_deg + 180 deg) mod 360 deg
 e_to = (sin(theta_to), cos(theta_to))
 ```
 
-角度由正北起算、順時針增加。上述 `+180°` 來自 NWW 相鄰專案已登錄的 wave-from 推定慣例；正式 run 必須在 config 與 manifest 明示該慣例及其證據版本。
+角度由正北起算、順時針增加。上述 `+180°` 採研究端已核定的
+`nww3_dp_wnd_two_typhoon_adopted_v1` 契約：NWW 相鄰專案以山陀兒與康芮兩個獨立颱風
+事件交叉判定 `DP` 為 wave-from，`.wnd` planes 1/2 為東／北向風分量。正式 run 必須在
+config 與 manifest 明示契約及證據版本；不再以「待供應者確認」描述。
 
 ### 3.2 波數與垂向 profile
 
@@ -152,7 +181,7 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 | 海面 | neutral／sinking 類擴散越界時反射；rising 類到達海面以 `surface_regime_exit` 停止 | 完全沉沒 baseline 不加 windage，故不得在海面繼續當表面漂流 |
 | 海床 | 記錄 first contact；suspended 反射，sinking／near-bed 首次接觸即 deposit 並停止 | 無再懸浮參數時不宣稱完整底床交換 |
 | forcing start | 到 2024-01-01 或實際最早可用時次停止 | 不能環回或外插 |
-| data gap | 超過核定間距或必要 forcing 缺值即停止 | no-Stokes 是另一個 physics case |
+| data gap | 已知 OCM 缺時須在 run 前由 approved reconstruction 或 gap-safe arrival window 消化；正常 baseline 不在已知缺口停止 | manifest 外缺檔、checksum/I/O 損毀、局部重建失敗或空間必要 forcing 無效時才停止；no-Stokes 是另一個 physics case |
 | max age | 到核定最大回溯期停止 | 與 exit 分開統計 |
 | numerical failure | NaN、CFL 無法滿足、定位失敗、step limit | 必須可重現並列入失敗率 |
 
@@ -218,6 +247,9 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | 測試 | 通過條件 |
 |---|---|
 | schema/shape/time | 24 個月份 inventory 可稽核；time 嚴格遞增；OCM/NWW domain 相容 |
+| canonical time | 24 個月份 stable sort/prefer-last 結果、72 個重複來源選擇、420 個缺時與每一 origin label 均可由 manifest 重建 |
+| OCM gap reconstruction | 依實際 1/23/24/25/49-step block cross-validation；Eulerian 與 Lagrangian 指標同時通過文件 10 預登錄門檻，或明確降級為 gap-safe baseline |
+| NWW full-hour rebuild | 四域皆由完整 native 17,544 UTC 重採樣；時間唯一、逐時連續、方向圓形內插且涵蓋所有 observed/reconstructed OCM UTC |
 | CRS round-trip | WGS84→metric→WGS84 誤差低於預先登錄門檻，domain corner/center 均測 |
 | triangle/quad | 面積、方向、對角線、triangle-to-face 與 barycentric sum 通過 |
 | mask/wetdry | 合成乾濕 face、海岸 triangle 與真實 snapshot 人工圖面抽查一致 |
@@ -245,7 +277,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | checkpoint/restart | 同 config/seed 分片中斷續跑後 row count、ID、event 與 checksum 等價 |
 | dt convergence | dt 減半後 exit ranking、90% HDR、median travel time 與 path density 變化低於預先登錄值 |
 | ensemble convergence | 隨 members 增加，主要統計與 bootstrap interval 穩定；由曲線決定正式 M |
-| domain adequacy | 現行 A v3 僅作 pilot；正式 A 區南界目標不北於約 `24.50°N`，且 OCM native、OCM surface、NWW analysis 對貢寮／龜山島 25/35 km local boundary 均保留至少兩個共同有效格點；擴域前後主要 entry/exit/path/HDR 指標變化預設低於 10%，否則報告尺度依賴性或調整 domain version |
+| domain adequacy | 現行 A v3 僅作 pilot；正式候選 `northeast_taiwan_common_cache_v4_lbt_south_expanded` bbox 南界為 `24.480000°N`，且 OCM native、OCM surface、NWW analysis 對貢寮／龜山島 25/35 km local boundary 均保留至少兩個共同有效格點；擴域前後主要 entry/exit/path/HDR 指標變化預設低於 10%，否則報告尺度依賴性或繼續調整 domain version |
 | cross-site semantics | 軌跡穿越 foreign local domain 前後位置、時間與方向可重現；`study_site_id`、scenario、seed、own-local first-exit 與 outer-stop state 不變；跨站比例以原站有效 members 為分母，不把兩站先合併 |
 | known-source synthetic | 正向已知來源到受體案例，其來源落入逆向 footprint 的核定 HDR，並量化 coverage |
 | forcing ablation | current-only、no-Stokes、deep/finite Stokes、Kh/Kz cases 可比較且命名不混淆 |
