@@ -134,7 +134,8 @@ flowchart LR
 │   ├── lagrangian_backtracking.example.yaml
 │   └── upstream/ocm_flow_domains_lbt_a_v4.json
 ├── scripts/
-│   └── prepare_a_v4_forcing.sh
+│   ├── prepare_a_v4_forcing.sh
+│   └── render_source_code_flow_diagrams.py
 ├── src/lagrangian_backtracking/
 │   ├── forcing.py, mesh.py, stokes.py, time_axis.py
 │   ├── integrators.py, diffusion.py, engine.py, boundaries.py
@@ -156,6 +157,8 @@ flowchart LR
 ```
 
 首次接手本專案時，請先閱讀[程式碼導覽、執行流程與工項計畫書追溯](docs/11_source_code_guide_and_plan_traceability.md)。該文件以模組關係圖、單粒子流程圖與「計畫書條目 → 程式 → 測試 → 正式成果」對照表說明 `src/` 的閱讀方式，並明確區分已驗證程式核心與尚未完成的正式資料、批次及圖表成果。
+
+可列印的兩頁流程圖已保存為[PDF](output/pdf/source_code_flow_diagrams.pdf)，另提供[模組關係 PNG](output/figures/source_code_module_relationship.png)與[單一粒子流程 PNG](output/figures/single_particle_backtracking_flow.png)。
 
 ## 安裝與目前可用命令
 

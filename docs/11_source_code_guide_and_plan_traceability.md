@@ -115,6 +115,11 @@ flowchart LR
     CLI --> OUT
 ```
 
+可直接引用的靜態圖檔如下：
+
+- [圖 1 PNG：src 模組關係與資料流](../output/figures/source_code_module_relationship.png)
+- [兩頁 PDF：圖 1 與圖 2](../output/pdf/source_code_flow_diagrams.pdf)
+
 ## 4. 一條粒子軌跡實際怎麼走
 
 下圖以一個「站點 × 行為 × 受體 × 到達時刻 × 系集成員」為例。每條粒子的 `study_site_id` 從建立到輸出都不會因為穿越其他站點而改變；這是貢寮與龜山島共用 A 區流場但維持獨立統計的關鍵。
@@ -138,6 +143,13 @@ flowchart TD
     Q -- 是 --> P[ParticleResult<br/>軌跡、事件、最終狀態]
     P --> O2[write_trajectory_shard]
     O2 --> A[aggregation.py<br/>入口密度、足跡、路徑與停留時間]
+```
+
+此圖的單頁 PNG 為[圖 2：單一粒子逆向溯源的處理流程](../output/figures/single_particle_backtracking_flow.png)。兩張圖的可重製來源是 `scripts/render_source_code_flow_diagrams.py`；在具備 ReportLab 的環境執行下列命令即可重新產製 PDF：
+
+```bash
+uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
+  --output output/pdf/source_code_flow_diagrams.pdf
 ```
 
 ### 4.1 邊界判定的閱讀重點
