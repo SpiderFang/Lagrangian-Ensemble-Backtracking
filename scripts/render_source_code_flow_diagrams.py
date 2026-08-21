@@ -117,17 +117,22 @@ def draw_box(
     text_x = x + 8
     title_font = CODE_FONT if title_is_code else BODY_FONT
     title_size = 8.4 if title_is_code else 9.1
+    title_leading = 10.0
+    title_top = y + height - 12
     draw_text_lines(
         canvas,
         title_lines,
         x=text_x,
-        y_top=y + height - 13,
+        y_top=title_top,
         font_name=title_font,
         font_size=title_size,
-        leading=10.5,
+        leading=title_leading,
     )
     if body_lines:
-        separator_y = y + height - 27 - (len(title_lines) - 1) * 10.5
+        # 分隔線要留在標題下方，而不是固定貼近方塊底部。原本的固定公式在高度 36
+        # points 的小方塊中會讓說明文字落到框外；改用標題實際行距計算後，單行與多行
+        # 標題都能保留「標題、分隔線、說明」三層清楚的垂直留白。
+        separator_y = title_top - (len(title_lines) - 1) * title_leading - 8
         canvas.setStrokeColor(border)
         canvas.setLineWidth(0.45)
         canvas.line(text_x, separator_y, x + width - 8, separator_y)
@@ -135,10 +140,10 @@ def draw_box(
             canvas,
             body_lines,
             x=text_x,
-            y_top=separator_y - 11,
+            y_top=separator_y - 9,
             font_name=BODY_FONT,
             font_size=7.5,
-            leading=9.0,
+            leading=8.4,
         )
 
 
@@ -176,6 +181,57 @@ def draw_group_panel(
     )
 
 
+def _draw_arrow_head(
+    canvas: Canvas,
+    *,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> None:
+    """在既有線段末端補上方向箭頭；方向取決於最後一段的起訖座標。"""
+
+    start_x, start_y = start
+    end_x, end_y = end
+    vector_x = end_x - start_x
+    vector_y = end_y - start_y
+    length = max((vector_x**2 + vector_y**2) ** 0.5, 1.0)
+    unit_x = vector_x / length
+    unit_y = vector_y / length
+    # 兩條短斜線形成箭頭，固定大小可避免短連線的箭頭過大或過小。
+    head = 6.0
+    side_x = -unit_y * 3.0
+    side_y = unit_x * 3.0
+    canvas.line(end_x, end_y, end_x - unit_x * head + side_x, end_y - unit_y * head + side_y)
+    canvas.line(end_x, end_y, end_x - unit_x * head - side_x, end_y - unit_y * head - side_y)
+
+
+def _draw_arrow_label(
+    canvas: Canvas,
+    *,
+    label: str,
+    center: tuple[float, float],
+    label_box: bool,
+) -> None:
+    """依文字實際寬度繪製箭頭標籤，避免固定寬度造成中文字被切掉或互相覆蓋。"""
+
+    center_x, center_y = center
+    font_size = 6.8
+    text_width = pdfmetrics.stringWidth(label, BODY_FONT, font_size)
+    box_width = max(24.0, text_width + 10.0)
+    if label_box:
+        canvas.setFillColor(white)
+        canvas.roundRect(center_x - box_width / 2, center_y - 5.5, box_width, 11, 2, fill=1, stroke=0)
+    draw_text_lines(
+        canvas,
+        (label,),
+        x=center_x - text_width / 2,
+        y_top=center_y + 2.2,
+        font_name=BODY_FONT,
+        font_size=font_size,
+        leading=7.5,
+        color=ARROW_COLOR,
+    )
+
+
 def draw_arrow(
     canvas: Canvas,
     *,
@@ -183,6 +239,7 @@ def draw_arrow(
     end: tuple[float, float],
     label: str | None = None,
     label_offset: tuple[float, float] = (0.0, 0.0),
+    label_box: bool = True,
 ) -> None:
     """繪製含箭頭的資料流，必要時加上短中文標籤。
 
@@ -190,37 +247,54 @@ def draw_arrow(
     避免接手者把「設定供給幾何」誤讀為兩個模組必然互相 import。
     """
 
-    start_x, start_y = start
-    end_x, end_y = end
     canvas.setStrokeColor(ARROW_COLOR)
     canvas.setFillColor(ARROW_COLOR)
     canvas.setLineWidth(1.0)
-    canvas.line(start_x, start_y, end_x, end_y)
-    vector_x = end_x - start_x
-    vector_y = end_y - start_y
-    length = max((vector_x**2 + vector_y**2) ** 0.5, 1.0)
-    unit_x = vector_x / length
-    unit_y = vector_y / length
-    # 兩條短斜線形成箭頭，長度固定以避免短箭頭失真。
-    head = 6.0
-    side_x = -unit_y * 3.0
-    side_y = unit_x * 3.0
-    canvas.line(end_x, end_y, end_x - unit_x * head + side_x, end_y - unit_y * head + side_y)
-    canvas.line(end_x, end_y, end_x - unit_x * head - side_x, end_y - unit_y * head - side_y)
+    canvas.line(*start, *end)
+    _draw_arrow_head(canvas, start=start, end=end)
     if label:
-        midpoint_x = (start_x + end_x) * 0.5 + label_offset[0]
-        midpoint_y = (start_y + end_y) * 0.5 + label_offset[1]
-        canvas.setFillColor(white)
-        canvas.roundRect(midpoint_x - 18, midpoint_y - 5, 36, 10, 2, fill=1, stroke=0)
-        draw_text_lines(
+        midpoint = (
+            (start[0] + end[0]) * 0.5 + label_offset[0],
+            (start[1] + end[1]) * 0.5 + label_offset[1],
+        )
+        _draw_arrow_label(canvas, label=label, center=midpoint, label_box=label_box)
+
+
+def draw_polyline_arrow(
+    canvas: Canvas,
+    *,
+    points: tuple[tuple[float, float], ...],
+    label: str | None = None,
+    label_position: tuple[float, float] | None = None,
+    label_offset: tuple[float, float] = (0.0, 0.0),
+    label_box: bool = False,
+) -> None:
+    """繪製可繞開其他方塊的折線箭頭，最後一段才顯示方向箭頭。
+
+    折線特別用於「仍可回溯」控制分支：若用單一長斜線直接跨回積分方塊，容易穿過
+    資料來源與其他標籤，讀者會誤以為那些方塊也是回圈的一部分。呼叫端提供的點依序
+    是折線轉折點，標籤可固定在空白處，避免被自動中點位置帶到方塊上。
+    """
+
+    if len(points) < 2:
+        raise ValueError("折線箭頭至少需要起點與終點")
+    canvas.setStrokeColor(ARROW_COLOR)
+    canvas.setFillColor(ARROW_COLOR)
+    canvas.setLineWidth(1.0)
+    for start, end in zip(points[:-1], points[1:], strict=True):
+        canvas.line(*start, *end)
+    _draw_arrow_head(canvas, start=points[-2], end=points[-1])
+    if label:
+        if label_position is None:
+            label_position = (
+                (points[-2][0] + points[-1][0]) * 0.5,
+                (points[-2][1] + points[-1][1]) * 0.5,
+            )
+        _draw_arrow_label(
             canvas,
-            (label,),
-            x=midpoint_x - 15,
-            y_top=midpoint_y + 2,
-            font_name=BODY_FONT,
-            font_size=6.8,
-            leading=7.5,
-            color=ARROW_COLOR,
+            label=label,
+            center=(label_position[0] + label_offset[0], label_position[1] + label_offset[1]),
+            label_box=label_box,
         )
 
 
@@ -288,12 +362,14 @@ def draw_module_relationship_page(canvas: Canvas) -> None:
         "對應文件 11 第 3 節；方塊是責任分工，箭頭是資料依賴。",
         1,
     )
-    top_y = 290
+    # 兩欄面板採用較寬的內容區，讓中央資料流只跨越一個短間隔；這比把四個窄面板
+    # 推到頁面兩側更容易追讀，也能讓檔名與中文責任說明保持在同一個方塊內。
+    top_y = 300
     bottom_y = 52
-    group_width = 185
+    group_width = 340
     group_height = 220
-    left_x = 36
-    right_x = PAGE_WIDTH - 36 - group_width
+    left_x = 32
+    right_x = PAGE_WIDTH - left_x - group_width
 
     draw_group_panel(
         canvas, x=left_x, y=top_y, width=group_width, height=group_height, title="資料與幾何", style="data"
@@ -326,8 +402,8 @@ def draw_module_relationship_page(canvas: Canvas) -> None:
         style="output",
     )
 
-    box_width = 165
-    box_height = 36
+    box_width = group_width - 20
+    box_height = 40
     for index, (title, body) in enumerate(
         (
             (("config.py",), ("科學計數與正式發布閘門",)),
@@ -378,9 +454,9 @@ def draw_module_relationship_page(canvas: Canvas) -> None:
         draw_box(
             canvas,
             x=left_x + 10,
-            y=bottom_y + 28 + (2 - index) * 52,
+            y=bottom_y + 24 + (2 - index) * 60,
             width=box_width,
-            height=44,
+            height=46,
             title_lines=title,
             body_lines=body,
             style="execution",
@@ -397,9 +473,9 @@ def draw_module_relationship_page(canvas: Canvas) -> None:
         draw_box(
             canvas,
             x=right_x + 10,
-            y=bottom_y + 28 + (2 - index) * 52,
+            y=bottom_y + 24 + (2 - index) * 60,
             width=box_width,
-            height=44,
+            height=46,
             title_lines=title,
             body_lines=body,
             style="output",
@@ -411,10 +487,16 @@ def draw_module_relationship_page(canvas: Canvas) -> None:
         canvas, start=(left_x + group_width, top_y + 130), end=(right_x, top_y + 130), label="資料契約"
     )
     draw_arrow(
-        canvas, start=(left_x + 92, top_y), end=(left_x + 92, bottom_y + group_height), label="受體與時刻"
+        canvas,
+        start=(left_x + group_width / 2, top_y),
+        end=(left_x + group_width / 2, bottom_y + group_height),
+        label="受體與時刻",
     )
     draw_arrow(
-        canvas, start=(right_x + 92, top_y), end=(right_x + 92, bottom_y + group_height), label="粒子結果"
+        canvas,
+        start=(right_x + group_width / 2, top_y),
+        end=(right_x + group_width / 2, bottom_y + group_height),
+        label="粒子結果",
     )
     draw_arrow(
         canvas,
@@ -422,7 +504,24 @@ def draw_module_relationship_page(canvas: Canvas) -> None:
         end=(right_x, bottom_y + 130),
         label="軌跡與事件",
     )
-    draw_arrow(canvas, start=(right_x + 92, bottom_y + 92), end=(right_x + 92, bottom_y + 72), label="聚合")
+    # 輸出面板內部的三個方塊已依「原子發布 → 聚合 → 圖表」由上而下排列；僅畫短的
+    # 無標籤連線，避免把「聚合」標籤塞進過窄的方塊間隙而遮住說明文字。
+    output_center_x = right_x + group_width / 2
+    top_output_y = bottom_y + 24 + 2 * 60
+    middle_output_y = bottom_y + 24 + 60
+    bottom_output_y = bottom_y + 24
+    draw_arrow(
+        canvas,
+        start=(output_center_x, top_output_y),
+        end=(output_center_x, middle_output_y + 46),
+        label=None,
+    )
+    draw_arrow(
+        canvas,
+        start=(output_center_x, middle_output_y),
+        end=(output_center_x, bottom_output_y + 46),
+        label=None,
+    )
     canvas.showPage()
 
 
@@ -440,11 +539,12 @@ def draw_particle_flow_page(canvas: Canvas) -> None:
         "對應文件 11 第 4 節；每條軌跡維持原始 study_site_id，不因跨站事件改變歸屬。",
         2,
     )
-    y_main = 335
-    y_source = 210
-    x_positions = [35, 160, 285, 410, 535, 660]
-    main_width = 112
-    main_height = 68
+    # 主流程上移並拉開標題與資料來源的層次；下方保留獨立空間給來源、停止分支與輸出，
+    # 讓讀者先讀水平主線，再讀垂直資料供給與回圈控制，不必在交叉線中猜方向。
+    y_main = 420
+    x_positions = [32, 158, 284, 410, 536, 662]
+    main_width = 118
+    main_height = 70
 
     draw_box(
         canvas,
@@ -517,16 +617,17 @@ def draw_particle_flow_page(canvas: Canvas) -> None:
             start=(start_x + main_width, y_main + main_height * 0.5),
             end=(end_x, y_main + main_height * 0.5),
             label=label,
-            label_offset=(0, 11),
+            # 標籤放在主線下方的空白帶，不再壓在相鄰方塊或箭頭線上。
+            label_offset=(0, -47),
         )
 
     # OCM 與 NWW3 來源分開畫出，強調總速度不是單一資料集直接給定的欄位。
     draw_box(
         canvas,
-        x=370,
-        y=y_source,
-        width=122,
-        height=58,
+        x=270,
+        y=230,
+        width=140,
+        height=60,
         title_lines=("OCMNativeMonth.sample",),
         body_lines=("三維海流、海面、海床、Kz",),
         style="data",
@@ -534,9 +635,9 @@ def draw_particle_flow_page(canvas: Canvas) -> None:
     )
     draw_box(
         canvas,
-        x=505,
-        y=y_source,
-        width=122,
+        x=470,
+        y=220,
+        width=120,
         height=58,
         title_lines=("NWWAnalysisMonth.sample",),
         body_lines=("波高、頻率、波向與有效遮罩",),
@@ -545,26 +646,35 @@ def draw_particle_flow_page(canvas: Canvas) -> None:
     )
     draw_box(
         canvas,
-        x=505,
-        y=118,
-        width=122,
+        x=470,
+        y=135,
+        width=120,
         height=52,
         title_lines=("finite_depth_stokes",),
         body_lines=("有限水深波浪表面漂移",),
         style="physics",
         title_is_code=True,
     )
-    draw_arrow(canvas, start=(431, y_source + 58), end=(466, y_main), label="海流")
-    draw_arrow(canvas, start=(566, y_source + 58), end=(566, y_main), label="波浪")
-    draw_arrow(canvas, start=(566, y_source), end=(566, 170), label="計算")
-    draw_arrow(canvas, start=(566, 170), end=(500, y_main), label="Stokes", label_offset=(7, 0))
+    draw_arrow(canvas, start=(340, 290), end=(470, y_main), label="海流")
+    # 波浪資料先進入有限水深 Stokes 計算，再把結果供給總速度；移除原本重複的
+    # NWW3 直達總速度箭頭，避免讀者以為波浪漂移已經是原始資料欄位。
+    draw_arrow(canvas, start=(530, 220), end=(530, 187), label="波浪", label_offset=(18, 0))
+    draw_polyline_arrow(
+        canvas,
+        # 先沿 OCM 與 NWW3 之間的空白走廊向下，再進入總速度方塊，避免斜線穿過
+        # NWWAnalysisMonth.sample 或其他來源方塊。
+        points=((530, 187), (435, 187), (435, 350), (470, y_main)),
+        label="Stokes",
+        label_position=(447, 320),
+        label_box=False,
+    )
 
     # 停止分支使用不同顏色，讓閱覽者快速看到何時會輸出一條完整軌跡。
     draw_box(
         canvas,
-        x=640,
-        y=185,
-        width=137,
+        x=600,
+        y=240,
+        width=135,
         height=57,
         title_lines=("仍可回溯",),
         body_lines=("返回下一個時間步；", "不改變 study_site_id"),
@@ -572,25 +682,47 @@ def draw_particle_flow_page(canvas: Canvas) -> None:
     )
     draw_box(
         canvas,
-        x=640,
-        y=92,
-        width=137,
-        height=70,
+        x=650,
+        y=130,
+        width=145,
+        height=68,
         title_lines=("ParticleResult",),
         body_lines=("最終狀態、固定間隔軌跡、", "邊界事件與停止原因"),
         style="output",
         title_is_code=True,
     )
-    draw_arrow(canvas, start=(716, y_main), end=(716, 242), label="未停止")
-    draw_arrow(canvas, start=(716, y_main), end=(716, 162), label="停止")
-    draw_arrow(canvas, start=(640, 213), end=(590, 287), label="下一步", label_offset=(0, -7))
+    draw_arrow(
+        canvas,
+        start=(695, y_main),
+        end=(667, 298),
+        label="未停止",
+        label_offset=(50, 0),
+        label_box=False,
+    )
+    # 停止分支沿仍可回溯方塊的右側直下，避免兩條分支共用同一條線而互相覆蓋。
+    draw_arrow(
+        canvas,
+        start=(760, y_main),
+        end=(760, 198),
+        label="停止",
+        label_offset=(26, 0),
+        label_box=False,
+    )
+    # 折線回圈在資料來源上方繞回 RK4 方塊，清楚表達「未停止就進入下一時間步」。
+    draw_polyline_arrow(
+        canvas,
+        points=((600, 269), (600, 310), (575, 310), (575, 350), (600, 350), (600, y_main)),
+        label="下一步",
+        label_position=(579, 332),
+        label_box=False,
+    )
 
     draw_box(
         canvas,
-        x=470,
-        y=48,
-        width=135,
-        height=46,
+        x=480,
+        y=60,
+        width=145,
+        height=52,
         title_lines=("write_trajectory_shard",),
         body_lines=("原子寫出軌跡、事件與檢查資料",),
         style="output",
@@ -598,17 +730,24 @@ def draw_particle_flow_page(canvas: Canvas) -> None:
     )
     draw_box(
         canvas,
-        x=304,
-        y=48,
-        width=145,
-        height=46,
+        x=300,
+        y=60,
+        width=155,
+        height=52,
         title_lines=("aggregation.py",),
         body_lines=("入口密度、足跡、路徑、停留時間",),
         style="output",
         title_is_code=True,
     )
-    draw_arrow(canvas, start=(690, 92), end=(605, 71), label="發布")
-    draw_arrow(canvas, start=(470, 71), end=(449, 71), label="聚合")
+    draw_arrow(
+        canvas,
+        start=(722, 130),
+        end=(552, 112),
+        label="發布",
+        label_offset=(0, -12),
+        label_box=False,
+    )
+    draw_arrow(canvas, start=(480, 86), end=(455, 86), label="聚合", label_offset=(0, 14))
     canvas.showPage()
 
 
