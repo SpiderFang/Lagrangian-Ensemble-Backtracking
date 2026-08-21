@@ -117,8 +117,8 @@ flowchart LR
 
 可直接引用的靜態圖檔如下：
 
-- [圖 1 PNG：src 模組關係與資料流](../output/figures/source_code_module_relationship.png)
-- [兩頁 PDF：圖 1 與圖 2](../output/pdf/source_code_flow_diagrams.pdf)
+- [圖 1 PNG：src 模組關係與資料流](output/figures/source_code_module_relationship.png)
+- [兩頁 PDF：圖 1 與圖 2](output/pdf/source_code_flow_diagrams.pdf)
 
 ## 4. 一條粒子軌跡實際怎麼走
 
@@ -145,11 +145,11 @@ flowchart TD
     O2 --> A[aggregation.py<br/>入口密度、足跡、路徑與停留時間]
 ```
 
-此圖的單頁 PNG 為[圖 2：單一粒子逆向溯源的處理流程](../output/figures/single_particle_backtracking_flow.png)。兩張圖的可重製來源是 `scripts/render_source_code_flow_diagrams.py`；在具備 ReportLab 的環境執行下列命令即可重新產製 PDF：
+此圖的單頁 PNG 為[圖 2：單一粒子逆向溯源的處理流程](output/figures/single_particle_backtracking_flow.png)。兩張圖的可重製來源是 `scripts/render_source_code_flow_diagrams.py`；在具備 ReportLab 的環境執行下列命令即可重新產製 PDF：
 
 ```bash
 uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
-  --output output/pdf/source_code_flow_diagrams.pdf
+  --output docs/output/pdf/source_code_flow_diagrams.pdf
 ```
 
 ### 4.1 邊界判定的閱讀重點

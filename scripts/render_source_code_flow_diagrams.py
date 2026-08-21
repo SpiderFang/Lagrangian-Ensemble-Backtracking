@@ -7,7 +7,7 @@
 
 輸入不讀取大型 OCM、NWW3 或軌跡資料；所有文字均來自已版本化的文件 11，因此此腳本
 不會接觸 SERVER 資料，也不會改變科學計算結果。輸出位置由命令列指定，預設為
-``output/pdf/source_code_flow_diagrams.pdf``。若日後模組責任或流程改變，必須先更新文件
+``docs/output/pdf/source_code_flow_diagrams.pdf``。若日後模組責任或流程改變，必須先更新文件
 11，再同步更新本腳本的方塊與箭頭文字，避免圖與文件不一致。
 """
 
@@ -619,8 +619,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("output/pdf/source_code_flow_diagrams.pdf"),
-        help="輸出 PDF；預設為 output/pdf/source_code_flow_diagrams.pdf",
+        default=Path("docs/output/pdf/source_code_flow_diagrams.pdf"),
+        help="輸出 PDF；預設為 docs/output/pdf/source_code_flow_diagrams.pdf",
     )
     return parser.parse_args()
 
