@@ -1,8 +1,9 @@
-"""signed-time RK4 與獨立 stochastic split 的純 NumPy 參考實作。
+"""計算單一粒子一步移動的基準方法。
 
-速度 provider 永遠回傳物理時間向前的速度；backward 只由負 ``dt_seconds`` 表達。
-每個 RK stage 都重新取樣位置、z 與時間，任何 stage 無效即整步失敗，不能沿用步首速度
-或把缺值當零。隨機位移在完整 RK4 後加入，符合文件的 operator-split 基線。
+本模組以四階龍格－庫塔法（RK4）計算海流、波浪造成的確定移動，再另外加入隨機擴散
+造成的位移。速度資料一律表示「物理時間往後」的流速；逆向溯源時只要給負的時間步長，
+便會沿相反時間方向回推。每個中間計算點都必須重新讀取速度，若資料缺漏或位置無效，
+整步便停止，絕不把缺值當成零速度。
 """
 
 from __future__ import annotations
@@ -17,14 +18,23 @@ from .models import ParticleState, SampleQC, VelocitySample
 
 
 class VelocityProvider(Protocol):
-    """OCM/Stokes/浮沉合成速度必須實作的 stage 取樣介面。"""
+    """取得某位置、深度與時刻速度的共同介面。
+
+    海流、波浪造成的表面漂移、浮沉速度可以先各自處理，再由呼叫端合成為此介面需要的
+    三個方向速度。輸入座標使用公尺，深度 ``z_m`` 以海面為零且水下為負，時間使用世界
+    協調時間（UTC）的奈秒整數；回傳值中的品質旗標會說明資料是否可用。
+    """
 
     def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
-        """回傳指定位置與 UTC 的物理時間向前速度。"""
+        """回傳指定位置與 UTC 時刻、物理時間往後的三向速度。"""
 
 
 class SamplingError(RuntimeError):
-    """RK stage 因 forcing/QC 無效而中止，保留 bitmask 供 engine 分類。"""
+    """中間計算點無法取得可用速度時拋出的例外。
+
+    ``stage`` 說明失敗發生在四階計算的哪一個中間點；``qc`` 保留品質檢查旗標，讓粒子
+    引擎可區分「資料缺口」與「數值計算失敗」，而非把兩者混為同一種停止原因。
+    """
 
     def __init__(self, stage: str, qc: SampleQC) -> None:
         super().__init__(f"RK4 {stage} 取樣無效：qc={int(qc)}")
@@ -33,7 +43,7 @@ class SamplingError(RuntimeError):
 
 
 def _velocity_vector(sample: VelocitySample, stage: str) -> np.ndarray:
-    """把有效速度轉成 float64 三向量，無效則保留 stage/QC 丟例外。"""
+    """把已通過檢查的速度轉為三個浮點數；無效時保留原因並停止這一步。"""
 
     if not sample.valid:
         raise SamplingError(stage, sample.qc)
@@ -44,10 +54,12 @@ def _velocity_vector(sample: VelocitySample, stage: str) -> np.ndarray:
 
 
 def rk4_step(state: ParticleState, *, dt_seconds: float, velocity: VelocityProvider) -> ParticleState:
-    """執行一個完整的 signed-time RK4 確定性步。
+    """以四階龍格－庫塔法計算一次不含隨機擴散的粒子移動。
 
-    ``age_seconds`` 增加 ``abs(dt)``，UTC 則依 signed dt 改變。ID、站點與 local-exit
-    狀態保持不變；海面／海床與水平 boundary policy 由 engine 在步後依 crossing 處理。
+    ``dt_seconds`` 為正代表往未來推進，為負代表往過去回溯。粒子的已追蹤時間
+    ``age_seconds`` 永遠增加正值，UTC 時刻則依時間步長的正負方向改變。此函式只改變
+    位置、深度與時間；碰到海面、海床、海岸或研究範圍邊界的處理，交由粒子引擎在本步
+    完成後統一判定，避免不同規則互相覆蓋。
     """
 
     if not np.isfinite(dt_seconds) or dt_seconds == 0:
@@ -81,7 +93,11 @@ def split_rk4_brownian_step(
     coefficients: DiffusionCoefficients,
     rng: np.random.Generator,
 ) -> ParticleState:
-    """先做完整 RK4，再加入一次 Brownian 位移的基線 Lie split。"""
+    """先依流速移動，再加入一次隨機擴散位移。
+
+    將流速移動與隨機擴散分開計算，可清楚檢查兩種影響各自是否正確；隨機位移只在完整
+    的四階流速計算完成後加入一次，因此不會在同一時間步中被重複套用。
+    """
 
     advanced = rk4_step(state, dt_seconds=dt_seconds, velocity=velocity)
     displacement = brownian_displacement(coefficients, dt_seconds=dt_seconds, rng=rng)

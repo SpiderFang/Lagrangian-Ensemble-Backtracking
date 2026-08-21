@@ -1,8 +1,9 @@
-"""常數擴散參考、Smagorinsky 候選與 adaptive time-step 限制。
+"""計算隨機擴散位移、速度梯度候選擴散係數與安全時間步長。
 
-隨機位移使用 ``sqrt(2K|dt|)``，永遠不把 backward 設為負 diffusivity，也不把亂數
-增量放入 RK4 stage。空變 K 的 gradient drift 尚未在此啟用；Smagorinsky 函式只輸出
-候選 Kh 與 cap/floor 診斷，正式 baseline 仍需 well-mixed 驗證。
+隨機位移使用 ``sqrt(2K|dt|)``；即使是逆向回溯，擴散變異仍為正值，不能把擴散係數
+設成負數，也不能把亂數位移塞入四階龍格－庫塔法的中間計算點。目前尚未啟用隨位置改變
+的擴散係數所需的額外漂移修正。Smagorinsky 方法只提供候選水平擴散係數與上下限命中
+紀錄；正式基準仍須先通過「粒子在均勻濃度下不產生假累積」的驗證。
 """
 
 from __future__ import annotations
@@ -15,14 +16,14 @@ import numpy as np
 
 @dataclass(frozen=True, slots=True)
 class DiffusionCoefficients:
-    """公尺平方每秒的對角擴散係數。"""
+    """東向、北向與垂向三個方向的擴散係數，單位為平方公尺每秒。"""
 
     kx_m2ps: float
     ky_m2ps: float
     kz_m2ps: float
 
     def validate(self) -> None:
-        """負值或非有限 K 代表病態模型，必須在產生亂數前拒絕。"""
+        """負值或非有限擴散係數代表模型不合理，必須在產生亂數前拒絕。"""
 
         values = (self.kx_m2ps, self.ky_m2ps, self.kz_m2ps)
         if not all(math.isfinite(value) and value >= 0 for value in values):
@@ -31,7 +32,7 @@ class DiffusionCoefficients:
 
 @dataclass(frozen=True, slots=True)
 class TimeStepDecision:
-    """adaptive step 的絕對秒數與主導限制，方向由 caller 另加正負號。"""
+    """自動選出的時間步長絕對秒數與限制來源；回溯或正向方向由呼叫端另行指定。"""
 
     seconds: float
     limiting_reason: str
@@ -40,7 +41,7 @@ class TimeStepDecision:
 def brownian_displacement(
     coefficients: DiffusionCoefficients, *, dt_seconds: float, rng: np.random.Generator
 ) -> np.ndarray:
-    """產生三軸獨立的 Euler–Maruyama 位移，shape 固定為 ``(3,)`` 公尺。"""
+    """產生東、北、垂向彼此獨立的隨機擴散位移，回傳三個公尺值。"""
 
     coefficients.validate()
     if not math.isfinite(dt_seconds) or dt_seconds == 0:
@@ -62,7 +63,7 @@ def smagorinsky_horizontal_diffusivity(
     floor_m2ps: float | None = None,
     cap_m2ps: float | None = None,
 ) -> tuple[float, bool, bool]:
-    """依文件式 (10) 計算 triangle 內候選 Kh 與 floor/cap 命中狀態。"""
+    """依文件公式（10）計算三角形內的候選水平擴散係數，並回報是否碰到上下限。"""
 
     values = [du_dx_per_s, du_dy_per_s, dv_dx_per_s, dv_dy_per_s, triangle_area_m2, coefficient_cs]
     if not all(math.isfinite(value) for value in values) or triangle_area_m2 <= 0 or coefficient_cs < 0:
@@ -93,11 +94,11 @@ def choose_time_step(
     vertical_fraction: float = 0.25,
     diffusive_fraction: float = 0.25,
 ) -> TimeStepDecision:
-    """由水平平流、垂向平流、擴散與 forcing 邊界選最小合法步長。
+    """從水平移動、垂向移動、擴散與資料時間邊界中選擇最小且安全的步長。
 
-    ``seconds_to_forcing_boundary`` 是沿目前積分方向到下一資料時界的正秒數。若所需步長
-    低於 ``dt_min``，函式仍回傳 ``dt_min`` 並標示 ``minimum_clamp``；engine 必須計數，
-    超過核定次數時停止為 numerical failure，而不是無限縮步。
+    ``seconds_to_forcing_boundary`` 是沿目前積分方向走到下一個資料時刻邊界的正秒數。若
+    所需步長小於設定最小值，函式仍回傳最小值並標記此情況；粒子引擎必須累計發生次數，
+    超過核定上限時以數值計算失敗停止，而不是無限縮小步長。
     """
 
     coefficients.validate()

@@ -1,11 +1,11 @@
-"""巢狀 local、foreign-local、共用 outer 與垂向障壁事件解析。
+"""判定局部分析區、共同流場範圍、海岸及垂向邊界的穿越事件。
 
-水平事件以步內線段與 polygon exterior 的第一交點計算，不以步末位置替代。每個
-polygon boundary 必須再以顯式 open-water 線段區分開放邊界與海岸：穿越 open-water
-才是 local/flow exit，穿越被海岸裁切出的其餘邊界則是 coast contact。貢寮／龜山島的
-own-local exit 只記錄後繼續；foreign-local crossing 永不改變 site、scenario、seed 或
-停止狀態；共同 A outer exit 才停止。B-D 的 local/flow 重合時只寫一筆 outer event，
-並以 attribute 保存同時具有 local-first-exit 語意。
+水平事件以粒子在單一步內走過的線段與多邊形邊界的第一個交點計算，不能只看步末位置。
+每個多邊形邊界還要明確標示可與外海交換水體的線段：穿越這些線段才是離開局部分析區
+或流場範圍；其餘被海岸切出的邊界都視為撞岸。貢寮與龜山島各自離開局部分析區時只記錄
+事件、不中止回溯；穿越另一研究區的局部範圍也不改變粒子的歸屬。只有離開共同 A 區流場
+範圍才停止。B 至 D 區若局部範圍與流場範圍相同，只寫一筆離開流場事件，並註明它同時
+也是第一次離開局部分析區。
 """
 
 from __future__ import annotations
@@ -22,12 +22,12 @@ from .models import BoundaryEvent, EventType, ParticleState, ParticleStatus, Vel
 
 @dataclass(frozen=True, slots=True)
 class BoundaryGeometry:
-    """單一 study site 執行時所需的固定公尺制邊界集合。
+    """執行單一研究區時需要的公尺制邊界資料。
 
-    ``own_local_open_boundary`` 與 ``flow_open_boundary`` 是 polygon exterior 中允許
-    水體交換的 LineString/MultiLineString 子集合；交點不在子集合上即視為海岸。
-    ``None`` 只保留給合成測試與舊 manifest 相容，代表整圈皆為開放邊界；正式發布
-    的 geometry manifest 必須提供兩者，避免把海岸誤算成來源入口。
+    ``own_local_open_boundary`` 與 ``flow_open_boundary`` 分別是局部分析區及流場範圍
+    的邊界中，允許水體進出的線段；交點不在這些線段上就代表海岸。值為 ``None`` 只供
+    自動測試和舊版設定檔相容，意義是整個外框都可進出。正式分析必須提供兩組線段，否則
+    可能把海岸誤判為潛在來源的入口。
     """
 
     own_local_domain: Polygon
@@ -42,10 +42,11 @@ class BoundaryGeometry:
     boundary_match_tolerance_m: float = 1.0e-6
 
     def __post_init__(self) -> None:
-        """拒絕負 tolerance 與非線狀 open-boundary 幾何。
+        """拒絕不合理的容許誤差與非線狀的可進出邊界。
 
-        tolerance 只吸收 GEOS overlay 的浮點殘差，不得以大型 buffer 取代正確的岸線
-        拓撲。Polygon 若誤傳為 open boundary 會讓內部點距離為零，因此在此 fail-fast。
+        容許誤差只用來吸收幾何運算的極小浮點誤差，不能用很大的緩衝距離掩蓋錯誤的岸線
+        資料。若誤把面積多邊形當成可進出線段，面內任何點到它的距離都可能為零，因此在
+        建立設定時立刻報錯，避免分析結果被悄悄污染。
         """
 
         if self.boundary_match_tolerance_m < 0:
@@ -64,11 +65,11 @@ def _open_boundary_crossing(
     *,
     tolerance_m: float,
 ) -> SegmentCrossing | None:
-    """判斷 polygon crossing 是否落在命名的 open-water 線段。
+    """判斷穿越點是否落在允許進出水體的邊界線段。
 
-    回傳值的 ``boundary_s_m`` 改以 open-boundary 線段本身的弧長座標表示，使不同
-    local/flow polygon 的海岸段不會佔據 KDE 的一維座標。無顯式線段時沿用 polygon
-    exterior 弧長，此模式僅供合成測試及舊資料相容。
+    回傳資料中的 ``boundary_s_m`` 會改成沿可進出線段量得的距離。如此一來，後續估計
+    邊界來源密度時，海岸線不會占用一維座標。若沒有提供線段，才暫時使用整個多邊形外框
+    的距離；這個相容模式只供測試或讀取舊資料，不能用於正式成果。
     """
 
     if open_boundary is None:
@@ -86,7 +87,7 @@ def _coast_event(
     crossing: SegmentCrossing,
     geometry: BoundaryGeometry,
 ) -> BoundaryEvent:
-    """建立不可穿越的海岸接觸事件；海岸不納入任何 open-boundary density。"""
+    """建立不可穿越的撞岸事件；海岸不列入外海入口的來源統計。"""
 
     return _event_at_crossing(
         previous,
@@ -108,7 +109,7 @@ def _event_at_crossing(
     boundary_segment_id: str | None = None,
     attributes: dict[str, bool | float | int | str] | None = None,
 ) -> BoundaryEvent:
-    """以同一 crossing fraction 內插 UTC 與 z，避免事件欄位彼此錯位。"""
+    """依穿越位置在本步所占比例，同步內插時刻與深度，避免欄位彼此錯位。"""
 
     fraction = crossing.fraction
     time_ns = previous.time_utc_ns + int(round(fraction * (proposed.time_utc_ns - previous.time_utc_ns)))
@@ -136,11 +137,11 @@ def _event_at_crossing(
 def resolve_horizontal_boundaries(
     previous: ParticleState, proposed: ParticleState, geometry: BoundaryGeometry
 ) -> tuple[ParticleState, list[BoundaryEvent]]:
-    """依沿步進方向的 fraction 排序並套用水平事件。
+    """依粒子行進順序判定並套用水平邊界事件。
 
-    同一步可能先離開 own local、再穿過 foreign local、最後離開 flow domain；函式保留
-    outer stop 以前的所有事件，outer 後事件不寫入。邊界上的 ``covers`` 語意可避免
-    浮點小誤差把步首誤判為域外。
+    單一步內可能先離開自己的局部分析區、再穿越另一研究區的局部範圍，最後離開共同
+    流場範圍。本函式會保留真正停止前的所有事件，停止後的事件不再寫入。使用包含邊界
+    的幾何判定，可避免極小浮點誤差把剛好在邊界上的步首位置誤認成範圍外。
     """
 
     start_xy = (previous.x_m, previous.y_m)

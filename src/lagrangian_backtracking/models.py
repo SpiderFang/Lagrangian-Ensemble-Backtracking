@@ -1,8 +1,9 @@
-"""跨 forcing、積分器、邊界與輸出模組共用的科學資料型別。
+"""所有模組共用的粒子、速度與事件資料格式。
 
-本模組集中定義粒子狀態、速度取樣與事件語意，避免各模組以裸字串或特殊數值表示
-缺值。所有位置都位於 flow domain 固定的公尺制 CRS；``z_m`` 採 SCHISM 慣例的
-positive-up，海面約為 ``eta``、海床約為 ``-depth``。經緯度僅在 I/O 邊界轉換。
+這裡把「粒子目前在哪裡」、「海流與波浪取樣是否可用」及「何時碰到邊界」定義成同一套
+資料格式。這樣遇到缺資料、乾點或數值問題時，不會有人用 0 速度、有人用空值，導致結果
+無法比較。位置一律先換算為公尺再計算；``z_m`` 向上為正，海面接近 ``eta_m``，海床為
+負水深。經緯度只在讀取資料和畫圖時使用。
 """
 
 from __future__ import annotations
@@ -12,10 +13,11 @@ from enum import IntFlag, StrEnum
 
 
 class SampleQC(IntFlag):
-    """速度或波浪取樣的可組合品質旗標。
+    """速度或波浪取樣的品質檢查旗標（程式欄位名為 ``qc``）。
 
-    ``OK`` 是唯一可直接送入正式積分的值。其餘 bit 分開保留域外、時間缺口、乾點、
-    垂向無包夾、波浪缺值與數值失敗，避免把不同原因都變成 NaN 後失去可追溯性。
+    ``OK`` 表示資料完整，可直接用來計算。其餘旗標分別記錄位置在資料範圍外、時間有
+    缺口、海域已乾掉、深度無法由上下層包住、波浪不可用或數值失敗。不同原因分開保存，
+    才能在成果中知道哪一種問題造成粒子停止。
     """
 
     OK = 0
@@ -68,12 +70,12 @@ class EventType(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class VelocitySample:
-    """單一 RK stage 的物理時間向前速度與局地幾何資訊。
+    """一次速度查詢得到的正向物理速度與附近網格資訊。
 
-    參數皆使用 SI 單位。``u/v/w`` 是 OCM、Stokes 與浮沉尚未必全部合成的呼叫端約定；
-    取樣器必須以 ``qc`` 表示失敗，不能回傳零速度替代域外或缺值。``eta_m`` 與
-    ``bed_z_m`` 供海面／海床障壁判定，``horizontal_scale_m`` 與
-    ``vertical_scale_m`` 供 adaptive time-step 控制。
+    數值都採國際單位制：速度為公尺/秒，長度為公尺。``u_mps``、``v_mps``、``w_mps``
+    分別是東向、北向與向上的速度，可由海流、波浪造成的漂移和物體浮沉速度合成。
+    取樣失敗一定寫入品質檢查旗標（``qc``），不可假裝成靜水。海面、海床及附近網格大小
+    用於判斷粒子能否繼續前進，以及下一步最多可走多遠。
     """
 
     u_mps: float
@@ -91,17 +93,18 @@ class VelocitySample:
 
     @property
     def valid(self) -> bool:
-        """只有完全無 QC bit 的樣本才可進入正式積分。"""
+        """只有沒有任何品質問題的樣本，才可用於正式粒子計算。"""
 
         return self.qc == SampleQC.OK
 
 
 @dataclass(frozen=True, slots=True)
 class ParticleState:
-    """一個 member 在某時刻的不可變狀態。
+    """一個系集成員在某時刻的完整狀態。
 
-    ``time_utc_ns`` 為 UTC epoch nanoseconds；backward 積分只讓它隨負 ``dt`` 遞減，
-    不改變速度函式的物理正向。``age_seconds`` 永遠非負，用來判斷 max-age censor。
+    ``time_utc_ns`` 是世界協調時間（UTC）的奈秒整數。逆向追蹤時只讓時間往過去減少，
+    海流函式本身仍回傳真實世界向前流動的速度。``age_seconds`` 是已回溯多久，永遠為
+    非負值，用來判斷是否達到最長回溯時間。
     """
 
     particle_id: str
@@ -121,11 +124,12 @@ class ParticleState:
 
 @dataclass(frozen=True, slots=True)
 class BoundaryEvent:
-    """步內插值後的事件紀錄。
+    """粒子在單一步驟中碰到邊界或停止條件的紀錄。
 
-    crossing 座標與時間對應同一線段內的 ``fraction``（0 到 1）。他站 local-domain
-    事件以 ``related_study_site_id`` 指出被穿越站點，但原粒子站點保持不變。
-    ``attributes`` 只放穩定、可 JSON/Parquet 序列化的輔助值。
+    交點位置、深度與時間都依同一個 ``fraction``（步首為 0、步末為 1）計算，避免時間
+    和位置不相符。若粒子穿過其他站點的關注海域，只在 ``related_study_site_id`` 記下
+    對方站點；粒子原本所屬的站點不會改變。``attributes`` 只放能安全寫進結果檔的補充
+    說明。
     """
 
     particle_id: str

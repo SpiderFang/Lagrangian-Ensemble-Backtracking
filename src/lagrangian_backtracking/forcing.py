@@ -1,9 +1,11 @@
-"""OCM native 4D、NWW3 analysis 3D 與 Stokes/浮沉的唯讀 forcing adapters。
+"""讀取海流、波浪、表面漂移與浮沉資料，並在指定時空位置提供速度。
 
-每個 adapter 只 memory-map 一個月份。跨月切換由 ``MonthlyCombinedForcing`` 依 stage
-UTC 選擇，禁止最近月份外插。OCM 依「node 垂向 → triangle barycentric → 時間線性」
-順序取樣；三個支撐 node 任一無法包夾 z、face 乾或時次缺口時，回傳明確 QC bit。
-NWW3 只在四角及前後時次的 ``valid_mask_wave`` 全部有效時做保守雙線性／時間插值。
+海流資料使用海洋模式（OCM）的原始三維網格及時間軸；波浪資料使用 NWW3 分析資料。
+每個讀取器一次只以唯讀方式開啟一個月份，避免把完整兩年資料載入記憶體。跨月時由
+``MonthlyCombinedForcing`` 依世界協調時間（UTC）選取正確月份，絕不借用最近月份資料。
+海流依序在節點垂向、三角形平面與時間上內插；若三個支撐節點任一處無法夾住指定深度、
+網格面乾涸或時間間隔過大，會回傳明確的品質檢查旗標。波浪只有在周圍四個格點及前後
+兩個時刻的資料都有效時，才做空間與時間內插。
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from .stokes import finite_depth_stokes
 def _time_bracket(
     times_ns: np.ndarray, target_ns: int, *, maximum_gap_ns: int
 ) -> tuple[int, int, float, SampleQC]:
-    """回傳前後 index 與線性權重；域外、重複或過大 gap 分開標記。"""
+    """找出目標時刻前後的資料索引與內插比例，並分開標記各種時間問題。"""
 
     if times_ns.ndim != 1 or times_ns.size < 2:
         return 0, 0, 0.0, SampleQC.OUTSIDE_TIME_RANGE
@@ -47,7 +49,7 @@ def _time_bracket(
 
 @dataclass(frozen=True, slots=True)
 class WaveSample:
-    """NWW3 bulk 波況；raw direction 尚未轉成傳播向量。"""
+    """一筆 NWW3 波浪摘要資料；原始波向尚未轉為傳播方向向量。"""
 
     significant_wave_height_m: float
     peak_frequency_hz: float
@@ -57,13 +59,16 @@ class WaveSample:
 
     @property
     def valid(self) -> bool:
-        """只有共同有效遮罩與物理值都通過才可計算 Stokes。"""
+        """只有資料遮罩與物理數值都通過檢查時，才能計算波浪造成的表面漂移。"""
 
         return self.qc == SampleQC.OK
 
 
 class OCMNativeMonth:
-    """一個 OCM schema 3 月份的 4D 原生網格取樣器。"""
+    """讀取一個月份 OCM 原始網格的速度與擴散資料。
+
+    資料包含時間、水平位置與垂向深度三個方向；網格拓撲沿用前處理結果，不自行重建。
+    """
 
     def __init__(
         self,
@@ -81,7 +86,7 @@ class OCMNativeMonth:
         wet_value: float = 0.0,
         use_numba_kernel: bool = False,
     ) -> None:
-        """保留 memory-map 並驗證跨陣列前導維度，不複製完整月份。"""
+        """保留唯讀的大型陣列並檢查各欄位的時間、節點與深度維度一致。"""
 
         self.month_id = month_id
         self.mesh = mesh
@@ -115,12 +120,12 @@ class OCMNativeMonth:
 
     @classmethod
     def from_directory(cls, month_dir: str | Path, *, mesh: NativeMesh) -> OCMNativeMonth:
-        """由月份目錄以禁止 pickle 的 read-only mmap 建立取樣器。"""
+        """從月份資料夾以唯讀方式開啟陣列，不允許載入任意序列化物件。"""
 
         root = Path(month_dir)
 
         def load(name: str) -> np.ndarray:
-            """以唯讀 mmap 載入單一 OCM 月陣列，不複製大型 time×node×layer 資料。"""
+            """唯讀開啟一個月份陣列，避免複製龐大的時間、節點與深度資料。"""
 
             path = root / name
             if not path.is_file():
@@ -142,10 +147,11 @@ class OCMNativeMonth:
     def _vertical_node_sample(
         self, *, time_index: int, node_index: int, z_m: float
     ) -> tuple[np.ndarray, float] | None:
-        """在一個 node 柱中包夾 z，回傳 ``[u,v,w,kz]`` 與 bracket span。
+        """在單一節點的水柱中，以指定深度上下兩層內插速度與垂向擴散。
 
-        不假設 layer index 排序；任一必要欄位缺值時該 layer 不可用。單側最近層不作
-        外插，粒子在海床以下或海面以上會由 caller 收到 ``None``。
+        回傳的四個值依序是東向、北向、垂向速度與垂向擴散係數，另附兩層間的深度差。
+        不假設資料層號已由淺到深排序；任一必要數值缺漏時該層不可用。只用一側最近層的
+        外插會製造不可靠速度，因此粒子在海床以下或海面以上時回傳 ``None``。
         """
 
         physical_z = np.asarray(self.zcor[time_index, node_index], dtype=np.float64)
@@ -173,7 +179,7 @@ class OCMNativeMonth:
     def _spatial_at_time(
         self, location: MeshLocation, *, time_index: int, z_m: float
     ) -> tuple[tuple[np.ndarray, float, float] | None, SampleQC]:
-        """對三個 node 完成垂向與水平內插，並分開回報乾點或垂向無支撐。"""
+        """在三個三角形節點完成垂向及水平內插，並區分乾涸與深度資料不足。"""
 
         face = location.source_face_local_index
         wetdry = float(self.wetdry_elem[time_index, face])
@@ -198,7 +204,11 @@ class OCMNativeMonth:
         return (combined, eta, vertical_scale), SampleQC.OK
 
     def sample(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
-        """取樣 OCM ``u/v/w/Kz/eta/bed``，失敗以 QC 回傳而非丟失原因。"""
+        """取得 OCM 東、北、垂向速度、擴散係數、海面高度與水深。
+
+        取樣失敗時仍回傳品質檢查旗標，讓呼叫端知道是超出範圍、時間缺口、乾涸或深度
+        資料不足，而不是只得到沒有原因的空值。
+        """
 
         location = self.mesh.locate(x_m, y_m)
         if location is None:
@@ -319,7 +329,7 @@ class NWWAnalysisMonth:
         qc_flags: np.ndarray,
         maximum_time_gap_seconds: float = 5_400.0,
     ) -> None:
-        """驗證 ``(time,lat,lon)`` 契約並保留 read-only memory maps。"""
+        """檢查時間、緯度、經度三個軸的資料格式，並保留唯讀大型陣列。"""
 
         self.month_id = month_id
         self.lon = np.asarray(lon)
@@ -352,13 +362,13 @@ class NWWAnalysisMonth:
 
     @classmethod
     def from_directories(cls, grid_dir: str | Path, month_dir: str | Path) -> NWWAnalysisMonth:
-        """由 analysis grid 與月份目錄建立 mmap 取樣器。"""
+        """從波浪格網與月份資料夾建立唯讀取樣器。"""
 
         grid = Path(grid_dir)
         month = Path(month_dir)
 
         def load(root: Path, name: str) -> np.ndarray:
-            """由 grid 或 month root 唯讀 mmap NWW 陣列，禁止 pickle 與缺檔猜測。"""
+            """從格網或月份資料夾唯讀開啟 NWW 陣列，不載入任意序列化物件，也不猜測缺檔。"""
 
             path = root / name
             if not path.is_file():
@@ -378,7 +388,7 @@ class NWWAnalysisMonth:
         )
 
     def sample(self, lon: float, lat: float, time_utc_ns: int) -> WaveSample:
-        """以四角全有效政策做空間／時間插值，方向用 cos/sin 避免 0/360 斷點。"""
+        """僅在四個周圍格點都有效時做空間與時間內插；波向以正弦、餘弦避免 0/360 度斷點。"""
 
         if lon < self.lon[0] or lon > self.lon[-1] or lat < self.lat[0] or lat > self.lat[-1]:
             return WaveSample(np.nan, np.nan, np.nan, 0, SampleQC.OUTSIDE_HORIZONTAL_DOMAIN)
@@ -429,7 +439,7 @@ class NWWAnalysisMonth:
 
 
 class CombinedMonthForcing:
-    """同一月份 OCM、NWW、投影與粒子浮沉的速度 provider。"""
+    """合併同月海流、波浪、座標投影與粒子浮沉速度的取樣器。"""
 
     def __init__(
         self,
@@ -440,7 +450,7 @@ class CombinedMonthForcing:
         settling_velocity_mps: float,
         include_stokes: bool,
     ) -> None:
-        """no-Stokes case 可不提供 NWW，含 Stokes case 則強制要求。"""
+        """不納入波浪表面漂移的案例可不讀波浪資料；納入時則必須提供 NWW 資料。"""
 
         if include_stokes and nww is None:
             raise ValueError("include_stokes=True 時必須提供 NWW month")
@@ -451,7 +461,7 @@ class CombinedMonthForcing:
         self.include_stokes = include_stokes
 
     def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
-        """合成 ``OCM current + finite-depth Stokes + settling`` 的 forward-time 速度。"""
+        """合成海流、有限水深波浪表面漂移與粒子浮沉後，回傳物理時間往後的速度。"""
 
         current = self.ocm.sample(x_m, y_m, z_m, time_utc_ns)
         if not current.valid:

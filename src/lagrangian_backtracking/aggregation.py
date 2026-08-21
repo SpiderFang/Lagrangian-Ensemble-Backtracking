@@ -1,8 +1,9 @@
-"""條件式足跡 KDE/HDR、路徑停留、停止結果與跨站 local-domain 連通聚合。
+"""把大量粒子結果整理成可解讀的來源足跡統計。
 
-本模組的比例一律要求 caller 提供有效 member 分母，且輸出 raw count。KDE 是在指定
-受體、到達時間、物性與 forcing 條件下的條件式密度，不是 posterior 或絕對來源機率。
-HDR 以離散格網 cell probability 排序建立，並回報質量正規化誤差供 QC。
+所有比例都同時保留原始粒子數和有效成員分母，避免只看百分比而不知道樣本有多少。
+本模組的空間密度只表示「在指定受體、到達時間、物性和流場條件下，粒子較常出現的
+位置」，不是絕對來源機率。核密度估計（KDE）將離散交點轉成平滑地圖；高密度區（HDR）
+則圈出累積包含 50%、75% 或 90% 質量的格網。
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from .models import BoundaryEvent, EventType, ParticleStatus
 
 @dataclass(frozen=True, slots=True)
 class KDEGrid:
-    """公尺制規則格網上的條件式密度、cell probability 與 HDR masks。"""
+    """公尺制格網上的密度、每格機率和高密度區遮罩。"""
 
     x_centers_m: np.ndarray
     y_centers_m: np.ndarray
@@ -32,11 +33,11 @@ class KDEGrid:
 
 @dataclass(frozen=True, slots=True)
 class PathwayGrid:
-    """軌跡規則格網的 unique-particle count 與 residence time。
+    """軌跡格網中的不重複粒子數與停留秒數。
 
-    兩個量不可互換：前者每個 particle/cell 最多計一次，後者依相鄰 observation 的實際
-    ``age_seconds`` 差分配。單段在公尺制平面假設直線，並以所有穿越的 x/y grid edge
-    切段，因此停留秒數守恆，不會因輸出間隔跨過格線而全部落入步末 cell。
+    兩個量不能互換：每條粒子軌跡在同一格最多只算一次；停留時間則依相鄰觀測點真正相隔
+    的秒數分配。兩點間暫時視為直線，並在每個格線交點切開，因此粒子跨越格線時，不會把
+    全部時間錯算到步末那一格。
     """
 
     x_edges_m: np.ndarray
@@ -50,7 +51,7 @@ class PathwayGrid:
 
 @dataclass(frozen=True, slots=True)
 class BoundaryArclengthHistogram:
-    """單一命名 open-boundary segment 的弧長 bin 統計與明示分母。"""
+    """單一開放邊界線段上的交點數、每公尺密度和有效成員分母。"""
 
     boundary_segment_id: str
     s_edges_m: np.ndarray
@@ -68,10 +69,10 @@ def conditional_kde_2d(
     hdr_levels: Sequence[float] = (0.50, 0.75, 0.90),
     bandwidth: str | float = "scott",
 ) -> KDEGrid:
-    """建立正規化 2D Gaussian KDE 與 50/75/90% 離散 HDR。
+    """建立二維平滑密度地圖與 50/75/90% 高密度區。
 
-    至少需要三個非共線點；樣本不足應由上游保留 raw points 並標示 KDE 不可估，而非
-    人工加 jitter。格網 cell 面積可不等，這裡接受各軸非等距 edges 並逐格正規化。
+    至少需要三個不在同一直線上的點。樣本太少時，應保留原始交點並標示「無法估計」，
+    不能為了畫圖而加入隨機擾動。格網每一格可有不同面積，函式會依真實面積重新校正。
     """
 
     points = np.asarray(points_xy_m, dtype=np.float64)
@@ -244,11 +245,11 @@ def boundary_arclength_histogram(
         EventType.FLOW_DOMAIN_OPEN_EXIT,
     ),
 ) -> BoundaryArclengthHistogram:
-    """以命名線段弧長建立 1D raw count 與條件式密度。
+    """沿指定開放邊界量測交點數和每公尺的條件式比例。
 
-    只接受 open-boundary 事件；coast contact 沒有弧長 KDE 的科學語意。每個事件須有
-    ``boundary_s_m``，且超出 edges 直接失敗，避免靜默遺失 crossing。條件式密度以
-    有效 member 分母與 bin 長度正規化，積分後等於該 segment 的條件式 crossing 比例。
+    只統計穿越開放水域邊界的事件；碰到海岸沒有「沿開放邊界位置」的意義，不能混進來。
+    每筆事件都要有沿邊界的距離 ``boundary_s_m``，超出設定範圍就立刻報錯，避免漏掉交點。
+    每公尺比例以有效成員數和該段長度校正，全部加總後等於穿越這條邊界的比例。
     """
 
     edges = np.asarray(s_edges_m, dtype=np.float64)

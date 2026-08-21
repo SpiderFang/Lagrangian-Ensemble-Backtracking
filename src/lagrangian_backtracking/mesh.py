@@ -1,9 +1,9 @@
-"""SCHISM 原生 face 拓撲的決定性三角化與公尺制 point locator。
+"""保留原始海洋模式網格拓撲，並快速找出粒子所在三角形。
 
-本模組只使用上游發布的 ``source_face_nodes_local``，不以 SciPy Delaunay 重建網格，
-因此 ``triangle_id`` 可追溯回原始 SCHISM face。四邊形依公尺制較短對角線切分，同距
-時固定選 0–2 對角線；uniform-bin index 只加速候選查找，不改變拓撲或 barycentric
-權重。
+本模組只使用前處理資料提供的網格面與節點關係，不以通用插值工具重新建網，因此每個
+三角形都能追溯回原始 SCHISM 模式網格面。四邊形依公尺制較短的對角線拆成兩個三角形；
+兩條對角線等長時固定選節點 0 至 2，確保每次結果一致。內部的方格索引只用來加快候選
+三角形查找，不會改變網格連接關係或三角形內插權重。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from .geometry import DomainProjection
 
 @dataclass(frozen=True, slots=True)
 class MeshLocation:
-    """查詢點所在三角形、來源 face 與重心權重。"""
+    """查詢位置所在三角形、原始網格面與三個節點的內插權重。"""
 
     triangle_id: int
     source_face_local_index: int
@@ -29,14 +29,14 @@ class MeshLocation:
 
 
 def _signed_double_area(vertices_xy: np.ndarray) -> float:
-    """回傳三角形有向面積的兩倍，供方向與退化判斷。"""
+    """回傳帶正負號的兩倍三角形面積，用來判定節點方向與退化面。"""
 
     a, b, c = vertices_xy
     return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
 
 
 def _oriented_triangle(nodes: tuple[int, int, int], node_xy: np.ndarray) -> tuple[int, int, int]:
-    """將 triangle 固定為 counter-clockwise，退化面立即拒絕。"""
+    """把三角形節點固定為逆時針順序；面積近零時立即拒絕使用。"""
 
     vertices = node_xy[np.asarray(nodes)]
     area2 = _signed_double_area(vertices)
@@ -48,10 +48,11 @@ def _oriented_triangle(nodes: tuple[int, int, int], node_xy: np.ndarray) -> tupl
 def triangulate_faces(
     face_nodes_local: np.ndarray, face_node_count: np.ndarray, node_xy: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """把 triangle/quad faces 轉成決定性三角形與來源 face index。
+    """將三角形或四邊形網格面轉成固定方式的三角形，並保留來源面索引。
 
-    quad 若 0–2 對角線不長於 1–3，切成 ``(0,1,2)+(0,2,3)``；否則採另一對角線。
-    ``-1`` 只允許出現在 triangle 的第四欄，避免壞 connectivity 被負索引吞掉。
+    四邊形的節點 0 至 2 對角線不長於 1 至 3 時，拆成 ``(0,1,2)`` 與 ``(0,2,3)``；
+    否則使用另一條對角線。``-1`` 只允許出現在三角形資料未使用的第四欄，避免錯誤的
+    節點連接關係被陣列的負索引規則默默接受。
     """
 
     connectivity = np.asarray(face_nodes_local, dtype=np.int64)
@@ -86,7 +87,7 @@ def triangulate_faces(
 
 
 class NativeMesh:
-    """已投影的 OCM native 子網格與 uniform-bin locator。"""
+    """已投影為公尺座標的 OCM 子網格，以及快速位置查找索引。"""
 
     def __init__(
         self,
@@ -101,7 +102,7 @@ class NativeMesh:
         source_face_global_index: np.ndarray,
         bin_size_m: float | None = None,
     ) -> None:
-        """驗證靜態陣列、三角化並建立 bbox-to-bin index。"""
+        """檢查不隨時間改變的網格資料、拆分三角形並建立查找索引。"""
 
         self.node_lon = np.asarray(node_lon, dtype=np.float64)
         self.node_lat = np.asarray(node_lat, dtype=np.float64)
@@ -149,12 +150,12 @@ class NativeMesh:
 
     @classmethod
     def from_directory(cls, grid_dir: str | Path, *, projection: DomainProjection) -> NativeMesh:
-        """由 OCM schema 3 ``grid/`` memory-map 靜態陣列並投影 node。"""
+        """從 OCM 網格資料夾唯讀開啟靜態陣列，並將經緯度投影為公尺座標。"""
 
         root = Path(grid_dir)
 
         def load(name: str) -> np.ndarray:
-            """以唯讀 mmap 載入單一 schema-3 grid array，缺檔時保留完整路徑失敗。"""
+            """唯讀開啟一個網格陣列；缺檔時顯示完整路徑以利補齊資料。"""
 
             path = root / name
             if not path.is_file():
@@ -176,10 +177,11 @@ class NativeMesh:
         )
 
     def locate(self, x_m: float, y_m: float, *, tolerance: float = 1e-10) -> MeshLocation | None:
-        """以 uniform bin 找候選，再用 barycentric 判定 point-in-triangle。
+        """先用方格索引縮小候選，再以三角形內插權重判定位置是否落在面內。
 
-        共邊點可能同時落入兩個 triangle；固定選最小 triangle ID，確保 restart 與不同
-        worker 得到一致 provenance。域外回傳 ``None``，不做最近 triangle 外插。
+        共用邊上的點可能同時屬於兩個三角形；固定選編號較小者，讓重新啟動與不同工作
+        處理程序都得到相同的來源網格記錄。位置在網格外時回傳 ``None``，不以最近三角形
+        硬做外插，以免製造不存在的流速。
         """
 
         point = np.array([x_m, y_m], dtype=np.float64)

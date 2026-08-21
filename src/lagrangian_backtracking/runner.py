@@ -1,10 +1,10 @@
-"""情境分片、member run unit 與可重現 reference batch executor。
+"""安排情境批次、隨機系集成員與可重現的基準計算。
 
-計畫書的 10×20×50 是每站基礎 scenario 數；隨機系集成員是 scenario 外層維度。本模組
-明確建立 ``Scenario × member_id`` run unit，使每站總軌跡為 ``10,000×M``，並保證
-修改 shard 大小、worker 數或輸入 manifest 列順序不會改變 particle ID 與亂數 seed。
-reference executor 以逐粒子 NumPy 引擎建立科學基準；正式大批次仍須在 Numba backend
-通過逐項等價與 benchmark gate 後才能宣稱 production ready。
+計畫書的 10×20×50 是每個研究站點的基礎情境數；每個情境外面再配置 ``M`` 個獨立的
+隨機系集成員。本模組明確建立「情境 × 成員」的執行單位，因此每站總軌跡數是
+``10,000 × M``。不論一次處理多少情境、使用多少工作程序或輸入清單原有順序如何，
+粒子識別碼與亂數種子都不會改變。此處的 NumPy 逐粒子計算是科學比對基準；大量正式
+計算的加速版本必須先證明與它逐項一致並完成效能驗證。
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .scenarios import Scenario, derive_member_seed, stable_identifier
 
 @dataclass(frozen=True, slots=True)
 class RunUnit:
-    """一條可獨立重跑的 scenario/member 軌跡識別與 seed。"""
+    """一條可單獨重跑的軌跡所需情境、成員編號、粒子識別碼與亂數種子。"""
 
     scenario: Scenario
     experiment_case_id: str
@@ -35,11 +35,11 @@ class RunUnit:
 
 @dataclass(frozen=True, slots=True)
 class ScenarioShard:
-    """以完整 scenario 為邊界的不可重疊分片。
+    """以完整情境為單位、不互相重疊的一批工作。
 
-    同一 scenario 的 M 個 members 不跨 shard，便於檢查情境完整率與一致分母；若 pilot
-    顯示單一 scenario 的 M 過大，須另建立已記錄的 member-subshard schema，不可在此
-    靜默拆分。
+    同一情境的 ``M`` 個成員不分到不同批次，才能直接檢查每個情境的成員是否完整，並讓
+    各情境的統計分母一致。若試算顯示一個情境的成員數大到必須拆開，必須另外定義並記錄
+    拆分格式，不能在這裡悄悄拆分。
     """
 
     shard_id: str
@@ -51,23 +51,23 @@ class ScenarioShard:
 
     @property
     def scenario_count(self) -> int:
-        """回傳 shard 中的基礎 scenario 數，不乘 M。"""
+        """回傳此批次的基礎情境數，不乘上每情境成員數。"""
 
         return len(self.scenarios)
 
     @property
     def particle_count(self) -> int:
-        """回傳實際需積分的 trajectory 數，即 scenario_count×M。"""
+        """回傳實際需要積分的軌跡數，即基礎情境數乘上每情境成員數。"""
 
         return self.scenario_count * self.members_per_scenario
 
 
 @dataclass(frozen=True, slots=True)
 class ReferenceParticleRequest:
-    """reference executor 所需的單粒子物理依賴。
+    """計算一條基準粒子軌跡所需的物理資料與設定。
 
-    factory 可依 scenario 的 flow domain 共用 forcing cache，並依 behavior/material 指派
-    垂向速度與擴散；這裡不在 runner 內硬編碼 SERVER 路徑或資料載入策略。
+    建立請求的函式可依情境所屬流場共用已開啟的資料，並依材料行為指定垂向速度與擴散。
+    本模組不硬寫伺服器路徑或資料載入方式，讓正式執行環境可由設定檔指定。
     """
 
     initial_state: ParticleState
@@ -85,11 +85,11 @@ def plan_scenario_shards(
     shard_scenario_count: int,
     experiment_case_id: str,
 ) -> list[ScenarioShard]:
-    """排序、驗證並把 scenario manifest 切成穩定分片。
+    """排序、檢查並把情境清單切成固定且可重現的批次。
 
-    排序只用唯一 ``scenario_id``，因此來源 Parquet/YAML 的列順序不影響 shard。分片 ID
-    含 experiment case 與 scenario ID 範圍的 hash；同一情境不可重複，空 manifest、
-    ``M<1`` 或無效 shard size 皆立即失敗。
+    僅依唯一的 ``scenario_id`` 排序，所以輸入資料檔的列順序不影響批次內容。批次識別碼
+    包含實驗案例與情境識別碼範圍的雜湊值；重複情境、空清單、每情境成員數小於一或不合理
+    的批次大小都會立即報錯。
     """
 
     if not scenarios:
@@ -125,7 +125,7 @@ def plan_scenario_shards(
 
 
 def iter_run_units(shard: ScenarioShard, *, master_seed: int) -> Iterator[RunUnit]:
-    """依 scenario、member 穩定順序逐一產生 run units，不一次配置大型清單。"""
+    """依固定情境與成員順序逐一產生執行單位，避免一次建立龐大清單。"""
 
     if master_seed < 0:
         raise ValueError("master_seed 不可為負")
@@ -156,11 +156,11 @@ def run_reference_shard(
     request_factory: Callable[[RunUnit], ReferenceParticleRequest],
     on_result: Callable[[RunUnit, ParticleResult], None] | None = None,
 ) -> list[ParticleResult]:
-    """以逐粒子 NumPy engine 執行一個 shard，供驗證與小型 pilot。
+    """以 NumPy 逐粒子引擎執行一批工作，供驗證與小型試算。
 
-    factory 產出的 initial state 必須逐項符合 run unit；這可阻止錯 receptor、case 或
-    member 的初始列被寫入正確 seed 的結果。PCG64DXSM 接受 128-bit 派生 seed，確保
-    單獨重跑某 member 與批次執行得到相同 Brownian 序列。
+    建立函式回傳的初始粒子狀態必須和執行單位逐欄一致，避免錯誤受體、實驗案例或成員的
+    初始資料被寫成看似正確的結果。亂數產生器使用由主種子、情境、案例與成員共同導出的
+    128 位元種子，因此單獨重跑某一成員與整批計算會得到相同的隨機擴散序列。
     """
 
     results: list[ParticleResult] = []

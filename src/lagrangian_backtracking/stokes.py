@@ -1,8 +1,9 @@
-"""有限水深單色 bulk Stokes drift 與方向轉換。
+"""依有限水深波浪資料計算表面漂移，並轉換波向。
 
-本方法以 NWW3 ``Hs``、``fp``、raw peak direction 與 OCM 瞬時水深建立水平 Stokes
-profile。它不能重建方向頻譜，正式成果必須與 no-Stokes、deep-water 案例並列。方向
-慣例由 config 明示為「自正北順時針 wave-from」，本模組不隱藏推定。
+本方法以 NWW3 的有效波高（``Hs``）、峰值頻率（``fp``）、原始峰值波向與 OCM 當時
+水深，計算波浪造成的水平表面漂移。它不能重建完整方向頻譜，因此正式成果必須另列
+「不納入波浪表面漂移」與「深水近似」結果比較。波向慣例明確採「波浪從正北起順時針
+吹來」；本模組不自行猜測或改變此定義。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ GRAVITY_MPS2 = 9.80665
 
 @dataclass(frozen=True, slots=True)
 class StokesResult:
-    """Stokes 水平速度與可供 QC/敏感度報告的診斷量。"""
+    """波浪表面漂移的東、北速度及供品質檢查與敏感度分析使用的診斷量。"""
 
     u_mps: float
     v_mps: float
@@ -31,10 +32,10 @@ class StokesResult:
 def solve_wave_number(
     *, angular_frequency_radps: float, water_depth_m: float, gravity_mps2: float = GRAVITY_MPS2
 ) -> float:
-    """解 ``omega²=g k tanh(kh)`` 的唯一正根。
+    """求解有限水深波浪色散關係 ``omega²=g k tanh(kh)`` 的唯一正波數。
 
-    bracket 由深水估計起始並倍增到殘差轉正；``brentq`` 保證 bracket 內收斂。極淺水
-    或非有限輸入直接拒絕，避免 root solver 回傳可疑值後污染整條軌跡。
+    搜尋範圍從深水近似開始逐步放大，直到方程式兩側差值跨過零；接著使用有收斂保證的
+    數值方法求根。極淺水或非有限輸入會立即拒絕，避免不可靠結果污染整條粒子軌跡。
     """
 
     if not (
@@ -49,7 +50,7 @@ def solve_wave_number(
     omega2 = angular_frequency_radps**2
 
     def residual(wave_number: float) -> float:
-        """回傳有限水深 dispersion equation 左右兩側差，供 bracket root solver 使用。"""
+        """回傳有限水深色散關係兩側的差值，供求根步驟判定方向。"""
 
         return gravity_mps2 * wave_number * math.tanh(wave_number * water_depth_m) - omega2
 
@@ -66,7 +67,7 @@ def solve_wave_number(
 
 
 def wave_from_direction_to_unit_vector(direction_raw_deg: float) -> tuple[float, float]:
-    """將自北順時針 wave-from 角度轉成傳播去向的 east/north 單位向量。"""
+    """將「從正北起順時針」的來波角度，轉為波浪傳播方向的東、北單位向量。"""
 
     if not math.isfinite(direction_raw_deg):
         raise ValueError("波向必須有限")
@@ -84,12 +85,12 @@ def finite_depth_stokes(
     bed_z_m: float,
     gravity_mps2: float = GRAVITY_MPS2,
 ) -> StokesResult:
-    """計算文件式 (7) 對應的有限水深 bulk Stokes 水平速度。
+    """計算文件公式（7）對應的有限水深波浪表面漂移水平速度。
 
-    ``particle_z_m/surface_z_m/bed_z_m`` 都是 positive-up。粒子必須位於閉區間
-    ``[bed,surface]``；Hs=0 合法且回傳零速度，但 fp、方向與水深仍須有效，讓無波與
-    缺波可被區分。為避免 ``sinh(kh)`` 在深水溢位，``kh>20`` 直接使用已驗證的深水
-    極限；這是數值穩定轉換，不是更換 physics case。
+    ``particle_z_m``、``surface_z_m`` 與 ``bed_z_m`` 都以海面向上為正。粒子必須位於
+    海床與海面之間；有效波高為零時可合法回傳零速度，但峰值頻率、波向與水深仍必須有效，
+    才能區分「確實無波」和「缺少波浪資料」。水很深時為避免雙曲函數數值溢位，會改用
+    已驗證的深水極限公式；這只是穩定計算方式，不是改變物理情境。
     """
 
     values = [

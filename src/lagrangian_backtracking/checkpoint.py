@@ -1,9 +1,9 @@
-"""不可混用設定／輸入／seed 的 immutable checkpoint 寫入與恢復。
+"""安全寫入與讀回中途計算狀態，避免混用不同設定或輸入資料。
 
-checkpoint 是未發布工作資料，但每一代仍採不可變目錄；caller 以遞增 sequence 建立新
-目錄，成功後才更新外部 latest pointer。這避免程序中斷時破壞上一代可恢復狀態，也
-讓 restart 能逐項驗證 config hash、input inventory hash、experiment、shard 與 seed
-policy，拒絕以不同 forcing 或 worker 配置接續同一粒子集合。
+中途保存的資料雖未正式發布，每一代仍使用不可覆寫的新資料夾。呼叫端以遞增編號建立
+新一代，成功完成後才更新外部的「最新版本」指標。這能避免程序中斷破壞上一代可恢復
+狀態，也能在續跑前逐項確認設定、輸入資料清單、實驗案例、批次和亂數規則相同，拒絕
+以不同流速資料或不同工作配置接續同一批粒子。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from .outputs import sha256_file
 
 @dataclass(frozen=True, slots=True)
 class CheckpointBinding:
-    """決定 checkpoint 是否可安全續跑的不可變識別欄位。"""
+    """判定中途計算狀態是否可安全續跑的固定識別欄位。"""
 
     config_hash: str
     input_inventory_hash: str
@@ -42,7 +42,7 @@ def write_checkpoint(
     states: Sequence[ParticleState],
     sequence: int,
 ) -> Path:
-    """原子發布一代 particle state checkpoint，禁止覆寫既有目錄。"""
+    """以完整寫入後再更名的方式保存一代粒子狀態，禁止覆寫既有資料夾。"""
 
     if sequence < 0 or not states:
         raise ValueError("checkpoint sequence 必須非負且 states 不可空")
@@ -89,10 +89,10 @@ def load_checkpoint(
     *,
     expected_binding: CheckpointBinding,
 ) -> tuple[list[ParticleState], int]:
-    """驗證 binding/checksum/row count 後重建不可變 particle states。
+    """檢查設定綁定、檔案摘要與資料筆數後，讀回不可修改的粒子狀態。
 
-    任一 binding 欄位不同都拒絕恢復；即使科學設定相同，code commit 不同也需另建立
-    migration/compatibility 決策，避免未審查的程式行為改變混入長批次。
+    任一綁定欄位不同都拒絕續跑；即使科學設定看似相同，程式提交版本不同也必須先有
+    明確的相容性決定，避免未審查的程式行為改變混入長時間批次計算。
     """
 
     root = Path(path)

@@ -1,8 +1,8 @@
-"""不可變 trajectory shard、Parquet 事件表、checksum 與原子發布。
+"""安全寫出軌跡、事件與檢查資料，避免留下半套結果。
 
-軌跡使用 CSR 類型：particle table 與 ``trajectory_offsets`` 對應共同一維 observation
-arrays，不建立 object dtype。所有檔案先寫入同一父目錄的 ``.partial-UUID``，完成 shape、
-row count 與 SHA-256 manifest 後才原子改名；已存在目的地一律拒絕覆寫。
+所有粒子的觀測點放在連續的一維陣列；``trajectory_offsets`` 記錄每條軌跡在陣列中的起點
+和終點，所以不需要難以處理的巢狀陣列。每個結果分片先寫到暫存目錄，確認檔案大小、筆數
+和 SHA-256 檔案指紋都正確後，才一次改成正式名稱。已有同名結果時一律拒絕覆寫。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from .models import ParticleStatus
 
 
 def sha256_file(path: str | Path, *, chunk_bytes: int = 8 * 1024 * 1024) -> str:
-    """以固定 chunk 串流計算檔案 SHA-256，不把大型 array 載入記憶體。"""
+    """分段讀取檔案並計算 SHA-256 指紋，不把大型資料一次放進記憶體。"""
 
     digest = sha256()
     with Path(path).open("rb") as handle:
@@ -60,10 +60,11 @@ def write_trajectory_shard(
     *,
     run_metadata: dict[str, Any],
 ) -> Path:
-    """原子發布一個已完成粒子結果集合。
+    """安全發布一個已完成的粒子結果分片。
 
-    ``run_metadata`` 至少應含 config/input hash、Git commit、dirty flag、seed policy 與
-    shard 範圍；函式不自行猜測。空 shard 沒有可解釋分母，因此拒絕發布。
+    ``run_metadata`` 至少要寫下設定與輸入資料的指紋、程式版本、是否有未提交修改、亂數
+    種子規則和此分片涵蓋的情境範圍。函式不替呼叫端猜這些資訊。空分片沒有可用分母，
+    不能產生可解釋的比例，因此直接拒絕。
     """
 
     if not results:
@@ -150,11 +151,11 @@ def write_trajectory_shard(
 
 
 def validate_trajectory_shard(path: str | Path, *, require_formal_metadata: bool = False) -> dict[str, Any]:
-    """重新驗證 checksum、CSR、時間方向、狀態、row count 與正式 provenance。
+    """重新確認每個檔案、時間順序和粒子狀態都正確。
 
-    ``require_formal_metadata`` 只應用於準備進 aggregate/release 的 shard；synthetic smoke
-    可略過 Git 與正式 input inventory 欄位。任何陣列 shape、非有限座標、age 非遞增、
-    UTC 非遞減或 particle final status 不一致都列為錯誤，不把可讀檔案誤當科學有效。
+    ``require_formal_metadata`` 只在準備做正式彙整或發布時啟用；合成測試可少部分正式
+    資訊。只要陣列長度不一致、座標不是有限數字、回溯時間沒有增加、UTC 時間沒有往過去
+    走，或最後觀測狀態和粒子表不同，就列為錯誤；能打開檔案不代表結果可用。
     """
 
     root = Path(path)
