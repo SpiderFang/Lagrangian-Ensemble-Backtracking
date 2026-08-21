@@ -151,8 +151,11 @@ flowchart LR
     ├── 07_results_visualization_plan.md
     ├── 08_design_baseline_and_derived_gates.md
     ├── 09_implementation_audit_2026-08-19.md
-    └── 10_available_data_time_reconstruction_and_a_expansion.md
+    ├── 10_available_data_time_reconstruction_and_a_expansion.md
+    └── 11_source_code_guide_and_plan_traceability.md
 ```
+
+首次接手本專案時，請先閱讀[程式碼導覽、執行流程與工項計畫書追溯](docs/11_source_code_guide_and_plan_traceability.md)。該文件以模組關係圖、單粒子流程圖與「計畫書條目 → 程式 → 測試 → 正式成果」對照表說明 `src/` 的閱讀方式，並明確區分已驗證程式核心與尚未完成的正式資料、批次及圖表成果。
 
 ## 安裝與目前可用命令
 
