@@ -34,7 +34,7 @@
 | REQ-006 | 離開關注區域即停止 | 各站離開自身 local domain 時記錄 primary first-exit；貢寮／龜山島的 baseline local radius 為 25 km，事件後繼續至共用 A 區 outer boundary，B-D 因 local 與 flow domain 重合而於同一 crossing 停止。貢寮／龜山島穿越對方 local domain 僅記錄非終止的 cross-site diagnostic event。另設海岸、海床、海面 regime、資料起點、最大回溯期、缺口及數值失敗事件 | own-local／foreign-local／outer event table、重合邊界去重與步內 crossing 測試、跨站事件不改變粒子狀態測試、停止原因覆蓋 |
 | REQ-007 | `v_total = v_current + v_stokes + v_falling` | OCM 三維速度、有限水深 bulk Stokes 水平速度與浮沉垂向速度使用一致 SI 單位及正向 | 分項速度輸出、關閉單項敏感度、單位 gate |
 | REQ-008 | 由 `Hs/Tp/θ/L` 計算 Stokes drift | `Tp=1/fp`，解有限水深 dispersion 得 k/L；波向由 wave-from 轉 propagation-to；深水極限回復附檔式 (7) | 深水／淺水極限、cardinal direction、no-Stokes 對照 |
-| REQ-009 | 四階 Runge-Kutta 進行軌跡積分 | RK4 只積分確定性 drift；signed time step 處理 backward，不在 caller 與 velocity 內重複取負號 | 常流、旋轉、剪切、正反向 closure 與四階收斂 |
+| REQ-009 | 四階  Runge-Kutta  進行軌跡積分 | RK4 只積分確定性 drift；signed time step 處理 backward，不在 caller 與 velocity 內重複取負號 | 常流、旋轉、剪切、正反向 closure 與四階收斂 |
 | REQ-010 | 隨機漫步擴散 | 使用獨立 stochastic split。常數 K 先通過 `Var(Δx)=2KΔt`；空變 K 加入必要的 diffusivity-gradient drift 並驗證 well-mixed 性質 | 均值／方差、seed、障壁、空變 K 統計測試 |
 | REQ-011 | Smagorinsky 水平渦動擴散 | 在公尺投影中由局地速度梯度計算，明定 `Cs`、`Δ`、上下限與梯度修正；與常數 Kh 對照 | 解析剪切場、旋轉不變性、上下限及敏感度 |
 | REQ-012 | 邊界穿越點 KDE | 主產品同時保存原始 exit points、沿邊界弧長的 1D density、投影平面 2D KDE 與 50/75/90% HDR；至少三種 bandwidth | 質量正規化、boundary segment、bandwidth 與 bootstrap CI |

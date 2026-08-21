@@ -1,6 +1,6 @@
 """計算單一粒子一步移動的基準方法。
 
-本模組以四階龍格－庫塔法（RK4）計算海流、波浪造成的確定移動，再另外加入隨機擴散
+本模組以四階 Runge-Kutta 法（RK4）計算海流、波浪造成的確定移動，再另外加入隨機擴散
 造成的位移。速度資料一律表示「物理時間往後」的流速；逆向溯源時只要給負的時間步長，
 便會沿相反時間方向回推。每個中間計算點都必須重新讀取速度，若資料缺漏或位置無效，
 整步便停止，絕不把缺值當成零速度。
@@ -54,7 +54,7 @@ def _velocity_vector(sample: VelocitySample, stage: str) -> np.ndarray:
 
 
 def rk4_step(state: ParticleState, *, dt_seconds: float, velocity: VelocityProvider) -> ParticleState:
-    """以四階龍格－庫塔法計算一次不含隨機擴散的粒子移動。
+    """以四階 Runge-Kutta 法計算一次不含隨機擴散的粒子移動。
 
     ``dt_seconds`` 為正代表往未來推進，為負代表往過去回溯。粒子的已追蹤時間
     ``age_seconds`` 永遠增加正值，UTC 時刻則依時間步長的正負方向改變。此函式只改變
