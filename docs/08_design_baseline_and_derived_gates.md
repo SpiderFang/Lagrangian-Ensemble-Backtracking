@@ -111,14 +111,42 @@ scenario_id = hash(
 
 ### 5.3 垂向層位
 
-每個水平位置以當時局地總水深 `H=eta+depth` 建立四個目標：
+本節的 `depth` 不是每月 forcing 內另存的一個欄位，而是來自 OCM 靜態網格的
+`source_depth_m.npy`。此欄位代表海床相對垂向基準面的水深，採正值向下；上游
+前處理設定可能以 `bathymetry_m.npy` 命名，但進入本專案資料契約後統一使用
+`source_depth_m.npy`。`eta` 則來自每月 OCM 的時變自由水面高程 `elev.npy`，
+採 `z` positive-up。兩者的資料欄位、單位與 `zcor` 的關係見
+[資料契約](02_architecture_and_data_contract.md)。
 
-- `upper_water_column`：自海面向下 `0.10H`；
-- `mid_upper_water_column`：自海面向下 `0.40H`；
-- `mid_lower_water_column`：自海面向下 `0.70H`；
+對水平 receptor 所在的原生 OCM face，先以同一組 barycentric 權重內插靜態與時變
+欄位。令三個 face 節點為 `i`、水平權重為 `w_i`、到達時間為 `t_a`，定義：
+
+```text
+h_r       = sum_i(w_i * source_depth_m[i])
+eta_r(t_a) = sum_i(w_i * elev[t_a, i])
+H_r(t_a)  = h_r + eta_r(t_a)
+```
+
+其中 `h_r` 是水平位置的靜態水深，`eta_r(t_a)` 是該到達時刻的自由水面高程，
+`H_r(t_a)` 才是建立比例層位時使用的局地總水深。`H_r(t_a)` 必須為正且所有節點
+均有效；不得以零值、最近鄰或單側外插補上無效水深／水面。這也表示同一水平
+receptor 在不同到達時間的實際 `z` 可能因潮位而略有變化，manifest 必須逐一保存
+到達時間對應的 `H_r` 與實際層位。
+
+每個水平位置以該到達時間的局地總水深 `H_r(t_a)` 建立四個目標：
+
+- `upper_water_column`：目標 `z = eta_r(t_a) - 0.10H_r(t_a)`；
+- `mid_upper_water_column`：目標 `z = eta_r(t_a) - 0.40H_r(t_a)`；
+- `mid_lower_water_column`：目標 `z = eta_r(t_a) - 0.70H_r(t_a)`；
 - `near_bed`：最低有效 OCM layer 的中心；同時保存實際 height above bed。
 
-實際 `z` 需 snap 至可被各 node `zcor` 包夾的有效層位，不允許海面上或海床下外插。若兩個目標落入同一有效層，選擇相鄰可用層以維持四個不同 receptor；若無法形成四個有效層位，該水平位置淘汰並改選下一個 maximin 候選。manifest 必須保存目標比例、實際 z/HAB、調整原因與所有 50 個到達時間的有效性。
+上述目標的實際位置必須使用同一到達時間、同一 face 的 `zcor` 做垂向有效性檢查
+與 layer snap；`zcor` 是實際 OCM 物理層座標，不可把固定 layer index 當成固定深度，
+也不可以 `source_depth_m` 取代 `zcor`。不得將粒子放在海面以上、海床以下或只有單側
+支撐的層位。若兩個目標落入同一有效層，選擇相鄰可用層以維持四個不同 receptor；若
+無法形成四個有效層位，該水平位置淘汰並改選下一個 maximin 候選。manifest 必須保存
+`h_r`、`eta_r(t_a)`、`H_r(t_a)`、目標比例、目標 `z`、snap 後 `zcor` 層位、實際
+`z_m`／HAB、調整原因與所有 50 個到達時間的有效性。
 
 ## 6. 十種浮沉行為基線
 
