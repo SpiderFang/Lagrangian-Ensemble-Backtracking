@@ -35,7 +35,7 @@
 新接手者不應從數值迴圈開始逐行閱讀。建議依下列順序建立全貌，再進入細節：
 
 1. [README](../README.md)：研究站點、情境計數、資料根目錄、目前可執行命令與正式閘門概覽。
-2. 本文件第 3、4 節：先看四個程式群組與兩張流程圖。
+2. 先開啟[互動式程式架構地圖](source_code_architecture_map.html)建立全貌，再閱讀本文件第 3、4 節的四個程式群組與兩張流程圖。
 3. [設定範例](../configs/lagrangian_backtracking.example.yaml) 與 `config.py`：了解何者被鎖定為科學契約，何者尚不可用於正式發布。
 4. `models.py`、`scenarios.py`、`runner.py`：了解一條軌跡如何由站點、受體、到達時間、行為、成員唯一識別。
 5. `forcing.py`、`mesh.py`、`stokes.py`、`diffusion.py`、`integrators.py`：了解每一時間步的速度如何取得與計算。
@@ -119,6 +119,13 @@ flowchart LR
 
 - [圖 1 PNG：src 模組關係與資料流](output/figures/source_code_module_relationship.png)
 - [兩頁 PDF：圖 1 與圖 2](output/pdf/source_code_flow_diagrams.pdf)
+- [互動式 HTML：程式架構追蹤地圖](source_code_architecture_map.html)
+
+互動式地圖中的實線由腳本 `scripts/render_source_code_architecture_map.py` 直接掃描目前
+`src/lagrangian_backtracking/` 的相對匯入產生；虛線則是本文件為了說明資料與控制流程而登錄的
+語意連線。兩者分開呈現，避免把「資料流向」誤讀成 Python 函式必然直接呼叫。點選模組後，
+右側會列出它實際引用的模組、引用它的模組、主要入口與原始碼連結；若要追到函式級行為，
+仍須從入口函式進入原始碼並對照 `tests/`。
 
 ## 4. 一條粒子軌跡實際怎麼走
 

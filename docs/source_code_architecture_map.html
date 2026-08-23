@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lagrangian 系集逆向溯源｜程式架構追蹤地圖</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #64748b;
+      --line: #cbd5e1;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --accent: #2563eb;
+      --import: #2563eb;
+      --flow: #d97706;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #eef3f8;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", sans-serif;
+    }
+    .page { max-width: 1780px; margin: 0 auto; padding: 22px; }
+    header { margin-bottom: 14px; }
+    h1 { margin: 0 0 5px; font-size: clamp(22px, 2.2vw, 32px); letter-spacing: .01em; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
+    .toolbar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+      margin: 14px 0; padding: 11px 14px; background: var(--surface);
+      border: 1px solid var(--line); border-radius: 10px;
+    }
+    .search { display: flex; align-items: center; gap: 8px; flex: 1 1 260px; }
+    .search label { color: var(--muted); font-size: 13px; white-space: nowrap; }
+    input[type="search"] { width: 100%; min-width: 160px; padding: 8px 10px; border: 1px solid #b6c3d1; border-radius: 7px; font: inherit; }
+    input[type="search"]:focus { outline: 3px solid #bfdbfe; border-color: var(--accent); }
+    .toggle { display: inline-flex; align-items: center; gap: 6px; color: #475569; font-size: 13px; white-space: nowrap; }
+    .toggle input { accent-color: var(--accent); }
+    button {
+      border: 1px solid #94a3b8; border-radius: 7px; padding: 7px 11px; background: #fff;
+      color: #334155; font: inherit; cursor: pointer;
+    }
+    button:hover, button:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .legend { display: inline-flex; align-items: center; gap: 12px; margin-left: auto; color: var(--muted); font-size: 12px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-line { display: inline-block; width: 25px; border-top: 2px solid var(--import); }
+    .legend-line.flow { border-top: 2px dashed var(--flow); }
+    .workspace { display: grid; grid-template-columns: minmax(680px, 1fr) 350px; gap: 14px; align-items: start; }
+    .map-panel, .detail-panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+    .map-panel { overflow: auto; min-height: 760px; }
+    svg { display: block; width: 100%; min-width: 1240px; height: auto; min-height: 760px; background: linear-gradient(180deg, #fbfdff 0%, #f4f8fc 100%); }
+    .group-panel { fill: #fff; fill-opacity: .8; stroke-width: 2; }
+    .group-title { font-size: 18px; font-weight: 700; }
+    .group-description { fill: var(--muted); font-size: 11px; }
+    .node { cursor: pointer; }
+    .node rect { fill: #fff; stroke: #94a3b8; stroke-width: 1.3; transition: opacity .16s, stroke-width .16s, filter .16s; }
+    .node:hover rect, .node:focus rect { stroke: var(--accent); stroke-width: 2.5; outline: none; }
+    .node-title { fill: var(--ink); font-size: 15px; font-weight: 700; pointer-events: none; }
+    .node-role { fill: #475569; font-size: 11px; pointer-events: none; }
+    .node-file { fill: #64748b; font-size: 10px; pointer-events: none; }
+    .edge { fill: none; pointer-events: none; transition: opacity .16s, stroke-width .16s; }
+    .edge.import { stroke: var(--import); stroke-width: 1.15; opacity: .17; }
+    .edge.flow { stroke: var(--flow); stroke-width: 2; stroke-dasharray: 7 5; opacity: .24; }
+    .edge-label { fill: #9a5b08; font-size: 10px; opacity: .42; pointer-events: none; }
+    .node.is-selected rect { stroke: var(--accent); stroke-width: 3; filter: drop-shadow(0 3px 4px rgba(37,99,235,.18)); }
+    .node.is-related rect { stroke: #0f766e; stroke-width: 2.2; }
+    .node.is-dim, .edge.is-dim, .edge-label.is-dim { opacity: .08; }
+    .edge.is-highlight.import { opacity: .9; stroke-width: 2.6; }
+    .edge.is-highlight.flow { opacity: .95; stroke-width: 3.1; }
+    .detail-panel { position: sticky; top: 14px; padding: 18px; min-height: 540px; }
+    .detail-kicker { color: var(--muted); font-size: 12px; letter-spacing: .04em; }
+    .detail-panel h2 { margin: 5px 0 8px; font-size: 23px; }
+    .detail-role { margin: 0 0 14px; font-size: 14px; line-height: 1.6; }
+    .detail-section { border-top: 1px solid #e2e8f0; padding-top: 11px; margin-top: 12px; }
+    .detail-section h3 { margin: 0 0 6px; font-size: 12px; color: #475569; letter-spacing: .04em; }
+    .detail-section p { margin: 0; color: #334155; font-size: 13px; line-height: 1.6; }
+    .detail-section ul { margin: 5px 0 0; padding-left: 19px; color: #334155; font-size: 13px; line-height: 1.65; }
+    .code-link { display: inline-block; margin-top: 15px; color: var(--accent); font-size: 13px; }
+    .code-link:hover { text-decoration: underline; }
+    .status { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+    footer { margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    @media (max-width: 1040px) {
+      .workspace { grid-template-columns: 1fr; }
+      .detail-panel { position: static; min-height: 0; }
+      .legend { margin-left: 0; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>Lagrangian 系集逆向溯源｜程式架構追蹤地圖</h1>
+      <p class="subtitle">先看四個責任群組，再點選任一檔案追蹤「它引用誰、誰引用它、資料在流程中的位置」。本圖由目前 <code>src/lagrangian_backtracking/</code> 的相對匯入自動整理。</p>
+    </header>
+    <section class="toolbar" aria-label="架構地圖控制列">
+      <div class="search">
+        <label for="module-search">搜尋模組</label>
+        <input id="module-search" type="search" placeholder="例如 runner、forcing、受體" autocomplete="off">
+      </div>
+      <label class="toggle"><input id="show-imports" type="checkbox" checked> 實際 import</label>
+      <label class="toggle"><input id="show-flow" type="checkbox" checked> 資料／控制流程</label>
+      <button id="reset-selection" type="button">回到 runner</button>
+      <div class="legend" aria-label="箭頭圖例">
+        <span class="legend-item"><span class="legend-line"></span>實際相對 import</span>
+        <span class="legend-item"><span class="legend-line flow"></span>文件化流程</span>
+      </div>
+    </section>
+    <main class="workspace">
+      <section class="map-panel" aria-label="程式架構圖，可點選節點">
+        <svg id="architecture-map" viewBox="0 0 1370 900" role="img" aria-labelledby="map-title map-description">
+          <title id="map-title">Lagrangian 系集逆向溯源程式模組與流程關係</title>
+          <desc id="map-description">四個模組群組排列在左右欄位，實線表示原始碼相對 import，虛線表示文件化資料或控制流程。點選模組可在右側閱讀引用關係。</desc>
+          <defs>
+            <marker id="import-arrow" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 z" fill="#2563eb"></path></marker>
+            <marker id="flow-arrow" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#d97706"></path></marker>
+          </defs>
+          <g id="group-layer"></g>
+          <g id="edge-layer"></g>
+          <g id="node-layer"></g>
+        </svg>
+      </section>
+      <aside id="detail-panel" class="detail-panel" aria-live="polite"></aside>
+    </main>
+    <footer>
+      實線只表示模組層級的相對 <code>import</code>，不宣稱每條線都是函式直接呼叫；虛線是文件化的資料／控制流程。若要追到函式級行為，從右側「主要閱讀入口」開啟對應原始碼，再回看測試與文件 11 的追溯表。
+    </footer>
+  </div>
+  <script>
+    const modules = [{"id":"config","title":"config.py","group":"data","groupLabel":"資料與幾何","order":0,"source":"../src/lagrangian_backtracking/config.py","role":"科學設定契約與正式發布閘門","inputs":"YAML 設定、資料根目錄與五站範圍","outputs":"ProjectConfig；驗證四個 forcing domain、五站與情境計數","entrypoints":["ProjectConfig","load_config"],"read_first":"先確認哪些設定可以進入正式發布，以及 10 × 20 × 50 的不可縮減契約。"},{"id":"preflight","title":"preflight.py","group":"data","groupLabel":"資料與幾何","order":1,"source":"../src/lagrangian_backtracking/preflight.py","role":"上游月份、資料品質與時間支援盤點","inputs":"OCM／NWW3 metadata、月份檔與預期時間軸","outputs":"PreflightReport；缺時、schema、維度與可用時間證據","entrypoints":["run_preflight","PreflightReport"],"read_first":"先看它如何把資料可用性問題寫成可追溯報告，而不是默默補值。"},{"id":"time_axis","title":"time_axis.py","group":"data","groupLabel":"資料與幾何","order":2,"source":"../src/lagrangian_backtracking/time_axis.py","role":"跨月份的唯一 UTC 時間軸","inputs":"各月份的時間片段與預期時間間隔","outputs":"CanonicalTimeAxis、TimeChunk 與 GapInterval","entrypoints":["canonicalize_time_chunks","CanonicalTimeAxis"],"read_first":"確認跨月拼接、缺時區段與粒子可回溯時間範圍的定義。"},{"id":"geometry","title":"geometry.py","group":"data","groupLabel":"資料與幾何","order":3,"source":"../src/lagrangian_backtracking/geometry.py","role":"經緯度與公尺座標、局部範圍及多邊形穿越","inputs":"經緯度、候選框、共同 flow domain 與 local domain","outputs":"DomainProjection、Polygon 與 SegmentCrossing","entrypoints":["DomainProjection","build_anchor_local_domain","first_polygon_crossing"],"read_first":"貢寮／龜山島 local domain 可重疊，但 forcing 與最外層停止邊界另有契約。"},{"id":"mesh","title":"mesh.py","group":"data","groupLabel":"資料與幾何","order":4,"source":"../src/lagrangian_backtracking/mesh.py","role":"原始 OCM 三角網格的定位與插值準備","inputs":"節點座標、三角面與公尺座標投影","outputs":"NativeMesh、MeshLocation 與面索引","entrypoints":["NativeMesh","triangulate_faces"],"read_first":"了解粒子如何找到原始網格面，避免把規則格網假設帶入 OCM。"},{"id":"receptors","title":"receptors.py","group":"data","groupLabel":"資料與幾何","order":5,"source":"../src/lagrangian_backtracking/receptors.py","role":"每站 20 個三維受體的可重現選取","inputs":"濕潤網格面、local domain、垂向層位與品質指標","outputs":"HorizontalReceptor、VerticalTarget","entrypoints":["select_horizontal_receptors","build_vertical_targets"],"read_first":"先看水平 5 點與垂向 4 層如何形成每站 20 個 receptors。"},{"id":"arrival_times","title":"arrival_times.py","group":"data","groupLabel":"資料與幾何","order":6,"source":"../src/lagrangian_backtracking/arrival_times.py","role":"每站 50 個到達時刻的分層選取","inputs":"CanonicalTimeAxis、資料品質與缺時區段","outputs":"ArrivalTime 清單；48 個分層時刻加 2 個事件時刻","entrypoints":["select_arrival_times"],"read_first":"確認到達時刻不是任意等距抽樣，而要避開不可用時間。"},{"id":"models","title":"models.py","group":"physics","groupLabel":"物理與邊界","order":0,"source":"../src/lagrangian_backtracking/models.py","role":"所有模組共用的資料型別與狀態契約","inputs":"無外部資料；由其他模組建立狀態與品質旗標","outputs":"ParticleState、VelocitySample、BoundaryEvent、ParticleStatus","entrypoints":["ParticleState","VelocitySample","BoundaryEvent"],"read_first":"先建立欄位、單位、品質旗標與停止狀態的共同語言。"},{"id":"forcing","title":"forcing.py","group":"physics","groupLabel":"物理與邊界","order":1,"source":"../src/lagrangian_backtracking/forcing.py","role":"OCM 海流與 NWW3 波浪的時空取樣與合成","inputs":"原始網格、時間軸、粒子位置、深度與波浪條件","outputs":"OCMNativeMonth、NWWAnalysisMonth、CombinedMonthForcing","entrypoints":["OCMNativeMonth.sample","NWWAnalysisMonth.sample","CombinedMonthForcing"],"read_first":"確認海流、Stokes 漂流、浮沉與擴散係數的資料來源與遮罩。"},{"id":"accelerated","title":"accelerated.py","group":"physics","groupLabel":"物理與邊界","order":2,"source":"../src/lagrangian_backtracking/accelerated.py","role":"OCM 垂向欄位插值的可選加速核心","inputs":"已整理的 OCM 欄位、粒子水平位置與垂向索引","outputs":"Numba 加速的支援值；結果須與參考核心一致","entrypoints":["interpolate_ocm_support_numba"],"read_first":"它是效能替代路徑，不改變科學公式；先與 forcing 的參考路徑對照。"},{"id":"stokes","title":"stokes.py","group":"physics","groupLabel":"物理與邊界","order":3,"source":"../src/lagrangian_backtracking/stokes.py","role":"由波浪條件計算有限水深 Stokes 漂流","inputs":"波高、週期／頻率、波向、波長與水深","outputs":"StokesResult 與水平漂流速度","entrypoints":["solve_wave_number","finite_depth_stokes","deep_water_stokes"],"read_first":"先確認波向轉換、色散關係與深水／有限水深極限。"},{"id":"diffusion","title":"diffusion.py","group":"physics","groupLabel":"物理與邊界","order":4,"source":"../src/lagrangian_backtracking/diffusion.py","role":"隨機漫步與 Smagorinsky 水平擴散係數","inputs":"Kx、Ky、Kz、時間步長與速度梯度候選值","outputs":"DiffusionCoefficients、TimeStepDecision 與 Brownian 位移","entrypoints":["brownian_displacement","smagorinsky_horizontal_diffusivity","choose_time_step"],"read_first":"隨機擴散在 RK4 後獨立加入，不可混入 RK4 stage。"},{"id":"integrators","title":"integrators.py","group":"physics","groupLabel":"物理與邊界","order":5,"source":"../src/lagrangian_backtracking/integrators.py","role":"負時間步的四階 Runge-Kutta 與擴散分裂","inputs":"ParticleState、VelocityProvider、時間步長與擴散係數","outputs":"下一個 ParticleState 或 SamplingError","entrypoints":["rk4_step","split_rk4_brownian_step"],"read_first":"確認逆向只把時間步取反一次，並把隨機位移放在積分後。"},{"id":"boundaries","title":"boundaries.py","group":"physics","groupLabel":"物理與邊界","order":6,"source":"../src/lagrangian_backtracking/boundaries.py","role":"水平／垂向邊界事件與穿越點解析","inputs":"提議的新位置、local／flow domain、海岸、海面與海床","outputs":"BoundaryEvent、修正後狀態與停止／繼續判定","entrypoints":["BoundaryGeometry","resolve_horizontal_boundaries","resolve_vertical_boundaries"],"read_first":"先分清自站 local exit、跨站診斷、flow open exit、海岸與資料停止。"},{"id":"engine","title":"engine.py","group":"physics","groupLabel":"物理與邊界","order":7,"source":"../src/lagrangian_backtracking/engine.py","role":"單一粒子回溯主迴圈與停止控制","inputs":"ReferenceParticleRequest、VelocityProvider、BoundaryGeometry","outputs":"ParticleResult；觀測、事件、最終狀態與停止原因","entrypoints":["EngineSettings","run_particle","ParticleResult"],"read_first":"這是最接近一條軌跡完整生命週期的模組，串起取樣、積分與邊界。"},{"id":"scenarios","title":"scenarios.py","group":"execution","groupLabel":"情境與執行","order":0,"source":"../src/lagrangian_backtracking/scenarios.py","role":"建立 10 × 20 × 50 的基礎情境與成員種子","inputs":"10 種行為、20 個 receptors、50 個到達時刻與 master seed","outputs":"Scenario、穩定 scenario_id 與每成員可重現 seed","entrypoints":["build_scenarios","derive_member_seed","validate_baseline_coverage"],"read_first":"先確認基礎情境與 M 個隨機成員是兩個不同層次。"},{"id":"runner","title":"runner.py","group":"execution","groupLabel":"情境與執行","order":1,"source":"../src/lagrangian_backtracking/runner.py","role":"把情境展開成粒子 RunUnit 並切成可重跑批次","inputs":"ScenarioShard、master seed、forcing 與邊界設定","outputs":"RunUnit、ParticleResult 與 shard 執行結果","entrypoints":["plan_scenario_shards","iter_run_units","run_reference_shard"],"read_first":"沿著它追 `scenario × M` 如何進入 engine，以及如何維持 member_id。"},{"id":"checkpoint","title":"checkpoint.py","group":"execution","groupLabel":"情境與執行","order":2,"source":"../src/lagrangian_backtracking/checkpoint.py","role":"中途狀態的安全寫入與續跑繫結","inputs":"粒子中途狀態、批次識別與設定繫結","outputs":"CheckpointBinding 與可驗證 checkpoint JSON","entrypoints":["write_checkpoint","load_checkpoint"],"read_first":"確認續跑不能改變輸入設定、種子或輸出識別。"},{"id":"cli","title":"cli.py","group":"execution","groupLabel":"情境與執行","order":3,"source":"../src/lagrangian_backtracking/cli.py","role":"設定檢查、資料盤點、合成試算與 shard 驗證入口","inputs":"命令列參數、設定檔與資料根目錄","outputs":"可重現的命令結果與驗證報告","entrypoints":["main","run_config_check","run_preflight_command","run_synthetic_smoke"],"read_first":"先用 CLI 了解哪些功能已可執行，以及哪些正式閘門仍會拒絕發布。"},{"id":"outputs","title":"outputs.py","group":"output","groupLabel":"輸出與聚合","order":0,"source":"../src/lagrangian_backtracking/outputs.py","role":"粒子軌跡、事件與檢查資料的原子發布","inputs":"完成的 ParticleResult 清單與正式 metadata","outputs":"trajectory shard、events、checksum 與 validate 報告","entrypoints":["write_trajectory_shard","validate_trajectory_shard"],"read_first":"先確認輸出不可覆寫、要有 checksum，且不完整 shard 不可進聚合。"},{"id":"aggregation","title":"aggregation.py","group":"output","groupLabel":"輸出與聚合","order":1,"source":"../src/lagrangian_backtracking/aggregation.py","role":"邊界密度、足跡、路徑、停留時間與跨站連通統計","inputs":"已驗證的事件、軌跡與有效分母","outputs":"KDEGrid、PathwayGrid、BoundaryArclengthHistogram 與摘要表","entrypoints":["conditional_kde_2d","pathway_residence_grid","boundary_arclength_histogram","cross_site_connectivity"],"read_first":"聚合結果是條件式來源足跡，不可直接稱為絕對來源機率。"}];
+    const importEdges = [{"source":"aggregation","target":"engine"},{"source":"aggregation","target":"models"},{"source":"arrival_times","target":"scenarios"},{"source":"boundaries","target":"geometry"},{"source":"boundaries","target":"models"},{"source":"checkpoint","target":"models"},{"source":"checkpoint","target":"outputs"},{"source":"cli","target":"boundaries"},{"source":"cli","target":"config"},{"source":"cli","target":"diffusion"},{"source":"cli","target":"engine"},{"source":"cli","target":"models"},{"source":"cli","target":"outputs"},{"source":"cli","target":"preflight"},{"source":"cli","target":"scenarios"},{"source":"engine","target":"boundaries"},{"source":"engine","target":"diffusion"},{"source":"engine","target":"integrators"},{"source":"engine","target":"models"},{"source":"forcing","target":"accelerated"},{"source":"forcing","target":"geometry"},{"source":"forcing","target":"mesh"},{"source":"forcing","target":"models"},{"source":"forcing","target":"stokes"},{"source":"integrators","target":"diffusion"},{"source":"integrators","target":"models"},{"source":"mesh","target":"geometry"},{"source":"outputs","target":"engine"},{"source":"outputs","target":"models"},{"source":"preflight","target":"config"},{"source":"preflight","target":"time_axis"},{"source":"receptors","target":"geometry"},{"source":"receptors","target":"mesh"},{"source":"receptors","target":"scenarios"},{"source":"runner","target":"boundaries"},{"source":"runner","target":"diffusion"},{"source":"runner","target":"engine"},{"source":"runner","target":"integrators"},{"source":"runner","target":"models"},{"source":"runner","target":"scenarios"}].map(edge => ({...edge, type: "import"}));
+    const flowEdges = [{"source":"cli","target":"config","label":"載入設定"},{"source":"config","target":"preflight","label":"設定約束"},{"source":"preflight","target":"time_axis","label":"時間支援"},{"source":"geometry","target":"mesh","label":"座標／網格"},{"source":"geometry","target":"receptors","label":"候選範圍"},{"source":"mesh","target":"receptors","label":"網格定位"},{"source":"arrival_times","target":"scenarios","label":"50 個時刻"},{"source":"receptors","target":"scenarios","label":"20 個受體"},{"source":"scenarios","target":"runner","label":"情境 × M"},{"source":"runner","target":"engine","label":"逐粒子回溯"},{"source":"forcing","target":"engine","label":"速度樣本"},{"source":"stokes","target":"forcing","label":"Stokes 漂流"},{"source":"diffusion","target":"engine","label":"隨機位移"},{"source":"engine","target":"boundaries","label":"停止判定"},{"source":"engine","target":"outputs","label":"ParticleResult"},{"source":"checkpoint","target":"runner","label":"安全續跑"},{"source":"outputs","target":"aggregation","label":"已驗證事件"}].map(edge => ({...edge, type: "flow"}));
+    const allEdges = [...importEdges, ...flowEdges];
+    const groups = [{"id":"data","label":"資料與幾何","description":"設定、時間軸、座標、網格、受體與到達時刻","color":"#3b82f6","modules":["config","preflight","time_axis","geometry","mesh","receptors","arrival_times"]},{"id":"physics","label":"物理與邊界","description":"共用資料型別、forcing、速度、擴散、積分與停止事件","color":"#16a34a","modules":["models","forcing","accelerated","stokes","diffusion","integrators","boundaries","engine"]},{"id":"execution","label":"情境與執行","description":"10 × 20 × 50 情境、M 個成員、批次與續跑","color":"#d97706","modules":["scenarios","runner","checkpoint","cli"]},{"id":"output","label":"輸出與聚合","description":"不可變 shard、事件、軌跡與條件式來源統計","color":"#7c3aed","modules":["outputs","aggregation"]}];
+    const svgNS = "http://www.w3.org/2000/svg";
+    const mapWidth = 1370;
+    const nodeWidth = 250;
+    const nodeHeight = 66;
+    const groupX = {data: 30, physics: 350, execution: 670, output: 990};
+    const groupWidth = 290;
+    const groupTop = 28;
+    const groupBottom = 858;
+    const state = {selected: "runner", query: "", showImports: true, showFlow: true};
+    const positions = new Map();
+    const moduleById = new Map(modules.map(module => [module.id, module]));
+
+    function createSvgElement(tag, attributes = {}) {
+      const element = document.createElementNS(svgNS, tag);
+      Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, value));
+      return element;
+    }
+
+    function textElement(tag, text, attributes = {}) {
+      const element = createSvgElement(tag, attributes);
+      element.textContent = text;
+      return element;
+    }
+
+    function layout() {
+      groups.forEach(group => {
+        group.modules.forEach((moduleId, index) => {
+          const x = groupX[group.id] + 20;
+          const y = groupTop + 55 + index * 82;
+          positions.set(moduleId, {x, y, cx: x + nodeWidth / 2, cy: y + nodeHeight / 2});
+        });
+      });
+    }
+
+    function curvePath(sourceId, targetId) {
+      const source = positions.get(sourceId);
+      const target = positions.get(targetId);
+      if (!source || !target) return "";
+      const direction = target.cx >= source.cx ? 1 : -1;
+      const startX = source.cx + direction * (nodeWidth / 2 - 4);
+      const endX = target.cx - direction * (nodeWidth / 2 - 4);
+      const bend = Math.max(45, Math.abs(endX - startX) * 0.33);
+      return `M ${startX} ${source.cy} C ${startX + direction * bend} ${source.cy}, ${endX - direction * bend} ${target.cy}, ${endX} ${target.cy}`;
+    }
+
+    function drawGroups() {
+      const layer = document.getElementById("group-layer");
+      layer.replaceChildren();
+      groups.forEach(group => {
+        const x = groupX[group.id];
+        const panel = createSvgElement("rect", {x, y: groupTop, width: groupWidth, height: groupBottom - groupTop, rx: 15, class: "group-panel", stroke: group.color});
+        layer.appendChild(panel);
+        layer.appendChild(textElement("text", group.label, {x: x + 20, y: 55, class: "group-title", fill: group.color}));
+        layer.appendChild(textElement("text", group.description, {x: x + 20, y: 76, class: "group-description"}));
+      });
+    }
+
+    function drawEdges() {
+      const layer = document.getElementById("edge-layer");
+      layer.replaceChildren();
+      allEdges.forEach((edge, index) => {
+        const visible = edge.type === "import" ? state.showImports : state.showFlow;
+        const path = createSvgElement("path", {
+          d: curvePath(edge.source, edge.target),
+          class: `edge ${edge.type}`,
+          "data-edge-index": index,
+          "data-source": edge.source,
+          "data-target": edge.target,
+          "marker-end": `url(#${edge.type}-arrow)`,
+        });
+        if (!visible) path.style.display = "none";
+        layer.appendChild(path);
+        if (edge.type === "flow") {
+          const source = positions.get(edge.source);
+          const target = positions.get(edge.target);
+          if (source && target) {
+            const label = textElement("text", edge.label, {x: (source.cx + target.cx) / 2, y: (source.cy + target.cy) / 2 - 4, class: "edge-label", "data-edge-index": index});
+            if (!visible) label.style.display = "none";
+            layer.appendChild(label);
+          }
+        }
+      });
+    }
+
+    function drawNodes() {
+      const layer = document.getElementById("node-layer");
+      layer.replaceChildren();
+      modules.forEach(module => {
+        const pos = positions.get(module.id);
+        const group = createSvgElement("g", {class: "node", tabindex: "0", role: "button", "aria-label": `${module.title}：${module.role}`, "data-module-id": module.id});
+        group.appendChild(createSvgElement("rect", {x: pos.x, y: pos.y, width: nodeWidth, height: nodeHeight, rx: 9, stroke: groups.find(item => item.id === module.group).color}));
+        group.appendChild(textElement("text", module.title, {x: pos.x + 14, y: pos.y + 23, class: "node-title"}));
+        group.appendChild(textElement("text", module.role, {x: pos.x + 14, y: pos.y + 43, class: "node-role"}));
+        group.appendChild(textElement("text", `src/lagrangian_backtracking/${module.id}.py`, {x: pos.x + 14, y: pos.y + 58, class: "node-file"}));
+        group.addEventListener("click", () => selectModule(module.id));
+        group.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectModule(module.id); } });
+        layer.appendChild(group);
+      });
+    }
+
+    function relatedIds(moduleId) {
+      const related = new Set([moduleId]);
+      allEdges.forEach(edge => {
+        if ((edge.source === moduleId || edge.target === moduleId) && (edge.type === "import" ? state.showImports : state.showFlow)) {
+          related.add(edge.source);
+          related.add(edge.target);
+        }
+      });
+      return related;
+    }
+
+    function applyVisualState() {
+      const query = state.query.trim().toLowerCase();
+      const related = relatedIds(state.selected);
+      document.querySelectorAll(".node").forEach(node => {
+        const id = node.dataset.moduleId;
+        const module = moduleById.get(id);
+        const matches = !query || `${module.id} ${module.title} ${module.role} ${module.entrypoints.join(" ")}`.toLowerCase().includes(query);
+        node.classList.toggle("is-selected", id === state.selected);
+        node.classList.toggle("is-related", !query && id !== state.selected && related.has(id));
+        // 有搜尋文字時以搜尋結果為主；沒有搜尋文字時才以選取模組的鄰居為主，避免
+        // 使用者搜尋 forcing 時，因為目前選取 runner 而把 forcing 一起淡化。
+        node.classList.toggle("is-dim", query ? !matches : Boolean(state.selected) && !related.has(id));
+      });
+      document.querySelectorAll(".edge, .edge-label").forEach(element => {
+        const index = Number(element.dataset.edgeIndex);
+        const edge = allEdges[index];
+        const visible = edge.type === "import" ? state.showImports : state.showFlow;
+        const highlighted = edge.source === state.selected || edge.target === state.selected;
+        element.classList.toggle("is-highlight", highlighted && visible);
+        element.classList.toggle("is-dim", Boolean(state.selected) && !highlighted);
+        if (edge.type === "import") element.style.display = state.showImports ? "" : "none";
+        if (edge.type === "flow") element.style.display = state.showFlow ? "" : "none";
+      });
+    }
+
+    function listHtml(items, emptyText) {
+      if (!items.length) return `<p>${emptyText}</p>`;
+      return `<ul>${items.map(item => `<li><code>${item}</code></li>`).join("")}</ul>`;
+    }
+
+    function selectModule(moduleId) {
+      state.selected = moduleId;
+      const module = moduleById.get(moduleId);
+      const imports = importEdges.filter(edge => edge.source === moduleId).map(edge => `${moduleById.get(edge.target).title}：${moduleById.get(edge.target).role}`);
+      const importedBy = importEdges.filter(edge => edge.target === moduleId).map(edge => `${moduleById.get(edge.source).title}：${moduleById.get(edge.source).role}`);
+      const flowOut = flowEdges.filter(edge => edge.source === moduleId).map(edge => `${edge.label} → ${moduleById.get(edge.target).title}`);
+      const flowIn = flowEdges.filter(edge => edge.target === moduleId).map(edge => `${moduleById.get(edge.source).title} → ${edge.label}`);
+      const panel = document.getElementById("detail-panel");
+      panel.innerHTML = `
+        <div class="detail-kicker">${module.groupLabel}</div>
+        <h2>${module.title}</h2>
+        <p class="detail-role">${module.role}</p>
+        <p class="status">已選取：${module.title}；圖上已高亮直接關聯節點。</p>
+        <section class="detail-section"><h3>主要閱讀入口</h3>${listHtml(module.entrypoints, "此模組沒有列出的公開入口。")}</section>
+        <section class="detail-section"><h3>輸入</h3><p>${module.inputs}</p></section>
+        <section class="detail-section"><h3>輸出／責任</h3><p>${module.outputs}</p></section>
+        <section class="detail-section"><h3>它實際引用的模組</h3>${listHtml(imports, "沒有相對匯入；可能是資料型別、數值核心或入口模組。")}</section>
+        <section class="detail-section"><h3>引用它的模組</h3>${listHtml(importedBy, "目前沒有其他 src 模組直接相對匯入它。")}</section>
+        <section class="detail-section"><h3>文件化流程：輸入 → 它</h3>${listHtml(flowIn, "沒有登錄的上游流程連線。")}</section>
+        <section class="detail-section"><h3>文件化流程：它 → 輸出</h3>${listHtml(flowOut, "沒有登錄的下游流程連線。")}</section>
+        <section class="detail-section"><h3>接手時先問</h3><p>${module.read_first}</p></section>
+        <a class="code-link" href="${module.source}">開啟 ${module.title} 原始碼 ↗</a>
+      `;
+      applyVisualState();
+    }
+
+    function searchModules(value) {
+      state.query = value;
+      applyVisualState();
+    }
+
+    layout();
+    drawGroups();
+    drawEdges();
+    drawNodes();
+    selectModule(state.selected);
+    document.getElementById("module-search").addEventListener("input", event => searchModules(event.target.value));
+    document.getElementById("show-imports").addEventListener("change", event => { state.showImports = event.target.checked; drawEdges(); applyVisualState(); });
+    document.getElementById("show-flow").addEventListener("change", event => { state.showFlow = event.target.checked; drawEdges(); applyVisualState(); });
+    document.getElementById("reset-selection").addEventListener("click", () => { document.getElementById("module-search").value = ""; state.query = ""; selectModule("runner"); });
+  </script>
+</body>
+</html>

@@ -135,7 +135,8 @@ flowchart LR
 │   └── upstream/ocm_flow_domains_lbt_a_v4.json
 ├── scripts/
 │   ├── prepare_a_v4_forcing.sh
-│   └── render_source_code_flow_diagrams.py
+│   ├── render_source_code_flow_diagrams.py
+│   └── render_source_code_architecture_map.py
 ├── src/lagrangian_backtracking/
 │   ├── forcing.py, mesh.py, stokes.py, time_axis.py
 │   ├── integrators.py, diffusion.py, engine.py, boundaries.py
@@ -153,12 +154,15 @@ flowchart LR
     ├── 08_design_baseline_and_derived_gates.md
     ├── 09_implementation_audit_2026-08-19.md
     ├── 10_available_data_time_reconstruction_and_a_expansion.md
-    └── 11_source_code_guide_and_plan_traceability.md
+    ├── 11_source_code_guide_and_plan_traceability.md
+    └── source_code_architecture_map.html
 ```
 
 首次接手本專案時，請先閱讀[程式碼導覽、執行流程與工項計畫書追溯](docs/11_source_code_guide_and_plan_traceability.md)。該文件以模組關係圖、單粒子流程圖與「計畫書條目 → 程式 → 測試 → 正式成果」對照表說明 `src/` 的閱讀方式，並明確區分已驗證程式核心與尚未完成的正式資料、批次及圖表成果。
 
 可列印的兩頁流程圖已保存為[PDF](docs/output/pdf/source_code_flow_diagrams.pdf)，另提供[模組關係 PNG](docs/output/figures/source_code_module_relationship.png)與[單一粒子流程 PNG](docs/output/figures/single_particle_backtracking_flow.png)。
+
+若要像看一張地圖一樣追蹤模組，請開啟[互動式程式架構地圖](docs/source_code_architecture_map.html)。點選模組後，右側會列出實際相對 `import`、引用它的模組、文件化資料流程、主要閱讀入口與原始碼連結；重新執行 `scripts/render_source_code_architecture_map.py` 可依目前 `src/` 匯入關係更新 HTML。
 
 ## 安裝與目前可用命令
 
