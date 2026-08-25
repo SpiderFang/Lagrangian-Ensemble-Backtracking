@@ -21,6 +21,7 @@ data/
 work/
 outputs/
 checkpoints/
+docs/output/
 logs/*.log
 logs/*.jsonl
 *.parquet
