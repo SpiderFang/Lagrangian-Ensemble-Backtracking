@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 from shapely.geometry import box
 
 from lagrangian_backtracking.boundaries import BoundaryGeometry
@@ -11,10 +12,12 @@ from lagrangian_backtracking.diffusion import DiffusionCoefficients
 from lagrangian_backtracking.engine import EngineSettings
 from lagrangian_backtracking.models import ParticleState, ParticleStatus, VelocitySample
 from lagrangian_backtracking.runner import (
+    SCENARIO_ORDERING_POLICY,
     ReferenceParticleRequest,
     iter_run_units,
     plan_scenario_shards,
     run_reference_shard,
+    scenario_execution_sort_key,
 )
 from lagrangian_backtracking.scenarios import Scenario
 
@@ -26,10 +29,10 @@ def _scenario(identifier: str, arrival_time_utc_ns: int = 100_000_000_000) -> Sc
         scenario_id=identifier,
         study_site_id="gongliao",
         analysis_region_id="A",
-        material_id="neutral_000mmps",
+        material_id="oca_nonrecyclable_flexible_sheet",
         receptor_id=f"receptor-{identifier}",
         arrival_time_id="arrival-0",
-        settling_velocity_mps=0.0,
+        settling_velocity_mps=-0.001,
         arrival_time_utc_ns=arrival_time_utc_ns,
         design_version="test-v1",
     )
@@ -63,6 +66,49 @@ def test_shard_size_does_not_change_run_unit_identity_or_seed() -> None:
 
     assert flatten(plans_a) == flatten(plans_b)
     assert sum(plan.particle_count for plan in plans_a) == 3 * 3
+
+
+def test_execution_order_groups_region_and_arrival_without_crossing_group() -> None:
+    """固定 policy 先排序，再只在同一 region+arrival group 內切割。"""
+
+    scenarios = [
+        replace(_scenario("b", 200), analysis_region_id="A", study_site_id="site-b"),
+        replace(_scenario("a", 100), analysis_region_id="A", study_site_id="site-a"),
+        replace(_scenario("c", 200), analysis_region_id="A", study_site_id="site-a"),
+        replace(_scenario("d", 100), analysis_region_id="B", study_site_id="site-a"),
+    ]
+    plans = plan_scenario_shards(
+        list(reversed(scenarios)),
+        members_per_scenario=2,
+        shard_scenario_count=1,
+        experiment_case_id="baseline",
+    )
+    flattened = [scenario for shard in plans for scenario in shard.scenarios]
+    assert [scenario_execution_sort_key(item) for item in flattened] == sorted(
+        scenario_execution_sort_key(item) for item in scenarios
+    )
+    assert SCENARIO_ORDERING_POLICY.endswith("_v1")
+    for shard in plans:
+        assert all(
+            (item.analysis_region_id, item.arrival_time_utc_ns)
+            == (shard.analysis_region_id, shard.arrival_time_utc_ns)
+            for item in shard.scenarios
+        )
+    assert [(shard.analysis_region_id, shard.arrival_time_utc_ns) for shard in plans] == [
+        ("A", 100),
+        ("A", 200),
+        ("A", 200),
+        ("B", 100),
+    ]
+    assert [shard.group_part_index for shard in plans[1:3]] == [0, 1]
+    assert all(shard.group_part_count == 2 for shard in plans[1:3])
+
+
+def test_execution_sort_key_rejects_bool_arrival() -> None:
+    """bool 不可冒充 UTC 奈秒整數，避免排序在不同輸入中產生歧義。"""
+
+    with pytest.raises(ValueError, match="非 bool 整數"):
+        scenario_execution_sort_key(replace(_scenario("bad"), arrival_time_utc_ns=True))
 
 
 def test_reference_shard_runs_every_member_once() -> None:
@@ -105,7 +151,7 @@ def test_reference_shard_runs_every_member_once() -> None:
             initial_state=state,
             velocity=velocity,
             boundaries=boundaries,
-            behavior_class="suspended",
+            behavior_class="sinking",
             diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
             settings=EngineSettings(1.0, 4.0, 4.0, 100.0, 100, 0),
         )
@@ -147,7 +193,7 @@ def test_reference_executor_rejects_mismatched_initial_identity() -> None:
             initial_state=replace(state),
             velocity=lambda *_: VelocitySample(0.0, 0.0, 0.0, 0.0, -10.0, 1.0, 1.0),
             boundaries=BoundaryGeometry(box(-1, -1, 1, 1), box(-2, -2, 2, 2), {}),
-            behavior_class="suspended",
+            behavior_class="sinking",
             diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
             settings=EngineSettings(1.0, 1.0, 1.0, 1.0, 1, 0),
         )

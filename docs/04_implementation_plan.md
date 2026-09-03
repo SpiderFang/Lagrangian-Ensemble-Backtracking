@@ -12,7 +12,7 @@
 flowchart LR
     A["A：SERVER 輸入盤點"] --> F["G1：forcing sampler"]
     B["B：合成場數值核心"] --> N["G2：verified kernel"]
-    C["C：behavior／五站各 20 receptors／arrival manifests"] --> S["5×(10×20×50) scenario builder"]
+    C["C：behavior／100 receptor templates／250 arrivals／5,000 dynamic pair IC"] --> S["5×(10×20×50) scenario builder"]
     F --> E["G3：ensemble engine"]
     N --> E
     S --> E
@@ -34,12 +34,42 @@ A、B、C、D 四條工程工作流立即同時啟動。真正不可跳過的關
 | LBT-000 | P0 | repository 與規格基線 | README、需求、架構、科學方法、快速計畫、風險、SERVER runbook、視覺化規格與 example config 一致 | 已完成規劃骨架 |
 | LBT-001 | P0 | SERVER 唯讀 inventory | 逐 domain/month 列出 2024-2025 metadata、shape、dtype、time、coverage、bytes、status/cache kind 與 checksum 摘要 | 需要 SERVER 認證；與其餘工作並行 |
 | LBT-002 | P0 | forcing 語意核對 | OCM `hvel/w/zcor/elev/wetdry/diffusivity` 與 NWW3 `Hs/fp/DP` 的單位、方向、mask、gap 與時間對位有證據 | LBT-001，可先讀相鄰專案契約 |
-| LBT-003 | P0 | 科學 manifests | 依文件 08 生成恰好 10 個 behavior classes、每站 20／全案 100 個 receptors、每站 50 個 arrival-time 條件；每列含 site、region、版本、UTC、深度基準與衍生證據 | SERVER 資料與既定演算法；schema 可先行 |
+| LBT-003 | P0 | 科學 manifests | 依文件 08 生成恰好 10 個全為嚴格負值的 iOcean 材質／形狀代理、每站 20／全案 100 個 receptor templates、每站 50／全案 250 個 arrival-time 條件，並驗證每站 1,000／全案 5,000 個 receptor×arrival dynamic initial-condition pairs；material 每列含分類、材質、形狀、適用條件、速度來源、校準狀態與證據等級 | SERVER 資料與既定演算法；material、template 與 pair loader 可先以 fixture 驗證 |
 | LBT-004 | P0 | 運算與儲存 preflight | 核定 output/scratch、檔案系統、可用 CPU/RAM、配額與原子發布方法 | LBT-001；不阻塞合成開發 |
 | LBT-005 | P0 | A 區 expanded forcing 規格與產物 | 現行 v3 固定為 pilot；產製 `northeast_taiwan_common_cache_v4_lbt_south_expanded`、bbox `[121.306315,122.793685,24.480000,25.499156]`，並證明 OCM native／surface 與 NWW analysis 對龜山島 25/35 km 邊界至少保留兩個共同有效格點 | LBT-001/002；正式產物屬 G1 gate，由本專案接續處理，不需使用者先擴域 |
 | LBT-006 | P0 | 全期 canonical 與 forcing 重建 | OCM stable sort/prefer-last、實際 gap-shape blocked validation、immutable reconstruction patch；NWW native 17,544 UTC 重建 full-hour analysis；未通過的 OCM 長缺口以 gap-safe arrival/horizon fallback | LBT-001/002；不等待供應者補件 |
 
 **G0 完成條件：** 正式根路徑與輸入契約可稽核；未通過文件 08 衍生閘門的欄位會被 config validator 拒絕。G0 未完成仍可實作與測試，但不得啟動正式科學批次；這些 gate 由資料與測試產出，不需再向使用者徵詢方案。
+
+### Phase 3A2：dynamic receptor×arrival 初始條件 loader（本 slice 已完成）
+
+本 slice 已加入 `ReceptorArrivalInitialCondition` immutable 資料類別、strict
+`receptor_arrival_initial_condition_manifest` 1.0.0 loader、formal／pilot coverage gate、
+formal release flow-domain resolver、`ScenarioInputs.initial_conditions_by_pair` 唯讀索引，
+以及 raw/canonical component hash。正式 actual z 來自已產出的 OCM-derived pair manifest；
+`Receptor` 模板 z 不再被當成所有 arrival 的實際深度。pilot/formal runtime 已由
+`initialize_run`、`RuntimeRequestFactory` 與 `open_run_controller` 消費 pair record，不能
+回退使用模板 z；formal 另套用正式 inventory topology、時間軸與 gap-safe/full-product
+release gate。正式 release config 或 approved inventory 未到位時仍必須 fail-closed，不得
+降級成 pilot。
+
+### Phase 3B2a：固定 execution ordering 與跨程序 run locking（本 slice 已完成）
+
+本 slice 將 run plan 升為 schema `2.0.0`，公開固定排序政策
+`analysis_region_arrival_utc_site_material_receptor_scenario_v1`。`Scenario` 先依
+分析區域、到達 UTC 奈秒、站點、材料、受體與 scenario ID 排序，再在每個
+`(analysis_region_id, arrival_time_utc_ns)` execution group 內獨立切 shard；群組不跨界，
+因此只改善 I/O locality，不改科學樣本、粒子 ID 或 seed。plan rows 保存 group/part
+metadata，scenario table 與 seed table 都必須遵循同一 order。
+
+每個已發布 workspace 預建固定 `locks/`：run gate、progress 與每 shard lock。worker 依
+run gate shared → shard exclusive → progress exclusive 順序使用 Unix `fcntl.flock`；不同
+shard 可並行，同 shard contention 與 reconcile contention 會 fail-closed。progress 每次
+mutation 重讀最新 revision，避免跨程序遺失更新。schema 1 舊 synthetic/pilot workspace
+沒有相容 resume，必須重建。現有 CLI 已提供 `lbt run-create --run-kind pilot/formal`、
+`lbt run-shard` 與 `lbt run-reconcile`；formal 會在建立與執行前套用正式 config、inventory
+與 release gate，失敗時 fail-closed，不會降級成 pilot。這些入口代表程式已可正式執行，
+但不代表已完成 SERVER 科學批次；NFS/NAS 鎖定仍需 SERVER preflight 實測。
 
 ### G1：forcing、網格與幾何
 
@@ -60,10 +90,10 @@ mask 靜默外插；每一重建時次及 forcing member 都能回溯方法、�
 | ID | 優先序 | 工作 | 完成條件 | 依賴 |
 |---|---:|---|---|---|
 | LBT-201 | P0 | 有限水深 dispersion 與 Stokes | root residual、深／淺水極限、方向、深度衰減及 no/deep/finite cases 通過 | LBT-105；可先用解析輸入 |
-| LBT-202 | P0 | signed-time RK4 | constant/rotation/shear、沉降／上浮、forward-backward closure 與預期階數通過 | 合成 velocity API |
+| LBT-202 | P0 | signed-time RK4 | constant/rotation/shear、signed 垂向 drift、forward-backward closure 與預期階數通過；正式 material manifest 另驗證十筆速度均嚴格小於 0 | 合成 velocity API |
 | LBT-203 | P0 | stochastic split | constant Kh/Kz Brownian mean/variance、seed reproducibility、障壁處理通過 | LBT-202 |
 | LBT-204 | P1 | 空變 diffusivity | Smagorinsky、K gradient drift、well-mixed/PDE 對照通過後才可升為 baseline | LBT-104、LBT-203 |
-| LBT-205 | P0 | 邊界與粒子狀態 | own-local entry、foreign-local 非終止 crossing、共用 A flow-exit、surface-regime/bed/coast/data-gap/max-age/numerical events 與步內 first crossing 通過；foreign crossing 不改變 site/scenario/seed/停止狀態 | LBT-102/103、LBT-202/203 |
+| LBT-205 | P0 | 邊界與粒子狀態 | own-local entry、foreign-local 非終止 crossing、共用 A flow-exit、sinking 海面反射、bed deposition、coast/data-gap/max-age/numerical events 與步內 first crossing 通過；foreign crossing 不改變 site/scenario/seed/停止狀態 | LBT-102/103、LBT-202/203 |
 | LBT-206 | P0 | dt controller | advective、vertical-layer、diffusive限制及 forcing-boundary substep；dt 減半指標收斂 | LBT-201..205 |
 
 **G2 完成條件：** NumPy reference kernel 的解析、統計與邊界測試通過。空變 K 若尚未通過，只保留為敏感度，不阻塞已驗證的常數 K 基線。
@@ -72,7 +102,7 @@ mask 靜默外插；每一重建時次及 forcing member 都能回溯方法、�
 
 | ID | 優先序 | 工作 | 完成條件 | 依賴 |
 |---|---:|---|---|---|
-| LBT-301 | P0 | scenario builder | 五站點各 10×20×50 恰好 10,000 個、A 區 20,000、全案 50,000 個唯一 `scenario_id`；缺列、重列或未通過衍生 gate 的 manifest 立即失敗 | LBT-003 |
+| LBT-301 | P0 | scenario builder | 五站點各 10×20×50 恰好 10,000 個、A 區 20,000、全案 50,000 個唯一 `scenario_id`；每個 material 透過 pair key 共享一筆 dynamic initial condition，不複製成 50,000 筆 pair rows；缺列、重列或未通過衍生 gate 的 manifest 立即失敗 | LBT-003 |
 | LBT-302 | P0 | member/seed contract | `scenario_id`、`experiment_case_id`、`member_id` 分離；seed 與 worker/shard/restart 無關 | LBT-301 |
 | LBT-303 | P0 | vectorized ensemble engine | chunked particle stepping、事件、ragged output 與一致的有效分母 | G1、G2、LBT-302 |
 | LBT-304 | P0 | checkpoint/restart/merge | config/input/seed 綁定；中斷續跑不重複或遺漏 ID，合併前後等價 | LBT-303 |

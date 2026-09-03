@@ -19,9 +19,9 @@
 | D003 | decided | G1 | 採 `nww3_dp_wnd_two_typhoon_adopted_v1`：由山陀兒與康芮兩個獨立事件判定 `DP` 為自正北順時針 wave-from、`+180°` 轉 propagation-to，`.wnd` planes 1/2 為東／北向風分量；後續產品做 cardinal/vector QC | 只有新實證直接反駁時才建立新版契約並重跑；供應者不可考不是未決項 | 研究團隊／海洋數值審查 |
 | D004 | decided | 情境基線 | `10×20×50=10,000` 套用於貢寮、龜山島、新竹、後灣、連江每一獨立站點；A 區 20,000、全案 50,000，1,000 為誤植。`M` 由 member convergence 衍生 | 不得把任一站 baseline 縮為 1,000、把 A 區兩站合併或把全案縮為 10,000 | 研究團隊／數值／系統 |
 | D005 | derived_pending | G0/G3 | 每站 5 個 deterministic maximin 水平位置 × `0.10H/0.40H/0.70H/near-bed` 四層，共 20；全案 100。實際座標由 OCM persistent-wet mesh 生成 | manifest 未通過前可用合成 receptor 測試，不得凍結正式 scenario table | geometry selector／數值審查 |
-| D006 | decided | G0/G3 | 十個垂向行為速度固定為 `-0.100,-0.030,-0.010,-0.003,-0.001,0,+0.001,+0.003,+0.010,+0.030 m/s`，作未校準行為敏感度類別 | 不得把類別名稱寫成有量測支持的特定材質 | 研究方法基線 |
+| D006 | decided | G0/G3 | 依研究主持人 2026-08-27 裁決，取消中性與所有上浮情境；十個速度固定為 `-0.0001,-0.0002,-0.0005,-0.001,-0.002,-0.005,-0.010,-0.020,-0.050,-0.100 m/s`，一對一連結 iOcean 十類及代表材質／形狀條件 | 所有速度必須嚴格小於 0；iOcean 只供分類名稱，數值仍是 `provisional_proxy`，不得宣稱為官方量測或類別平均 | 研究主持人／研究方法基線 |
 | D007 | derived_pending | G0/G3 | 每站 50 個 arrival times 採 48 個年份×季節×大／小潮×三潮位相位 proxy，加局地高波與強流各 1；確切 UTC 由 observed/reconstructed forcing selector 產生，重建未過門檻時限於 gap-safe windows | 不得刪除 strata；若較長 horizon 無法支撐全部 strata，採最短已收斂且可完整覆蓋者並揭露限制 | deterministic selector／統計審查 |
-| D008 | derived_pending | G2/G4 | local first exit 記錄後續跑、flow-domain exit/coast/deposition/surface-regime 停止；`max_backtrack_days` 比較 7/14/30/60 日取最小穩定值 | horizon 未收斂前只可跑 pilot；邊界政策不再任意選擇 | 數值 pilot／方法審查 |
+| D008 | derived_pending | G2/G4 | local first exit 記錄後續跑、flow-domain exit/coast/deposition 停止；sinking 代理因擴散越過海面時反射並記錄；`max_backtrack_days` 比較 7/14/30/60 日取最小穩定值 | horizon 未收斂前只可跑 pilot；正式設定若含零速或正值須在情境建表前拒絕 | 數值 pilot／方法審查 |
 | D009 | derived_pending | G2 | 常數 Kh/Kz 作 reference，實際值由 Brownian/well-mixed 與 pilot 決定；Smagorinsky + gradient drift 通過 PDE/well-mixed 測試後才可升為基準 | 未通過時不得把空變 K 當正式基準 | 數值驗證／統計 |
 | D010 | provisional | G3 | 軌跡採 ragged NumPy columns、事件／scenario 採 Parquet、immutable shards | benchmark 若顯示 I/O 不合適，需新 schema minor/major 決策 | 開發／系統 |
 | D011 | derived_pending | Pilot/G4 | 正式 output root、local scratch、NFS publish、備份與配額由容量／檔案系統 preflight 決定 | 未通過不得啟動大批次或把半成品寫入正式路徑 | 系統 preflight／管理者 |
@@ -31,6 +31,7 @@
 | D015 | derived_pending | G0/G1/G4 | 現行 v3 固定為 pilot；正式候選 ID 為 `northeast_taiwan_common_cache_v4_lbt_south_expanded`，bbox `[121.306315,122.793685,24.480000,25.499156]`。龜山島 35 km geodesic 南緣至名目南界約 5.22 km；實際仍驗證 OCM/NWW 共同 mask 與 25/35 km margin | expanded OCM native/surface/NWW 與共同 mask/margin 未通過前，不得把現行 v3 用於龜山島 25 km 正式 baseline，亦不得只引用 native source margin | geometry／forcing preflight |
 | D016 | decided | G0/G1 | OCM 24 月先 stable sort／`prefer_last` 建 canonical 軸；33 個單一缺時比較短缺口內插與 state-space，23–49-step 長缺口採多變量 EOF-harmonic state-space bidirectional smoother 與 posterior forcing members，並以實際缺口形狀做 Eulerian/Lagrangian blocked validation。pure DINEOF 不得單獨補整個缺失 snapshot | 方法未過門檻時 baseline 改用 gap-safe 分層 arrival windows；已知缺口不作正常 runtime terminal | 研究方法／數值驗證 |
 | D017 | decided | G0/G1 | NWW native 2024–2025 實測恰有 17,544 個連續逐時 UTC；正式 analysis 從 native 重採樣到 OCM 靜態格網，方向用單位向量作圓形內插，時間軸涵蓋 observed/reconstructed OCM UTC | 不對波浪時間作統計補值，也不沿用舊 gappy OCM target-time 軸 | forcing 產製／QC |
+| D018 | decided（定性優先項） | G5 | 依合作團隊一頁簡報與主管口頭意見，將 `oca_fishinggear_open_mesh_bundle × near_bed` 列為正文主要分析層；簡報僅支持「海底廢棄物中漁業用具類為最大宗／調查關注覆網分布」的定性敘述 | 不得由「最大宗」或「特別關注」推導件數／重量先驗、沉降速度或因果來源；v2 十類、速度、情境 ID 與 10×20×50 不變 | 研究團隊／報告統計 |
 
 ## 3. 決策紀錄模板
 
@@ -78,6 +79,8 @@ Supersedes:
 | R020 | 中文註解、README、schema 與程式行為不同步 | M/M | PR checklist、docstring/README/tests 同任務更新、每週文件檢查 | 行為已變但文件未更新：不得合併或通過 gate |
 | R021 | local domains 重疊造成 site 歸屬、事件或分母混用 | M/H | own-local first-exit 與 foreign-local diagnostic 使用不同 event types；`study_site_id` immutable；跨站比例按原站有效 members 正規化 | foreign crossing 改變 scenario/site/seed/停止狀態或進入主要入口分母時，視為 G2/G5 blocker |
 | R022 | 只利用 OCM native source margin 擴域，含 Stokes 軌跡卻超出 NWW analysis 支撐 | M/H | expanded domain 同時驗證 OCM native、OCM surface、NWW analysis 與逐時 mask；含 Stokes baseline 取三者交集 | 任一必要 forcing 在 local/outer margin 無效即阻擋 expanded version，不以 current-only 結果冒充 baseline |
+| R023 | iOcean 清除分類或文獻量級被誤讀為單體沉降校準 | H/H | manifest 分開保存 `classification_source`、`velocity_source`、代表形狀、適用條件、`calibration_status` 與證據等級；YAML 與程式測試拒絕零速、正值及缺欄位 | 未取得樣本密度、尺寸、含氣／附著狀態與終端速度前，只能報告代理敏感度；不得以清除重量作來源先驗或把暫定值稱為實測 |
+| R024 | 主管關注沉底漁具被誤讀成統計權重，或 repeated contact 被當成基線必要資料 | M/H | 報告層固定以 `study_site_id × material_id` member 分母計算；首次接觸／沉積各自保存 raw count 與比例，`BED_CONTACT` member-level 去重 | 只有正式樣本或再懸浮敏感度才能加入覆網掛附、拖曳、再移動與 repeated-contact 動力；目前不調整基線速度與情境矩陣 |
 
 ## 5. 資源不足時的裁決順序
 

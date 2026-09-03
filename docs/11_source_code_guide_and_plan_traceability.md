@@ -16,14 +16,30 @@
 | **資料產製待完成** | 演算法已有，但正式的 flow domain、receptor、arrival 或 forcing manifest 尚未從 SERVER 資料產生。 | 不可。 |
 | **正式成果待完成** | 尚未完成全期批次、收斂驗證、release、圖表或成果審查。 | 不可。 |
 
-因此，這個 repository 現況正確描述是「可執行且經測試的 reference core」，不是「2024–2025 五站正式逆向溯源已完成」。完整工程稽核結論見[實作與 SERVER 驗證稽核](09_implementation_audit_2026-08-19.md)。
+因此，這個 repository 現況正確描述是「可執行且經測試的 reference core、CPU/NumPy
+ProductionBatch、schema 2 run-control 契約與 pilot／formal runtime」，不是「2024–2025
+五站正式逆向溯源已完成」。目前 `initialize_run`／`initialize_formal_run`、
+`RuntimeRequestFactory` 與 `open_run_controller` 已接通兩種模式；`lbt run-create`、
+`lbt run-shard` 與 `lbt run-reconcile` 已提供對應入口。formal 由正式 config、approved
+manifests、strict inventory topology／時間軸與逐 arrival flow 的 gap 支援 gate 控制，任何
+證據不足都會在 forcing I/O 前 fail-closed。example config 與實際 release artifacts 尚未
+到位；本輪未登入或執行 SERVER，沒有正式研究結果。完整工程稽核結論見
+[實作與 SERVER 驗證稽核](09_implementation_audit_2026-08-19.md)。
 
-### 1.1 本工項的原始範圍與後續裁決
+### 1.1 BayTrace 可用部分整合界線
+
+本專案只整合 BayTrace 可對應本地 CPU 執行的工程思路：CPU SoA／batch／chunk、每粒子可
+重現亂數、SCHISM triangle hint、可暫停 engine，以及 schema 2 checkpoint/restart。未採用
+GPU/CUDA、BayTrace raw `schout`／`bp` I/O、oil/weathering、droptime、共享記憶體
+multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只保留為未來具備完整
+相容 fixture 時的 golden reference；目前不把它當成正式驗證結果。
+
+### 1.2 本工項的原始範圍與後續裁決
 
 本文件僅對照計畫書紅框「三、Lagrangian 系集逆向溯源」：PDF 第 3–5 頁、印刷頁 28–30。該段包含：
 
-- 10 種沉降／上升行為、20 個三維到達地點、50 個到達時間，以及離開關注區域的停止邊界；
-- OCM 三維海流、NWW3 波浪導出的 Stokes 漂流與浮沉速度之合成；
+- 原提案的 10 種沉降／上升行為，已依研究主持人裁決改為 10 種全非上浮的海廢材質／形狀代理；另含 20 個三維到達地點、50 個到達時間，以及離開關注區域的停止邊界；
+- OCM 三維海流、NWW3 波浪導出的 Stokes 漂流與向下沉降速度之合成；
 - 四階 Runge-Kutta 法、隨機漫步擴散與 Smagorinsky 水平擴散；
 - 邊界穿越點的高斯核密度估計；
 - 主要潛在來源路徑的視覺化。
@@ -35,84 +51,93 @@
 新接手者不應從數值迴圈開始逐行閱讀。建議依下列順序建立全貌，再進入細節：
 
 1. [README](../README.md)：研究站點、情境計數、資料根目錄、目前可執行命令與正式閘門概覽。
-2. 先開啟[互動式程式架構地圖](source_code_architecture_map.html)建立全貌，再閱讀本文件第 3、4 節的四個程式群組與兩張流程圖。
+2. 先開啟[互動式程式架構地圖](source_code_architecture_map.html)建立全貌，再閱讀本文件第 3、4 節的五個程式群組與兩張流程圖。
 3. [設定範例](../configs/lagrangian_backtracking.example.yaml) 與 `config.py`：了解何者被鎖定為科學契約，何者尚不可用於正式發布。
-4. `models.py`、`scenarios.py`、`runner.py`：了解一條軌跡如何由站點、受體、到達時間、行為、成員唯一識別。
-5. `forcing.py`、`mesh.py`、`stokes.py`、`diffusion.py`、`integrators.py`：了解每一時間步的速度如何取得與計算。
-6. `boundaries.py`、`engine.py`：了解何時記錄事件、何時停止回溯。
-7. `outputs.py`、`checkpoint.py`、`aggregation.py`：了解如何保存可追溯結果，以及如何產生密度與路徑統計。
-8. 對照 `tests/`：每一核心宣稱至少要有對應測試；測試通過表示程式邏輯符合該測試案例，不代表正式海域結果已產出。
-9. 最後閱讀[科學方法與驗證](03_scientific_method_and_validation.md)、[成果呈現與學術視覺化規格](07_results_visualization_plan.md)與[實作稽核](09_implementation_audit_2026-08-19.md)。
+4. `models.py`、`scenarios.py`、`runner.py`、`batch_state.py`：了解一條軌跡如何由站點、受體、到達時間、行為、成員唯一識別並進入 SoA 批次。
+5. `forcing.py`、`forcing_window.py`、`mesh.py`、`stokes.py`、`diffusion.py`、`integrators.py`：了解每一時間步的速度如何取得與計算。
+6. `boundaries.py`、`engine.py`、`production.py`：了解何時記錄事件、何時停止回溯，以及 CPU batch 如何呼叫共用單步 engine。
+7. `runtime.py`、`run_control.py`、`run_locking.py`、`run_validation.py`、`cli.py`：了解 pilot／formal request、workspace、鎖定、reconcile 與命令列邊界。
+8. `outputs.py`、`checkpoint.py`、`report_material_statistics.py`、`aggregation.py`：了解如何保存可追溯結果，以及如何產生材質／底部接觸、密度與路徑統計。
+9. 對照 `tests/`：每一核心宣稱至少要有對應測試；測試通過表示程式邏輯符合該測試案例，不代表正式海域結果已產出。
+10. 最後閱讀[科學方法與驗證](03_scientific_method_and_validation.md)、[成果呈現與學術視覺化規格](07_results_visualization_plan.md)與[實作稽核](09_implementation_audit_2026-08-19.md)。
 
-## 3. `src` 的四個程式群組
+## 3. `src` 的五個程式群組
 
-下表是 `src/lagrangian_backtracking/` 的導覽索引。英文名稱為程式檔或欄位的既有名稱；右欄以中文說明其用途，避免必須從檔名猜測責任。
+下表是 `src/lagrangian_backtracking/` 的完整導覽索引。英文名稱為程式檔或欄位的既有名稱；右欄以中文說明資料意義與目前責任，避免必須從檔名猜測實作狀態。
 
 | 群組 | 模組 | 主要輸入 | 主要輸出／責任 | 建議首先閱讀的公開函式或類別 |
 |---|---|---|---|---|
 | 資料與幾何 | `config.py` | YAML 設定 | 鎖定 4 個流場範圍、5 個站點、每站 10,000／全案 50,000 個基礎情境；正式發布時拒絕未補齊的證據。 | `ProjectConfig`、`load_config` |
 | 資料與幾何 | `preflight.py`、`time_axis.py` | OCM／NWW3 月份 metadata 與 UTC 軸 | 唯讀盤點上游檔案、建立跨月唯一 UTC 軸、列出缺時與資料契約問題。 | `run_preflight`、`canonicalize_time_chunks` |
-| 資料與幾何 | `geometry.py`、`mesh.py` | 經緯度、原始 OCM 節點與網格面 | 轉為公尺座標、建立局部分析區，並定位粒子所在原始三角形。 | `DomainProjection`、`build_anchor_local_domain`、`NativeMesh.locate` |
+| 資料與幾何 | `geometry.py`、`mesh.py` | 經緯度、原始 OCM 節點與網格面 | 轉為公尺座標、建立局部分析區，並以原始三角形定位粒子。 | `DomainProjection`、`build_anchor_local_domain`、`NativeMesh.locate` |
 | 資料與幾何 | `receptors.py`、`arrival_times.py` | 可長期濕潤的網格面、各時段資料品質指標 | 選取每站 5 個水平位置 × 4 個垂向層位，以及 48 個分層時刻加 2 個事件時刻。 | `select_horizontal_receptors`、`build_vertical_targets`、`select_arrival_times` |
+| 資料與幾何 | `manifests.py` | 已產製的 component／geometry JSON 與 config resolver | 嚴格驗證 material、receptor、arrival、dynamic pair 與巢狀邊界；formal A 依 resolver 綁定 expanded flow-domain ID。 | `load_scenario_inputs`、`load_boundary_geometries` |
 | 物理與邊界 | `models.py` | 無 | 定義所有模組共用的粒子狀態、速度樣本、品質旗標、事件與停止狀態。 | `ParticleState`、`VelocitySample`、`BoundaryEvent` |
-| 物理與邊界 | `forcing.py`、`accelerated.py` | OCM 原始網格、NWW3 波浪格網、時間與粒子位置 | 在指定位置、深度、UTC 時刻讀取海流、波浪與擴散資料；可選用加速的 OCM 內插內核。 | `OCMNativeMonth.sample`、`NWWAnalysisMonth.sample`、`CombinedMonthForcing` |
-| 物理與邊界 | `stokes.py`、`diffusion.py`、`integrators.py` | 波浪條件、擴散係數、速度取樣器 | 計算有限水深 Stokes 漂流、隨機擴散位移與逆向四階時間積分。 | `finite_depth_stokes`、`brownian_displacement`、`rk4_step` |
+| 物理與邊界 | `forcing.py`、`forcing_window.py` | OCM／NWW3 產品、時間、粒子位置與 UTC stage | 取樣海流、波浪、Stokes、沉降與擴散資料；以月份 lazy window 管理 resident cache。 | `CombinedMonthForcing`、`ForcingWindowManager` |
+| 物理與邊界 | `accelerated.py`、`stokes.py`、`diffusion.py`、`integrators.py` | 欄位、波浪條件、擴散係數與速度取樣器 | 提供 OCM 內插加速、有限水深 Stokes、隨機擴散與逆向四階時間積分。 | `interpolate_ocm_support_numba`、`finite_depth_stokes`、`brownian_displacement`、`rk4_step` |
 | 物理與邊界 | `boundaries.py`、`engine.py` | 提議的新粒子位置、局部／外層範圍、海面與海床資料 | 解析海岸、局部範圍、共同流場外框、海面與海床事件，控制單粒子回溯至停止。 | `resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` |
-| 情境與執行 | `scenarios.py`、`runner.py` | 行為、受體、到達時刻、主亂數種子 | 建立 10 × 20 × 50 的唯一情境，擴充為每情境 `M` 個系集成員，切成可重跑批次。 | `build_scenarios`、`derive_member_seed`、`plan_scenario_shards`、`run_reference_shard` |
-| 情境與執行 | `checkpoint.py`、`cli.py` | 粒子中途狀態、命令列參數 | 安全保存／讀回中途狀態；提供設定檢查、資料盤點、行為清單、合成試算與結果檢查命令。 | `write_checkpoint`、`load_checkpoint`、`main` |
+| 批次與重啟 | `scenarios.py`、`runner.py` | 行為、受體、到達時刻、主亂數種子 | 建立 10 × 20 × 50 唯一情境，展開 `RunUnit` 與每情境 `M` 個成員，固定順序切 shard。 | `build_scenarios`、`derive_member_seed`、`plan_scenario_shards`、`iter_run_units` |
+| 批次與重啟 | `batch_state.py`、`production.py` | `ParticleState`、`ScenarioShard`、request factory 與 reference engine 單步介面 | 以 SoA 保存狀態，執行 CPU/NumPy active compaction、chunking、scatter 與可暫停 batch。 | `ParticleBatch`、`ProductionBatch`、`run_production_shard` |
+| 批次與重啟 | `checkpoint.py` | 粒子 execution、觀測、事件、RNG state 與 binding | 以 schema 2 保存可重啟系集狀態；不覆寫既有 generation，並驗證輸入繫結。 | `write_execution_checkpoint`、`load_execution_checkpoint` |
+| 執行控制 | `cli.py`、`runtime.py` | 命令列參數、run workspace、manifest、config 與 forcing roots | 提供 `run-create`、`run-shard`、`run-reconcile`；依 run kind 建立 `RuntimeRequestFactory` 與 controller，formal 先通過 strict inventory／manifest gate。 | `main`、`initialize_run`、`initialize_formal_run`、`RuntimeRequestFactory`、`open_run_controller` |
+| 執行控制 | `provenance.py`、`run_control.py` | 部署指紋、run plan/progress、ProductionBatch 與 checkpoint/output | 綁定程式來源、schema 2 immutable plan、atomic progress、lock topology、shard 執行與 reconcile。 | `collect_code_provenance`、`initialize_run_workspace`、`RunController` |
+| 執行控制 | `run_locking.py`、`run_validation.py` | lock file、validator 輸入與 checksum | 以 Unix `flock` 保護互斥；唯讀驗證 lifecycle、identity、order、checkpoint/output 與工程摘要。 | `acquire_run_lock`、`validate_run`、`benchmark_report` |
 | 輸出與聚合 | `outputs.py` | 完成的 `ParticleResult` 清單 | 原子寫出粒子摘要、事件、軌跡一維陣列與檢查資料；拒絕覆寫或不完整結果。 | `write_trajectory_shard`、`validate_trajectory_shard` |
-| 輸出與聚合 | `aggregation.py` | 已驗證的事件與軌跡 | 計算邊界密度、二維條件式足跡、高密度區、路徑訪格比例、停留時間與跨站連通。 | `conditional_kde_2d`、`pathway_residence_grid`、`boundary_arclength_histogram` |
+| 輸出與聚合 | `aggregation.py` | 已驗證的事件與軌跡 | 計算邊界密度、二維條件式足跡、高密度區、路徑訪格比例、停留時間與跨站連通；正式成果仍待資料 release。 | `conditional_kde_2d`、`pathway_residence_grid`、`boundary_arclength_histogram` |
+| 輸出與聚合 | `report_material_statistics.py` | `Scenario`／`ScenarioStratum` 與一次串流的 `ParticleResult` | 依 `study_site_id × material_id` 產生有效 member 分母、首次海床接觸／沉積 member count 與 fraction；沉底漁具優先層僅是定性排序，不改速度或來源先驗，重複接觸按 member 去重，基線不含再懸浮。 | `MaterialStatisticsAccumulator`、`build_material_statistics` |
 
-### 3.1 四群組不是四套獨立程式
+### 3.1 五群組不是五套獨立程式
 
-四群組的關係如下。箭頭表示資料依賴，而非同一個 Python 函式必定直接呼叫另一個函式。
+五群組的關係如下。箭頭表示文件化資料／控制語意，而非同一個 Python 函式必定直接呼叫另一個函式；實際相對 `import` 請以互動式架構地圖為準。
 
 ```mermaid
 flowchart LR
     subgraph A[資料與幾何]
-        CFG[config.py<br/>科學契約與設定]
-        PRE[preflight.py + time_axis.py<br/>上游資料盤點與時間軸]
-        GEO[geometry.py + mesh.py<br/>公尺座標、網格與範圍]
-        REC[receptors.py + arrival_times.py<br/>受體與到達時刻]
+        CFG[config.py<br/>設定契約]
+        MAN[manifests.py<br/>component／geometry manifest]
+        GEO[geometry.py + mesh.py<br/>公尺座標與三角形定位]
     end
     subgraph B[物理與邊界]
-        MOD[models.py<br/>共用資料型別]
-        FOR[forcing.py + accelerated.py<br/>OCM、NWW3 取樣]
-        PHY[stokes.py + diffusion.py + integrators.py<br/>速度、擴散與時間積分]
+        FOR[forcing.py + forcing_window.py<br/>UTC forcing window]
+        PHY[models.py + accelerated.py + stokes.py + diffusion.py + integrators.py<br/>共用物理核心]
         BND[boundaries.py + engine.py<br/>事件與停止]
     end
-    subgraph C[情境與執行]
-        SCN[scenarios.py<br/>10 x 20 x 50]
-        RUN[runner.py<br/>情境 x M 成員批次]
-        CKP[checkpoint.py<br/>中途續跑]
-        CLI[cli.py<br/>可重現命令]
+    subgraph C[批次與重啟]
+        SCN[scenarios.py + runner.py<br/>情境與 RunUnit]
+        PB[batch_state.py + production.py<br/>CPU/NumPy ProductionBatch]
+        CKP[checkpoint.py<br/>schema 2 restart]
     end
-    subgraph D[輸出與聚合]
-        OUT[outputs.py<br/>軌跡、事件與檢查資料]
-        AGG[aggregation.py<br/>足跡、密度與路徑統計]
-        FIG[圖表與成果報告<br/>尚待正式產製]
+    subgraph D[執行控制]
+        CLI[cli.py<br/>run-create／run-shard／run-reconcile]
+        RT[runtime.py<br/>RuntimeRequestFactory]
+        RC[run_control.py<br/>RunController]
+        VAL[run_validation.py<br/>唯讀 validator]
     end
-    CFG --> PRE
-    CFG --> GEO
-    CFG --> REC
-    PRE --> FOR
-    GEO --> FOR
-    GEO --> REC
-    REC --> SCN
-    MOD --> FOR
-    MOD --> PHY
-    MOD --> BND
-    FOR --> PHY
+    subgraph E[輸出與聚合]
+        OUT[outputs.py<br/>shard／events]
+        MAT[report_material_statistics.py<br/>材質／底部接觸 member 統計]
+        AGG[aggregation.py<br/>條件式來源足跡與統計]
+    end
+    CFG --> RT
+    MAN --> RT
+    CLI --> RT
+    CLI --> RC
+    SCN --> RT
+    RT --> FOR
+    FOR --> RC
+    RC --> PB
+    PB --> PHY
     PHY --> BND
-    SCN --> RUN
-    BND --> RUN
-    RUN --> CKP
-    RUN --> OUT
-    OUT --> AGG
-    AGG --> FIG
-    CLI --> CFG
-    CLI --> PRE
-    CLI --> OUT
+    PB --> CKP
+    PB --> OUT
+    OUT --> MAT
+    CKP --> VAL
+    OUT --> VAL
+    RC --> VAL
+    MAT --> AGG
+    VAL --> AGG
+    GEO --> FOR
+    GEO --> MAN
 ```
 
 可直接引用的靜態圖檔如下：
@@ -140,7 +165,7 @@ flowchart TD
     V --> O[OCMNativeMonth.sample<br/>u、v、w、海面、海床、Kz]
     V --> W[NWWAnalysisMonth.sample]
     W --> ST[finite_depth_stokes<br/>有限水深波浪表面漂移]
-    O --> T[總速度<br/>海流 + Stokes + 浮沉]
+    O --> T[總速度<br/>海流 + Stokes + 向下沉降]
     ST --> T
     T --> R[rk4_step<br/>負時間步長回溯]
     R --> D[brownian_displacement<br/>加入正變異隨機擴散]
@@ -179,12 +204,12 @@ uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
 
 | 計畫書條目 | 主要原始碼 | 已有測試或可執行證據 | 目前狀態與仍需完成事項 |
 |---|---|---|---|
-| 10 種沉降／上升速度 | `scenarios.BASELINE_BEHAVIORS`、`Behavior`、`CombinedMonthForcing` | [test_cli_smoke.py](../tests/test_cli_smoke.py) 驗證 10 筆行為輸出。 | **程式核心已驗證。** 正式 material manifest、材料說明與敏感度選定尚待產製。 |
+| 10 種非上浮海廢材質／形狀代理 | `scenarios.BASELINE_BEHAVIORS`、`Behavior`、`config.ProjectConfig`、`CombinedMonthForcing` | [test_cli_smoke.py](../tests/test_cli_smoke.py)、[test_config.py](../tests/test_config.py) 與 [test_scenarios.py](../tests/test_scenarios.py) 驗證 10 筆、iOcean 分類唯一、欄位完整及速度全部嚴格小於 0。 | **v2 程式契約已驗證。** 目前速度仍為 `provisional_proxy`；正式 material manifest 尚待發布，現地物性校準屬後續 gate。 |
 | 20 個三維 receptors／每站 | `geometry.py`、`mesh.py`、`receptors.py` | [test_receptors.py](../tests/test_receptors.py) 驗證長期濕潤水平選取與 4 個有效垂向層。 | **資料產製待完成。** 演算法已具備；五站正式 local/open-boundary/receptor manifests 尚未由實際網格產生。 |
 | 50 個到達時間／每站 | `arrival_times.select_arrival_times`、`scenarios.ArrivalTime` | [test_checkpoint_arrivals.py](../tests/test_checkpoint_arrivals.py) 驗證 48 個分層時刻加 2 個事件時刻。 | **資料產製待完成。** 尚未以完整資料時間軸產生五站正式 50 個 UTC 與回溯可用範圍證據。 |
 | 每站 `10 × 20 × 50 = 10,000`，全案 50,000 | `config.ProjectConfig`、`scenarios.build_scenarios`、`validate_baseline_coverage` | [test_config.py](../tests/test_config.py)、[test_scenarios.py](../tests/test_scenarios.py) 拒絕縮減計數並驗證 50,000 個唯一情境。 | **程式契約已驗證。** 尚待把正式受體、到達時間和行為表交叉成不可變的 scenario manifest。 |
 | 離開關注區域的邊界停止 | `BoundaryGeometry`、`resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` | [test_boundaries_engine.py](../tests/test_boundaries_engine.py) 驗證自站、他站、外層、海岸、海面／海床與時間步內交點。 | **邏輯已驗證；正式幾何待完成。** A 區 v4 南擴流場與五站開放水域邊界尚未生成和驗收。 |
-| 公式（6）：海流 + Stokes + 浮沉的總平流速度；完全沉沒不加 windage | `forcing.CombinedMonthForcing`、`stokes.py` | [test_mesh_forcing.py](../tests/test_mesh_forcing.py)、[test_stokes.py](../tests/test_stokes.py) 驗證 OCM／NWW 取樣、波向與深淺水極限。 | **程式核心已驗證。** 尚未以 SERVER 全期正式 forcing 實跑與檢查單位、濕乾語意及共同有效遮罩。 |
+| 公式（6）：海流 + Stokes + 向下沉降的總平流速度；完全沉沒不加 windage | `forcing.CombinedMonthForcing`、`stokes.py` | [test_mesh_forcing.py](../tests/test_mesh_forcing.py)、[test_stokes.py](../tests/test_stokes.py) 驗證 OCM／NWW 取樣、波向與深淺水極限。 | **程式核心已驗證。** 尚未以 SERVER 全期正式 forcing 實跑與檢查單位、濕乾語意及共同有效遮罩。 |
 | 公式（7）：由波高、週期、波向與波長計算 Stokes 漂流 | `solve_wave_number`、`finite_depth_stokes`、`deep_water_stokes` | [test_stokes.py](../tests/test_stokes.py) 驗證色散關係殘差、深水極限與波向轉換。 | **程式核心已驗證。** baseline 的波浪資料版本、no-Stokes／深水／有限水深敏感度尚未以實值資料產出。 |
 | 公式（8）：逆向四階 Runge-Kutta 時間積分 | `integrators.rk4_step`、`engine.run_particle` | [test_integrators_diffusion.py](../tests/test_integrators_diffusion.py)、[test_boundaries_engine.py](../tests/test_boundaries_engine.py) 驗證負時間步長只取反一次、四個中間點與離域處理。 | **程式核心已驗證。** 正式的最小／最大時間步長和時間步收斂試驗尚待 pilot 決定。 |
 | 公式（9）：隨機漫步擴散 | `brownian_displacement`、`split_rk4_brownian_step` | [test_integrators_diffusion.py](../tests/test_integrators_diffusion.py) 驗證變異數為 `2KΔt`。 | **程式核心已驗證。** 正式水平、垂向擴散係數及系集成員數 `M` 尚待收斂試驗決定。 |
@@ -238,7 +263,7 @@ flowchart LR
 
 ### 7.1 已完成且可立即閱讀、測試的部分
 
-- `src` 的 reference core、合成資料端到端 smoke、結果 shard 驗證與 57 項單元測試。
+- `src` 的 reference core、合成資料端到端 smoke、結果 shard 驗證與本輪完整 suite 的 377 項測試（2026-08-28）；此數字是本機測試，不是 SERVER 測試。
 - 跨欄位的科學計數契約：A 區有兩個獨立站點、五站各 10,000、全案 50,000；程式拒絕將此契約縮減為 1,000。
 - OCM 原始網格內插、NWW3 波浪取樣、Stokes 漂流、四階逆時間積分、隨機擴散、巢狀邊界事件、情境成員識別、輸出與聚合的可測試語意。
 
@@ -249,9 +274,9 @@ flowchart LR
 1. OCM 缺時重建或 gap-safe 到達／回溯窗 manifest；
 2. NWW3 完整逐時 analysis manifest；
 3. 南向擴充的 A 區正式 flow domain 與五站 domain、開放邊界、受體 manifests；
-4. 五站各 50 個到達時刻、10 種行為及 50,000 個 scenario manifest；
+4. 五站各 50 個到達時刻、10 種非上浮材質／形狀代理及 50,000 個 scenario manifest；
 5. 由 pilot 決定的 `M`、擴散係數、時間步長、最大回溯期、批次大小與 checkpoint 間隔；
-6. 完整的加速 production engine、實值 pilot、全期 batch、aggregate release 與 F01–F12 圖表。
+6. 實值 pilot、全期 SERVER batch、aggregate release 與 F01–F12 圖表。
 
 這些不是要求使用者再提供科學資料；依既有決策，應由現有 2024–2025 資料、既定演算法和 pilot 驗證產生。詳細待辦與不可放寬的閘門見[實作與 SERVER 驗證稽核](09_implementation_audit_2026-08-19.md)第 4 節。
 
@@ -265,7 +290,10 @@ flowchart LR
 4. local entry、outer exit、海岸與資料停止原因的摘要；
 5. 最少一組 F02、F03、F04、F05、F10、F12 的可重製草圖與資料 sidecar。
 
-通過後才可固定正式設定、接通 production batch，並把 `aggregation.py` 的資料產品產製為計畫書所要求的主要潛在來源路徑成果。
+pilot／formal runtime 已接通現有 CPU/NumPy batch；上述條件通過後，才可凍結正式
+production run 設定、在 SERVER 執行全期 batch，並把 `aggregation.py` 的資料產品產製為
+計畫書所要求的主要潛在來源路徑成果。因此「程式可正式執行」已達成，但「正式 release
+artifacts、SERVER 科學批次與成果」仍未完成。
 
 ## 8. 維護規則
 

@@ -12,6 +12,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 from scipy.stats import gaussian_kde
 
 from .engine import ParticleResult
@@ -28,6 +29,32 @@ class KDEGrid:
     cell_probability: np.ndarray
     hdr_masks: dict[float, np.ndarray]
     bandwidth_factor: float
+    raw_point_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class BinnedKDEGrid:
+    """保存格網化條件式來源足跡的公尺制產品。
+
+    ``raw_count`` 的軸順序固定為 ``(y_cell, x_cell)``，每個元素是 caller 逐批次或逐
+    shard 累加的原始交點整數計數；本資料結構不保存原始粒子點集合。``cell_probability``
+    是高斯平滑後在目前格網內重新正規化的相對來源權重，``density_per_m2`` 則以每格的
+    實際公尺平方面積換算為面積密度。x/y 邊界、頻寬與密度的長度單位都是公尺，故結果可
+    與其他公尺制空間產品對齊。
+
+    這個結果是把離散格網計數視為格心質量、再以高斯核平滑的計算近似；零值邊界會截去
+    格網外的高斯尾部，輸出的機率只對格網內保留下來的質量重新正規化。它描述的是在
+    指定受體、到達條件、物性與流場條件下的格網化條件式來源足跡／相對來源權重，不是
+    建立先驗、似然和觀測驗證後的絕對來源機率，也不補回域外或未觀測來源的質量。
+    """
+
+    x_edges_m: np.ndarray
+    y_edges_m: np.ndarray
+    raw_count: np.ndarray
+    density_per_m2: np.ndarray
+    cell_probability: np.ndarray
+    hdr_masks: dict[float, np.ndarray]
+    bandwidth_m: float
     raw_point_count: int
 
 
@@ -59,6 +86,193 @@ class BoundaryArclengthHistogram:
     count_density_per_m: np.ndarray
     conditional_fraction_per_m: np.ndarray
     valid_member_denominator: int
+
+
+def binned_gaussian_kde_2d(
+    raw_count: np.ndarray,
+    *,
+    x_edges_m: np.ndarray,
+    y_edges_m: np.ndarray,
+    bandwidth_m: float,
+    hdr_levels: Sequence[float] = (0.50, 0.75, 0.90),
+) -> BinnedKDEGrid:
+    """由二維格網計數建立高斯平滑的條件式來源足跡與高密度區遮罩。
+
+    ``raw_count`` 的形狀與軸意義固定為
+    ``(len(y_edges_m) - 1, len(x_edges_m) - 1)``；每格代表公尺制 x/y 格網內的原始
+    交點數。函式只接收逐批次或逐 shard 累加後的計數矩陣，不需要再次載入原始點集合，
+    適合大型系集的串流聚合。x/y 邊界必須是有限、嚴格遞增且等距的公尺制格線，才能把
+    物理頻寬正確換算成兩個格網軸上的標準差。
+
+    平滑明確使用 ``scipy.ndimage.gaussian_filter``，輸入為浮點計數，且
+    ``sigma=(bandwidth_m / y_step, bandwidth_m / x_step)``、
+    ``mode="constant"``、``cval=0``。零值邊界代表格網外不納入本次產品，可能截去高斯
+    尾部；因此平滑後只將格網內保留的質量重新正規化，使 ``cell_probability`` 總和為 1。
+    ``density_per_m2`` 是 ``cell_probability`` 除以每格真實公尺平方面積，x/y 格距不必
+    相同。
+
+    高密度區（highest-density region，HDR）依每格機率遞減排列，選取累積質量首次達到
+    各門檻所需的最小格數。排序採穩定排序，且以 C-order 展平的 row-major 順序作為相同
+    機率的決定性平手順序；所有門檻共用同一排列，故遮罩必然巢狀。輸入計數會防禦性複製
+    為 ``int64``，避免 caller 修改原矩陣後污染結果。
+
+    所有機率、密度與 HDR 只表示指定受體、到達條件、物性及流場條件下的格網化條件式
+    來源足跡／相對來源權重；未建立先驗、似然與觀測驗證前，不得解讀為絕對來源機率或
+    因果歸因。格網化與高斯平滑本身也是近似，解析度、頻寬和邊界截斷都會影響結果。
+
+    Args:
+        raw_count: 非負整數的 ``(y_cell, x_cell)`` 原始計數矩陣，總數必須大於零。
+        x_edges_m: x 軸公尺制格線，至少兩點、有限、嚴格遞增且等距。
+        y_edges_m: y 軸公尺制格線，至少兩點、有限、嚴格遞增且等距。
+        bandwidth_m: 公尺制高斯頻寬，必須有限且大於零。
+        hdr_levels: 唯一、有限且嚴格介於 0 與 1 的 HDR 累積質量門檻。
+
+    Returns:
+        含防禦性複製的格線與原始計數、平滑密度、每格機率、HDR 遮罩及原始點總數的
+        ``BinnedKDEGrid``。
+
+    Raises:
+        ValueError: 輸入維度、dtype、數值、格線、頻寬或 HDR 門檻不符合契約時。
+        RuntimeError: 平滑後無法得到有限且正的格網總質量時。
+    """
+
+    # 格線先複製成固定的浮點陣列；若輸入無法轉為數值，直接轉成契約一致的 ValueError，
+    # 避免後續 shape 或差分運算暴露不一致的 TypeError。複製也避免 caller 改動格線後，
+    # 回傳產品的座標定義被悄悄改寫。
+    try:
+        x_edges = np.array(x_edges_m, dtype=np.float64, copy=True)
+        y_edges = np.array(y_edges_m, dtype=np.float64, copy=True)
+    except (TypeError, ValueError) as error:
+        raise ValueError("x_edges_m 與 y_edges_m 必須可轉為數值格線") from error
+    if x_edges.ndim != 1 or x_edges.size < 2 or not np.all(np.isfinite(x_edges)):
+        raise ValueError("x_edges_m 必須是至少兩點的有限一維陣列")
+    if y_edges.ndim != 1 or y_edges.size < 2 or not np.all(np.isfinite(y_edges)):
+        raise ValueError("y_edges_m 必須是至少兩點的有限一維陣列")
+    x_widths = np.diff(x_edges)
+    y_widths = np.diff(y_edges)
+    if (
+        not np.all(np.isfinite(x_widths))
+        or not np.all(np.isfinite(y_widths))
+        or np.any(x_widths <= 0)
+        or np.any(y_widths <= 0)
+    ):
+        raise ValueError("x_edges_m 與 y_edges_m 必須嚴格遞增")
+    if not np.allclose(x_widths, x_widths[0], rtol=1.0e-12, atol=1.0e-12):
+        raise ValueError("x_edges_m 必須具有均勻格距")
+    if not np.allclose(y_widths, y_widths[0], rtol=1.0e-12, atol=1.0e-12):
+        raise ValueError("y_edges_m 必須具有均勻格距")
+
+    expected_shape = (y_edges.size - 1, x_edges.size - 1)
+    try:
+        counts_input = np.asarray(raw_count)
+    except (TypeError, ValueError) as error:
+        raise ValueError("raw_count 必須是二維整數矩陣") from error
+    if counts_input.ndim != 2 or counts_input.shape != expected_shape:
+        raise ValueError(f"raw_count 必須是形狀完全相符的二維矩陣 {expected_shape}")
+    if counts_input.dtype.kind not in "iu":
+        raise ValueError("raw_count 必須是整數 dtype，不接受浮點數或布林值")
+    if counts_input.dtype.kind == "i" and np.any(counts_input < 0):
+        raise ValueError("raw_count 不可包含負值")
+    if counts_input.dtype.kind == "u" and np.any(counts_input > np.iinfo(np.int64).max):
+        raise ValueError("raw_count 的值必須可安全表示為 int64")
+    # 這個副本同時確保回傳型別固定為 int64，且 caller 修改原始矩陣不會污染結果。
+    counts = np.array(counts_input, dtype=np.int64, copy=True)
+    # 以 Python 整數逐格累加，避免大量非負 int64 計數相加時在 uint64 累加器中繞回；
+    # raw_point_count 是原始交點總數，應忠實保存而不能因固定寬度整數溢位變小。
+    raw_point_count = sum(int(value) for value in counts.flat)
+    if raw_point_count <= 0:
+        raise ValueError("raw_count 的總數必須大於零")
+
+    # 頻寬是單一公尺制標量；拒絕陣列、布林與字串，避免把形狀或非物理值靜默轉成頻寬。
+    try:
+        bandwidth_value = np.asarray(bandwidth_m)
+        if bandwidth_value.ndim != 0 or bandwidth_value.dtype.kind not in "iuf":
+            raise ValueError
+        bandwidth = float(bandwidth_value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("bandwidth_m 必須是有限正值") from error
+    if not np.isfinite(bandwidth) or bandwidth <= 0:
+        raise ValueError("bandwidth_m 必須是有限正值")
+
+    # 先把門檻 materialize 成 tuple，讓 generator 也能被檢查，並逐項限制為數值標量；
+    # 唯一性是必要條件，否則同一個 dictionary key 會覆蓋前一份 HDR 結果。
+    try:
+        level_values = tuple(hdr_levels)
+        level_numbers: list[float] = []
+        for level in level_values:
+            level_value = np.asarray(level)
+            if level_value.ndim != 0 or level_value.dtype.kind not in "iuf":
+                raise ValueError
+            level_numbers.append(float(level_value))
+        levels = tuple(level_numbers)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("HDR levels 必須是唯一、有限且介於 0 與 1 的門檻") from error
+    if (
+        not levels
+        or len(set(levels)) != len(levels)
+        or any(not np.isfinite(level) or level <= 0.0 or level >= 1.0 for level in levels)
+    ):
+        raise ValueError("HDR levels 必須唯一、有限且嚴格介於 0 與 1")
+
+    # sigma 的單位是 cell 數，因此 x/y 必須各自用自己的物理格距換算，避免矩形格網
+    # 把同一個 scalar sigma 錯當成兩軸相同的公尺尺度。
+    smoothed = np.asarray(
+        gaussian_filter(
+            counts.astype(np.float64, copy=False),
+            sigma=(bandwidth / float(y_widths[0]), bandwidth / float(x_widths[0])),
+            mode="constant",
+            cval=0.0,
+        ),
+        dtype=np.float64,
+    )
+    if smoothed.shape != expected_shape or not np.all(np.isfinite(smoothed)) or np.any(smoothed < 0.0):
+        raise RuntimeError("Gaussian 平滑結果必須與輸入同形，且全部有限非負")
+    smoothed_total = float(np.sum(smoothed, dtype=np.float64))
+    if not np.isfinite(smoothed_total) or smoothed_total <= 0.0:
+        raise RuntimeError("Gaussian 平滑後的格網總質量無效")
+
+    # 零值邊界造成的流失在此只對格網內保留質量重新正規化；cell area 使用實際邊界差，
+    # 因此 density_per_m2 與 probability 的關係不依賴格網是否為正方形。另檢查面積是否
+    # 可由有限浮點數表示，避免極端座標範圍產生無限密度。
+    cell_area = y_widths[:, None] * x_widths[None, :]
+    if not np.all(np.isfinite(cell_area)) or np.any(cell_area <= 0.0):
+        raise ValueError("x_edges_m 與 y_edges_m 的 cell 面積必須是有限正值")
+    cell_probability = smoothed / smoothed_total
+    cell_probability /= float(np.sum(cell_probability, dtype=np.float64))
+    probability_total = float(np.sum(cell_probability, dtype=np.float64))
+    if (
+        not np.all(np.isfinite(cell_probability))
+        or np.any(cell_probability < 0.0)
+        or not np.isclose(probability_total, 1.0, rtol=0.0, atol=1.0e-12)
+    ):
+        raise RuntimeError("cell_probability 必須有限、非負且總和為 1")
+    density_per_m2 = np.asarray(cell_probability / cell_area, dtype=np.float64)
+    if not np.all(np.isfinite(density_per_m2)) or np.any(density_per_m2 < 0.0):
+        raise RuntimeError("density_per_m2 必須有限且非負")
+
+    # flatten 使用 C-order row-major；對負機率排序並指定 stable，可在相同機率時保留
+    # row-major 先後，且所有門檻共用同一順序，自然形成巢狀 HDR masks。
+    flat_probability = cell_probability.ravel()
+    descending_order = np.argsort(-flat_probability, kind="stable")
+    cumulative_probability = np.cumsum(flat_probability[descending_order], dtype=np.float64)
+    hdr_masks: dict[float, np.ndarray] = {}
+    for level in levels:
+        selected_count = int(np.searchsorted(cumulative_probability, level, side="left")) + 1
+        selected_count = min(selected_count, descending_order.size)
+        mask_flat = np.zeros(flat_probability.size, dtype=bool)
+        mask_flat[descending_order[:selected_count]] = True
+        hdr_masks[level] = mask_flat.reshape(expected_shape)
+
+    return BinnedKDEGrid(
+        x_edges_m=x_edges,
+        y_edges_m=y_edges,
+        raw_count=counts,
+        density_per_m2=density_per_m2,
+        cell_probability=np.asarray(cell_probability, dtype=np.float64),
+        hdr_masks=hdr_masks,
+        bandwidth_m=bandwidth,
+        raw_point_count=raw_point_count,
+    )
 
 
 def conditional_kde_2d(

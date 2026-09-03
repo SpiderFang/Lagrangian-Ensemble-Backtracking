@@ -8,6 +8,7 @@ arrival times 都是 wet，且與 candidate boundary 保留核定 margin；maxim
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,6 +35,29 @@ class HorizontalReceptor:
 
 
 @dataclass(frozen=True, slots=True)
+class HorizontalReceptorCandidatePool:
+    """單站一次建立、可供多輪 deterministic 重選的水平候選池。
+
+    candidate pool 已完成 persistent-wet、candidate polygon 與 boundary margin gate；
+    陣列分別保存 source face local/global index、公尺制中心、經緯度與 tie-break key。
+    所有 numpy 欄位都是 defensive copy 且設為唯讀，後續 NWW／OCM 垂向 blacklist 只能透過
+    ``excluded_face_indices`` 傳入 selector，不能改寫原始候選池或重新掃描 Shapely
+    geometry。經緯度只作 receptor 資料交換與 NWW 空間 gate，maximin 距離仍在公尺制
+    ``candidate_xy_m`` 與 ``anchor_xy`` 上計算。
+    """
+
+    study_site_id: str
+    anchor_xy: tuple[float, float]
+    maximum_anchor_snap_distance_m: float | None
+    candidate_face_local_indices: np.ndarray
+    candidate_face_global_indices: np.ndarray
+    candidate_xy_m: np.ndarray
+    candidate_lon: np.ndarray
+    candidate_lat: np.ndarray
+    tie_break_keys: tuple[tuple[float, float, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class VerticalTarget:
     """單一 arrival/水平位置的實際 positive-up z 與 HAB。"""
 
@@ -54,33 +78,43 @@ def _face_centers(mesh: NativeMesh) -> np.ndarray:
     return centers
 
 
-def select_horizontal_receptors(
+def _readonly_copy(values: np.ndarray) -> np.ndarray:
+    """建立候選池專用的唯讀 array copy，避免 excluded 狀態污染 immutable pool。"""
+
+    result = np.array(values, copy=True)
+    result.setflags(write=False)
+    return result
+
+
+def prepare_horizontal_receptor_candidates(
     *,
     study_site_id: str,
     mesh: NativeMesh,
     candidate_polygon_metric: Polygon,
     anchor_xy: tuple[float, float],
     wetdry_at_arrivals: np.ndarray,
-    count: int = 5,
     boundary_margin_m: float = 0.0,
     wet_value: float = 0.0,
     maximum_anchor_snap_distance_m: float | None = None,
-) -> list[HorizontalReceptor]:
-    """從 persistent-wet faces 以 anchor-first deterministic maximin 選水平點。
+) -> HorizontalReceptorCandidatePool:
+    """一次掃描 geometry，建立單站 persistent-wet 的 immutable 水平候選池。
 
     ``wetdry_at_arrivals`` shape 為 ``(arrival,source_face)``；50 個時次任一非有限或非 wet
     即剔除。``boundary_margin_m`` 同時避開 candidate polygon 外界與被 ocean clipping
-    形成的岸線，若候選不足 caller 可依文件規則另立半 margin QC case，不在此靜默放寬。
+    形成的岸線。這個階段不接受 count，也不進行 maximin；候選數量與 NWW／垂向
+    blacklist 由 ``select_horizontal_receptors_from_pool`` 在不重做 geometry scan 的
+    情況下處理。pool 保存的座標與 tie-break key 已經是原 wrapper 的同一份資料，故
+    不會因重選輪次或 excluded set 的輸入順序改變結果。
     """
 
     wetdry = np.asarray(wetdry_at_arrivals, dtype=np.float64)
     if wetdry.ndim != 2 or wetdry.shape[1] != mesh.face_nodes_local.shape[0]:
         raise ValueError("wetdry_at_arrivals 必須是 (arrival,source_face)")
-    if count < 1 or boundary_margin_m < 0:
-        raise ValueError("count 必須為正且 boundary margin 不可為負")
+    if boundary_margin_m < 0:
+        raise ValueError("boundary margin 不可為負")
     persistent_wet = np.all(np.isfinite(wetdry) & np.isclose(wetdry, wet_value, atol=0.1), axis=0)
     centers = _face_centers(mesh)
-    candidate_indices = []
+    candidate_indices: list[int] = []
     for face_index, (x_m, y_m) in enumerate(centers):
         point = Point(float(x_m), float(y_m))
         if not persistent_wet[face_index] or not candidate_polygon_metric.covers(point):
@@ -88,10 +122,6 @@ def select_horizontal_receptors(
         if boundary_margin_m > 0 and point.distance(candidate_polygon_metric.boundary) < boundary_margin_m:
             continue
         candidate_indices.append(face_index)
-    if len(candidate_indices) < count:
-        raise ValueError(
-            f"{study_site_id} persistent-wet/margin 候選不足：需要 {count}，實際 {len(candidate_indices)}"
-        )
     indices = np.asarray(candidate_indices, dtype=np.int64)
     candidate_xy = centers[indices]
     lon = np.empty(indices.size, dtype=np.float64)
@@ -105,47 +135,149 @@ def select_horizontal_receptors(
         (float(lon[index]), float(lat[index]), int(mesh.source_face_global_index[face_index]))
         for index, face_index in enumerate(indices)
     ]
+    return HorizontalReceptorCandidatePool(
+        study_site_id=study_site_id,
+        anchor_xy=(float(anchor_xy[0]), float(anchor_xy[1])),
+        maximum_anchor_snap_distance_m=(
+            float(maximum_anchor_snap_distance_m)
+            if maximum_anchor_snap_distance_m is not None
+            else None
+        ),
+        candidate_face_local_indices=_readonly_copy(indices),
+        candidate_face_global_indices=_readonly_copy(mesh.source_face_global_index[indices]),
+        candidate_xy_m=_readonly_copy(candidate_xy),
+        candidate_lon=_readonly_copy(lon),
+        candidate_lat=_readonly_copy(lat),
+        tie_break_keys=tuple(tie_keys),
+    )
+
+
+def select_horizontal_receptors_from_pool(
+    pool: HorizontalReceptorCandidatePool,
+    *,
+    count: int = 5,
+    excluded_face_indices: Iterable[int] = (),
+) -> list[HorizontalReceptor]:
+    """在既有 immutable candidate pool 上重跑 anchor-first deterministic maximin。
+
+    ``excluded_face_indices`` 是目前 study site 已被 NWW 或 OCM 垂向 gate 淘汰的 source
+    face local index 集合；selector 只建立一份布林選取 mask，不修改 pool 的任何 array。
+    因此每輪只做數值 maximin，不重新建立 Shapely Point、重新判斷 polygon 或讀取 wetdry。
+    候選不足仍以 ``ValueError`` fail closed；未被排除的候選、tie-break、anchor snap 與
+    receptor ID 格式均保持原 ``select_horizontal_receptors`` 的結果。
+    """
+
+    if not isinstance(pool, HorizontalReceptorCandidatePool):
+        raise ValueError("pool 必須是 HorizontalReceptorCandidatePool")
+    if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)):
+        raise ValueError("count 必須為正整數")
+    count_value = int(count)
+    if count_value < 1:
+        raise ValueError("count 必須為正整數")
+    try:
+        excluded_values = tuple(excluded_face_indices)
+    except TypeError as exc:
+        raise ValueError("excluded_face_indices 必須是整數 iterable") from exc
+    if any(
+        isinstance(face_index, (bool, np.bool_))
+        or not isinstance(face_index, (int, np.integer))
+        for face_index in excluded_values
+    ):
+        raise ValueError("excluded_face_indices 必須是整數 iterable")
+    excluded = frozenset(int(face_index) for face_index in excluded_values)
+    include = np.asarray(
+        [int(face_index) not in excluded for face_index in pool.candidate_face_local_indices],
+        dtype=bool,
+    )
+    remaining_count = int(np.count_nonzero(include))
+    if remaining_count < count_value:
+        raise ValueError(
+            f"{pool.study_site_id} persistent-wet/margin 候選不足：需要 {count_value}，實際 {remaining_count}"
+        )
+    candidate_xy = pool.candidate_xy_m[include]
+    candidate_lon = pool.candidate_lon[include]
+    candidate_lat = pool.candidate_lat[include]
+    candidate_local_indices = pool.candidate_face_local_indices[include]
+    candidate_global_indices = pool.candidate_face_global_indices[include]
+    candidate_tie_keys = tuple(
+        key for key, included in zip(pool.tie_break_keys, include, strict=True) if included
+    )
     local_selected = deterministic_maximin(
-        candidate_xy, count=count, anchor_xy=anchor_xy, tie_break_keys=tie_keys
+        candidate_xy,
+        count=count_value,
+        anchor_xy=pool.anchor_xy,
+        tie_break_keys=candidate_tie_keys,
     )
     selected: list[HorizontalReceptor] = []
-    anchor = np.asarray(anchor_xy, dtype=np.float64)
+    anchor = np.asarray(pool.anchor_xy, dtype=np.float64)
     for order, local_index in enumerate(local_selected):
-        face_index = int(indices[local_index])
-        x_m, y_m = candidate_xy[local_index]
-        snap_distance = float(np.linalg.norm(candidate_xy[local_index] - anchor)) if order == 0 else None
+        index = int(local_index)
+        x_m, y_m = candidate_xy[index]
+        snap_distance = float(np.linalg.norm(candidate_xy[index] - anchor)) if order == 0 else None
         if (
             order == 0
-            and maximum_anchor_snap_distance_m is not None
-            and snap_distance > maximum_anchor_snap_distance_m
+            and pool.maximum_anchor_snap_distance_m is not None
+            and snap_distance > pool.maximum_anchor_snap_distance_m
         ):
             raise ValueError(
-                f"{study_site_id} anchor snap {snap_distance:.3f} m "
-                f"超過 {maximum_anchor_snap_distance_m:.3f} m"
+                f"{pool.study_site_id} anchor snap {snap_distance:.3f} m "
+                f"超過 {pool.maximum_anchor_snap_distance_m:.3f} m"
             )
-        identifier = stable_identifier(
-            "hr",
-            [
-                study_site_id,
-                str(int(mesh.source_face_global_index[face_index])),
-                f"{x_m:.6f}",
-                f"{y_m:.6f}",
-            ],
-        )
         selected.append(
             HorizontalReceptor(
-                horizontal_receptor_id=identifier,
-                study_site_id=study_site_id,
+                horizontal_receptor_id=stable_identifier(
+                    "hr",
+                    [
+                        pool.study_site_id,
+                        str(int(candidate_global_indices[index])),
+                        f"{x_m:.6f}",
+                        f"{y_m:.6f}",
+                    ],
+                ),
+                study_site_id=pool.study_site_id,
                 x_m=float(x_m),
                 y_m=float(y_m),
-                lon=float(lon[local_index]),
-                lat=float(lat[local_index]),
-                source_face_local_index=face_index,
-                source_face_global_index=int(mesh.source_face_global_index[face_index]),
+                lon=float(candidate_lon[index]),
+                lat=float(candidate_lat[index]),
+                source_face_local_index=int(candidate_local_indices[index]),
+                source_face_global_index=int(candidate_global_indices[index]),
                 anchor_snap_distance_m=snap_distance,
             )
         )
     return selected
+
+
+def select_horizontal_receptors(
+    *,
+    study_site_id: str,
+    mesh: NativeMesh,
+    candidate_polygon_metric: Polygon,
+    anchor_xy: tuple[float, float],
+    wetdry_at_arrivals: np.ndarray,
+    count: int = 5,
+    boundary_margin_m: float = 0.0,
+    wet_value: float = 0.0,
+    maximum_anchor_snap_distance_m: float | None = None,
+) -> list[HorizontalReceptor]:
+    """相容既有 API：prepare 一次候選池後執行無 exclusion 的 deterministic selector。
+
+    wrapper 保持原參數與回傳型別，讓既有 caller 不需知道 pool 內部拆分；候選 pool 的
+    geometry、persistent-wet、anchor-first、tie-break、boundary margin 與 snap distance
+    語意完全由新的兩階段 API 共用。input derivation 在需要 NWW／垂向 blacklist 時，
+    直接呼叫兩階段 API 以避免每輪重建幾何候選。
+    """
+
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id=study_site_id,
+        mesh=mesh,
+        candidate_polygon_metric=candidate_polygon_metric,
+        anchor_xy=anchor_xy,
+        wetdry_at_arrivals=wetdry_at_arrivals,
+        boundary_margin_m=boundary_margin_m,
+        wet_value=wet_value,
+        maximum_anchor_snap_distance_m=maximum_anchor_snap_distance_m,
+    )
+    return select_horizontal_receptors_from_pool(pool, count=count)
 
 
 def build_vertical_targets(

@@ -1,10 +1,12 @@
-# 本檔固定 design_baseline_v1 的科學與工程規則，但仍不是可直接送入正式批次的 release config。
+# 本檔固定 design_baseline_v2_non_rising_oca_proxy 的科學與工程規則，但仍不是可直接送入
+# 正式批次的 release config。v2 依研究主持人意見取消中性懸浮與所有上浮情境，並為十個
+# 嚴格負值沉降格點指定 iOcean 分類、代表材質、形狀、適用條件及證據等級。
 # local-domain polygon、受體座標、50 個 UTC、M、擴散係數與 SERVER 路徑必須依已決定的
 # 演算法由實際網格、forcing 與先導試驗衍生；null 表示「尚未產出衍生 manifest」，不是
 # 等待研究人員任意選值。正式批次只接受所有 derived gate 均通過的 approved release config。
-schema_version: "0.3.0"
+schema_version: "0.4.0"
 config_status: design_baseline_example
-design_version: design_baseline_v1
+design_version: design_baseline_v2_non_rising_oca_proxy
 project_id: lagrangian_ensemble_backtracking
 time_standard: UTC
 
@@ -74,7 +76,12 @@ inputs:
     # trial_ready 僅表示 lexical cycle selection 不宣稱最佳 forecast lead；在供應者不可考
     # 的前提下，研究端以固定選取與 audit 契約正式採用，不再要求改寫上游 status。
     accepted_statuses: [ready, trial_ready]
-    accepted_cache_kinds: [ocm_analysis_grid_resample_from_nww3_native]
+    # 第二個名稱是目前 SERVER metadata 的 accepted cache kind：先使用完整可取得的
+    # NWW archive native hourly time axis，再重格網至 OCM spatial grid；它不代表供應者
+    # 的 best-cycle 或最佳 forecast lead。保留舊名稱以相容既有已驗收產品與 release binding。
+    accepted_cache_kinds:
+      - ocm_analysis_grid_resample_from_nww3_native
+      - ocm_spatial_grid_resample_from_complete_available_nww3_archive_native_time_v1
     required_arrays:
       - time_utc_ns.npy
       - significant_wave_height.npy
@@ -255,28 +262,119 @@ physics:
       - finite_depth_bulk
 
   settling:
-    # 未有材質、粒徑、密度或生物附著量測，因此十類是涵蓋三個數量級的垂向行為
-    # 敏感度基線，不是十種具名廢棄物的校準值。正式 material manifest 必須由本表
-    # 確定性生成並保存 design_version，不得在 batch 前任意改值。
+    # iOcean 網頁只提供清除統計所用的十個分類名稱，未提供單體密度、尺寸、形狀因子、
+    # 阻力係數或終端速度。本表將官方分類與代表材質／形狀條件對接，但十個負值速度只
+    # 是涵蓋 10^-4–10^-1 m/s 的敏感度格點，不得宣稱為官方量測或類別平均物性。
+    # 對保麗龍、木材與中空瓶罐，只納入吸水、附著或進水後已完全沉沒且向下運動者；
+    # 未符合條件的物件必須排除，不能為了湊足十類而強制賦予負值。
     material_manifest: null
     expected_material_count: 10
-    settling_negative_rising_positive: true
+    z_positive_up_sign_convention: true
+    require_strictly_negative_velocity: true
+    positive_or_zero_velocity_policy: reject_config
     velocity_unit: m_per_s
-    design_decision_status: decided_behavior_classes
-    behavior_classes:
-      - {material_id: sink_100mmps, settling_velocity_mps: -0.100, behavior_class: sinking}
-      - {material_id: sink_030mmps, settling_velocity_mps: -0.030, behavior_class: sinking}
-      - {material_id: sink_010mmps, settling_velocity_mps: -0.010, behavior_class: sinking}
-      - {material_id: sink_003mmps, settling_velocity_mps: -0.003, behavior_class: sinking}
-      - {material_id: sink_001mmps, settling_velocity_mps: -0.001, behavior_class: sinking}
-      - {material_id: neutral_000mmps, settling_velocity_mps: 0.000, behavior_class: suspended}
-      - {material_id: rise_001mmps, settling_velocity_mps: 0.001, behavior_class: rising}
-      - {material_id: rise_003mmps, settling_velocity_mps: 0.003, behavior_class: rising}
-      - {material_id: rise_010mmps, settling_velocity_mps: 0.010, behavior_class: rising}
-      - {material_id: rise_030mmps, settling_velocity_mps: 0.030, behavior_class: rising}
+    classification_source: oca_iocean_marine_litter_categories_accessed_2026_08_27
+    velocity_source: design_sensitivity_grid_not_oca_measurement
+    design_decision_status: decided_material_shape_proxies_pending_calibration
+    material_classes:
+      - material_id: oca_styrofoam_porous_fragment
+        oca_category_zh: 保麗龍
+        material_family_zh: 發泡聚苯乙烯（EPS）
+        representative_shape_zh: 吸水或生物附著之多孔不規則碎塊
+        settling_velocity_mps: -0.0001
+        behavior_class: sinking
+        applicability_condition_zh: 限已吸水或生物附著、整體仍完全沉沒且呈負浮力者
+        calibration_status: provisional_proxy
+        evidence_grade: C_conditional_biofouling_mechanism
+      - material_id: oca_wood_waterlogged_elongated
+        oca_category_zh: 竹木
+        material_family_zh: 竹材或木材
+        representative_shape_zh: 水浸飽和之細長枝條或片狀木屑
+        settling_velocity_mps: -0.0002
+        behavior_class: sinking
+        applicability_condition_zh: 限水浸後整體密度已高於周圍海水者
+        calibration_status: provisional_proxy
+        evidence_grade: D_no_transferable_item_velocity
+      - material_id: oca_wastepaper_folded_fiber
+        oca_category_zh: 廢紙
+        material_family_zh: 吸水纖維材料
+        representative_shape_zh: 濕潤摺疊紙片或纖維團
+        settling_velocity_mps: -0.0005
+        behavior_class: sinking
+        applicability_condition_zh: 固定形狀與速度，不模擬持續解體、溶散或團聚
+        calibration_status: provisional_proxy
+        evidence_grade: D_no_transferable_item_velocity
+      - material_id: oca_nonrecyclable_flexible_sheet
+        oca_category_zh: 其他/不可回收
+        material_family_zh: 混合塑膠或複合包材
+        representative_shape_zh: 進水薄膜、軟片或皺摺包裝片
+        settling_velocity_mps: -0.001
+        behavior_class: sinking
+        applicability_condition_zh: 只作異質類別的條件代理，不解讀為類別平均物性
+        calibration_status: provisional_proxy
+        evidence_grade: C_shape_framework_only
+      - material_id: oca_fishinggear_open_mesh_bundle
+        oca_category_zh: 廢漁網漁具
+        material_family_zh: 尼龍、聚乙烯或混合漁具材料
+        representative_shape_zh: 網片、繩索或繩結纖維束
+        settling_velocity_mps: -0.002
+        behavior_class: sinking
+        applicability_condition_zh: 不顯式解析網目開孔、纏繞、展開與姿態變化
+        calibration_status: provisional_proxy
+        evidence_grade: C_fragment_and_fiber_range_overlap
+      - material_id: oca_pet_waterfilled_bottle
+        oca_category_zh: 寶特瓶
+        material_family_zh: 聚對苯二甲酸乙二酯（PET）
+        representative_shape_zh: 進水或壓扁之中空瓶體
+        settling_velocity_mps: -0.005
+        behavior_class: sinking
+        applicability_condition_zh: 只納入已進水且向下運動者；密閉含氣瓶體必須排除
+        calibration_status: provisional_proxy
+        evidence_grade: C_pet_fragment_range_shape_mismatch
+      - material_id: oca_other_recyclable_irregular_fragment
+        oca_category_zh: 其他/可回收
+        material_family_zh: 混合可回收塑膠、橡膠或複合材料
+        representative_shape_zh: 不規則片塊或零組件
+        settling_velocity_mps: -0.010
+        behavior_class: sinking
+        applicability_condition_zh: 只作異質類別代理；正式校準前應再依材質與形狀分群
+        calibration_status: provisional_proxy
+        evidence_grade: D_heterogeneous_category
+      - material_id: oca_aluminum_crushed_cylinder
+        oca_category_zh: 鋁罐
+        material_family_zh: 鋁合金
+        representative_shape_zh: 進水壓扁之薄壁中空圓筒
+        settling_velocity_mps: -0.020
+        behavior_class: sinking
+        applicability_condition_zh: 只納入已進水或壓扁者；密閉含氣罐體必須排除
+        calibration_status: provisional_proxy
+        evidence_grade: B_material_order_D_can_velocity
+      - material_id: oca_steel_rigid_cylinder
+        oca_category_zh: 鐵罐
+        material_family_zh: 鋼鐵或鍍錫鋼板
+        representative_shape_zh: 進水之剛性圓筒或金屬片
+        settling_velocity_mps: -0.050
+        behavior_class: sinking
+        applicability_condition_zh: 姿態、開口、塗層與腐蝕效應尚未顯式解析
+        calibration_status: provisional_proxy
+        evidence_grade: B_material_order_D_can_velocity
+      - material_id: oca_glass_bottle_or_fragment
+        oca_category_zh: 玻璃瓶
+        material_family_zh: 玻璃
+        representative_shape_zh: 進水瓶體或緻密銳角碎片
+        settling_velocity_mps: -0.100
+        behavior_class: sinking
+        applicability_condition_zh: 完整瓶與碎片幾何差異留待樣本量測校準
+        calibration_status: provisional_proxy
+        evidence_grade: D_no_transferable_item_velocity
 
   horizontal_diffusion:
     # 常數 Kh 是解析／統計 reference；Smagorinsky 需通過空變 K 與 well-mixed 測試。
+    # runtime 的 finite_depth_stokes／no_stokes 只讀 constant_kh_m2ps；smagorinsky_cs_*
+    # 則只讀下方的 Smagorinsky mapping，因此兩組設定可以分開核定與執行。
+    # 當正式／pilot scalar gate 已提供有限非負 constant_kh_m2ps 時，前兩個常數案例仍
+    # 可執行，即使下方 Smagorinsky floor/cap 尚未核定；本 example 本身仍因 placeholder
+    # 與其他正式輸入未完成而維持 blocked。
     reference_method: constant
     baseline_method_decision_status: decided_constant_value_pending_validation_pilot
     constant_kh_m2ps: null
@@ -284,6 +382,9 @@ physics:
       formula: proposal_equation_10_metric_triangle_gradient
       cs_sensitivity: [0.10, 0.15, 0.20]
       delta_policy: sqrt_local_triangle_area_m
+      # example config 刻意保留未核定的假值為 null；Smagorinsky runtime 會 fail-closed，
+      # 不會將 null 轉成 0 或其他隱含上下限。只有完成 pilot、well-mixed、PDE、收斂與
+      # floor/cap 物理審查後，才可在 release config 填入有限非負值且 floor <= cap。
       kh_floor_m2ps: null
       kh_cap_m2ps: null
       variable_diffusivity_gradient_drift_required: true
@@ -325,7 +426,8 @@ boundaries:
   flow_domain_open_boundary: stop_at_first_crossing
   coast_baseline: stop_and_record_contact
   surface_suspended_or_sinking: reflect_and_record_contact
-  surface_rising: stop_as_surface_regime_exit
+  # v2 正式情境建表前會拒絕零值與正值；此欄明示不能把通用引擎的 rising 能力誤當基線。
+  unsupported_surface_rising: reject_before_run
   bed_suspended: reflect_and_record_contact
   bed_sinking_or_near_bed: deposit_on_first_contact_and_stop
   stop_at_forcing_start: true
@@ -361,6 +463,9 @@ scenarios:
     - {vertical_id: near_bed, policy: lowest_valid_ocm_layer_center}
   receptor_design_decision_status: decided_coordinates_pending_server_mesh
   arrival_time_manifest: null
+  # 每個 receptor×arrival 的正式 actual z 必須由 OCM eta/zcor/wetdry 產出；此相對路徑
+  # 是下游 loader 的 placeholder，不代表本 example 已有 generator、OCM 讀取或 SERVER 產物。
+  receptor_arrival_initial_condition_manifest: manifests/receptor_arrival_initial_condition.json
   # 每站點皆須有 50 個 arrival-time 條件；貢寮／龜山島優先配對 UTC，但潮位相位、
   # forcing coverage 與極端事件標籤仍逐站點計算。
   expected_arrival_time_count_per_site: 50
@@ -389,7 +494,8 @@ scenarios:
   members_per_scenario: null
   members_decision_status: derived_by_registered_convergence
   master_seed: null
-  seed_policy: hash_master_scenario_member
+  # 目前程式實作的 128-bit seed 派生規則；正式 runtime 不接受其他命名。
+  seed_policy: sha256_v1_pcg64dxsm
 
 arrival_time_selection:
   # 48+2 的分層與選取演算法已決定；確切 UTC 只能從 SERVER forcing 與潮位序列
@@ -405,9 +511,15 @@ arrival_time_selection:
 
 execution:
   reference_backend: numpy
-  production_backend: numba
+  # 目前只有 CPU/NumPy reference orchestration；不可宣稱已接 Numba kernel。
+  production_backend: numpy_reference
   shard_scenario_count: null
-  checkpoint_interval_output_steps: null
+  # cadence 以完整 sweep 計算，不以輸出觀測點代替。
+  checkpoint_interval_sweeps: null
+  # null 表示沿用 ProductionBatch 的全 active set；實際值待 pilot benchmark。
+  active_chunk_size: null
+  # 單一 process 最多保留的 forcing 月份；2 是可調整的工程預設，不是科學參數。
+  max_resident_forcing_months: 2
   fail_if_dirty_git: true
   atomic_publish: true
   input_change_policy: reject_resume

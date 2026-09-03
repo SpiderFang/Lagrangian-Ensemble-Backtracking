@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from shapely.geometry import box
 
 from lagrangian_backtracking.mesh import NativeMesh
-from lagrangian_backtracking.receptors import build_vertical_targets, select_horizontal_receptors
+from lagrangian_backtracking.receptors import (
+    build_vertical_targets,
+    prepare_horizontal_receptor_candidates,
+    select_horizontal_receptors,
+    select_horizontal_receptors_from_pool,
+)
 
 
-def _five_face_mesh() -> NativeMesh:
-    """建立五個互不重疊的小 triangle，供 deterministic selector 測試。"""
+def _five_face_mesh(face_count: int = 5) -> NativeMesh:
+    """建立指定數量的互不重疊小 triangle，供 deterministic selector 測試。"""
 
     coordinates = []
     faces = []
-    for face in range(5):
+    for face in range(face_count):
         x = float(face * 20)
         base = len(coordinates)
         coordinates.extend([[x, 0.0], [x + 5.0, 0.0], [x, 5.0]])
@@ -28,8 +34,8 @@ def _five_face_mesh() -> NativeMesh:
         source_depth_m=np.full(node_count, 20.0),
         source_node_bottom_index=np.zeros(node_count, dtype=np.int64),
         face_nodes_local=np.asarray(faces),
-        face_node_count=np.full(5, 3),
-        source_face_global_index=np.arange(100, 105),
+        face_node_count=np.full(face_count, 3),
+        source_face_global_index=np.arange(100, 100 + face_count),
         bin_size_m=10.0,
     )
 
@@ -64,6 +70,91 @@ def test_horizontal_selector_requires_all_arrivals_wet() -> None:
     )
     assert len(receptors) == 5
     assert receptors[0].source_face_global_index == 100
+
+
+def test_wrapper_matches_prepare_and_pool_selection_without_exclusion() -> None:
+    """無 exclusion 時，新兩階段 API 必須與既有 wrapper 完全同結果。"""
+
+    mesh = _five_face_mesh()
+    wetdry = np.zeros((50, 5))
+    polygon = box(-10.0, -10.0, 100.0, 10.0)
+    wrapper_result = select_horizontal_receptors(
+        study_site_id="test",
+        mesh=mesh,
+        candidate_polygon_metric=polygon,
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=wetdry,
+        count=5,
+    )
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="test",
+        mesh=mesh,
+        candidate_polygon_metric=polygon,
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=wetdry,
+    )
+    pool_result = select_horizontal_receptors_from_pool(pool, count=5)
+    assert wrapper_result == pool_result
+
+
+def test_pool_exclusion_does_not_mutate_candidates_and_reselects_deterministically() -> None:
+    """排除 face 後不得回傳該 face，且 pool 的唯讀內容與結果順序保持穩定。"""
+
+    mesh = _five_face_mesh(face_count=7)
+    wetdry = np.zeros((50, 7))
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="test",
+        mesh=mesh,
+        candidate_polygon_metric=box(-10.0, -10.0, 200.0, 10.0),
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=wetdry,
+    )
+    before = {
+        "local": np.array(pool.candidate_face_local_indices, copy=True),
+        "global": np.array(pool.candidate_face_global_indices, copy=True),
+        "xy": np.array(pool.candidate_xy_m, copy=True),
+        "lon": np.array(pool.candidate_lon, copy=True),
+        "lat": np.array(pool.candidate_lat, copy=True),
+    }
+    selected = select_horizontal_receptors_from_pool(
+        pool,
+        count=5,
+        excluded_face_indices=(0,),
+    )
+    assert all(item.source_face_local_index != 0 for item in selected)
+    assert tuple(item.source_face_local_index for item in selected) == tuple(
+        item.source_face_local_index
+        for item in select_horizontal_receptors_from_pool(
+            pool,
+            count=5,
+            excluded_face_indices=(0,),
+        )
+    )
+    assert np.array_equal(pool.candidate_face_local_indices, before["local"])
+    assert np.array_equal(pool.candidate_face_global_indices, before["global"])
+    assert np.array_equal(pool.candidate_xy_m, before["xy"])
+    assert np.array_equal(pool.candidate_lon, before["lon"])
+    assert np.array_equal(pool.candidate_lat, before["lat"])
+    assert not pool.candidate_face_local_indices.flags.writeable
+    assert not pool.candidate_face_global_indices.flags.writeable
+    assert not pool.candidate_xy_m.flags.writeable
+    assert not pool.candidate_lon.flags.writeable
+    assert not pool.candidate_lat.flags.writeable
+
+
+def test_pool_selection_fails_closed_when_exclusion_leaves_fewer_than_five() -> None:
+    """排除後共同有效候選不足五面時，pool selector 必須明確 ValueError。"""
+
+    mesh = _five_face_mesh()
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="test",
+        mesh=mesh,
+        candidate_polygon_metric=box(-10.0, -10.0, 100.0, 10.0),
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=np.zeros((50, 5)),
+    )
+    with pytest.raises(ValueError, match="候選不足"):
+        select_horizontal_receptors_from_pool(pool, count=5, excluded_face_indices=(0,))
 
 
 def test_vertical_targets_are_positive_up_and_distinct() -> None:

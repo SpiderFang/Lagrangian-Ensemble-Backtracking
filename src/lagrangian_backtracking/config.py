@@ -17,6 +17,76 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+# 這組名稱取自海洋保育署 iOcean 海洋廢棄物管理頁於 2026-08-27 顯示的查詢類別。
+# 常數只用來驗證臺灣情境的分類追溯是否完整；該網站的清除重量與件數不含單體物性，
+# 因此不得用這組分類或統計量反推密度、阻力或終端沉降速度。
+EXPECTED_OCA_CATEGORIES_ZH = frozenset(
+    {
+        "竹木",
+        "保麗龍",
+        "廢漁網漁具",
+        "其他/不可回收",
+        "鐵罐",
+        "鋁罐",
+        "寶特瓶",
+        "玻璃瓶",
+        "廢紙",
+        "其他/可回收",
+    }
+)
+
+
+def _validate_non_rising_material_contract(settling: Any, *, expected_count: int) -> None:
+    """驗證設定中的十類材質／形狀代理均為嚴格負值且可追溯。
+
+    ``settling`` 來自 YAML 的 ``physics.settling``。因該區塊同時保存研究說明與未來可
+    擴充欄位，目前仍以 mapping 讀取；本函式補上不可放寬的科學契約：z 軸向上為正、
+    零速與上浮一律拒絕、十個 iOcean 類別一對一、材質／形狀／適用條件與證據欄位不可
+    缺漏。檢查通過只代表設計一致，不代表暫定速度已由現地樣本校準。
+    """
+
+    if not isinstance(settling, dict):
+        raise ValueError("physics.settling 必須是 mapping")
+    if settling.get("z_positive_up_sign_convention") is not True:
+        raise ValueError("沉降速度必須採 z positive-up 符號慣例")
+    if settling.get("require_strictly_negative_velocity") is not True:
+        raise ValueError("非上浮基線必須要求 settling_velocity_mps 嚴格小於 0")
+    if settling.get("positive_or_zero_velocity_policy") != "reject_config":
+        raise ValueError("零速或正值物性必須在設定驗證階段拒絕")
+
+    records = settling.get("material_classes")
+    if not isinstance(records, list) or len(records) != expected_count:
+        raise ValueError(f"physics.settling.material_classes 必須恰有 {expected_count} 筆")
+    material_ids: list[str] = []
+    categories: list[str] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f"material_classes[{index}] 必須是 mapping")
+        required_fields = (
+            "material_id",
+            "oca_category_zh",
+            "material_family_zh",
+            "representative_shape_zh",
+            "applicability_condition_zh",
+            "calibration_status",
+            "evidence_grade",
+        )
+        if any(
+            not isinstance(record.get(field), str) or not record[field].strip() for field in required_fields
+        ):
+            raise ValueError(f"material_classes[{index}] 缺少材質、形狀、適用條件或證據欄位")
+        velocity = record.get("settling_velocity_mps")
+        if isinstance(velocity, bool) or not isinstance(velocity, (int, float)) or velocity >= 0.0:
+            raise ValueError(f"{record['material_id']} 的 settling_velocity_mps 必須嚴格小於 0")
+        if record.get("behavior_class") != "sinking":
+            raise ValueError(f"{record['material_id']} 的 behavior_class 必須是 sinking")
+        material_ids.append(record["material_id"])
+        categories.append(record["oca_category_zh"])
+    if len(set(material_ids)) != len(material_ids):
+        raise ValueError("material_classes 的 material_id 必須唯一")
+    if set(categories) != EXPECTED_OCA_CATEGORIES_ZH:
+        raise ValueError("material_classes 必須一對一涵蓋 iOcean 十個海廢類別")
+
 
 class StrictModel(BaseModel):
     """允許文件型額外欄位、但禁止未知型別被任意轉成物件的共同基底。"""
@@ -66,6 +136,19 @@ class DomainConfig(StrictModel):
     formal_release_flow_domain_id: str | None = None
     formal_release_domain_status: str | None = None
 
+    def resolved_flow_domain_id(self, *, formal: bool = False) -> str:
+        """回傳目前執行模式應使用的 flow-domain 識別碼。
+
+        pilot 與開發模式固定使用現行 ``flow_domain_id``；formal 模式若已核定
+        ``formal_release_flow_domain_id``，則改用該正式上游產品 ID。集中在 domain 設定
+        提供此 resolver，可避免 receptor 初始條件、geometry、preflight 與未來 runtime
+        各自複製 A 區 expanded-domain 判斷。此方法只解析識別碼，不讀取 OCM 或驗證檔案。
+        """
+
+        if formal and self.formal_release_flow_domain_id:
+            return self.formal_release_flow_domain_id
+        return self.flow_domain_id
+
     @model_validator(mode="after")
     def validate_bbox(self) -> DomainConfig:
         """拒絕倒置 bbox 或位於 bbox 外的投影中心。"""
@@ -86,11 +169,24 @@ class StudySiteConfig(StrictModel):
     study_site_name_zh: str
     analysis_region_id: str
     flow_domain_id: str
+    formal_release_flow_domain_id: str | None = None
     anchor_lonlat: tuple[float, float] | None = None
     receptor_core_radius_m: float | None = None
     local_domain_baseline_radius_m: float | None = None
     local_domain_sensitivity_radii_m: list[float] = Field(default_factory=list)
     local_domain_policy: str | None = None
+
+    def resolved_flow_domain_id(self, *, formal: bool = False) -> str:
+        """回傳 study site 在目前執行模式應使用的 flow-domain ID。
+
+        `flow_domain_id` 保留 pilot／開發來源；正式 release 可另外保存與所屬 region
+        一致的 expanded 或正式來源 ID。這個欄位不改變站點的獨立情境身分，只讓 site-level
+        runtime、geometry 與 input inventory 能明確指向同一套 accepted forcing。
+        """
+
+        if formal and self.formal_release_flow_domain_id:
+            return self.formal_release_flow_domain_id
+        return self.flow_domain_id
 
 
 class ScenarioConfig(StrictModel):
@@ -106,20 +202,47 @@ class ScenarioConfig(StrictModel):
     receptor_manifest: str | None = None
     arrival_time_manifest: str | None = None
     material_manifest: str | None = None
+    receptor_arrival_initial_condition_manifest: str | None = None
     members_per_scenario: int | None = None
     master_seed: int | None = None
+    seed_policy: str | None = None
 
 
 class ExecutionConfig(StrictModel):
-    """reference/production backend、分片與 checkpoint 的正式工程欄位。"""
+    """CPU backend、分片、checkpoint cadence 與 forcing cache 的工程欄位。
+
+    ``checkpoint_interval_sweeps`` 的單位是完整批次 sweep，不是輸出觀測點；兩者在
+    adaptive time-step 下不等價。``active_chunk_size`` 控制一次散射／回寫的粒子數，
+    ``max_resident_forcing_months`` 控制單一 process 的月份 cache 上限。這些欄位只描述
+    執行策略，不改變 Scenario、粒子 seed 或物理方程。
+    """
 
     reference_backend: str
     production_backend: str
     shard_scenario_count: int | None = None
-    checkpoint_interval_output_steps: int | None = None
+    checkpoint_interval_sweeps: int | None = None
+    active_chunk_size: int | None = None
+    max_resident_forcing_months: int | None = 2
     fail_if_dirty_git: bool
     atomic_publish: bool
     input_change_policy: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_checkpoint_field(cls, value: Any) -> Any:
+        """拒絕舊的 output-step 欄位，避免 YAML extra=allow 造成靜默誤讀。
+
+        專案仍允許文件型額外設定欄位，但 ``checkpoint_interval_output_steps`` 曾被誤用
+        為 checkpoint cadence；若讓它落入 ``model_extra``，呼叫端可能以為設定已生效而
+        實際採用另一個預設值。因此只對這個已淘汰欄位建立局部 before gate，不改變全域
+        extra 欄位相容性。
+        """
+
+        if isinstance(value, dict) and "checkpoint_interval_output_steps" in value:
+            raise ValueError(
+                "execution.checkpoint_interval_output_steps 已淘汰，請改用 checkpoint_interval_sweeps"
+            )
+        return value
 
 
 class BoundaryConfig(StrictModel):
@@ -190,9 +313,18 @@ class ProjectConfig(StrictModel):
         if len(set(site_ids)) != len(site_ids):
             raise ValueError("study_site_id 必須唯一")
         domain_by_region = {item.analysis_region_id: item.flow_domain_id for item in self.domains}
+        formal_domain_by_region = {
+            item.analysis_region_id: item.formal_release_flow_domain_id for item in self.domains
+        }
         for site in self.study_sites:
             if domain_by_region.get(site.analysis_region_id) != site.flow_domain_id:
                 raise ValueError(f"{site.study_site_id} 的 region 與 flow domain 對應不一致")
+            formal_domain = formal_domain_by_region.get(site.analysis_region_id)
+            if (
+                site.formal_release_flow_domain_id is not None
+                and site.formal_release_flow_domain_id != formal_domain
+            ):
+                raise ValueError(f"{site.study_site_id} 的 formal flow domain 與 region 設定不一致")
         northeast = {site.study_site_id: site for site in self.study_sites if site.analysis_region_id == "A"}
         if set(northeast) != {"gongliao", "guishan"}:
             raise ValueError("A 區必須恰含獨立的 gongliao 與 guishan 站點")
@@ -209,6 +341,10 @@ class ProjectConfig(StrictModel):
             or counts.expected_receptor_count != 100
         ):
             raise ValueError("情境契約必須維持每站 10×20×50、A 區 20,000、全案 50,000")
+        _validate_non_rising_material_contract(
+            self.physics.get("settling"),
+            expected_count=counts.expected_material_count,
+        )
         if self.boundaries.other_site_local_domain_changes_study_site:
             raise ValueError("foreign-local crossing 不得改變 study_site_id")
         return self
@@ -243,20 +379,20 @@ class ProjectConfig(StrictModel):
         time_contract = self.inputs.time_axis_contract
         if time_contract.get("canonicalization_policy") != "sort_and_deduplicate_prefer_last":
             blockers.append("正式時間軸必須使用 sort_and_deduplicate_prefer_last")
-        if not (
-            self.inputs.ocm_gap_reconstruction_manifest
-            or self.inputs.ocm_gap_safe_arrival_manifest
-        ):
-            blockers.append(
-                "OCM approved reconstruction 或 gap-safe arrival/horizon manifest 尚未產出"
-            )
+        if not (self.inputs.ocm_gap_reconstruction_manifest or self.inputs.ocm_gap_safe_arrival_manifest):
+            blockers.append("OCM approved reconstruction 或 gap-safe arrival/horizon manifest 尚未產出")
         if not self.inputs.nww_full_hourly_analysis_manifest:
             blockers.append("NWW 完整逐時 analysis manifest 尚未產出")
         if self.scenarios.members_per_scenario is None or self.scenarios.members_per_scenario < 1:
             blockers.append("正式 members_per_scenario 尚未由收斂測試核定")
         if self.scenarios.master_seed is None or self.scenarios.master_seed < 0:
             blockers.append("正式 master_seed 尚未核定")
-        for field_name in ("receptor_manifest", "arrival_time_manifest", "material_manifest"):
+        for field_name in (
+            "receptor_manifest",
+            "arrival_time_manifest",
+            "material_manifest",
+            "receptor_arrival_initial_condition_manifest",
+        ):
             if not getattr(self.scenarios, field_name):
                 blockers.append(f"scenarios.{field_name} 尚未產出")
         for field_name in (
@@ -296,18 +432,40 @@ class ProjectConfig(StrictModel):
             blockers.append("正式 max_backtrack_days/maximum_step_count 尚未核定")
         if self.execution.shard_scenario_count is None or self.execution.shard_scenario_count < 1:
             blockers.append("正式 shard_scenario_count 尚未核定")
-        if (
-            self.execution.checkpoint_interval_output_steps is None
-            or self.execution.checkpoint_interval_output_steps < 1
-        ):
-            blockers.append("正式 checkpoint_interval_output_steps 尚未核定")
+        if self.execution.checkpoint_interval_sweeps is None or self.execution.checkpoint_interval_sweeps < 1:
+            blockers.append("正式 checkpoint_interval_sweeps 尚未核定")
         region_a = next(item for item in self.domains if item.analysis_region_id == "A")
         if not region_a.formal_release_flow_domain_id:
             blockers.append("A 區 expanded formal_release_flow_domain_id 尚未產出")
         if region_a.formal_release_flow_domain_id == region_a.flow_domain_id:
             blockers.append("A 區正式 domain 不得沿用僅供 pilot 的現行 v3 ID")
+        for site in self.study_sites:
+            if (
+                site.analysis_region_id == "A"
+                and site.formal_release_flow_domain_id is not None
+                and site.formal_release_flow_domain_id != region_a.formal_release_flow_domain_id
+            ):
+                blockers.append(f"{site.study_site_id} formal flow domain 未與 A 區 source 一致")
         if blockers:
             raise ValueError("正式發布設定未通過：" + "；".join(blockers))
+
+
+def resolve_flow_domain_id(config: ProjectConfig, analysis_region_id: str, *, formal: bool = False) -> str:
+    """依 analysis region 解析 pilot 或 formal runtime 應使用的 flow-domain ID。
+
+    設定中的 ``flow_domain_id`` 是開發／pilot 的現行產品識別碼；formal 且有核定值時，
+    ``formal_release_flow_domain_id`` 才是正式 OCM/NWW runtime 應讀取的識別碼。這個公開
+    resolver 只做 config lookup，不讀取 OCM、不產生 manifest，也不修改設定；後續 geometry、
+    dynamic initial-condition loader 與 runtime 應共用它，避免不同模組對 A 區 expanded
+    domain 做出不一致判斷。
+    """
+
+    if not isinstance(analysis_region_id, str) or not analysis_region_id.strip():
+        raise ValueError("analysis_region_id 不可為空白")
+    matches = [domain for domain in config.domains if domain.analysis_region_id == analysis_region_id]
+    if len(matches) != 1:
+        raise ValueError(f"config 必須恰有一個 analysis_region_id：{analysis_region_id}")
+    return matches[0].resolved_flow_domain_id(formal=formal)
 
 
 def load_config(path: str | Path, *, formal_release: bool = False) -> ProjectConfig:

@@ -69,7 +69,7 @@ def test_arrival_selector_produces_48_plus_2_unique_times() -> None:
         current_speed_mps=current,
         valid_forcing=np.ones(count, dtype=bool),
         backward_window_available=np.ones(count, dtype=bool),
-        design_version="design_baseline_v1",
+        design_version="design_baseline_v2_non_rising_oca_proxy",
     )
     assert len(records) == 50
     assert len({item.time_utc_ns for item in records}) == 50

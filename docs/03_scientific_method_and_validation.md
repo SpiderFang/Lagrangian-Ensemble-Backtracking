@@ -16,12 +16,12 @@ SCHISM 的 `z` 採正向向上，海面為 `z=eta`，海床近似為 `z=-depth`�
 V_det = (u_ocm + u_stokes, v_ocm + v_stokes, w_ocm + w_b)
 ```
 
-- `w_b < 0` 表示物理時間向前的沉降，`w_b > 0` 表示上浮。
+- `w_b < 0` 表示物理時間向前的沉降；`design_baseline_v2_non_rising_oca_proxy` 會在情境建表前拒絕 `w_b >= 0`。通用數值核心仍保留 signed velocity 的解析測試能力，但不得因此建立正式中性或上浮情境。
 - Stokes baseline 只有水平分量。
 - 完全沉沒 baseline 不含 windage。
 - 每一項都以 m/s 表示；任一單位 gate 未通過時不得正式運算。
 
-在沒有特定材質量測的前提下，十個 `w_b` 行為類別固定為 `[-0.100, -0.030, -0.010, -0.003, -0.001, 0, +0.001, +0.003, +0.010, +0.030] m/s`。這是跨三個數量級的敏感度設計，不是對十種具名廢棄物的量測校準；符號、ID 與限制詳見文件 08。
+在沒有特定單體物性量測的前提下，十個 `w_b` 固定為 `[-0.0001,-0.0002,-0.0005,-0.001,-0.002,-0.005,-0.010,-0.020,-0.050,-0.100] m/s`，一對一連結 iOcean 十個分類及代表材質／形狀條件。這是跨三個數量級的暫定敏感度設計，不是官方清除統計或文獻直接量得的類別平均值；保麗龍、竹木及中空容器等只在已轉為負浮力且完全沉沒時納入。完整 ID、適用條件、證據等級與限制詳見文件 08 及 `data/marine_litter_classification/README.md`。
 
 ## 2. OCM 四維速度
 
@@ -144,7 +144,25 @@ delta_X_diff = (sqrt(2Kx*|dt|) Nx,
                 sqrt(2Kz*|dt|) Nz)
 ```
 
-`Nx,Ny,Nz` 為互相獨立的標準常態。使用 `|dt|` 保持 backward ensemble 的變異為正；負 diffusivity 永遠非法。隨機增量在完整 RK4 advection step 前或後以已登錄 split 順序加入。
+`Nx,Ny,Nz` 為互相獨立的標準常態。使用 `|dt|` 保持 backward ensemble 的變異為正；負 diffusivity 永遠非法。Slice 2A 固定在完整 RK4 advection step 完成後，以已登錄 split 順序加入一次隨機增量。
+
+Slice 2A 將這項約定固定為 backward pseudo-time generator：每個步首建立一個不可變的
+`DiffusionSample`，內含對角 `K=[Kx,Ky,Kz]`、公尺制梯度向量
+`div(K)=[∂Kx/∂x,∂Ky/∂y,∂Kz/∂z]`（單位 m/s）及 `qc`。常數 K 的梯度為零；空間
+provider 只在步首取樣一次，且同一 sample 同時供 dt 選擇與位移計算，避免步長和實際
+擴散看到不同資料。
+
+本 baseline 的 operator split 為先完成完整 RK4 確定性平流，再一次加入
+
+```text
+delta_X_diff = div(K)*|dt| + (sqrt(2Kx*|dt|) Nx,
+                             sqrt(2Ky*|dt|) Ny,
+                             sqrt(2Kz*|dt|) Nz)
+```
+
+這裡的 `+div(K)|dt|` 是已登錄的 pseudo-time 漂移符號，不是嚴格 reversed-time SDE 的
+一般時間反轉定理；因此正、負 `dt` 在同一 RNG state 下有相同的擴散位移。非零 `qc`、
+負／非有限 K 或非有限梯度都在選步長與消耗 RNG 前停止，不能以零 K 代替缺值或失敗。
 
 ### 5.2 空變 Smagorinsky Kh
 
@@ -156,9 +174,73 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 
 - `Delta` 預定為局地 triangle area 的平方根；另以 1 km target spacing 作敏感度。
 - `Cs` 至少比較 0.10、0.15、0.20，並以物理上核定的 Kh floor/cap 防止零擴散與單點爆量；floor/cap 命中率必須輸出。
+- floor/cap 必須是有限非負值，且 `floor <= cap`；這是輸入驗證，不代表已完成空間梯度或 OCM runtime 驗收。
 - node 垂向取樣後，triangle 內的線性 shape functions 可直接得到 `du/dx` 等梯度；不得在經緯度上直接差分。
 
-對空變 K，與 Eulerian advection-diffusion 一致的 Itô SDE 含 diffusivity-gradient drift；[OceanParcels diffusion 方法](https://docs.oceanparcels.org/en/latest/examples/tutorial_diffusion.html)亦明載此項及 Milstein 修正。本專案必須先固定所求的 backward pseudo-time generator，再推導 gradient term 的符號，並通過解析 Fokker-Planck／well-mixed 障壁案例。未通過前，Smagorinsky 只能列為研究敏感度，常數 Kh 為驗證基線。
+對空變 K，與 Eulerian advection-diffusion 一致的 Itô SDE 含 diffusivity-gradient drift；[OceanParcels diffusion 方法](https://docs.oceanparcels.org/en/latest/examples/tutorial_diffusion.html)亦明載此項。本專案 Slice 2A 先固定上述 backward pseudo-time generator 與 `+div(K)` 符號，並以解析 Fokker-Planck／well-mixed 障壁案例驗證介面；這不等同於完成嚴格 time reversal。Slice 2B2 已將 OCM native P1 nodal gradient 核心接到三個 `smagorinsky_cs_*` runtime sensitivity cases，但其 diffusion facade 只讀 OCM、不讀 NWW；因三個 velocity path 仍含 finite-depth Stokes，整個 request 仍需 NWW。未通過正式空間驗證前，Smagorinsky 只能列為研究敏感度，常數 Kh 為驗證基線。
+
+Slice 2B1 已具備 OCM native mesh 的 P1 nodal Kh／grad(K) reference 取樣核心，Slice 2B2
+再由 runtime factory 建立 lazy OCM-only diffusion facade：速度梯度在
+DomainProjection 的公尺制座標計算，triangle candidate 先套 floor/cap，再以 incident
+triangle 面積加權得到連續 nodal Kh。此核心雖已接 runtime experiment case，仍尚未
+完成 well-mixed、PDE 障壁與真實 OCM pilot 驗證；因此 Smagorinsky cases 不升級為正式
+baseline，亦不代表已完成空間變擴散的科學驗收。`finite_depth_stokes` 是 formal baseline
+候選，但仍須通過 release、NWW full-hour 與其他正式 input gates。
+
+### 5.2.1 真資料 pilot 校準 evidence
+
+Slice 3A 的校準器只接收已通過 `validate_release_config(..., formal=False)` 的 immutable
+input release。它從 dynamic initial-condition manifest 取得每個 receptor×arrival pair 的
+實際 `z_m_positive_up`、arrival UTC、OCM 月份、source face 與 wet/dry provenance，先將
+receptor 經緯度投影至所屬 flow domain 的公尺座標，再由同一個 OCM-only lazy manager 取樣。
+`ForcingWindowManager` 的 NWW route 不會被建立或觸發；因此這個 evidence 用來校準
+OCM 擴散／步長候選，不是含 Stokes 的完整 velocity experiment。
+
+每個 pair 會保存 OCM velocity QC、有效速度與尺度、OCM sampled Kz，以及 Cs=0.10、0.15、
+0.20 各自的 particle Kh、raw current-triangle Kh、`grad(K)`、floor/cap 命中與 triangle
+provenance。非零 QC 的物理值以 nullable 欄位保留缺值，不能用零值代替；velocity 與
+Smagorinsky 若同時提供 month／triangle 卻不一致，建置直接 fail-closed。統計報告以有效
+樣本 pooled quantile 產生 constant Kz（有效 OCM sampled Kz 的 q50）、唯一的
+`constant_kh_m2ps`（Cs=0.15 有效 particle Kh 的 q50）、floor=0 與 cap（Cs=0.20 raw
+current-triangle Kh 的 q99.5）候選。pilot calibration schema `1.1.0` 的 diffusion
+time-limit 依 Brownian 各軸方差 `2*K_axis*dt` 分開計算：水平每列使用
+`(0.25*horizontal_scale_m)²/(2*constant_kh_m2ps)`，垂向每列使用
+`(0.25*vertical_scale_m)²/(2*constant_kz_m2ps)`。零分母或無效尺度只在對應軸記為
+unlimited，不進入該軸的有限 quantile；Kh 不可用不會使 Kz 軸一併失效，反之亦然。
+這禁止將最小水平／垂向尺度與另一軸的最大 K 任意配對。既有 schema `1.0.0` artifact
+仍以其明示的 `(0.25*min(horizontal_scale_m, vertical_scale_m))² /
+(2*max(constant_kh_m2ps, constant_kz_m2ps))` combined contract 驗證；它不能被靜默
+升級為 1.1.0 公式，builder 則固定寫 1.1.0。
+
+這些候選值僅代表指定 OCM、受體與 arrival sample 下的條件式工程測量；即使完整輸出
+5,000 筆 unique pairs 並標示 `completion_status=complete`，仍不得稱為正式 baseline、
+絕對來源機率或因果歸因。正式升級前至少要完成空間／時間收斂、well-mixed、PDE barrier、
+floor/cap sensitivity、known-source 與 runtime trajectory gates。
+
+### 5.2.2 calibration-bound pilot execution config
+
+Slice 3B2a 的 `pilot-config-create` 只把已驗證的 calibration evidence 綁定到可供
+pilot runtime 讀取的 generated YAML，不重新估計候選值，也不執行粒子軌跡。source
+設定先以 `load_config(..., formal_release=False)` 讀取，並由 release validator 確認
+四域／五站／50,000 情境設計與 immutable input binding 未被縮減；calibration 則必須是
+schema `1.1.0`、`server_real_data_pilot_candidate`、`completion_status=complete` 且仍為
+`candidate_pending_trajectory_convergence_and_scientific_validation`。舊 schema `1.0.0`
+可供 calibration 唯讀相容驗證，但不可作為此 builder 的候選來源。
+
+builder 將 report 的 constant Kh、constant Kz、Smagorinsky floor/cap 精確套用至既定
+physics 欄位，並把 `dt_min_seconds`、`dt_max_seconds`、輸出間隔、回溯期、步數上限、
+members、seed、scenario shard、checkpoint、active chunk 與 resident forcing month 一次
+保存。工程 scalar 必須是原生有限數值／整數；active chunk 的 `None` 只有在 CLI 明示
+`none` 時成立。回溯期同時受 gap-safe root 與每筆 arrival record 限制，`crossed_gap`、
+`missing_utc` 與 expected／supported step count 不得隱藏缺口。
+
+target root 的 `pilot_execution_binding` 以 schema `1.0.0` 保存 source semantic config
+hash（由 calibration report 的 `input_binding.config_hash` 驗證）、其他 payload hash、候選值
+與執行 snapshot，不保存檔案 path；release binding 與所有 runtime component reference 則依
+固定檔名相對 target parent 重建。狀態固定為
+`candidate_pending_dt_and_member_convergence`，因此此步驟不是參數科學驗收，後續仍需
+trajectory、時間步長與系集收斂、well-mixed、PDE barrier、floor/cap sensitivity 及
+known-source 驗證。
 
 ### 5.3 垂向 Kz
 
@@ -168,7 +250,7 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 
 ### 5.4 backward 結果的解釋
 
-忽略擴散時，逆時間積分是明確的終值 ODE。加入擴散後，time reversal 有多種不同統計定義，結果可能不同；[Gräwe et al. (2011)](https://doi.org/10.1016/j.jmarsys.2011.03.009)專門比較這些作法。因此基線輸出稱為「逆時間平流加正擴散的條件式來源足跡」，不宣稱是唯一的真實歷史路徑或 posterior source probability。
+忽略擴散時，逆時間積分是明確的終值 ODE。加入擴散後，time reversal 有多種不同統計定義，結果可能不同；[Gräwe et al. (2011)](https://doi.org/10.1016/j.jmarsys.2011.03.009)專門比較這些作法。因此本實作的 `+div(K)|dt|` 僅是明確登錄的 pseudo-time baseline；輸出稱為「逆時間平流加正擴散的條件式來源足跡」，不宣稱是嚴格 reversed-time SDE、唯一的真實歷史路徑或 posterior source probability。
 
 ## 6. 邊界與事件
 
@@ -178,8 +260,8 @@ Kh = (Cs*Delta)^2 * sqrt((du/dx-dv/dy)^2 + (dv/dx+du/dy)^2)
 | 另一站 local boundary | 穿越時寫 `other_site_local_domain_enter/exit` 後繼續；不得停止、改變 scenario 所屬或取代 own first-exit | 跨站穿越率、配對 UTC pathway/HDR overlap 與共享傳輸走廊診斷 |
 | A 區共用 flow-domain open boundary | 貢寮與龜山島使用同一 outer boundary；計算線段 first crossing，記錄 segment 與弧長後停止 | 擴域前後比較 exit time、HDR 與 ranking；避免用任意站界切斷水動力連通 |
 | 海岸／陸地 | 不允許跨越；記錄 coast contact 並停止 | reflect 作敏感度，不混入基準 |
-| 海面 | neutral／sinking 類擴散越界時反射；rising 類到達海面以 `surface_regime_exit` 停止 | 完全沉沒 baseline 不加 windage，故不得在海面繼續當表面漂流 |
-| 海床 | 記錄 first contact；suspended 反射，sinking／near-bed 首次接觸即 deposit 並停止 | 無再懸浮參數時不宣稱完整底床交換 |
+| 海面 | 十個 sinking 代理因亂流擴散越界時反射並記錄 contact | 不代表物件具有向上的物性速度；正式設定不接受 rising 類別，完全沉沒 baseline 亦不加 windage |
+| 海床 | 十個 sinking／near-bed 代理首次接觸即 deposit 並停止 | 無再懸浮參數時不宣稱完整底床交換 |
 | forcing start | 到 2024-01-01 或實際最早可用時次停止 | 不能環回或外插 |
 | data gap | 已知 OCM 缺時須在 run 前由 approved reconstruction 或 gap-safe arrival window 消化；正常 baseline 不在已知缺口停止 | manifest 外缺檔、checksum/I/O 損毀、局部重建失敗或空間必要 forcing 無效時才停止；no-Stokes 是另一個 physics case |
 | max age | 到核定最大回溯期停止 | 與 exit 分開統計 |
@@ -210,6 +292,62 @@ N_{\mathrm{base,total}}=5\times N_{\mathrm{base,site}}=50{,}000.
 - 2 個補充：在 forcing 完整前提下，分別選取 local-domain 高波與強流案例。
 
 分層與 deterministic tie-break 已定案；確切 UTC、潮位分類門檻與事件值由 2024-2025 SERVER 資料衍生，不再等待人工任選。貢寮／龜山島在 coverage 允許時使用配對 UTC，但仍各自通過 50 條 coverage。潮位導數相位只是 tide-phase proxy，不宣稱為現場三維最大漲／退潮流；若未來取得真實調查日期，另建立 observation-conditioned experiment，不改寫 baseline。
+
+### 7.1 到達時刻的動態垂向初始條件
+
+100 筆 `Receptor` 是水平位置與 `vertical_id` 的模板，模板中的 `z_m_positive_up` 只作
+候選／代表值；它不能代表同一受體在 50 個 arrival UTC 的實際 z。正式的三維初始條件
+由每個 receptor×arrival pair 的 OCM `eta`、`zcor`、`wetdry_elem` 與來源 face 摘要提供，
+五站 100 個 receptor 與 250 個 arrival-time 恰形成 5,000 個 pair records。十種 material
+共用這筆 pair 條件，所以物性展開後仍是 50,000 個基礎 scenarios，而不是 50,000 筆
+重複的初始深度資料。
+
+pair manifest 固定採 z positive-up 與公尺制，並在到達 UTC 驗證：
+
+```text
+eta > bed
+water_column_height_m = eta - bed
+bed <= z <= eta
+height_above_bed_m = z - bed
+bed <= zcor_lower < zcor_upper <= eta
+zcor_lower <= z <= zcor_upper
+vertical_bracket_alpha = (z - zcor_lower) / (zcor_upper - zcor_lower)
+```
+
+`wetdry_elem_value=0` 才是可執行的濕元素，語意固定為
+`schism_wetdry_elem_0_wet_1_dry`；本 slice 只接受 `ocm_time_origin=observed`，不能把
+未核准重建資料混入正式初始條件。所有 pair 必須與模板逐欄核對站點、region、UTC ns、
+vertical、來源月份與索引，flow domain 由 config 的單一 resolver 選取（formal 優先使用
+該 region 的 `formal_release_flow_domain_id`，pilot 使用 base ID）。數值等式可容許固定
+`1e-8 m`／無因次序列化尾差，但實際水柱與 zcor bracket 的物理範圍不可放寬。
+
+目前 Phase 3A2 只提供 strict JSON loader、immutable pair records、唯讀 pair mapping 與
+raw/canonical hash；不讀取 OCM、不產生這份 manifest，也尚未把 actual z 接入粒子 runtime
+或宣稱完成 SERVER 執行。
+
+### 7.2 工程 pilot scenario selector
+
+正式 scenario coverage 仍固定為每站 10,000、A 區 20,000、全案 50,000。工程 pilot 可在
+完整且已驗證的 scenarios 與 receptors 上執行：
+
+```bash
+uv run lbt run-create \
+  --config "$PILOT_CONFIG" \
+  --input-inventory "$PILOT_INVENTORY" \
+  --destination "$LBT_SCRATCH_ROOT/pilots" \
+  --run-id pilot-stratified-n1 \
+  --run-kind pilot \
+  --experiment-case no_stokes \
+  --pilot-scenarios-per-stratum 1
+```
+
+selector 以每個 `(study_site_id, receptor.vertical_id)` 為 exact stratum，使用版本化
+SHA-256 ranking policy 選取每層 N 筆；在目前五站、四個垂向層位的完整資料中，N=1 預期
+為 `5×4=20` 筆。20 是工程 sanity／benchmark 子集，不是正式結果，也不改寫 50,000
+情境設計。immutable plan 保存 source/selected count、order-independent scenario ID
+hash 與 strata binding；`run-shard` 的 static loader 會以目前完整 manifests 重算 selector
+後才接受 immutable scenario table，不能只信任 plan 中已發布的列。formal run 禁止此參數，
+永遠使用完整 50,000 情境。
 
 若同一情境包含隨機擴散、受體位置／深度微擾、forcing ensemble 或其他隨機項，需以不同 seed 產生獨立實現。第 `s` 個情境的 member 數記為 `M_s`，故單一 experiment case 的總軌跡數為：
 
@@ -250,6 +388,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | canonical time | 24 個月份 stable sort/prefer-last 結果、72 個重複來源選擇、420 個缺時與每一 origin label 均可由 manifest 重建 |
 | OCM gap reconstruction | 依實際 1/23/24/25/49-step block cross-validation；Eulerian 與 Lagrangian 指標同時通過文件 10 預登錄門檻，或明確降級為 gap-safe baseline |
 | NWW full-hour rebuild | 四域皆由完整 native 17,544 UTC 重採樣；時間唯一、逐時連續、方向圓形內插且涵蓋所有 observed/reconstructed OCM UTC |
+| receptor×arrival 初始條件 | 100 個 receptor template、250 個 arrival-time 與 5,000 個 pair records 的完整 coverage；pair 唯一、同站 cross-reference、eta/bed/z 範圍、zcor bracket、wetdry 與 observed provenance 全通過；10 種 material 不重複展開 pair rows |
 | CRS round-trip | WGS84→metric→WGS84 誤差低於預先登錄門檻，domain corner/center 均測 |
 | triangle/quad | 面積、方向、對角線、triangle-to-face 與 barycentric sum 通過 |
 | mask/wetdry | 合成乾濕 face、海岸 triangle 與真實 snapshot 人工圖面抽查一致 |
@@ -262,7 +401,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | constant flow | forward/backward 位移與解析解一致 |
 | solid rotation | 閉合軌跡、半徑誤差與 dt 收斂符合 RK4 預期階數 |
 | linear shear | 路徑、triangle gradient 與 Smagorinsky 值符合解析解 |
-| settling/rising | `z(t)=z0+w_b t`，backward 時方向自然反轉且無雙重取負 |
+| signed vertical drift | 通用核心以 `z(t)=z0+w_b t` 驗證正負號與 backward 無雙重取負；正式 material manifest 另驗證十筆 `w_b < 0` |
 | Stokes dispersion | deep/shallow 初值均收斂，代回 residual 達門檻 |
 | Stokes profile | finite-depth 深水極限回復式 (7)，四個 cardinal DP 方向正確 |
 | Brownian statistics | mean 在信賴區間含 0，variance 在統計容許範圍含 `2K t` |
@@ -288,7 +427,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 
 - 「在指定 OCM/NWW3 forcing、受體、到達時間、物性與擴散假設下的條件式潛在來源足跡」。
 - 「相對較常出現的邊界通量方向或傳輸走廊」。
-- 「對 Stokes、浮沉、擴散、邊界與情境設計的敏感度」。
+- 「對 Stokes、十種材質／形狀沉降代理、擴散、邊界與情境設計的敏感度」。
 
 除非另有觀測、先驗、likelihood 與驗證，不可使用：
 

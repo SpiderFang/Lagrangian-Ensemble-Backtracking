@@ -56,8 +56,8 @@
 
 ### F02 方法、情境矩陣與計數圖
 
-- 概念圖顯示 OCM current、NWW3-derived Stokes、浮沉速度、Kh/Kz、反向時間、海面／海床／海岸／開放邊界事件。
-- 情境方塊明列每站 `10 behaviors × 20 receptors × 50 arrival times = 10,000 base scenarios`、A 區兩站 `20,000`，以及五站合計 `50,000`。
+- 概念圖顯示 OCM current、NWW3-derived Stokes、嚴格負值沉降速度、Kh/Kz、反向時間、海面／海床／海岸／開放邊界事件。
+- 情境方塊明列每站 `10 non-rising material/shape proxies × 20 receptors × 50 arrival times = 10,000 base scenarios`、A 區兩站 `20,000`，以及五站合計 `50,000`。
 - 另列 `M` 為每情境隨機 members；單一 experiment case 的總軌跡數為 `sum(M_s)`，一致 M 時為每站 `10,000×M`、A 區 `20,000×M`、全案 `50,000×M`。
 - no-Stokes、domain expansion 等以獨立 experiment cases 顯示，不混入基礎情境數。
 
@@ -66,7 +66,7 @@
 五個研究站點各選少量預先登錄的代表案例；貢寮與龜山島不得只以 A 區 pooled path 取代。每個案例至少使用兩個同步 panel：
 
 1. plan-view 地圖：軌跡按 backward age 著色，受體以星號、自站 local first exit、他站 local-domain enter/exit 與 A 區 outer exit 以不同符號表示；他站穿越只作水動力連通診斷，不使用終止符號。背景含水深與主要流向。
-2. depth–time 或沿軌跡距離–深度剖面：顯示海面、海床、粒子 `z`、浮沉類別、first bed contact 與有效水深。
+2. depth–time 或沿軌跡距離–深度剖面：顯示海面、海床、粒子 `z`、iOcean 類別、代表材質／形狀、沉降格點、first bed contact 與有效水深。
 
 可附 3D 透視圖作補充，但不能作唯一三維成果，因透視遮蔽與視角會妨礙定量比較。全體軌跡只畫經固定 seed 或分位數規則抽出的代表 subset，圖說標示抽樣規則與 `n/N`。
 
@@ -108,12 +108,18 @@
 - 每 panel 顯示來源足跡或來源段相對權重，並標示實際 arrival-time 數、members 與 forcing coverage。
 - 每站 50 個到達時間的個別結果保留在 supplement／scenario browser；正文以站點分層摘要與代表個案呈現。
 
-### F09 物性、垂向行為、停留與底部接觸
+### F09 材質／形狀代理、沉降、停留與底部接觸
 
-- 10 種浮沉速度以有物理順序的 small multiples 或「速度 × 指標」曲線呈現，不用十種任意類別色造成辨識負荷。
-- 對沉降／近底類別並列 first bed-contact density、repeated contact 或 deposited fraction；對上浮／懸浮類別並列 surface-contact 與 vertical occupancy。
+- 10 種非上浮材質／形狀代理按沉降速度排序，以 small multiples 或「速度 × 指標」曲線呈現；圖例同時保留 iOcean 類別與代理形狀，不能只顯示匿名速度。
+- 正文主要 panel 固定先呈現 `material_id=oca_fishinggear_open_mesh_bundle`、`vertical_id=near_bed`；其餘九類與三個較上層受體仍以相同尺度完整保留於比較／補充產品。這是研究注意力排序，不是將漁具數量設定為先驗權重。
+- 各類至少並列首次海床接觸 member count/fraction 與 deposited member count/fraction；`BED_CONTACT` 的多次事件以 member 去重，基線不要求 repeated-contact 欄位。海面接觸只表示亂流擴散造成的反射事件，不得解讀為材料具有上浮速度。
 - 深度分布使用 depth–time heatmap 或 quantile ribbon，明示 z positive-up、深度／HAB 基準及水深變化。
 - 不具再懸浮參數時，圖名只能使用 contact/deposition-under-assumed-policy，不能宣稱完整底床沉積動力。
+
+材質計數由 `report_material_statistics.py` 的一次串流 reducer 產生。每一列以
+`study_site_id × material_id` 為 join key，保存有效 member 分母、首次接觸與沉積 raw count
+及比例；`DATA_GAP`／`NUMERICAL_FAILURE` 不進有效分母，零分母比例保留為不可估計狀態。
+此產品不把簡報中的「最大宗」轉成出現率，也不模擬覆網掛礁、海床拖曳、掩埋或再懸浮。
 
 ### F10 停止結果、資料品質與失敗圖
 

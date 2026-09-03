@@ -9,6 +9,7 @@ description = "CWA OCM/NWW3 三維 Lagrangian 系集逆向溯源與條件式來�
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "matplotlib>=3.10",
     "numba>=0.61",
     "numpy>=2.0",
     "pyarrow>=18",
@@ -23,8 +24,15 @@ dependencies = [
 lbt = "lagrangian_backtracking.cli:main"
 lbt-config-check = "lagrangian_backtracking.cli:config_check_main"
 lbt-preflight = "lagrangian_backtracking.cli:preflight_main"
+lbt-inputs-build = "lagrangian_backtracking.cli:inputs_build_main"
+lbt-inputs-validate = "lagrangian_backtracking.cli:inputs_validate_main"
+lbt-release-config-create = "lagrangian_backtracking.cli:release_config_create_main"
+lbt-release-config-validate = "lagrangian_backtracking.cli:release_config_validate_main"
 lbt-synthetic-smoke = "lagrangian_backtracking.cli:synthetic_smoke_main"
 lbt-validate-shard = "lagrangian_backtracking.cli:validate_shard_main"
+lbt-code-provenance = "lagrangian_backtracking.cli:code_provenance_main"
+lbt-validate-run = "lagrangian_backtracking.cli:validate_run_main"
+lbt-benchmark-report = "lagrangian_backtracking.cli:benchmark_report_main"
 
 [dependency-groups]
 dev = [

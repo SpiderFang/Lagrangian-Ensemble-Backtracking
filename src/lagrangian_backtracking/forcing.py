@@ -6,6 +6,9 @@
 海流依序在節點垂向、三角形平面與時間上內插；若三個支撐節點任一處無法夾住指定深度、
 網格面乾涸或時間間隔過大，會回傳明確的品質檢查旗標。波浪只有在周圍四個格點及前後
 兩個時刻的資料都有效時，才做空間與時間內插。
+Smagorinsky reference 則只使用 OCM native current，在公尺制 triangle shape function
+上建立先套 floor/cap 的 P1 nodal Kh 與 grad(K)；它不讀取 Stokes、settling 或空變 Kz，
+也尚未代表正式 runtime baseline。
 """
 
 from __future__ import annotations
@@ -18,6 +21,12 @@ from pathlib import Path
 import numpy as np
 
 from .accelerated import interpolate_ocm_support_numba
+from .diffusion import (
+    DiffusionCoefficients,
+    DiffusionSample,
+    SmagorinskySettings,
+    smagorinsky_horizontal_diffusivity,
+)
 from .geometry import DomainProjection
 from .mesh import MeshLocation, NativeMesh
 from .models import SampleQC, VelocitySample
@@ -64,10 +73,76 @@ class WaveSample:
         return self.qc == SampleQC.OK
 
 
+@dataclass(frozen=True, slots=True)
+class _SmagorinskyTimeSlice:
+    """一個 OCM time slice 的 P1 nodal Kh 與 gradient 中間結果。
+
+    ``nodal_kh_m2ps`` 只保存目前 particle triangle 三個節點的連續 nodal Kh；其值已
+    由所有 valid incident triangle 的面積加權 candidate 組成，並非直接保存某一面
+    的 piecewise-constant Kh。其餘欄位用於時間內插與 JSON-safe diagnostics，最後才由
+    ``sample_smagorinsky_diffusion`` 組成公開的 ``DiffusionSample``。
+    """
+
+    nodal_kh_m2ps: tuple[float, float, float]
+    particle_kh_m2ps: float
+    gradient_x_mps: float
+    gradient_y_mps: float
+    raw_current_triangle_kh_m2ps: float
+    floor_hit: bool
+    cap_hit: bool
+    valid_incident_triangle_count: int
+    excluded_incident_triangle_count: int
+
+
+def _smagorinsky_method_name() -> str:
+    """回傳固定 method token，讓 diagnostics 可在 JSON 與報告中辨識演算法版本。"""
+
+    return "smagorinsky_native_mesh_p1_nodal"
+
+
+def _invalid_smagorinsky_sample(
+    settings: SmagorinskySettings,
+    qc: SampleQC,
+    *,
+    triangle_id: int | None,
+    valid_incident_triangle_count: int = 0,
+    excluded_incident_triangle_count: int = 0,
+) -> DiffusionSample:
+    """建立有明確非零 QC 的 Smagorinsky 失敗樣本，不以零 K 偽裝有效結果。
+
+    當位置、時間、乾面或固定 z 垂向支撐失效時，水平 K 與梯度沒有科學值；此 helper
+    仍保存方法、設定、triangle ID 與支撐計數，讓上層可稽核失敗來源。``None`` 是
+    JSON-safe 缺值，與有效的數值零明確區分；Kz 只保留設定值作為型別欄位，不會因
+    ``qc`` 非零而進入粒子積分。
+    """
+
+    return DiffusionSample(
+        coefficients=DiffusionCoefficients(0.0, 0.0, settings.constant_kz_m2ps),
+        diffusivity_divergence_mps=(0.0, 0.0, 0.0),
+        qc=qc,
+        diagnostics={
+            "method": _smagorinsky_method_name(),
+            "coefficient_cs": settings.coefficient_cs,
+            "kh_m2ps": None,
+            "d_kh_dx_mps": None,
+            "d_kh_dy_mps": None,
+            "raw_current_triangle_kh_m2ps": None,
+            "floor_hit": False,
+            "cap_hit": False,
+            "valid_incident_triangle_count": int(valid_incident_triangle_count),
+            "excluded_incident_triangle_count": int(excluded_incident_triangle_count),
+            "triangle_id": triangle_id,
+        },
+    )
+
+
 class OCMNativeMonth:
     """讀取一個月份 OCM 原始網格的速度與擴散資料。
 
     資料包含時間、水平位置與垂向深度三個方向；網格拓撲沿用前處理結果，不自行重建。
+    ``sample_smagorinsky_diffusion`` 是同一月份物理資料上的 NumPy reference 方法，
+    只用 native current 算空間 Kh；一般 ``sample`` 的 OCM vertical velocity 與
+    diffusivity 取樣契約不會被它改寫。
     """
 
     def __init__(
@@ -176,6 +251,381 @@ class OCMNativeMonth:
         alpha = (z_m - float(physical_z[lower])) / span
         return values[lower] + alpha * (values[upper] - values[lower]), span
 
+    def _vertical_horizontal_velocity_node_sample(
+        self, *, time_index: int, node_index: int, z_m: float
+    ) -> tuple[np.ndarray, float] | None:
+        """只以 OCM 水平 current 在固定 z 取樣，供 Smagorinsky 梯度使用。
+
+        這裡刻意不讀 ``vertical_velocity`` 或 OCM ``diffusivity``：Slice 2B1 的 Kh
+        定義只使用 native current，Kz 則由 ``SmagorinskySettings.constant_kz_m2ps``
+        提供。仍沿用與一般速度取樣相同的上下夾層政策，故海面以上、海床以下、zcor
+        缺值或 hvel 缺值都回傳 ``None``，不做單側最近層外插。回傳的兩個水平分量單位
+        為 m/s，第二項是實際夾層深度差（m），只供資料品質與垂向支撐診斷。
+        """
+
+        if not np.isfinite(z_m):
+            return None
+        physical_z = np.asarray(self.zcor[time_index, node_index], dtype=np.float64)
+        horizontal_velocity = np.asarray(
+            self.hvel[time_index, node_index, :, :2], dtype=np.float64
+        )
+        usable = np.isfinite(physical_z) & np.all(np.isfinite(horizontal_velocity), axis=1)
+        below = np.flatnonzero(usable & (physical_z <= z_m))
+        above = np.flatnonzero(usable & (physical_z >= z_m))
+        if below.size == 0 or above.size == 0:
+            return None
+        lower = int(below[np.argmax(physical_z[below])])
+        upper = int(above[np.argmin(physical_z[above])])
+        span = float(physical_z[upper] - physical_z[lower])
+        if abs(span) <= np.finfo(np.float64).eps * 16.0:
+            sampled = horizontal_velocity[lower]
+        else:
+            alpha = (z_m - float(physical_z[lower])) / span
+            sampled = horizontal_velocity[lower] + alpha * (
+                horizontal_velocity[upper] - horizontal_velocity[lower]
+            )
+        if not np.all(np.isfinite(sampled)):
+            return None
+        return np.asarray(sampled, dtype=np.float64), span
+
+    def _smagorinsky_time_slice(
+        self,
+        location: MeshLocation,
+        *,
+        time_index: int,
+        z_m: float,
+        settings: SmagorinskySettings,
+    ) -> tuple[_SmagorinskyTimeSlice | None, SampleQC, int, int]:
+        """計算一個時間片的 incident-support area weighting 與 P1 Kh gradient。
+
+        先以目前 triangle 三個節點的 adjacency 建立 deterministic 支撐集合，再在同一
+        ``time_index`` 內用 ``node_cache`` 保存每個 unique node 的固定 z 水平 current。
+        每個 incident triangle 的速度梯度由 native mesh 的 shape functions 計算；該面
+        的 raw Kh 先套 floor/cap，才以 triangle area 做 nodal Kh 加權。乾面、固定 z
+        無法夾層的 incident triangle 只增加 excluded count；但目前 particle triangle
+        無 valid candidate，或目前任一節點沒有 valid support，便回傳相應 QC，禁止零值
+        或最近值補洞。
+        """
+
+        triangle_id = location.triangle_id
+        incident_triangle_ids = sorted(
+            {
+                incident_id
+                for node in location.node_indices
+                for incident_id in self.mesh.incident_triangles(node)
+            }
+        )
+        node_cache: dict[int, tuple[np.ndarray, float] | None] = {}
+        bounded_by_triangle: dict[int, float] = {}
+        raw_by_triangle: dict[int, float] = {}
+        floor_hit_by_triangle: dict[int, bool] = {}
+        cap_hit_by_triangle: dict[int, bool] = {}
+        excluded_count = 0
+
+        for incident_id in incident_triangle_ids:
+            face = int(self.mesh.triangle_face_local[incident_id])
+            wetdry = float(self.wetdry_elem[time_index, face])
+            if not np.isfinite(wetdry) or not np.isclose(wetdry, self.wet_value, atol=0.1):
+                excluded_count += 1
+                continue
+            node_values: list[np.ndarray] = []
+            unsupported = False
+            for node_value in self.mesh.triangle_nodes[incident_id]:
+                node = int(node_value)
+                if node not in node_cache:
+                    node_cache[node] = self._vertical_horizontal_velocity_node_sample(
+                        time_index=time_index,
+                        node_index=node,
+                        z_m=z_m,
+                    )
+                sampled = node_cache[node]
+                if sampled is None:
+                    unsupported = True
+                    break
+                node_values.append(sampled[0])
+            if unsupported:
+                excluded_count += 1
+                continue
+            horizontal_values = np.asarray(node_values, dtype=np.float64)
+            try:
+                du_dx, du_dy = self.mesh.triangle_linear_gradient(
+                    incident_id, horizontal_values[:, 0]
+                )
+                dv_dx, dv_dy = self.mesh.triangle_linear_gradient(
+                    incident_id, horizontal_values[:, 1]
+                )
+                raw_kh, _, _ = smagorinsky_horizontal_diffusivity(
+                    du_dx_per_s=du_dx,
+                    du_dy_per_s=du_dy,
+                    dv_dx_per_s=dv_dx,
+                    dv_dy_per_s=dv_dy,
+                    triangle_area_m2=float(self.mesh.triangle_area_m2[incident_id]),
+                    coefficient_cs=settings.coefficient_cs,
+                )
+                bounded_kh, floor_hit, cap_hit = smagorinsky_horizontal_diffusivity(
+                    du_dx_per_s=du_dx,
+                    du_dy_per_s=du_dy,
+                    dv_dx_per_s=dv_dx,
+                    dv_dy_per_s=dv_dy,
+                    triangle_area_m2=float(self.mesh.triangle_area_m2[incident_id]),
+                    coefficient_cs=settings.coefficient_cs,
+                    floor_m2ps=settings.floor_m2ps,
+                    cap_m2ps=settings.cap_m2ps,
+                )
+            except (TypeError, ValueError, FloatingPointError) as error:
+                # 靜態 mesh 與有限 node current 已通過前置閘門；若公式仍不能產生有限
+                # Kh，這是數值失敗而非可安全排除的乾面，必須 fail closed。
+                del error
+                return (
+                    None,
+                    SampleQC.NUMERICAL_FAILURE,
+                    len(bounded_by_triangle),
+                    len(incident_triangle_ids) - len(bounded_by_triangle),
+                )
+            bounded_by_triangle[incident_id] = float(bounded_kh)
+            raw_by_triangle[incident_id] = float(raw_kh)
+            floor_hit_by_triangle[incident_id] = bool(floor_hit)
+            cap_hit_by_triangle[incident_id] = bool(cap_hit)
+
+        valid_count = len(bounded_by_triangle)
+        if triangle_id not in bounded_by_triangle:
+            current_face = int(self.mesh.triangle_face_local[triangle_id])
+            current_wetdry = float(self.wetdry_elem[time_index, current_face])
+            if not np.isfinite(current_wetdry) or not np.isclose(
+                current_wetdry, self.wet_value, atol=0.1
+            ):
+                qc = SampleQC.DRY_FACE
+            else:
+                qc = SampleQC.VERTICAL_UNSUPPORTED
+            return None, qc, valid_count, len(incident_triangle_ids) - valid_count
+
+        nodal_kh: list[float] = []
+        for node_value in location.node_indices:
+            node = int(node_value)
+            support_ids = [
+                incident_id
+                for incident_id in self.mesh.incident_triangles(node)
+                if incident_id in bounded_by_triangle
+            ]
+            if not support_ids:
+                return (
+                    None,
+                    SampleQC.VERTICAL_UNSUPPORTED,
+                    valid_count,
+                    len(incident_triangle_ids) - valid_count,
+                )
+            areas = np.asarray(
+                [self.mesh.triangle_area_m2[incident_id] for incident_id in support_ids],
+                dtype=np.float64,
+            )
+            area_total = float(np.sum(areas))
+            if not np.all(np.isfinite(areas)) or area_total <= 0:
+                return (
+                    None,
+                    SampleQC.NUMERICAL_FAILURE,
+                    valid_count,
+                    len(incident_triangle_ids) - valid_count,
+                )
+            weighted = float(
+                np.dot(
+                    areas,
+                    np.asarray([bounded_by_triangle[incident_id] for incident_id in support_ids]),
+                )
+                / area_total
+            )
+            if not np.isfinite(weighted) or weighted < 0:
+                return (
+                    None,
+                    SampleQC.NUMERICAL_FAILURE,
+                    valid_count,
+                    len(incident_triangle_ids) - valid_count,
+                )
+            nodal_kh.append(weighted)
+
+        nodal_values = (nodal_kh[0], nodal_kh[1], nodal_kh[2])
+        weights = np.asarray(location.barycentric_weights, dtype=np.float64)
+        if weights.shape != (3,) or not np.all(np.isfinite(weights)):
+            return (
+                None,
+                SampleQC.NUMERICAL_FAILURE,
+                valid_count,
+                len(incident_triangle_ids) - valid_count,
+            )
+        particle_kh = float(weights @ np.asarray(nodal_values, dtype=np.float64))
+        try:
+            gradient_x, gradient_y = self.mesh.triangle_linear_gradient(triangle_id, nodal_values)
+        except (TypeError, ValueError, IndexError):
+            return (
+                None,
+                SampleQC.NUMERICAL_FAILURE,
+                valid_count,
+                len(incident_triangle_ids) - valid_count,
+            )
+        if not np.isfinite(particle_kh) or particle_kh < 0:
+            return (
+                None,
+                SampleQC.NUMERICAL_FAILURE,
+                valid_count,
+                len(incident_triangle_ids) - valid_count,
+            )
+        return (
+            _SmagorinskyTimeSlice(
+                nodal_kh_m2ps=nodal_values,
+                particle_kh_m2ps=particle_kh,
+                gradient_x_mps=float(gradient_x),
+                gradient_y_mps=float(gradient_y),
+                raw_current_triangle_kh_m2ps=float(raw_by_triangle[triangle_id]),
+                floor_hit=floor_hit_by_triangle[triangle_id],
+                cap_hit=cap_hit_by_triangle[triangle_id],
+                valid_incident_triangle_count=valid_count,
+                excluded_incident_triangle_count=len(incident_triangle_ids) - valid_count,
+            ),
+            SampleQC.OK,
+            valid_count,
+            len(incident_triangle_ids) - valid_count,
+        )
+
+    def sample_smagorinsky_diffusion(
+        self,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+        time_utc_ns: int,
+        settings: SmagorinskySettings,
+        *,
+        triangle_hint: int | None = None,
+    ) -> DiffusionSample:
+        """以 OCM native current 取樣 P1 nodal Smagorinsky 空間變擴散。
+
+        取樣流程固定為：先以既有 ``mesh.locate`` 取得 particle triangle，再用既有
+        ``_time_bracket`` 找 UTC 前後時間片；每個時間片先在三個節點固定 ``z_m`` 做
+        水平 current 垂向內插，接著對每個 incident triangle 以 native 公尺座標的線性
+        shape function 計算速度梯度與 equation 10 的 triangle Kh。每個 candidate 先套
+        ``settings.floor_m2ps``／``cap_m2ps``，再按 triangle area 對目前三個節點加權，
+        形成連續 P1 nodal Kh；最後以 particle triangle 的 barycentric weights 內插
+        particle Kh，並由同三個 nodal 值計算公尺制 ``(dKh/dx,dKh/dy)``。
+
+        before／after 時間片各自完成上述非線性 Kh 計算後，再對 particle Kh、梯度與
+        raw current-triangle Kh 線性內插；Kx=Ky 為內插 Kh，Kz 固定取設定值，垂向梯度
+        暫設為零。每個時間片內 unique node 的固定 z 取樣由 helper cache，避免同一
+        node column 因多個 incident triangle 重複讀取。乾面或 z unsupported 的非目前
+        incident triangle 只排除並記數；目前 triangle 在任一必要時間片失效時回傳非零
+        QC，不做最近值、跨 gap 或域外外插。``use_numba_kernel`` 不參與此方法，因為
+        Slice 2B1 的 Smagorinsky reference algorithm 必須在 NumPy 與 Numba velocity
+        switch 下得到相同數值；這不代表已具備正式 runtime 或通過 well-mixed/PDE 驗證。
+        """
+
+        if not isinstance(settings, SmagorinskySettings):
+            raise TypeError("settings 必須是 SmagorinskySettings")
+        settings.validate()
+        location = self.mesh.locate(x_m, y_m, triangle_hint=triangle_hint)
+        if location is None:
+            return _invalid_smagorinsky_sample(
+                settings,
+                SampleQC.OUTSIDE_HORIZONTAL_DOMAIN,
+                triangle_id=None,
+            )
+        before, after, alpha, time_qc = _time_bracket(
+            self.time_utc_ns,
+            time_utc_ns,
+            maximum_gap_ns=self.maximum_time_gap_ns,
+        )
+        if time_qc != SampleQC.OK:
+            return _invalid_smagorinsky_sample(
+                settings,
+                time_qc,
+                triangle_id=location.triangle_id,
+            )
+
+        first, first_qc, first_valid_count, first_excluded_count = self._smagorinsky_time_slice(
+            location,
+            time_index=before,
+            z_m=z_m,
+            settings=settings,
+        )
+        if first is None or first_qc != SampleQC.OK:
+            return _invalid_smagorinsky_sample(
+                settings,
+                first_qc,
+                triangle_id=location.triangle_id,
+                valid_incident_triangle_count=first_valid_count,
+                excluded_incident_triangle_count=first_excluded_count,
+            )
+        if after == before:
+            second = first
+            second_qc = SampleQC.OK
+            second_valid_count = first_valid_count
+            second_excluded_count = first_excluded_count
+        else:
+            second, second_qc, second_valid_count, second_excluded_count = (
+                self._smagorinsky_time_slice(
+                    location,
+                    time_index=after,
+                    z_m=z_m,
+                    settings=settings,
+                )
+            )
+        if second is None or second_qc != SampleQC.OK:
+            return _invalid_smagorinsky_sample(
+                settings,
+                first_qc | second_qc,
+                triangle_id=location.triangle_id,
+                valid_incident_triangle_count=second_valid_count,
+                excluded_incident_triangle_count=second_excluded_count,
+            )
+
+        interpolation = float(alpha)
+        first_nodal = np.asarray(first.nodal_kh_m2ps, dtype=np.float64)
+        second_nodal = np.asarray(second.nodal_kh_m2ps, dtype=np.float64)
+        nodal_kh = first_nodal + interpolation * (second_nodal - first_nodal)
+        weights = np.asarray(location.barycentric_weights, dtype=np.float64)
+        particle_kh = float(weights @ nodal_kh)
+        gradient_x, gradient_y = self.mesh.triangle_linear_gradient(
+            location.triangle_id,
+            nodal_kh,
+        )
+        raw_current_triangle_kh = first.raw_current_triangle_kh_m2ps + interpolation * (
+            second.raw_current_triangle_kh_m2ps - first.raw_current_triangle_kh_m2ps
+        )
+        floor_hit = bool(first.floor_hit or second.floor_hit)
+        cap_hit = bool(first.cap_hit or second.cap_hit)
+        valid_count = min(first.valid_incident_triangle_count, second.valid_incident_triangle_count)
+        excluded_count = max(
+            first.excluded_incident_triangle_count,
+            second.excluded_incident_triangle_count,
+        )
+        diagnostics: dict[str, bool | float | int | str] = {
+            "method": _smagorinsky_method_name(),
+            "coefficient_cs": settings.coefficient_cs,
+            "kh_m2ps": particle_kh,
+            "d_kh_dx_mps": float(gradient_x),
+            "d_kh_dy_mps": float(gradient_y),
+            "raw_current_triangle_kh_m2ps": float(raw_current_triangle_kh),
+            "floor_hit": floor_hit,
+            "cap_hit": cap_hit,
+            "valid_incident_triangle_count": int(valid_count),
+            "excluded_incident_triangle_count": int(excluded_count),
+            "valid_incident_triangle_count_before": int(first.valid_incident_triangle_count),
+            "valid_incident_triangle_count_after": int(second.valid_incident_triangle_count),
+            "excluded_incident_triangle_count_before": int(
+                first.excluded_incident_triangle_count
+            ),
+            "excluded_incident_triangle_count_after": int(
+                second.excluded_incident_triangle_count
+            ),
+            "triangle_id": int(location.triangle_id),
+        }
+        return DiffusionSample(
+            coefficients=DiffusionCoefficients(
+                particle_kh,
+                particle_kh,
+                settings.constant_kz_m2ps,
+            ),
+            diffusivity_divergence_mps=(float(gradient_x), float(gradient_y), 0.0),
+            qc=SampleQC.OK,
+            diagnostics=diagnostics,
+        )
+
     def _spatial_at_time(
         self, location: MeshLocation, *, time_index: int, z_m: float
     ) -> tuple[tuple[np.ndarray, float, float] | None, SampleQC]:
@@ -203,14 +653,24 @@ class OCMNativeMonth:
         vertical_scale = max(min((value for value in spans if value > 0), default=0.1), 0.1)
         return (combined, eta, vertical_scale), SampleQC.OK
 
-    def sample(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+    def sample(
+        self,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+        time_utc_ns: int,
+        *,
+        triangle_hint: int | None = None,
+    ) -> VelocitySample:
         """取得 OCM 東、北、垂向速度、擴散係數、海面高度與水深。
 
         取樣失敗時仍回傳品質檢查旗標，讓呼叫端知道是超出範圍、時間缺口、乾涸或深度
-        資料不足，而不是只得到沒有原因的空值。
+        資料不足，而不是只得到沒有原因的空值。``triangle_hint`` 只作 native mesh
+        定位的效能提示，不是物理資料；失效或過期提示由 mesh locator 自動回退原本的
+        uniform-bin 候選搜尋，因此不會改變三角形 provenance、遮罩或數值結果。
         """
 
-        location = self.mesh.locate(x_m, y_m)
+        location = self.mesh.locate(x_m, y_m, triangle_hint=triangle_hint)
         if location is None:
             return VelocitySample(
                 0.0, 0.0, 0.0, np.nan, np.nan, np.nan, np.nan, SampleQC.OUTSIDE_HORIZONTAL_DOMAIN
@@ -460,10 +920,24 @@ class CombinedMonthForcing:
         self.settling_velocity_mps = float(settling_velocity_mps)
         self.include_stokes = include_stokes
 
-    def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
-        """合成海流、有限水深波浪表面漂移與粒子浮沉後，回傳物理時間往後的速度。"""
+    def sample(
+        self,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+        time_utc_ns: int,
+        *,
+        triangle_hint: int | None = None,
+    ) -> VelocitySample:
+        """合成海流、有限水深波浪表面漂移與粒子浮沉後回傳物理時間往後的速度。
 
-        current = self.ocm.sample(x_m, y_m, z_m, time_utc_ns)
+        mesh hint 只傳給同月 OCM locator；NWW 的規則經緯度格網不使用此提示。其餘
+        Stokes、沉降、時間、乾點、垂向遮罩與品質檢查流程保持原本順序與語意。
+        """
+
+        current = self.ocm.sample(
+            x_m, y_m, z_m, time_utc_ns, triangle_hint=triangle_hint
+        )
         if not current.valid:
             return current
         stokes_u = 0.0
@@ -536,6 +1010,11 @@ class CombinedMonthForcing:
             diagnostics=diagnostics,
         )
 
+    def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """以既有四參數 ``VelocityProvider`` 介面取樣，且不攜帶 mesh hint。"""
+
+        return self.sample(x_m, y_m, z_m, time_utc_ns)
+
 
 class MonthlyCombinedForcing:
     """依每個 RK stage UTC 選月份的唯讀 provider，不在缺月時外插。"""
@@ -547,11 +1026,26 @@ class MonthlyCombinedForcing:
             raise ValueError("months 必須是非空 YYYYMM -> forcing mapping")
         self.months = dict(months)
 
-    def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
-        """以 UTC calendar month 選 adapter；缺月明確回傳 OUTSIDE_TIME_RANGE。"""
+    def sample(
+        self,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+        time_utc_ns: int,
+        *,
+        triangle_hint: int | None = None,
+    ) -> VelocitySample:
+        """以 UTC 月份選取 adapter 並傳遞 mesh hint；缺月明確回傳範圍外狀態。"""
 
         month_id = datetime.fromtimestamp(time_utc_ns / 1_000_000_000, tz=UTC).strftime("%Y%m")
         provider = self.months.get(month_id)
         if provider is None:
             return VelocitySample(0.0, 0.0, 0.0, np.nan, np.nan, np.nan, np.nan, SampleQC.OUTSIDE_TIME_RANGE)
-        return provider(x_m, y_m, z_m, time_utc_ns)
+        return provider.sample(
+            x_m, y_m, z_m, time_utc_ns, triangle_hint=triangle_hint
+        )
+
+    def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """以既有四參數 provider 介面選月取樣，且不攜帶 mesh hint。"""
+
+        return self.sample(x_m, y_m, z_m, time_utc_ns)

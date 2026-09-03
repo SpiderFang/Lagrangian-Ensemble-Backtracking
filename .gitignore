@@ -17,16 +17,34 @@ dist/
 
 # 大型 forcing、軌跡、checkpoint 與聚合成果體積龐大且可能含 SERVER 路徑；
 # repository 只保存 schema、小型合成 fixture、程式與不可變 manifest 範例。
+BayTrace/
 data/
 work/
 outputs/
 checkpoints/
 docs/output/
+tmp/
 logs/*.log
 logs/*.jsonl
 *.parquet
 *.npy
 *.npz
+
+# 海廢分類與情境設計的文字索引屬可稽核研究契約，應隨程式版本保存；大型原文、
+# 標註 PDF 與品質檢查影像仍由上方 data 規則忽略，避免把文獻全文誤當輕量原始碼。
+!data/
+data/*
+!data/marine_litter_classification/
+data/marine_litter_classification/*
+!data/marine_litter_classification/README.md
+!data/scenario_design_literature/
+data/scenario_design_literature/*
+!data/scenario_design_literature/README.md
+# 成果呈現文獻的原始 PDF、紅框副本與暫存影像體積大且受各出版商授權限制；
+# 只追蹤可稽核的繁中索引 README，避免把全文或 QA PNG 誤提交至 Git。
+!data/results_visualization_literature/
+data/results_visualization_literature/*
+!data/results_visualization_literature/README.md
 
 # 作業系統與編輯器暫存檔。
 .DS_Store

@@ -2,7 +2,7 @@
 
 ## 1. 文件地位
 
-本文件記錄 2026-08-17 完成並於 2026-08-18 補充的設計裁決。使用者已明示沒有可再提供的科學數據，並授權計畫書未明定之處依本專案最佳科學與工程判斷處理。因此，下列項目是可直接實作的 `design_baseline_v1`，不再列為待研究團隊選擇的問題；只有必須由 SERVER 實際資料、OCM 網格或先導試驗計算出的數值，保留為「衍生閘門」。
+本文件記錄 2026-08-17 完成並於 2026-08-27 依研究主持人意見修訂的設計裁決。最新版本 `design_baseline_v2_non_rising_oca_proxy` 取消中性懸浮與所有上浮物性速度，改以海洋保育署十個海廢統計項目建立材質／形狀代理情境。使用者已明示沒有可再提供的單體物性資料，因此只有必須由 SERVER 實際資料、OCM 網格、現地樣本或先導試驗計算出的數值保留為「衍生閘門」。
 
 本裁決的核心原則是：**四個 forcing flow domains 不等於四個情境統計單元**。貢寮與龜山島共用同一套東北台灣 OCM/NWW forcing，但兩者是獨立研究站點，各自具有 20 個受體、50 個到達時間與完整 `10×20×50` 情境矩陣。
 
@@ -14,6 +14,7 @@
 | `OCM-SVD-Analysis/configs/guishan_gongliao_northeast_taiwan_flow_domain_water_column_svd_available_2024_2025.json` | `daeb9f876eb8a62996b2f7b762e5cee0e03298adf010c802f03261527bdf67e0` | 貢寮與龜山島共用完整東北台灣水柱聯合 SVD／flow domain，不重複建立 forcing |
 | `OCM-SVD-Analysis/configs/gongliao_surface_svd_available_2024_2025.json` | `70fc29a16bfd25f468f7a9aac5ea431fea604aed1b47ac88314324c1b1767c7d` | 貢寮 anchor 與舊候選框 provenance；舊框不作本專案 local domain |
 | `OCM-SVD-Analysis/configs/guishan_surface_svd_available_2024_2025.json` | `58d79fc374aff88841ac354f34d407256048bff24d46dfb840d73c82c398bcf4` | 龜山島西側 anchor 與舊候選框 provenance；舊框不作本專案 local domain |
+| [海洋保育署 iOcean 海洋廢棄物管理頁](https://iocean.oca.gov.tw/OCA_OceanConservation/PUBLIC/Marine_Litter_v2.aspx) | 動態網頁；2026-08-27 查閱 | 採用查詢介面顯示的十個海廢項目作情境分類名稱；不採用重量／件數推估物性或來源先驗 |
 
 上游兩個候選框的線性尺度不足以作逆向傳輸的 local boundary。依使用者最新裁決，本專案只沿用其 anchor 與 provenance，**不沿用候選 bbox**；改以公尺制等距緩衝建立較大的 Lagrangian local domain。這不回寫或改變上游 SVD 的核定狀態。
 
@@ -148,24 +149,38 @@ receptor 在不同到達時間的實際 `z` 可能因潮位而略有變化，man
 `h_r`、`eta_r(t_a)`、`H_r(t_a)`、目標比例、目標 `z`、snap 後 `zcor` 層位、實際
 `z_m`／HAB、調整原因與所有 50 個到達時間的有效性。
 
-## 6. 十種浮沉行為基線
+## 6. 十種非上浮海廢材質／形狀代理基線
 
-在缺少特定廢棄物材質、尺寸、密度與生物附著量測時，不應假造十種具名材料。baseline 將其定義為涵蓋三個數量級的**垂向行為類別**，供敏感度與傳輸機制比較；數值不是對任何特定廢棄物的量測校準。
+海洋保育署 iOcean 頁面可支持「我國清除統計使用哪些海廢項目名稱」，但沒有單體密度、尺寸、投影面積、形狀因子、阻力係數、生物附著量或沉降速度。因此，本版將官方十項分類與十個嚴格負值速度一對一配對，目的在建立可辨識、可重現的材質／形狀敏感度矩陣；**配對順序與數值不是官方量測、類別平均值或由清除重量回歸而得**。
 
-| `material_id` | `settling_velocity_mps` | 行為 |
-|---|---:|---|
-| `sink_100mmps` | -0.100 | 快速沉降 |
-| `sink_030mmps` | -0.030 | 沉降 |
-| `sink_010mmps` | -0.010 | 沉降 |
-| `sink_003mmps` | -0.003 | 緩慢沉降 |
-| `sink_001mmps` | -0.001 | 近中性沉降 |
-| `neutral_000mmps` | 0.000 | 中性懸浮 |
-| `rise_001mmps` | +0.001 | 近中性上浮 |
-| `rise_003mmps` | +0.003 | 緩慢上浮 |
-| `rise_010mmps` | +0.010 | 上浮 |
-| `rise_030mmps` | +0.030 | 快速上浮 |
+| `material_id` | iOcean 項目 | 代表材質與形狀代理 | `settling_velocity_mps` | 適用條件 |
+|---|---|---|---:|---|
+| `oca_styrofoam_porous_fragment` | 保麗龍 | EPS 多孔不規則碎塊 | -0.0001 | 限吸水或生物附著後仍完全沉沒者 |
+| `oca_wood_waterlogged_elongated` | 竹木 | 水浸飽和之細長枝條或片狀木屑 | -0.0002 | 限整體密度已高於周圍海水者 |
+| `oca_wastepaper_folded_fiber` | 廢紙 | 濕潤摺疊紙片或纖維團 | -0.0005 | 不模擬持續解體或溶散 |
+| `oca_nonrecyclable_flexible_sheet` | 其他／不可回收 | 進水薄膜、軟片或皺摺複合包材 | -0.001 | 分類內異質性另列主要限制 |
+| `oca_fishinggear_open_mesh_bundle` | 廢漁網漁具 | 展開／覆網網片、繩索或纏結纖維束的共同代理 | -0.002 | 不解析網目實度、纏結、展開、掛礁與姿態變化；僅作沉降敏感度代理 |
+| `oca_pet_waterfilled_bottle` | 寶特瓶 | 進水或壓扁之 PET 中空瓶體 | -0.005 | 不含密閉含氣瓶體 |
+| `oca_other_recyclable_irregular_fragment` | 其他／可回收 | 混合可回收材質之不規則片塊 | -0.010 | 只作異質類別代理，不作類別平均 |
+| `oca_aluminum_crushed_cylinder` | 鋁罐 | 進水壓扁之薄壁中空圓筒 | -0.020 | 不含密閉含氣罐體 |
+| `oca_steel_rigid_cylinder` | 鐵罐 | 進水之剛性圓筒或金屬片 | -0.050 | 姿態與腐蝕效應未顯式解析 |
+| `oca_glass_bottle_or_fragment` | 玻璃瓶 | 進水瓶體或緻密銳角碎片 | -0.100 | 完整瓶與碎片差異納入未來校準 |
 
-座標採 z positive-up，故負值沉降、正值上浮。生物附著造成的隨時間變速、粒徑分布或材質先驗若未來取得，必須建立新 `experiment_case_id` 或 design version，不可靜默改寫本表。
+座標採 `z` positive-up，故十個速度皆為負值且代表物理時間向前的沉降；設定驗證必須拒絕 `settling_velocity_mps >= 0`。速度格點涵蓋 `10^-4–10^-1 m/s` 三個數量級，其中 `-0.001` 至 `-0.005 m/s` 鄰近 van der Molen et al. (2021) 對沉降 PS 顆粒採用的 `-0.0015、-0.004、-0.006 m/s` 敏感度範圍，但此相近性只支持量級測試，不足以校準上述十類大型或複合海廢。各類另以 B／C／D 記錄近似實驗、機制量級或無可轉用數值的證據等級，完整文獻對照見 [iOcean 海廢十類與非上浮沉降代理之文獻備查](../data/marine_litter_classification/README.md)。若後續取得密度、尺寸、終端速度或現地樣本，應建立新 `experiment_case_id` 或 design version，保存舊版 run 為 `superseded`，不可靜默改寫本表。
+
+### 6.1 沉底漁業用具的報告優先層
+
+合作團隊簡報照片（`S__20529161.jpg`，SHA-256
+`bff3187f875a8e312aa9744ae5488401fc7cfb5110e0675a0f21c23d901693ed`）指出海底廢棄物中漁業用具類
+為最大宗，主管另口頭表示特別關注沉底漁業用具。這兩項目前都只能列為定性、待正式文件確認的
+研究優先項，不能改寫十類代理的速度、出現率或來源先驗。
+
+正文統計固定先讀取 `oca_fishinggear_open_mesh_bundle × near_bed`，並以
+`report_material_statistics.py` 依 `study_site_id × material_id` 產生有效 member 分母、首次
+海床接觸 member 計數／比例及沉積 member 計數／比例。其他九種材質與三個較上層受體不得刪除，
+只是在正文外顯示為同尺度比較。`BED_CONTACT` 若多次發生，按 member 只計一次；
+`deposit_on_first_contact_and_stop` 基線可只有 `DEPOSITED` terminal event，不要求 repeated
+contact。只有另行登錄的 `bed_reflect`／再懸浮敏感度，才可將重複接觸作為核心結果。
 
 ## 7. 每站點 50 個到達時間
 
@@ -195,10 +210,8 @@ intra-tidal phases:
 | `other_site_local_domain_enter/exit` | 穿越同一 A 區內另一站 local domain 時另記錄非終止事件；不得改變 scenario 所屬或主要入口分母 | 描述貢寮—龜山島共享傳輸走廊與條件式跨站連通診斷 |
 | `flow_domain_open_exit` | 首次離開外層 flow domain 時記錄並停止 | 遠域條件式潛在來源與主要傳輸走廊 |
 | `coast_contact` | 記錄首次接觸並停止 | 潛在沿岸來源；避免粒子穿陸 |
-| `bed_contact_deposit` | sinking／near-bed 類首次接觸海床後沉積並停止 | 沉積廢棄物來源足跡；不宣稱含再懸浮 |
-| `bed_contact_reflect` | neutral／suspended 類數值越界時反射並記錄 | 維持完全沉沒懸浮狀態；另報接觸率 |
-| `surface_regime_exit` | rising 類到達海面時停止 | 表示已離開「完全沉沒」模型適用範圍；不得在未含 windage 時繼續當表面漂流 |
-| `surface_reflect` | neutral／sinking 類因擴散越過海面時反射並記錄 | 數值障壁處理，不改變物性類別 |
+| `bed_contact_deposit` | 十個 sinking 代理類首次接觸海床後沉積並停止；報告層只計首次海床接觸與 assumed deposition | 沉積廢棄物來源足跡；不宣稱含再懸浮或 repeated-contact 動力 |
+| `surface_reflect` | sinking 類因亂流擴散越過海面時反射並記錄 | 數值障壁處理；不代表材料具有上浮速度 |
 | `forcing_start` | 到達可用 forcing 最早時次即 censor 並停止 | 禁止時間外插 |
 | `forcing_gap` | 已知 OCM 缺時在 run 前由 approved reconstruction 或 gap-safe arrival/horizon 處理；正常 baseline 不在這些缺口停止 | 只有 manifest 外缺檔、checksum/I/O 損毀、空間必要欄位無效或局部重建失敗才停止，並以 origin/exposure/failure 圖避免誤讀 |
 | `max_age` | 到先導試驗核定的最大回溯日數即 censor 並停止 | 防止封閉流線無限計算 |

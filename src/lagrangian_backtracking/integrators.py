@@ -13,7 +13,12 @@ from typing import Protocol
 
 import numpy as np
 
-from .diffusion import DiffusionCoefficients, brownian_displacement
+from .diffusion import (
+    DiffusionCoefficients,
+    DiffusionSample,
+    brownian_displacement,
+    diffusion_displacement,
+)
 from .models import ParticleState, SampleQC, VelocitySample
 
 
@@ -90,17 +95,28 @@ def split_rk4_brownian_step(
     *,
     dt_seconds: float,
     velocity: VelocityProvider,
-    coefficients: DiffusionCoefficients,
+    coefficients: DiffusionCoefficients | DiffusionSample,
     rng: np.random.Generator,
 ) -> ParticleState:
     """先依流速移動，再加入一次隨機擴散位移。
 
     將流速移動與隨機擴散分開計算，可清楚檢查兩種影響各自是否正確；隨機位移只在完整
-    的四階流速計算完成後加入一次，因此不會在同一時間步中被重複套用。
+    的四階流速計算完成後加入一次，因此不會在同一時間步中被重複套用。``coefficients``
+    若是舊版常數 ``DiffusionCoefficients``，只加入 ``sqrt(2K|dt|)N``；若是步首
+    ``DiffusionSample``，則另外加入該樣本的 ``+div(K)|dt|`` pseudo-time 漂移。兩種
+    路徑都不會在 RK4 stage 中讀取或消耗擴散亂數。
     """
 
     advanced = rk4_step(state, dt_seconds=dt_seconds, velocity=velocity)
-    displacement = brownian_displacement(coefficients, dt_seconds=dt_seconds, rng=rng)
+    # 舊版呼叫端直接傳 DiffusionCoefficients；保留這條分支可維持既有 Brownian 公式、
+    # NumPy 亂數消耗順序與固定 seed 結果。新的 DiffusionSample 則把步首梯度漂移和
+    # Brownian 增量包在同一個 operator split 中，且仍只在四個 RK4 stage 完成後呼叫一次。
+    if isinstance(coefficients, DiffusionCoefficients):
+        displacement = brownian_displacement(coefficients, dt_seconds=dt_seconds, rng=rng)
+    elif isinstance(coefficients, DiffusionSample):
+        displacement = diffusion_displacement(coefficients, dt_seconds, rng)
+    else:
+        raise TypeError("coefficients 必須是 DiffusionCoefficients 或 DiffusionSample")
     return replace(
         advanced,
         x_m=advanced.x_m + float(displacement[0]),

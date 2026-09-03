@@ -6,18 +6,40 @@
 > 不可能再取得；NWW 方向也已由兩個獨立颱風事件定案。以下第 3、4 節已依重新盤點的
 > canonical 時間軸改寫，舊 preflight JSON 只作歷史證據，不代表現行正式判準。
 
+> **2026-08-27 情境基線修訂。** 研究主持人取消中性懸浮與所有上浮物性情境，並要求
+> 十個情境對應不同海廢材質與形狀。現行 `design_baseline_v2_non_rising_oca_proxy`
+> 已改為十個嚴格負值的 iOcean 分類代理；本文件較早提到的「10 種浮沉行為」只描述
+> 8 月 19 日稽核當時狀態，不得再用於正式 material manifest。
+
+> **2026-08-28 本輪執行界線。** 本輪只在本機同步程式架構地圖、測試與文件，未登入或
+> 執行 SERVER，沒有正式研究結果；下文的歷史 SERVER 證據不等同於本輪正式 run。
+
 ## 1. 結論
 
-本專案已由純規劃狀態進入「可執行 reference core、可進資料重建與 pilot」階段。本機與
-SERVER 均可由 `uv.lock` 重建環境、執行測試、產生 constant-flow backward
-synthetic shard，並獨立驗證 checksum、CSR、Parquet、時間方向與停止狀態。現階段不可
-直接宣稱 2024–2025 baseline 已完成；原因不是缺資料或尚待使用者選擇，而是 OCM
-reconstruction、NWW full-hour analysis、expanded A 區、資料衍生 manifests、數值收斂與
-production backend 尚待由既定方法產製及驗證。
+本專案已由純規劃狀態進入「可執行 reference core、可重啟 CPU/NumPy batch、可進資料重建與
+pilot」階段。本機與 SERVER 均可由 `uv.lock` 重建環境、執行測試、產生 constant-flow
+backward synthetic shard，並獨立驗證 checksum、CSR、Parquet、時間方向與停止狀態。現階段
+不可直接宣稱 2024–2025 baseline 已完成；原因不是缺資料或尚待使用者選擇，而是 OCM
+reconstruction、NWW full-hour analysis、expanded A 區、實值資料衍生 manifests、數值收斂、
+SERVER benchmark、release artifacts 與正式成果執行仍待由既定方法產製及驗證。schema 2
+run controller、完整 run validator、provenance 契約與 pilot／formal runtime 已完成；
+`initialize_run`、`initialize_formal_run`、`RuntimeRequestFactory`、`open_run_controller` 及
+`lbt run-create`、`lbt run-shard`、`lbt run-reconcile` 已接通兩種模式。formal 會以正式
+config、approved manifests、月份 topology、時間軸及逐 arrival flow 的 gap 支援 fail-closed，
+不會降級成 pilot。正式 manifest loader 與 forcing-window cache 已於 Phase 3A 完成，不再
+列為待實作元件。
 
 使用者不需再提供額外科學數據或任意指定 `M`、Kh/Kz、dt、回溯期與 shard 大小；這些
 欄位依設計文件由實際資料 QC、代表性 pilot、dt/member/horizon convergence 與 benchmark
 衍生。任何未通過 gate 的值不得以方便執行為由自行填入正式 release config。
+
+## 1.1 BayTrace 可用部分整合界線
+
+本專案已採用 BayTrace 可對應本地 CPU 執行的工程思路：CPU SoA／batch／chunk、每粒子可
+重現亂數、SCHISM triangle hint、可暫停 engine，以及 schema 2 checkpoint/restart。未採用
+GPU/CUDA、BayTrace raw `schout`／`bp` I/O、oil/weathering、droptime、共享記憶體
+multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 僅保留為未來具備完整
+相容 fixture 時的 golden reference，不是目前的正式驗證結果。
 
 ## 2. 已完成的可執行範圍
 
@@ -25,13 +47,14 @@ production backend 尚待由既定方法產製及驗證。
 |---|---|---|
 | 設定與 preflight | Pydantic 跨欄位契約、canonical config hash、4 flow domains／5 sites／每站 10,000／全案 50,000 計數、正式 fail-closed gate、OCM/NWW metadata/time/schema/status inventory | 本機 fixture 與 SERVER 192 筆月份 inventory 已執行 |
 | 幾何與受體 | AEQD 投影、densified bbox、anchor local domain、deterministic maximin、persistent-wet 5×4 受體選擇核心、polygon crossing | 合成 geometry/receptor 測試通過；SERVER 正式 manifests 待產生 |
-| 原生 forcing | SCHISM tri/quad 可追溯切分、uniform-bin locator、barycentric weights、OCM x/y/z/t 保守內插、NWW mask-aware/circular 內插、跨月 provider | 線性解析場、乾 face、無外插、NumPy/Numba OCM 內插對照通過 |
-| 物理與積分 | signed-time RK4、常數 Brownian split、adaptive dt、Smagorinsky 候選、有限/深水 Stokes、10 種浮沉行為 | 常流、四 stage、Brownian variance、dispersion residual、深水極限及方向測試通過 |
+| 原生 forcing | SCHISM tri/quad 可追溯切分、uniform-bin locator、提示式三角形鄰接走訪（hint-aware triangle-neighbor walk）、barycentric weights、OCM x/y/z/t 保守內插、NWW mask-aware/circular 內插、跨月 provider | 線性解析場、乾 face、無外插、hint 有效／失效／共邊 provenance、NumPy/Numba OCM 內插對照通過 |
+| 物理與積分 | signed-time RK4、常數 Brownian split、adaptive dt、Smagorinsky 候選、有限/深水 Stokes、10 種全非上浮材質／形狀代理 | 常流、四 stage、Brownian variance、dispersion residual、深水極限及方向測試通過；v2 另驗證十筆速度均嚴格小於 0 且分類一對一 |
 | 邊界與事件 | own-local first exit、foreign-local 非終止 enter/exit、共用 A outer stop、顯式 open-water/海岸分類、海面／海床政策、forcing/data/max-age/numerical stop | 步內 crossing、重合邊界、海岸、foreign endpoint 去重、RK stage 域外 terminal recovery 測試通過 |
 | Scenario/member | 五站完整交叉、穩定 scenario/particle ID、SHA-256 128-bit seed、scenario shard、`scenario×M` reference executor | shard 大小、manifest 列順序與 worker-independent identity/seed 測試通過 |
-| 輸出與恢復 | 不可變 CSR-like trajectory arrays、particle/event Parquet、原子發布、checksum、formal metadata gate、binding/checksum checkpoint | round-trip、破損拒絕、相容/不相容 checkpoint 測試通過 |
+| 輸出與恢復 | 不可變 CSR-like trajectory arrays、particle/event Parquet、原子發布、checksum、formal metadata gate、schema 1 binding checkpoint、schema 2 execution／RNG-complete checkpoint | round-trip、破損拒絕、相容/不相容 checkpoint、重啟後 RNG continuation 測試通過 |
+| CPU 批次核心 | 可暫停單粒子 execution、固定 RunUnit 順序、HintTrackingVelocityProvider、active compaction／chunk／scatter、逐粒子 PCG64DXSM runtime | reference 與 production 完全等價、chunk size 等價、提早停止 identity 不錯位、request factory 一次／unit 測試通過 |
 | 聚合 | 2D KDE、50/75/90% HDR、open-boundary arclength histogram、unique-particle pathway、秒數守恆 residence、停止比例、跨站條件比例 | 正規化、分母、跨格線時間分配與去重測試通過 |
-| CLI | `config-check`、`preflight`、`behavior-manifest`、`synthetic-smoke`、`validate-shard` | 本機與 SERVER 端到端執行通過 |
+| CLI／runtime | `config-check`、`preflight`、`behavior-manifest`、`synthetic-smoke`、`validate-shard`、`run-create`、`run-shard`、`run-reconcile` | pilot／formal workspace 建立、shard、checkpoint／resume 與 reconcile 已由本機測試驗證；正式 release artifacts 與 SERVER 科學批次尚未完成 |
 
 實作過程另修正四個若只做理想常流測試容易遺漏的問題：polygon exit 原先未區分海岸與
 開放水域；RK stage 可能先落到無效 native mesh 而漏記已發生的 coast/outer crossing；
@@ -103,15 +126,57 @@ gap-safe 分層 arrival windows；兩者都不需外部補件，也不會把所�
 
 ### 4.3 尚待完成的 production/成果層
 
-- 目前有逐粒子 NumPy reference batch 與 Numba OCM 內插核心，尚不是完整 chunked/vectorized
-  Numba production engine；須補 active-particle compaction、forcing-window cache、mid-run RNG
-  checkpoint、restart/merge 等價與吞吐/RAM benchmark。
-- `lbt-run`、完整 run validator、實值 pilot builder、streaming aggregate publisher 尚待上述
-  manifests 與 production backend 固定後接通；現有 CLI 不會假裝已能啟動正式全期批次。
+- Phase 1 的 `ParticleBatch` SoA、固定 ParticleStatus code、作用中粒子壓縮／分散回寫
+  （active particle compaction/scatter）與提示式 mesh 定位已接入 Phase 2 `ProductionBatch`。
+  `run_particle` 現在只透過可暫停的 `initialize_particle_execution`、
+  `advance_particle_once` 與 `finalize_particle_execution` 執行，避免 reference 與 batch
+  形成兩套物理流程。
+- Phase 2 已完成 CPU/NumPy orchestration：固定 source order 的 active sweep、不同
+  `active_chunk_size` 的結果／RNG 等價、提早停止後的 identity-safe scatter、普通 callable
+  與 hint-aware sampler 介面，以及保存完整 execution／觀測／事件／triangle hint／每粒子
+  PCG64DXSM state 的 schema 2 checkpoint。這不是完整 Numba physics kernel，也沒有啟用
+  multiprocessing 或 GPU。
+- Phase 3A 已完成正式 manifest loader 與 `ForcingWindowManager` 的月份 lazy cache；尚須補
+  端到端 restart/merge 等價、吞吐／RAM benchmark 與正式資料 release。runtime 已由
+  `initialize_run`／`initialize_formal_run`、`RuntimeRequestFactory`、`open_run_controller`
+  接上已驗證 component bundle、forcing provider、`ProductionBatch` 與 run validator；
+  `lbt run-create`、`lbt run-shard`、`lbt run-reconcile` 可供 pilot／formal 執行與狀態控制。
+  formal open 會重驗 immutable plan binding 與 strict inventory；OCM residual gaps 只允許
+  已核准 gap-safe manifest 並依 arrival 所屬 flow 檢查 inclusive 回溯窗。SERVER
+  benchmark 必須量測每 sweep 的 alignment（粒子狀態與 execution 對齊）及
+  `ParticleBatch.validate` overhead；未通過前不得宣稱正式吞吐。本輪不改這條同步快路徑，
+  streaming aggregate、release artifacts 與正式 SERVER run 仍未完成。
 - bottom-contact first/repeated density、failure density、bootstrap CI、paired-UTC HDR overlap、
   source–receptor matrix、學術圖表 registry/sidecar 與 known-source synthetic coverage 尚待 G3–G5。
 
-## 5. 可立即進行的工作
+## 5. Phase 3A：manifest 與 lazy forcing window（2026-08-28 新增）
+
+本 slice 已完成輸入契約層，沒有改動 Phase 2 的 engine、ProductionBatch、checkpoint 或
+任何 GPU 路徑：
+
+- `manifests.py` 嚴格讀取既有 material schema 2.0.0 及新增的 receptor、arrival-time、
+  domain/local/open-boundary schema 1.0.0。root／record unknown key、重複 JSON key、
+  bool numeric、NaN/Infinity、空白 ID、錯誤 UTC year、站點／region／flow cross-reference、
+  geometry CRS/type/validity 與 formal coverage 都會在輸入階段 fail-fast。
+- component manifest 的相對路徑只相對於 config YAML；scenario bundle 以 raw file SHA-256、
+  canonical component hash、immutable records 與既有 deterministic `build_scenarios` 綁定。
+  arrival formal gate 另鎖定每站兩年 × DJF/MAM/JJA/SON × 兩種潮差代理 × 三種潮內相位的
+  48 格及高波／強流事件各一筆；情境仍維持每站 10×20×50、A 區 20,000、全案 50,000，
+  pilot 僅允許 config 站點子集。
+- `load_boundary_geometries` 只把 WGS84 交換幾何轉成公尺制 `BoundaryGeometry`，保留 A 區
+  own/foreign local semantics；B-D `local_equals_flow` 可安全共用 flow open line，foreign
+  local 不跨 flow domain。
+- `forcing_window.py` 提供單一 flow domain 的 `ForcingWindowManager`、material facade、
+  immutable cache stats 與 `from_roots` production constructor。每個 RK stage 嚴格依 UTC
+  月份 lazy load；同月不同材料共用 OCM，NWW 僅於 Stokes 首次需求載入，月份缺失與產品
+  損壞維持不同處理，LRU 淘汰不由 facade 偷留大型陣列。
+- 新增 `tests/test_manifests.py` 與 `tests/test_forcing_window.py`，涵蓋 CLI material
+  round-trip、正式／pilot coverage、完整 50,000 stable scenario、metric nested geometry、
+  missing/corrupt month QC、NWW lazy load、LRU eviction、hint propagation 與 production root
+  layout。Phase 3A 不包含正式 run controller、restart publisher、streaming aggregate 或
+  SERVER 實值資料執行；這些仍是後續 slice 的 gate。
+
+## 6. 可立即進行的工作
 
 在不放寬 gate 的前提下，可立即使用已部署 reference core 產生 canonical/reconstruction
 validation、NWW full-hour analysis、實際 mesh/local/open-boundary/receptor manifests，並產製

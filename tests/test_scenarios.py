@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from lagrangian_backtracking.scenarios import (
     BASELINE_BEHAVIORS,
     ArrivalTime,
@@ -9,6 +13,7 @@ from lagrangian_backtracking.scenarios import (
     build_scenarios,
     derive_member_seed,
     validate_baseline_coverage,
+    validate_non_rising_behaviors,
 )
 
 SITES = {
@@ -63,12 +68,34 @@ def test_full_cross_produces_50000_unique_scenarios() -> None:
         behaviors=BASELINE_BEHAVIORS,
         receptors=receptors,
         arrival_times=arrivals,
-        design_version="design_baseline_v1",
+        design_version="design_baseline_v2_non_rising_oca_proxy",
     )
     counts = validate_baseline_coverage(scenarios)
     assert len(scenarios) == 50_000
     assert len({item.scenario_id for item in scenarios}) == 50_000
     assert counts["gongliao"] == counts["guishan"] == 10_000
+
+
+def test_baseline_behaviors_are_named_strictly_sinking_proxies() -> None:
+    """十類須一對一保存 iOcean 名稱、材質、形狀與限制，且不得含零速或上浮。"""
+
+    validate_non_rising_behaviors(BASELINE_BEHAVIORS)
+    assert len(BASELINE_BEHAVIORS) == 10
+    assert len({item.oca_category_zh for item in BASELINE_BEHAVIORS}) == 10
+    assert all(item.settling_velocity_mps < 0.0 for item in BASELINE_BEHAVIORS)
+    assert {item.behavior_class for item in BASELINE_BEHAVIORS} == {"sinking"}
+    assert all(item.material_family_zh for item in BASELINE_BEHAVIORS)
+    assert all(item.representative_shape_zh for item in BASELINE_BEHAVIORS)
+    assert all(item.applicability_condition_zh for item in BASELINE_BEHAVIORS)
+
+
+@pytest.mark.parametrize("invalid_velocity", [0.0, 0.001])
+def test_rejects_zero_or_rising_baseline_velocity(invalid_velocity: float) -> None:
+    """PI 已取消中性與上浮情境，建表閘門必須對零值及正值失敗。"""
+
+    invalid = (replace(BASELINE_BEHAVIORS[0], settling_velocity_mps=invalid_velocity),)
+    with pytest.raises(ValueError, match="嚴格小於 0"):
+        validate_non_rising_behaviors(invalid)
 
 
 def test_seed_is_stable_and_member_specific() -> None:

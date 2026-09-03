@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 import yaml
 
-from lagrangian_backtracking.config import ProjectConfig, load_config
+from lagrangian_backtracking.config import ProjectConfig, load_config, resolve_flow_domain_id
+from lagrangian_backtracking.scenarios import BASELINE_BEHAVIORS
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
@@ -30,6 +32,28 @@ def test_example_config_has_fixed_scientific_counts() -> None:
     assert len(config.study_sites) == 5
     assert config.scenarios.expected_receptor_count == 100
     assert config.scenarios.scenario_count == 50_000
+    assert config.scenarios.seed_policy == "sha256_v1_pcg64dxsm"
+    assert config.execution.checkpoint_interval_sweeps is None
+    assert config.execution.active_chunk_size is None
+    assert config.execution.max_resident_forcing_months == 2
+
+
+def test_example_material_table_matches_runtime_baseline() -> None:
+    """YAML 與程式內建表不可各自維護不同的材質、形狀、條件或速度。"""
+
+    payload = _payload()
+    assert payload["design_version"] == "design_baseline_v2_non_rising_oca_proxy"
+    assert payload["physics"]["settling"]["material_classes"] == [asdict(item) for item in BASELINE_BEHAVIORS]
+
+
+@pytest.mark.parametrize("invalid_velocity", [0.0, 0.001])
+def test_config_rejects_zero_or_rising_material_velocity(invalid_velocity: float) -> None:
+    """正式設定不得藉修改 YAML 重新加入中性懸浮或上浮物性速度。"""
+
+    payload = _payload()
+    payload["physics"]["settling"]["material_classes"][0]["settling_velocity_mps"] = invalid_velocity
+    with pytest.raises(ValueError, match="嚴格小於 0"):
+        ProjectConfig.model_validate(payload)
 
 
 def test_config_hash_is_independent_of_mapping_order() -> None:
@@ -85,3 +109,38 @@ def test_yaml_member_field_is_not_silently_ignored() -> None:
     payload["scenarios"]["members_per_scenario"] = 8
     config = ProjectConfig.model_validate(payload)
     assert config.scenarios.members_per_scenario == 8
+
+
+def test_legacy_checkpoint_interval_field_is_rejected_locally() -> None:
+    """舊 output-step 欄位不得因 StrictModel extra=allow 而靜默進入設定。"""
+
+    payload = _payload()
+    payload["execution"]["checkpoint_interval_output_steps"] = 3
+    with pytest.raises(ValueError, match="checkpoint_interval_sweeps"):
+        ProjectConfig.model_validate(payload)
+
+
+def test_flow_domain_resolver_selects_formal_release_id_only_in_formal_mode() -> None:
+    """A 區 formal 使用 expanded ID；pilot 與 B-D 維持各自 base flow-domain。"""
+
+    payload = _payload()
+    payload["domains"][0]["formal_release_flow_domain_id"] = (
+        "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+    )
+    config = ProjectConfig.model_validate(payload)
+    assert resolve_flow_domain_id(config, "A") == "northeast_taiwan_common_cache_v3"
+    assert (
+        resolve_flow_domain_id(config, "A", formal=True)
+        == "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+    )
+    assert resolve_flow_domain_id(config, "B", formal=True) == "hsinchu_cache_v3"
+
+
+def test_formal_release_requires_dynamic_initial_condition_manifest_path() -> None:
+    """正式設定即使已有 receptor／arrival path，也不可省略 dynamic pair manifest。"""
+
+    payload = _payload()
+    payload["scenarios"]["receptor_arrival_initial_condition_manifest"] = None
+    config = ProjectConfig.model_validate(payload)
+    with pytest.raises(ValueError, match="receptor_arrival_initial_condition_manifest"):
+        config.assert_formal_release_ready()

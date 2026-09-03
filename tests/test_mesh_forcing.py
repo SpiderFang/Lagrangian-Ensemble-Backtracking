@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from lagrangian_backtracking.forcing import NWWAnalysisMonth, OCMNativeMonth
-from lagrangian_backtracking.mesh import NativeMesh, triangulate_faces
+from lagrangian_backtracking.diffusion import SmagorinskySettings, smagorinsky_horizontal_diffusivity
+from lagrangian_backtracking.forcing import (
+    CombinedMonthForcing,
+    MonthlyCombinedForcing,
+    NWWAnalysisMonth,
+    OCMNativeMonth,
+)
+from lagrangian_backtracking.geometry import DomainProjection
+from lagrangian_backtracking.mesh import NativeMesh, _build_triangle_neighbors, triangulate_faces
 from lagrangian_backtracking.models import SampleQC
 
 
@@ -44,6 +52,63 @@ def test_mesh_locator_returns_barycentric_weights_and_global_face() -> None:
     assert location.source_face_global_index == 99
     assert np.allclose(location.barycentric_weights, [0.5, 0.2, 0.3])
     assert mesh.locate(9.0, 9.0) is None
+
+
+def test_native_mesh_shape_gradient_is_exact_for_linear_scalar() -> None:
+    """任意線性 scalar 在公尺制三角形上應精確回傳其 x/y 係數。"""
+
+    mesh = _triangle_mesh()
+    coefficients = (2.5, -1.25, 9.0)
+    scalar_values = np.asarray(
+        [coefficients[0] * x + coefficients[1] * y + coefficients[2] for x, y in mesh.node_xy]
+    )
+    assert mesh.triangle_shape_gradients.shape == (1, 3, 2)
+    assert np.allclose(mesh.triangle_linear_gradient(0, scalar_values), coefficients[:2])
+    assert np.allclose(mesh.triangle_scalar_gradient(0, scalar_values), coefficients[:2])
+    assert np.allclose(mesh.triangle_shape_gradients.sum(axis=1), 0.0)
+
+
+def test_native_mesh_incident_adjacency_is_sorted_and_immutable() -> None:
+    """node-to-triangle adjacency 應固定排序、保留孤立 node 空 tuple 並不可 append。"""
+
+    mesh = _adjacent_mesh()
+    assert mesh.node_incident_triangles == ((0, 1), (0,), (0, 1), (1,))
+    assert mesh.node_to_incident_triangles is mesh.node_incident_triangles
+    assert mesh.incident_triangles(2) == (0, 1)
+    with pytest.raises(TypeError):
+        mesh.node_incident_triangles[0] += (3,)
+    with pytest.raises(IndexError):
+        mesh.incident_triangles(99)
+
+
+def test_native_mesh_gradient_rejects_invalid_triangle_or_scalar_inputs() -> None:
+    """triangle ID、local scalar shape 與非有限值錯誤都必須在梯度計算前拒絕。"""
+
+    mesh = _triangle_mesh()
+    with pytest.raises(IndexError):
+        mesh.triangle_linear_gradient(99, [0.0, 0.0, 0.0])
+    with pytest.raises(TypeError):
+        mesh.triangle_linear_gradient(True, [0.0, 0.0, 0.0])
+    with pytest.raises(ValueError, match=r"shape=\(3,\)"):
+        mesh.triangle_linear_gradient(0, [0.0, 0.0])
+    with pytest.raises(ValueError, match="全部有限"):
+        mesh.triangle_linear_gradient(0, [0.0, np.nan, 0.0])
+
+
+def test_native_mesh_rejects_degenerate_triangle_for_shape_gradient() -> None:
+    """退化三角形不應產生除以零的形函數梯度。"""
+
+    with pytest.raises(ValueError, match="退化"):
+        NativeMesh(
+            node_lon=np.array([121.0, 121.001, 121.002]),
+            node_lat=np.array([25.0, 25.0, 25.0]),
+            node_xy=np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]),
+            source_depth_m=np.full(3, 10.0),
+            source_node_bottom_index=np.zeros(3, dtype=np.int64),
+            face_nodes_local=np.array([[0, 1, 2, -1]]),
+            face_node_count=np.array([3]),
+            source_face_global_index=np.array([1]),
+        )
 
 
 def test_ocm_sampler_is_exact_for_linear_xyzt_field() -> None:
@@ -144,3 +209,449 @@ def test_nww_direction_uses_circular_interpolation() -> None:
     sample = sampler.sample(121.5, 24.5, 1_800_000_000_000)
     assert sample.valid
     assert min(abs(sample.peak_direction_raw_deg), abs(sample.peak_direction_raw_deg - 360.0)) < 1e-10
+
+
+def _adjacent_mesh() -> NativeMesh:
+    """建立由兩個三角形組成的正方形，供 hint 跨共邊走訪測試使用。"""
+
+    return NativeMesh(
+        node_lon=np.array([121.0, 121.001, 121.001, 121.0]),
+        node_lat=np.array([25.0, 25.0, 25.001, 25.001]),
+        node_xy=np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+        source_depth_m=np.full(4, 10.0),
+        source_node_bottom_index=np.zeros(4, dtype=np.int64),
+        face_nodes_local=np.array([[0, 1, 2, -1], [0, 2, 3, -1]]),
+        face_node_count=np.array([3, 3]),
+        source_face_global_index=np.array([101, 102]),
+        bin_size_m=10.0,
+    )
+
+
+def _adjacent_ocm_sampler(mesh: NativeMesh, *, use_numba_kernel: bool = False) -> OCMNativeMonth:
+    """建立線性且兩個 face 都濕潤的 OCM 測試場，以檢查 hint 不改變物理取樣。"""
+
+    times = np.array([0, 10_000_000_000], dtype=np.int64)
+    z_levels = np.array([-10.0, -5.0, 0.0])
+    zcor = np.broadcast_to(z_levels, (2, 4, 3)).copy()
+    hvel = np.empty((2, 4, 3, 2), dtype=np.float64)
+    vertical_velocity = np.empty((2, 4, 3), dtype=np.float64)
+    diffusivity = np.full((2, 4, 3), 0.01, dtype=np.float64)
+    for time_index, seconds in enumerate([0.0, 10.0]):
+        for node, (x_m, y_m) in enumerate(mesh.node_xy):
+            for layer, z_m in enumerate(z_levels):
+                hvel[time_index, node, layer, 0] = 0.01 * x_m + 0.02 * y_m + 0.1 * z_m + seconds
+                hvel[time_index, node, layer, 1] = 0.03 * x_m - 0.04 * y_m - 0.05 * z_m
+                vertical_velocity[time_index, node, layer] = 0.001 * z_m
+    return OCMNativeMonth(
+        month_id="197001",
+        mesh=mesh,
+        time_utc_ns=times,
+        hvel=hvel,
+        vertical_velocity=vertical_velocity,
+        zcor=zcor,
+        elev=np.zeros((2, 4)),
+        wetdry_elem=np.zeros((2, 2)),
+        diffusivity=diffusivity,
+        maximum_time_gap_seconds=20.0,
+        use_numba_kernel=use_numba_kernel,
+    )
+
+
+def _assert_velocity_samples_equal(first, second) -> None:
+    """逐一比較速度、尺度、QC 與 provenance，避免只比較 valid 布林值。"""
+
+    assert np.allclose(
+        [
+            first.u_mps,
+            first.v_mps,
+            first.w_mps,
+            first.eta_m,
+            first.bed_z_m,
+            first.horizontal_scale_m,
+            first.vertical_scale_m,
+        ],
+        [
+            second.u_mps,
+            second.v_mps,
+            second.w_mps,
+            second.eta_m,
+            second.bed_z_m,
+            second.horizontal_scale_m,
+            second.vertical_scale_m,
+        ],
+        equal_nan=True,
+    )
+    assert first.qc == second.qc
+    assert first.source_face_id == second.source_face_id
+    assert first.triangle_id == second.triangle_id
+    assert first.forcing_month_id == second.forcing_month_id
+    assert first.diagnostics == second.diagnostics
+
+
+def test_triangle_neighbors_are_opposite_vertex_adjacency() -> None:
+    """共邊鄰接欄位必須對應對頂點的邊，外邊界使用 -1。"""
+
+    mesh = _adjacent_mesh()
+    assert mesh.triangle_neighbors.tolist() == [[-1, 1, -1], [-1, -1, 0]]
+
+
+def test_non_manifold_shared_edge_is_marked_unknown_without_rejection() -> None:
+    """三個面共用同一邊時不任意選鄰居，且 adjacency 建構仍可完成。"""
+
+    neighbors = _build_triangle_neighbors(
+        np.array([[0, 1, 2], [1, 0, 3], [0, 1, 4]], dtype=np.int64)
+    )
+    assert np.all(neighbors == -1)
+
+
+def test_triangle_hint_follows_adjacent_triangle_without_uniform_bin_candidates() -> None:
+    """清空局部 mesh 的 bins 後，public hint path 仍須從 triangle 0 走到 triangle 1。"""
+
+    mesh = _adjacent_mesh()
+    target_point = (0.2, 0.8)
+    assert mesh.locate(*target_point).triangle_id == 1
+    mesh._bins.clear()
+
+    # 測試仍呼叫 public locate；只將這個局部 fixture 的候選索引清空，藉此隔離 hint
+    # 走訪是否真的有效。測試結束後 fixture 被丟棄，不影響其他測試或正式 mesh。
+    assert mesh.locate(*target_point) is None
+    hinted_location = mesh.locate(*target_point, triangle_hint=0)
+    assert hinted_location is not None
+    assert hinted_location.triangle_id == 1
+
+
+def test_triangle_hint_fallback_handles_stale_outside_and_nonfinite_points() -> None:
+    """失效 hint、域外與非有限座標都維持原 locator 的安全結果。"""
+
+    mesh = _adjacent_mesh()
+    baseline = mesh.locate(0.2, 0.8)
+    assert baseline is not None
+    assert mesh.locate(0.2, 0.8, triangle_hint=-1) == baseline
+    assert mesh.locate(0.2, 0.8, triangle_hint=999) == baseline
+    assert mesh.locate(2.0, 2.0, triangle_hint=0) is None
+    assert mesh.locate(np.nan, 0.0, triangle_hint=0) is None
+    assert mesh.locate(0.0, np.inf, triangle_hint=0) is None
+
+
+def test_edge_and_vertex_hints_fallback_to_smallest_triangle_id() -> None:
+    """共邊與頂點不採 hint 直接回傳，必須維持全域搜尋的最小 triangle_id。"""
+
+    mesh = _adjacent_mesh()
+    for point in ((0.5, 0.5), (0.0, 0.0)):
+        baseline = mesh.locate(*point)
+        hinted_from_first = mesh.locate(*point, triangle_hint=0)
+        hinted_from_second = mesh.locate(*point, triangle_hint=1)
+        assert baseline is not None and baseline.triangle_id == 0
+        assert hinted_from_first == baseline
+        assert hinted_from_second == baseline
+
+
+def test_ocm_hint_sampling_preserves_physics_and_provenance() -> None:
+    """OCM 有效、stale 與無 hint 的速度、QC、face/triangle provenance 必須一致。"""
+
+    mesh = _adjacent_mesh()
+    sampler = _adjacent_ocm_sampler(mesh)
+    baseline = sampler.sample(0.2, 0.8, -7.5, 5_000_000_000)
+    walked = sampler.sample(0.2, 0.8, -7.5, 5_000_000_000, triangle_hint=0)
+    stale = sampler.sample(0.2, 0.8, -7.5, 5_000_000_000, triangle_hint=999)
+
+    assert baseline.valid
+    assert baseline.triangle_id == 1
+    assert baseline.source_face_id == 102
+    _assert_velocity_samples_equal(baseline, walked)
+    _assert_velocity_samples_equal(baseline, stale)
+
+
+def test_combined_and_monthly_sample_forward_hint_without_changing_call_api() -> None:
+    """新增 sample keyword 不改變既有 __call__ 的四參數相容介面。"""
+
+    sampler = _adjacent_ocm_sampler(_adjacent_mesh())
+    combined = CombinedMonthForcing(
+        ocm=sampler,
+        nww=None,
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=0.0,
+        include_stokes=False,
+    )
+    explicit = combined.sample(0.2, 0.8, -7.5, 5_000_000_000, triangle_hint=0)
+    via_call = combined(0.2, 0.8, -7.5, 5_000_000_000)
+    _assert_velocity_samples_equal(explicit, via_call)
+
+    monthly = MonthlyCombinedForcing({"197001": combined})
+    monthly_explicit = monthly.sample(0.2, 0.8, -7.5, 5_000_000_000, triangle_hint=0)
+    monthly_via_call = monthly(0.2, 0.8, -7.5, 5_000_000_000)
+    _assert_velocity_samples_equal(explicit, monthly_explicit)
+    _assert_velocity_samples_equal(explicit, monthly_via_call)
+
+
+def _smagorinsky_sampler_from_node_values(
+    mesh: NativeMesh,
+    *,
+    u_values_by_time: list[np.ndarray],
+    v_values_by_time: list[np.ndarray],
+    wetdry_elem: np.ndarray | None = None,
+    maximum_time_gap_seconds: float = 20.0,
+    use_numba_kernel: bool = False,
+) -> OCMNativeMonth:
+    """把每個時間／節點的水平 current 值展開成固定 z OCM synthetic month。"""
+
+    time_count = len(u_values_by_time)
+    node_count = mesh.node_xy.shape[0]
+    z_levels = np.array([-10.0, 0.0])
+    zcor = np.broadcast_to(z_levels, (time_count, node_count, z_levels.size)).copy()
+    hvel = np.empty((time_count, node_count, z_levels.size, 2), dtype=np.float64)
+    for time_index in range(time_count):
+        hvel[time_index, :, :, 0] = np.asarray(u_values_by_time[time_index])[:, None]
+        hvel[time_index, :, :, 1] = np.asarray(v_values_by_time[time_index])[:, None]
+    vertical_velocity = np.zeros((time_count, node_count, z_levels.size), dtype=np.float64)
+    diffusivity = np.full_like(vertical_velocity, 0.01)
+    return OCMNativeMonth(
+        month_id="197001",
+        mesh=mesh,
+        time_utc_ns=np.arange(time_count, dtype=np.int64) * 10_000_000_000,
+        hvel=hvel,
+        vertical_velocity=vertical_velocity,
+        zcor=zcor,
+        elev=np.zeros((time_count, node_count)),
+        wetdry_elem=(
+            np.zeros((time_count, mesh.source_face_global_index.size))
+            if wetdry_elem is None
+            else wetdry_elem
+        ),
+        diffusivity=diffusivity,
+        maximum_time_gap_seconds=maximum_time_gap_seconds,
+        use_numba_kernel=use_numba_kernel,
+    )
+
+
+def test_smagorinsky_triangle_formula_and_constant_kz_are_exact() -> None:
+    """native current 線性 shear 的 raw/current Kh 應等於既有 equation 10。"""
+
+    mesh = _triangle_mesh()
+    u = np.array([0.01 * x + 0.02 * y for x, y in mesh.node_xy])
+    v = np.array([0.03 * x - 0.04 * y for x, y in mesh.node_xy])
+    sampler = _smagorinsky_sampler_from_node_values(mesh, u_values_by_time=[u, u], v_values_by_time=[v, v])
+    settings = SmagorinskySettings(0.2, 0.0, 10.0, 0.07)
+    sample = sampler.sample_smagorinsky_diffusion(2.0, 3.0, -5.0, 5_000_000_000, settings)
+    expected, floor_hit, cap_hit = smagorinsky_horizontal_diffusivity(
+        du_dx_per_s=0.01,
+        du_dy_per_s=0.02,
+        dv_dx_per_s=0.03,
+        dv_dy_per_s=-0.04,
+        triangle_area_m2=50.0,
+        coefficient_cs=0.2,
+        floor_m2ps=0.0,
+        cap_m2ps=10.0,
+    )
+    assert sample.valid
+    assert sample.coefficients.kx_m2ps == expected
+    assert sample.coefficients.ky_m2ps == expected
+    assert sample.coefficients.kz_m2ps == 0.07
+    assert np.allclose(sample.diffusivity_divergence_mps, (0.0, 0.0, 0.0), atol=1e-18)
+    assert sample.diagnostics["raw_current_triangle_kh_m2ps"] == expected
+    assert sample.diagnostics["floor_hit"] is floor_hit
+    assert sample.diagnostics["cap_hit"] is cap_hit
+    assert sample.diagnostics["triangle_id"] == 0
+
+
+def test_smagorinsky_solid_body_rotation_has_zero_strain_at_zero_floor() -> None:
+    """剛體旋轉的反對稱速度梯度不應被誤判為剪切擴散。"""
+
+    mesh = _triangle_mesh()
+    omega = 0.3
+    u = np.array([-omega * y for _, y in mesh.node_xy])
+    v = np.array([omega * x for x, _ in mesh.node_xy])
+    sampler = _smagorinsky_sampler_from_node_values(mesh, u_values_by_time=[u, u], v_values_by_time=[v, v])
+    sample = sampler.sample_smagorinsky_diffusion(
+        2.0,
+        3.0,
+        -5.0,
+        0,
+        SmagorinskySettings(0.2, 0.0, 10.0, 0.01),
+    )
+    assert sample.valid
+    assert sample.coefficients.kx_m2ps == 0.0
+    assert sample.diffusivity_divergence_mps == (0.0, 0.0, 0.0)
+    assert sample.diagnostics["raw_current_triangle_kh_m2ps"] == 0.0
+
+
+def test_smagorinsky_strain_invariant_under_orthogonal_coordinate_rotation() -> None:
+    """同一線性速度場以旋轉座標表示時，equation 10 的 strain/Kh 應保持不變。"""
+
+    gradient = np.array([[0.4, -0.7], [0.2, 0.1]])
+    angle = 0.61
+    rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    rotated = rotation.T @ gradient @ rotation
+    original_kh, _, _ = smagorinsky_horizontal_diffusivity(
+        du_dx_per_s=gradient[0, 0],
+        du_dy_per_s=gradient[0, 1],
+        dv_dx_per_s=gradient[1, 0],
+        dv_dy_per_s=gradient[1, 1],
+        triangle_area_m2=2.0,
+        coefficient_cs=0.15,
+    )
+    rotated_kh, _, _ = smagorinsky_horizontal_diffusivity(
+        du_dx_per_s=rotated[0, 0],
+        du_dy_per_s=rotated[0, 1],
+        dv_dx_per_s=rotated[1, 0],
+        dv_dy_per_s=rotated[1, 1],
+        triangle_area_m2=2.0,
+        coefficient_cs=0.15,
+    )
+    assert np.isclose(original_kh, rotated_kh, rtol=1e-12, atol=1e-12)
+
+
+def test_smagorinsky_nodal_area_weighting_and_gradient_use_all_support_triangles() -> None:
+    """兩三角形不同 shear 時，particle K 與 grad(K) 應符合手算 nodal area weighting。"""
+
+    mesh = _adjacent_mesh()
+    u = np.array([0.0, 0.0, 0.0, 2.0])
+    v = np.zeros(4)
+    sampler = _smagorinsky_sampler_from_node_values(mesh, u_values_by_time=[u, u], v_values_by_time=[v, v])
+    settings = SmagorinskySettings(0.2, 0.0, 100.0, 0.01)
+    sample = sampler.sample_smagorinsky_diffusion(0.2, 0.8, -5.0, 0, settings)
+
+    # triangle 0 為零 strain；triangle 1 的梯度為 (-2,2)，故 Kh1=.02*sqrt(8)。
+    # 兩面積都是 0.5，current triangle 1 的三個 nodal K 為 [Kh1/2,Kh1/2,Kh1]。
+    expected_triangle_kh = 0.02 * np.sqrt(8.0)
+    expected_particle_kh = 0.8 * expected_triangle_kh
+    assert sample.valid
+    assert np.isclose(sample.coefficients.kx_m2ps, expected_particle_kh)
+    assert np.isclose(sample.diagnostics["d_kh_dx_mps"], -expected_triangle_kh / 2.0)
+    assert np.isclose(sample.diagnostics["d_kh_dy_mps"], expected_triangle_kh / 2.0)
+    assert np.isclose(sample.diagnostics["raw_current_triangle_kh_m2ps"], expected_triangle_kh)
+    assert sample.diagnostics["valid_incident_triangle_count"] == 2
+    assert sample.diagnostics["excluded_incident_triangle_count"] == 0
+
+
+def test_smagorinsky_time_interpolation_is_after_each_slice_formula() -> None:
+    """before/after 的非線性 Kh 各自計算後，raw current triangle Kh 才線性內插。"""
+
+    mesh = _triangle_mesh()
+    zero = np.zeros(3)
+    shear = np.array([0.0, 20.0, 0.0])
+    sampler = _smagorinsky_sampler_from_node_values(
+        mesh,
+        u_values_by_time=[zero, shear],
+        v_values_by_time=[zero, zero],
+    )
+    settings = SmagorinskySettings(0.2, 0.0, 100.0, 0.01)
+    sample = sampler.sample_smagorinsky_diffusion(2.0, 3.0, -5.0, 5_000_000_000, settings)
+    # 這個 triangle 的 shear 值在 node 2 造成 du/dx=2；面積 50、Cs=.2 時 Kh=4.0。
+    expected_after, _, _ = smagorinsky_horizontal_diffusivity(
+        du_dx_per_s=2.0,
+        du_dy_per_s=0.0,
+        dv_dx_per_s=0.0,
+        dv_dy_per_s=0.0,
+        triangle_area_m2=50.0,
+        coefficient_cs=0.2,
+    )
+    assert sample.valid
+    assert np.isclose(sample.diagnostics["raw_current_triangle_kh_m2ps"], expected_after * 0.5)
+    assert np.isclose(sample.coefficients.kx_m2ps, expected_after * 0.5)
+
+
+def test_smagorinsky_floor_cap_and_numba_velocity_switch_have_stable_diagnostics() -> None:
+    """floor/cap 命中需可追蹤，且 Smag reference 不受 OCM velocity switch 影響。"""
+
+    mesh = _triangle_mesh()
+    u = np.zeros(3)
+    v = np.zeros(3)
+    numpy_sampler = _smagorinsky_sampler_from_node_values(
+        mesh, u_values_by_time=[u, u], v_values_by_time=[v, v], use_numba_kernel=False
+    )
+    numba_sampler = _smagorinsky_sampler_from_node_values(
+        mesh, u_values_by_time=[u, u], v_values_by_time=[v, v], use_numba_kernel=True
+    )
+    settings = SmagorinskySettings(0.2, 0.1, 0.2, 0.01)
+    numpy_sample = numpy_sampler.sample_smagorinsky_diffusion(2.0, 3.0, -5.0, 0, settings)
+    numba_sample = numba_sampler.sample_smagorinsky_diffusion(2.0, 3.0, -5.0, 0, settings)
+    assert numpy_sample.valid and numba_sample.valid
+    assert numpy_sample.diagnostics == numba_sample.diagnostics
+    assert numpy_sample.diagnostics["floor_hit"] is True
+    assert numpy_sample.diagnostics["cap_hit"] is False
+    assert numpy_sample.coefficients.kx_m2ps == 0.1
+
+
+def test_smagorinsky_excludes_dry_support_but_fails_current_triangle() -> None:
+    """非目前 incident dry face 可排除；目前 triangle 乾涸則必須回 DRY_FACE。"""
+
+    mesh = _adjacent_mesh()
+    u = np.array([0.0, 0.0, 0.0, 2.0])
+    v = np.zeros(4)
+    wet = np.zeros((2, 2))
+    wet[:, 0] = 1.0
+    sampler = _smagorinsky_sampler_from_node_values(
+        mesh, u_values_by_time=[u, u], v_values_by_time=[v, v], wetdry_elem=wet
+    )
+    settings = SmagorinskySettings(0.2, 0.0, 100.0, 0.01)
+    supported = sampler.sample_smagorinsky_diffusion(0.2, 0.8, -5.0, 0, settings)
+    assert supported.valid
+    assert supported.diagnostics["valid_incident_triangle_count"] == 1
+    assert supported.diagnostics["excluded_incident_triangle_count"] == 1
+
+    current_dry = _smagorinsky_sampler_from_node_values(
+        mesh,
+        u_values_by_time=[u, u],
+        v_values_by_time=[v, v],
+        wetdry_elem=np.ones((2, 2)),
+    )
+    failed = current_dry.sample_smagorinsky_diffusion(0.2, 0.8, -5.0, 0, settings)
+    assert not failed.valid
+    assert failed.qc & SampleQC.DRY_FACE
+
+
+def test_smagorinsky_returns_vertical_time_gap_and_outside_qc_without_fill() -> None:
+    """固定 z unsupported、時間 gap 與域外位置都應各自保留非零 QC。"""
+
+    mesh = _triangle_mesh()
+    zeros = np.zeros(3)
+    settings = SmagorinskySettings(0.2, 0.0, 100.0, 0.01)
+    vertical = _smagorinsky_sampler_from_node_values(
+        mesh, u_values_by_time=[zeros, zeros], v_values_by_time=[zeros, zeros]
+    )
+    unsupported = vertical.sample_smagorinsky_diffusion(2.0, 3.0, 1.0, 0, settings)
+    assert not unsupported.valid
+    assert unsupported.qc & SampleQC.VERTICAL_UNSUPPORTED
+
+    gap = _smagorinsky_sampler_from_node_values(
+        mesh,
+        u_values_by_time=[zeros, zeros],
+        v_values_by_time=[zeros, zeros],
+        maximum_time_gap_seconds=1.0,
+    )
+    gap_sample = gap.sample_smagorinsky_diffusion(2.0, 3.0, -5.0, 5_000_000_000, settings)
+    assert not gap_sample.valid
+    assert gap_sample.qc & SampleQC.TIME_GAP
+
+    outside = vertical.sample_smagorinsky_diffusion(99.0, 99.0, -5.0, 0, settings)
+    assert not outside.valid
+    assert outside.qc & SampleQC.OUTSIDE_HORIZONTAL_DOMAIN
+
+
+def test_smagorinsky_caches_unique_node_columns_per_time_slice() -> None:
+    """同一 time slice 的每個 unique node 固定 z 取樣只能呼叫一次。"""
+
+    mesh = _adjacent_mesh()
+    u = np.zeros(4)
+    v = np.zeros(4)
+    sampler = _smagorinsky_sampler_from_node_values(mesh, u_values_by_time=[u, u], v_values_by_time=[v, v])
+    calls: list[tuple[int, int]] = []
+    original = sampler._vertical_horizontal_velocity_node_sample
+
+    def wrapped(*, time_index: int, node_index: int, z_m: float):
+        """記錄 helper 呼叫後交回原本的保守垂向取樣。"""
+
+        calls.append((time_index, node_index))
+        return original(time_index=time_index, node_index=node_index, z_m=z_m)
+
+    sampler._vertical_horizontal_velocity_node_sample = wrapped
+    sample = sampler.sample_smagorinsky_diffusion(
+        0.2,
+        0.8,
+        -5.0,
+        5_000_000_000,
+        SmagorinskySettings(0.2, 0.0, 100.0, 0.01),
+    )
+    assert sample.valid
+    assert sorted(calls) == [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3)]
