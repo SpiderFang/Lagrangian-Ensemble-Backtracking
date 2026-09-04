@@ -123,8 +123,17 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "report_trajectory_identity",
             "report_trajectory_selection",
             "report_material_statistics",
+            "report_matrix_statistics",
+            "report_source_receptor_statistics",
+            "report_statistics",
+            "report_comparison_statistics",
+            "report_pipeline",
+            "report_trajectory_stream",
+            "report_release",
             "report_font",
             "report_style",
+            "report_render",
+            "report_validation_evidence",
         ),
     },
 )
@@ -496,9 +505,9 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": "驗證器要拒絕未知檔案、錯誤 checksum、錯誤 identity/order 與不合法 lifecycle，不能替 caller 偷修 progress 或刪除資料。",
     },
     "cli": {
-        "role": "正式 preflight、run workspace、分片執行、reconcile 與唯讀驗證入口",
+        "role": "正式 preflight、run workspace、分片執行、reconcile、aggregate 與 report 唯讀驗證入口",
         "inputs": "命令列參數、設定檔與資料根目錄",
-        "outputs": "formal/pilot preflight、run lifecycle、shard 結果與驗證報告",
+        "outputs": "formal/pilot preflight、run lifecycle、shard 結果、aggregate 與 report 驗證報告",
         "entrypoints": [
             "main",
             "run_preflight_command",
@@ -506,11 +515,15 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "run_shard",
             "run_reconcile",
             "run_validate_run",
+            "run_report_validate",
+            "report-validate",
         ],
         "read_first": (
             "正式鏈路依序閱讀 main → run_preflight_command（--formal-release）→ run_create → "
             "run_shard／run_reconcile → run_validate_run；synthetic 與設定檢查是輔助入口，"
-            "不能取代 formal inventory gate。"
+            "不能取代 formal inventory gate。report-spec-create 只建立 renderer 規格；"
+            "run_report_validate／report-validate 只讀取 caller 明示的既有 report-v1 release，"
+            "不猜測路徑、不建立產品，也不把 engineering validator 通過稱為科學成果。"
         ),
     },
     "outputs": {
@@ -743,6 +756,60 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "圖面可重現，不等同海洋科學結果或觀測驗證。"
         ),
     },
+    "report_render": {
+        "role": "共同 staging、格式與校驗基礎；固定 report artifact 的可重現輸出邊界",
+        "inputs": (
+            "exact ReportSpec、caller 已驗證 typed products／PyArrow Table、figure callback、"
+            "明示空白 staging root 與 caption／table metadata"
+        ),
+        "outputs": (
+            "RenderedArtifact；固定 PNG／SVG／PDF、Parquet／CSV、canonical sidecar 與由實際 "
+            "bytes 建立的 ReportProductRef size／SHA-256"
+        ),
+        "entrypoints": [
+            "RenderedArtifact",
+            "ReportStagingRenderer",
+            "report_render_style_context",
+            "ReportStagingRenderer.render_figure",
+            "ReportStagingRenderer.render_table",
+        ],
+        "read_first": (
+            "共同 staging/格式/校驗基礎已完成；renderer 只負責 caller 已準備內容的固定格式、"
+            "相對路徑與 bytes 校驗，不重算科學統計、不讀 trajectory／aggregate，也不決定 final "
+            "report path。report_pipeline.py 的建置前唯讀 gate 已完成，但 F01–F12/T01–T06 專屬 "
+            "artifact adapters、build_report_release、CLI report-build 與正式 SERVER 科學發布仍未完成，"
+            "不能推定正式報告完成。"
+        ),
+    },
+    "report_validation_evidence": {
+        "role": "F12/T06 定量 evidence schema/I/O 已完成；正式科學 evidence 尚未產生",
+        "inputs": (
+            "AggregateSpec／ReportSpec canonical JSON snapshot、source run plan／threshold "
+            "snapshot 與 caller 明示的定量 metric"
+        ),
+        "outputs": (
+            "schema 1.0.0 的 immutable ValidationEvidence、七類驗證指標、canonical JSON "
+            "snapshot 與 strict read／write／validate 邊界"
+        ),
+        "entrypoints": [
+            "VALIDATION_EVIDENCE_CATEGORIES",
+            "VALIDATION_EVIDENCE_SCHEMA_VERSION",
+            "VALIDATION_METRIC_CATEGORIES",
+            "ValidationMetric",
+            "ValidationEvidence",
+            "load_validation_evidence",
+            "validate_validation_evidence",
+            "write_validation_evidence",
+        ],
+        "read_first": (
+            "pytest 通過或布林文字不是定量證據；所有 metric 必須有單位、樣本數、比較符號與"
+            "預先登錄門檻。F12/T06 定量 evidence schema/I/O 已完成，但解析解（analytic_solution）、"
+            "dt/M 收斂（timestep_convergence／member_convergence）、known-source（known_source_synthetic）、"
+            "restart（checkpoint_restart）、NumPy/Numba（numpy_numba_consistency）與"
+            "forward-validation（forward_validation）的正式 evidence 尚未產生，故 F12/T06 科學成果"
+            "仍未完成；本模組不會自行繪圖，也不代表 OCM／NWW3 科學驗證已完成。"
+        ),
+    },
     "report_material_statistics": {
         "role": "沉底漁業用具優先層的材質／底部接觸 member-level 統計",
         "inputs": "Scenario／ScenarioStratum 分層索引與一次串流的 ParticleResult",
@@ -757,6 +824,164 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "正文優先層是 fishing gear × near_bed；此定性優先順序不改速度或來源先驗。"
             " BED_CONTACT／DEPOSITED 以 member 去重，基線只報首次接觸／假設沉積，不含再懸浮或"
             " repeated-contact 動力；其他材質與水層仍須保留。"
+        ),
+    },
+    "report_matrix_statistics": {
+        "role": "建立停止結果與方向性跨站連通的不可變報告統計",
+        "inputs": (
+            "AggregateReleasePayload 中完整的停止狀態、source→target 跨站 raw count、"
+            "total／valid member 分母與失敗網格"
+        ),
+        "outputs": (
+            "OutcomeStatistics、ConnectivityStatistics；保留 raw count、兩種分母、比例狀態、"
+            "方向性 site axis 與對角線不適用遮罩"
+        ),
+        "entrypoints": [
+            "OutcomeStatistics",
+            "ConnectivityStatistics",
+            "build_outcome_statistics",
+            "build_connectivity_statistics",
+        ],
+        "read_first": (
+            "跨站矩陣的列是來源站、欄是目標站；visit fraction 使用來源站有效 member 分母，"
+            "event share 使用同一來源列的跨站事件分母。DATA_GAP／NUMERICAL_FAILURE 只留在"
+            "停止與失敗曝光診斷，不得補零後混入條件式來源母體。"
+        ),
+    },
+    "report_source_receptor_statistics": {
+        "role": "建立來源段—受體的條件式比例、事件占比與旅行年齡統計",
+        "inputs": (
+            "AggregateReleasePayload 的 source-receptor raw count、受體有效 member 分母、"
+            "秒制旅行年齡 histogram 與 ReportSpec policy"
+        ),
+        "outputs": (
+            "SourceReceptorStatistics、SourceReceptorStatistic 與 TravelAgeStatistics；"
+            "保留 raw numerator／denominator、分箱中點分位數與不可用狀態"
+        ),
+        "entrypoints": [
+            "SourceReceptorStatistics",
+            "SourceReceptorStatistic",
+            "TravelAgeStatistics",
+            "build_source_receptor_statistics",
+        ],
+        "read_first": (
+            "條件式比例以同站同受體的有效 member 為分母，event share 則以同受體同邊界類別"
+            "的事件總數為分母；兩者語意不同。旅行年齡軸固定為 (age_bin,) 秒制分箱，零分母"
+            "或缺列不能用 0 取代，結果仍只代表條件式來源足跡／相對來源權重。"
+        ),
+    },
+    "report_statistics": {
+        "role": "組合 renderer 可直接讀取的不可變報告統計 facade",
+        "inputs": (
+            "exact AggregateReleasePayload 與 ReportSpec，或已驗證的 matrix、source-receptor、"
+            "pathway、KDE 與 material typed products"
+        ),
+        "outputs": "ReportStatistics 與固定名稱的唯讀 products index",
+        "entrypoints": ["ReportStatistics", "build_report_statistics"],
+        "read_first": (
+            "統一報告介面（facade）在綁定來源時，將核心及路徑產品與來源聚合資料逐欄核對，"
+            "包含完整原始計數、分母、座標軸與規格政策；核密度估計（KDE）只依來源單次建立。"
+            "材料與外部 KDE 只能走無執行批次身分的純產品（pure-products）入口。"
+            "不從軌跡重算、不接受繪圖端臨時更改分母、分位數或平滑帶寬，也不負責繪圖、"
+            "附屬說明檔、成果檔寫入或報告發布。"
+        ),
+    },
+    "report_comparison_statistics": {
+        "role": "F11/T05 exact compatibility 與核心差值的純計算產品",
+        "inputs": (
+            "兩份各自帶有 AggregateReleasePayload／ReportSpec 的 ReportStatistics，"
+            "以及 caller 明示的單一物理參數差異"
+        ),
+        "outputs": (
+            "ReportComparisonStatistics；outcome、connectivity、source-receptor、pathway、"
+            "HDR 差值；材質（material）來源核對尚未完成，目前不提供材質差值"
+        ),
+        "entrypoints": [
+            "ComparisonHDRStatus",
+            "ComparisonParameterDifference",
+            "ComparisonRatioDifference",
+            "ComparisonScalarDifference",
+            "ReportComparisonStatistics",
+            "build_report_comparison_statistics",
+        ],
+        "read_first": (
+            "先核對 run、site／scenario／receptor／arrival／material、geometry、age／KDE／"
+            "pathway 軸與報告政策的 exact compatibility，再計算 comparison 減 baseline；"
+            "zero／unavailable 不補 0。F11/T05 的 exact compatibility 與核心差值純計算已完成；"
+            "比較只接受來源綁定的統計介面，材質的逐粒子來源核對尚未完成，因此目前不提供"
+            "材質差值，不能宣稱全部差值可用。"
+            "comparison release I/O、artifact adapter、pipeline/render 整合與真實 sensitivity cases "
+            "尚未完成，不能稱 F11/T05 科學成果完成。"
+        ),
+    },
+    "report_pipeline": {
+        "role": "report_pipeline.py 建置前唯讀 gate 已完成；完整 report pipeline 尚未完成",
+        "inputs": (
+            "complete run、aggregate release／AggregateSpec、ReportSpec、MPLCONFIGDIR、固定 output "
+            "與可選 comparison／validation evidence"
+        ),
+        "outputs": (
+            "immutable ReportBuildPreflight；保存 typed identity、schema、SHA-256、flags 與絕對 Path，"
+            "不建立 JSON、圖表、staging 或 final report"
+        ),
+        "entrypoints": ["ReportBuildPreflight", "preflight_report_build"],
+        "read_first": (
+            "建置前唯讀 gate 已完成：會檢查 complete run、aggregate/spec binding、formal trajectory "
+            "v2、MPLCONFIGDIR、output/evidence policy 與固定 output；不讀 raw NetCDF、不產生圖表、不建立 "
+            "partial。build_report_release、F01–F12/T01–T06 專屬 artifact adapters、CLI report-build "
+            "與正式 SERVER 科學發布仍未完成，不能把 preflight 稱為完整 pipeline。comparison aggregate "
+            "的精確 compatibility matrix 仍由 report_comparison_statistics 負責。"
+        ),
+    },
+    "report_trajectory_stream": {
+        "role": "以一次 bounded trajectory stream 同步建立有效 pathway、環境、材質與代表軌跡 products",
+        "inputs": (
+            "已驗證 ParticleResult shard iterator、AggregateSpec、ReportSpec 與完整 ScenarioStratum "
+            "identity index"
+        ),
+        "outputs": (
+            "TrajectoryStreamStatistics；包含 EnvironmentCompletenessStatistics、材質統計、"
+            "有效 pathway 與固定容量 representative selection"
+        ),
+        "entrypoints": [
+            "EnvironmentCompletenessSiteStatistics",
+            "EnvironmentCompletenessStatistics",
+            "EnvironmentCompletenessAccumulator",
+            "build_environment_completeness_statistics",
+            "TrajectoryStreamStatistics",
+            "TrajectoryReportAccumulator",
+            "build_trajectory_stream_statistics",
+        ],
+        "read_first": (
+            "完整 shard 依 immutable run plan 順序交給 add_shard；只把有效 member 送入 pathway，"
+            "DATA_GAP／NUMERICAL_FAILURE 不得補零或混入有效分母。此模組只保存 bounded typed "
+            "products，不代表 renderer、完整 report pipeline 或正式科學成果已完成。"
+        ),
+    },
+    "report_release": {
+        "role": "report-v1 source binding、fixed topology 與 atomic writer／reader／validator",
+        "inputs": (
+            "caller 明示的 ReportRegistry、aggregate／run／spec source snapshot 與已產生的普通 "
+            "figure、table、caption、data sidecar files"
+        ),
+        "outputs": (
+            "同父 sibling 的 immutable report-v1 release、exact manifest／checksum 與固定 "
+            "JSON-safe validation report"
+        ),
+        "entrypoints": [
+            "ReportRelease",
+            "ReportReleaseWriter",
+            "read_report_registry",
+            "read_report_release",
+            "validate_report_release",
+            "write_report_release",
+        ],
+        "read_first": (
+            "writer 只封裝 caller 已建立的 products，先完成 source binding、registry closure、"
+            "exact inventory 與 self-validation 才 atomic rename；reader／validator 唯讀且不追隨 "
+            "symlink。report_pipeline.py 的建置前唯讀 gate 已完成，但 build_report_release、F01–F12/"
+            "T01–T06 專屬 artifact adapters、CLI report-build 與正式 SERVER 科學發布仍未完成；"
+            "synthetic engineering release 也不是 OCM／NWW 科學成果。"
         ),
     },
 }
@@ -812,6 +1037,10 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "engine", "target": "outputs", "label": "ParticleResult"},
     {"source": "production", "target": "outputs", "label": "ordered result stream"},
     {"source": "outputs", "target": "report_material_statistics", "label": "ParticleResult stream"},
+    {"source": "production", "target": "report_trajectory_stream", "label": "complete ParticleResult iterator"},
+    {"source": "aggregate_spec", "target": "report_trajectory_stream", "label": "metric grid／age bins"},
+    {"source": "report_spec", "target": "report_trajectory_stream", "label": "selection／low-sample policy"},
+    {"source": "report_trajectory_stream", "target": "report_statistics", "label": "material／pathway products"},
     {"source": "outputs", "target": "event_aggregation", "label": "validated events"},
     {"source": "outputs", "target": "streaming_aggregation", "label": "trajectory stream"},
     {"source": "aggregate_spec", "target": "event_aggregation", "label": "event topology"},
@@ -826,12 +1055,31 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "aggregate_release_payload", "target": "aggregate_release_codec", "label": "encode／decode"},
     {"source": "aggregate_release_codec", "target": "aggregate_release", "label": "tables／arrays"},
     {"source": "aggregate_release", "target": "report_spec", "label": "validated aggregate"},
+    {"source": "aggregate_release", "target": "report_release", "label": "source snapshots"},
+    {"source": "report_spec", "target": "report_release", "label": "report spec snapshot"},
+    {"source": "report_records", "target": "report_release", "label": "registry／product identity"},
+    {"source": "report_statistics", "target": "report_release", "label": "caller report products"},
+    {"source": "cli", "target": "report_release", "label": "report-validate"},
+    {"source": "aggregate_release", "target": "report_matrix_statistics", "label": "outcome／cross-site counts"},
+    {"source": "aggregate_release", "target": "report_source_receptor_statistics", "label": "source-receptor／age histograms"},
+    {"source": "aggregate_release", "target": "report_statistics", "label": "immutable payload binding"},
     {"source": "aggregate_release", "target": "report_ratio_statistics", "label": "counts／age histograms"},
     {"source": "aggregate_release", "target": "report_pathway_statistics", "label": "pathway products"},
     {"source": "aggregate_release", "target": "report_kde_statistics", "label": "event grids"},
     {"source": "report_spec", "target": "report_kde_statistics", "label": "KDE／低樣本 policy"},
+    {"source": "report_spec", "target": "report_source_receptor_statistics", "label": "quantile／低樣本 policy"},
+    {"source": "report_spec", "target": "report_statistics", "label": "facade policy binding"},
+    {"source": "aggregate_release_payload", "target": "report_comparison_statistics", "label": "exact run／axis binding"},
+    {"source": "report_spec", "target": "report_comparison_statistics", "label": "policy compatibility"},
+    {"source": "report_statistics", "target": "report_comparison_statistics", "label": "baseline／comparison typed products"},
+    {"source": "report_comparison_statistics", "target": "report_records", "label": "F11/T05 comparison products"},
     {"source": "report_spec", "target": "report_trajectory_selection", "label": "K／8 strata policy"},
     {"source": "report_trajectory_identity", "target": "report_trajectory_selection", "label": "identity／priority"},
+    {"source": "report_matrix_statistics", "target": "report_statistics", "label": "outcome／connectivity products"},
+    {"source": "report_source_receptor_statistics", "target": "report_statistics", "label": "source-receptor products"},
+    {"source": "report_pathway_statistics", "target": "report_statistics", "label": "pathway products"},
+    {"source": "report_kde_statistics", "target": "report_statistics", "label": "KDE／HDR products"},
+    {"source": "report_material_statistics", "target": "report_statistics", "label": "optional material product"},
     {"source": "report_ratio_statistics", "target": "report_records", "label": "ratio products"},
     {"source": "report_pathway_statistics", "target": "report_records", "label": "pathway products"},
     {"source": "report_kde_statistics", "target": "report_records", "label": "KDE／HDR products"},
@@ -841,6 +1089,20 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "report_font", "target": "report_style", "label": "CJK font selection"},
     {"source": "report_spec", "target": "report_style", "label": "renderer policy"},
     {"source": "report_style", "target": "report_records", "label": "style provenance"},
+    {"source": "report_spec", "target": "report_render", "label": "renderer policy"},
+    {"source": "report_style", "target": "report_render", "label": "style／font provenance"},
+    {"source": "report_records", "target": "report_render", "label": "record／product contract"},
+    {"source": "report_statistics", "target": "report_render", "label": "typed report products"},
+    {"source": "report_render", "target": "report_release", "label": "staged artifacts"},
+    {"source": "run_validation", "target": "report_pipeline", "label": "complete run／trajectory schema gate"},
+    {"source": "aggregate_release", "target": "report_pipeline", "label": "aggregate release identity"},
+    {"source": "report_spec", "target": "report_pipeline", "label": "ReportSpec／AggregateSpec binding"},
+    {"source": "report_validation_evidence", "target": "report_pipeline", "label": "validation evidence policy"},
+    {"source": "report_pipeline", "target": "report_release", "label": "preflight → future build_report_release"},
+    {"source": "aggregate_spec", "target": "report_validation_evidence", "label": "canonical snapshot／SHA"},
+    {"source": "report_spec", "target": "report_validation_evidence", "label": "canonical snapshot／SHA"},
+    {"source": "run_control", "target": "report_validation_evidence", "label": "source run plan snapshot"},
+    {"source": "report_validation_evidence", "target": "report_records", "label": "F12/T06 evidence"},
     {"source": "report_material_statistics", "target": "aggregation", "label": "材質 member 統計"},
     {"source": "checkpoint", "target": "run_validation", "label": "checkpoint binding"},
     {"source": "outputs", "target": "run_validation", "label": "shard checksum"},

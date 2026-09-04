@@ -7,7 +7,17 @@ spec、payload 與 release API 只保存公尺制／秒制的條件式來源足�
 synthetic 測試不等於真實 OCM／NWW3 科學成果。report spec 只登錄 renderer、抽樣與
 垂向 positive-down 分箱的可重現設定；report records 則把 synthetic、SERVER pilot、
 SERVER formal baseline 與 SERVER scientific evidence 分開，不能因 registry 或 hash
-契約通過就把本機工程 smoke 誤認為正式海洋科學證據。
+契約通過就把本機工程 smoke 誤認為正式海洋科學證據。套件根目錄另公開停止結果、
+方向性跨站連通、來源段—受體與統一報告統計 facade，以及有效成員 pathway／環境／
+材質／代表軌跡的一次串流 typed API；這些 API 只組合已驗證 payload 與比例產品，
+不在統計層繪圖。report-v1 的 ``ReportRelease``、atomic writer、reader 與 validator
+已完成，可對 caller 明示的 products 做來源綁定、固定拓撲與唯讀完整性驗證；共同
+staging/格式/校驗基礎已完成，``report_render.py`` 提供固定格式、canonical sidecar、
+實際 bytes size／SHA-256 與 immutable staging view。這仍不代表任何 F/T 科學內容已
+產生：``report_pipeline.py`` 的建置前唯讀 gate 已完成，涵蓋 complete run、aggregate/spec
+binding、formal trajectory v2、MPLCONFIGDIR 與 output/evidence policy；但
+``build_report_release``、F01–F12/T01–T06 專屬 artifact adapters、CLI ``report-build``
+與正式 SERVER 科學發布仍未完成，不能把 preflight 稱為完整 pipeline 或推定正式報告完成。
 """
 
 from .aggregate_pipeline import build_aggregate_release_payload
@@ -128,6 +138,14 @@ from .production import (
     run_production_shard,
 )
 from .provenance import CodeProvenance, collect_code_provenance
+from .report_comparison_statistics import (
+    ComparisonHDRStatus,
+    ComparisonParameterDifference,
+    ComparisonRatioDifference,
+    ComparisonScalarDifference,
+    ReportComparisonStatistics,
+    build_report_comparison_statistics,
+)
 from .report_material_statistics import (
     FISHING_GEAR_MATERIAL_ID,
     MaterialStatistics,
@@ -137,6 +155,13 @@ from .report_material_statistics import (
     MaterialStatisticsSummary,
     build_material_statistics,
 )
+from .report_matrix_statistics import (
+    ConnectivityStatistics,
+    OutcomeStatistics,
+    build_connectivity_statistics,
+    build_outcome_statistics,
+)
+from .report_pipeline import ReportBuildPreflight, preflight_report_build
 from .report_records import (
     REPORT_COMPARISON_ARTIFACT_IDS,
     REPORT_CORE_ARTIFACT_IDS,
@@ -148,12 +173,51 @@ from .report_records import (
     ReportProductRef,
     ReportRegistry,
 )
+from .report_release import (
+    ReportRelease,
+    ReportReleaseWriter,
+    read_report_registry,
+    read_report_release,
+    validate_report_release,
+    write_report_release,
+)
+from .report_render import (
+    RenderedArtifact,
+    ReportStagingRenderer,
+    report_render_style_context,
+)
+from .report_source_receptor_statistics import (
+    SourceReceptorStatistic,
+    SourceReceptorStatistics,
+    TravelAgeStatistics,
+    build_source_receptor_statistics,
+)
 from .report_spec import (
     REPORT_SPEC_SCHEMA_VERSION,
     ReportSpec,
     load_report_spec,
     validate_report_spec_against_aggregate_spec,
     write_report_spec,
+)
+from .report_statistics import ReportStatistics, build_report_statistics
+from .report_trajectory_stream import (
+    EnvironmentCompletenessAccumulator,
+    EnvironmentCompletenessSiteStatistics,
+    EnvironmentCompletenessStatistics,
+    TrajectoryReportAccumulator,
+    TrajectoryStreamStatistics,
+    build_environment_completeness_statistics,
+    build_trajectory_stream_statistics,
+)
+from .report_validation_evidence import (
+    VALIDATION_EVIDENCE_CATEGORIES,
+    VALIDATION_EVIDENCE_SCHEMA_VERSION,
+    VALIDATION_METRIC_CATEGORIES,
+    ValidationEvidence,
+    ValidationMetric,
+    load_validation_evidence,
+    validate_validation_evidence,
+    write_validation_evidence,
 )
 from .run_control import (
     RunController,
@@ -196,6 +260,14 @@ __all__ = [
     "BoundaryGeometryBundle",
     "CheckpointBinding",
     "CodeProvenance",
+    "ComparisonHDRStatus",
+    "ComparisonParameterDifference",
+    "ComparisonRatioDifference",
+    "ComparisonScalarDifference",
+    "ConnectivityStatistics",
+    "EnvironmentCompletenessAccumulator",
+    "EnvironmentCompletenessSiteStatistics",
+    "EnvironmentCompletenessStatistics",
     "EnvironmentSampleStatus",
     "EngineSettings",
     "EXPERIMENT_CASE_INCLUDE_STOKES",
@@ -218,6 +290,7 @@ __all__ = [
     "ManagedSpatialDiffusionProvider",
     "MissingForcingMonth",
     "Observation",
+    "OutcomeStatistics",
     "PARTICLE_CODE_TO_STATUS",
     "PARTICLE_STATUS_TO_CODE",
     "PAIR_SAMPLE_SCHEMA",
@@ -248,6 +321,9 @@ __all__ = [
     "REPORT_SPEC_SCHEMA_VERSION",
     "REPORT_TABLE_IDS",
     "REPORT_VALIDATION_ARTIFACT_IDS",
+    "VALIDATION_EVIDENCE_CATEGORIES",
+    "VALIDATION_EVIDENCE_SCHEMA_VERSION",
+    "VALIDATION_METRIC_CATEGORIES",
     "FISHING_GEAR_MATERIAL_ID",
     "MaterialStatistics",
     "MaterialStatisticsAccumulator",
@@ -255,9 +331,16 @@ __all__ = [
     "MaterialStatisticsResult",
     "MaterialStatisticsSummary",
     "ReportArtifactRecord",
+    "ReportBuildPreflight",
+    "ReportComparisonStatistics",
+    "ReportRelease",
+    "ReportReleaseWriter",
     "ReportProductRef",
     "ReportRegistry",
+    "RenderedArtifact",
     "ReportSpec",
+    "ReportStagingRenderer",
+    "ReportStatistics",
     "ReceptorArrivalInitialCondition",
     "RunController",
     "RunExecutionSummary",
@@ -267,7 +350,14 @@ __all__ = [
     "ScenarioShard",
     "ScenarioInputs",
     "SampleQC",
+    "SourceReceptorStatistic",
+    "SourceReceptorStatistics",
     "SpatialDiffusionProvider",
+    "TravelAgeStatistics",
+    "TrajectoryReportAccumulator",
+    "TrajectoryStreamStatistics",
+    "ValidationEvidence",
+    "ValidationMetric",
     "ValidatedRunStaticInputs",
     "VelocitySample",
     "advance_particle_once",
@@ -275,9 +365,17 @@ __all__ = [
     "apply_scenario_selection",
     "benchmark_report",
     "build_aggregate_release_payload",
+    "build_connectivity_statistics",
+    "build_environment_completeness_statistics",
     "build_input_derivatives",
     "build_material_statistics",
+    "build_outcome_statistics",
     "build_full_scenario_selection",
+    "build_report_comparison_statistics",
+    "preflight_report_build",
+    "build_report_statistics",
+    "build_source_receptor_statistics",
+    "build_trajectory_stream_statistics",
     "brownian_displacement",
     "checkpoint_input_binding_hash",
     "canonical_scenario_ids_sha256",
@@ -303,6 +401,7 @@ __all__ = [
     "load_receptor_arrival_initial_condition_manifest",
     "load_receptor_manifest",
     "load_report_spec",
+    "load_validation_evidence",
     "load_scenario_inputs",
     "load_validated_run_static_inputs",
     "resolve_manifest_path",
@@ -313,6 +412,9 @@ __all__ = [
     "read_aggregate_release",
     "read_canonical_json",
     "read_pilot_calibration",
+    "read_report_registry",
+    "read_report_release",
+    "report_render_style_context",
     "run_particle",
     "run_production_shard",
     "read_trajectory_shard",
@@ -324,7 +426,9 @@ __all__ = [
     "smagorinsky_horizontal_diffusivity",
     "validate_aggregate_release",
     "validate_aggregate_spec_against_boundaries",
+    "validate_report_release",
     "validate_report_spec_against_aggregate_spec",
+    "validate_validation_evidence",
     "validate_run",
     "validate_input_derivatives",
     "validate_pilot_calibration",
@@ -335,7 +439,9 @@ __all__ = [
     "write_execution_checkpoint",
     "write_aggregate_release",
     "write_aggregate_spec_from_boundaries",
+    "write_report_release",
     "write_report_spec",
+    "write_validation_evidence",
     "write_canonical_json",
     "build_pilot_calibration",
 ]

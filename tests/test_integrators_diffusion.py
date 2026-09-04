@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -64,6 +66,198 @@ def test_rk4_calls_all_four_stages() -> None:
     result = rk4_step(_state(), dt_seconds=10.0, velocity=velocity)
     assert len(calls) == 4
     assert np.isclose(result.x_m, 50.0)
+
+
+def test_rk4_rotation_field_closes_after_forward_and_reverse_steps() -> None:
+    """旋轉場以正、負 signed ``dt`` 往返後，位置應在明定公尺誤差內閉合。
+
+    測試場為二維剛體旋轉 ``u=-omega*y``、``v=omega*x``，其中座標是 m、速度是 m/s、
+    ``omega=0.1 s^-1``、每一步 ``dt=1 s``。經典四階 Runge-Kutta 並非精確可逆，因此
+    容許正向再反向一個步長的殘差不超過 ``1e-7 m``；時間必須精確回到原本的 UTC ns。
+    ``age_seconds`` 是累計經過量而非可逆座標，往返後預期為 ``2 s``。
+    """
+
+    initial = replace(_state(), x_m=1.0, y_m=4.0)
+    omega_per_s = 0.1
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """回傳不依時間變化的剛體旋轉速度；z 軸維持靜止以隔離水平閉合。"""
+
+        del z_m, time_utc_ns
+        return VelocitySample(
+            -omega_per_s * y_m,
+            omega_per_s * x_m,
+            0.0,
+            0.0,
+            -100.0,
+            1_000.0,
+            1.0,
+        )
+
+    forward = rk4_step(initial, dt_seconds=1.0, velocity=velocity)
+    round_trip = rk4_step(forward, dt_seconds=-1.0, velocity=velocity)
+    assert np.allclose(
+        [round_trip.x_m, round_trip.y_m, round_trip.z_m],
+        [initial.x_m, initial.y_m, initial.z_m],
+        rtol=0.0,
+        atol=1e-7,
+    )
+    assert round_trip.time_utc_ns == initial.time_utc_ns
+    assert round_trip.age_seconds == 2.0
+
+
+def test_rk4_spatial_shear_field_closes_after_forward_and_reverse_steps() -> None:
+    """空間剪切場的正向與反向 RK4 步驟應閉合，且 stage 位置確實會被重新取樣。
+
+    採用 ``u=gamma*y``、``v=0`` 的水平剪切場；``gamma=0.35 s^-1`` 與 ``y``（m）相乘
+    產生 m/s。這個解析場的 y 不變、x 線性漂移，所以正向 ``dt=2 s`` 後再以 ``-2 s``
+    回溯理論上精確回到步首；浮點運算的位置殘差容許 ``1e-12 m``。另外記錄八次 stage
+    取樣，確認至少有一個 stage 看到已更新的 x 座標，而非每次都重用步首位置。
+    """
+
+    initial = replace(_state(), x_m=1.0, y_m=4.0)
+    gamma_per_s = 0.35
+    sampled_positions: list[tuple[float, float]] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """記錄每個 RK4 stage 的水平位置，並回傳單純剪切速度。"""
+
+        del z_m, time_utc_ns
+        sampled_positions.append((x_m, y_m))
+        return VelocitySample(
+            gamma_per_s * y_m,
+            0.0,
+            0.0,
+            0.0,
+            -100.0,
+            1_000.0,
+            1.0,
+        )
+
+    forward = rk4_step(initial, dt_seconds=2.0, velocity=velocity)
+    round_trip = rk4_step(forward, dt_seconds=-2.0, velocity=velocity)
+    assert np.allclose(
+        [round_trip.x_m, round_trip.y_m, round_trip.z_m],
+        [initial.x_m, initial.y_m, initial.z_m],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    assert round_trip.time_utc_ns == initial.time_utc_ns
+    assert round_trip.age_seconds == 4.0
+    assert len(sampled_positions) == 8
+    assert any(abs(x_m - initial.x_m) > 0.0 for x_m, _ in sampled_positions[1:4])
+
+
+def test_rk4_has_fourth_order_convergence_for_position_and_time_dependent_field() -> None:
+    """用有解析解的 ``x'=x/tau+a*t`` 驗證全域四階收斂與每 stage 的時空取樣。
+
+    ``x`` 是 m、時間是 s、速度是 m/s；取 ``tau=1 s``、``a=1 m/s²``、初值
+    ``x(0)=1 m``，故解析解為 ``x(t)=2*exp(t)-t-1 m``。先以一個 ``0.75 s`` 步驟
+    逐一核對四個 stage 的 x（m）與 UTC ns，再用 4、8、16、32 個等距正向步驟計算
+    ``t=1 s`` 的誤差。相鄰加倍解析誤差的觀察階數需大於 3.5（理想值 4），且最後誤差
+    以 ``2e-7 m`` 作為絕對數值上限；這些門檻同時避免把「只取步首位置／時間」誤判為
+    合格的四階實作。
+    """
+
+    start_ns = _state().time_utc_ns
+    tau_seconds = 1.0
+    acceleration_mps2 = 1.0
+    initial_x_m = 1.0
+
+    def make_state() -> ParticleState:
+        """建立固定 UTC 起點與解析初值，其他欄位保持可積分的有效水域資訊。"""
+
+        return ParticleState(
+            particle_id="analytic",
+            scenario_id="rk4_order",
+            member_id=0,
+            study_site_id="synthetic",
+            analysis_region_id="A",
+            receptor_id="r0",
+            x_m=initial_x_m,
+            y_m=0.0,
+            z_m=-10.0,
+            time_utc_ns=start_ns,
+        )
+
+    stage_calls: list[tuple[float, float, float, int]] = []
+
+    def velocity_with_trace(
+        x_m: float, y_m: float, z_m: float, time_utc_ns: int
+    ) -> VelocitySample:
+        """以收到的 stage 位置與 UTC 時間計算 m/s，並保存取樣順序供契約檢查。"""
+
+        elapsed_seconds = (time_utc_ns - start_ns) / 1_000_000_000
+        stage_calls.append((x_m, y_m, z_m, time_utc_ns))
+        return VelocitySample(
+            x_m / tau_seconds + acceleration_mps2 * elapsed_seconds,
+            0.0,
+            0.0,
+            0.0,
+            -100.0,
+            1_000.0,
+            1.0,
+        )
+
+    stage_dt_seconds = 0.75
+    one_step = rk4_step(make_state(), dt_seconds=stage_dt_seconds, velocity=velocity_with_trace)
+    assert len(stage_calls) == 4
+    expected_stage_times = [
+        start_ns,
+        start_ns + 375_000_000,
+        start_ns + 375_000_000,
+        start_ns + 750_000_000,
+    ]
+    expected_stage_x = [1.0, 1.375, 1.65625, 2.5234375]
+    assert [call[3] for call in stage_calls] == expected_stage_times
+    assert np.allclose(
+        [call[0] for call in stage_calls], expected_stage_x, rtol=0.0, atol=1e-12
+    )
+    assert np.allclose(
+        [call[1] for call in stage_calls], 0.0, rtol=0.0, atol=1e-15
+    )
+    assert np.allclose(
+        [call[2] for call in stage_calls], -10.0, rtol=0.0, atol=1e-15
+    )
+    assert one_step.time_utc_ns == start_ns + 750_000_000
+
+    def integrate(step_count: int) -> tuple[float, ParticleState]:
+        """以指定步數完成 1 s 正向積分，回傳 m 誤差與最終狀態。"""
+
+        state = make_state()
+        dt_seconds = 1.0 / step_count
+
+        def velocity(
+            x_m: float, y_m: float, z_m: float, time_utc_ns: int
+        ) -> VelocitySample:
+            """在每個步驟的四個 stage 重新使用 m 與 UTC ns 計算 m/s。"""
+
+            elapsed_seconds = (time_utc_ns - start_ns) / 1_000_000_000
+            return VelocitySample(
+                x_m / tau_seconds + acceleration_mps2 * elapsed_seconds,
+                0.0,
+                0.0,
+                0.0,
+                -100.0,
+                1_000.0,
+                1.0,
+            )
+
+        for _ in range(step_count):
+            state = rk4_step(state, dt_seconds=dt_seconds, velocity=velocity)
+        exact_x_m = (initial_x_m + acceleration_mps2 * tau_seconds**2) * np.exp(
+            1.0 / tau_seconds
+        ) - acceleration_mps2 * tau_seconds * 1.0 - acceleration_mps2 * tau_seconds**2
+        return abs(state.x_m - exact_x_m), state
+
+    step_counts = np.array([4, 8, 16, 32], dtype=np.int64)
+    errors_m, final_states = zip(*(integrate(int(count)) for count in step_counts), strict=True)
+    errors = np.asarray(errors_m, dtype=np.float64)
+    observed_orders = np.log2(errors[:-1] / errors[1:])
+    assert np.all(observed_orders > 3.5)
+    assert errors[-1] < 2.0e-7
+    assert all(state.time_utc_ns == start_ns + 1_000_000_000 for state in final_states)
+    assert all(state.age_seconds == 1.0 for state in final_states)
 
 
 def test_brownian_variance_matches_2kdt() -> None:

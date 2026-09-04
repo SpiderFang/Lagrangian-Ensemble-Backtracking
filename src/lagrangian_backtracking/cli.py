@@ -6,11 +6,13 @@ CLI 只接受明示路徑或環境變數，不把本機／SERVER 絕對路徑寫
 建立 pilot 或 formal workspace 並立即做只讀驗證；run-shard 先驗證 workspace，再依
 immutable plan 選擇 runtime mode 與 forcing root；run-reconcile 僅採認 checkpoint／progress
 狀態，不建立物理 request，也不啟動 forcing。aggregate-spec-create、aggregate-build、
-aggregate-validate 與 report-spec-create 分別負責建立公尺制格網／秒制 age 規格、串流
-建立並原子發布 aggregate release、輸出固定 JSON-safe release 驗證報告，以及建立不讀取
-source run 的報告 renderer 規格。aggregate／report 流程只保存條件式來源足跡或相對來源
-權重的工程統計；本機 synthetic 測試不是 OCM／NWW 科學成果，也不能取代 SERVER 正式
-資料驗收。
+aggregate-validate、report-spec-create 與 report-validate 分別負責建立公尺制格網／秒制
+age 規格、串流建立並原子發布 aggregate release、輸出固定 JSON-safe aggregate 驗證報告、
+建立不讀取 source run 的報告 renderer 規格，以及唯讀驗證 caller 明示的既有 report-v1
+release。report-spec-create 只產生報告規格，不建立報告成果；report-validate 只驗證既有
+release，不猜測路徑、不建立或修改任何產品。aggregate／report 流程只保存條件式來源足跡
+或相對來源權重的工程統計；本機 synthetic 測試不是 OCM／NWW 科學成果，也不能取代 SERVER
+正式資料驗收。
 pilot-config-create／pilot-config-validate 只負責把完整 calibration candidate 綁定到
 generated pilot execution YAML；它不建立軌跡、不把設定升為 approved，也不把任何 SERVER
 或 synthetic 輸入宣稱為科學成果。
@@ -66,6 +68,7 @@ from .pilot_config import (
 )
 from .preflight import run_preflight
 from .provenance import collect_code_provenance
+from .report_release import validate_report_release
 from .report_spec import (
     load_report_spec,
     validate_report_spec_against_aggregate_spec,
@@ -449,6 +452,21 @@ def _aggregate_validate_parser() -> argparse.ArgumentParser:
     """建立 aggregate release 唯讀驗證 parser。"""
 
     parser = argparse.ArgumentParser(description="驗證 final aggregate release")
+    parser.add_argument("release", type=Path)
+    return parser
+
+
+def _report_validate_parser() -> argparse.ArgumentParser:
+    """建立 report-v1 release 唯讀驗證 parser。
+
+    ``release`` 必須由 caller 明示為唯一位置參數；CLI 不接受隱含的工作目錄、
+    自動搜尋結果或推測出的 sibling 路徑，才能讓 validator 的輸入與 runbook、
+    checksum 證據保持一一對應。此 parser 只負責將文字轉成 ``Path``，不讀取、
+    建立或修改 release 內容；實際的 no-follow I/O 與固定 JSON-safe 錯誤收斂由
+    ``validate_report_release`` 負責。
+    """
+
+    parser = argparse.ArgumentParser(description="驗證 final report-v1 release")
     parser.add_argument("release", type=Path)
     return parser
 
@@ -1467,6 +1485,23 @@ def run_aggregate_validate(argv: Sequence[str] | None = None) -> int:
     return 0 if isinstance(report, Mapping) and report.get("valid") is True else 2
 
 
+def run_report_validate(argv: Sequence[str] | None = None) -> int:
+    """原樣輸出 report-v1 release 的 pretty、sorted、UTF-8 validator report。
+
+    validator 已把 report release 的 topology、exact inventory、檔案大小／SHA-256、
+    ReportRegistry closure 與 source binding 失敗收斂為不含路徑及底層例外的 JSON-safe
+    報告；handler 因此只解析 caller 明示的 release、呼叫 validator 並原樣序列化回傳。
+    ``valid`` 僅在嚴格等於 ``True`` 時映射為 shell 狀態 0，其他固定失敗報告映射為
+    狀態 2。這個命令是唯讀工程驗證，不把 local synthetic release 宣稱為 OCM／NWW
+    科學成果，也不修改輸入或建立任何輸出檔案。
+    """
+
+    args = _report_validate_parser().parse_args(argv)
+    report = validate_report_release(args.release)
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if isinstance(report, Mapping) and report.get("valid") is True else 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """整合 ``lbt`` 子命令；未知命令由 argparse 以狀態 2 拒絕。"""
 
@@ -1546,6 +1581,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parents=[_report_spec_create_parser()],
         add_help=False,
     )
+    subparsers.add_parser(
+        "report-validate",
+        parents=[_report_validate_parser()],
+        add_help=False,
+    )
     parsed, remainder = parser.parse_known_args(argv)
     # 重新交給共用 handler 解析完整參數，確保獨立與整合 entry point 行為一致。
     command_argv = list(argv if argv is not None else sys.argv[1:])[1:]
@@ -1595,6 +1635,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_aggregate_validate(command_argv)
     if parsed.command == "report-spec-create":
         return run_report_spec_create(command_argv)
+    if parsed.command == "report-validate":
+        return run_report_validate(command_argv)
     parser.error(f"未知命令：{parsed.command}; 其餘參數={remainder}")
     return 2
 

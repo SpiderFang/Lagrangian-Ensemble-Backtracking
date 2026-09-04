@@ -15,6 +15,7 @@ from lagrangian_backtracking.forcing import (
 from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.mesh import NativeMesh, _build_triangle_neighbors, triangulate_faces
 from lagrangian_backtracking.models import SampleQC
+from lagrangian_backtracking.stokes import finite_depth_stokes
 
 
 def _triangle_mesh() -> NativeMesh:
@@ -655,3 +656,132 @@ def test_smagorinsky_caches_unique_node_columns_per_time_slice() -> None:
     )
     assert sample.valid
     assert sorted(calls) == [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3)]
+
+
+def test_combined_forcing_sums_3d_ocm_stokes_and_strict_sinking_without_windage() -> None:
+    """驗證三維 OCM、非零 NWW3 Stokes 與嚴格負沉降速度的解析三分量合成。
+
+    OCM 測試場在公尺座標 ``(x,y,z)`` 與秒單位時間上各自為線性函式，因此三角形水平
+    形函數、垂向夾層及時間內插都能得到解析值。NWW3 則提供非零有效波高與斜向來波，
+    由有限水深 Stokes 公式產生兩個水平分量。粒子位於 ``-4 m``，嚴格低於海面 ``0 m``
+    且高於海床 ``-10 m``，所以這個測試驗證的是完全浸沒粒子：水平只含 OCM current
+    加 Stokes，垂向只把嚴格小於零的沉降速度加到 OCM ``w``，不得偷偷加入風致漂移。
+
+    單位與容許誤差：位置是 m、速度是 m/s、時間是 UTC ns；解析合成以 ``rtol=1e-12``
+    與 ``atol=1e-12 m/s`` 比較。``settling_velocity_mps=-0.07`` 明確代表向下速度，
+    而不是零值或未定義的浮力項。
+    """
+
+    mesh = _triangle_mesh()
+    times_ns = np.array([0, 10_000_000_000], dtype=np.int64)
+    z_levels_m = np.array([-10.0, -5.0, 0.0])
+    zcor = np.broadcast_to(z_levels_m, (2, 3, 3)).copy()
+    hvel = np.empty((2, 3, 3, 2), dtype=np.float64)
+    vertical_velocity = np.empty((2, 3, 3), dtype=np.float64)
+    diffusivity = np.full((2, 3, 3), 0.01, dtype=np.float64)
+    for time_index, time_seconds in enumerate((0.0, 10.0)):
+        for node_index, (x_m, y_m) in enumerate(mesh.node_xy):
+            for layer_index, z_m in enumerate(z_levels_m):
+                # 這三個線性場分別是東、北與向上速度；時間項用來確認 OCM 四維
+                # 內插也參與合成，但預期值仍可由解析函式直接計算。
+                hvel[time_index, node_index, layer_index, 0] = (
+                    0.4 + 0.01 * x_m + 0.02 * y_m + 0.03 * z_m + 0.01 * time_seconds
+                )
+                hvel[time_index, node_index, layer_index, 1] = (
+                    -0.2 + 0.015 * x_m - 0.01 * y_m + 0.02 * z_m - 0.005 * time_seconds
+                )
+                vertical_velocity[time_index, node_index, layer_index] = (
+                    0.05 + 0.001 * x_m - 0.002 * y_m + 0.004 * z_m + 0.002 * time_seconds
+                )
+    ocm = OCMNativeMonth(
+        month_id="197001",
+        mesh=mesh,
+        time_utc_ns=times_ns,
+        hvel=hvel,
+        vertical_velocity=vertical_velocity,
+        zcor=zcor,
+        elev=np.zeros((2, 3), dtype=np.float64),
+        wetdry_elem=np.zeros((2, 1), dtype=np.float64),
+        diffusivity=diffusivity,
+        maximum_time_gap_seconds=20.0,
+    )
+    nww = NWWAnalysisMonth(
+        month_id="197001",
+        lon=np.array([120.0, 122.0]),
+        lat=np.array([24.0, 26.0]),
+        time_utc_ns=times_ns,
+        significant_wave_height=np.full((2, 2, 2), 1.5, dtype=np.float64),
+        peak_frequency=np.full((2, 2, 2), 0.125, dtype=np.float64),
+        peak_direction_raw_deg=np.full((2, 2, 2), 225.0, dtype=np.float64),
+        valid_mask_wave=np.ones((2, 2, 2), dtype=bool),
+        qc_flags=np.zeros((2, 2, 2), dtype=np.uint16),
+        maximum_time_gap_seconds=20.0,
+    )
+    projection = DomainProjection(121.0, 25.0)
+    sinking_velocity_mps = -0.07
+    with_stokes = CombinedMonthForcing(
+        ocm=ocm,
+        nww=nww,
+        projection=projection,
+        settling_velocity_mps=sinking_velocity_mps,
+        include_stokes=True,
+    )
+    without_stokes = CombinedMonthForcing(
+        ocm=ocm,
+        nww=None,
+        projection=projection,
+        settling_velocity_mps=sinking_velocity_mps,
+        include_stokes=False,
+    )
+
+    x_m, y_m, z_m, time_ns = 2.0, 3.0, -4.0, 5_000_000_000
+    sample = with_stokes.sample(x_m, y_m, z_m, time_ns)
+    no_stokes_sample = without_stokes.sample(x_m, y_m, z_m, time_ns)
+    assert sample.valid and no_stokes_sample.valid
+    assert no_stokes_sample.eta_m == 0.0
+    assert no_stokes_sample.bed_z_m == -10.0
+    assert no_stokes_sample.bed_z_m < z_m < no_stokes_sample.eta_m
+
+    elapsed_seconds = 5.0
+    expected_ocm = np.array(
+        [
+            0.4 + 0.01 * x_m + 0.02 * y_m + 0.03 * z_m + 0.01 * elapsed_seconds,
+            -0.2 + 0.015 * x_m - 0.01 * y_m + 0.02 * z_m - 0.005 * elapsed_seconds,
+            0.05 + 0.001 * x_m - 0.002 * y_m + 0.004 * z_m + 0.002 * elapsed_seconds,
+        ],
+        dtype=np.float64,
+    )
+    expected_stokes = finite_depth_stokes(
+        significant_wave_height_m=1.5,
+        peak_frequency_hz=0.125,
+        direction_raw_deg=225.0,
+        particle_z_m=z_m,
+        surface_z_m=0.0,
+        bed_z_m=-10.0,
+    )
+    expected_total = expected_ocm + np.array(
+        [expected_stokes.u_mps, expected_stokes.v_mps, sinking_velocity_mps]
+    )
+    assert np.linalg.norm([expected_stokes.u_mps, expected_stokes.v_mps]) > 0.0
+    assert np.allclose(
+        [sample.u_mps, sample.v_mps, sample.w_mps],
+        expected_total,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert np.allclose(
+        [no_stokes_sample.u_mps, no_stokes_sample.v_mps, no_stokes_sample.w_mps],
+        expected_ocm + np.array([0.0, 0.0, sinking_velocity_mps]),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert np.allclose(
+        [sample.u_mps - no_stokes_sample.u_mps, sample.v_mps - no_stokes_sample.v_mps],
+        [expected_stokes.u_mps, expected_stokes.v_mps],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert np.isclose(sample.w_mps, no_stokes_sample.w_mps, rtol=0.0, atol=1e-12)
+    assert sample.w_mps < expected_ocm[2]
+    assert np.isclose(sample.diagnostics["stokes_u_mps"], expected_stokes.u_mps, atol=1e-12)
+    assert np.isclose(sample.diagnostics["stokes_v_mps"], expected_stokes.v_mps, atol=1e-12)

@@ -2,9 +2,35 @@
 
 本專案實作「三、Lagrangian 系集逆向溯源」：針對完全沉沒於三維水體中的沉降與近底海洋廢棄物，以 CWA-OCM 三維海流、CWA-NWW3 波浪衍生的 Stokes drift、向下沉降速度及次網格擴散，從受體位置與到達時間向過去建立條件式來源足跡。
 
-目前狀態為 `reference_core_implemented_formal_runtime_cli_connected_release_gated`。設定/preflight、native forcing adapters、
+目前狀態為 `reference_core_implemented_formal_runtime_cli_connected_report_trajectory_stream_report_statistics_facade_report_release_io_report_validation_evidence_schema_io_implemented_release_gated`。設定/preflight、native forcing adapters、
 signed-time RK4、Stokes、擴散、巢狀邊界、scenario×member 分片、不可變 shard/checkpoint 與
-核心聚合均已有可執行實作及測試；SERVER synthetic shard 驗證成功。研究團隊已將現存
+核心聚合均已有可執行實作及測試；報告純統計層亦已具備停止結果與方向性跨站來源矩陣、
+來源段—受體條件式比例／事件占比／旅行年齡，以及統一的 renderer-facing typed facade。
+這些產品保留 raw numerator／denominator、低樣本或零分母等不可用狀態，並維持公尺格網
+``(y, x[, age])`` 與 source→target site axis；`report_trajectory_stream.py` 已可對完整
+trajectory iterator 一次串流，依有效 member 政策同步建立 pathway、環境完整性、材質與
+代表軌跡 products；`report_release.py` 已提供 report-v1 的 source binding、fixed topology、
+atomic writer／reader／validator。這些都是可重現的工程資料契約，不能把 typed facade 或
+synthetic release 通過測試解讀為正式科學成果。共同 staging/格式/校驗基礎已完成：
+`report_render.py` 可接受 caller 已驗證的 typed products／圖面 callback，在明示空白 staging
+root 產生固定格式、canonical sidecar、實際 bytes size／SHA-256 與 immutable staging view；
+`report_validation_evidence.py` 的 F12/T06 定量 evidence schema/I/O 已完成：schema `1.0.0`、
+immutable `ValidationMetric`／`ValidationEvidence`、canonical source binding，以及 strict
+load／validate／atomic write 都已接入公開 API。這只完成 evidence 的工程契約；解析解（`analytic_solution`）、
+dt/M 收斂（`timestep_convergence`／`member_convergence`）、
+known-source（`known_source_synthetic`）、restart（`checkpoint_restart`）、NumPy/Numba
+（`numpy_numba_consistency`）與 forward-validation（`forward_validation`）的正式 evidence
+尚未產生，因此 F12/T06 科學成果仍未完成。`report_pipeline.py` 的建置前唯讀 gate 已完成（complete run、
+aggregate/spec binding、formal trajectory v2、MPLCONFIGDIR、output/evidence policy）；但
+`build_report_release`、F01–F12/T01–T06 專屬 artifact adapters、CLI `report-build` 與正式 SERVER 科學發布
+仍未完成，不能把 preflight 稱為完整 pipeline。`report_comparison_statistics.py`
+F11/T05 的 exact compatibility 與核心差值純計算已完成：它只接受兩份相同研究設計的
+`ReportStatistics` 與 caller 明示的單一物理參數差異，保留 comparison 減 baseline 的
+outcome、connectivity、source-receptor、pathway、HDR 差值；材質來源核對尚未完成，目前不提供材質差值。
+不可用狀態或零分母不補成零。comparison release I/O、artifact adapter、pipeline/render 整合與真實 sensitivity cases 尚未完成，
+不能稱 F11/T05 科學成果完成。SERVER synthetic shard
+驗證成功。研究
+團隊已將現存
 OCM/NWW 凍結為正式的「2024–2025 全部可得資料」母體，`trial_ready`、partial month 與
 供應者 metadata 不再是等待外部補件的阻擋。正式模擬尚未宣稱完成，是因 OCM 缺時重建
 交叉驗證（或 gap-safe arrival/horizon manifest）、NWW 完整逐時 analysis、expanded A 與
@@ -338,7 +364,13 @@ flowchart LR
 │   ├── scenarios.py, runner.py, batch_state.py, production.py, checkpoint.py
 │   ├── cli.py, pilot_calibration.py, pilot_config.py, pilot_selection.py, runtime.py, provenance.py
 │   ├── run_control.py, run_locking.py, run_validation.py
-│   ├── outputs.py, aggregation.py
+│   ├── outputs.py, aggregation.py, event_aggregation.py, streaming_aggregation.py
+│   ├── aggregate_spec.py, aggregate_release_payload.py, aggregate_pipeline.py, aggregate_release.py
+│   ├── report_spec.py, report_ratio_statistics.py, report_pathway_statistics.py, report_kde_statistics.py
+│   ├── report_material_statistics.py, report_matrix_statistics.py, report_source_receptor_statistics.py
+│   ├── report_statistics.py, report_comparison_statistics.py, report_records.py
+│   ├── report_trajectory_stream.py, report_release.py, report_pipeline.py
+│   ├── report_validation_evidence.py
 │   └── input_derivation.py
 ├── tests/
 └── docs/
@@ -414,12 +446,85 @@ uv run lbt config-check --config configs/lagrangian_backtracking.example.yaml
 uv run lbt synthetic-smoke --output /private/tmp/lbt-synthetic-smoke
 uv run lbt validate-shard /private/tmp/lbt-synthetic-smoke
 uv run lbt code-provenance --project-root .
+# 只讀驗證 caller 明示的既有 report-v1 release，不猜測路徑或建立新檔案：
+uv run lbt report-validate <run_id>.report-v1
 uv run lbt-validate-run /path/to/run-workspace
 uv run lbt-benchmark-report /path/to/run-workspace
 # checkpoint 寫在 workspace 外時，validator 與報告必須傳入同一 runtime root：
 uv run lbt-validate-run /path/to/run-workspace --checkpoint-root /path/to/checkpoints
 uv run lbt-benchmark-report /path/to/run-workspace --checkpoint-root /path/to/checkpoints
 ```
+
+### 報告統計、一次串流與 report-v1 release 邊界
+
+`report_trajectory_stream.py` 的 `TrajectoryReportAccumulator`／
+`build_trajectory_stream_statistics` 以完整且已驗證的 `ParticleResult` shard iterator
+為單一資料流，依 immutable `ReportSpec`、`AggregateSpec` 與 `ScenarioStratum` 同步產生
+有效成員的 pathway、環境完整性、材質與代表軌跡 products。`DATA_GAP`、
+`NUMERICAL_FAILURE` 等失敗狀態保留原始語意，不會以零值代替，也不會把失敗 member 混入
+有效 pathway 分母；多個 shard 應由 accumulator 逐一呼叫 `add_shard`，不可把已處理結果
+重新 materialize 成全案清單。
+
+`report_statistics.py` 的 `build_report_statistics` 只組合已驗證的停止結果、方向性跨站、
+來源段—受體、路徑、核密度估計（KDE）與材質統計產品，提供繪圖端使用的統一介面；它不讀寫
+檔案、不改變分母，也不負責繪圖。帶來源聚合資料（`AggregateReleasePayload`）的建構子／建立函式
+會將核心產品及路徑與同一來源衍生結果逐欄核對，涵蓋完整原始計數、有效與總分母、
+失敗格網、受體／來源段識別碼、座標與旅行年齡軸，以及明示 ReportSpec 的統計政策。
+同型別、同站點或同總數不足以證明來源相同。綁定來源的 KDE 只在建構子內依來源單次建立：
+建立函式省略 KDE 參數，或建構子明示 `kde_statistics_by_site=None` 會要求計算；
+空對照表表示省略。外部 KDE 覆寫及無法由來源聚合資料核對逐粒子來源的材質產品只能走
+純產品（pure-products）入口，該入口的 `run_id=None`，不能宣稱來源已綁定。
+`report_release.py` 的 `ReportReleaseWriter`、
+`read_report_release`、`read_report_registry` 與 `validate_report_release` 則負責
+report-v1 的 source binding、固定 F01–F12／T01–T06 registry closure、exact inventory、
+checksum 與 atomic sibling 發布／唯讀驗證。release writer 只接受 caller 明示的已產生產品，
+不會自行建立圖表或猜測路徑；`report-validate` 也只讀取 caller 明示的既有 release。
+report-v1 發布使用已核對身分的同父目錄描述符，透過 Linux `renameat2(RENAME_NOREPLACE)`
+或 Darwin `renameatx_np(RENAME_EXCL)` 原子拒覆寫；其他程序搶先建立檔案、空目錄或符號連結時，
+拋出 `FileExistsError` 並保留對方節點。缺少平台、函式或檔案系統支援即停止，不退回可覆寫操作；
+失敗僅清理自有暫存目錄（partial）。完成改名後 `fsync` 失敗仍保留正式目錄（final），並回報耐久性未確認。
+
+`report_comparison_statistics.py` 的 `build_report_comparison_statistics` 是 F11/T05 的
+純計算邊界：先以兩份 `ReportStatistics` 的 `AggregateReleasePayload`／`ReportSpec`
+核對 exact compatibility，再輸出 comparison 減 baseline 的核心差值與兩側
+raw denominator／availability／status。這表示 F11/T05 的 exact compatibility 與核心差值
+純計算已完成，但 comparison release I/O、artifact adapter、pipeline/render 整合與真實
+sensitivity cases 尚未完成，不能稱 F11/T05 科學成果完成；本模組也不負責 I/O、繪圖或
+pipeline。
+目前來源綁定比較尚不支援材質差值：比較入口只接受帶來源的統計介面，而材質產品的逐粒子
+來源核對尚未完成，只能由無來源身分的純產品入口提供；因此不能宣稱全部 F11/T05 差值可用。
+
+### report pipeline 建置前唯讀 gate
+
+`report_pipeline.py` 的公開 `preflight_report_build(...)` 會在任何 report partial／staging
+建立以前，只讀檢查 complete run、aggregate release／AggregateSpec／ReportSpec binding、
+formal trajectory manifest 的 exact schema `2.0.0`、明示且可寫的 `MPLCONFIGDIR`、固定
+`<run_id>.report-v1` output ownership，以及 evidence class、comparison／validation 與
+allow flag policy。它回傳 immutable `ReportBuildPreflight` memory view，只保存 typed
+identity、schema、SHA-256、flags 與絕對 Path；不產生圖表、JSON、staging 或 final release，
+也不讀取 raw NetCDF。
+
+這個 gate 已完成，但不等於完整報告 pipeline：`build_report_release`、F01–F12/T01–T06
+專屬 artifact adapters、CLI `report-build` 與正式 SERVER 科學發布仍未完成，因此不能把
+preflight 稱為完整 pipeline。
+
+### F12/T06 定量 evidence schema/I/O 狀態
+
+`report_validation_evidence.py` 已完成 schema `1.0.0` 的 immutable 定量 evidence 資料
+契約與 strict canonical JSON I/O，並由套件根目錄公開
+`ValidationMetric`、`ValidationEvidence`、`load_validation_evidence`、
+`validate_validation_evidence`、`write_validation_evidence` 及三個 validation category
+常數。這表示 evidence 可以被明確建立、綁定 source snapshot、寫入、讀回與驗證，不表示
+正式科學測試已執行。
+
+目前尚未產生解析解、dt/M 收斂、known-source、restart、NumPy/Numba 或 forward-validation
+的正式 evidence；因此 F12/T06 科學成果仍未完成，不能將 schema/I/O 通過或 synthetic
+evidence 解讀為正式 OCM／NWW3 科學驗證。
+
+上述統計、release I/O、共同 staging/格式/校驗基礎與 report pipeline 建置前唯讀 gate 都是工程
+資料契約，不等於正式科學成果。`build_report_release`、F01–F12/T01–T06 專屬 artifact adapters、
+CLI `report-build` 與正式 SERVER 科學發布仍未完成，因此目前不能推定正式報告完成或宣稱任何
+正式 OCM／NWW3 圖表成果已完成。
 
 Slice 1 輸入衍生使用明示的 accepted-product root；root 未提供時才讀 config 指定的環境
 變數，程式不猜測 SERVER 絕對路徑。`inputs-build` 產生 immutable component 目錄，
