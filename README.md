@@ -416,6 +416,7 @@ flowchart LR
     ├── 04_implementation_plan.md
     ├── 05_decisions_and_risks.md
     ├── 06_server_runbook_plan.md
+    ├── git_deployment_and_data_sync.md
     ├── 07_results_visualization_plan.md
     ├── 08_design_baseline_and_derived_gates.md
     ├── 09_implementation_audit_2026-08-19.md
@@ -430,6 +431,12 @@ flowchart LR
 可列印的兩頁流程圖已保存為[PDF](docs/output/pdf/source_code_flow_diagrams.pdf)，另提供[模組關係 PNG](docs/output/figures/source_code_module_relationship.png)與[單一粒子流程 PNG](docs/output/figures/single_particle_backtracking_flow.png)。
 
 若要像看一張地圖一樣追蹤模組，請開啟[互動式程式架構地圖](docs/source_code_architecture_map.html)。點選模組後，右側會列出實際相對 `import`、引用它的模組、文件化資料流程、主要閱讀入口與原始碼連結；重新執行 `scripts/render_source_code_architecture_map.py` 可依目前 `src/` 匯入關係更新 HTML。
+
+## Git 與 SERVER 部署邊界
+
+本機 Git 是唯一開發來源；SERVER 只部署已核定且乾淨的 commit。同步驗收必須同時證明同一個 Git commit 與相同的 tracked files，不能只依賴同名目錄或部分 source。大型 OCM／NWW 主資料、執行期輸出、checkpoint、舊版快照與環境由資料流程分開管理。
+
+既有 SERVER canonical 根目錄接入本機歷史、首次完整 bundle、衝突備份與後續 fast-forward 更新，請依[Git 部署與資料同步手冊](docs/git_deployment_and_data_sync.md)；科學 preflight、pilot、正式 batch 與 QC 仍依[SERVER 執行手冊](docs/06_server_runbook_plan.md)。
 
 Phase 3A 的 Python 接線可由下列方式使用。相對 manifest 路徑必須以 config YAML
 所在目錄解析，不能依賴目前工作目錄；`load_scenario_inputs` 只回傳已驗證的 immutable

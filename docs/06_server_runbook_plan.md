@@ -3,6 +3,7 @@
 ## 1. 適用範圍
 
 本文件定義 SERVER 部署、preflight、pilot、正式 batch、checkpoint、QC 與發布程序。
+程式歷史接入、canonical 根目錄衝突保留、Git bundle 與大型資料同步邊界，另見[Git 部署與資料同步手冊](git_deployment_and_data_sync.md)；本文件只保留科學 runtime 與發布流程。
 `config-check`、`preflight`、`behavior-manifest`、`synthetic-smoke` 與 `validate-shard` 已可
 執行；Phase 3B1/3B2a 另已提供 `code-provenance`、`validate-run` 與 `benchmark-report`，
 並以 schema 2 ordering、固定 lock topology 與跨程序 progress 契約約束 restart。
