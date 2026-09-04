@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from test_pilot_selection import _complete_exact_records
 from test_runtime import (
     EXAMPLE_CONFIG,
     _configured_project_config,
@@ -47,7 +48,7 @@ from lagrangian_backtracking.run_control import (
     load_run_plan,
 )
 from lagrangian_backtracking.runner import scenario_execution_sort_key
-from lagrangian_backtracking.scenarios import stable_identifier
+from lagrangian_backtracking.scenarios import BASELINE_BEHAVIORS, stable_identifier
 
 
 class _UninspectablePath:
@@ -533,6 +534,186 @@ def test_static_loader_rejects_current_pilot_source_or_vertical_tamper(
     _patch_static_loaders(monkeypatch, data, scenario_inputs=changed_inputs)
     with pytest.raises(ValueError):
         _static_loader()(workspace.path, config_path=EXAMPLE_CONFIG, expected_run_kind="pilot")
+
+
+@pytest.fixture(scope="module")
+def exact_runtime_data() -> dict[str, Any]:
+    """以完整五萬合成情境測試真實計畫發布／重開，不載入海洋陣列。
+
+    清單 loader 仍由測試替身提供；來源含五站、十種沉降代理、100 受體、250 到達及
+    5,000 動態配對，僅驗證完整來源先於選擇的呼叫契約。動態公尺深度沿用既有合成
+    樣本，不冒充經 OCM 驗收的真資料或校準證據。
+    """
+
+    data = _runtime_data()
+    scenarios, receptors, arrivals = _complete_exact_records()
+    flows = {site.study_site_id: site.flow_domain_id for site in data["config"].study_sites}
+    pairs = tuple(
+        replace(data["pair"], receptor_id=receptor.receptor_id,
+                arrival_time_id=arrival.arrival_time_id, study_site_id=receptor.study_site_id,
+                analysis_region_id=receptor.analysis_region_id, flow_domain_id=flows[receptor.study_site_id],
+                vertical_id=receptor.vertical_id, time_utc_ns=arrival.time_utc_ns)
+        for receptor in receptors for arrival in arrivals
+        if receptor.study_site_id == arrival.study_site_id
+    )
+    data["inputs"] = replace(
+        data["inputs"], materials=BASELINE_BEHAVIORS, receptors=receptors, arrival_times=arrivals,
+        scenarios=scenarios, initial_conditions=pairs,
+        initial_conditions_by_pair={(pair.receptor_id, pair.arrival_time_id): pair for pair in pairs},
+    )
+    return data
+
+
+def _initialize_exact_test_run(
+    data: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> RunWorkspace:
+    """以明示合成 ID 經公開 runtime 建立精確先導，沿用真實輸入盤點與計畫驗證。"""
+
+    inventory_path = tmp_path / "exact-inventory.json"
+    _write_inventory(inventory_path, _pilot_inventory(data["config"].config_hash()))
+    _patch_pilot_orchestration(monkeypatch, data)
+    return runtime.initialize_pilot_run(
+        config_path=EXAMPLE_CONFIG, input_inventory_path=inventory_path,
+        destination=tmp_path / "runs", run_id="exact-pilot", experiment_case_id="no_stokes",
+        project_root=tmp_path / "project", pilot_study_site_id="hsinchu",
+        pilot_arrival_id="hsinchu-arrival-7", pilot_material_id=BASELINE_BEHAVIORS[4].material_id,
+    )
+
+
+def test_exact_plan_reopens_complete_50000_source_before_selecting_twenty(
+    exact_runtime_data: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """根計畫仍為 2.1.0，建立與重開均先驗證五萬來源，再取原站完整 20 個受體。"""
+
+    seen = []
+    real_coverage = runtime.validate_baseline_coverage
+    real_select = runtime.select_exact_pilot_scenarios
+
+    def checked_coverage(scenarios):
+        """執行真實完整覆蓋驗證，記錄成功後才允許子集選擇。"""
+        result = real_coverage(scenarios)
+        assert len(scenarios) == 50_000
+        seen.append("coverage")
+        return result
+
+    def checked_select(scenarios, receptors, expected_source_scenario_count, **kwargs):
+        """若先裁剪來源或跳過完整驗證，立即使測試失敗。"""
+        assert seen[-1] == "coverage"
+        assert len(scenarios) == expected_source_scenario_count == 50_000
+        seen.append("selection")
+        return real_select(scenarios, receptors, expected_source_scenario_count, **kwargs)
+
+    monkeypatch.setattr(runtime, "validate_baseline_coverage", checked_coverage)
+    monkeypatch.setattr(runtime, "select_exact_pilot_scenarios", checked_select)
+    workspace = _initialize_exact_test_run(exact_runtime_data, tmp_path, monkeypatch)
+    plan = load_run_plan(workspace)
+    assert seen == ["coverage", "selection"]
+    assert plan["schema_version"] == "2.1.0"
+    assert plan["scenario_selection"]["schema_version"] == "2.0.0"
+    assert plan["scenario_selection"]["mode"] == "pilot_exact"
+    assert plan["scenario_selection"]["source_scenario_count"] == 50_000
+    assert plan["scenario_count"] == 20
+    assert plan["particle_count"] == 20 * plan["members_per_scenario"]
+    assert plan["scenario_selection"]["arrival_time_id"] == "hsinchu-arrival-7"
+    _patch_static_loaders(monkeypatch, exact_runtime_data)
+    before = _snapshot_tree(workspace.path)
+    loaded = _static_loader()(workspace, config_path=EXAMPLE_CONFIG, expected_run_kind="pilot")
+    assert seen.count("coverage") == 2
+    assert len(loaded.scenario_inputs.scenarios) == 20
+    assert len(loaded.scenario_inputs.receptors) == 100
+    assert len(loaded.scenario_inputs.arrival_times) == 250
+    assert len(loaded.scenario_inputs.initial_conditions) == 5_000
+    assert len(loaded.scenario_inputs.materials) == 10
+    assert _snapshot_tree(workspace.path) == before
+    with pytest.raises(ValueError, match="validation"):
+        _static_loader()(
+            workspace, config_path=EXAMPLE_CONFIG, expected_run_kind="pilot", require_complete=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "tamper", ("trim_source", "source_value", "vertical", "plan_hash", "plan_filter", "plan_mix"),
+)
+def test_exact_static_and_resume_reject_source_and_plan_tamper(
+    exact_runtime_data: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+) -> None:
+    """重開及 resume 都重驗來源；來源或計畫變動時在 forcing 建立前拒絕且不修檔。"""
+
+    data = exact_runtime_data
+    workspace = _initialize_exact_test_run(data, tmp_path, monkeypatch)
+    inputs = data["inputs"]
+    if tamper == "trim_source":
+        inputs = replace(inputs, scenarios=inputs.scenarios[:20])
+    elif tamper == "source_value":
+        inputs = replace(inputs, scenarios=(
+            *inputs.scenarios[:-1], replace(inputs.scenarios[-1], settling_velocity_mps=-0.123),
+        ))
+    elif tamper == "vertical":
+        inputs = replace(inputs, receptors=(
+            replace(inputs.receptors[0], vertical_id="changed"), *inputs.receptors[1:],
+        ))
+    else:
+        plan = load_run_plan(workspace)
+        key, value = {
+            "plan_hash": ("source_records_sha256", "0" * 64),
+            "plan_filter": ("arrival_time_id", "hsinchu-arrival-8"),
+            "plan_mix": ("samples_per_stratum", 1),
+        }[tamper]
+        plan["scenario_selection"][key] = value
+        (workspace.path / "run_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    _patch_static_loaders(monkeypatch, data, scenario_inputs=inputs)
+    before = _snapshot_tree(workspace.path)
+    with pytest.raises(ValueError):
+        _static_loader()(workspace, config_path=EXAMPLE_CONFIG, expected_run_kind="pilot")
+    with pytest.raises(ValueError):
+        runtime.open_pilot_run_controller(workspace, config_path=EXAMPLE_CONFIG,
+                                         ocm_native_root=_UninspectablePath(), resume=True)
+    assert _snapshot_tree(workspace.path) == before
+
+
+@pytest.mark.parametrize("run_kind,options", (
+    ("formal", {"pilot_study_site_id": "hsinchu", "pilot_arrival_id": "id", "pilot_material_id": "id"}),
+    ("synthetic", {"pilot_study_site_id": "hsinchu"}),
+    ("pilot", {"pilot_study_site_id": "hsinchu"}),
+    ("pilot", {"pilot_study_site_id": "hsinchu", "pilot_arrival_id": "id", "pilot_material_id": "id",
+               "pilot_scenarios_per_stratum": 1}),
+))
+def test_exact_runtime_rejects_invalid_mode_or_identifiers_before_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_kind: str, options: dict,
+) -> None:
+    """正式／合成、不完整識別碼及混用分層 N 均在來源讀取前拒絕。"""
+
+    def blocked_load(*args, **kwargs):
+        """錯誤請求不應嘗試讀取設定或清單。"""
+        raise AssertionError("invalid exact request must precede I/O")
+
+    monkeypatch.setattr(runtime, "load_config", blocked_load)
+    with pytest.raises(ValueError):
+        runtime.initialize_run(
+            config_path=tmp_path / "missing.yaml", input_inventory_path=tmp_path / "missing.json",
+            destination=tmp_path / "runs", run_id="invalid", experiment_case_id="no_stokes",
+            project_root=tmp_path, run_kind=run_kind, **options,
+        )
+    assert not (tmp_path / "runs").exists()
+
+
+def test_exact_initialize_rejects_incomplete_source_before_subset_or_publish(
+    exact_runtime_data: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """即使請求的受體仍在，小型裁剪來源也不能先選出部分資料再冒稱完整母體。"""
+
+    data = {**exact_runtime_data, "inputs": replace(
+        exact_runtime_data["inputs"], scenarios=exact_runtime_data["inputs"].scenarios[:20],
+    )}
+
+    def blocked_select(*args, **kwargs):
+        """完整來源驗證失敗時不得進入子集選擇。"""
+        raise AssertionError("full source validation must precede subset")
+
+    monkeypatch.setattr(runtime, "select_exact_pilot_scenarios", blocked_select)
+    with pytest.raises(ValueError, match="coverage"):
+        _initialize_exact_test_run(data, tmp_path, monkeypatch)
+    assert not (tmp_path / "runs").exists()
 
 
 def test_static_helper_has_no_forcing_factory_or_manager_side_effect(

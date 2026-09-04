@@ -12,6 +12,7 @@ import math
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -802,6 +803,101 @@ def test_fractional_horizon_nanoseconds_fails_before_manager(
     with pytest.raises(ValueError, match="horizon ns"):
         factory(_unit(data["scenario"]))
     assert calls == []
+
+
+@pytest.mark.parametrize("hours", range(1, 73))
+def test_integer_hour_horizons_restore_exact_nanoseconds(hours: int) -> None:
+    """整數一至七十二小時以天數 float 傳入，必須還原同一秒數與奈秒，不移動時間窗。"""
+
+    assert runtime._backtrack_horizon(hours / 24) == (hours * 3600.0, hours * 3_600_000_000_000)
+
+
+@pytest.mark.parametrize("days", [1.0, 7.0, 30.0, 365.0, 0.1, 0.3, 0.1234, 365.123456])
+def test_existing_exact_decimal_days_are_unchanged(days: float) -> None:
+    """既有十進位天數已能精確轉奈秒的值優先保留，不讓浮點正規化改變原有整數結果。"""
+
+    expected_ns = Decimal(str(days)) * Decimal(86_400) * Decimal(1_000_000_000)
+    assert expected_ns == expected_ns.to_integral_value()
+    expected = (float(expected_ns / Decimal(1_000_000_000)), int(expected_ns))
+    assert runtime._backtrack_horizon(days) == expected
+    # 共用工具不得受呼叫端 Decimal 的低精度影響而默默把次奈秒捨入成整數。
+    with localcontext() as context:
+        context.prec = 6
+        assert runtime._backtrack_horizon(days) == expected
+        with pytest.raises(ValueError, match="horizon ns"):
+            runtime._backtrack_horizon(1e-12)
+
+
+@pytest.mark.parametrize(("days", "expected_ns"), [
+    (1 / 24, 3_600_000_000_000), (1 / 48, 1_800_000_000_000),
+    (7 / 24, 25_200_000_000_000), (1e-9 / 86_400, 1), (1e-8 / 86_400, 10), (7.0, 604_800_000_000_000),
+])
+def test_fractional_day_factory_and_formal_gap_safe_share_exact_window(
+    runtime_fixture, tmp_path, monkeypatch, days, expected_ns,
+) -> None:
+    """真實 factory request 與正式缺口閘門使用同一奈秒窗，窗口起點的 1 ns 邊界不可改動。"""
+
+    data = _formal_test_data(runtime_fixture, gap_safe=True)
+    config = data["config"].model_copy(update={
+        "boundaries": data["config"].boundaries.model_copy(update={"max_backtrack_days": days}),
+    })
+    data = {**data, "config": config}
+    calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
+    factory = _factory(data, tmp_path, run_kind="formal")
+    unit = _unit(data["scenario"])
+    request = factory(unit)
+    arrival_ns = unit.scenario.arrival_time_utc_ns
+    earliest_ns = arrival_ns - expected_ns
+    assert request.settings.max_backtrack_seconds == expected_ns / 1_000_000_000
+    assert request.settings.earliest_forcing_time_utc_ns == earliest_ns
+    assert request.initial_state.time_utc_ns == arrival_ns
+    assert request.initial_state.scenario_id == unit.scenario.scenario_id
+    assert request.initial_state.member_id == unit.member_id and unit.seed == 1001
+    assert len(calls) == 1
+    flow = runtime.resolve_flow_domain_id(config, data["scenario"].analysis_region_id, formal=True)
+    flows = runtime._formal_flow_domain_ids(config)
+    # 缺口終點在窗口前一奈秒時可通過，碰到起點時則拒絕；兩端仍是閉區間。
+    safe_axes = [("ocm_native", key, 3_600_000_000_000,
+                  ((earliest_ns - 1_000_000_000, earliest_ns - 1),) if key == flow else ()) for key in flows]
+    runtime._validate_formal_ocm_gap_support(config, data["inputs"], ocm_axes=safe_axes)
+    touching_axes = [(product, key, step, ((earliest_ns - 1_000_000_000, earliest_ns),) if gaps else ())
+                     for product, key, step, gaps in safe_axes]
+    with pytest.raises(ValueError, match="相交"):
+        runtime._validate_formal_ocm_gap_support(config, data["inputs"], ocm_axes=touching_axes)
+
+
+@pytest.mark.parametrize("days", [
+    1e-12, 1.05e-8 / 86_400, math.nextafter(1 / 24, math.inf), math.nextafter(1 / 24, 0.0),
+    float("inf"), float("nan"), 1e308, 107_000.0, 0.0, -1.0, None, True, "1",
+])
+def test_unrepresentable_horizon_still_fails_before_manager(
+    runtime_fixture, tmp_path, monkeypatch, days,
+) -> None:
+    """真正次奈秒、可分辨的鄰值、非有限／溢位及非法輸入，不得因浮點容許界線變成成功。"""
+
+    data = runtime_fixture
+    config = data["config"].model_copy(update={
+        "boundaries": data["config"].boundaries.model_copy(update={"max_backtrack_days": days}),
+    })
+    calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
+    with pytest.raises((TypeError, ValueError)):
+        _factory({**data, "config": config}, tmp_path)(_unit(data["scenario"]))
+    assert calls == []
+    formal = _formal_test_data(data, gap_safe=True)
+    formal_config = formal["config"].model_copy(update={"boundaries": config.boundaries})
+    flow = runtime.resolve_flow_domain_id(formal_config, data["scenario"].analysis_region_id, formal=True)
+    axes = [("ocm_native", key, 3_600_000_000_000, ((0, 1),) if key == flow else ())
+            for key in runtime._formal_flow_domain_ids(formal_config)]
+    with pytest.raises((TypeError, ValueError)):
+        runtime._validate_formal_ocm_gap_support(formal_config, formal["inputs"], ocm_axes=axes)
+
+
+def test_horizon_earliest_int64_underflow_rejected(runtime_fixture, tmp_path) -> None:
+    """合法回溯長度也不能把最早 UTC 奈秒推到檔案格式的有號 64 位整數範圍以外。"""
+
+    factory = _factory(runtime_fixture, tmp_path)
+    with pytest.raises(ValueError, match="earliest_forcing_time_utc_ns"):
+        factory._build_settings(-(1 << 63))
 
 
 def test_manifest_material_settling_mismatch_fails_before_manager(

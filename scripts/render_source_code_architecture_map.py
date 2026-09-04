@@ -104,6 +104,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
         "color": "#7c3aed",
         "modules": (
             "outputs",
+            "pilot_preview",
             "event_aggregation",
             "streaming_aggregation",
             "aggregation",
@@ -142,6 +143,17 @@ GROUPS: tuple[dict[str, Any], ...] = (
 # 這些說明對應文件 11 的模組導覽表。它們是交接用的中文語境，不取代原始碼
 # 本身。
 MODULE_INFO: dict[str, dict[str, Any]] = {
+    "pilot_preview": {
+        "role": "已完成精確單站先導的獨立工程預覽，不是正式報告平台",
+        "inputs": "pilot_exact 完整 run、來源設定、schema 2 軌跡與可選失敗診斷",
+        "outputs": "pilot-preview-v1：3 PNG、全量粒子／觀測 CSV、summary／校驗 JSON 與繁中說明",
+        "entrypoints": ["build_pilot_preview", "scripts/build_pilot_preview.py"],
+        "read_first": (
+            "先以小型計畫／清單早期拒絕超量輸入，再完成靜態來源及全部分片驗證；"
+            "不讀 forcing、不重算軌跡。水平總覽＋局部真實公尺面板、near_bed 優先、"
+            "全部停止原因與失敗分母完整保留，缺診斷不補零；不放寬 report-v1 固定拓撲。"
+        ),
+    },
     "config": {
         "role": "科學設定契約與正式發布閘門",
         "inputs": "YAML 設定、資料根目錄與五站範圍",
@@ -290,18 +302,21 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
     "pilot_selection": {
-        "role": "依固定分層與 SHA-256 排序建立工程 pilot 情境子集",
-        "inputs": "完整且已驗證的 Scenario／Receptor 清單、每層容量與 selection policy",
+        "role": "由完整來源依分層排名或精確站點／到達／材質建立工程先導情境子集",
+        "inputs": "完整且已驗證的 Scenario／Receptor 清單、分層 N 或明示三個識別碼",
         "outputs": "scenario selection binding；完整來源數／雜湊、選取數／雜湊與分層摘要",
         "entrypoints": [
             "build_full_scenario_selection",
             "select_pilot_scenarios",
+            "select_exact_pilot_scenarios",
             "apply_scenario_selection",
             "validate_scenario_selection_binding_shape",
         ],
         "read_first": (
             "pilot 只服務工程 sanity／benchmark；selector 以 study_site_id × vertical_id 分層，"
             "不改 formal 的完整 10 × 20 × 50 coverage，也不保存一長串 scenario ID。"
+            "精確模式 pilot_exact 使用獨立 2.0.0 繫結與完整受體集合，根計畫仍為 2.1.0；"
+            "舊 full／stratified 仍為 1.0.0。建立與重開均先驗完整五萬來源，三 ID 不可混用分層 N。"
         ),
     },
     "batch_state": {
@@ -993,6 +1008,9 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
 # 不存在的節點時產生未定義端點的屬性錯誤。聚合／報告分支刻意標記成「文件化流程」：
 # 它們表示已核定的資料契約與責任邊界，不表示每一條線都是目前某個函式的直接呼叫。
 FLOW_EDGES: tuple[dict[str, str], ...] = (
+    {"source": "runtime", "target": "pilot_preview", "label": "完整 pilot 靜態來源驗證"},
+    {"source": "run_validation", "target": "pilot_preview", "label": "schema 2 全成員逐片讀取"},
+    {"source": "report_release", "target": "pilot_preview", "label": "只沿用原子拒覆寫工具"},
     {"source": "cli", "target": "config", "label": "run-create／設定"},
     {"source": "cli", "target": "runtime", "label": "run-create／pilot+formal"},
     {"source": "cli", "target": "run_control", "label": "run-shard／run-reconcile"},

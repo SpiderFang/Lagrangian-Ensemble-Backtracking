@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import numpy as np
@@ -34,27 +34,65 @@ class VelocityProvider(Protocol):
         """回傳指定位置與 UTC 時刻、物理時間往後的三向速度。"""
 
 
+@dataclass(frozen=True, slots=True)
+class SamplingContext:
+    """保留失敗查詢當下已知的位置、時間及樣本上下界，不重新取樣。
+
+    三軸位置與海面／海床高程均為公尺，垂向向上為正；時間是世界協調時間（UTC）
+    奈秒整數。欄位只來自該次查詢的引數與回傳樣本，不讀取樣本的任意診斷字典。
+    記憶體中允許未知值 ``None`` 或失敗樣本的非有限值；引擎寫入事件時會省略它們並
+    標示不可用，絕不補零或將非有限值寫成 JSON。這些欄位不參與積分或邊界判定。
+    """
+
+    x_m: float | None = None
+    y_m: float | None = None
+    z_m: float | None = None
+    time_utc_ns: int | None = None
+    eta_m: float | None = None
+    bed_z_m: float | None = None
+
+
 class SamplingError(RuntimeError):
     """中間計算點無法取得可用速度時拋出的例外。
 
     ``stage`` 說明失敗發生在四階計算的哪一個中間點；``qc`` 保留品質檢查旗標，讓粒子
     引擎可區分「資料缺口」與「數值計算失敗」，而非把兩者混為同一種停止原因。
+    可選的具型別上下文（``context``）只補充既有查詢證據；舊的兩參數呼叫仍有效。
+    外部傳入的 ``stage`` 與例外文字不保證安全，事件序列化必須使用階段白名單，
+    不得直接複製例外訊息。新增上下文不改變原有例外觸發條件或恢復策略。
     """
 
-    def __init__(self, stage: str, qc: SampleQC) -> None:
+    def __init__(
+        self, stage: str, qc: SampleQC, *, context: SamplingContext | None = None
+    ) -> None:
+        """保存品質旗標與可選查詢證據；不藉診斷資料改變原有失敗分類。"""
+
         super().__init__(f"RK4 {stage} 取樣無效：qc={int(qc)}")
         self.stage = stage
         self.qc = qc
+        self.context = context
 
 
-def _velocity_vector(sample: VelocitySample, stage: str) -> np.ndarray:
-    """把已通過檢查的速度轉為三個浮點數；無效時保留原因並停止這一步。"""
+def _velocity_vector(
+    sample: VelocitySample, stage: str, *, position: np.ndarray, time_utc_ns: int
+) -> np.ndarray:
+    """檢查已取得的速度，僅在失敗時附上同次查詢的公尺位置與 UTC 奈秒。
+
+    有效分支保持原三向速度陣列與有限值檢查；失敗分支只讀取已在記憶體的座標與
+    海面／海床，不新增速度查詢，也不改寫樣本或四階中間位置。
+    """
 
     if not sample.valid:
-        raise SamplingError(stage, sample.qc)
+        raise SamplingError(
+            stage, sample.qc,
+            context=SamplingContext(*position, time_utc_ns, sample.eta_m, sample.bed_z_m),
+        )
     vector = np.array([sample.u_mps, sample.v_mps, sample.w_mps], dtype=np.float64)
     if not np.all(np.isfinite(vector)):
-        raise SamplingError(stage, SampleQC.NUMERICAL_FAILURE)
+        raise SamplingError(
+            stage, SampleQC.NUMERICAL_FAILURE,
+            context=SamplingContext(*position, time_utc_ns, sample.eta_m, sample.bed_z_m),
+        )
     return vector
 
 
@@ -64,7 +102,8 @@ def rk4_step(state: ParticleState, *, dt_seconds: float, velocity: VelocityProvi
     ``dt_seconds`` 為正代表往未來推進，為負代表往過去回溯。粒子的已追蹤時間
     ``age_seconds`` 永遠增加正值，UTC 時刻則依時間步長的正負方向改變。此函式只改變
     位置、深度與時間；碰到海面、海床、海岸或研究範圍邊界的處理，交由粒子引擎在本步
-    完成後統一判定，避免不同規則互相覆蓋。
+    完成後統一判定，避免不同規則互相覆蓋。失敗上下文綁定原本 k1--k4 查詢的位置與
+    時刻，不為診斷增加查詢、重試或亂數消耗。
     """
 
     if not np.isfinite(dt_seconds) or dt_seconds == 0:
@@ -72,13 +111,25 @@ def rk4_step(state: ParticleState, *, dt_seconds: float, velocity: VelocityProvi
     position = np.array([state.x_m, state.y_m, state.z_m], dtype=np.float64)
     dt_ns = int(round(dt_seconds * 1_000_000_000))
     half_ns = int(round(dt_seconds * 0.5 * 1_000_000_000))
-    k1 = _velocity_vector(velocity(*position, state.time_utc_ns), "k1")
+    k1 = _velocity_vector(
+        velocity(*position, state.time_utc_ns), "k1",
+        position=position, time_utc_ns=state.time_utc_ns,
+    )
     p2 = position + 0.5 * dt_seconds * k1
-    k2 = _velocity_vector(velocity(*p2, state.time_utc_ns + half_ns), "k2")
+    k2 = _velocity_vector(
+        velocity(*p2, state.time_utc_ns + half_ns), "k2",
+        position=p2, time_utc_ns=state.time_utc_ns + half_ns,
+    )
     p3 = position + 0.5 * dt_seconds * k2
-    k3 = _velocity_vector(velocity(*p3, state.time_utc_ns + half_ns), "k3")
+    k3 = _velocity_vector(
+        velocity(*p3, state.time_utc_ns + half_ns), "k3",
+        position=p3, time_utc_ns=state.time_utc_ns + half_ns,
+    )
     p4 = position + dt_seconds * k3
-    k4 = _velocity_vector(velocity(*p4, state.time_utc_ns + dt_ns), "k4")
+    k4 = _velocity_vector(
+        velocity(*p4, state.time_utc_ns + dt_ns), "k4",
+        position=p4, time_utc_ns=state.time_utc_ns + dt_ns,
+    )
     advanced = position + dt_seconds * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
     return replace(
         state,

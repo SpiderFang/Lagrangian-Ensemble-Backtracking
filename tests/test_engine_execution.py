@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
+import pytest
 from shapely.geometry import box
 
 from lagrangian_backtracking.boundaries import BoundaryGeometry
+from lagrangian_backtracking.checkpoint import (
+    CheckpointBinding,
+    load_execution_checkpoint,
+    write_execution_checkpoint,
+)
 from lagrangian_backtracking.diffusion import DiffusionCoefficients, DiffusionSample
 from lagrangian_backtracking.engine import (
     EngineSettings,
+    _failure_attributes,
     advance_particle_once,
     finalize_particle_execution,
     initialize_particle_execution,
     run_particle,
 )
+from lagrangian_backtracking.integrators import SamplingContext, SamplingError
 from lagrangian_backtracking.models import ParticleState, ParticleStatus, SampleQC, VelocitySample
+from lagrangian_backtracking.outputs import read_trajectory_shard, write_trajectory_shard
+from lagrangian_backtracking.runner import RunUnit
+from lagrangian_backtracking.scenarios import Scenario
 
 
 def _state(*, time_utc_ns: int = 100_000_000_000, age_seconds: float = 0.0) -> ParticleState:
@@ -159,11 +173,12 @@ def test_stepwise_engine_keeps_rk_stage_invalid_boundary_recovery() -> None:
         flow_domain=box(-5.0, -5.0, 5.0, 5.0),
         foreign_local_domains={},
     )
+    queries: list[tuple[float, float, float, int]] = []
 
     def clipped_velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
         """只在 flow domain 內回傳有效樣本，模擬 native mesh 的保守域外結果。"""
 
-        del y_m, z_m, time_utc_ns
+        queries.append((x_m, y_m, z_m, time_utc_ns))
         if x_m < -5.0 or x_m > 5.0:
             return VelocitySample(
                 0.0,
@@ -178,6 +193,7 @@ def test_stepwise_engine_keeps_rk_stage_invalid_boundary_recovery() -> None:
         return VelocitySample(1.0, 0.0, 0.0, 0.0, -100.0, 100.0, 10.0)
 
     settings = EngineSettings(1.0, 4.0, 4.0, 100.0, 100, 0)
+    direct_rng = np.random.Generator(np.random.PCG64DXSM(9))
     direct = run_particle(
         _state(),
         velocity=clipped_velocity,
@@ -185,9 +201,12 @@ def test_stepwise_engine_keeps_rk_stage_invalid_boundary_recovery() -> None:
         behavior_class="suspended",
         diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
         settings=settings,
-        rng=np.random.Generator(np.random.PCG64DXSM(9)),
+        rng=direct_rng,
     )
+    direct_queries = list(queries)
+    queries.clear()
     execution = initialize_particle_execution(_state(), settings)
+    resumed_rng = np.random.Generator(np.random.PCG64DXSM(9))
     while not advance_particle_once(
         execution,
         velocity=clipped_velocity,
@@ -195,7 +214,7 @@ def test_stepwise_engine_keeps_rk_stage_invalid_boundary_recovery() -> None:
         behavior_class="suspended",
         diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
         settings=settings,
-        rng=np.random.Generator(np.random.PCG64DXSM(9)),
+        rng=resumed_rng,
     ):
         pass
     resumed = finalize_particle_execution(execution)
@@ -204,6 +223,25 @@ def test_stepwise_engine_keeps_rk_stage_invalid_boundary_recovery() -> None:
     assert resumed.observations == direct.observations
     assert resumed.events == direct.events
     assert resumed.events[-1].attributes["boundary_locator"] == "reference_drift_after_rk_stage_invalid"
+    # 既有邊界恢復只完成第一步的四階／擴散；第二步 k2 域外後用步首漂移定位 x=-5。
+    assert queries == direct_queries == [
+        (x_m, 0.0, -10.0, time_ns)
+        for x_m, time_ns in (
+            (0.0, 100_000_000_000), (0.0, 100_000_000_000),
+            (-2.0, 98_000_000_000), (-2.0, 98_000_000_000), (-4.0, 96_000_000_000),
+            (-4.0, 96_000_000_000), (-4.0, 96_000_000_000), (-6.0, 94_000_000_000),
+        )
+    ]
+    assert resumed.final_state.x_m == -5.0
+    assert resumed.final_state.time_utc_ns == 95_000_000_000
+    assert resumed.final_state.status == ParticleStatus.FLOW_DOMAIN_EXIT
+    assert resumed.step_count == 2
+    assert all("diagnostic_version" not in event.attributes for event in resumed.events)
+    assert resumed.events[-1].attributes["requires_dt_halving_validation"] is True
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(9))
+    expected_rng.normal(size=3)
+    assert direct_rng.bit_generator.state == resumed_rng.bit_generator.state
+    assert direct_rng.bit_generator.state == expected_rng.bit_generator.state
 
 
 def test_finalize_adds_terminal_observation_without_advancing() -> None:
@@ -346,3 +384,385 @@ def test_invalid_spatial_diffusion_stops_before_timestep_rk4_and_rng() -> None:
     assert provider.call_count == 1
     assert velocity_calls == [_state().time_utc_ns]
     assert np.array_equal(rng.normal(size=3), control_rng.normal(size=3))
+    attributes = execution.events[-1].attributes
+    assert attributes["failure_reason"] == "invalid_diffusion_sample"
+    assert attributes["failure_stage"] == "diffusion"
+    assert attributes["qc_flags"] == int(SampleQC.INVALID_PHYSICS)
+    assert attributes["sampling_context_available"] is True
+    assert attributes["sample_eta_available"] is False
+    assert attributes["sample_bed_available"] is False
+    assert attributes["attempted_dt_available"] is False
+    _assert_safe_diagnostic(attributes)
+
+
+def _assert_safe_diagnostic(attributes: dict[str, bool | float | int | str]) -> None:
+    """確認診斷只含既有純量型別，缺值沒有被寫為 null、非有限值或任意路徑。"""
+
+    assert attributes["diagnostic_version"] == 1
+    assert all(type(value) in (bool, float, int, str) for value in attributes.values())
+    encoded = json.dumps(attributes, allow_nan=False)
+    assert json.loads(encoded) == attributes
+    assert "/not-a-real-path" not in encoded
+
+
+@pytest.mark.parametrize("qc", [
+    SampleQC.VERTICAL_UNSUPPORTED, SampleQC.NUMERICAL_FAILURE,
+    SampleQC.TIME_GAP, SampleQC.WAVE_UNSUPPORTED,
+])
+def test_step_start_failure_records_same_sample_without_advancing(qc: SampleQC) -> None:
+    """步首無效樣本保留品質位元與已知海床，未知海面省略；狀態分類與查詢次數不變。"""
+
+    calls: list[tuple[float, float, float, int]] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """只回傳一次失敗樣本；任意字典內的路徑與 NaN 不得進入事件。"""
+
+        calls.append((x_m, y_m, z_m, time_utc_ns))
+        return VelocitySample(
+            np.nan, np.nan, np.nan, np.nan, -100.0, 100.0, 10.0, qc,
+            diagnostics={"path": "/not-a-real-path/private", "nan": np.nan},
+        )
+
+    settings = _settings()
+    execution = initialize_particle_execution(_state(), settings)
+    rng = np.random.Generator(np.random.PCG64DXSM(5))
+    before = deepcopy(rng.bit_generator.state)
+    result = advance_particle_once(
+        execution, velocity=velocity, boundaries=_boundaries(), behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0), settings=settings, rng=rng,
+    )
+    expected_status = (
+        ParticleStatus.DATA_GAP
+        if qc & (SampleQC.TIME_GAP | SampleQC.WAVE_UNSUPPORTED)
+        else ParticleStatus.NUMERICAL_FAILURE
+    )
+    assert result.terminal and not result.stepped
+    assert execution.state == replace(_state(), status=expected_status)
+    assert calls == [(0.0, 0.0, -10.0, _state().time_utc_ns)]
+    assert rng.bit_generator.state == before
+    attributes = execution.events[-1].attributes
+    assert attributes["failure_reason"] == "invalid_velocity_sample"
+    assert attributes["failure_stage"] == "step_start"
+    assert attributes["qc_flags"] == int(qc)
+    assert attributes["sampling_context_available"] is True
+    assert attributes["sample_time_utc_ns"] == _state().time_utc_ns
+    assert attributes["sample_z_m"] == -10.0
+    assert attributes["sample_eta_available"] is False
+    assert "sample_eta_m" not in attributes
+    assert attributes["sample_bed_z_m"] == -100.0
+    assert attributes["sample_bed_available"] is True
+    assert attributes["attempted_dt_available"] is False
+    assert "attempted_dt_seconds" not in attributes
+    assert attributes["step_count"] == attributes["minimum_clamp_count"] == 0
+    _assert_safe_diagnostic(attributes)
+
+
+@pytest.mark.parametrize("stage_index", [2, 4])
+@pytest.mark.parametrize("qc", [SampleQC.VERTICAL_UNSUPPORTED, SampleQC.TIME_GAP, SampleQC.NUMERICAL_FAILURE])
+def test_unrecoverable_rk_failure_records_failed_query_not_terminal_position(
+    stage_index: int, qc: SampleQC
+) -> None:
+    """原直線邊界判定無法恢復時，失敗中間點與最後有效位置必須分開保存。"""
+
+    calls: list[tuple[float, float, float, int]] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """步首先成功，其後在指定四階計算點回傳品質失敗，不製造物理邊界穿越。"""
+
+        calls.append((x_m, y_m, z_m, time_utc_ns))
+        return VelocitySample(
+            1.0, -0.5, 0.25, 0.3, -90.0, 100.0, 10.0,
+            qc if len(calls) == stage_index + 1 else SampleQC.OK,
+        )
+
+    execution = initialize_particle_execution(_state(), _settings())
+    rng = np.random.Generator(np.random.PCG64DXSM(8))
+    before = deepcopy(rng.bit_generator.state)
+    result = advance_particle_once(
+        execution, velocity=velocity, boundaries=_boundaries(), behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.1, 0.1, 0.01), settings=_settings(), rng=rng,
+    )
+    expected_status = ParticleStatus.DATA_GAP if qc == SampleQC.TIME_GAP else ParticleStatus.NUMERICAL_FAILURE
+    assert result.terminal and not result.stepped
+    assert execution.state == replace(_state(), status=expected_status)
+    assert len(calls) == stage_index + 1
+    assert rng.bit_generator.state == before
+    assert execution.step_count == execution.minimum_clamp_count == 0
+    event = execution.events[-1]
+    assert (event.x_m, event.y_m, event.z_m, event.time_utc_ns) == calls[0]
+    attributes = event.attributes
+    assert attributes["failure_reason"] == "rk_stage_unrecoverable"
+    assert attributes["failure_stage"] == f"k{stage_index}"
+    assert attributes["qc_flags"] == int(qc)
+    assert attributes["attempted_dt_seconds"] == -2.0
+    assert tuple(attributes[key] for key in (
+        "sample_x_m", "sample_y_m", "sample_z_m", "sample_time_utc_ns"
+    )) == calls[-1]
+    assert calls[-1] != calls[0]
+    assert attributes["sample_eta_m"] == 0.3
+    assert attributes["sample_bed_z_m"] == -90.0
+    _assert_safe_diagnostic(attributes)
+
+
+@pytest.mark.parametrize("limit", ["maximum_step_count", "minimum_clamp_limit"])
+def test_limit_failure_distinguishes_step_count_and_minimum_clamps(limit: str) -> None:
+    """最大步數與第 101 次下限累計分開標記，不假造失敗樣本或更動任何上限。"""
+
+    calls: list[int] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """極小水平尺度只用於觸發既有步長下限，不執行四階積分。"""
+
+        del x_m, y_m, z_m
+        calls.append(time_utc_ns)
+        return VelocitySample(1.0, 0.0, 0.0, 0.0, -100.0, 0.001, 10.0)
+
+    settings = _settings()
+    execution = initialize_particle_execution(_state(), settings)
+    if limit == "maximum_step_count":
+        execution.step_count = settings.maximum_step_count
+    else:
+        execution.minimum_clamp_count = settings.maximum_minimum_clamps
+    rng = np.random.Generator(np.random.PCG64DXSM(9))
+    before = deepcopy(rng.bit_generator.state)
+    result = advance_particle_once(
+        execution, velocity=velocity, boundaries=_boundaries(), behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0), settings=settings, rng=rng,
+    )
+    assert result.terminal and not result.stepped
+    assert result.state == replace(_state(), status=ParticleStatus.NUMERICAL_FAILURE)
+    assert len(calls) == (0 if limit == "maximum_step_count" else 1)
+    assert rng.bit_generator.state == before
+    attributes = execution.events[-1].attributes
+    assert attributes["failure_stage"] == "limits"
+    assert attributes["failure_reason"] == limit
+    assert attributes["step_count"] == execution.step_count
+    assert attributes["minimum_clamp_count"] == execution.minimum_clamp_count
+    assert attributes["maximum_step_count"] == settings.maximum_step_count
+    assert attributes["maximum_minimum_clamps"] == 100
+    assert attributes["dt_min_seconds"] == 1.0
+    assert attributes["dt_max_seconds"] == 2.0
+    assert attributes["sampling_context_available"] is False
+    assert attributes["qc_available"] is False
+    assert "qc_flags" not in attributes
+    if limit == "minimum_clamp_limit":
+        assert attributes["minimum_clamp_count"] == 101
+        assert attributes["attempted_dt_seconds"] == -1.0
+    else:
+        assert "attempted_dt_seconds" not in attributes
+    _assert_safe_diagnostic(attributes)
+
+
+@pytest.mark.parametrize("error_type", [TypeError, ValueError])
+def test_diffusion_evaluation_error_omits_untrusted_exception_message(error_type: type[Exception]) -> None:
+    """擴散評估例外沿用數值失敗狀態，只保存已知查詢位置，不把例外路徑當診斷。"""
+
+    class BrokenProvider:
+        """模擬現有擴散解析分支會捕捉的型別／數值錯誤。"""
+
+        def sample(self, *args: object, **kwargs: object) -> DiffusionSample:
+            """拋出含不可信文字的例外，以驗證輸出沒有複製訊息。"""
+
+            raise error_type("/not-a-real-path/private NaN")
+
+    execution = initialize_particle_execution(_state(), _settings())
+    rng = np.random.Generator(np.random.PCG64DXSM(10))
+    before = deepcopy(rng.bit_generator.state)
+    advance_particle_once(
+        execution, velocity=_position_dependent_velocity, boundaries=_boundaries(),
+        behavior_class="sinking", diffusion=BrokenProvider(), settings=_settings(), rng=rng,
+    )
+    assert execution.state.status == ParticleStatus.NUMERICAL_FAILURE
+    assert rng.bit_generator.state == before
+    attributes = execution.events[-1].attributes
+    assert attributes["failure_reason"] == "diffusion_evaluation_error"
+    assert attributes["failure_stage"] == "diffusion"
+    assert attributes["sampling_context_available"] is True
+    assert attributes["qc_available"] is False
+    assert "qc_flags" not in attributes
+    _assert_safe_diagnostic(attributes)
+
+
+@pytest.mark.parametrize("context", [None, SamplingContext(), SamplingContext(
+    x_m=np.nan, y_m=np.inf, z_m=-np.inf, time_utc_ns=np.nan, eta_m=np.nan, bed_z_m=np.inf,
+)])
+def test_missing_or_nonfinite_context_omitted_from_event_and_roundtrips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context: SamplingContext | None
+) -> None:
+    """缺值政策能嚴格 JSON、中途續跑與 v2 軌跡往返，舊空屬性亦仍可讀。
+
+    使用合成資料注入外部非標準階段；事件必須標為 unknown 並省略未知數值。
+    所有檔案只寫測試暫存目錄，不變更輸出實作或檔案格式版本。
+    """
+
+    def fail_step(*args: object, **kwargs: object) -> ParticleState:
+        """模擬既有取樣例外，不讓外部階段文字進入序列化資料。"""
+
+        raise SamplingError("/not-a-real-path/private", SampleQC.TIME_GAP, context=context)
+
+    monkeypatch.setattr("lagrangian_backtracking.engine.split_rk4_brownian_step", fail_step)
+    execution = initialize_particle_execution(_state(), _settings())
+    rng = np.random.Generator(np.random.PCG64DXSM(12))
+    advance_particle_once(
+        execution, velocity=_position_dependent_velocity, boundaries=_boundaries(),
+        behavior_class="sinking", diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=_settings(), rng=rng,
+    )
+    attributes = execution.events[-1].attributes
+    assert attributes["failure_stage"] == "unknown"
+    assert attributes["sampling_context_available"] is False
+    assert attributes["sample_eta_available"] is False
+    assert attributes["sample_bed_available"] is False
+    assert not set(attributes) & {
+        "sample_x_m", "sample_y_m", "sample_z_m", "sample_time_utc_ns", "sample_eta_m", "sample_bed_z_m",
+    }
+    _assert_safe_diagnostic(attributes)
+    scenario = Scenario("s0", "gongliao", "A", "material", "r0", "arrival", -0.002, 100_000_000_000, "test")
+    unit = RunUnit(scenario, "baseline", 0, "p0", 12)
+    binding = CheckpointBinding("config", "inventory", "baseline", "shard", "pcg64dxsm-v1", "commit")
+    checkpoint_path = write_execution_checkpoint(
+        tmp_path / "checkpoint", binding=binding, run_units=[unit], executions=[execution],
+        rngs=[rng], triangle_hints=[None], sequence=0,
+    )
+    restored = load_execution_checkpoint(checkpoint_path, expected_binding=binding, expected_run_units=[unit])
+    assert restored.executions[0] == execution
+    assert restored.rng_states[0] == rng.bit_generator.state
+    assert json.loads((checkpoint_path / "checkpoint.json").read_text())["schema_version"] == "2.1.0"
+    result = finalize_particle_execution(restored.executions[0])
+    for name, event_attributes in (
+        ("diagnostic", attributes), ("legacy", {}), ("ordinary", {"label": "old"}),
+    ):
+        candidate = replace(result, events=[replace(result.events[-1], attributes=event_attributes)])
+        shard = write_trajectory_shard(tmp_path / name, [candidate], run_metadata={"run_kind": "synthetic"})
+        assert json.loads((shard / "manifest.json").read_text())["schema_version"] == "2.0.0"
+        assert read_trajectory_shard(shard) == (candidate,)
+
+
+def test_diagnostic_whitelist_preserves_partial_context_without_coercing_unknown_values() -> None:
+    """部分有限值保留原義，未知旗標／時間／步長省略；任意理由與階段退為 unknown。"""
+
+    attributes = _failure_attributes(
+        initialize_particle_execution(_state(), _settings()), _settings(),
+        reason="/not-a-real-path/private", stage="/not-a-real-path/private",
+        context=SamplingContext(np.float64(2.5), np.nan, -3.0, 1 << 65, 0.0, np.nan),
+        attempted_dt_seconds=np.nan,
+    )
+    assert attributes["failure_reason"] == attributes["failure_stage"] == "unknown"
+    assert attributes["sample_x_m"] == 2.5
+    assert attributes["sample_z_m"] == -3.0
+    assert attributes["sample_eta_m"] == 0.0  # 真正觀測到的零高程可以保留，不是補值。
+    assert attributes["sample_eta_available"] is True
+    assert attributes["sample_bed_available"] is False
+    assert attributes["sampling_context_available"] is False
+    assert attributes["attempted_dt_available"] is False
+    assert not set(attributes) & {
+        "sample_y_m", "sample_bed_z_m", "sample_time_utc_ns", "attempted_dt_seconds",
+    }
+    _assert_safe_diagnostic(attributes)
+
+
+def test_successful_execution_matches_analytic_queries_positions_and_rng() -> None:
+    """常流加擴散的成功案例鎖住每步查詢、位置、輸出時序與完整亂數狀態。
+
+    對照值獨立由常流解析位移與每步一次三向布朗亂數建立，不用另一個引擎入口互比。
+    三步為 2、2、1 秒，最長回溯停止仍保留舊空屬性，不因新增失敗診斷而改寫成功事件。
+    """
+
+    queries: list[tuple[float, float, float, int]] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """常流讓四階中間位置可解析核對，數值尺度足以維持原設定步長。"""
+
+        queries.append((x_m, y_m, z_m, time_utc_ns))
+        return VelocitySample(1.0, -0.5, 0.0, 0.0, -100.0, 100.0, 10.0)
+
+    rng = np.random.Generator(np.random.PCG64DXSM(22))
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(22))
+    result = run_particle(
+        _state(), velocity=velocity, boundaries=_boundaries(), behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.2, 0.1, 0.01), settings=_settings(), rng=rng,
+    )
+    position = np.array([0.0, 0.0, -10.0])
+    time_ns = _state().time_utc_ns
+    expected_queries = []
+    expected_positions = [tuple(position)]
+    flow = np.array([1.0, -0.5, 0.0])
+    for dt in (2.0, 2.0, 1.0):
+        for fraction in (0.0, 0.0, 0.5, 0.5, 1.0):
+            expected_queries.append((
+                *(position - fraction * dt * flow), time_ns - int(fraction * dt * 1_000_000_000),
+            ))
+        position = position - dt * flow + np.sqrt(2.0 * np.array([0.2, 0.1, 0.01]) * dt) * (
+            expected_rng.normal(size=3)
+        )
+        expected_positions.append(tuple(position))
+        time_ns -= int(dt * 1_000_000_000)
+    assert queries == expected_queries
+    assert [(item.x_m, item.y_m, item.z_m) for item in result.observations] == expected_positions
+    assert [item.age_seconds for item in result.observations] == [0.0, 2.0, 4.0, 5.0]
+    assert result.final_state == replace(
+        _state(), x_m=position[0], y_m=position[1], z_m=position[2], time_utc_ns=time_ns,
+        age_seconds=5.0, status=ParticleStatus.MAX_AGE,
+    )
+    assert result.step_count == 3
+    assert result.minimum_clamp_count == 0
+    assert len(result.events) == 1
+    assert result.events[0].event_type.value == "max_age"
+    assert result.events[0].attributes == {}
+    assert rng.bit_generator.state == expected_rng.bit_generator.state
+
+
+def test_checkpoint_resume_retains_exact_rk_failure_diagnostics(tmp_path: Path) -> None:
+    """先成功一步、寫中途續跑檔，再於 k4 失敗；重啟與直跑須連診斷及亂數完全一致。
+
+    合成流場只在固定 UTC 門檻回傳垂向不支援，不依呼叫次數或亂數選失敗情境。
+    同時以既有 v2 輸出讀回有限位置／時間／上下界，確認診斷沒有引入新格式。
+    """
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """第二步的第四個計算點失敗；步首與較早中間點保持有效。"""
+
+        del x_m, y_m, z_m
+        qc = SampleQC.VERTICAL_UNSUPPORTED if time_utc_ns <= 96_000_000_000 else SampleQC.OK
+        return VelocitySample(1.0, 0.0, 0.0, 0.0, -100.0, 100.0, 10.0, qc)
+
+    settings = _settings()
+    arguments = {
+        "velocity": velocity, "boundaries": _boundaries(), "behavior_class": "sinking",
+        "diffusion": DiffusionCoefficients(0.2, 0.1, 0.01), "settings": settings,
+    }
+    direct_rng = np.random.Generator(np.random.PCG64DXSM(16))
+    direct = run_particle(_state(), rng=direct_rng, **arguments)
+    rng = np.random.Generator(np.random.PCG64DXSM(16))
+    execution = initialize_particle_execution(_state(), settings)
+    first = advance_particle_once(execution, rng=rng, **arguments)
+    assert first.stepped and not first.terminal
+    scenario = Scenario("s0", "gongliao", "A", "material", "r0", "arrival", -0.002, 100_000_000_000, "test")
+    unit = RunUnit(scenario, "baseline", 0, "p0", 16)
+    binding = CheckpointBinding("config", "inventory", "baseline", "shard", "pcg64dxsm-v1", "commit")
+    path = write_execution_checkpoint(
+        tmp_path / "active", binding=binding, run_units=[unit], executions=[execution],
+        rngs=[rng], triangle_hints=[None], sequence=1,
+    )
+    checkpoint = load_execution_checkpoint(path, expected_binding=binding, expected_run_units=[unit])
+    restored_rng = np.random.Generator(np.random.PCG64DXSM())
+    restored_rng.bit_generator.state = checkpoint.rng_states[0]
+    restored = checkpoint.executions[0]
+    outcome = advance_particle_once(restored, rng=restored_rng, **arguments)
+    assert outcome.terminal and not outcome.stepped
+    result = finalize_particle_execution(restored)
+    assert result == direct
+    assert restored_rng.bit_generator.state == direct_rng.bit_generator.state
+    attributes = result.events[-1].attributes
+    assert attributes["failure_stage"] == "k4"
+    assert attributes["sample_time_utc_ns"] == 96_000_000_000
+    assert result.final_state.time_utc_ns == 98_000_000_000
+    assert attributes["sample_eta_available"] is attributes["sample_bed_available"] is True
+    _assert_safe_diagnostic(attributes)
+    terminal_path = write_execution_checkpoint(
+        tmp_path / "terminal", binding=binding, run_units=[unit], executions=[restored],
+        rngs=[restored_rng], triangle_hints=[None], sequence=2,
+    )
+    assert load_execution_checkpoint(terminal_path, expected_binding=binding).executions[0] == restored
+    shard = write_trajectory_shard(tmp_path / "output", [result], run_metadata={"run_kind": "synthetic"})
+    assert read_trajectory_shard(shard) == (result,)

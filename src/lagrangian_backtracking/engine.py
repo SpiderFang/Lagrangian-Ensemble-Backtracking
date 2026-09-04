@@ -22,7 +22,7 @@ import numpy as np
 
 from .boundaries import BoundaryGeometry, resolve_horizontal_boundaries, resolve_vertical_boundaries
 from .diffusion import DiffusionCoefficients, DiffusionModel, choose_time_step, resolve_diffusion_sample
-from .integrators import SamplingError, VelocityProvider, split_rk4_brownian_step
+from .integrators import SamplingContext, SamplingError, VelocityProvider, split_rk4_brownian_step
 from .models import BoundaryEvent, EventType, ParticleState, ParticleStatus, SampleQC, VelocitySample
 
 
@@ -529,6 +529,113 @@ def _status_from_sampling_error(error: SamplingError) -> tuple[ParticleStatus, E
     return ParticleStatus.NUMERICAL_FAILURE, EventType.NUMERICAL_FAILURE
 
 
+# 終止診斷版本只規範事件補充欄位，不變更軌跡或中途續跑檔案格式。版本 1 的缺值政策是
+# 「省略數值並提供可用性旗標」；不可寫入 None、NaN、無限值，也不可用 0 代替未知值。
+_FAILURE_DIAGNOSTIC_VERSION = 1
+# 階段與原因採固定白名單，防止外部例外文字、檔案路徑或任意樣本字典流入公開事件。
+_FAILURE_STAGES = frozenset({"k1", "k2", "k3", "k4", "step_start", "diffusion", "limits", "unknown"})
+_FAILURE_REASONS = frozenset({
+    "invalid_velocity_sample", "invalid_diffusion_sample", "diffusion_evaluation_error",
+    "rk_stage_unrecoverable", "maximum_step_count", "minimum_clamp_limit", "unknown",
+})
+
+
+def _diagnostic_float(value: object) -> float | None:
+    """只接受已知數值型別並轉成有限原生浮點數，不轉換任意物件或文字。
+
+    NumPy 的浮點／整數純量來自中間座標陣列，可轉為 JSON 支援的原生數值；布林值、
+    文字、未知物件與非有限數值都視為不可用，避免轉型副作用或假造物理零值。
+    """
+
+    if type(value) not in (int, float) and not isinstance(value, (np.integer, np.floating)):
+        return None
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return normalized if math.isfinite(normalized) else None
+
+
+def _diagnostic_int(value: object) -> int | None:
+    """只接受原生或 NumPy 整數；時間、計數與位元旗標不可由浮點數截斷猜測。"""
+
+    if type(value) is int or isinstance(value, np.integer):
+        return int(value)
+    return None
+
+
+def _failure_attributes(
+    execution: ParticleExecutionState,
+    settings: EngineSettings,
+    *,
+    reason: str,
+    stage: str,
+    qc: SampleQC | None = None,
+    context: SamplingContext | None = None,
+    attempted_dt_seconds: float | None = None,
+) -> dict[str, bool | float | int | str]:
+    """建立版本 1 的失敗診斷，只回傳既有事件格式允許的安全純量。
+
+    原因與階段必須在白名單內，否則記為 ``unknown``；不保存例外文字或樣本任意字典。
+    ``sample_x_m/y_m/z_m`` 是失敗查詢座標（公尺，向上為正），不是粒子的最後有效位置；
+    ``sample_time_utc_ns`` 是該查詢的 UTC 奈秒。``sampling_context_available`` 表示這
+    四欄全部可用；部分可用欄位仍保留。海面／海床只取自同次失敗樣本，各有獨立旗標。
+    未知、型別不符或非有限數值省略，不寫入 null 或補零；這使舊讀取器仍能重讀事件。
+
+    ``attempted_dt_seconds`` 帶積分方向，回溯為負；下限累計超限時表示已選但未執行的
+    步長。步數、下限累計、上限及設定步長供重現停止閘門，不代表新的數值修正。最大
+    步數／下限次數停止沒有失敗樣本，因此品質旗標與取樣欄位保持不可用，不假造 qc=0。
+    """
+
+    attributes: dict[str, bool | float | int | str] = {
+        "diagnostic_version": _FAILURE_DIAGNOSTIC_VERSION,
+        "failure_reason": reason if type(reason) is str and reason in _FAILURE_REASONS else "unknown",
+        "failure_stage": stage if type(stage) is str and stage in _FAILURE_STAGES else "unknown",
+    }
+    # 所有數值皆逐欄轉成安全原生純量；不接受任意 mapping 擴充輸出欄位集合。
+    for key, value in (
+        ("step_count", execution.step_count),
+        ("minimum_clamp_count", execution.minimum_clamp_count),
+        ("maximum_step_count", settings.maximum_step_count),
+        ("maximum_minimum_clamps", settings.maximum_minimum_clamps),
+    ):
+        normalized_int = _diagnostic_int(value)
+        if normalized_int is not None:
+            attributes[key] = normalized_int
+    for key, value in (
+        ("dt_min_seconds", settings.dt_min_seconds),
+        ("dt_max_seconds", settings.dt_max_seconds),
+        ("attempted_dt_seconds", attempted_dt_seconds),
+    ):
+        normalized_float = _diagnostic_float(value)
+        if normalized_float is not None:
+            attributes[key] = normalized_float
+    attributes["attempted_dt_available"] = "attempted_dt_seconds" in attributes
+    normalized_qc = int(qc) if isinstance(qc, SampleQC) else _diagnostic_int(qc)
+    attributes["qc_available"] = normalized_qc is not None and 0 <= normalized_qc <= (1 << 32) - 1
+    if normalized_qc is not None and attributes["qc_available"]:
+        attributes["qc_flags"] = normalized_qc
+
+    if isinstance(context, SamplingContext):
+        for key, value in (
+            ("sample_x_m", context.x_m), ("sample_y_m", context.y_m),
+            ("sample_z_m", context.z_m), ("sample_eta_m", context.eta_m),
+            ("sample_bed_z_m", context.bed_z_m),
+        ):
+            normalized_float = _diagnostic_float(value)
+            if normalized_float is not None:
+                attributes[key] = normalized_float
+        sample_time = _diagnostic_int(context.time_utc_ns)
+        if sample_time is not None and -(1 << 63) <= sample_time < (1 << 63):
+            attributes["sample_time_utc_ns"] = sample_time
+    attributes["sampling_context_available"] = all(
+        key in attributes for key in ("sample_x_m", "sample_y_m", "sample_z_m", "sample_time_utc_ns")
+    )
+    attributes["sample_eta_available"] = "sample_eta_m" in attributes
+    attributes["sample_bed_available"] = "sample_bed_z_m" in attributes
+    return attributes
+
+
 def _validate_engine_settings(settings: EngineSettings) -> None:
     """集中保存 reference engine 原有的設定檢查，避免重啟入口漏掉相同閘門。
 
@@ -572,6 +679,7 @@ def _terminate_execution(
     status: ParticleStatus,
     event_type: EventType,
     environment_context: EnvironmentContext | None = None,
+    failure_attributes: dict[str, bool | float | int | str] | None = None,
 ) -> ParticleAdvanceResult:
     """依既有停止順序更新狀態、事件及終點觀測。
 
@@ -579,10 +687,15 @@ def _terminate_execution(
     reference sample。它讓 terminal observation 在最新固定 observation 尚未到達目前
     state 時仍保留失敗的品質旗標；沒有明確 context 時，仍遵守 status-only replace 的
     原有 context preservation 規則。
+    ``failure_attributes`` 只能由 ``_failure_attributes`` 的白名單整理器建立，且只附加到
+    終止事件，不改變粒子位置、觀測環境或物理狀態。未提供時保留既有空事件屬性。
     """
 
     execution.state = replace(execution.state, status=status)
-    execution.events.append(_terminal_event(execution.state, event_type))
+    event = _terminal_event(execution.state, event_type)
+    if failure_attributes is not None:
+        event = replace(event, attributes=dict(failure_attributes))
+    execution.events.append(event)
     _append_or_replace_observation(
         execution.observations,
         execution.state,
@@ -671,6 +784,7 @@ def advance_particle_once(
     使用公尺、年齡使用秒、時間使用 UTC 奈秒。無效擴散樣本在 choose-time-step、RK4
     與 RNG 之前依既有 QC 終止。終止狀態會立即寫入最後觀測，因此呼叫端可以在每次
     sweep 後安全 checkpoint；``on_step`` 只在真正完成數值步時呼叫一次。
+    失敗事件另附版本化的安全診斷；不增加取樣或改變步長、亂數、重試及邊界恢復政策。
     """
 
     if execution.terminal:
@@ -686,6 +800,9 @@ def advance_particle_once(
             execution,
             status=ParticleStatus.NUMERICAL_FAILURE,
             event_type=EventType.NUMERICAL_FAILURE,
+            failure_attributes=_failure_attributes(
+                execution, settings, reason="maximum_step_count", stage="limits",
+            ),
         )
     remaining_age = settings.max_backtrack_seconds - state.age_seconds
     seconds_to_start = (state.time_utc_ns - settings.earliest_forcing_time_utc_ns) / 1_000_000_000
@@ -708,13 +825,23 @@ def advance_particle_once(
         execution.observations, state, reference
     )
     if not reference.valid:
-        error = SamplingError("step_start", reference.qc)
+        error = SamplingError(
+            "step_start", reference.qc,
+            context=SamplingContext(
+                state.x_m, state.y_m, state.z_m, state.time_utc_ns,
+                reference.eta_m, reference.bed_z_m,
+            ),
+        )
         status, event_type = _status_from_sampling_error(error)
         return _terminate_execution(
             execution,
             status=status,
             event_type=event_type,
             environment_context=environment_context,
+            failure_attributes=_failure_attributes(
+                execution, settings, reason="invalid_velocity_sample", stage=error.stage,
+                qc=error.qc, context=error.context,
+            ),
         )
     try:
         # 擴散 provider 僅以步首狀態取樣一次；同一個 immutable sample 會同時供
@@ -728,7 +855,11 @@ def advance_particle_once(
             triangle_hint=reference.triangle_id,
         )
         if not diffusion_sample.valid:
-            raise SamplingError("diffusion", diffusion_sample.qc)
+            # 擴散樣本沒有海面／海床欄位；不可把另一個速度樣本的上下界冒充成它的證據。
+            raise SamplingError(
+                "diffusion", diffusion_sample.qc,
+                context=SamplingContext(state.x_m, state.y_m, state.z_m, state.time_utc_ns),
+            )
     except SamplingError as error:
         status, event_type = _status_from_sampling_error(error)
         return _terminate_execution(
@@ -736,6 +867,10 @@ def advance_particle_once(
             status=status,
             event_type=event_type,
             environment_context=environment_context,
+            failure_attributes=_failure_attributes(
+                execution, settings, reason="invalid_diffusion_sample", stage=error.stage,
+                qc=error.qc, context=error.context,
+            ),
         )
     except (TypeError, ValueError):
         # provider 回傳錯誤型別、形狀或 qc=OK 但數值不合法時，轉成既有數值失敗語意。
@@ -745,6 +880,10 @@ def advance_particle_once(
             status=ParticleStatus.NUMERICAL_FAILURE,
             event_type=EventType.NUMERICAL_FAILURE,
             environment_context=environment_context,
+            failure_attributes=_failure_attributes(
+                execution, settings, reason="diffusion_evaluation_error", stage="diffusion",
+                context=SamplingContext(state.x_m, state.y_m, state.z_m, state.time_utc_ns),
+            ),
         )
     horizontal_speed = float(np.hypot(reference.u_mps, reference.v_mps))
     decision = choose_time_step(
@@ -763,6 +902,10 @@ def advance_particle_once(
                 execution,
                 status=ParticleStatus.NUMERICAL_FAILURE,
                 event_type=EventType.NUMERICAL_FAILURE,
+                failure_attributes=_failure_attributes(
+                    execution, settings, reason="minimum_clamp_limit", stage="limits",
+                    attempted_dt_seconds=-decision.seconds,
+                ),
             )
     recovered_terminal = False
     try:
@@ -788,7 +931,13 @@ def advance_particle_once(
         )
         if recovery is None:
             status, event_type = _status_from_sampling_error(error)
-            return _terminate_execution(execution, status=status, event_type=event_type)
+            return _terminate_execution(
+                execution, status=status, event_type=event_type,
+                failure_attributes=_failure_attributes(
+                    execution, settings, reason="rk_stage_unrecoverable", stage=error.stage,
+                    qc=error.qc, context=error.context, attempted_dt_seconds=-decision.seconds,
+                ),
+            )
         proposed, recovered_events = recovery
         execution.events.extend(recovered_events)
         recovered_terminal = True

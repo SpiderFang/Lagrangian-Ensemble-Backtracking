@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
@@ -16,7 +17,12 @@ from lagrangian_backtracking.diffusion import (
     diffusion_displacement,
     smagorinsky_horizontal_diffusivity,
 )
-from lagrangian_backtracking.integrators import rk4_step, split_rk4_brownian_step
+from lagrangian_backtracking.integrators import (
+    SamplingContext,
+    SamplingError,
+    rk4_step,
+    split_rk4_brownian_step,
+)
 from lagrangian_backtracking.models import ParticleState, SampleQC, VelocitySample
 
 
@@ -66,6 +72,68 @@ def test_rk4_calls_all_four_stages() -> None:
     result = rk4_step(_state(), dt_seconds=10.0, velocity=velocity)
     assert len(calls) == 4
     assert np.isclose(result.x_m, 50.0)
+
+
+@pytest.mark.parametrize("stage_index", [1, 2, 3, 4])
+@pytest.mark.parametrize("nonfinite_velocity", [False, True])
+def test_failed_rk_stage_context_uses_exact_existing_query(
+    stage_index: int, nonfinite_velocity: bool
+) -> None:
+    """失敗證據必須來自原查詢，不增加查詢或消耗擴散亂數。
+
+    合成常流為 (1, -0.5, 0.25) 公尺／秒，逆向兩秒使中間位置可解析核對。
+    分別注入垂向不支援與 qc=OK 但速度非有限的樣本，確保錯誤品質旗標仍沿用舊規則。
+    """
+
+    state = _state()
+    queries: list[tuple[float, float, float, int]] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """在指定既有計算點回傳失敗樣本；任意診斷字典不可被上下文複製。"""
+
+        queries.append((x_m, y_m, z_m, time_utc_ns))
+        sample = VelocitySample(1.0, -0.5, 0.25, 0.3, -90.0, 1000.0, 10.0)
+        if len(queries) == stage_index:
+            return replace(
+                sample,
+                u_mps=np.nan if nonfinite_velocity else sample.u_mps,
+                qc=SampleQC.OK if nonfinite_velocity else SampleQC.VERTICAL_UNSUPPORTED,
+                diagnostics={"untrusted": "/not-a-real-path/private", "bad": np.nan},
+            )
+        return sample
+
+    rng = np.random.Generator(np.random.PCG64DXSM(13))
+    before = deepcopy(rng.bit_generator.state)
+    with pytest.raises(SamplingError) as caught:
+        split_rk4_brownian_step(
+            state, dt_seconds=-2.0, velocity=velocity,
+            coefficients=DiffusionCoefficients(0.2, 0.1, 0.01), rng=rng,
+        )
+    expected_queries = [
+        (0.0, 0.0, -10.0, state.time_utc_ns),
+        (-1.0, 0.5, -10.25, state.time_utc_ns - 1_000_000_000),
+        (-1.0, 0.5, -10.25, state.time_utc_ns - 1_000_000_000),
+        (-2.0, 1.0, -10.5, state.time_utc_ns - 2_000_000_000),
+    ]
+    assert queries == expected_queries[:stage_index]
+    assert caught.value.stage == f"k{stage_index}"
+    expected_qc = SampleQC.NUMERICAL_FAILURE if nonfinite_velocity else SampleQC.VERTICAL_UNSUPPORTED
+    assert caught.value.qc == expected_qc
+    assert caught.value.context == SamplingContext(*expected_queries[stage_index - 1], 0.3, -90.0)
+    assert rng.bit_generator.state == before
+    assert state == _state()
+
+
+def test_sampling_error_keeps_legacy_constructor_and_optional_context() -> None:
+    """舊兩參數例外仍可用，新增可選上下文不強迫外部呼叫端假造未知數值。"""
+
+    legacy = SamplingError("external-stage", SampleQC.TIME_GAP)
+    assert legacy.context is None
+    assert legacy.stage == "external-stage"
+    assert legacy.qc == SampleQC.TIME_GAP
+    context = SamplingContext(z_m=np.nan)
+    enriched = SamplingError("k2", SampleQC.VERTICAL_UNSUPPORTED, context=context)
+    assert enriched.context is context
 
 
 def test_rk4_rotation_field_closes_after_forward_and_reverse_steps() -> None:
@@ -367,10 +435,12 @@ def test_constant_split_keeps_legacy_fixed_seed_displacement() -> None:
     coefficients = DiffusionCoefficients(4.0, 2.0, 0.01)
     state = _state()
 
+    calls: list[tuple[float, float, float, int]] = []
+
     def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
         """提供零確定性速度，讓測試只比較擴散亂數的相容性。"""
 
-        del x_m, y_m, z_m, time_utc_ns
+        calls.append((x_m, y_m, z_m, time_utc_ns))
         return VelocitySample(0.0, 0.0, 0.0, 0.0, -100.0, 1000.0, 100.0)
 
     split_rng = np.random.default_rng(20260831)
@@ -391,6 +461,12 @@ def test_constant_split_keeps_legacy_fixed_seed_displacement() -> None:
         np.array([split_result.x_m, split_result.y_m, split_result.z_m]),
         np.array([state.x_m, state.y_m, state.z_m]) + expected_displacement,
     )
+    # 零流場的四個查詢仍依原時序，並且只在其後消耗一次三向布朗位移的亂數。
+    assert calls == [
+        (state.x_m, state.y_m, state.z_m, state.time_utc_ns + offset)
+        for offset in (0, -30_000_000_000, -30_000_000_000, -60_000_000_000)
+    ]
+    assert split_rng.bit_generator.state == brownian_rng.bit_generator.state
 
 
 def test_diffusion_sample_positive_and_negative_dt_are_identical() -> None:

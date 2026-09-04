@@ -5,20 +5,38 @@ forcing、server 路徑或任何軌跡結果。pilot 的目的只是工程 sanit
 執行仍必須使用完整 scenario coverage。selector 的 binding 只保存版本、分層規則、
 計數與 SHA-256 證據，不保存一長串 scenario ID，因此 static loader 可以在執行前由
 目前完整 manifest 重算同一子集，再與 immutable run plan 做逐欄位比對。
+精確模式另以 2.0.0 繫結單站／到達時間／材質的全部受體，保存完整來源記錄指紋，
+不依結果排名挑選，也不改既有 1.0.0 完整／分層繫結或正式五萬情境契約。
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from hashlib import sha256
+from math import isfinite
 from typing import Any, Final
 
-from .scenarios import Receptor, Scenario
+from .scenarios import Receptor, Scenario, records_as_dicts
 
 PILOT_SCENARIO_SELECTION_SCHEMA_VERSION: Final[str] = "1.0.0"
 """scenario selection binding 的固定 schema 版本。"""
+
+PILOT_EXACT_SELECTION_SCHEMA_VERSION: Final[str] = "2.0.0"
+"""精確站點／到達時間／材質選擇的獨立繫結版本；既有完整與分層模式仍使用 1.0.0。"""
+
+PILOT_EXACT_SELECTION_POLICY: Final[str] = "pilot_exact_site_arrival_material_all_receptors_v1"
+"""保留指定組合的全部受體，不依結果或排名抽樣的固定選擇政策。"""
+
+_EXACT_SELECTION_BINDING_KEYS: Final[frozenset[str]] = frozenset({
+    "schema_version", "mode", "selection_policy", "study_site_id", "arrival_time_id",
+    "material_id", "source_scenario_count", "selected_scenario_count",
+    "source_scenario_ids_sha256", "selected_scenario_ids_sha256", "source_records_sha256",
+    "source_site_receptor_count", "source_site_receptor_ids_sha256",
+})
+"""精確模式的完整欄位集合；不得混入分層排名、任意 ID 清單或來源路徑。"""
 
 PILOT_SCENARIO_SELECTION_RANKING_POLICY: Final[str] = "pilot_site_vertical_sha256_rank_v1"
 """pilot 分層抽樣使用的版本化 deterministic ranking policy 識別碼。"""
@@ -326,6 +344,136 @@ def select_pilot_scenarios(
     return selected_tuple, binding
 
 
+def _exact_identifier(value: object, *, label: str) -> str:
+    """要求精確篩選識別碼為非空原生字串，不去除空白或猜測替代名稱。"""
+
+    text = _strict_nonempty_text(value, label=label)
+    if text != text.strip():
+        raise ValueError(f"{label} 不可有首尾空白")
+    return text
+
+
+def _exact_source_records_sha256(
+    scenarios: Sequence[Scenario], receptors: Sequence[Receptor],
+) -> str:
+    """對完整來源情境及受體記錄建立與列順序無關的內容指紋。
+
+    既有資料類別轉成 JSON，情境按 scenario_id、受體按 receptor_id 排序，欄位名稱亦
+    固定排序。完整記錄包含到達 UTC 奈秒、沉降公尺／秒、受體經緯度與模板公尺深度，
+    不只比對識別碼；未選中的記錄遭更動也會改變指紋。非有限數值及無法序列化的欄位
+    直接拒絕，不補值。這不取代上游清單驗證；動態實際初始深度與完整來源檔案仍由
+    執行計畫既有的 component_canonical_hashes 核對。本函式不讀檔、不存來源路徑。
+    """
+
+    payload = {
+        "scenarios": records_as_dicts(sorted(scenarios, key=lambda item: item.scenario_id)),
+        "receptors": records_as_dicts(sorted(receptors, key=lambda item: item.receptor_id)),
+    }
+    return sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def select_exact_pilot_scenarios(
+    scenarios: Sequence[Scenario],
+    receptors: Sequence[Receptor],
+    expected_source_scenario_count: int,
+    *,
+    study_site_id: str,
+    arrival_id: str,
+    material_id: str,
+    run_kind: str,
+) -> tuple[tuple[Scenario, ...], dict[str, Any]]:
+    """從完整已驗證來源選出單站、單到達時間、單材質的全部受體情境。
+
+    arrival_id 對應來源欄位 arrival_time_id，不是 UTC 字串或列索引。三個識別碼必須
+    同時存在且屬於合法組合；本入口只接受 run_kind='pilot'。每個選中情境原樣回傳，
+    不改 scenario_id、沉降速度、公尺深度或 UTC 奈秒，也不參與成員 seed 推導。
+    全來源先核對設定要求的情境數及受體參照，再要求選中集合對該站每個來源受體恰有
+    一筆；現行設計為 5 水平×4 垂向，但不以寫死的 20 代替來源集合驗證。
+
+    回傳固定 scenario_id 排序的原情境物件及獨立 2.0.0 繫結。空／未知／跨站組合、
+    重複或缺少受體、裁剪來源、非 pilot 均拋出 ValueError；不產出部分結果。呼叫端仍
+    須先執行完整清單、動態初始條件與設定驗證，不能把本函式當成來源驗收捷徑。
+    """
+
+    if type(run_kind) is not str or run_kind != "pilot":
+        raise ValueError("pilot_exact 只允許 run_kind=pilot")
+    site = _exact_identifier(study_site_id, label="study_site_id")
+    arrival = _exact_identifier(arrival_id, label="arrival_id")
+    material = _exact_identifier(material_id, label="material_id")
+    source = _validated_scenarios(scenarios, expected_count=expected_source_scenario_count)
+    receptor_values = _validated_receptors(receptors)
+    _scenario_context(source, receptor_values)
+    # 本先導延續全負沉降代理，不用零值或符號翻轉把非沉降來源偽裝成合法案例。
+    if any(not isfinite(item.settling_velocity_mps) or item.settling_velocity_mps >= 0 for item in source):
+        raise ValueError("pilot_exact 完整來源必須使用有限且嚴格負值的沉降速度")
+    site_receptors = tuple(item for item in receptor_values if item.study_site_id == site)
+    if not site_receptors:
+        raise ValueError("pilot_exact study_site_id 不存在於完整來源")
+    selected = tuple(sorted((
+        item for item in source
+        if item.study_site_id == site
+        and item.arrival_time_id == arrival
+        and item.material_id == material
+    ), key=lambda item: item.scenario_id))
+    if not selected:
+        raise ValueError("pilot_exact 站點／arrival_id／material_id 組合不存在")
+    receptor_ids = {item.receptor_id for item in site_receptors}
+    selected_receptors = [item.receptor_id for item in selected]
+    if set(selected_receptors) != receptor_ids or len(selected_receptors) != len(receptor_ids):
+        raise ValueError("pilot_exact 必須完整且不重複涵蓋該站全部來源受體")
+    binding = {
+        "schema_version": PILOT_EXACT_SELECTION_SCHEMA_VERSION,
+        "mode": "pilot_exact",
+        "selection_policy": PILOT_EXACT_SELECTION_POLICY,
+        "study_site_id": site,
+        "arrival_time_id": arrival,
+        "material_id": material,
+        "source_scenario_count": len(source),
+        "selected_scenario_count": len(selected),
+        "source_scenario_ids_sha256": scenario_ids_sha256(source),
+        "selected_scenario_ids_sha256": scenario_ids_sha256(selected),
+        "source_records_sha256": _exact_source_records_sha256(source, receptor_values),
+        "source_site_receptor_count": len(receptor_ids),
+        "source_site_receptor_ids_sha256": scenario_ids_sha256(receptor_ids),
+    }
+    return selected, binding
+
+
+def _validate_exact_selection_binding(
+    binding: dict[str, Any], run_kind: str, selected_scenario_count: int,
+) -> None:
+    """只驗證精確繫結自身可證明的欄位與計數，完整來源另由重新選擇核對。
+
+    輸入是執行計畫中的普通字典；不接受舊分層欄位、其他模式或其他執行種類。
+    識別碼、整數、SHA-256 格式及每受體一情境的計數關係皆須吻合。不符時拋出
+    ValueError，通過時無回傳值或寫入；格式通過不代表雜湊宣告已證實。
+    """
+
+    if set(binding) != _EXACT_SELECTION_BINDING_KEYS:
+        raise ValueError("pilot_exact scenario_selection 欄位集合不符")
+    if type(run_kind) is not str or run_kind != "pilot":
+        raise ValueError("pilot_exact 只允許 run_kind=pilot")
+    if binding["mode"] != "pilot_exact" or binding["selection_policy"] != PILOT_EXACT_SELECTION_POLICY:
+        raise ValueError("pilot_exact mode／selection_policy 不符")
+    for key in ("study_site_id", "arrival_time_id", "material_id"):
+        _exact_identifier(binding[key], label=f"scenario_selection.{key}")
+    expected_count = _strict_positive_integer(selected_scenario_count, label="selected_scenario_count")
+    for key in ("source_scenario_count", "selected_scenario_count", "source_site_receptor_count"):
+        _strict_positive_integer(binding[key], label=f"scenario_selection.{key}")
+    if not (
+        binding["selected_scenario_count"] == expected_count == binding["source_site_receptor_count"]
+        and expected_count <= binding["source_scenario_count"]
+    ):
+        raise ValueError("pilot_exact scenario／receptor count 不一致")
+    for key in (
+        "source_scenario_ids_sha256", "selected_scenario_ids_sha256", "source_records_sha256",
+        "source_site_receptor_ids_sha256",
+    ):
+        _strict_sha256(binding[key], label=f"scenario_selection.{key}")
+
+
 def _strict_equal(expected: object, actual: object, *, label: str) -> None:
     """遞迴要求 binding 的容器型別與每個 scalar 都 exact 相同。"""
 
@@ -357,12 +505,16 @@ def validate_scenario_selection_binding_shape(
     這個 public shape validator 不讀 source scenario，因此只檢查可以由 binding 自身
     證明的欄位；source/selected ID hash 與 strata 內容的真實性由
     ``apply_scenario_selection`` 以目前完整 manifests 重算後 exact 比對。formal 只能
-    使用 full；pilot 可使用 full 或 pilot_stratified；synthetic 只為既有工程 fixture
-    保留 full 相容，不進入 runtime physical initializer。
+    使用 full；pilot 可使用 full、pilot_stratified 或獨立 2.0.0 的 pilot_exact；
+    synthetic 只為既有工程 fixture 保留 full 相容，不進入 runtime physical initializer。
+    精確模式的來源內容與受體集合雜湊亦須由 apply 重算，格式通過不等於來源已驗證。
     """
 
     if type(binding) is not dict:
         raise ValueError("scenario_selection 必須是 ordinary dict")
+    if binding.get("schema_version") == PILOT_EXACT_SELECTION_SCHEMA_VERSION:
+        _validate_exact_selection_binding(binding, run_kind, selected_scenario_count)
+        return
     if set(binding) != _SELECTION_BINDING_KEYS:
         raise ValueError("scenario_selection root 欄位集合不符")
     if type(run_kind) is not str or run_kind not in _ALLOWED_RUN_KINDS:
@@ -472,10 +624,12 @@ def apply_scenario_selection(
 
     static loader 不信任 plan 保存的 selected scenario table，也不使用 binding 內未保存的
     ID 清單。它會先驗證 binding shape，再驗證目前 source count、receptor mapping 與
-    scenario ID hash，最後重跑 full 或 stratified selector；任何 count、垂向 mapping、
+    scenario ID hash，最後重跑 full、stratified 或 exact selector；任何 count、垂向 mapping、
     ranking metadata、strata、hash 或 scalar 型別差異都 fail closed。回傳 tuple 的順序是
     selector 定義的 deterministic strata/ranking 順序，後續 run-control 仍會套用既有
     execution ordering policy。
+    精確模式另核對完整來源情境／受體記錄指紋及單站完整受體集合；未選中的來源變動
+    也會拒絕，且不沿用先裁剪的來源或重算新的 seed。
     """
 
     if type(binding) is not dict:
@@ -498,6 +652,12 @@ def apply_scenario_selection(
     if binding["mode"] == "full":
         selected = source
         expected_binding = build_full_scenario_selection(source)
+    elif binding["mode"] == "pilot_exact":
+        selected, expected_binding = select_exact_pilot_scenarios(
+            source, receptors, expected_source_scenario_count,
+            study_site_id=binding["study_site_id"], arrival_id=binding["arrival_time_id"],
+            material_id=binding["material_id"], run_kind=run_kind,
+        )
     else:
         selected, expected_binding = select_pilot_scenarios(
             source,
@@ -512,6 +672,8 @@ def apply_scenario_selection(
 
 
 __all__ = [
+    "PILOT_EXACT_SELECTION_POLICY",
+    "PILOT_EXACT_SELECTION_SCHEMA_VERSION",
     "PILOT_SCENARIO_SELECTION_POLICY",
     "PILOT_SCENARIO_SELECTION_RANKING_POLICY",
     "PILOT_SCENARIO_SELECTION_SCHEMA_VERSION",
@@ -520,6 +682,7 @@ __all__ = [
     "build_full_scenario_selection",
     "canonical_scenario_ids_sha256",
     "scenario_ids_sha256",
+    "select_exact_pilot_scenarios",
     "select_pilot_scenarios",
     "validate_scenario_selection_binding_shape",
 ]

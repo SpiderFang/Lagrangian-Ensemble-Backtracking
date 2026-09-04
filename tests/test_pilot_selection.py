@@ -4,19 +4,32 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from functools import lru_cache
 
 import pytest
 
+import lagrangian_backtracking.pilot_selection as selection_module
 from lagrangian_backtracking.pilot_selection import (
+    PILOT_EXACT_SELECTION_SCHEMA_VERSION,
     PILOT_SCENARIO_SELECTION_RANKING_POLICY,
     PILOT_SCENARIO_SELECTION_STRATUM_FIELDS,
     apply_scenario_selection,
     build_full_scenario_selection,
     scenario_ids_sha256,
+    select_exact_pilot_scenarios,
     select_pilot_scenarios,
     validate_scenario_selection_binding_shape,
 )
-from lagrangian_backtracking.scenarios import Receptor, Scenario, stable_identifier
+from lagrangian_backtracking.runner import iter_run_units, plan_scenario_shards
+from lagrangian_backtracking.scenarios import (
+    BASELINE_BEHAVIORS,
+    ArrivalTime,
+    Receptor,
+    Scenario,
+    build_scenarios,
+    stable_identifier,
+    validate_baseline_coverage,
+)
 
 
 def _records() -> tuple[tuple[Scenario, ...], tuple[Receptor, ...]]:
@@ -219,3 +232,175 @@ def test_scenario_id_hash_rejects_duplicate_and_is_order_independent() -> None:
     assert scenario_ids_sha256(("a", "b")) == scenario_ids_sha256(("b", "a"))
     with pytest.raises(ValueError, match="重複"):
         scenario_ids_sha256(("a", "a"))
+
+
+@lru_cache(maxsize=1)
+def _complete_exact_records() -> tuple[tuple[Scenario, ...], tuple[Receptor, ...], tuple[ArrivalTime, ...]]:
+    """建立完整五萬情境的合成資料，驗證集合契約而非真實海洋成果。
+
+    五站各有 5 水平×4 垂向受體、50 個唯一到達 ID，沿用十個負沉降代理與正式情境
+    建立函式，再通過既有完整覆蓋驗證。固定 UTC 奈秒與公尺深度只供測試使用；呼叫端
+    不得修改共用記錄的 metadata，變異案例應以 replace 建立新物件。
+    """
+
+    receptors = []
+    arrivals = []
+    for site, region in (
+        ("gongliao", "A"), ("guishan", "A"), ("hsinchu", "B"), ("houwan", "C"), ("lienchiang", "D"),
+    ):
+        for horizontal in range(5):
+            for vertical in range(4):
+                receptors.append(Receptor(
+                    receptor_id=f"{site}-h{horizontal}-v{vertical}", study_site_id=site,
+                    analysis_region_id=region, lon=120.0 + horizontal * 0.001, lat=24.0,
+                    z_m_positive_up=-float(vertical + 1), vertical_id=f"v{vertical}",
+                    metadata={"horizontal_id": f"h{horizontal}"},
+                ))
+        for index in range(50):
+            arrivals.append(ArrivalTime(
+                arrival_time_id=f"{site}-arrival-{index}", study_site_id=site,
+                time_utc_ns=1_700_000_000_000_000_000 + index * 3_600_000_000_000,
+                year=2023, season="autumn", tide_class="spring", phase_or_event="test",
+                metadata={},
+            ))
+    scenarios = tuple(build_scenarios(
+        behaviors=BASELINE_BEHAVIORS, receptors=receptors, arrival_times=arrivals,
+        design_version="synthetic-exact-test-v1",
+    ))
+    validate_baseline_coverage(scenarios)
+    return scenarios, tuple(receptors), tuple(arrivals)
+
+
+def _select_exact(
+    scenarios: tuple[Scenario, ...], receptors: tuple[Receptor, ...], **overrides: object,
+) -> tuple[tuple[Scenario, ...], dict]:
+    """以小型合成來源的已知組合呼叫公開入口，僅在拒絕測試覆寫指定參數。"""
+
+    kwargs = {
+        "study_site_id": "site-a", "arrival_id": "arrival-0", "material_id": "material-0",
+        "run_kind": "pilot", "expected_source_scenario_count": len(scenarios),
+    }
+    kwargs.update(overrides)
+    return select_exact_pilot_scenarios(scenarios, receptors, **kwargs)
+
+
+def test_exact_full_50000_preserves_all_receptors_and_nested_member_seeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """完整來源先驗證，選中 20 個原受體且不同 M 共用前綴成員 seed；不宣稱軌跡收斂。"""
+
+    source, receptors, _ = _complete_exact_records()
+    kwargs = {"study_site_id": "hsinchu", "arrival_id": "hsinchu-arrival-7",
+              "material_id": BASELINE_BEHAVIORS[4].material_id, "run_kind": "pilot"}
+    chosen, binding = select_exact_pilot_scenarios(source, receptors, 50_000, **kwargs)
+    again, reordered = select_exact_pilot_scenarios(
+        tuple(reversed(source)), tuple(reversed(receptors)), 50_000, **kwargs,
+    )
+    assert chosen == again and binding == reordered
+    assert binding["schema_version"] == PILOT_EXACT_SELECTION_SCHEMA_VERSION
+    assert binding["source_scenario_count"] == 50_000
+    assert len(chosen) == binding["source_site_receptor_count"] == 20
+    expected = {item.receptor_id: item.vertical_id for item in receptors if item.study_site_id == "hsinchu"}
+    assert {item.receptor_id for item in chosen} == set(expected)
+    assert {vertical: list(expected.values()).count(vertical) for vertical in set(expected.values())} == {
+        f"v{index}": 5 for index in range(4)
+    }
+    originals = {item.scenario_id: item for item in source}
+    assert all(item is originals[item.scenario_id] and item.settling_velocity_mps < 0 for item in chosen)
+    seeds = []
+    for members in (2, 4):
+        shards = plan_scenario_shards(chosen, members_per_scenario=members,
+                                     shard_scenario_count=7, experiment_case_id="no_stokes")
+        seeds.append({unit.particle_id: unit.seed for shard in shards
+                      for unit in iter_run_units(shard, master_seed=123)})
+    assert len(seeds[0]) == 40 and len(seeds[1]) == 80
+    assert all(seeds[1][key] == value for key, value in seeds[0].items())
+
+    def cannot_select(*args: object, **kwargs: object) -> None:
+        """若來源數量未驗證就解析受體，表示裁剪來源能進入選擇流程。"""
+        raise AssertionError("來源數量驗證必須先於受體篩選")
+
+    monkeypatch.setattr(selection_module, "_scenario_context", cannot_select)
+    with pytest.raises(ValueError, match="expected_source_scenario_count"):
+        select_exact_pilot_scenarios(chosen, receptors, 50_000, **kwargs)
+
+
+@pytest.mark.parametrize("overrides", (
+    {"run_kind": "formal"}, {"run_kind": "synthetic"}, {"study_site_id": "missing"},
+    {"study_site_id": ""}, {"arrival_id": "unknown"}, {"material_id": "unknown"},
+    {"arrival_id": "arrival-1"}, {"material_id": " material-0"}, {"arrival_id": None},
+))
+def test_exact_rejects_unknown_empty_cross_combination_and_nonpilot(overrides: dict) -> None:
+    """未知、空白、到達／材質不配對及非 pilot 模式不能產生部分選擇。"""
+
+    source, receptors = _records()
+    with pytest.raises(ValueError):
+        _select_exact(source, receptors, **overrides)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "duplicate", "non_sinking"))
+def test_exact_requires_each_source_receptor_once(mutation: str) -> None:
+    """來源受體集合不能缺漏、增補或重複，沉降代理不能變為零或正值。"""
+
+    source, receptors = _records()
+    if mutation == "missing":
+        source = source[1:]
+    elif mutation == "extra":
+        receptors += (replace(receptors[0], receptor_id="extra-source-receptor"),)
+    elif mutation == "duplicate":
+        source += (replace(source[0], scenario_id="duplicate-pair-different-id"),)
+    else:
+        source = (replace(source[0], settling_velocity_mps=0.0), *source[1:])
+    with pytest.raises(ValueError):
+        _select_exact(source, receptors)
+
+
+@pytest.mark.parametrize("field,value", (
+    ("schema_version", "1.0.0"), ("mode", "full"), ("selection_policy", "unknown"),
+    ("study_site_id", "site-b"), ("arrival_time_id", "arrival-1"), ("material_id", "material-1"),
+    ("source_scenario_count", 2), ("selected_scenario_count", True),
+    ("source_site_receptor_count", 1), ("source_site_receptor_ids_sha256", "0" * 64),
+    ("source_scenario_ids_sha256", "0" * 64), ("selected_scenario_ids_sha256", "0" * 64),
+    ("source_records_sha256", "0" * 64), ("samples_per_stratum", 1),
+))
+def test_exact_binding_tamper_is_rejected(field: str, value: object) -> None:
+    """繫結的版本、識別碼、計數、雜湊及形式混用皆須由重算或形狀驗證拒絕。"""
+
+    source, receptors = _records()
+    chosen, binding = _select_exact(source, receptors)
+    assert apply_scenario_selection(binding, source, receptors, len(source), "pilot") == chosen
+    binding[field] = value
+    with pytest.raises(ValueError):
+        apply_scenario_selection(binding, source, receptors, len(source), "pilot")
+
+
+@pytest.mark.parametrize(
+    "mutation", ("unselected_value", "vertical", "receptor_position", "source_id", "missing_field"),
+)
+def test_exact_reopen_rejects_stale_source_even_with_unchanged_ids(mutation: str) -> None:
+    """不只選中列：未選中情境物性、受體垂向／位置或來源識別改變也必須拒絕。"""
+
+    source, receptors = _records()
+    _, binding = _select_exact(source, receptors)
+    if mutation == "unselected_value":
+        source = (*source[:-1], replace(source[-1], settling_velocity_mps=-0.2))
+    elif mutation == "vertical":
+        receptors = (replace(receptors[0], vertical_id="changed"), *receptors[1:])
+    elif mutation == "receptor_position":
+        receptors = (replace(receptors[0], lon=121.0), *receptors[1:])
+    elif mutation == "source_id":
+        source = (*source[:-1], replace(source[-1], scenario_id="changed-source-id"))
+    else:
+        del binding["source_records_sha256"]
+    with pytest.raises(ValueError):
+        apply_scenario_selection(binding, source, receptors, len(source), "pilot")
+
+
+@pytest.mark.parametrize("run_kind", ("formal", "synthetic"))
+def test_exact_binding_cannot_be_relabelled_as_formal_or_synthetic(run_kind: str) -> None:
+    """執行計畫 validator 使用的公開形狀驗證也必須拒絕精確模式改標籤。"""
+
+    source, receptors = _records()
+    chosen, binding = _select_exact(source, receptors)
+    with pytest.raises(ValueError, match="pilot"):
+        validate_scenario_selection_binding_shape(binding, run_kind, len(chosen))

@@ -15,10 +15,17 @@ from typing import Any
 
 import pytest
 import yaml
+from test_runtime import (
+    _factory,
+    _matching_location,
+    _patch_from_roots,
+    _unit,
+)
+from test_runtime import runtime_fixture as runtime_fixture
 
 import lagrangian_backtracking.cli as cli
 import lagrangian_backtracking.pilot_config as pilot_config
-from lagrangian_backtracking.config import ProjectConfig
+from lagrangian_backtracking.config import ProjectConfig, load_config
 from lagrangian_backtracking.input_derivation import (
     ARTIFACT_FILENAMES,
     DERIVED_INPUT_SCHEMA_VERSION,
@@ -186,6 +193,44 @@ def _scalar_arguments(summary: dict[str, Any]) -> dict[str, Any]:
     """從 create summary 取出 builder API 的完整 scalar keyword 集合。"""
 
     return {name: summary[name] for name in pilot_config._EXECUTION_SCALAR_NAMES}
+
+
+@pytest.mark.parametrize(("days", "seconds"), [(1 / 24, 3600.0), (1 / 48, 1800.0), (7 / 24, 25200.0)])
+def test_builder_fractional_day_config_constructs_actual_runtime_request(
+    tmp_path, monkeypatch, runtime_fixture, days, seconds,
+) -> None:
+    """由真實 builder 發布 YAML、重新載入，再經 RuntimeRequestFactory 產生小時制 request。
+
+    上游清單／校準語意及 forcing manager 仍用既有工程替身，不讀海洋陣列；不再以自造
+    七秒 EngineSettings 取代本次錯誤路徑。ID、UTC、種子與沉降物性原樣保留。
+    """
+
+    source, input_root, calibration_root, _, summary = _create_fixture(tmp_path, monkeypatch)
+    scalars = {**_scalar_arguments(summary), "max_backtrack_days": days, "members_per_scenario": 1}
+    destination = tmp_path / "hourly-pilot.yaml"
+    pilot_config.create_pilot_execution_config(source, input_root, calibration_root, destination, **scalars)
+    before = destination.read_bytes()
+    config = load_config(destination)
+    assert config.boundaries.max_backtrack_days == days
+    assert config.scenarios.members_per_scenario == 1 and config.scenarios.scenario_count == 50_000
+    assert config.pilot_execution_binding["execution_scalar_snapshot"]["max_backtrack_days"] == days
+    data = {**runtime_fixture, "config": config}
+    calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
+    factory = _factory(data, tmp_path)
+    unit = _unit(data["scenario"], member_id=0)
+    original_seed = unit.seed
+    request = factory(unit)
+    assert request.settings.max_backtrack_seconds == seconds
+    assert request.settings.earliest_forcing_time_utc_ns == (
+        unit.scenario.arrival_time_utc_ns - int(seconds) * 1_000_000_000
+    )
+    assert request.initial_state.time_utc_ns == unit.scenario.arrival_time_utc_ns
+    assert request.initial_state.scenario_id == unit.scenario.scenario_id
+    assert request.initial_state.receptor_id == unit.scenario.receptor_id
+    assert request.initial_state.study_site_id == unit.scenario.study_site_id
+    assert request.behavior_class == "sinking" and unit.scenario.settling_velocity_mps < 0
+    assert unit.seed == original_seed and len(calls) == 1
+    assert destination.read_bytes() == before
 
 
 def _walk_strings(value: object) -> list[str]:

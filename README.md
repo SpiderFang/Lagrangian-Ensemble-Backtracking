@@ -71,6 +71,42 @@ Slice 3B2b 的 `pilot_selection.py` 只對完整且已驗證的 scenario/recepto
 selected count/hash 與 strata 綁定 immutable plan；`run-shard`／static loader 會由目前完整
 manifest 重算後再比對 scenario table。formal run 禁止 selector，仍必須執行完整 `50,000`。
 
+單站沉降先導另可在 `run-create --run-kind pilot` 同時指定 `--pilot-study-site-id`、
+`--pilot-arrival-id`、`--pilot-material-id`，從完整五萬來源選取該組合的全部受體；不得與
+分層 N 混用、缺項或重複指定。現行單站為 5 水平×4 垂向，共 20 個基礎情境，粒子數為
+`20×M`，M 是每情境隨機成員數，不是情境數。獨立 `pilot_exact` 繫結版本 `2.0.0`
+保存三 ID、完整來源記錄與來源／選中 ID 雜湊、數量及完整受體集合證據；根 run-plan
+仍為 `2.1.0`，舊 full／stratified 繫結維持 `1.0.0`。來源先通過既有靜態檢查及
+五萬覆蓋驗證，建立／重開／續跑均重算，不能先裁剪來源再宣稱完整。情境 ID、負沉降
+速度、原始 seed 推導與校準設定不變；此小樣本未經 M／dt 收斂或觀測驗證，不是正式科學
+結論或絕對來源機率。精確參數與重建步驟見 [單站先導執行計畫](docs/pilot_run_plan.md)。
+
+runtime 的回溯天數轉換由 formal gap-safe 與 request factory 共用：舊十進位規則已能
+精確表示的整數奈秒保持不變；其餘先按 builder 的 `days×86400` 轉秒，僅接受誤差
+嚴格小於 0.5 ns、至多兩個秒數浮點間距且能往返重建原始天數的整數奈秒候選。
+因此 `1/24` 天還原為 3600 秒／3,600,000,000,000 ns，半小時與可還原的 10 ns 亦可用；
+`1e-12` 天＝86.4 ns 仍在建立 forcing manager 前拒絕。非有限值、奈秒長度或最早 UTC
+超出有號 64 位範圍同樣拒絕。這是表示精度契約，不是任意捨入或宣稱次奈秒準確度；
+設定檔、到達 UTC、ID、seed、物理步長及驅動資料皆不改動。
+
+完整 `pilot_exact` 可用獨立 `uv run python scripts/build_pilot_preview.py --run "$PILOT_RUN" \
+--config "$PILOT_CONFIG" --output "$PILOT_PREVIEW"` 建立新的 `pilot-preview-v1` 目錄；
+不是正式 `report-build` 或 `report-v1`。先只讀小型計畫／分片清單拒絕超量輸入，再完成
+靜態來源綁定與全部完成驗證，僅讀 schema 2 已記錄軌跡，不讀 forcing 或重算路徑。
+輸出水平總覽＋各水平受體局部放大圖、四垂向實值 z／eta／bed—回溯秒數圖、全成員
+停止原因圖（3 PNG），以及全量粒子／觀測 CSV、summary JSON、繁中說明與 SHA-256 清單。
+失敗與零位移成員不刪除；畫線依固定成員順序限量且揭露 n/N，局部圖維持真實公尺刻度。
+`MPLCONFIGDIR` 必須預先設定為專用普通目錄；可明示 `--font-path`，無合格中文字型時
+圖用英文、說明仍用繁中，不下載字型或地圖。輸出不得原地重建、覆寫或經符號連結，
+沿用已驗收的原子拒覆寫改名；不支援的平台停止發布。合成測試圖不是 PI 真資料成果。
+
+失敗終止事件現保存 `diagnostic_version=1`：白名單原因／階段
+`failure_reason`／`failure_stage`、品質位元 `qc_flags`、有方向的嘗試 dt、步數／下限
+累計與上限、失敗查詢 XYZ 公尺／UTC 奈秒及可得海面／海床。未知或非有限數值在來源
+事件中省略，對應 availability 為 false，不補 0 或 null；preview 表格才將缺欄明示為
+空欄／JSON null，缺文字為 unknown。未改輸出格式、取樣、RNG 或重試政策；診斷提升
+可追查性，不表示數值失敗已修復。
+
 本次 Slice 3B2a-A 已補強並接通上述契約：geometry loader 在 formal 模式依
 `resolve_flow_domain_id` 綁定 A 區 expanded ID，provenance 固定 Git／declared deployment
 來源與 dirty 語意，設定欄位改用 `checkpoint_interval_sweeps`、`active_chunk_size` 與

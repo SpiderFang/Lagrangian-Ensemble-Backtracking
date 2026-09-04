@@ -360,6 +360,79 @@ def test_run_create_pilot_forwards_selector_and_reports_selection_summary(
     assert "scenario_ids" not in json.dumps(output)
 
 
+def _exact_create_arguments(tmp_path: Path) -> list[str]:
+    """建立僅供解析測試的明示三 ID 命令，不指向真實輸入或 SERVER。"""
+
+    return [
+        "run-create", "--config", str(tmp_path / "config.yaml"),
+        "--input-inventory", str(tmp_path / "inventory.json"),
+        "--destination", str(tmp_path / "runs"), "--run-id", "exact-pilot",
+        "--run-kind", "pilot", "--experiment-case", "no_stokes",
+        "--pilot-study-site-id", "hsinchu", "--pilot-arrival-id", "synthetic-arrival-id",
+        "--pilot-material-id", "synthetic-material-id",
+    ]
+
+
+def test_run_create_forwards_exact_identifiers_and_keeps_scenario_and_member_counts_distinct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI 原樣傳遞識別碼；來源五萬、選中二十情境與八十粒子不得混為同一分母。"""
+
+    calls = []
+
+    def create(**kwargs):
+        """只記錄參數，返回模擬計畫；本測試不執行來源讀取或粒子積分。"""
+        calls.append(kwargs)
+        return _FakeWorkspace(tmp_path / "exact-pilot", {"scenario_selection": {
+            "mode": "pilot_exact", "source_scenario_count": 50_000, "selected_scenario_count": 20,
+        }})
+
+    monkeypatch.setattr(cli, "initialize_pilot_run", create)
+    monkeypatch.setattr(cli, "validate_run", lambda *args, **kwargs: {
+        "valid": True, "summary": {"scenario_count": 20, "particle_count": 80, "shard_count": 2},
+    })
+    assert main(_exact_create_arguments(tmp_path)) == 0
+    assert calls[0]["pilot_study_site_id"] == "hsinchu"
+    assert calls[0]["pilot_arrival_id"] == "synthetic-arrival-id"
+    assert calls[0]["pilot_material_id"] == "synthetic-material-id"
+    assert "pilot_scenarios_per_stratum" not in calls[0]
+    result = json.loads(capsys.readouterr().out)
+    assert result["selection_mode"] == "pilot_exact"
+    assert result["source_scenario_count"] == 50_000
+    assert result["scenario_count"] == 20
+    assert result["particle_count"] == 80
+
+
+@pytest.mark.parametrize(
+    "case", ("missing", "duplicate", "empty", "whitespace", "mixed", "formal", "synthetic"),
+)
+def test_run_create_rejects_malformed_exact_requests_before_initializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    """三 ID 缺項、重複、空白、混用分層或非 pilot 都須在建立器之前拒絕。"""
+
+    def blocked(**kwargs):
+        """非法 CLI 請求不應觸發來源讀取或目錄發布。"""
+        raise AssertionError("invalid request reached initializer")
+
+    monkeypatch.setattr(cli, "initialize_pilot_run", blocked)
+    monkeypatch.setattr(cli, "initialize_formal_run", blocked)
+    args = _exact_create_arguments(tmp_path)
+    if case == "missing":
+        args = args[:-2]
+    elif case == "duplicate":
+        args += ["--pilot-arrival-id", "another-id"]
+    elif case in {"empty", "whitespace"}:
+        args[-1] = "" if case == "empty" else " material-id "
+    elif case == "mixed":
+        args += ["--pilot-scenarios-per-stratum", "1"]
+    else:
+        args[args.index("--run-kind") + 1] = case
+    with pytest.raises((ValueError, SystemExit)):
+        main(args)
+    assert not (tmp_path / "runs").exists()
+
+
 def test_run_create_formal_rejects_pilot_selector_before_initializer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

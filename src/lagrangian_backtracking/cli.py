@@ -345,6 +345,8 @@ def _run_create_parser() -> argparse.ArgumentParser:
     CLI 介面；``--pilot-scenarios-per-stratum`` 僅供 pilot 工程 sanity／benchmark，formal
     明確禁止。formal 的 strict forcing、產品 topology 與 gap-safe gate 由 runtime
     initializer 執行，失敗時不會靜默降級成 pilot。
+    精確選擇另以 --pilot-study-site-id、--pilot-arrival-id、--pilot-material-id 明示，
+    三者缺一、重複或與分層 N 混用都拒絕；不依軌跡結果挑選案例。
     """
 
     parser = argparse.ArgumentParser(description="建立可驗證的 pilot 或 formal run workspace")
@@ -359,6 +361,13 @@ def _run_create_parser() -> argparse.ArgumentParser:
         default=None,
         help="pilot 工程 sanity/benchmark 每個 study_site×receptor.vertical strata 的情境數；formal 禁止",
     )
+    # 暫存每次出現值，讓 handler 拒絕重複選項，不採 argparse 預設的最後一值覆蓋。
+    for flag, meaning in (
+        ("--pilot-study-site-id", "單一研究站點 study_site_id"),
+        ("--pilot-arrival-id", "單一到達時間 arrival_time_id 識別碼，非 UTC 或列索引"),
+        ("--pilot-material-id", "單一材質 material_id"),
+    ):
+        parser.add_argument(flag, action="append", help=f"pilot 精確選擇：{meaning}；三項必須一起指定")
     parser.add_argument(
         "--experiment-case",
         required=True,
@@ -1076,11 +1085,28 @@ def run_create(argv: Sequence[str] | None = None) -> int:
     ``validate_run(..., require_complete=False)`` 做只讀驗證。失敗例外只帶 validator
     錯誤碼，不帶 workspace 或 SERVER 絕對路徑；成功 JSON 的 workspace 只供 CLI 顯示，
     並不回寫 plan。
+    精確選擇的三個識別碼只傳給 pilot 建立器，再由計畫繫結持久保存；此處先拒絕
+    缺項、重複、首尾空白與正式／分層形式混用，不自行讀取或裁剪來源清單。
     """
 
     args = _run_create_parser().parse_args(argv)
     if args.run_kind == "formal" and args.pilot_scenarios_per_stratum is not None:
         raise ValueError("formal run 禁止 --pilot-scenarios-per-stratum")
+    exact_options = {
+        name: getattr(args, name)
+        for name in ("pilot_study_site_id", "pilot_arrival_id", "pilot_material_id")
+    }
+    exact_requested = any(values is not None for values in exact_options.values())
+    if exact_requested:
+        if args.run_kind != "pilot":
+            raise ValueError("formal run 禁止 pilot_exact")
+        if args.pilot_scenarios_per_stratum is not None:
+            raise ValueError("pilot_exact 不可與 --pilot-scenarios-per-stratum 混用")
+        if any(
+            values is None or len(values) != 1 or not values[0] or values[0] != values[0].strip()
+            for values in exact_options.values()
+        ):
+            raise ValueError("pilot_exact 必須各一次明示完整且無首尾空白的三個識別碼")
     initializer = initialize_formal_run if args.run_kind == "formal" else initialize_pilot_run
     initializer_kwargs: dict[str, object] = {
         "config_path": args.config,
@@ -1095,6 +1121,8 @@ def run_create(argv: Sequence[str] | None = None) -> int:
     # pilot initializer，formal 已在上方先拒絕，避免任何 manifest／workspace I/O。
     if args.run_kind == "pilot" and args.pilot_scenarios_per_stratum is not None:
         initializer_kwargs["pilot_scenarios_per_stratum"] = args.pilot_scenarios_per_stratum
+    if exact_requested:
+        initializer_kwargs.update({name: values[0] for name, values in exact_options.items()})
     workspace = initializer(**initializer_kwargs)
     validation = validate_run(workspace, require_complete=False)
     if not isinstance(validation, Mapping) or validation.get("valid") is not True:

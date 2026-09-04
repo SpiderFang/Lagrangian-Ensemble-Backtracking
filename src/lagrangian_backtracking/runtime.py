@@ -39,7 +39,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
@@ -62,6 +62,7 @@ from .models import ParticleState
 from .pilot_selection import (
     apply_scenario_selection,
     build_full_scenario_selection,
+    select_exact_pilot_scenarios,
     select_pilot_scenarios,
 )
 from .preflight import Finding, MonthInventory, TimeAxisInventory, TimeGapInventory
@@ -77,6 +78,7 @@ from .run_control import (
 )
 from .run_validation import validate_run
 from .runner import ReferenceParticleRequest, RunUnit, scenario_execution_sort_key
+from .scenarios import validate_baseline_coverage
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +405,47 @@ def _positive_integer(value: Any, *, label: str) -> int:
     if value < 1:
         raise ValueError(f"{label} 必須是正整數")
     return int(value)
+
+
+def _backtrack_horizon(max_days: float) -> tuple[float, int]:
+    """將設定的回溯天數轉為一致的秒數與整數奈秒，不任意捨入次奈秒時間。
+
+    輸入先驗證為有限正浮點數；一天固定為 86,400 秒、一秒為十億奈秒。舊十進位
+    天數規則若已給出整數奈秒，原值完全保留。否則先沿用設定建立器的浮點乘法轉秒，
+    再由秒數的最短十進位表示找最近整數奈秒候選。候選僅在以下三項同時成立時接受：
+    誤差嚴格小於 0.5 ns、不超過秒數兩個相鄰浮點間距（ULP），且候選轉回秒／天後
+    與原輸入 float 完全相同。兩個間距涵蓋乘法與十進位表示誤差，但不能取代往返核對。
+
+    因此 1/24 天及由 10 ns 換算的天數可還原，86.4 ns、10.5 ns 或可區分的鄰近
+    天數不得被當成整數奈秒。浮點輸入本來無法區分的更細時間也不能由此恢復；此規則
+    不是宣稱任意時間都具奈秒準確度。非正值、非有限秒數及超過有號 64 位奈秒範圍
+    均拒絕；不改到達時間、設定檔或物理步長。兩個 runtime 入口必須共用本規則。
+    """
+
+    days = _finite_scalar(
+        max_days, label="boundaries.max_backtrack_days", minimum=0.0, allow_zero=False,
+    )
+    seconds = days * 86_400.0
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("max_backtrack_days 換算後的秒數必須有限且為正")
+    # 局部精度足以保存 float 最短字串乘單位的所有有效位數，且不受呼叫端 Decimal 設定影響。
+    with localcontext() as context:
+        context.prec = 50
+        scale = Decimal(1_000_000_000)
+        horizon = Decimal(str(days)) * Decimal(86_400) * scale
+        if horizon != horizon.to_integral_value():
+            normalized_ns = Decimal(str(seconds)) * scale
+            candidate = normalized_ns.to_integral_value(rounding=ROUND_HALF_EVEN)
+            error_ns = abs(candidate - normalized_ns)
+            tolerance_ns = Decimal(str(math.ulp(seconds))) * 2 * scale
+            candidate_seconds = float(candidate / scale)
+            if (error_ns >= Decimal("0.5") or error_ns > tolerance_ns
+                    or candidate_seconds / 86_400.0 != days):
+                raise ValueError("boundaries.max_backtrack_days 換算後的 horizon ns 必須是可驗證整數")
+            horizon = candidate
+        if not 1 <= horizon <= (1 << 63) - 1:
+            raise ValueError("horizon ns 必須位於正有號 64 位整數範圍")
+        return float(horizon / scale), int(horizon)
 
 
 def _required_mapping_value(container: Any, *, label: str, key: str) -> Any:
@@ -1143,7 +1186,8 @@ def _validate_formal_ocm_gap_support(
     入檢查。若任何正式 OCM axis 仍有 gap，只有 config 明示的 gap-safe manifest 能使
     gate 繼續；reconstruction manifest 本身不是已完成重建的證據，不能代替時間 coverage。
     函式只比較 inventory 的 UTC 摘要與已載入的 arrival records，不讀 OCM 大型陣列，也不
-    執行缺口重建。
+    執行缺口重建。天數轉奈秒與 request factory 共用有界浮點往返規則；接受可還原的
+    小時分數，不捨入真正次奈秒，也不移動 gap-safe 窗口的任一端點。
     """
 
     site_flow_ids: dict[str, str] = {}
@@ -1183,16 +1227,7 @@ def _validate_formal_ocm_gap_support(
             "OCM inventory 仍有 gaps；僅宣告 reconstruction manifest 或未宣告 gap-safe "
             "arrival manifest，formal runtime 必須拒絕"
         )
-    max_days = _finite_scalar(
-        config.boundaries.max_backtrack_days,
-        label="boundaries.max_backtrack_days",
-        minimum=0.0,
-        allow_zero=False,
-    )
-    horizon_decimal = Decimal(str(max_days)) * Decimal(86_400) * Decimal(1_000_000_000)
-    if horizon_decimal != horizon_decimal.to_integral_value():
-        raise ValueError("formal gap-safe horizon ns 必須是整數")
-    horizon_ns = int(horizon_decimal)
+    _, horizon_ns = _backtrack_horizon(config.boundaries.max_backtrack_days)
     if not arrival_flows:
         raise ValueError("formal gap-safe inventory 必須有 arrival records")
     for arrival, flow_id in arrival_flows:
@@ -1473,7 +1508,7 @@ def _select_current_plan_scenarios(
 ) -> tuple[Any, ...]:
     """由完整 current manifest 重算 plan 選擇，將 legacy 2.0 視為 full。
 
-    2.1 plan 的 pilot stratified binding 以設定中的 ``scenario_count`` 作 source count
+    2.1 plan 的 pilot 分層與精確選擇繫結，均以設定中的 ``scenario_count`` 作完整來源數
     gate；full binding 則以 plan 自身的 source count 驗證，因為既有 synthetic／小型
     engineering fixture 可能刻意只提供一筆完整 fixture。無論版本或模式，實際 selected
     tuple 都由 ``apply_scenario_selection`` 重跑，不信任 scenario table 以外的舊列或
@@ -1490,7 +1525,10 @@ def _select_current_plan_scenarios(
         binding = plan["scenario_selection"]
         if not isinstance(binding, Mapping):
             raise ValueError("run plan scenario_selection 必須是 mapping")
-        if binding["mode"] == "pilot_stratified":
+        if binding["mode"] in {"pilot_stratified", "pilot_exact"}:
+            if binding["mode"] == "pilot_exact":
+                # 精確先導仍從正式五萬基礎情境出發，不以 run plan 的小樣本數代替母體。
+                validate_baseline_coverage(scenario_inputs.scenarios)
             configured_source_count = _positive_integer(
                 config.scenarios.scenario_count,
                 label="config.scenarios.scenario_count",
@@ -1694,6 +1732,9 @@ def initialize_run(
     run_kind: str,
     declared_git_commit: str | None = None,
     pilot_scenarios_per_stratum: int | None = None,
+    pilot_study_site_id: str | None = None,
+    pilot_arrival_id: str | None = None,
+    pilot_material_id: str | None = None,
 ) -> RunWorkspace:
     """依 ``run_kind`` 初始化 pilot 或 formal run workspace。
 
@@ -1706,6 +1747,10 @@ def initialize_run(
     ``pilot_scenarios_per_stratum`` 只供 pilot 工程 sanity／benchmark；指定時會先從
     完整 source scenarios 依站點×receptor vertical 分層選樣，formal 即使傳入數值也會在
     任何 manifest／forcing I/O 前拒絕。省略時 pilot 與 formal 都保存 full selection。
+    三個 pilot_*_id 必須一起明示，且不可與分層 N 混用；其精確選擇在完整來源清單、
+    幾何、輸入盤點及執行設定驗證後才執行。arrival_id 對應 arrival_time_id 識別碼，
+    不接受 UTC 或列索引。選中站的全部受體原樣保留，三個識別碼只存入獨立版本的
+    scenario_selection，不改 config 或校準繫結。正式／合成模式及不完整參數均拒絕。
     """
 
     if type(run_kind) is not str or run_kind not in _RUNTIME_RUN_KINDS:
@@ -1717,6 +1762,15 @@ def initialize_run(
     formal = run_kind == "formal"
     if formal and pilot_scenarios_per_stratum is not None:
         raise ValueError("formal run 禁止 pilot_scenarios_per_stratum")
+    exact_ids = (pilot_study_site_id, pilot_arrival_id, pilot_material_id)
+    exact_requested = any(value is not None for value in exact_ids)
+    if exact_requested:
+        if formal:
+            raise ValueError("formal run 禁止 pilot_exact")
+        if pilot_scenarios_per_stratum is not None:
+            raise ValueError("pilot_exact 不可與 pilot_scenarios_per_stratum 混用")
+        if any(type(value) is not str or not value or value != value.strip() for value in exact_ids):
+            raise ValueError("pilot_exact 必須明示完整且無首尾空白的三個識別碼")
     # experiment case 是 run identity 與 physics 分支的唯一 registry key；先在讀取 config
     # 與 manifest 前拒絕未知值，避免 caller 以任意字串觸發未定義的 fallback 路徑。
     _experiment_case_spec(experiment_case_id)
@@ -1739,10 +1793,11 @@ def initialize_run(
         expected_keys=_PILOT_GEOMETRY_HASH_KEYS,
         label=f"{run_kind} geometries.canonical_component_hashes",
     )
-    if pilot_scenarios_per_stratum is None:
+    # 精確選擇延至下方完整輸入盤點及執行設定檢查後，既有完整／分層路徑維持原順序。
+    if not exact_requested and pilot_scenarios_per_stratum is None:
         selected_scenarios = tuple(scenario_inputs.scenarios)
         scenario_selection = build_full_scenario_selection(selected_scenarios)
-    else:
+    elif not exact_requested:
         expected_source_count = _positive_integer(
             config.scenarios.scenario_count,
             label="config.scenarios.scenario_count",
@@ -1779,6 +1834,18 @@ def initialize_run(
     # production_backend 已在 strict gate 驗證；既有 initialize_run_workspace 的固定
     # plan schema 不保存這個欄位，避免在 Slice 3B2a 擴張自訂 plan 欄位。
     del production_backend
+
+    if exact_requested:
+        validate_baseline_coverage(scenario_inputs.scenarios)
+        selected_scenarios, scenario_selection = select_exact_pilot_scenarios(
+            scenario_inputs.scenarios,
+            scenario_inputs.receptors,
+            _positive_integer(config.scenarios.scenario_count, label="config.scenarios.scenario_count"),
+            study_site_id=pilot_study_site_id,
+            arrival_id=pilot_arrival_id,
+            material_id=pilot_material_id,
+            run_kind=run_kind,
+        )
 
     provenance = collect_code_provenance(
         project_root,
@@ -1817,8 +1884,15 @@ def initialize_pilot_run(
     project_root: str | Path,
     declared_git_commit: str | None = None,
     pilot_scenarios_per_stratum: int | None = None,
+    pilot_study_site_id: str | None = None,
+    pilot_arrival_id: str | None = None,
+    pilot_material_id: str | None = None,
 ) -> RunWorkspace:
-    """建立 pilot workspace，可選擇每個 site×vertical strata 的工程抽樣數 N。"""
+    """建立工程先導執行，可選分層 N 或單站／到達時間／材質的全部受體。
+
+    三個精確識別碼須同時提供，與 pilot_scenarios_per_stratum 互斥；皆省略時維持
+    舊完整選擇。驗證與拒絕條件同 initialize_run；不修改來源清單、設定或 seed。
+    """
 
     return initialize_run(
         config_path=config_path,
@@ -1830,6 +1904,9 @@ def initialize_pilot_run(
         run_kind="pilot",
         declared_git_commit=declared_git_commit,
         pilot_scenarios_per_stratum=pilot_scenarios_per_stratum,
+        pilot_study_site_id=pilot_study_site_id,
+        pilot_arrival_id=pilot_arrival_id,
+        pilot_material_id=pilot_material_id,
     )
 
 
@@ -2121,8 +2198,8 @@ class RuntimeRequestFactory:
         if pair.flow_domain_id != flow_id:
             raise ValueError(f"dynamic pair flow_domain_id 與 resolved {self._run_kind} flow 不一致")
 
-        # horizon 以 Decimal(str(days)) 計算；若奈秒不是整數便拒絕，不用 round、floor
-        # 或 ceil 偷改到達時間。提前建立 settings 也可讓不合法 horizon 在 manager 前停止。
+        # 回溯上限與正式 gap-safe 共用精度有界的天／秒／奈秒轉換；只修正可往返的浮點
+        # 表示，不偷改到達時間。先建立設定，讓不合法次奈秒或溢位在 forcing manager 前停止。
         settings = self._build_settings(scenario.arrival_time_utc_ns)
 
         geometry = self._geometries.get(scenario.study_site_id)
@@ -2205,23 +2282,23 @@ class RuntimeRequestFactory:
         )
 
     def _build_settings(self, arrival_time_utc_ns: int) -> EngineSettings:
-        """依固定十進位奈秒規則建立引擎設定，不對 horizon 做近似捨入。"""
+        """以共用有界轉換建立秒制引擎設定，最早 UTC 以整數奈秒相減。
 
-        days = Decimal(str(self._max_backtrack_days))
-        horizon = days * Decimal(86400) * Decimal(1_000_000_000)
-        if horizon != horizon.to_integral_value():
-            raise ValueError("boundaries.max_backtrack_days 換算後的 horizon ns 必須是整數")
-        horizon_ns = int(horizon)
-        max_backtrack_seconds = float(days * Decimal(86400))
-        if not math.isfinite(max_backtrack_seconds):
-            raise ValueError("max_backtrack_days 換算後的 max_backtrack_seconds 不可為非有限值")
+        來源 arrival 不重算；拒絕不能精確還原的次奈秒上限及最早時間超出有號 64 位範圍。
+        此函式在建立 forcing manager 前呼叫，不改步長、種子、亂數或取樣策略。
+        """
+
+        max_backtrack_seconds, horizon_ns = _backtrack_horizon(self._max_backtrack_days)
+        earliest_ns = arrival_time_utc_ns - horizon_ns
+        if not -(1 << 63) <= earliest_ns < (1 << 63):
+            raise ValueError("earliest_forcing_time_utc_ns 超出有號 64 位整數範圍")
         return EngineSettings(
             dt_min_seconds=self._dt_min_seconds,
             dt_max_seconds=self._dt_max_seconds,
             output_interval_seconds=self._output_interval_seconds,
             max_backtrack_seconds=max_backtrack_seconds,
             maximum_step_count=self._maximum_step_count,
-            earliest_forcing_time_utc_ns=arrival_time_utc_ns - horizon_ns,
+            earliest_forcing_time_utc_ns=earliest_ns,
             maximum_minimum_clamps=self._maximum_minimum_clamps,
         )
 
