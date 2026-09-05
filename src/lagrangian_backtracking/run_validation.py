@@ -65,10 +65,10 @@ class ValidatedTrajectoryShard:
 
     ``trajectory_schema_version`` 緊接在 manifest 雜湊之後，保存同一份已驗證
     ``output/manifest.json`` 的原生 ``schema_version`` 字串。它描述目前 shard 的
-    固定 payload 契約；公開的 ``TRAJECTORY_SHARD_SCHEMA_VERSION`` 才是正式 report
-    gate 可精確比對的版本。一般工程 iterator 不在此處淘汰 legacy ``"1.0.0"``，而是
-    原樣交給下游辨識；正式 report 仍須在更上層另外要求公開版本，避免把相容讀取誤當
-    成正式科學輸入資格。
+    固定 payload 契約；一般工程 iterator 保留 validator 已接受的 v1／v2／v3 實際版本，
+    交給下游辨識，不在此處把 reader 相容性誤當成正式報告資格。正式 report gate 由
+    ``report_pipeline`` 另行要求全 run 單一 v2 或 v3，避免把相容讀取誤當成正式科學
+    輸入資格。
     """
 
     shard_id: str
@@ -736,10 +736,9 @@ def iter_complete_run_trajectory_shards(
                 raise ValueError("trajectory manifest 缺少解析結果")
             schema_version = manifest.get("schema_version")
             # 這裡只確認已通過 validator 的 manifest 邊界仍是原生非空版本字串；刻意
-            # 不比對公開 current 版本，因為一般工程聚合必須能讀取 legacy v1。正式
-            # report gate 會在更上層另外精確要求 TRAJECTORY_SHARD_SCHEMA_VERSION，
-            # 避免把 reader 相容性與正式報告資格混為一談。保留原值也能讓下游辨識實際
-            # 契約，不以 str() 或 trim 進行可能掩蓋壞 manifest 的隱式修補。
+            # 保留實際 v1／v2／v3 版本，因為一般工程聚合需維持 reader 的舊檔相容性。
+            # 正式 report gate 會在更上層要求全 run 單一 v2 或 v3，避免把相容讀取與
+            # 正式報告資格混為一談。不以 str() 或 trim 進行可能掩蓋壞 manifest 的修補。
             if type(schema_version) is not str or not schema_version:
                 raise ValueError("trajectory manifest schema_version 不合法")
             manifest_counts = tuple(

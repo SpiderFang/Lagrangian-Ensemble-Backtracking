@@ -1,6 +1,6 @@
 """由已完成且來源綁定的精確先導產生獨立工程預覽，不建立正式 report-v1。
 
-只讀既有 schema 2 軌跡、環境與事件，不開啟海流／波浪陣列、不重新積分。全部成員
+只讀既有 trajectory schema 2／3 的軌跡、環境、速度與事件，不開啟海流／波浪陣列、不重新積分。全部成員
 皆進入停止統計及 CSV；曲線太多時依明示的穩定成員順序限量並揭露分母。公尺制位置、
 UTC 奈秒及回溯秒數原樣保留，缺環境或診斷不補零。來源與產品的 SHA-256 可供重建核對。
 合成測試只驗工程，預覽不是收斂、觀測驗證、絕對來源機率或來源歸因證據。
@@ -40,6 +40,10 @@ from .scenarios import derive_member_seed, stable_identifier
 
 PILOT_PREVIEW_SCHEMA_VERSION = "1.0.0"
 """獨立先導預覽的版本，不沿用正式報告固定圖表清單。"""
+
+# 預覽只接受已定義且有環境欄位的 trajectory schema 2 或目前 writer 發布的 schema 3。
+# schema 1 沒有環境證據，不能在這個需要輸出環境／速度 CSV 的 consumer 中被假裝成完整資料。
+_PREVIEW_TRAJECTORY_SCHEMA_VERSIONS = frozenset({"2.0.0", TRAJECTORY_SHARD_SCHEMA_VERSION})
 
 _TERMINAL_STATUSES = tuple(item.value for item in ParticleStatus if item is not ParticleStatus.ACTIVE)
 _VERTICAL_PRIORITY = ("near_bed", "mid_lower_water_column", "mid_upper_water_column", "upper_water_column")
@@ -165,8 +169,9 @@ def _trajectory_metadata(root: Path, plan: Mapping) -> dict:
         if not path.is_relative_to(root):
             raise PilotPreviewError("trajectory manifest 不屬於來源 run")
         manifest = _small_json(path)
-        if TRAJECTORY_SHARD_SCHEMA_VERSION != "2.0.0" or manifest["schema_version"] != "2.0.0":
-            raise PilotPreviewError("preview 只接受 trajectory schema 2.0.0；legacy 環境欄位不可用")
+        schema_version = manifest.get("schema_version")
+        if type(schema_version) is not str or schema_version not in _PREVIEW_TRAJECTORY_SCHEMA_VERSIONS:
+            raise PilotPreviewError("preview 只接受 trajectory schema 2.0.0 或 3.0.0；schema 1 缺少環境欄位")
         counts = {key: manifest[key] for key in ("particle_count", "observation_count", "event_count")}
         if any(type(value) is not int or value < 0 for value in counts.values()):
             raise PilotPreviewError("trajectory manifest 計數無效")
@@ -323,8 +328,11 @@ def _collect(
         if shard.shard_id in seen_shards or shard.shard_id not in shard_sources:
             raise PilotPreviewError("preview 分片重複或與來源計畫不符")
         seen_shards.add(shard.shard_id)
-        if shard.trajectory_schema_version != "2.0.0":
-            raise PilotPreviewError("preview 不接受 legacy trajectory")
+        if (
+            type(shard.trajectory_schema_version) is not str
+            or shard.trajectory_schema_version not in _PREVIEW_TRAJECTORY_SCHEMA_VERSIONS
+        ):
+            raise PilotPreviewError("preview 只接受 trajectory schema 2.0.0 或 3.0.0；拒絕 schema 1")
         if shard.trajectory_manifest_sha256 != shard_sources[shard.shard_id]["trajectory_manifest_sha256"]:
             raise PilotPreviewError("preview trajectory manifest 在讀取期間變動")
         for result in shard.results:
@@ -406,6 +414,17 @@ def _collect(
                         "environment_sample_status": observation.environment_sample_status.value,
                         "environment_qc_flags": observation.environment_qc_flags,
                         "forcing_month_id": observation.forcing_month_id,
+                        "velocity_sample_status": observation.velocity_sample_status.value,
+                        "total_u_mps": observation.total_u_mps,
+                        "total_v_mps": observation.total_v_mps,
+                        "total_w_mps": observation.total_w_mps,
+                        "ocm_u_mps": observation.ocm_u_mps,
+                        "ocm_v_mps": observation.ocm_v_mps,
+                        "ocm_w_mps": observation.ocm_w_mps,
+                        "stokes_u_mps": observation.stokes_u_mps,
+                        "stokes_v_mps": observation.stokes_v_mps,
+                        "settling_w_mps": observation.settling_w_mps,
+                        "velocity_qc_flags": observation.velocity_qc_flags,
                     }
                 )
     if seen != set(expected) or seen_shards != set(shard_sources):
@@ -796,7 +815,7 @@ def build_pilot_preview(
     """以已驗證完整先導建立新目錄，回傳無私有路徑的來源／輸出校驗清單。
 
     先只讀小型計畫／分片清單做容量與模式的早期拒絕；通過不代表來源已驗收。隨後必須
-    完整驗證靜態來源（pilot、require_complete=True），再串流 schema 2 結果，三 ID 與
+    完整驗證靜態來源（pilot、require_complete=True），再串流 schema 2／3 結果，三 ID 與
     全部受體／M 必須一致。容量上限在通用驗證器讀觀測前以清單宣告數量檢查，
     讀回後再驗實數；單次最多一個分片加有界表格，不載入 forcing。MPLCONFIGDIR 必須
     由 caller 明示且已存在；字型可指定，無合格中文字碼時圖用英文，繁中說明仍保留。

@@ -1,5 +1,10 @@
 # 2024–2025 全部可得資料、時間缺口重建與 A 區擴張決策
 
+> **閱讀提示**
+> - 文件類型：資料可用性、時間缺口與 A 區擴張決策。
+> - 它回答：全部可得資料如何定義，以及缺時何時重建、何時採缺口安全視窗。
+> - 建議先讀：[科學方法與驗證](../foundation/03_scientific_method_and_validation.md)，再讀[SERVER 手冊](06_server_runbook_plan.md)。
+
 ## 1. 決策效力與適用範圍
 
 本文件取代先前將資料狀態、供應者 metadata 或時間缺口列為「等待外部補件」的判定。
@@ -85,7 +90,7 @@ et al. (2018) 的持續嚴重缺口案例顯示，Eulerian 流場看似可接受
 - [Delandmeter and van Sebille (2019), The Parcels v2.0 Lagrangian framework](https://doi.org/10.5194/gmd-12-3571-2019)：Lagrangian 計算須先在粒子位置內插 Eulerian 場，再積分粒子 ODE，支持將 forcing 重建與數值積分分層驗證。
 
 上述四篇核心文獻的 DOI、原文頁碼及紅框短摘錄備存於
-[`data/time_reconstruction_literature/`](../data/time_reconstruction_literature/README.md)。紅框只標記本案
+[`data/time_reconstruction_literature/`](../../data/time_reconstruction_literature/README.md)。紅框只標記本案
 實際採用的段落；本案的潮汐項、VAR 正則化、雙向 smoother、member 數與 acceptance threshold
 均為資料驅動的實作選擇，不能被誤稱為文獻直接給定的通用參數。
 

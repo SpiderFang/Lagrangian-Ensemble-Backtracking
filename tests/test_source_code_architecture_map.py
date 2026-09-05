@@ -11,11 +11,76 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 from types import ModuleType
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "render_source_code_architecture_map.py"
+
+# 這 18 筆是原先位於 docs 根層的文件：其中 17 筆已依主題搬入子目錄，
+# implementation_status.md 仍留在根層作為目前狀態的單一索引。測試同時核對現行路徑
+# 與索引中的原路徑文字，避免整理文件時遺失任一份歷史或現行內容。
+DOCUMENT_CATALOG: tuple[tuple[str, str], ...] = (
+    ("docs/implementation_status.md", "docs/implementation_status.md"),
+    (
+        "docs/foundation/01_requirements_traceability.md",
+        "docs/01_requirements_traceability.md",
+    ),
+    (
+        "docs/foundation/02_architecture_and_data_contract.md",
+        "docs/02_architecture_and_data_contract.md",
+    ),
+    (
+        "docs/foundation/03_scientific_method_and_validation.md",
+        "docs/03_scientific_method_and_validation.md",
+    ),
+    ("docs/archive/04_implementation_plan.md", "docs/04_implementation_plan.md"),
+    ("docs/development/05_decisions_and_risks.md", "docs/05_decisions_and_risks.md"),
+    ("docs/operations/06_server_runbook_plan.md", "docs/06_server_runbook_plan.md"),
+    ("docs/results/07_results_visualization_plan.md", "docs/07_results_visualization_plan.md"),
+    (
+        "docs/foundation/08_design_baseline_and_derived_gates.md",
+        "docs/08_design_baseline_and_derived_gates.md",
+    ),
+    (
+        "docs/archive/09_implementation_audit_2026-08-19.md",
+        "docs/09_implementation_audit_2026-08-19.md",
+    ),
+    (
+        "docs/operations/10_available_data_time_reconstruction_and_a_expansion.md",
+        "docs/10_available_data_time_reconstruction_and_a_expansion.md",
+    ),
+    (
+        "docs/development/11_source_code_guide_and_plan_traceability.md",
+        "docs/11_source_code_guide_and_plan_traceability.md",
+    ),
+    (
+        "docs/results/12_aggregate_release_and_server_execution_plan.md",
+        "docs/12_aggregate_release_and_server_execution_plan.md",
+    ),
+    (
+        "docs/results/13_report_release_and_scientific_outputs_plan.md",
+        "docs/13_report_release_and_scientific_outputs_plan.md",
+    ),
+    (
+        "docs/operations/14_input_derivation_and_release_contract.md",
+        "docs/14_input_derivation_and_release_contract.md",
+    ),
+    ("docs/operations/cli_reference.md", "docs/cli_reference.md"),
+    ("docs/operations/git_deployment_and_data_sync.md", "docs/git_deployment_and_data_sync.md"),
+    ("docs/operations/pilot_run_plan.md", "docs/pilot_run_plan.md"),
+)
+
+# 只抓取一般 Markdown 連結，不把圖片語法的開頭驚嘆號當成另一個連結；外部 URL
+# 會在掃描函式中排除，保留所有本地 Markdown、圖檔、PDF 與設定檔連結的存在性檢查。
+MARKDOWN_LINK_PATTERN = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]*)\)")
+EXTERNAL_LINK_PREFIXES = ("http://", "https://", "mailto:")
+# BayTrace、work、tmp、outputs 與虛擬環境是大型外部／執行產物，不是本專案文件拓撲；
+# 排除它們可讓「全 repo 文件」驗收聚焦於可交付的 tracked 文件與本次新增索引。
+NON_DELIVERABLE_MARKDOWN_DIRECTORIES = frozenset(
+    {".git", ".pytest_cache", ".venv", "BayTrace", "dist", "outputs", "tmp", "work"}
+)
 
 
 def _load_architecture_map_module() -> ModuleType:
@@ -26,6 +91,36 @@ def _load_architecture_map_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _iter_local_markdown_links() -> list[tuple[Path, str, Path]]:
+    """列出全 repository Markdown 中的本地連結及其解析後目標。
+
+    掃描以連結所在 Markdown 檔案的父目錄為基準，這樣文件搬移後的 ``../`` 層級會
+    直接受到測試約束。外部 DOI、網頁與電子郵件連結不屬於本地檔案拓撲，因此排除；
+    只有去除片段識別碼後的實際路徑會交由呼叫端檢查是否存在。回傳原始檔、原始目標
+    與解析後的 Path，方便失敗訊息指出哪一份文件的哪個連結斷裂。
+    """
+
+    links: list[tuple[Path, str, Path]] = []
+    for source_path in sorted(PROJECT_ROOT.rglob("*.md")):
+        if any(part in NON_DELIVERABLE_MARKDOWN_DIRECTORIES for part in source_path.parts):
+            continue
+        contents = source_path.read_text(encoding="utf-8")
+        for match in MARKDOWN_LINK_PATTERN.finditer(contents):
+            raw_target = match.group(1).strip()
+            if raw_target.startswith("<") and ">" in raw_target:
+                raw_target = raw_target[1 : raw_target.index(">")]
+            if raw_target.startswith(EXTERNAL_LINK_PREFIXES):
+                continue
+            target_without_fragment = raw_target.split("#", 1)[0].strip()
+            resolved_target = (
+                source_path
+                if not target_without_fragment
+                else (source_path.parent / target_without_fragment).resolve()
+            )
+            links.append((source_path, raw_target, resolved_target))
+    return links
 
 
 def test_module_catalog_covers_package_exactly() -> None:
@@ -457,52 +552,155 @@ def test_render_html_contains_new_nodes_and_replaces_placeholders(tmp_path: Path
 
 
 def test_readme_states_report_boundary_without_claiming_renderer_completion() -> None:
-    """README 應說明已完成的統計／release I/O 與尚未完成的 renderer 邊界。"""
+    """README 導覽與 implementation status 應保留 report 工程邊界及正式 evidence 缺口。"""
 
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "report_trajectory_stream.py" in readme
-    assert "report_release.py" in readme
-    assert "uv run lbt report-validate <run_id>.report-v1" in readme
-    assert "report_render.py" in readme
-    assert "report_validation_evidence.py" in readme
-    assert "report_comparison_statistics.py" in readme
-    assert "F12/T06 定量 evidence schema/I/O 已完成" in readme
-    assert "解析解（`analytic_solution`）" in readme
-    assert "dt/M 收斂（`timestep_convergence`／`member_convergence`）" in readme
-    assert "known-source（`known_source_synthetic`）" in readme
-    assert "restart（`checkpoint_restart`）" in readme
-    assert "NumPy/Numba" in readme
-    assert "forward-validation（`forward_validation`）" in readme
-    assert "正式 evidence\n尚未產生" in readme
-    assert "F12/T06 科學成果仍未完成" in readme
-    assert "report_pipeline.py" in readme
-    assert "report_pipeline.py` 的建置前唯讀 gate 已完成" in readme
-    for status_term in (
-        "complete run",
-        "aggregate/spec binding",
-        "formal trajectory v2",
-        "MPLCONFIGDIR",
-        "output/evidence policy",
-        "`build_report_release`",
-        "F01–F12/T01–T06 專屬 artifact adapters",
-        "CLI `report-build`",
-        "正式 SERVER 科學發布",
-        "不能把 preflight 稱為完整 pipeline",
+    status = (PROJECT_ROOT / "docs" / "implementation_status.md").read_text(encoding="utf-8")
+    requirements = (
+        PROJECT_ROOT / "docs" / "foundation" / "01_requirements_traceability.md"
+    ).read_text(
+        encoding="utf-8"
+    )
+    assert len(readme.splitlines()) <= 250
+    first_formal_section = next(
+        index for index, line in enumerate(readme.splitlines(), start=1) if line.startswith("## ")
+    )
+    assert first_formal_section <= 15
+    guide_section = readme.split("## 6. 文件導覽\n", 1)[1].split("\n## 7. ", 1)[0]
+    guide_rows = [line for line in guide_section.splitlines() if line.startswith("| ")]
+    assert len(guide_rows) == 6  # 表頭加上五個穩定入口；詳細分類移至 docs/README.md。
+    for link in (
+        "docs/README.md",
+        "docs/implementation_status.md",
+        "docs/operations/cli_reference.md",
+        "docs/operations/06_server_runbook_plan.md",
+        "docs/source_code_architecture_map.html",
     ):
-        assert status_term in readme
-    assert "report-build" in readme
-    assert "共同 staging/格式/校驗基礎已完成" in readme
-    assert "F01–F12/T01–T06 專屬 artifact adapters" in readme
-    assert "不能推定正式報告完成" in readme
-    assert "F11/T05 的 exact compatibility 與核心差值純計算已完成" in readme
-    assert "comparison release I/O" in readme
-    assert "artifact adapter" in readme
-    assert "pipeline/render" in readme
-    assert "真實 sensitivity cases" in readme
-    assert "不能稱 F11/T05 科學成果完成" in readme
-    assert "尚未完成" in readme
-    assert "解讀為正式科學成果" in readme
+        assert link in readme
+    assert "docs/operations/pilot_run_plan.md#獨立海岸底圖重繪" in readme
+    pilot_plan = (PROJECT_ROOT / "docs" / "operations" / "pilot_run_plan.md").read_text(
+        encoding="utf-8"
+    )
+    assert "## 獨立海岸底圖重繪" in pilot_plan
+    for required_term in (
+        "OCM native schema `3`",
+        "NWW3 analysis schema `1`",
+        "trajectory shard",
+        "execution checkpoint",
+        "50,000×M",
+        "不讀 raw NetCDF",
+        "不以零值",
+        "條件式來源足跡",
+        "B 區 r2",
+        "--style baytrace",
+        "關閉單項敏感度、單位檢核",
+    ):
+        assert required_term in readme
+    for homepage_only_term in ("F11/T05", "F12/T06"):
+        assert homepage_only_term not in readme
+    homepage_prose = re.sub(r"`[^`]*`", "", readme)
+    homepage_prose = re.sub(r"\[[^\]]*\]\([^)]*\)", "", homepage_prose)
+    for forbidden_prose_term in (
+        "runtime",
+        "gate",
+        "forcing",
+        "facade",
+        "evidence",
+        "immutable",
+        "binding",
+        "payload",
+        "consumer",
+        "cadence",
+        "selector",
+    ):
+        assert re.search(
+            rf"(?<![A-Za-z]){re.escape(forbidden_prose_term)}(?![A-Za-z])",
+            homepage_prose,
+        ) is None
+    combined_status = f"{readme}\n{status}"
+    for status_term in ("report-build", "F11/T05", "F12/T06"):
+        assert status_term in combined_status
+    assert "REQ-007" in requirements
+    assert "關閉單項敏感度、單位 gate" in requirements
+    assert "test_velocity_recording.py" in requirements
+    assert "正式 writer／reader" in requirements
+
+    for report_module in (
+        "report_trajectory_stream.py",
+        "report_statistics.py",
+        "report_release.py",
+        "report_render.py",
+        "report_validation_evidence.py",
+        "report_pipeline.py",
+        "report_comparison_statistics.py",
+    ):
+        assert report_module in status
+    assert "F12/T06 的正式 evidence 尚未產生" in status
+    for evidence_category in (
+        "解析解 `analytic_solution`",
+        "dt／M 收斂",
+        "known-source `known_source_synthetic`",
+        "restart `checkpoint_restart`",
+        "NumPy／Numba `numpy_numba_consistency`",
+        "forward-validation `forward_validation`",
+    ):
+        assert evidence_category in status
+    assert "v2 或 v3" in status
+    assert "v1 明確拒絕正式垂向證據" in status
+    assert "v2／v3 混用" in status
+    assert "report-build" in status
+    assert "F01–F12／T01–T06 專屬 artifact adapters" in status
+    assert "不能把 preflight 稱為完整 pipeline" in status
+    assert "共同 staging／格式／checksum 基礎" in status
+    assert "F11/T05 的 exact compatibility 與核心差值純計算已存在" in status
+    assert "comparison release I/O" in status
+    assert "真實 sensitivity cases" in status
+    assert "不能稱 F11/T05 科學成果完成" in status
+    assert "不能將 schema／I/O 通過" in status
+    assert "解讀為正式 OCM／NWW3\n科學驗證" in status
     assert "目前尚未完成圖表 renderer" not in readme
+    assert "目前尚未完成圖表 renderer" not in status
+
+
+def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> None:
+    """確認文件總入口涵蓋分類與原 18 份文件，且全 repo 的本地連結不斷裂。
+
+    這裡檢查的是所有 Markdown 檔案的實際連結拓撲，包含跨分類文件、設定檔、測試、
+    圖檔與 PDF；不只檢查新加入的閱讀提示。外部 DOI 與網頁連結由掃描器排除，因為
+    它們不是本地檔案存在性可以驗收的範圍。
+    """
+
+    index_path = PROJECT_ROOT / "docs" / "README.md"
+    index = index_path.read_text(encoding="utf-8")
+    assert len(DOCUMENT_CATALOG) == 18
+    for category in ("foundation/", "operations/", "results/", "development/", "archive/"):
+        assert category in index
+    for current_path, original_path in DOCUMENT_CATALOG:
+        assert (PROJECT_ROOT / current_path).is_file(), current_path
+        index_relative_path = current_path.removeprefix("docs/")
+        assert index_relative_path in index
+        assert original_path in index
+    for archive_path in (
+        PROJECT_ROOT / "docs" / "archive" / "04_implementation_plan.md",
+        PROJECT_ROOT / "docs" / "archive" / "09_implementation_audit_2026-08-19.md",
+    ):
+        archive_text = archive_path.read_text(encoding="utf-8")
+        assert "今天狀態以 [實作狀態](../implementation_status.md) 為準" in archive_text
+
+    local_links = _iter_local_markdown_links()
+    assert len(local_links) == 140
+    broken_links = [
+        (
+            source_path.relative_to(PROJECT_ROOT).as_posix(),
+            target,
+            resolved_target.relative_to(PROJECT_ROOT).as_posix()
+            if resolved_target.is_relative_to(PROJECT_ROOT)
+            else str(resolved_target),
+        )
+        for source_path, target, resolved_target in local_links
+        if not resolved_target.is_file()
+    ]
+    assert not broken_links, "本地 Markdown 連結目標不存在：" + repr(broken_links)
 
 
 def test_committed_html_is_source_generated(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 from test_run_control import _first_shard, _request, _workspace
 
+from lagrangian_backtracking.models import VelocitySampleStatus
 from lagrangian_backtracking.outputs import TRAJECTORY_SHARD_SCHEMA_VERSION, sha256_file
 from lagrangian_backtracking.run_control import RunController, load_run_progress
 from lagrangian_backtracking.run_validation import (
@@ -25,6 +26,19 @@ _ENVIRONMENT_PAYLOAD_FILES = (
     "bed_z_m.npy",
     "forcing_month_yyyymm.npy",
     "environment_qc_flags.npy",
+)
+_VELOCITY_PAYLOAD_FILES = (
+    "total_u_mps.npy",
+    "total_v_mps.npy",
+    "total_w_mps.npy",
+    "ocm_u_mps.npy",
+    "ocm_v_mps.npy",
+    "ocm_w_mps.npy",
+    "stokes_u_mps.npy",
+    "stokes_v_mps.npy",
+    "settling_w_mps.npy",
+    "velocity_sample_status_code.npy",
+    "velocity_qc_flags.npy",
 )
 
 
@@ -45,20 +59,35 @@ def _complete_workspace(parent: Path, run_id: str) -> Path:
 
 
 def _downgrade_shard_to_legacy(shard: Path) -> None:
-    """將已驗證的 v2 shard 降為唯讀相容的 v1 fixture，保留 base payload 與計數。
+    """將已驗證的 v3 shard 降為唯讀相容的 v1 fixture，保留 base payload 與計數。
 
-    legacy v1 的固定拓撲沒有 environment context 五個 NPY 欄位；測試只移除這些 v2
-    payload 並同步 manifest 的檔案契約與版本，藉此確認原有工程 validator/reader 能通過
+    legacy v1 的固定拓撲沒有 environment context 與 velocity context NPY 欄位；測試只
+    移除這些 v2／v3 payload 並同步 manifest 的檔案契約與版本，藉此確認原有工程 validator/reader 能通過
     v1，而 ``iter_complete_run_trajectory_shards`` 仍會把實際版本原值交給下游辨識。
     這個 helper 不模擬或重建科學資料，也不把 v1 宣稱為正式 F03/F09 輸入。
     """
 
     manifest_path = shard / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for filename in _ENVIRONMENT_PAYLOAD_FILES:
+    for filename in (*_ENVIRONMENT_PAYLOAD_FILES, *_VELOCITY_PAYLOAD_FILES):
         (shard / filename).unlink()
         manifest["files"].pop(filename)
     manifest["schema_version"] = _LEGACY_TRAJECTORY_SHARD_SCHEMA_VERSION
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _downgrade_shard_to_v2(shard: Path) -> None:
+    """從 v3 fixture 移除速度 payload，建立真正固定拓撲的 v2 fixture。"""
+
+    manifest_path = shard / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for filename in _VELOCITY_PAYLOAD_FILES:
+        (shard / filename).unlink()
+        manifest["files"].pop(filename)
+    manifest["schema_version"] = "2.0.0"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -109,7 +138,7 @@ def test_seed_validation_streams_without_read_table(tmp_path: Path, monkeypatch:
 
 
 def test_complete_trajectory_shard_exposes_current_schema_version(tmp_path: Path) -> None:
-    """完整 current shard 的 container 必須逐字保存公開 v2 schema 常數。
+    """完整 current shard 的 container 必須逐字保存公開 v3 schema 常數。
 
     iterator 會先經過 run-level 與 trajectory-level validator，再從已驗證 manifest 產生
     ``ValidatedTrajectoryShard``；此測試確認下游取得的是 manifest 的資料契約版本，而不
@@ -122,6 +151,27 @@ def test_complete_trajectory_shard_exposes_current_schema_version(tmp_path: Path
 
     assert records
     assert all(shard.trajectory_schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION for shard in records)
+
+
+def test_v2_trajectory_shard_schema_is_preserved_with_velocity_defaults(tmp_path: Path) -> None:
+    """真正移除 v3 速度 payload 的 v2 shard 可供工程 iterator 讀取，且不補算速度。"""
+
+    workspace = _complete_workspace(tmp_path, "v2-trajectory-schema")
+    for shard_id in load_run_progress(workspace)["shards"]:
+        _downgrade_shard_to_v2(workspace / "shards" / shard_id)
+
+    records = tuple(iter_complete_run_trajectory_shards(workspace))
+
+    assert records
+    assert all(record.trajectory_schema_version == "2.0.0" for record in records)
+    assert all(
+        observation.velocity_sample_status is VelocitySampleStatus.NOT_SAMPLED
+        and observation.total_u_mps is None
+        and observation.velocity_qc_flags is None
+        for record in records
+        for result in record.results
+        for observation in result.observations
+    )
 
 
 def test_legacy_trajectory_shard_schema_is_preserved_for_engineering_reader(

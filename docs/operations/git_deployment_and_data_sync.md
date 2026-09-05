@@ -1,5 +1,10 @@
 # Git 部署與資料同步手冊
 
+> **閱讀提示**
+> - 文件類型：本機 Git、SERVER source 與大型資料同步的安全手冊。
+> - 它回答：如何保留既有資料、核對 commit／checksum，並判定部署是否可驗收。
+> - 建議先讀：[SERVER 手冊](06_server_runbook_plan.md)，再核對[實作狀態](../implementation_status.md)。
+
 ## 1. 目的與狀態
 
 本手冊定義把既有 SERVER canonical 專案根目錄接入本機 Git 完整歷史的安全流程。`<...>`

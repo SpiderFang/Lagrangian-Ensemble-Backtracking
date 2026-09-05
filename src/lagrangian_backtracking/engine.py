@@ -6,8 +6,10 @@
 定位失敗，都會以不同停止狀態保留下來。日後加速版本必須逐項得到相同結果，不能另訂
 一套物理規則。Observation 的環境欄位只記錄步首樣本能證明的海面、海床、forcing
 月份與品質狀態：``z_m`` 採海面向上為正、長度採公尺、月份採 UTC 的 ``YYYYMM``。
-缺值與品質失敗不能以零值冒充有效環境；本機 synthetic callback 的結果也只是工程測試
-證據，不是正式 OCM／NWW3 海洋科學成果。
+速度 observation 另保存同點步首 sample 的總量及 OCM／Stokes 水平／沉降分項；輸出
+頻率是位置 observation cadence，不是 RK4 stage 或位移平均速度。缺值與品質失敗不能
+以零值冒充有效環境或速度來源；本機 synthetic callback 的結果也只是工程測試證據，
+不是正式 OCM／NWW3 海洋科學成果。
 """
 
 from __future__ import annotations
@@ -23,7 +25,17 @@ import numpy as np
 from .boundaries import BoundaryGeometry, resolve_horizontal_boundaries, resolve_vertical_boundaries
 from .diffusion import DiffusionCoefficients, DiffusionModel, choose_time_step, resolve_diffusion_sample
 from .integrators import SamplingContext, SamplingError, VelocityProvider, split_rk4_brownian_step
-from .models import BoundaryEvent, EventType, ParticleState, ParticleStatus, SampleQC, VelocitySample
+from .models import (
+    BoundaryEvent,
+    EventType,
+    ParticleState,
+    ParticleStatus,
+    SampleQC,
+    VelocityComponents,
+    VelocityQC,
+    VelocitySample,
+    VelocitySampleStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +67,9 @@ class EnvironmentSampleStatus(StrEnum):
 
 _ENVIRONMENT_GEOMETRY_TOLERANCE_M = 1.0e-6
 _MAX_ENVIRONMENT_QC_FLAGS = (1 << 32) - 1
+_VELOCITY_SUM_RTOL = 1.0e-12
+_VELOCITY_SUM_ATOL = 1.0e-12
+_MAX_VELOCITY_QC_FLAGS = (1 << 32) - 1
 _YYYYMM_PATTERN = re.compile(r"^[0-9]{6}$")
 EnvironmentContext = tuple[
     EnvironmentSampleStatus,
@@ -63,6 +78,23 @@ EnvironmentContext = tuple[
     str | None,
     int | None,
 ]
+VelocityObservationContext = tuple[
+    VelocitySampleStatus,
+    VelocityComponents | None,
+    int | None,
+]
+
+_VELOCITY_COMPONENT_FIELDS = (
+    "total_u_mps",
+    "total_v_mps",
+    "total_w_mps",
+    "ocm_u_mps",
+    "ocm_v_mps",
+    "ocm_w_mps",
+    "stokes_u_mps",
+    "stokes_v_mps",
+    "settling_w_mps",
+)
 
 
 def _canonical_environment_float(value: object, *, label: str) -> float:
@@ -213,15 +245,132 @@ def _validate_observation_environment(
     raise ValueError("未知 environment_sample_status")
 
 
+def _canonical_observation_velocity_float(value: object, *, label: str) -> float:
+    """驗證 Observation 內的速度欄位為有限公尺/秒數值。
+
+    Observation 是會進入 checkpoint、trajectory shard 與報告 consumer 的 immutable
+    邊界，因此這裡接受一般 Python／NumPy 實數但拒絕 bool、文字、複數與 NaN／無限值。
+    provider 的缺值在進入 Observation 前必須明確使用 ``None``，輸出 writer 才會將其
+    編碼為 NaN sentinel；不把非有限數值直接留在記憶體，可避免不同 consumer 對缺值有
+    不同解讀。
+    """
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{label} 必須是有限公尺/秒數值")
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{label} 必須是有限公尺/秒數值") from error
+    if not math.isfinite(normalized):
+        raise ValueError(f"{label} 不可為非有限數值")
+    return normalized
+
+
+def _validate_observation_velocity(
+    *,
+    status: VelocitySampleStatus,
+    components: tuple[object, ...],
+    velocity_qc_flags: int | None,
+) -> tuple[tuple[float | None, ...], int | None]:
+    """驗證 Observation 的九個速度欄位、狀態與獨立品質旗標。
+
+    九欄固定順序是總速度 ``u/v/w``、OCM ``u/v/w``、Stokes 水平 ``u/v`` 及沉降
+    ``w``，單位均為公尺/秒、方向均為正向物理方向。``COMPLETE`` 必須全部有限，並
+    以 ``1e-12`` 相對／絕對容差驗證水平與垂向合成；``TOTAL_ONLY`` 只允許總速度。
+    其他狀態可以保留部分有限診斷值，但必須有非零 velocity QC，不能把不完整資料當成
+    有效完整分項。函式回傳原生 float／None，供 frozen ``Observation`` 寫回 canonical
+    欄位。
+    """
+
+    if type(status) is not VelocitySampleStatus:
+        raise TypeError("velocity_sample_status 必須是 VelocitySampleStatus")
+    if len(components) != len(_VELOCITY_COMPONENT_FIELDS):
+        raise ValueError("velocity 欄位數量不符")
+
+    normalized: list[float | None] = []
+    for value, field_name in zip(components, _VELOCITY_COMPONENT_FIELDS, strict=True):
+        if value is None:
+            normalized.append(None)
+        else:
+            normalized.append(
+                _canonical_observation_velocity_float(value, label=field_name)
+            )
+
+    if status is VelocitySampleStatus.NOT_SAMPLED:
+        if any(value is not None for value in normalized) or velocity_qc_flags is not None:
+            raise ValueError("not_sampled 的速度 context 必須全部是 None")
+        return tuple(normalized), None
+
+    if type(velocity_qc_flags) is not int or not 0 <= velocity_qc_flags <= _MAX_VELOCITY_QC_FLAGS:
+        raise TypeError("velocity_qc_flags 必須是 uint32 範圍內的原生整數")
+
+    if status is VelocitySampleStatus.COMPLETE:
+        if velocity_qc_flags != 0 or any(value is None for value in normalized):
+            raise ValueError("complete 的速度欄位必須全部有限且 velocity_qc_flags=0")
+        total_u, total_v, total_w, ocm_u, ocm_v, ocm_w, stokes_u, stokes_v, settling_w = normalized
+        assert all(value is not None for value in normalized)
+        if not math.isclose(
+            total_u, ocm_u + stokes_u, rel_tol=_VELOCITY_SUM_RTOL, abs_tol=_VELOCITY_SUM_ATOL
+        ) or not math.isclose(
+            total_v, ocm_v + stokes_v, rel_tol=_VELOCITY_SUM_RTOL, abs_tol=_VELOCITY_SUM_ATOL
+        ) or not math.isclose(
+            total_w, ocm_w + settling_w, rel_tol=_VELOCITY_SUM_RTOL, abs_tol=_VELOCITY_SUM_ATOL
+        ):
+            raise ValueError("complete 的 total 與速度分項總和不符")
+        return tuple(normalized), 0
+
+    if status is VelocitySampleStatus.TOTAL_ONLY:
+        if velocity_qc_flags != 0:
+            raise ValueError("total_only 的 velocity_qc_flags 必須是 0")
+        if any(value is None for value in normalized[:3]) or any(
+            value is not None for value in normalized[3:]
+        ):
+            raise ValueError("total_only 只允許有限 total_u/v/w")
+        return tuple(normalized), 0
+
+    # INVALID、MISSING、NONFINITE 與 SUM_MISMATCH 都是「不完整或不可用」狀態；保留的
+    # 有限欄位只能作診斷，非零 QC 才是下游判定不可用的明示依據。記憶體內仍不允許 NaN，
+    # 缺值由 None 表示，輸出端才轉成 NaN。
+    if velocity_qc_flags == 0:
+        raise ValueError(f"{status.value} 的 velocity_qc_flags 必須非零")
+    return tuple(normalized), velocity_qc_flags
+
+
+def _velocity_context_kwargs(
+    context: VelocityObservationContext,
+) -> dict[str, object]:
+    """將步首速度 context 展開成 Observation 固定欄位，不新增任何取樣。
+
+    ``components=None`` 僅保留 ``NOT_SAMPLED`` 的全缺值語意；其餘狀態由 engine 先
+    建立明示的 ``VelocityComponents``，再逐欄傳入 constructor 驗證。這個小 helper 集中
+    維持九欄拓撲，避免 engine 的 enrichment、checkpoint reader 與 report clone 各自漏欄。
+    """
+
+    status, component_values, qc_flags = context
+    values = (
+        (None,) * len(_VELOCITY_COMPONENT_FIELDS)
+        if component_values is None
+        else tuple(getattr(component_values, name) for name in _VELOCITY_COMPONENT_FIELDS)
+    )
+    return {
+        "velocity_sample_status": status,
+        **dict(zip(_VELOCITY_COMPONENT_FIELDS, values, strict=True)),
+        "velocity_qc_flags": qc_flags,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """不等長軌跡中的一筆固定時間間隔位置與環境 context 紀錄。
+    """不等長軌跡中的一筆固定輸出點位置、環境與速度 context 紀錄。
 
     位置 ``x_m``、``y_m``、``z_m`` 使用公尺，``z_m`` 以海面向上為正；時間使用 UTC
-    奈秒，``age_seconds`` 使用秒。新增的四個環境欄位只描述同一 observation 時刻的步首
-    sample：有效時上下界必須包住粒子深度，無效時保留非零品質旗標，尚未取樣時全部為
-    ``None``。缺值不能以 0 混淆；即使 synthetic callback 通過工程測試，也不代表真實
-    OCM／NWW3 科學資料或正式來源足跡。
+    奈秒，``age_seconds`` 使用秒。環境欄位及九個速度欄位都只描述同一 observation
+    時刻能由步首 sample 證明的資料；速度總量與分項為公尺/秒、維持正向物理方向，
+    不因逆向積分另行取負。速度 sample 是輸出觀測點的取樣值，不是由位移除以時間的
+    平均速度，也不是 RK4 stage 或 internal step 的列表。缺值不能以 0 混淆；即使
+    synthetic callback 通過工程測試，也不代表真實 OCM／NWW3 科學資料或正式來源足跡。
     """
 
     particle_id: str
@@ -236,6 +385,17 @@ class Observation:
     bed_z_m: float | None = None
     forcing_month_id: str | None = None
     environment_qc_flags: int | None = None
+    velocity_sample_status: VelocitySampleStatus = VelocitySampleStatus.NOT_SAMPLED
+    total_u_mps: float | None = None
+    total_v_mps: float | None = None
+    total_w_mps: float | None = None
+    ocm_u_mps: float | None = None
+    ocm_v_mps: float | None = None
+    ocm_w_mps: float | None = None
+    stokes_u_mps: float | None = None
+    stokes_v_mps: float | None = None
+    settling_w_mps: float | None = None
+    velocity_qc_flags: int | None = None
 
     def __post_init__(self) -> None:
         """在建立 immutable observation 時驗證 context 並寫入原生 canonical 值。"""
@@ -252,6 +412,14 @@ class Observation:
         object.__setattr__(self, "bed_z_m", bed_z_m)
         object.__setattr__(self, "forcing_month_id", forcing_month_id)
         object.__setattr__(self, "environment_qc_flags", environment_qc_flags)
+        velocity_values, velocity_qc_flags = _validate_observation_velocity(
+            status=self.velocity_sample_status,
+            components=tuple(getattr(self, name) for name in _VELOCITY_COMPONENT_FIELDS),
+            velocity_qc_flags=self.velocity_qc_flags,
+        )
+        for name, value in zip(_VELOCITY_COMPONENT_FIELDS, velocity_values, strict=True):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "velocity_qc_flags", velocity_qc_flags)
 
 
 @dataclass(slots=True)
@@ -330,18 +498,35 @@ def _observation(
     *,
     preserve_context: Observation | None = None,
     environment_context: EnvironmentContext | None = None,
+    velocity_context: VelocityObservationContext | None = None,
 ) -> Observation:
-    """將目前粒子狀態整理成 observation，並在同一 state 時保留環境 context。
+    """將目前粒子狀態整理成 observation，並在同一 state 時保留兩種 context。
 
     新的時間／年齡或位置一定建立 ``NOT_SAMPLED`` observation；只有 max age、forcing
     start、finalize 等同一 state 的 status-only 更新，才可從上一筆完全相同的位置複製
-    context。若呼叫端明確提供 ``environment_context``，則它代表目前步首 reference
-    對同一 state 的取樣結果，優先於既有 context；這只用於無法與既有固定 observation
-    對齊的 invalid terminal，避免遺失實際失敗品質旗標。這個界線避免把步首樣本誤掛到
-    步末 boundary terminal，也讓中途恢復的有效 context 不會因單純改寫停止狀態而降級。
+    environment／velocity context。若呼叫端明確提供任一 context，則它代表目前步首
+    reference 對同一 state 的取樣結果，優先於既有 context；這只用於能證明同點的樣本，
+    不把步末 boundary terminal 或 RK4 中間 sample 借掛到新位置。這個界線也讓中途恢復
+    的有效 context 不會因單純改寫停止狀態而降級。
     """
 
     context: dict[str, object] = {}
+    if preserve_context is not None and _observation_matches_state(preserve_context, state):
+        context.update(
+            {
+                "environment_sample_status": preserve_context.environment_sample_status,
+                "eta_m": preserve_context.eta_m,
+                "bed_z_m": preserve_context.bed_z_m,
+                "forcing_month_id": preserve_context.forcing_month_id,
+                "environment_qc_flags": preserve_context.environment_qc_flags,
+                "velocity_sample_status": preserve_context.velocity_sample_status,
+                **{
+                    name: getattr(preserve_context, name)
+                    for name in _VELOCITY_COMPONENT_FIELDS
+                },
+                "velocity_qc_flags": preserve_context.velocity_qc_flags,
+            }
+        )
     if environment_context is not None:
         (
             environment_sample_status,
@@ -350,21 +535,17 @@ def _observation(
             forcing_month_id,
             environment_qc_flags,
         ) = environment_context
-        context = {
-            "environment_sample_status": environment_sample_status,
-            "eta_m": eta_m,
-            "bed_z_m": bed_z_m,
-            "forcing_month_id": forcing_month_id,
-            "environment_qc_flags": environment_qc_flags,
-        }
-    elif preserve_context is not None and _observation_matches_state(preserve_context, state):
-        context = {
-            "environment_sample_status": preserve_context.environment_sample_status,
-            "eta_m": preserve_context.eta_m,
-            "bed_z_m": preserve_context.bed_z_m,
-            "forcing_month_id": preserve_context.forcing_month_id,
-            "environment_qc_flags": preserve_context.environment_qc_flags,
-        }
+        context.update(
+            {
+                "environment_sample_status": environment_sample_status,
+                "eta_m": eta_m,
+                "bed_z_m": bed_z_m,
+                "forcing_month_id": forcing_month_id,
+                "environment_qc_flags": environment_qc_flags,
+            }
+        )
+    if velocity_context is not None:
+        context.update(_velocity_context_kwargs(velocity_context))
 
     return Observation(
         particle_id=state.particle_id,
@@ -383,15 +564,17 @@ def _append_or_replace_observation(
     state: ParticleState,
     *,
     environment_context: EnvironmentContext | None = None,
+    velocity_context: VelocityObservationContext | None = None,
 ) -> None:
     """寫入軌跡紀錄；若時間與位置未變，只更新為較新的狀態。
 
     粒子剛好停在多邊形邊界時，下一步可能立刻判定為停止。若同一時刻同一位置同時保留
     「仍在計算」與「已停止」兩筆資料，後續計算停留時間會產生長度為零的假區段。因此
     完全相同的時間與追蹤年齡只保留較新的狀態；不同時刻則正常新增資料。明確傳入的
-    ``environment_context`` 只代表目前 state 的步首樣本，供 invalid step-start 在上一個
-    固定輸出點尚未更新時直接寫入 terminal observation；一般 status-only 更新仍沿用前一筆
-    完全相同 state 的 context。
+    ``environment_context``／``velocity_context`` 只代表目前 state 的步首樣本，供
+    invalid step-start 在上一個固定輸出點尚未更新時直接寫入 terminal observation；一般
+    status-only 更新仍沿用前一筆完全相同 state 的 context。步末 terminal 若沒有同點
+    sample，兩種 context 都維持 ``NOT_SAMPLED`` 與 None。
     """
 
     previous = observations[-1] if observations else None
@@ -399,6 +582,7 @@ def _append_or_replace_observation(
         state,
         preserve_context=previous,
         environment_context=environment_context,
+        velocity_context=velocity_context,
     )
     if observations and (
         observations[-1].time_utc_ns == observation.time_utc_ns
@@ -407,6 +591,161 @@ def _append_or_replace_observation(
         observations[-1] = observation
     else:
         observations.append(observation)
+
+
+def _provider_velocity_value(value: object) -> tuple[float | None, str]:
+    """整理 provider 速度值並回傳 ``ok``／``missing``／``nonfinite``／``non_numeric``。
+
+    速度 provider 可能來自 NumPy 內插或一般 synthetic callback；這裡允許可明確轉成
+    實數的 Python／NumPy scalar，但拒絕 bool、文字、複數與無法轉換的物件。非有限值
+    不會寫入 Observation，而由獨立 velocity status/QC 保存其原因。
+    """
+
+    if value is None:
+        return None, "missing"
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        return None, "non_numeric"
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None, "non_numeric"
+    if not math.isfinite(normalized):
+        return None, "nonfinite"
+    return normalized, "ok"
+
+
+def _reference_velocity_context(reference: VelocitySample) -> VelocityObservationContext:
+    """把同一次步首 ``VelocitySample`` 轉成九欄速度 observation context。
+
+    這個函式只讀取已回傳的 sample，不新增 forcing 查詢、不改呼叫順序、不消耗 RNG。
+    ``CombinedMonthForcing`` 會提供完整分項；沒有分項的四參數 callback 則明示
+    ``TOTAL_ONLY``，只保存有限總速度。樣本本身無效時不把 provider 可能帶有的 0 或部分
+    數值升格成有效 total，而是以非零 ``SAMPLE_INVALID`` QC 及全缺值保存失敗語意。
+    """
+
+    if not isinstance(reference, VelocitySample):
+        raise TypeError("reference 必須是 VelocitySample")
+    # ``VelocitySample.valid`` 的既有判定維持原樣供積分使用；這裡額外防止 bool qc=0
+    # 被誤當成正式速度紀錄的有效品質旗標。
+    if type(reference.qc) is bool or not reference.valid:
+        return (
+            VelocitySampleStatus.INVALID,
+            VelocityComponents(),
+            int(VelocityQC.SAMPLE_INVALID),
+        )
+
+    total_values: list[float | None] = []
+    total_reasons: list[str] = []
+    for value in (reference.u_mps, reference.v_mps, reference.w_mps):
+        normalized, reason = _provider_velocity_value(value)
+        total_values.append(normalized)
+        total_reasons.append(reason)
+    total_components = VelocityComponents(
+        total_u_mps=total_values[0],
+        total_v_mps=total_values[1],
+        total_w_mps=total_values[2],
+    )
+    if "non_numeric" in total_reasons:
+        return VelocitySampleStatus.INVALID, total_components, int(VelocityQC.NON_NUMERIC)
+    if "nonfinite" in total_reasons:
+        return VelocitySampleStatus.NONFINITE, total_components, int(VelocityQC.NONFINITE)
+    if any(value is None for value in total_values):
+        return VelocitySampleStatus.MISSING, total_components, int(VelocityQC.MISSING_COMPONENT)
+
+    # 沒有 decomposition 是合法但不完整的 synthetic／legacy callback；total_* 仍是
+    # provider 明示的正向物理速度，六個來源分項維持 None，不能假造 OCM 或 Stokes。
+    if reference.components is None:
+        return VelocitySampleStatus.TOTAL_ONLY, total_components, 0
+    if type(reference.components) is not VelocityComponents:
+        return VelocitySampleStatus.INVALID, total_components, int(VelocityQC.NON_NUMERIC)
+
+    supplied = reference.components
+    component_names = (
+        "ocm_u_mps",
+        "ocm_v_mps",
+        "ocm_w_mps",
+        "stokes_u_mps",
+        "stokes_v_mps",
+        "settling_w_mps",
+    )
+    component_values: dict[str, float | None] = {}
+    component_reasons: list[str] = []
+    for name in component_names:
+        normalized, reason = _provider_velocity_value(getattr(supplied, name))
+        component_values[name] = normalized
+        component_reasons.append(reason)
+
+    # total_* 可由 typed provider 重複提供，用於檢查 typed payload 與 sample header 是否
+    # 一致；若省略，則以同一次 sample 的 u/v/w 作為保存的總量，避免第二個公式來源。
+    for name, sample_total in zip(
+        ("total_u_mps", "total_v_mps", "total_w_mps"), total_values, strict=True
+    ):
+        supplied_total = getattr(supplied, name)
+        if supplied_total is None:
+            component_values[name] = sample_total
+            continue
+        normalized, reason = _provider_velocity_value(supplied_total)
+        component_values[name] = normalized
+        component_reasons.append(reason)
+        if reason == "ok" and not math.isclose(
+            normalized,
+            sample_total,
+            rel_tol=_VELOCITY_SUM_RTOL,
+            abs_tol=_VELOCITY_SUM_ATOL,
+        ):
+            component_reasons.append("sum_mismatch")
+
+    components = VelocityComponents(**component_values)
+    if "non_numeric" in component_reasons:
+        return VelocitySampleStatus.INVALID, components, int(VelocityQC.NON_NUMERIC)
+    if "nonfinite" in component_reasons:
+        return VelocitySampleStatus.NONFINITE, components, int(VelocityQC.NONFINITE)
+    if "missing" in component_reasons:
+        return VelocitySampleStatus.MISSING, components, int(VelocityQC.MISSING_COMPONENT)
+    if "sum_mismatch" in component_reasons:
+        return VelocitySampleStatus.SUM_MISMATCH, components, int(VelocityQC.SUM_MISMATCH)
+
+    assert all(value is not None for value in component_values.values())
+    assert all(value is not None for value in total_values)
+    if not math.isclose(
+        component_values["total_u_mps"],
+        component_values["ocm_u_mps"] + component_values["stokes_u_mps"],
+        rel_tol=_VELOCITY_SUM_RTOL,
+        abs_tol=_VELOCITY_SUM_ATOL,
+    ) or not math.isclose(
+        component_values["total_v_mps"],
+        component_values["ocm_v_mps"] + component_values["stokes_v_mps"],
+        rel_tol=_VELOCITY_SUM_RTOL,
+        abs_tol=_VELOCITY_SUM_ATOL,
+    ) or not math.isclose(
+        component_values["total_w_mps"],
+        component_values["ocm_w_mps"] + component_values["settling_w_mps"],
+        rel_tol=_VELOCITY_SUM_RTOL,
+        abs_tol=_VELOCITY_SUM_ATOL,
+    ):
+        return VelocitySampleStatus.SUM_MISMATCH, components, int(VelocityQC.SUM_MISMATCH)
+    return VelocitySampleStatus.COMPLETE, components, 0
+
+
+def _invalid_total_velocity_qc(reference: VelocitySample) -> SampleQC | None:
+    """檢查速度總量是否可供既有積分核心使用，並在失敗時提供非零 SampleQC。
+
+    ``VelocitySample.valid`` 是歷史介面，主要依 provider 的 ``qc`` 判定；為避免 q=0
+    的 NaN、bool 或文字在步長選擇階段才造成未捕捉例外，這裡只重讀已回傳的 ``u/v/w``
+    三個值。回傳非 None 時，engine 會以既有數值失敗停止，不能進入 diffusion、RK4 或
+    RNG；不檢查六個分項，因為分項缺失／不一致只影響紀錄完整度，不應改變原有總速度
+    積分結果。
+    """
+
+    reasons = tuple(
+        _provider_velocity_value(value)[1]
+        for value in (reference.u_mps, reference.v_mps, reference.w_mps)
+    )
+    if all(reason == "ok" for reason in reasons):
+        return None
+    return SampleQC.INVALID_PHYSICS
 
 
 def _reference_environment_context(
@@ -468,35 +807,33 @@ def _enrich_latest_observation_from_reference(
     observations: list[Observation],
     state: ParticleState,
     reference: VelocitySample,
+    *,
+    velocity_context: VelocityObservationContext | None = None,
 ) -> EnvironmentContext | None:
-    """以既有步首 sample enrichment 最新且完全同 state 的 observation。
+    """以既有步首 sample 更新最新且完全同 state 的環境與速度 observation 欄位。
 
-    enrichment 只替換 list 中最後一筆 immutable Observation，不建立額外觀測、不呼叫
-    velocity，也不使用亂數。若最新 observation 已是較早的時間／位置，樣本不能跨觀測點
-    移植；若 valid sample 沒有 forcing 月份，則維持原有 context，明確保留 synthetic 與
-    正式 OCM／NWW3 可追溯證據的界線。
+    更新只替換 list 中最後一筆 immutable Observation，不建立額外觀測、不呼叫 velocity
+    或其他 forcing，也不使用亂數。若最新 observation 已是較早的時間／位置，樣本不能
+    跨觀測點移植；若 valid sample 沒有 forcing 月份，環境欄位維持原有狀態，但速度仍
+    可明示 ``TOTAL_ONLY``。這保留 synthetic 與正式 OCM／NWW3 可追溯證據的界線。
     """
 
     context = _reference_environment_context(reference=reference, state=state)
-    if context is None or not observations:
+    if velocity_context is None:
+        velocity_context = _reference_velocity_context(reference)
+    if not observations:
         return context
     latest = observations[-1]
     if not _observation_matches_state(latest, state):
         return context
-    (
-        environment_sample_status,
-        eta_m,
-        bed_z_m,
-        forcing_month_id,
-        environment_qc_flags,
-    ) = context
-    observations[-1] = replace(
-        latest,
-        environment_sample_status=environment_sample_status,
-        eta_m=eta_m,
-        bed_z_m=bed_z_m,
-        forcing_month_id=forcing_month_id,
-        environment_qc_flags=environment_qc_flags,
+    # 同一 observation 可能沒有 forcing 月份（例如 synthetic total-only callback），此時
+    # 環境欄位保留原狀，但速度欄位仍可明示「只有總速度」。兩種 context 都只從這次
+    # reference sample 取得，不透過差分或其他時間點推導。
+    observations[-1] = _observation(
+        state,
+        preserve_context=latest,
+        environment_context=context,
+        velocity_context=velocity_context,
     )
     return context
 
@@ -679,14 +1016,16 @@ def _terminate_execution(
     status: ParticleStatus,
     event_type: EventType,
     environment_context: EnvironmentContext | None = None,
+    velocity_context: VelocityObservationContext | None = None,
     failure_attributes: dict[str, bool | float | int | str] | None = None,
 ) -> ParticleAdvanceResult:
     """依既有停止順序更新狀態、事件及終點觀測。
 
-    ``environment_context`` 僅由 invalid step-start 傳入，且一定來自同一次已完成的
-    reference sample。它讓 terminal observation 在最新固定 observation 尚未到達目前
-    state 時仍保留失敗的品質旗標；沒有明確 context 時，仍遵守 status-only replace 的
-    原有 context preservation 規則。
+    ``environment_context``／``velocity_context`` 僅由同一個步首 sample 傳入，且一定來自
+    目前 state；它讓 invalid step-start 的 terminal observation 在最新固定 observation
+    尚未到達目前 state 時仍保留失敗品質旗標。步末 boundary、max-age 或 stage failure
+    沒有顯式同點 sample 時不傳入，仍遵守 status-only replace 的 context preservation
+    規則，不借用步首或 RK4 中間資料。
     ``failure_attributes`` 只能由 ``_failure_attributes`` 的白名單整理器建立，且只附加到
     終止事件，不改變粒子位置、觀測環境或物理狀態。未提供時保留既有空事件屬性。
     """
@@ -700,6 +1039,7 @@ def _terminate_execution(
         execution.observations,
         execution.state,
         environment_context=environment_context,
+        velocity_context=velocity_context,
     )
     return ParticleAdvanceResult(terminal=True, stepped=False, state=execution.state)
 
@@ -821,8 +1161,12 @@ def advance_particle_once(
     reference = velocity(state.x_m, state.y_m, state.z_m, state.time_utc_ns)
     # reference 已是本步唯一的步首 sample；環境欄位只 enrichment 同一 state 的最新
     # observation，不另取樣或消耗 RNG，因此不會改變 RK4、Brownian 與輸出 cadence。
+    velocity_context = _reference_velocity_context(reference)
     environment_context = _enrich_latest_observation_from_reference(
-        execution.observations, state, reference
+        execution.observations,
+        state,
+        reference,
+        velocity_context=velocity_context,
     )
     if not reference.valid:
         error = SamplingError(
@@ -838,9 +1182,42 @@ def advance_particle_once(
             status=status,
             event_type=event_type,
             environment_context=environment_context,
+            velocity_context=velocity_context,
             failure_attributes=_failure_attributes(
                 execution, settings, reason="invalid_velocity_sample", stage=error.stage,
                 qc=error.qc, context=error.context,
+            ),
+        )
+    invalid_total_qc = _invalid_total_velocity_qc(reference)
+    if invalid_total_qc is not None:
+        # q=0 的 NaN／bool／文字總速度仍不能進入既有 choose_time_step；把它轉成既有
+        # numerical-failure 流程，並保留同一 state 的 reference 速度狀態。這不會增加
+        # callback、擴散取樣或 RNG 次數。
+        error = SamplingError(
+            "step_start",
+            invalid_total_qc,
+            context=SamplingContext(
+                state.x_m,
+                state.y_m,
+                state.z_m,
+                state.time_utc_ns,
+                reference.eta_m,
+                reference.bed_z_m,
+            ),
+        )
+        return _terminate_execution(
+            execution,
+            status=ParticleStatus.NUMERICAL_FAILURE,
+            event_type=EventType.NUMERICAL_FAILURE,
+            environment_context=environment_context,
+            velocity_context=velocity_context,
+            failure_attributes=_failure_attributes(
+                execution,
+                settings,
+                reason="invalid_velocity_sample",
+                stage=error.stage,
+                qc=error.qc,
+                context=error.context,
             ),
         )
     try:
@@ -867,6 +1244,7 @@ def advance_particle_once(
             status=status,
             event_type=event_type,
             environment_context=environment_context,
+            velocity_context=velocity_context,
             failure_attributes=_failure_attributes(
                 execution, settings, reason="invalid_diffusion_sample", stage=error.stage,
                 qc=error.qc, context=error.context,
@@ -880,6 +1258,7 @@ def advance_particle_once(
             status=ParticleStatus.NUMERICAL_FAILURE,
             event_type=EventType.NUMERICAL_FAILURE,
             environment_context=environment_context,
+            velocity_context=velocity_context,
             failure_attributes=_failure_attributes(
                 execution, settings, reason="diffusion_evaluation_error", stage="diffusion",
                 context=SamplingContext(state.x_m, state.y_m, state.z_m, state.time_utc_ns),
@@ -902,6 +1281,7 @@ def advance_particle_once(
                 execution,
                 status=ParticleStatus.NUMERICAL_FAILURE,
                 event_type=EventType.NUMERICAL_FAILURE,
+                velocity_context=velocity_context,
                 failure_attributes=_failure_attributes(
                     execution, settings, reason="minimum_clamp_limit", stage="limits",
                     attempted_dt_seconds=-decision.seconds,
@@ -933,6 +1313,7 @@ def advance_particle_once(
             status, event_type = _status_from_sampling_error(error)
             return _terminate_execution(
                 execution, status=status, event_type=event_type,
+                velocity_context=velocity_context,
                 failure_attributes=_failure_attributes(
                     execution, settings, reason="rk_stage_unrecoverable", stage=error.stage,
                     qc=error.qc, context=error.context, attempted_dt_seconds=-decision.seconds,

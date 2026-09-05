@@ -23,7 +23,13 @@ from lagrangian_backtracking.engine import (
     initialize_particle_execution,
     run_particle,
 )
-from lagrangian_backtracking.models import ParticleState, ParticleStatus, SampleQC, VelocitySample
+from lagrangian_backtracking.models import (
+    ParticleState,
+    ParticleStatus,
+    SampleQC,
+    VelocitySample,
+    VelocitySampleStatus,
+)
 
 
 def _state(*, age_seconds: float = 0.0, time_utc_ns: int = 100_000_000_000) -> ParticleState:
@@ -359,8 +365,8 @@ def test_invalid_step_start_after_unoutput_step_appends_only_contextual_terminal
     assert terminal.environment_qc_flags == int(SampleQC.TIME_GAP)
 
 
-def test_valid_synthetic_month_none_keeps_existing_context_and_new_observation_unsampled() -> None:
-    """沒有月份 provenance 的 synthetic sample 不得猜測月份或宣稱 VALID。"""
+def test_valid_synthetic_month_none_keeps_existing_context_and_records_total_only_velocity() -> None:
+    """沒有月份來源的 synthetic sample 不得宣稱環境 VALID，但仍明示有限 total-only 速度。"""
 
     def velocity(*_args: object) -> VelocitySample:
         """回傳沒有 forcing 月份的 synthetic callback，僅供資料流測試。"""
@@ -392,7 +398,28 @@ def test_valid_synthetic_month_none_keeps_existing_context_and_new_observation_u
         settings=settings,
         rng=np.random.Generator(np.random.PCG64DXSM(4)),
     )
-    assert preserved_execution.observations == [existing]
+    assert len(preserved_execution.observations) == 1
+    preserved = preserved_execution.observations[0]
+    assert preserved.environment_sample_status is EnvironmentSampleStatus.VALID
+    assert (preserved.eta_m, preserved.bed_z_m, preserved.forcing_month_id) == (
+        existing.eta_m,
+        existing.bed_z_m,
+        existing.forcing_month_id,
+    )
+    assert preserved.velocity_sample_status is VelocitySampleStatus.TOTAL_ONLY
+    assert (preserved.total_u_mps, preserved.total_v_mps, preserved.total_w_mps) == (0.0, 0.0, 0.0)
+    assert all(
+        getattr(preserved, field_name) is None
+        for field_name in (
+            "ocm_u_mps",
+            "ocm_v_mps",
+            "ocm_w_mps",
+            "stokes_u_mps",
+            "stokes_v_mps",
+            "settling_w_mps",
+        )
+    )
+    assert preserved.velocity_qc_flags == 0
 
 
 @pytest.mark.parametrize(
@@ -484,9 +511,13 @@ def test_boundary_terminal_does_not_inherit_step_start_context_from_different_st
 
     assert result.terminal and result.stepped
     assert execution.observations[0].environment_sample_status is EnvironmentSampleStatus.VALID
+    assert execution.observations[0].velocity_sample_status is VelocitySampleStatus.TOTAL_ONLY
     terminal = execution.observations[-1]
     assert terminal.status is ParticleStatus.FLOW_DOMAIN_EXIT
     assert terminal.environment_sample_status is EnvironmentSampleStatus.NOT_SAMPLED
+    assert terminal.velocity_sample_status is VelocitySampleStatus.NOT_SAMPLED
+    assert (terminal.total_u_mps, terminal.total_v_mps, terminal.total_w_mps) == (None, None, None)
+    assert terminal.velocity_qc_flags is None
     assert len(execution.observations) == 2
 
 

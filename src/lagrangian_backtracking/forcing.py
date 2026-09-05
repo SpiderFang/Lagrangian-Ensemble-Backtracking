@@ -29,7 +29,7 @@ from .diffusion import (
 )
 from .geometry import DomainProjection
 from .mesh import MeshLocation, NativeMesh
-from .models import SampleQC, VelocitySample
+from .models import SampleQC, VelocityComponents, VelocitySample
 from .stokes import finite_depth_stokes
 
 
@@ -899,7 +899,14 @@ class NWWAnalysisMonth:
 
 
 class CombinedMonthForcing:
-    """合併同月海流、波浪、座標投影與粒子浮沉速度的取樣器。"""
+    """合併同月海流、波浪、座標投影與粒子浮沉速度的取樣器。
+
+    有效回傳值除了既有總速度，也保留同一次 OCM／NWW3 取樣實際使用的分項：OCM
+    東、北、向上 current、Stokes 水平東／北速度，以及以向上為正的垂向沉降速度。
+    Stokes 垂向與沉降水平不在公式中，因此不新增欄位或查詢。關閉 Stokes 時，Stokes
+    水平分項是明知的 0；NWW3 月份缺失時則回傳非零 ``WAVE_UNSUPPORTED``，不把缺值
+    轉成有效的零 Stokes。
+    """
 
     def __init__(
         self,
@@ -1008,6 +1015,17 @@ class CombinedMonthForcing:
             triangle_id=current.triangle_id,
             forcing_month_id=current.forcing_month_id,
             diagnostics=diagnostics,
+            components=VelocityComponents(
+                total_u_mps=current.u_mps + stokes_u,
+                total_v_mps=current.v_mps + stokes_v,
+                total_w_mps=current.w_mps + self.settling_velocity_mps,
+                ocm_u_mps=current.u_mps,
+                ocm_v_mps=current.v_mps,
+                ocm_w_mps=current.w_mps,
+                stokes_u_mps=stokes_u,
+                stokes_v_mps=stokes_v,
+                settling_w_mps=self.settling_velocity_mps,
+            ),
         )
 
     def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:

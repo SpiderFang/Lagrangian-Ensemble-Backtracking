@@ -11,7 +11,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from lagrangian_backtracking.engine import EnvironmentSampleStatus, Observation, ParticleResult
-from lagrangian_backtracking.models import BoundaryEvent, EventType, ParticleState, ParticleStatus
+from lagrangian_backtracking.models import (
+    BoundaryEvent,
+    EventType,
+    ParticleState,
+    ParticleStatus,
+    VelocitySampleStatus,
+)
 from lagrangian_backtracking.outputs import (
     TRAJECTORY_SHARD_SCHEMA_VERSION,
     read_trajectory_shard,
@@ -39,6 +45,19 @@ _ENVIRONMENT_PAYLOAD_FILES = {
     "bed_z_m.npy",
     "forcing_month_yyyymm.npy",
     "environment_qc_flags.npy",
+}
+_VELOCITY_PAYLOAD_FILES = {
+    "total_u_mps.npy",
+    "total_v_mps.npy",
+    "total_w_mps.npy",
+    "ocm_u_mps.npy",
+    "ocm_v_mps.npy",
+    "ocm_w_mps.npy",
+    "stokes_u_mps.npy",
+    "stokes_v_mps.npy",
+    "settling_w_mps.npy",
+    "velocity_sample_status_code.npy",
+    "velocity_qc_flags.npy",
 }
 
 
@@ -277,15 +296,92 @@ def _environment_result() -> ParticleResult:
     return ParticleResult(state, observations, [], 9, 2)
 
 
+def _velocity_result() -> ParticleResult:
+    """建立 not_sampled、complete、total_only 的 v3 速度 round-trip fixture。
+
+    ``complete`` 的九欄使用 m/s 且明確滿足 total 與 component 的加總契約；
+    ``total_only`` 只保存三個 total 欄位。這些有限 synthetic 數值只用來驗證
+    writer／validator／reader 的欄位與狀態拓撲，不代表任何 forcing 科學結果。
+    """
+
+    state = ParticleState(
+        particle_id="velocity-p0",
+        scenario_id="scenario-velocity-p0",
+        member_id=4,
+        study_site_id="gongliao",
+        analysis_region_id="A",
+        receptor_id="receptor-0",
+        x_m=30.0,
+        y_m=40.0,
+        z_m=-3.0,
+        time_utc_ns=10,
+        age_seconds=20.0,
+        status=ParticleStatus.MAX_AGE,
+    )
+    observations = [
+        Observation("velocity-p0", 30, 0.0, 10.0, 20.0, -1.0, ParticleStatus.ACTIVE),
+        Observation(
+            "velocity-p0",
+            20,
+            10.0,
+            20.0,
+            30.0,
+            -2.0,
+            ParticleStatus.ACTIVE,
+            velocity_sample_status=VelocitySampleStatus.COMPLETE,
+            total_u_mps=3.0,
+            total_v_mps=-1.0,
+            total_w_mps=-0.5,
+            ocm_u_mps=2.5,
+            ocm_v_mps=-1.2,
+            ocm_w_mps=-0.25,
+            stokes_u_mps=0.5,
+            stokes_v_mps=0.2,
+            settling_w_mps=-0.25,
+            velocity_qc_flags=0,
+        ),
+        Observation(
+            "velocity-p0",
+            10,
+            20.0,
+            30.0,
+            40.0,
+            -3.0,
+            ParticleStatus.MAX_AGE,
+            velocity_sample_status=VelocitySampleStatus.TOTAL_ONLY,
+            total_u_mps=1.25,
+            total_v_mps=-0.75,
+            total_w_mps=-0.1,
+            velocity_qc_flags=0,
+        ),
+    ]
+    return ParticleResult(state, observations, [], 9, 2)
+
+
 def _downgrade_to_v1(shard: Path) -> None:
-    """把已發布的 v2 合成 shard 降為 legacy v1 fixture，不改動九個 base payload。"""
+    """把已發布的 v3 合成 shard 降為 legacy v1 fixture，不改動九個 base payload。"""
 
     manifest_path = shard / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for filename in _ENVIRONMENT_PAYLOAD_FILES:
+    for filename in _ENVIRONMENT_PAYLOAD_FILES | _VELOCITY_PAYLOAD_FILES:
         (shard / filename).unlink()
         manifest["files"].pop(filename)
     manifest["schema_version"] = _LEGACY_SCHEMA_VERSION
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _downgrade_to_v2(shard: Path) -> None:
+    """從 v3 fixture 移除全部速度 payload，建立真正固定拓撲的 v2 fixture。"""
+
+    manifest_path = shard / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for filename in _VELOCITY_PAYLOAD_FILES:
+        (shard / filename).unlink()
+        manifest["files"].pop(filename)
+    manifest["schema_version"] = "2.0.0"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -305,14 +401,14 @@ def _refresh_checksum(shard: Path, filename: str) -> None:
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def test_writer_publishes_v2_manifest_and_exact_payload_topology(tmp_path: Path) -> None:
-    """writer 永遠發布 v2，manifest 與實際根目錄都只能含固定十四個 payload。"""
+def test_writer_publishes_v3_manifest_and_exact_payload_topology(tmp_path: Path) -> None:
+    """writer 永遠發布 v3，manifest 與實際根目錄都只能含固定二十五個 payload。"""
 
-    shard = tmp_path / "v2-topology"
+    shard = tmp_path / "v3-topology"
     write_trajectory_shard(shard, [_result()], run_metadata={"run_kind": "synthetic"})
 
     manifest = json.loads((shard / "manifest.json").read_text(encoding="utf-8"))
-    expected_payload = _BASE_PAYLOAD_FILES | _ENVIRONMENT_PAYLOAD_FILES
+    expected_payload = _BASE_PAYLOAD_FILES | _ENVIRONMENT_PAYLOAD_FILES | _VELOCITY_PAYLOAD_FILES
     assert manifest["schema_version"] == TRAJECTORY_SHARD_SCHEMA_VERSION
     assert set(manifest["files"]) == expected_payload
     assert {entry.name for entry in shard.iterdir()} == expected_payload | {"manifest.json"}
@@ -323,11 +419,30 @@ def test_writer_publishes_v2_manifest_and_exact_payload_topology(tmp_path: Path)
     assert np.load(shard / "bed_z_m.npy", allow_pickle=False).dtype == np.dtype(np.float64)
     assert np.load(shard / "forcing_month_yyyymm.npy", allow_pickle=False).dtype == np.dtype(np.int32)
     assert np.load(shard / "environment_qc_flags.npy", allow_pickle=False).dtype == np.dtype(np.uint32)
+    for filename in _VELOCITY_PAYLOAD_FILES - {
+        "velocity_sample_status_code.npy",
+        "velocity_qc_flags.npy",
+    }:
+        values = np.load(shard / filename, allow_pickle=False)
+        assert values.dtype == np.dtype(np.float64)
+        assert np.isnan(values).all()
+    assert np.load(shard / "velocity_sample_status_code.npy", allow_pickle=False).dtype == np.dtype(
+        np.uint8
+    )
+    assert np.array_equal(
+        np.load(shard / "velocity_sample_status_code.npy", allow_pickle=False),
+        np.array([0, 0], dtype=np.uint8),
+    )
+    assert np.load(shard / "velocity_qc_flags.npy", allow_pickle=False).dtype == np.dtype(np.uint32)
+    assert np.array_equal(
+        np.load(shard / "velocity_qc_flags.npy", allow_pickle=False),
+        np.array([0, 0], dtype=np.uint32),
+    )
     assert validate_trajectory_shard(shard)["valid"]
 
 
-def test_v2_round_trip_preserves_all_environment_states_and_sentinels(tmp_path: Path) -> None:
-    """v2 reader 依 code 還原三種狀態、None、月份與品質旗標，不靠 NaN 猜測。"""
+def test_v3_round_trip_preserves_all_environment_states_and_sentinels(tmp_path: Path) -> None:
+    """v3 reader 依 environment code 還原三種狀態、None、月份與品質旗標，不靠 NaN 猜測。"""
 
     shard = tmp_path / "environment-round-trip"
     source = _environment_result()
@@ -353,6 +468,59 @@ def test_v2_round_trip_preserves_all_environment_states_and_sentinels(tmp_path: 
     assert loaded[0].observations[0].environment_sample_status is EnvironmentSampleStatus.NOT_SAMPLED
     assert loaded[0].observations[1].environment_sample_status is EnvironmentSampleStatus.VALID
     assert loaded[0].observations[2].environment_sample_status is EnvironmentSampleStatus.INVALID
+
+
+def test_v3_round_trip_preserves_velocity_status_components_and_missing_values(
+    tmp_path: Path,
+) -> None:
+    """v3 reader 依速度 status 還原九欄、NaN 缺值、total_only 與 QC 語意。"""
+
+    shard = tmp_path / "velocity-round-trip"
+    source = _velocity_result()
+    write_trajectory_shard(shard, [source], run_metadata={"run_kind": "synthetic"})
+
+    assert np.array_equal(
+        np.load(shard / "velocity_sample_status_code.npy", allow_pickle=False),
+        np.array([0, 1, 2], dtype=np.uint8),
+    )
+    assert np.array_equal(
+        np.load(shard / "velocity_qc_flags.npy", allow_pickle=False),
+        np.array([0, 0, 0], dtype=np.uint32),
+    )
+    total_u = np.load(shard / "total_u_mps.npy", allow_pickle=False)
+    ocm_u = np.load(shard / "ocm_u_mps.npy", allow_pickle=False)
+    assert np.isnan(total_u[0]) and total_u[1] == 3.0 and total_u[2] == 1.25
+    assert np.isnan(ocm_u[0]) and ocm_u[1] == 2.5 and np.isnan(ocm_u[2])
+
+    loaded = read_trajectory_shard(shard)
+    assert loaded[0].observations == source.observations
+
+
+def test_v2_fixture_reads_velocity_as_not_sampled_defaults(tmp_path: Path) -> None:
+    """真正移除 v3 速度檔案的 v2 fixture 讀回時不從舊資料補算速度。"""
+
+    shard = tmp_path / "legacy-v2"
+    source = _velocity_result()
+    write_trajectory_shard(shard, [source], run_metadata={"run_kind": "synthetic"})
+    _downgrade_to_v2(shard)
+
+    validation = validate_trajectory_shard(shard)
+    assert validation["valid"]
+    loaded = read_trajectory_shard(shard)
+    assert all(
+        observation.velocity_sample_status is VelocitySampleStatus.NOT_SAMPLED
+        and observation.total_u_mps is None
+        and observation.total_v_mps is None
+        and observation.total_w_mps is None
+        and observation.ocm_u_mps is None
+        and observation.ocm_v_mps is None
+        and observation.ocm_w_mps is None
+        and observation.stokes_u_mps is None
+        and observation.stokes_v_mps is None
+        and observation.settling_w_mps is None
+        and observation.velocity_qc_flags is None
+        for observation in loaded[0].observations
+    )
 
 
 def test_v1_fixture_is_read_only_compatible_and_gets_not_sampled_defaults(tmp_path: Path) -> None:
@@ -382,7 +550,7 @@ def test_v1_fixture_is_read_only_compatible_and_gets_not_sampled_defaults(tmp_pa
     ["v1_extra_file", "v1_extra_manifest_entry", "v2_missing_file", "unknown_schema"],
 )
 def test_schema_version_selects_exact_fixed_topology(tmp_path: Path, mutation: str) -> None:
-    """v1/v2 版本、manifest files 與實體檔案拓撲不一致時一律拒絕。"""
+    """v1/v2/v3 版本、manifest files 與實體檔案拓撲不一致時一律拒絕。"""
 
     shard = tmp_path / mutation
     write_trajectory_shard(shard, [_result()], run_metadata={"run_kind": "synthetic"})
@@ -397,6 +565,8 @@ def test_schema_version_selects_exact_fixed_topology(tmp_path: Path, mutation: s
         manifest["files"]["eta_m.npy"] = {"size_bytes": 0, "sha256": "0" * 64}
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     elif mutation == "v2_missing_file":
+        _downgrade_to_v2(shard)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         (shard / "eta_m.npy").unlink()
         manifest["files"].pop("eta_m.npy")
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -444,6 +614,47 @@ def test_v2_environment_payload_tampering_is_rejected_after_checksum_refresh(
         payload[1] = 1
     else:
         payload[1] = 0.0
+    np.save(shard / filename, payload, allow_pickle=False)
+    _refresh_checksum(shard, filename)
+
+    validation = validate_trajectory_shard(shard)
+    assert validation["valid"] is False
+    assert not any(f"{filename}: checksum" == error for error in validation["errors"])
+    with pytest.raises(ValueError, match="驗證失敗"):
+        read_trajectory_shard(shard)
+
+
+@pytest.mark.parametrize(
+    ("filename", "mutation"),
+    [
+        ("velocity_sample_status_code.npy", "unknown_status"),
+        ("velocity_sample_status_code.npy", "dtype"),
+        ("velocity_qc_flags.npy", "bool"),
+        ("total_u_mps.npy", "infinity"),
+        ("total_u_mps.npy", "missing_consistency"),
+        ("total_u_mps.npy", "sum_mismatch"),
+    ],
+)
+def test_v3_velocity_payload_tampering_is_rejected_after_checksum_refresh(
+    tmp_path: Path, filename: str, mutation: str
+) -> None:
+    """速度 status／dtype／bool／Infinity／缺值／加總竄改即使重算 checksum 仍拒絕。"""
+
+    shard = tmp_path / f"velocity-tamper-{mutation}"
+    write_trajectory_shard(shard, [_velocity_result()], run_metadata={"run_kind": "synthetic"})
+    payload = np.load(shard / filename, allow_pickle=False).copy()
+    if mutation == "unknown_status":
+        payload[0] = 7
+    elif mutation == "dtype":
+        payload = payload.astype(np.int16)
+    elif mutation == "bool":
+        payload = payload.astype(bool)
+    elif mutation == "infinity":
+        payload[1] = np.inf
+    elif mutation == "missing_consistency":
+        payload[1] = np.nan
+    else:
+        payload[1] += 1.0
     np.save(shard / filename, payload, allow_pickle=False)
     _refresh_checksum(shard, filename)
 

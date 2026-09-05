@@ -1,8 +1,13 @@
 # 正式成果 release 與科學圖表生產管線規劃
 
+> **閱讀提示**
+> - 文件類型：正式報告 release、圖表與驗證證據的生產規劃。
+> - 它回答：如何由已驗證 run 與統計產品重建可稽核的科學輸出。
+> - 建議先讀：[成果呈現規格](07_results_visualization_plan.md)，再核對[實作狀態](../implementation_status.md)。
+
 ## 1. 目的、證據界線與完成條件
 
-本文件把 `docs/07_results_visualization_plan.md` 的 F01–F12、T01–T06 轉成可由 CLI
+本文件把 `docs/results/07_results_visualization_plan.md` 的 F01–F12、T01–T06 轉成可由 CLI
 重建、驗證及原子發布的生產管線。正式成果只能讀取已通過公開 validator 的 source run、
 aggregate release、原始設定與明示的比較／驗證證據；不得從未驗證目錄、Notebook 暫存
 變數或手工修改圖面取得數值。

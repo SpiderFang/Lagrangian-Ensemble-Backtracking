@@ -578,8 +578,8 @@ validation:
 reporting:
   # 核心圖表及 caption/data sidecar 的統計定義以文件 07 為準；設定檔只固定
   # 機器可驗證的識別碼，避免繪圖腳本自行選擇一套不同的成果口徑。
-  visualization_spec: docs/07_results_visualization_plan.md
-  design_baseline_spec: docs/08_design_baseline_and_derived_gates.md
+  visualization_spec: docs/results/07_results_visualization_plan.md
+  design_baseline_spec: docs/foundation/08_design_baseline_and_derived_gates.md
   primary_reporting_level: study_site
   region_A_pooled_product_policy: secondary_equal_site_weight_preserve_site_denominators
   permitted_primary_term_zh: 條件式來源足跡

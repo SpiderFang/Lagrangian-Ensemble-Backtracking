@@ -10,8 +10,8 @@ season、tide 四個 report strata 欄位；它們與選樣 seed 及版本化 po
 
 ``RepresentativeTrajectory`` 只保存 immutable identity、完整 64 碼優先序摘要與至少
 兩筆 ``Observation``。觀測序列會在建構時複製成 tuple，避免呼叫端之後修改原 list 影響
-已選出的報告案例；它仍然保存原始觀測順序與公尺、秒、UTC 奈秒欄位，不在此模組補值、
-裁切或改寫物理資料。
+已選出的報告案例；它仍然保存原始觀測順序、環境 context、同點逐步速度與公尺、秒、UTC
+奈秒欄位，不在此模組補值、裁切或改寫物理資料。
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from .engine import EnvironmentSampleStatus, Observation, ParticleResult
-from .models import ParticleState, ParticleStatus
+from .models import ParticleState, ParticleStatus, VelocitySampleStatus
 
 __all__ = [
     "CORE_SEASONS",
@@ -224,10 +224,9 @@ def _snapshot_observations(value: object, *, particle_id: str) -> tuple[Observat
     ``age_seconds`` 以秒嚴格遞增，``x_m``／``y_m``／``z_m`` 是有限公尺座標且年齡不得為負。
     除最後一筆外每筆狀態都必須是 ``ACTIVE``，最後一筆必須是 ``ParticleStatus`` 的正式
     非 ``ACTIVE`` 終止狀態；因此中途 terminal、最後仍 active 或半途結果都不能被畫成
-    代表軌跡。每筆的 ``environment_sample_status`` 與環境 context 會原樣交給既有
-    ``Observation`` constructor 再驗證並 canonicalize；這裡只保存已提供的 context，
-    不補值、不把 ``NOT_SAMPLED`` 改成有效。正式 v2 的 context completeness 由後續
-    trajectory stream gate 負責。
+    代表軌跡。每筆的環境與速度 context 會原樣交給既有 ``Observation`` constructor
+    再驗證並 canonicalize；這裡只保存已提供的 context，不補值、不把 ``NOT_SAMPLED``
+    改成有效。正式 v2／v3 的 context completeness 由後續 trajectory stream gate 負責。
 
     至少兩筆資料才能表達一段可繪製的完整軌跡，而不是只有單一端點。
     """
@@ -298,11 +297,17 @@ def _snapshot_observations(value: object, *, particle_id: str) -> tuple[Observat
                 f"observations[{index}].environment_sample_status "
                 "必須是 exact EnvironmentSampleStatus"
             )
+        velocity_sample_status = observation.velocity_sample_status
+        if type(velocity_sample_status) is not VelocitySampleStatus:
+            raise TypeError(
+                f"observations[{index}].velocity_sample_status "
+                "必須是 exact VelocitySampleStatus"
+            )
 
-        # Observation constructor 是環境 context 的既有唯一驗證入口；以已驗證的核心
-        # 原生值重建新物件，同時讓 eta／bed／月份／品質旗標重新通過其型別、有限性、
-        # 幾何範圍與缺值語意契約。這也確保不會把 caller 的 frozen object reference
-        # 直接帶進正式 representative record。
+        # Observation constructor 是環境與速度 context 的既有唯一驗證入口；以已驗證的
+        # 核心原生值重建新物件，同時讓 eta／bed／月份／品質旗標、九個公尺/秒速度欄位、
+        # 狀態與缺值語意重新通過資料契約。這也確保不會把 caller 的 frozen object
+        # reference 直接帶進正式 representative record。
         canonical_observations.append(
             Observation(
                 particle_id=observed_particle_id,
@@ -317,6 +322,17 @@ def _snapshot_observations(value: object, *, particle_id: str) -> tuple[Observat
                 bed_z_m=observation.bed_z_m,
                 forcing_month_id=observation.forcing_month_id,
                 environment_qc_flags=observation.environment_qc_flags,
+                velocity_sample_status=velocity_sample_status,
+                total_u_mps=observation.total_u_mps,
+                total_v_mps=observation.total_v_mps,
+                total_w_mps=observation.total_w_mps,
+                ocm_u_mps=observation.ocm_u_mps,
+                ocm_v_mps=observation.ocm_v_mps,
+                ocm_w_mps=observation.ocm_w_mps,
+                stokes_u_mps=observation.stokes_u_mps,
+                stokes_v_mps=observation.stokes_v_mps,
+                settling_w_mps=observation.settling_w_mps,
+                velocity_qc_flags=observation.velocity_qc_flags,
             )
         )
         previous_time_utc_ns = time_utc_ns

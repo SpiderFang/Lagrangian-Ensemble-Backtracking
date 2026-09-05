@@ -4,7 +4,7 @@
 run／aggregate／MPLCONFIGDIR 的普通檔案拓撲。這樣可以在不產生圖表、不建立 report
 partial、也不讀取 raw NetCDF 的前提下，驗證 preflight 的 identity、hash、schema、
 output ownership 與 evidence policy；正式科學 run 的 trajectory 測試只放置 manifest，
-確認 v2 schema gate 不會呼叫 trajectory reader 或第二次 materialize 全部軌跡。
+確認 v2/v3 schema gate 不會呼叫 trajectory reader 或第二次 materialize 全部軌跡。
 """
 
 from __future__ import annotations
@@ -346,11 +346,11 @@ def test_happy_path_is_immutable_and_read_only(tmp_path: Path, monkeypatch: pyte
         result.run_id = "tampered"  # type: ignore[misc]
 
 
-def test_formal_requires_exact_v2_manifest_without_reader_materialization(
+def test_formal_accepts_single_v2_or_v3_without_reader_materialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """formal 只讀 manifest schema；v1 被拒絕，且 preflight 不會讀軌跡 payload。"""
+    """formal 只讀 manifest schema；單一 v2/v3 通過、v1 被拒絕，且不讀軌跡 payload。"""
 
     fixture = _fixture(tmp_path, monkeypatch, run_kind="formal")
     result = _call(
@@ -361,6 +361,20 @@ def test_formal_requires_exact_v2_manifest_without_reader_materialization(
     )
     assert result.trajectory_schema_version == "2.0.0"
 
+    fixture = _fixture(
+        tmp_path / "v3",
+        monkeypatch,
+        run_kind="formal",
+        manifest_schema=pipeline.TRAJECTORY_SHARD_SCHEMA_VERSION,
+    )
+    result = _call(
+        fixture,
+        evidence_class="server_formal_baseline_evidence",
+        allow_missing_comparison=True,
+        allow_missing_validation_evidence=True,
+    )
+    assert result.trajectory_schema_version == pipeline.TRAJECTORY_SHARD_SCHEMA_VERSION
+
     fixture = _fixture(tmp_path / "legacy", monkeypatch, run_kind="formal", manifest_schema="1.0.0")
     with pytest.raises(ValueError, match="^report build preflight 驗證失敗$"):
         _call(
@@ -369,6 +383,35 @@ def test_formal_requires_exact_v2_manifest_without_reader_materialization(
             allow_missing_comparison=True,
             allow_missing_validation_evidence=True,
         )
+
+
+def test_formal_rejects_mixed_v2_v3_manifests(tmp_path: Path) -> None:
+    """正式 manifest 只允許全 run 單一版本，不可混用 v2 與 v3。"""
+
+    root = tmp_path / "mixed-run"
+    (root / "shards" / "s0").mkdir(parents=True)
+    (root / "shards" / "s1").mkdir(parents=True)
+    versions = ("2.0.0", pipeline.TRAJECTORY_SHARD_SCHEMA_VERSION)
+    plan = {"run_id": "mixed-run", "shards": [{"shard_id": "s0"}, {"shard_id": "s1"}]}
+    progress = {
+        "shards": {
+            f"s{i}": {"lifecycle": "COMPLETE", "output_relative_path": f"shards/s{i}"}
+            for i in range(2)
+        }
+    }
+    for index, version in enumerate(versions):
+        (root / "shards" / f"s{index}" / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": version,
+                    "run_metadata": {"run_id": "mixed-run", "shard_id": f"s{index}"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="mixed trajectory schema"):
+        pipeline._validate_formal_manifests(root, plan, progress)
 
 
 @pytest.mark.parametrize(

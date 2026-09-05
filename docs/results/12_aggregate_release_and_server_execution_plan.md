@@ -1,5 +1,10 @@
 # 聚合發布與 SERVER 正式執行實作計畫
 
+> **閱讀提示**
+> - 文件類型：軌跡聚合、不可變發布與 SERVER 驗收計畫。
+> - 它回答：固定 run 完成後，統計產品與圖表輸出如何建立、核對及發布。
+> - 建議先讀：[成果呈現規格](07_results_visualization_plan.md)，再核對[實作狀態](../implementation_status.md)。
+
 ## 1. 目的與完成定義
 
 本計畫固定軌跡 run 完成後的聚合、不可變發布、圖表產製與 SERVER 驗收流程。BayTrace

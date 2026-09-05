@@ -25,12 +25,19 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .engine import EnvironmentSampleStatus, Observation, ParticleResult
-from .models import BoundaryEvent, EventType, ParticleState, ParticleStatus
+from .models import (
+    BoundaryEvent,
+    EventType,
+    ParticleState,
+    ParticleStatus,
+    VelocitySampleStatus,
+)
 
-# trajectory shard 的 writer 只發布此版本；1.0.0 僅保留為唯讀相容格式，不能再由 writer
+# trajectory shard 的 writer 只發布此版本；舊版本都只作唯讀相容格式，不能再由 writer
 # 產生。版本值寫入 manifest，讓下游可以在讀取第一個 observation 前決定固定 payload 拓撲。
-TRAJECTORY_SHARD_SCHEMA_VERSION = "2.0.0"
+TRAJECTORY_SHARD_SCHEMA_VERSION = "3.0.0"
 _LEGACY_TRAJECTORY_SHARD_SCHEMA_VERSION = "1.0.0"
+_ENVIRONMENT_TRAJECTORY_SHARD_SCHEMA_VERSION = "2.0.0"
 
 # 這九個檔案是 legacy 1.0.0 的固定 payload。status_code.npy 在兩個版本都仍然是粒子
 # 生命週期狀態字串；環境取樣狀態使用 v2 額外的 environment_sample_status_code.npy，
@@ -57,12 +64,33 @@ _ENVIRONMENT_SHARD_PAYLOAD_FILES = frozenset(
         "environment_qc_flags.npy",
     }
 )
+_VELOCITY_SHARD_PAYLOAD_FILES = frozenset(
+    {
+        "total_u_mps.npy",
+        "total_v_mps.npy",
+        "total_w_mps.npy",
+        "ocm_u_mps.npy",
+        "ocm_v_mps.npy",
+        "ocm_w_mps.npy",
+        "stokes_u_mps.npy",
+        "stokes_v_mps.npy",
+        "settling_w_mps.npy",
+        "velocity_sample_status_code.npy",
+        "velocity_qc_flags.npy",
+    }
+)
 _SCHEMA_PAYLOAD_FILES = {
     _LEGACY_TRAJECTORY_SHARD_SCHEMA_VERSION: _BASE_SHARD_PAYLOAD_FILES,
-    TRAJECTORY_SHARD_SCHEMA_VERSION: _BASE_SHARD_PAYLOAD_FILES | _ENVIRONMENT_SHARD_PAYLOAD_FILES,
+    _ENVIRONMENT_TRAJECTORY_SHARD_SCHEMA_VERSION: _BASE_SHARD_PAYLOAD_FILES
+    | _ENVIRONMENT_SHARD_PAYLOAD_FILES,
+    TRAJECTORY_SHARD_SCHEMA_VERSION: _BASE_SHARD_PAYLOAD_FILES
+    | _ENVIRONMENT_SHARD_PAYLOAD_FILES
+    | _VELOCITY_SHARD_PAYLOAD_FILES,
 }
 # 保留 union 供內部錯誤分類使用；實際 validator 會先從 manifest schema 選擇上面的精確集合。
-_SHARD_PAYLOAD_FILES = _BASE_SHARD_PAYLOAD_FILES | _ENVIRONMENT_SHARD_PAYLOAD_FILES
+_SHARD_PAYLOAD_FILES = (
+    _BASE_SHARD_PAYLOAD_FILES | _ENVIRONMENT_SHARD_PAYLOAD_FILES | _VELOCITY_SHARD_PAYLOAD_FILES
+)
 _SHARD_FILES = _SHARD_PAYLOAD_FILES | {"manifest.json"}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -75,7 +103,26 @@ _ENVIRONMENT_STATUS_TO_CODE = {
 _ENVIRONMENT_CODE_TO_STATUS = {
     code: status for status, code in _ENVIRONMENT_STATUS_TO_CODE.items()
 }
+_VELOCITY_STATUS_TO_CODE = {
+    status: code for code, status in enumerate(VelocitySampleStatus)
+}
+_VELOCITY_CODE_TO_STATUS = {
+    code: status for status, code in _VELOCITY_STATUS_TO_CODE.items()
+}
 _ENVIRONMENT_GEOMETRY_TOLERANCE_M = 1.0e-6
+_VELOCITY_SUM_RTOL = 1.0e-12
+_VELOCITY_SUM_ATOL = 1.0e-12
+_VELOCITY_COMPONENT_FIELDS = (
+    "total_u_mps",
+    "total_v_mps",
+    "total_w_mps",
+    "ocm_u_mps",
+    "ocm_v_mps",
+    "ocm_w_mps",
+    "stokes_u_mps",
+    "stokes_v_mps",
+    "settling_w_mps",
+)
 _TRACKED_RUN_METADATA_FIELDS = frozenset(
     {
         "run_id",
@@ -333,6 +380,95 @@ def _encode_environment_observation(
     return 2, math.nan if eta_m is None else eta_m, math.nan if bed_z_m is None else bed_z_m, month, qc
 
 
+def _finite_velocity_value(value: object, *, label: str, allow_none: bool) -> float | None:
+    """整理單一速度欄位，讓 ``None`` 成為唯一可寫入的缺值來源。
+
+    速度值的物理單位是公尺/秒，且方向維持 provider 回傳的正向物理方向；逆向追蹤
+    只改變時間積分方向，不在輸出 writer 再取負。``Observation`` constructor 已在
+    正常流程拒絕非有限值，但 writer 仍重做這個 gate，避免有人透過低階 dataclass 操作
+    或未來的相容 adapter 把 ``NaN``／``Inf`` 寫進正式 payload。只有明確的 ``None`` 會
+    轉為 NPY 的 NaN sentinel，讀取端再依狀態碼還原成 ``None``。
+    """
+
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{label} 不可為缺值")
+    if type(value) not in (int, float):
+        raise TypeError(f"{label} 必須是原生公尺/秒數值")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"{label} 不可為 NaN 或 Infinity")
+    return normalized
+
+
+def _encode_velocity_observation(
+    observation: Observation,
+) -> tuple[int, tuple[float, ...], int]:
+    """將單筆 Observation 的速度 context 編碼成 v3 固定 11 個 NPY scalar。
+
+    回傳順序固定為速度樣本狀態碼、九個公尺/秒欄位及 uint32 品質旗標。狀態碼是
+    ``None``／NaN 缺值語意的唯一判定依據：``NOT_SAMPLED`` 會把九欄寫成 NaN、QC
+    sentinel 寫成 0；``COMPLETE`` 需九欄有限且總和在 1e-12 相對／絕對容差內；
+    ``TOTAL_ONLY`` 只允許三個 total 欄位有限；其餘狀態可保留部分有限診斷值，但 QC
+    必須是非零 uint32。未知列舉狀態、bool QC、超出 uint32 範圍、真正的 NaN/Inf 或
+    狀態與欄位拓撲不一致都在 writer 邊界拒絕。
+    """
+
+    status = observation.velocity_sample_status
+    if type(status) is not VelocitySampleStatus or status not in _VELOCITY_STATUS_TO_CODE:
+        raise TypeError("未知 velocity_sample_status")
+    raw_values = tuple(getattr(observation, name) for name in _VELOCITY_COMPONENT_FIELDS)
+    normalized = tuple(
+        _finite_velocity_value(value, label=name, allow_none=True)
+        for name, value in zip(_VELOCITY_COMPONENT_FIELDS, raw_values, strict=True)
+    )
+
+    if status is VelocitySampleStatus.NOT_SAMPLED:
+        if any(value is not None for value in normalized) or observation.velocity_qc_flags is not None:
+            raise ValueError("not_sampled 的速度 context 必須全部是 None")
+        return _VELOCITY_STATUS_TO_CODE[status], (math.nan,) * len(normalized), 0
+
+    qc = observation.velocity_qc_flags
+    if type(qc) is not int or not 0 <= qc <= np.iinfo(np.uint32).max:
+        raise TypeError("velocity_qc_flags 必須是 uint32 範圍內的原生整數")
+
+    if status is VelocitySampleStatus.COMPLETE:
+        if qc != 0 or any(value is None for value in normalized):
+            raise ValueError("complete 的速度欄位必須全部有限且 velocity_qc_flags=0")
+        total_u, total_v, total_w, ocm_u, ocm_v, ocm_w, stokes_u, stokes_v, settling_w = normalized
+        assert all(value is not None for value in normalized)
+        if not (
+            math.isclose(total_u, ocm_u + stokes_u, rel_tol=_VELOCITY_SUM_RTOL, abs_tol=_VELOCITY_SUM_ATOL)
+            and math.isclose(
+                total_v,
+                ocm_v + stokes_v,
+                rel_tol=_VELOCITY_SUM_RTOL,
+                abs_tol=_VELOCITY_SUM_ATOL,
+            )
+            and math.isclose(
+                total_w,
+                ocm_w + settling_w,
+                rel_tol=_VELOCITY_SUM_RTOL,
+                abs_tol=_VELOCITY_SUM_ATOL,
+            )
+        ):
+            raise ValueError("complete 的 total 與速度分項總和不符")
+    elif status is VelocitySampleStatus.TOTAL_ONLY:
+        if qc != 0 or any(value is None for value in normalized[:3]) or any(
+            value is not None for value in normalized[3:]
+        ):
+            raise ValueError("total_only 只允許有限 total_u/v/w")
+    elif qc == 0:
+        raise ValueError(f"{status.value} 的 velocity_qc_flags 必須非零")
+
+    return (
+        _VELOCITY_STATUS_TO_CODE[status],
+        tuple(math.nan if value is None else value for value in normalized),
+        qc,
+    )
+
+
 def write_trajectory_shard(
     destination: str | Path,
     results: Sequence[ParticleResult],
@@ -343,7 +479,11 @@ def write_trajectory_shard(
 
     ``run_metadata`` 至少要寫下設定與輸入資料的指紋、程式版本、是否有未提交修改、亂數
     種子規則和此分片涵蓋的情境範圍。函式不替呼叫端猜這些資訊。空分片沒有可用分母，
-    不能產生可解釋的比例，因此直接拒絕。
+    不能產生可解釋的比例，因此直接拒絕。writer 固定發布 trajectory schema 3.0.0：
+    除既有位置／生命週期與環境欄位外，另保存九個速度公尺/秒陣列、速度狀態 uint8
+    陣列及速度 QC uint32 陣列。速度是同一個步首 sample 的證據，不是由相鄰位置差分
+    推導，也不包含隨機擴散位移；未取樣或缺少來源時以 status code 與 NaN sentinel
+    分開保存，不能用物理零值代替。
     """
 
     if not results:
@@ -369,6 +509,11 @@ def write_trajectory_shard(
         bed_values: list[float] = []
         forcing_month_values: list[int] = []
         environment_qc_values: list[int] = []
+        velocity_values: dict[str, list[float]] = {
+            name: [] for name in _VELOCITY_COMPONENT_FIELDS
+        }
+        velocity_status_values: list[int] = []
+        velocity_qc_values: list[int] = []
         for result in results:
             state = result.final_state
             particle_rows.append(
@@ -403,6 +548,11 @@ def write_trajectory_shard(
                 bed_values.append(bed_z_m)
                 forcing_month_values.append(forcing_month_yyyymm)
                 environment_qc_values.append(environment_qc)
+                velocity_status, encoded_velocity, velocity_qc = _encode_velocity_observation(observation)
+                velocity_status_values.append(velocity_status)
+                velocity_qc_values.append(velocity_qc)
+                for name, value in zip(_VELOCITY_COMPONENT_FIELDS, encoded_velocity, strict=True):
+                    velocity_values[name].append(value)
             offsets.append(len(time_values))
             for event in result.events:
                 row = {key: _json_safe(value) for key, value in asdict(event).items()}
@@ -429,6 +579,12 @@ def write_trajectory_shard(
             "bed_z_m.npy": np.asarray(bed_values, dtype=np.float64),
             "forcing_month_yyyymm.npy": np.asarray(forcing_month_values, dtype=np.int32),
             "environment_qc_flags.npy": np.asarray(environment_qc_values, dtype=np.uint32),
+            **{
+                f"{name}.npy": np.asarray(values, dtype=np.float64)
+                for name, values in velocity_values.items()
+            },
+            "velocity_sample_status_code.npy": np.asarray(velocity_status_values, dtype=np.uint8),
+            "velocity_qc_flags.npy": np.asarray(velocity_qc_values, dtype=np.uint32),
         }
         for filename, values in arrays.items():
             np.save(partial / filename, values, allow_pickle=False)
@@ -461,16 +617,17 @@ def validate_trajectory_shard(
     """以不拋出結構性例外的方式重新確認一個 trajectory shard。
 
     驗證器第一個資料邊界永遠是 shard 根目錄下固定名稱的 ``manifest.json``；讀出並確認
-    schema 後，才依 1.0.0 或 2.0.0 選擇 hard-coded payload 拓撲，絕不追隨 manifest
-    提供的任意路徑。兩個版本都保留原九個軌跡／事件檔案；2.0.0 另須有五個環境 context
+    schema 後，才依 1.0.0、2.0.0 或 3.0.0 選擇 hard-coded payload 拓撲，絕不追隨
+    manifest 提供的任意路徑。所有版本都保留原九個軌跡／事件檔案；2.0.0 另須有五個
+    環境 context 陣列；3.0.0 再增加九個速度 float64、速度狀態 uint8 與速度 QC uint32
     陣列。輸入不存在、JSON 損壞、固定檔案被替換成目錄或 symlink、checksum 失敗及
     Parquet/NumPy 內容錯誤都轉成可機器讀取的錯誤，不讓上層 reconcile 因 ``KeyError``
     中斷。``expected_metadata`` 用於 run controller reconcile 的 binding 比對；值會以
     JSON 語意逐欄比較。``strict_run_metadata`` 用於 tracked formal/pilot run；
     ``require_formal_metadata`` 另要求 commit/dirty 的 formal gate，並隱含 strict mode。
-    合成 smoke 可維持較寬鬆 metadata，但固定 payload、checksum、物理順序與 v2 環境狀態
-    gate 不放寬。v1 是工程相容格式，不含垂向環境 context，不能作為 F03/F09 的正式垂向
-    證據。
+    合成 smoke 可維持較寬鬆 metadata，但固定 payload、checksum、物理順序與環境／速度
+    狀態 gate 不放寬。v1 是工程相容格式，不含垂向環境與速度 context；v2 沒有速度
+    context，但可依原有來源／環境驗收用於位置與環境分析；兩個舊版都不提供速度分項證據。
     """
 
     root = Path(path)
@@ -566,6 +723,11 @@ def validate_trajectory_shard(
             add("manifest.schema_version: unsupported")
             return {"valid": False, "errors": errors, "manifest": manifest}
         expected_payload_files = _SCHEMA_PAYLOAD_FILES[schema_version]
+        has_environment_payload = schema_version in {
+            _ENVIRONMENT_TRAJECTORY_SHARD_SCHEMA_VERSION,
+            TRAJECTORY_SHARD_SCHEMA_VERSION,
+        }
+        has_velocity_payload = schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION
 
         for name in ("particle_count", "observation_count", "event_count"):
             value = manifest.get(name)
@@ -680,11 +842,18 @@ def validate_trajectory_shard(
                 "status_code.npy",
             )
         }
-        if schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION:
+        if has_environment_payload:
             arrays.update(
                 {
                     filename: load_array(filename)
                     for filename in _ENVIRONMENT_SHARD_PAYLOAD_FILES
+                }
+            )
+        if has_velocity_payload:
+            arrays.update(
+                {
+                    filename: load_array(filename)
+                    for filename in _VELOCITY_SHARD_PAYLOAD_FILES
                 }
             )
 
@@ -697,7 +866,7 @@ def validate_trajectory_shard(
             "z_m.npy": np.dtype(np.float64),
             "status_code.npy": np.dtype("U32"),
         }
-        if schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION:
+        if has_environment_payload:
             expected_dtypes.update(
                 {
                     "environment_sample_status_code.npy": np.dtype(np.uint8),
@@ -705,6 +874,17 @@ def validate_trajectory_shard(
                     "bed_z_m.npy": np.dtype(np.float64),
                     "forcing_month_yyyymm.npy": np.dtype(np.int32),
                     "environment_qc_flags.npy": np.dtype(np.uint32),
+                }
+            )
+        if has_velocity_payload:
+            expected_dtypes.update(
+                {
+                    **{
+                        f"{name}.npy": np.dtype(np.float64)
+                        for name in _VELOCITY_COMPONENT_FIELDS
+                    },
+                    "velocity_sample_status_code.npy": np.dtype(np.uint8),
+                    "velocity_qc_flags.npy": np.dtype(np.uint32),
                 }
             )
         for filename, expected_dtype in expected_dtypes.items():
@@ -808,10 +988,10 @@ def validate_trajectory_shard(
         ):
             add("status_code: unknown")
 
-        # v2 五個環境欄位的狀態碼是缺值語意唯一來源；NaN 只作 optional payload sentinel，
-        # 不允許以 NaN／0 自行推論 valid 或 invalid。逐筆檢查也把 z_m 的公尺制幾何關係
-        # 綁回同一 observation，避免錯掛另一個時間點的海面／海床資料。
-        if schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION:
+        # v2/v3 五個環境欄位的狀態碼是缺值語意唯一來源；NaN 只作 optional payload
+        # sentinel，不允許以 NaN／0 自行推論 valid 或 invalid。逐筆檢查也把 z_m 的公尺制
+        # 幾何關係綁回同一 observation，避免錯掛另一個時間點的海面／海床資料。
+        if has_environment_payload:
             environment_code = arrays.get("environment_sample_status_code.npy")
             eta_values = arrays.get("eta_m.npy")
             bed_values = arrays.get("bed_z_m.npy")
@@ -904,6 +1084,94 @@ def validate_trajectory_shard(
                         or qc == 0
                     ):
                         add(f"environment[{index}]: invalid_contract")
+        if has_velocity_payload and base_shape is not None:
+            for filename in (
+                *(f"{name}.npy" for name in _VELOCITY_COMPONENT_FIELDS),
+                "velocity_sample_status_code.npy",
+                "velocity_qc_flags.npy",
+            ):
+                values = arrays.get(filename)
+                if values is not None and values.shape != base_shape:
+                    add(f"{filename}: observation_shape")
+        # v3 的速度 arrays 同樣以固定 status code 綁定缺值語意，但速度欄位沒有額外
+        # sample reference time/position：Observation 本身就是同點步首證據。NaN 只允許
+        # 表示 None；真正的 +/-Inf、complete／total_only 拓撲錯誤及 sum mismatch 都
+        # 必須在 checksum 通過後仍由內容層拒絕。
+        if has_velocity_payload:
+            velocity_status_code = arrays.get("velocity_sample_status_code.npy")
+            velocity_qc = arrays.get("velocity_qc_flags.npy")
+            velocity_arrays = [arrays.get(f"{name}.npy") for name in _VELOCITY_COMPONENT_FIELDS]
+            velocity_ready = (
+                velocity_status_code is not None
+                and velocity_qc is not None
+                and all(value is not None for value in velocity_arrays)
+                and observations is not None
+                and all(
+                    value is not None
+                    and value.shape == observations.shape
+                    and value.ndim == 1
+                    for value in (velocity_status_code, velocity_qc, *velocity_arrays)
+                )
+                and velocity_status_code.dtype == np.dtype(np.uint8)
+                and velocity_qc.dtype == np.dtype(np.uint32)
+                and all(value.dtype == np.dtype(np.float64) for value in velocity_arrays if value is not None)
+            )
+            if velocity_ready:
+                assert velocity_status_code is not None
+                assert velocity_qc is not None
+                assert observations is not None
+                typed_velocity_arrays = tuple(
+                    value for value in velocity_arrays if value is not None
+                )
+                known_velocity_codes = np.arange(
+                    len(_VELOCITY_STATUS_TO_CODE), dtype=np.uint8
+                )
+                if not np.all(np.isin(velocity_status_code, known_velocity_codes)):
+                    add("velocity_sample_status_code: unknown")
+                for index, code_value in enumerate(velocity_status_code):
+                    code = int(code_value)
+                    values = tuple(float(array[index]) for array in typed_velocity_arrays)
+                    qc = int(velocity_qc[index])
+                    finite_or_missing = all(math.isfinite(value) or math.isnan(value) for value in values)
+                    if not finite_or_missing:
+                        add(f"velocity[{index}]: infinity")
+                        continue
+                    if code == _VELOCITY_STATUS_TO_CODE[VelocitySampleStatus.NOT_SAMPLED]:
+                        if not all(math.isnan(value) for value in values) or qc != 0:
+                            add(f"velocity[{index}]: not_sampled_contract")
+                    elif code == _VELOCITY_STATUS_TO_CODE[VelocitySampleStatus.COMPLETE]:
+                        if (
+                            not all(math.isfinite(value) for value in values)
+                            or qc != 0
+                            or not math.isclose(
+                                values[0],
+                                values[3] + values[6],
+                                rel_tol=_VELOCITY_SUM_RTOL,
+                                abs_tol=_VELOCITY_SUM_ATOL,
+                            )
+                            or not math.isclose(
+                                values[1],
+                                values[4] + values[7],
+                                rel_tol=_VELOCITY_SUM_RTOL,
+                                abs_tol=_VELOCITY_SUM_ATOL,
+                            )
+                            or not math.isclose(
+                                values[2],
+                                values[5] + values[8],
+                                rel_tol=_VELOCITY_SUM_RTOL,
+                                abs_tol=_VELOCITY_SUM_ATOL,
+                            )
+                        ):
+                            add(f"velocity[{index}]: complete_contract")
+                    elif code == _VELOCITY_STATUS_TO_CODE[VelocitySampleStatus.TOTAL_ONLY]:
+                        if (
+                            not all(math.isfinite(value) for value in values[:3])
+                            or not all(math.isnan(value) for value in values[3:])
+                            or qc != 0
+                        ):
+                            add(f"velocity[{index}]: total_only_contract")
+                    elif code in _VELOCITY_CODE_TO_STATUS and qc == 0:
+                        add(f"velocity[{index}]: invalid_qc")
         if (
             offsets is not None
             and observations is not None
@@ -1084,7 +1352,7 @@ def _read_event_type(value: Any) -> EventType:
 def _load_shard_array(root: Path, filename: str) -> np.ndarray:
     """以固定檔名、唯讀 mmap 與 ``allow_pickle=False`` 載入一個 NumPy 陣列。
 
-    reader 不採用 manifest 提供的路徑，因為 schema 1.0.0／2.0.0 的檔案拓撲已固定；
+    reader 不採用 manifest 提供的路徑，因為 schema 1.0.0／2.0.0／3.0.0 的檔案拓撲已固定；
     即使 manifest 被竄改，也只能讀取 shard 根目錄下預先定義的檔名。陣列仍以 mmap
     開啟，讓大型軌跡不必先完整複製到記憶體；回傳的結果物件只保存逐筆 Python 值。
     """
@@ -1098,6 +1366,29 @@ def _load_shard_array(root: Path, filename: str) -> np.ndarray:
     return values
 
 
+def _decode_optional_velocity_value(
+    values: np.ndarray,
+    position: int,
+    *,
+    label: str,
+) -> float | None:
+    """將速度 NPY scalar 解碼成有限 float／None，明確區分 NaN 與 Infinity。
+
+    v3 以 NaN 表示 writer 從 Observation 的 ``None`` 產生的 optional 缺值；它不是物理
+    零值，也不是可由 reader 任意推斷的狀態。相反地，``+Inf``／``-Inf`` 代表損壞或未
+    遵守 writer contract 的 payload，必須拒絕，不能與 NaN 一起用 ``notfinite`` 模糊
+    轉成 None。validator 通常已先攔截，此 helper 仍保留 reader-level 防線，避免未來
+    其他呼叫路徑跳過內容驗證。
+    """
+
+    value = float(values[position])
+    if math.isnan(value):
+        return None
+    if not math.isfinite(value):
+        raise ValueError(f"{label} 不可為 Infinity")
+    return value
+
+
 def read_trajectory_shard(
     path: str | Path,
     *,
@@ -1105,7 +1396,7 @@ def read_trajectory_shard(
     strict_run_metadata: bool = False,
     expected_metadata: Mapping[str, Any] | None = None,
 ) -> tuple[ParticleResult, ...]:
-    """安全讀回 1.0.0 legacy 或 2.0.0 trajectory shard。
+    """安全讀回 1.0.0、2.0.0 或 3.0.0 trajectory shard。
 
     函式第一個資料操作一定是呼叫 ``validate_trajectory_shard``，並完整轉送 formal
     metadata、strict metadata 與 expected metadata 三個驗證選項；驗證結果不是明確的
@@ -1114,14 +1405,17 @@ def read_trajectory_shard(
     排序、不以事件時間重新排列，也不追隨 manifest 內的任意路徑。
 
     粒子的 final state 由 particle table 的 identity、final status、step 計數與最後一筆
-    observation 的公尺制位置、UTC 奈秒時間、回溯年齡及狀態重建；兩版都沒有保存
-    ``own_local_exit_recorded``，因此讀回時使用 ``ParticleState`` 的既有預設值 ``False``。
-    legacy 1.0.0 沒有環境 context，reader 明示還原成 ``NOT_SAMPLED`` 與 ``None``，這只
-    是工程相容行為，不能供 F03/F09 正式垂向證據。2.0.0 則依 status code 還原
-    ``EnvironmentSampleStatus``、海面／海床公尺值、UTC ``YYYYMM`` 與品質旗標，再由
-    ``Observation`` constructor 重驗。事件的 ``attributes_json`` 必須是無重複鍵的 JSON
-    object，值只能是布林、有限浮點數、整數或字串。空事件表只會含 writer 目前產生的
-    ``particle_id`` 空欄，讀回時直接得到空事件清單，不要求不存在的事件欄位。
+    observation 的公尺制位置、UTC 奈秒時間、回溯年齡及狀態重建；三個 trajectory schema
+    都沒有保存 ``own_local_exit_recorded``，因此讀回時使用 ``ParticleState`` 的既有預設值
+    ``False``。
+    legacy 1.0.0 沒有環境或速度 context，reader 明示還原成 ``NOT_SAMPLED`` 與 ``None``；
+    2.0.0 依環境 status code 還原海面／海床公尺值、UTC ``YYYYMM`` 與品質旗標；3.0.0
+    再依速度 status code 還原九個公尺/秒欄位與速度 QC。舊版速度欄位補預設值不能供
+    速度分項證據；v1 仍僅工程相容，v2 則可依原有來源／環境驗收用於位置與環境分析。
+    所有版本最後都交由 ``Observation`` constructor 重驗。
+    事件的 ``attributes_json`` 必須是無重複鍵的 JSON object，值只能
+    是布林、有限浮點數、整數或字串。空事件表只會含 writer 目前產生的 ``particle_id``
+    空欄，讀回時直接得到空事件清單，不要求不存在的事件欄位。
 
     任何驗證、檔案讀取、欄位缺失、型別不符、狀態／事件名稱未知或 JSON 屬性不合法都會
     以不含輸入路徑的 ``ValueError`` fail closed；這避免把伺服器絕對路徑洩漏到上層日志。
@@ -1146,6 +1440,11 @@ def read_trajectory_shard(
     schema_version = manifest.get("schema_version")
     if schema_version not in _SCHEMA_PAYLOAD_FILES:
         raise ValueError("trajectory shard 驗證失敗")
+    has_environment_payload = schema_version in {
+        _ENVIRONMENT_TRAJECTORY_SHARD_SCHEMA_VERSION,
+        TRAJECTORY_SHARD_SCHEMA_VERSION,
+    }
+    has_velocity_payload = schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION
 
     try:
         root = Path(path)
@@ -1161,12 +1460,20 @@ def read_trajectory_shard(
         bed_z_m = None
         forcing_month_yyyymm = None
         environment_qc_flags = None
-        if schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION:
+        if has_environment_payload:
             environment_status_code = _load_shard_array(root, "environment_sample_status_code.npy")
             eta_m = _load_shard_array(root, "eta_m.npy")
             bed_z_m = _load_shard_array(root, "bed_z_m.npy")
             forcing_month_yyyymm = _load_shard_array(root, "forcing_month_yyyymm.npy")
             environment_qc_flags = _load_shard_array(root, "environment_qc_flags.npy")
+        velocity_arrays: dict[str, np.ndarray] = {}
+        if has_velocity_payload:
+            for name in _VELOCITY_COMPONENT_FIELDS:
+                velocity_arrays[name] = _load_shard_array(root, f"{name}.npy")
+            velocity_arrays["velocity_sample_status_code"] = _load_shard_array(
+                root, "velocity_sample_status_code.npy"
+            )
+            velocity_arrays["velocity_qc_flags"] = _load_shard_array(root, "velocity_qc_flags.npy")
 
         if not np.issubdtype(offsets.dtype, np.integer) or offsets.ndim != 1:
             raise ValueError("trajectory_offsets 型別或維度不符")
@@ -1177,7 +1484,7 @@ def read_trajectory_shard(
                 raise ValueError("數值 observation 陣列型別或維度不符")
         if status_code.ndim != 1:
             raise ValueError("status_code 維度不符")
-        if schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION and any(
+        if has_environment_payload and any(
             values is None or values.ndim != 1
             for values in (
                 environment_status_code,
@@ -1188,6 +1495,10 @@ def read_trajectory_shard(
             )
         ):
             raise ValueError("environment context 維度不符")
+        if has_velocity_payload and any(
+            values.ndim != 1 for values in velocity_arrays.values()
+        ):
+            raise ValueError("velocity context 維度不符")
 
         expected_reader_dtypes = [
             (offsets, np.dtype(np.int64)),
@@ -1198,7 +1509,7 @@ def read_trajectory_shard(
             (z_m, np.dtype(np.float64)),
             (status_code, np.dtype("U32")),
         ]
-        if schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION:
+        if has_environment_payload:
             assert environment_status_code is not None
             assert eta_m is not None
             assert bed_z_m is not None
@@ -1213,6 +1524,17 @@ def read_trajectory_shard(
                     (environment_qc_flags, np.dtype(np.uint32)),
                 ]
             )
+        if has_velocity_payload:
+            expected_reader_dtypes.extend(
+                [
+                    *(
+                        (velocity_arrays[name], np.dtype(np.float64))
+                        for name in _VELOCITY_COMPONENT_FIELDS
+                    ),
+                    (velocity_arrays["velocity_sample_status_code"], np.dtype(np.uint8)),
+                    (velocity_arrays["velocity_qc_flags"], np.dtype(np.uint32)),
+                ]
+            )
         for values, expected_dtype in expected_reader_dtypes:
             if values.dtype != expected_dtype:
                 raise ValueError("trajectory shard payload dtype 不符")
@@ -1222,7 +1544,7 @@ def read_trajectory_shard(
             raise ValueError("trajectory_offsets 與 particle table 筆數不一致")
         if any(values.shape != time_utc_ns.shape for values in (age_seconds, x_m, y_m, z_m, status_code)):
             raise ValueError("observation 陣列長度不一致")
-        if schema_version == TRAJECTORY_SHARD_SCHEMA_VERSION and any(
+        if has_environment_payload and any(
             values.shape != time_utc_ns.shape
             for values in (
                 environment_status_code,
@@ -1233,6 +1555,10 @@ def read_trajectory_shard(
             )
         ):
             raise ValueError("environment context 長度不一致")
+        if has_velocity_payload and any(
+            values.shape != time_utc_ns.shape for values in velocity_arrays.values()
+        ):
+            raise ValueError("velocity context 長度不一致")
         if offsets.size == 0 or int(offsets[0]) != 0 or int(offsets[-1]) != time_utc_ns.size:
             raise ValueError("trajectory_offsets 邊界不符")
         if np.any(np.diff(offsets) <= 0):
@@ -1297,6 +1623,36 @@ def read_trajectory_shard(
                             else int(environment_qc_flags[position])
                         ),
                     }
+                if not has_velocity_payload:
+                    # v1/v2 的固定 payload 沒有速度陣列；舊結果不能由位置差分或
+                    # environment context 反推速度，故明示補回最新版 Observation 的
+                    # NOT_SAMPLED／None 預設，而不是建立虛假的物理零值。
+                    velocity_kwargs = {
+                        "velocity_sample_status": VelocitySampleStatus.NOT_SAMPLED,
+                        **{name: None for name in _VELOCITY_COMPONENT_FIELDS},
+                        "velocity_qc_flags": None,
+                    }
+                else:
+                    velocity_code = int(velocity_arrays["velocity_sample_status_code"][position])
+                    velocity_status = _VELOCITY_CODE_TO_STATUS.get(velocity_code)
+                    if velocity_status is None:
+                        raise ValueError("未知 velocity_sample_status code")
+                    velocity_kwargs = {
+                        "velocity_sample_status": velocity_status,
+                        **{
+                            name: _decode_optional_velocity_value(
+                                velocity_arrays[name],
+                                position,
+                                label=f"{name}[{position}]",
+                            )
+                            for name in _VELOCITY_COMPONENT_FIELDS
+                        },
+                        "velocity_qc_flags": (
+                            None
+                            if velocity_status is VelocitySampleStatus.NOT_SAMPLED
+                            else int(velocity_arrays["velocity_qc_flags"][position])
+                        ),
+                    }
                 observations.append(
                     Observation(
                         particle_id=particle_id,
@@ -1307,6 +1663,7 @@ def read_trajectory_shard(
                         z_m=float(z_m[position]),
                         status=observation_status,
                         **environment_kwargs,
+                        **velocity_kwargs,
                     )
                 )
             last_observation = observations[-1]

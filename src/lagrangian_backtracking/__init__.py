@@ -15,7 +15,8 @@ SERVER formal baseline 與 SERVER scientific evidence 分開，不能因 registr
 staging/格式/校驗基礎已完成，``report_render.py`` 提供固定格式、canonical sidecar、
 實際 bytes size／SHA-256 與 immutable staging view。這仍不代表任何 F/T 科學內容已
 產生：``report_pipeline.py`` 的建置前唯讀 gate 已完成，涵蓋 complete run、aggregate/spec
-binding、formal trajectory v2、MPLCONFIGDIR 與 output/evidence policy；但
+binding、全 run 單一 formal trajectory v2 或 v3、MPLCONFIGDIR 與 output/evidence policy；
+v2 的既有環境欄位仍可供位置／環境報告使用，缺少速度只表示沒有速度證據，不會使環境資料失效；但
 ``build_report_release``、F01–F12/T01–T06 專屬 artifact adapters、CLI ``report-build``
 與正式 SERVER 科學發布仍未完成，不能把 preflight 稱為完整 pipeline 或推定正式報告完成。
 """
@@ -100,7 +101,17 @@ from .manifests import (
     load_scenario_inputs,
     resolve_manifest_path,
 )
-from .models import BoundaryEvent, EventType, ParticleState, ParticleStatus, SampleQC, VelocitySample
+from .models import (
+    BoundaryEvent,
+    EventType,
+    ParticleState,
+    ParticleStatus,
+    SampleQC,
+    VelocityComponents,
+    VelocityQC,
+    VelocitySample,
+    VelocitySampleStatus,
+)
 from .outputs import read_trajectory_shard
 from .pilot_calibration import (
     PAIR_SAMPLE_SCHEMA,
@@ -360,6 +371,9 @@ __all__ = [
     "ValidationMetric",
     "ValidatedRunStaticInputs",
     "VelocitySample",
+    "VelocityComponents",
+    "VelocityQC",
+    "VelocitySampleStatus",
     "advance_particle_once",
     "acquire_run_lock",
     "apply_scenario_selection",

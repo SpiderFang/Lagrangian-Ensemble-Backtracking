@@ -11,8 +11,9 @@
 直接呼叫。
 
 輸出預設為 ``docs/source_code_architecture_map.html``。當模組新增、刪除或匯入關係改變
-時，重新執行本腳本即可更新圖上的實際引用；中文責任說明仍需同步檢查文件 11 與此腳本的
-``MODULE_INFO``，確保交接者看到的是目前的設計基線。
+時，重新執行本腳本即可更新圖上的實際引用；中文責任說明仍需同步檢查
+``docs/development/11_source_code_guide_and_plan_traceability.md`` 與此腳本的 ``MODULE_INFO``，
+確保交接者看到的是目前的設計基線。
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ PACKAGE_ROOT = PROJECT_ROOT / "src" / "lagrangian_backtracking"
 DEFAULT_OUTPUT = PROJECT_ROOT / "docs" / "source_code_architecture_map.html"
 
 
-# 五個群組的順序與文件 11 第 3 節一致，左右排列代表由上游資料逐步走向
+# 五個群組的順序與 ``docs/development/11_source_code_guide_and_plan_traceability.md`` 第 3 節一致，左右排列代表由上游資料逐步走向
 # 輸出聚合。
 #
 # 這裡保留明確的模組清單，而不是依檔名自動分群：群組本身是交接用的責任契約，
@@ -140,7 +141,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
 )
 
 
-# 這些說明對應文件 11 的模組導覽表。它們是交接用的中文語境，不取代原始碼
+# 這些說明對應 ``docs/development/11_source_code_guide_and_plan_traceability.md`` 的模組導覽表。它們是交接用的中文語境，不取代原始碼
 # 本身。
 MODULE_INFO: dict[str, dict[str, Any]] = {
     "pilot_preview": {
@@ -942,7 +943,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "entrypoints": ["ReportBuildPreflight", "preflight_report_build"],
         "read_first": (
             "建置前唯讀 gate 已完成：會檢查 complete run、aggregate/spec binding、formal trajectory "
-            "v2、MPLCONFIGDIR、output/evidence policy 與固定 output；不讀 raw NetCDF、不產生圖表、不建立 "
+            "v2 或 v3（同run單一版本）、MPLCONFIGDIR、output/evidence policy 與固定 output；不讀 raw NetCDF、不產生圖表、不建立 "
             "partial。build_report_release、F01–F12/T01–T06 專屬 artifact adapters、CLI report-build "
             "與正式 SERVER 科學發布仍未完成，不能把 preflight 稱為完整 pipeline。comparison aggregate "
             "的精確 compatibility matrix 仍由 report_comparison_statistics 負責。"
@@ -1305,7 +1306,7 @@ HTML_TEMPLATE = r'''<!doctype html>
       <aside id="detail-panel" class="detail-panel" aria-live="polite"></aside>
     </main>
     <footer>
-      實線只表示模組層級的相對 <code>import</code>，不宣稱每條線都是函式直接呼叫；虛線是文件化的資料／控制流程。若要追到函式級行為，從右側「主要閱讀入口」開啟對應原始碼，再回看測試與文件 11 的追溯表。
+      實線只表示模組層級的相對 <code>import</code>，不宣稱每條線都是函式直接呼叫；虛線是文件化的資料／控制流程。若要追到函式級行為，從右側「主要閱讀入口」開啟對應原始碼，再回看測試與 <code>docs/development/11_source_code_guide_and_plan_traceability.md</code> 的追溯表。
     </footer>
   </div>
   <script>

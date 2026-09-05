@@ -1,6 +1,6 @@
 """產生程式碼導覽文件第 3、4 節的可列印流程圖。
 
-本腳本把 ``docs/11_source_code_guide_and_plan_traceability.md`` 中的兩張 Mermaid 概念圖
+本腳本把 ``docs/development/11_source_code_guide_and_plan_traceability.md`` 中的兩張 Mermaid 概念圖
 轉為獨立的 A4 橫式 PDF。輸出刻意只呈現模組責任、資料流與一條粒子的處理順序，不把
 尚未產生的實值科學結果畫成已完成成果。PDF 適合報告與交接文件引用；同一 PDF 的每頁
 可再用 Poppler 轉為高解析度 PNG，供簡報或文件嵌入。

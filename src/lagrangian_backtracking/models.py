@@ -68,6 +68,68 @@ class EventType(StrEnum):
     NUMERICAL_FAILURE = "numerical_failure"
 
 
+class VelocitySampleStatus(StrEnum):
+    """Observation 速度紀錄的資料完整程度。
+
+    ``COMPLETE`` 只用於同一個步首取樣同時提供 OCM、Stokes 水平漂流與沉降分項，且
+    三個分項相加與總速度相符的樣本。一般四參數 synthetic callback 沒有分項來源時
+    使用 ``TOTAL_ONLY``；其餘狀態分開表示尚未取樣、缺分項、非有限值、型別無效或
+    總和不一致。這個列舉與環境樣本狀態分離，避免「有海面高度」被誤讀成「有速度
+    分項」，也讓輸出端能對每個速度欄位保留明確缺值語意。
+    """
+
+    NOT_SAMPLED = "not_sampled"
+    COMPLETE = "complete"
+    TOTAL_ONLY = "total_only"
+    INVALID = "invalid"
+    MISSING = "missing"
+    NONFINITE = "nonfinite"
+    SUM_MISMATCH = "sum_mismatch"
+
+
+class VelocityQC(IntFlag):
+    """速度紀錄本身的品質檢查旗標，不與環境 ``qc`` 共用欄位。
+
+    旗標只描述速度值或其分解，不取代 ``SampleQC`` 對 forcing 來源的取樣結果。無效、
+    缺分項、非有限、型別錯誤及總和不符都必須留下非零旗標；``TOTAL_ONLY`` 是明確的
+    「只有總速度」工程 callback 狀態，沒有把缺少來源誤標成速度數值錯誤。
+    """
+
+    OK = 0
+    SAMPLE_INVALID = 1 << 0
+    MISSING_COMPONENT = 1 << 1
+    NONFINITE = 1 << 2
+    NON_NUMERIC = 1 << 3
+    SUM_MISMATCH = 1 << 4
+
+
+@dataclass(frozen=True, slots=True)
+class VelocityComponents:
+    """一次速度取樣的具名、固定欄位分項資料，所有欄位單位都是公尺/秒。
+
+    ``total_*`` 是與 ``VelocitySample.u_mps/v_mps/w_mps`` 對應的正向物理總速度；
+    ``ocm_*`` 是 OCM current 的東、北、向上分量；``stokes_u_mps``／``stokes_v_mps``
+    是波浪造成且實際使用的水平 Stokes 漂流；``settling_w_mps`` 是以向上為正的垂向
+    沉降速度，本專案沉降案例為負值。Stokes 垂向分量與沉降水平分量不屬於本資料契約，
+    因此沒有欄位，也不可用 0 假造波浪或沉降來源。欄位可以是 ``None``，讓一般 callback
+    明示只有總速度或部分分項；正式 ``CombinedMonthForcing`` 的有效樣本會填滿全部九欄。
+
+    這組欄位只承載速度提供器在同一次 UTC／位置取樣中實際提供的資料，不自行查詢
+    forcing；引擎把它綁定到完全相同時間與 ``x_m/y_m/z_m`` 的位置觀測時，會檢查有限性、
+    型別與 ``total = OCM + Stokes(水平) + settling`` 的明定容差。
+    """
+
+    total_u_mps: float | None = None
+    total_v_mps: float | None = None
+    total_w_mps: float | None = None
+    ocm_u_mps: float | None = None
+    ocm_v_mps: float | None = None
+    ocm_w_mps: float | None = None
+    stokes_u_mps: float | None = None
+    stokes_v_mps: float | None = None
+    settling_w_mps: float | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class VelocitySample:
     """一次速度查詢得到的正向物理速度與附近網格資訊。
@@ -75,7 +137,9 @@ class VelocitySample:
     數值都採國際單位制：速度為公尺/秒，長度為公尺。``u_mps``、``v_mps``、``w_mps``
     分別是東向、北向與向上的速度，可由海流、波浪造成的漂移和物體浮沉速度合成。
     取樣失敗一定寫入品質檢查旗標（``qc``），不可假裝成靜水。海面、海床及附近網格大小
-    用於判斷粒子能否繼續前進，以及下一步最多可走多遠。
+    用於判斷粒子能否繼續前進，以及下一步最多可走多遠。``components`` 若存在，表示
+    同一次查詢實際取出的 OCM、Stokes 水平與垂向沉降分項；若為 ``None``，只能在輸出
+    中標為「只有總速度」，不可由總速度反推來源。
     """
 
     u_mps: float
@@ -90,6 +154,7 @@ class VelocitySample:
     triangle_id: int | None = None
     forcing_month_id: str | None = None
     diagnostics: dict[str, float | int | str] = field(default_factory=dict)
+    components: VelocityComponents | None = None
 
     @property
     def valid(self) -> bool:

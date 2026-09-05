@@ -1,5 +1,10 @@
 # 架構與資料契約
 
+> **閱讀提示**
+> - 文件類型：系統架構與資料契約。
+> - 它回答：上游資料、模組責任、狀態欄位與輸出產品如何銜接。
+> - 建議先讀：[文件總入口](../README.md)，再讀[科學方法與驗證](03_scientific_method_and_validation.md)。
+
 ## 1. 設計目標
 
 本專案採「上游快取唯讀、forcing adapter 與計算核心分離、輸出不可變」架構。大型 OCM/NWW3 陣列留在 SERVER 原位置，以 memory-map 與時間窗載入；本專案只保存索引、manifest、軌跡分片、事件與聚合成果。
@@ -7,7 +12,7 @@
 ### 1.1 BayTrace 可用部分整合界線
 
 本專案已採用 BayTrace 可對應本地 CPU 執行的工程思路：CPU SoA／batch／chunk、每粒子可
-重現亂數、SCHISM triangle hint、可暫停 engine，以及 schema 2 checkpoint/restart。未採用
+重現亂數、SCHISM triangle hint、可暫停 engine，以及 checkpoint schema 2.2/restart。未採用
 GPU/CUDA、BayTrace raw `schout`／`bp` I/O、oil/weathering、droptime、共享記憶體
 multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 僅保留為未來具備完整
 相容 fixture 時的 golden reference，不是目前的正式驗證結果。
@@ -186,7 +191,7 @@ OCM 與 NWW3 缺值政策分開：
 | `forcing.nww3` | NWW3 analysis-grid time/space sampler 與 QC |
 | `forcing_window` | 單一 flow domain 的 UTC 月份 lazy loader、LRU resident window、material facade 與 cache/resource stats |
 | `provenance` | 不含絕對路徑的 Git/deployment tree、uv.lock、Python 與套件版本指紋；formal 只接受 Git clean 或 declared deployment commit |
-| `run_control` | immutable run plan、atomic progress、schema 2 checkpoint generation、trajectory publish 與 reconcile |
+| `run_control` | immutable run plan、atomic progress、schema 2.2 checkpoint generation、trajectory publish 與 reconcile |
 | `run_validation` | run plan/progress、scenario/seed table、shard range、checkpoint/output checksum 與工程 benchmark 唯讀驗證 |
 | `physics.stokes` | dispersion solver、bulk finite-depth profile、方向轉換 |
 | `physics.diffusion` | Smagorinsky Kh、Kz、gradient drift 與 stochastic increment |
@@ -518,7 +523,51 @@ $LBT_OUTPUT_ROOT/particles/<run_id>/
 
 軌跡採 CSR 類型 ragged column arrays：`trajectory_offsets` 指出每個 particle 在共同一維 observation arrays 的起訖，避免 object dtype。事件與情境適合以 Parquet 保存可查詢欄位；所有大型輸出都需 checksum、shape、dtype、單位及分片 row count。
 
-### 8.1 必要事件欄位
+### 8.1 軌跡 shard 版本與逐點速度契約
+
+trajectory shard 的 payload 拓撲按版本固定，reader 先由 `manifest.json.schema_version` 選擇
+固定欄位集合，再以 `Observation` constructor 重新驗證；不得用最新版 dataclass 欄位反射結果
+推導舊版欄位，也不得把不同版本的 payload 混在同一個 shard：
+
+| trajectory schema | 固定 payload | 讀寫政策 |
+|---|---|---|
+| `1.0.0` | 原有位置／時間／年齡／粒子狀態、offset、particle table、events 共 9 個檔案 | 唯讀工程相容；環境與速度欄位讀回為 `NOT_SAMPLED`／`None` |
+| `2.0.0` | v1 全部 9 個檔案，加 `environment_sample_status_code.npy`、`eta_m.npy`、`bed_z_m.npy`、`forcing_month_yyyymm.npy`、`environment_qc_flags.npy` 共 14 個 payload 檔案 | 唯讀相容；依原有來源／環境驗收可用於位置與環境分析，但沒有速度分項證據；速度欄位讀回為 `NOT_SAMPLED`／`None` |
+| `3.0.0` | v2 全部 14 個檔案，加九個速度 `float64` 陣列、`velocity_sample_status_code.npy`（`uint8`）與 `velocity_qc_flags.npy`（`uint32`），共 25 個 payload 檔案加 `manifest.json` | 新 writer 固定發布；validator／reader 嚴格檢查固定拓撲、dtype、shape、count、QC 與 checksum |
+
+逐點速度的 11 個欄位為 `velocity_sample_status`、`total_u_mps`、`total_v_mps`、
+`total_w_mps`、`ocm_u_mps`、`ocm_v_mps`、`ocm_w_mps`、`stokes_u_mps`、
+`stokes_v_mps`、`settling_w_mps` 與 `velocity_qc_flags`。九個物理速度欄位單位皆為
+公尺／秒（m/s），方向採 provider 的真實物理正向；逆向追蹤只改變時間積分方向，不在
+寫檔或 consumer 再取負，也不包含隨機擴散位移。每筆速度是既有 query 的同一個
+step-start、同一粒子位置取樣，不是終點、Runge-Kutta stage、位置差分或時間平均；因此
+不另加 sample reference XYZ/time 欄位，`Observation` 本身就是同點證據。
+
+速度狀態碼固定如下，未知 code 必須拒絕：
+
+| code | `VelocitySampleStatus` | 欄位與 QC 契約 |
+|---:|---|---|
+| 0 | `NOT_SAMPLED` (`not_sampled`) | 九欄皆為 `None`；QC 為 `None`，磁碟九欄寫 NaN、QC payload 為 0 |
+| 1 | `COMPLETE` (`complete`) | 九欄皆有限、QC=0，且 `total_u=ocm_u+stokes_u`、`total_v=ocm_v+stokes_v`、`total_w=ocm_w+settling_w`，相對／絕對容差皆為 `1e-12` |
+| 2 | `TOTAL_ONLY` (`total_only`) | 只有三個 total 欄有限，六個 component 欄為 `None`，QC=0 |
+| 3 | `INVALID` (`invalid`) | 可保留有限診斷值；缺值為 `None`，QC 必須非零 |
+| 4 | `MISSING` (`missing`) | 可保留有限診斷值；缺值為 `None`，QC 必須非零 |
+| 5 | `NONFINITE` (`nonfinite`) | 可保留有限診斷值；缺值為 `None`，QC 必須非零；不得把真正的 Infinity 當缺值 |
+| 6 | `SUM_MISMATCH` (`sum_mismatch`) | 可保留有限診斷值；缺值為 `None`，QC 必須非零 |
+
+記憶體中的 `None` 是唯一缺值表示；寫入速度 float payload 時只可轉成 NaN。reader 只把
+NaN 還原為 `None`，任何 `+Infinity`／`-Infinity` 都拒絕；NaN 不代表物理零值，缺值也
+不得以零替代。QC 是可為 `None` 的 `uint32` 範圍整數：`NOT_SAMPLED` 使用 `None`，
+`COMPLETE`／`TOTAL_ONLY` 等有效狀態使用 QC=0；`INVALID`／`MISSING`／`NONFINITE`／
+`SUM_MISMATCH` 等無效、缺值、非有限或不一致狀態則必須使用非零 QC，並由 `Observation`
+constructor 再做狀態相依驗證。定期與終止 `Observation` 只有在同一粒子、同一時間與同一
+位置已有步首速度取樣時才附上速度欄位；boundary endpoint 若未查詢速度，必須保持
+`NOT_SAMPLED`，不得從終點、相鄰位置、時間差分或舊結果補算。舊 v1/v2 payload 沒有
+速度檔案，reader 明確建立 `NOT_SAMPLED` 與九個 `None`。正式 report gate 接受全 run
+單一 v2 或單一 v3，拒絕 v1 與 mixed version；一般工程 reader 則保留已登錄舊版的唯讀
+相容性。
+
+### 8.2 必要事件欄位
 
 - `particle_id`, `scenario_id`, `member_id`, `study_site_id`, `analysis_region_id`, `receptor_id`。
 - `event_type`：local_domain_first_exit / other_site_local_domain_enter / other_site_local_domain_exit / flow_domain_open_exit / coast_contact / surface_contact / surface_regime_exit / bed_contact / deposited / data_gap / max_age / forcing_start / numerical_failure。

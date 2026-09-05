@@ -17,7 +17,7 @@ import pytest
 from PIL import Image
 from shapely.geometry import box
 from test_run_control import _request
-from test_run_validation import _downgrade_shard_to_legacy
+from test_run_validation import _downgrade_shard_to_legacy, _downgrade_shard_to_v2
 from test_runtime_static_inputs import (
     _initialize_exact_test_run,
     _patch_static_loaders,
@@ -174,7 +174,21 @@ def test_complete_counts_units_and_readable_png(rendered_preview):
     with (output / "observations.csv").open() as stream:
         observations = list(csv.DictReader(stream))
     assert len(observations) == summary["observation_count"]
+    velocity_fields = (
+        "velocity_sample_status",
+        "total_u_mps",
+        "total_v_mps",
+        "total_w_mps",
+        "ocm_u_mps",
+        "ocm_v_mps",
+        "ocm_w_mps",
+        "stokes_u_mps",
+        "stokes_v_mps",
+        "settling_w_mps",
+        "velocity_qc_flags",
+    )
     for row in observations:
+        assert all(field in row for field in velocity_fields)
         assert float(row["age_seconds"]) == pytest.approx(
             (summary["arrival_time_utc_ns"] - int(row["time_utc_ns"])) / 1e9
         )
@@ -183,6 +197,20 @@ def test_complete_counts_units_and_readable_png(rendered_preview):
             assert float(row["eta_m"]) == 0.25 and float(row["bed_z_m"]) == -10
         elif row["environment_sample_status"] == "not_sampled":
             assert row["eta_m"] == row["bed_z_m"] == ""
+        velocity_status = row["velocity_sample_status"]
+        velocity_values = [row[field] for field in velocity_fields[1:10]]
+        if velocity_status == "not_sampled":
+            assert all(value == "" for value in velocity_values)
+            assert row["velocity_qc_flags"] == ""
+        elif velocity_status == "total_only":
+            assert all(value != "" for value in velocity_values[:3])
+            assert all(value == "" for value in velocity_values[3:])
+            assert row["velocity_qc_flags"] == "0"
+        elif velocity_status == "complete":
+            assert all(value != "" for value in velocity_values)
+            assert row["velocity_qc_flags"] == "0"
+        else:
+            assert int(row["velocity_qc_flags"]) > 0
     for name in ("horizontal.png", "depth_age.png", "terminal_counts.png"):
         with Image.open(output / name) as image:
             assert image.format == "PNG" and min(image.size) >= 900
@@ -201,6 +229,34 @@ def test_complete_counts_units_and_readable_png(rendered_preview):
         assert (output / name).stat().st_size == contract["size_bytes"]
     assert str(output.parent) not in (output / "summary.json").read_text()
     assert "逆向時間曲線變淺不表示" in (output / "README.md").read_text()
+
+
+def test_v2_preview_writes_new_velocity_columns_as_blank(preview_case):
+    """舊 v2 shard 沒有速度 payload，preview 仍輸出欄名但數值與 QC 保持空白。"""
+
+    root, config, output = preview_case
+    progress = load_run_progress(root)
+    for _shard_id, entry in progress["shards"].items():
+        _downgrade_shard_to_v2(root / entry["output_relative_path"])
+
+    _build(preview_case, max_curves_per_vertical=5)
+    with (output / "observations.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows
+    velocity_value_fields = (
+        "total_u_mps",
+        "total_v_mps",
+        "total_w_mps",
+        "ocm_u_mps",
+        "ocm_v_mps",
+        "ocm_w_mps",
+        "stokes_u_mps",
+        "stokes_v_mps",
+        "settling_w_mps",
+    )
+    assert all(row["velocity_sample_status"] == "not_sampled" for row in rows)
+    assert all(row[field] == "" for row in rows for field in velocity_value_fields)
+    assert all(row["velocity_qc_flags"] == "" for row in rows)
 
 
 def test_real_engine_failure_event_roundtrip(preview_template, rendered_preview):

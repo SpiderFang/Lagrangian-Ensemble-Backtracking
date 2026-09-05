@@ -259,7 +259,7 @@ def _adjacent_ocm_sampler(mesh: NativeMesh, *, use_numba_kernel: bool = False) -
 
 
 def _assert_velocity_samples_equal(first, second) -> None:
-    """逐一比較速度、尺度、QC 與 provenance，避免只比較 valid 布林值。"""
+    """逐一比較速度、分項、尺度、QC 與 provenance，避免只比較 valid 布林值。"""
 
     assert np.allclose(
         [
@@ -287,6 +287,7 @@ def _assert_velocity_samples_equal(first, second) -> None:
     assert first.triangle_id == second.triangle_id
     assert first.forcing_month_id == second.forcing_month_id
     assert first.diagnostics == second.diagnostics
+    assert first.components == second.components
 
 
 def test_triangle_neighbors_are_opposite_vertex_adjacency() -> None:
@@ -785,3 +786,34 @@ def test_combined_forcing_sums_3d_ocm_stokes_and_strict_sinking_without_windage(
     assert sample.w_mps < expected_ocm[2]
     assert np.isclose(sample.diagnostics["stokes_u_mps"], expected_stokes.u_mps, atol=1e-12)
     assert np.isclose(sample.diagnostics["stokes_v_mps"], expected_stokes.v_mps, atol=1e-12)
+    assert sample.components is not None
+    assert np.allclose(
+        [
+            sample.components.total_u_mps,
+            sample.components.total_v_mps,
+            sample.components.total_w_mps,
+            sample.components.ocm_u_mps,
+            sample.components.ocm_v_mps,
+            sample.components.ocm_w_mps,
+            sample.components.stokes_u_mps,
+            sample.components.stokes_v_mps,
+            sample.components.settling_w_mps,
+        ],
+        [
+            expected_total[0],
+            expected_total[1],
+            expected_total[2],
+            expected_ocm[0],
+            expected_ocm[1],
+            expected_ocm[2],
+            expected_stokes.u_mps,
+            expected_stokes.v_mps,
+            sinking_velocity_mps,
+        ],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert no_stokes_sample.components is not None
+    assert no_stokes_sample.components.stokes_u_mps == 0.0
+    assert no_stokes_sample.components.stokes_v_mps == 0.0
+    assert no_stokes_sample.components.settling_w_mps == sinking_velocity_mps

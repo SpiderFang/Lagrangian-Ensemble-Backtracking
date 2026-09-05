@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from lagrangian_backtracking.engine import EnvironmentSampleStatus, Observation, ParticleResult
-from lagrangian_backtracking.models import ParticleState, ParticleStatus
+from lagrangian_backtracking.models import ParticleState, ParticleStatus, VelocitySampleStatus
 from lagrangian_backtracking.report_trajectory_identity import (
     CORE_SEASONS,
     CORE_TIDE_CLASSES,
@@ -88,10 +88,11 @@ def _observations() -> list[Observation]:
 
 
 def _observations_with_environment_context() -> list[Observation]:
-    """建立帶有有效海面、海床、forcing 月份與品質旗標的 snapshot fixture。
+    """建立帶有環境與同點逐步速度 context 的 snapshot fixture。
 
     兩個觀測都在同一個有限公尺垂向範圍內，讓測試能確認 representative snapshot 會
-    保留環境上下文；這些 synthetic 欄位只測試資料契約，不代表真實 OCM／NWW3 樣本。
+    保留環境上下文與九個速度欄位；這些 synthetic 欄位只測試資料契約，不代表真實
+    OCM／NWW3 樣本。
     """
 
     return [
@@ -108,6 +109,17 @@ def _observations_with_environment_context() -> list[Observation]:
             -10.0,
             "202401",
             0,
+            velocity_sample_status=VelocitySampleStatus.COMPLETE,
+            total_u_mps=3.0,
+            total_v_mps=-1.0,
+            total_w_mps=-0.5,
+            ocm_u_mps=2.5,
+            ocm_v_mps=-1.2,
+            ocm_w_mps=-0.25,
+            stokes_u_mps=0.5,
+            stokes_v_mps=0.2,
+            settling_w_mps=-0.25,
+            velocity_qc_flags=0,
         ),
         Observation(
             "particle-0",
@@ -122,6 +134,17 @@ def _observations_with_environment_context() -> list[Observation]:
             -10.0,
             "202401",
             0,
+            velocity_sample_status=VelocitySampleStatus.COMPLETE,
+            total_u_mps=3.0,
+            total_v_mps=-1.0,
+            total_w_mps=-0.5,
+            ocm_u_mps=2.5,
+            ocm_v_mps=-1.2,
+            ocm_w_mps=-0.25,
+            stokes_u_mps=0.5,
+            stokes_v_mps=0.2,
+            settling_w_mps=-0.25,
+            velocity_qc_flags=0,
         ),
     ]
 
@@ -326,7 +349,7 @@ def test_representative_trajectory_defensively_snapshots_and_is_frozen() -> None
 
 
 def test_representative_trajectory_rebuilds_observations_and_preserves_context() -> None:
-    """snapshot 必須建立新 Observation，並完整保留既有環境 context。"""
+    """snapshot 必須建立新 Observation，並完整保留環境與速度 context。"""
 
     source = _observations_with_environment_context()
     record = RepresentativeTrajectory(
@@ -347,6 +370,17 @@ def test_representative_trajectory_rebuilds_observations_and_preserves_context()
         assert saved.bed_z_m == original.bed_z_m
         assert saved.forcing_month_id == original.forcing_month_id
         assert saved.environment_qc_flags == original.environment_qc_flags
+        assert saved.velocity_sample_status is original.velocity_sample_status
+        assert saved.total_u_mps == original.total_u_mps
+        assert saved.total_v_mps == original.total_v_mps
+        assert saved.total_w_mps == original.total_w_mps
+        assert saved.ocm_u_mps == original.ocm_u_mps
+        assert saved.ocm_v_mps == original.ocm_v_mps
+        assert saved.ocm_w_mps == original.ocm_w_mps
+        assert saved.stokes_u_mps == original.stokes_u_mps
+        assert saved.stokes_v_mps == original.stokes_v_mps
+        assert saved.settling_w_mps == original.settling_w_mps
+        assert saved.velocity_qc_flags == original.velocity_qc_flags
 
     # 即使 caller 以低階方式竄改原始 frozen object，record 仍只能看到自己的 canonical copy。
     object.__setattr__(source[0], "x_m", 999.0)

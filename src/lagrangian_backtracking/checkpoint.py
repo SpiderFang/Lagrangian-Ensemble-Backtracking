@@ -1,15 +1,20 @@
 """安全保存與恢復 reference／production 粒子中途狀態。
 
 schema 1 只保存 ``ParticleState``，本模組保留其既有 ``write_checkpoint``／
-``load_checkpoint`` API。execution checkpoint 的 writer 固定發布 schema ``2.1.0``，
+``load_checkpoint`` API。execution checkpoint 的 writer 固定發布 schema ``2.2.0``，
 保存完整 ``ParticleExecutionState``、每條粒子的 PCG64DXSM generator state、triangle hint
-與固定 RunUnit identity；schema ``2.0.0`` 僅作舊檔工程相容讀取。2.1 observation 另外保存
-環境樣本狀態、海面／海床公尺制垂向值、forcing 月份識別與品質旗標；這些欄位必須由
-engine 的明示資料來源提供，loader 不會從時間或位置猜測。forcing、mesh、邊界與其他
-外部大型資料不序列化，必須由同一個 request factory 在 restore 時重建。所有 JSON 禁止
-NaN／無限值，資料檔案以大小與 SHA-256 驗證，目標目錄以 partial directory 完成後原子
-更名且不允許覆寫既有 checkpoint。2.0 相容資料僅供工程重啟，不得被當作 F03／F09 的
-正式垂向證據；本機 synthetic 測試也不是 OCM／NWW3 科學成果。
+與固定 RunUnit identity；schema ``2.0.0``／``2.1.0`` 僅作舊檔工程相容讀取。2.2 observation
+在既有環境樣本欄位之外，保存同一個輸出觀測點的總速度、OCM current、Stokes 水平速度、
+向上為正的沉降速度、速度樣本狀態與獨立速度品質旗標；這些欄位必須由 engine 的明示
+資料來源提供，loader 不會從時間、位置或位移猜測。每個舊 schema 使用固定欄位集合，
+不會因目前 ``Observation`` dataclass 新增欄位而被靜默改寫；舊檔缺少的速度資料維持
+``NOT_SAMPLED``／``None``，不自動升格為新證據。forcing、mesh、邊界與其他外部大型資料
+不序列化，必須由同一個 request factory 在 restore 時重建。所有 JSON 禁止 NaN／無限值，
+資料檔案以大小與 SHA-256 驗證，目標目錄以 partial directory 完成後原子更名且不允許
+覆寫既有 checkpoint。schema ``2.0.0`` 缺少環境欄位，不能作正式垂向證據；schema
+``2.0.0``／``2.1.0`` 均沒有速度欄位，不能作速度證據。``2.1.0`` 既有的環境欄位仍可供
+環境資料讀取，缺少速度不表示環境欄位失效。checkpoint 本身是續跑工程產品，不是正式
+trajectory artifact；本機 synthetic 測試也不是 OCM／NWW3 科學成果。
 """
 
 from __future__ import annotations
@@ -32,7 +37,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .engine import EnvironmentSampleStatus, Observation, ParticleExecutionState
-from .models import BoundaryEvent, EventType, ParticleState, ParticleStatus
+from .models import (
+    BoundaryEvent,
+    EventType,
+    ParticleState,
+    ParticleStatus,
+    VelocitySampleStatus,
+)
 from .outputs import sha256_file
 
 
@@ -50,7 +61,7 @@ class CheckpointBinding:
 
 @dataclass(slots=True)
 class ExecutionCheckpoint:
-    """schema 2.0／2.1 execution checkpoint 的記憶體表示，供 loader 與 ``ProductionBatch`` 共用。
+    """schema 2.0／2.1／2.2 execution checkpoint 的記憶體表示，供 loader 與 ``ProductionBatch`` 共用。
 
     ``executions``、``rng_states``、``triangle_hints`` 與 ``run_unit_identities`` 的順序
     都是固定 particle order；任何一項重新排序都會在讀取或 restore 時拒絕。``binding``
@@ -73,8 +84,11 @@ class ExecutionCheckpoint:
 
 _SCHEMA20_VERSION = "2.0.0"
 _SCHEMA21_VERSION = "2.1.0"
-_WRITER_SCHEMA_VERSION = _SCHEMA21_VERSION
-_SUPPORTED_EXECUTION_SCHEMA_VERSIONS = frozenset({_SCHEMA20_VERSION, _SCHEMA21_VERSION})
+_SCHEMA22_VERSION = "2.2.0"
+_WRITER_SCHEMA_VERSION = _SCHEMA22_VERSION
+_SUPPORTED_EXECUTION_SCHEMA_VERSIONS = frozenset(
+    {_SCHEMA20_VERSION, _SCHEMA21_VERSION, _SCHEMA22_VERSION}
+)
 _SCHEMA2_DATA_FILES = frozenset({"execution_state.json", "rng_states.json"})
 _BINDING_FIELDS = tuple(field.name for field in fields(CheckpointBinding))
 _PARTICLE_FIELDS = tuple(field.name for field in fields(ParticleState))
@@ -87,7 +101,28 @@ _LEGACY_OBSERVATION_FIELDS = (
     "z_m",
     "status",
 )
-_OBSERVATION_FIELDS = tuple(field.name for field in fields(Observation))
+_ENVIRONMENT_OBSERVATION_FIELDS = (
+    "environment_sample_status",
+    "eta_m",
+    "bed_z_m",
+    "forcing_month_id",
+    "environment_qc_flags",
+)
+_VELOCITY_OBSERVATION_FIELDS = (
+    "velocity_sample_status",
+    "total_u_mps",
+    "total_v_mps",
+    "total_w_mps",
+    "ocm_u_mps",
+    "ocm_v_mps",
+    "ocm_w_mps",
+    "stokes_u_mps",
+    "stokes_v_mps",
+    "settling_w_mps",
+    "velocity_qc_flags",
+)
+_SCHEMA21_OBSERVATION_FIELDS = _LEGACY_OBSERVATION_FIELDS + _ENVIRONMENT_OBSERVATION_FIELDS
+_SCHEMA22_OBSERVATION_FIELDS = _SCHEMA21_OBSERVATION_FIELDS + _VELOCITY_OBSERVATION_FIELDS
 _EVENT_FIELDS = tuple(field.name for field in fields(BoundaryEvent))
 _YYYYMM_PATTERN = re.compile(r"^[0-9]{6}$")
 
@@ -217,6 +252,23 @@ def _environment_sample_status(value: Any, *, label: str) -> EnvironmentSampleSt
         raise ValueError(f"{label} 含有未知 EnvironmentSampleStatus：{value!r}") from error
 
 
+def _velocity_sample_status(value: Any, *, label: str) -> VelocitySampleStatus:
+    """嚴格解析 observation 的速度樣本狀態列舉。
+
+    checkpoint JSON 保存的是固定的狀態值字串；這裡拒絕列舉名稱、整數、bool 與其他
+    可轉型物件。``NOT_SAMPLED`` 代表該 observation 沒有同點速度取樣，不是速度為零；
+    ``TOTAL_ONLY``、``COMPLETE`` 與各種無效狀態則由 engine 的 Observation constructor
+    再驗證其欄位和獨立速度品質旗標，避免舊檔或手動修改的資料被讀成完整分項。
+    """
+
+    if type(value) is not str:
+        raise ValueError(f"{label} 必須是 VelocitySampleStatus 字串")
+    try:
+        return VelocitySampleStatus(value)
+    except ValueError as error:
+        raise ValueError(f"{label} 含有未知 VelocitySampleStatus：{value!r}") from error
+
+
 def _optional_forcing_month(value: Any, *, label: str) -> str | None:
     """解析可省略的 forcing 月份識別，要求真實存在的 ``YYYYMM``。
 
@@ -339,19 +391,21 @@ def _serialize_observation(
     *,
     schema_version: str = _WRITER_SCHEMA_VERSION,
 ) -> dict[str, Any]:
-    """把 Observation 序列化成 writer 固定發布的 2.1 JSON object。
+    """把 Observation 序列化成 writer 固定發布的 2.2 JSON object。
 
-    2.1 將 engine 的全部欄位寫出，列舉使用穩定的 ``value`` 而不是 Python 名稱；
-    ``None`` 是唯一的 JSON 缺值表示，絕不把 NaN／無限值當作缺值。函式刻意拒絕以
-    schema 2.0 寫檔，因為 2.0 僅是 loader 的舊檔工程相容格式，不能讓新 writer 產生
-    沒有環境來源狀態的 legacy checkpoint。
+    2.2 以明確固定的 23 欄保存舊有位置／狀態、環境 context 與速度紀錄；不使用目前
+    ``Observation`` dataclass 的反射欄位集合，避免日後新增執行期欄位時改變檔案拓撲。
+    列舉使用穩定的 ``value`` 而不是 Python 名稱；``None`` 是唯一的 JSON 缺值表示，
+    絕不把 NaN／無限值當作缺值。函式刻意拒絕以 schema 2.0／2.1 寫檔，因為兩者僅是
+    loader 的舊檔工程相容格式，不能讓新 writer 產生沒有新速度紀錄的 checkpoint。
     """
 
     if schema_version != _WRITER_SCHEMA_VERSION:
-        raise ValueError("execution checkpoint writer 不提供 schema 2.0 downgrade")
-    row = asdict(observation)
+        raise ValueError("execution checkpoint writer 不提供 schema 2.0／2.1 downgrade")
+    row = {name: getattr(observation, name) for name in _SCHEMA22_OBSERVATION_FIELDS}
     row["status"] = observation.status.value
     row["environment_sample_status"] = observation.environment_sample_status.value
+    row["velocity_sample_status"] = observation.velocity_sample_status.value
     return _json_safe(row)
 
 
@@ -363,17 +417,20 @@ def _deserialize_observation(
 ) -> Observation:
     """依 execution schema 嚴格還原 Observation 並交由 constructor 驗證跨欄位契約。
 
-    schema 2.0 的 observation 只允許原有七欄；讀取後新增的環境 context 一律保持 engine
-    預設的 ``NOT_SAMPLED`` 與四個 ``None``，不從時間、位置、月份或深度推測。schema 2.1
-    則必須逐欄提供完整 Observation，有限海面／海床公尺值、合法 ``YYYYMM`` 與原生整數
-    品質旗標先經本模組的 JSON 邊界檢查，再交給 engine constructor 做 status／垂向範圍
-    的 cross-field 驗證。這條責任界線確保舊檔可重啟，但不會冒充 F03／F09 正式證據。
+    schema 2.0 的 observation 只允許原有七欄；schema 2.1 只允許七欄加五個環境欄位；
+    schema 2.2 才允許再加固定的 11 個速度欄位。舊版本讀取後新增欄位一律保持 engine
+    預設的 ``NOT_SAMPLED`` 與 ``None``，不從時間、位置、月份、深度或總速度推測。2.1／
+    2.2 的有限數值、合法 ``YYYYMM``、狀態列舉與原生整數品質旗標先經本模組的 JSON
+    邊界檢查，再交給 engine constructor 做 status／垂向範圍／速度總和的 cross-field
+    驗證。這條責任界線確保舊檔可重啟，但不會冒充 F03／F09 正式證據。
     """
 
     if schema_version == _SCHEMA20_VERSION:
         expected_fields = _LEGACY_OBSERVATION_FIELDS
     elif schema_version == _SCHEMA21_VERSION:
-        expected_fields = _OBSERVATION_FIELDS
+        expected_fields = _SCHEMA21_OBSERVATION_FIELDS
+    elif schema_version == _SCHEMA22_VERSION:
+        expected_fields = _SCHEMA22_OBSERVATION_FIELDS
     else:
         raise ValueError(f"checkpoint schema 不支援：{schema_version!r}")
     row = _require_exact_keys(value, expected_fields, label=label)
@@ -388,7 +445,7 @@ def _deserialize_observation(
         "z_m": _finite_float(row["z_m"], label=f"{label}.z_m"),
         "status": _particle_status(row["status"], label=f"{label}.status"),
     }
-    if schema_version == _SCHEMA21_VERSION:
+    if schema_version in {_SCHEMA21_VERSION, _SCHEMA22_VERSION}:
         kwargs.update(
             environment_sample_status=_environment_sample_status(
                 row["environment_sample_status"],
@@ -401,6 +458,37 @@ def _deserialize_observation(
             ),
             environment_qc_flags=_optional_integer(
                 row["environment_qc_flags"], label=f"{label}.environment_qc_flags"
+            ),
+        )
+    if schema_version == _SCHEMA22_VERSION:
+        kwargs.update(
+            velocity_sample_status=_velocity_sample_status(
+                row["velocity_sample_status"],
+                label=f"{label}.velocity_sample_status",
+            ),
+            total_u_mps=_optional_finite_float(
+                row["total_u_mps"], label=f"{label}.total_u_mps"
+            ),
+            total_v_mps=_optional_finite_float(
+                row["total_v_mps"], label=f"{label}.total_v_mps"
+            ),
+            total_w_mps=_optional_finite_float(
+                row["total_w_mps"], label=f"{label}.total_w_mps"
+            ),
+            ocm_u_mps=_optional_finite_float(row["ocm_u_mps"], label=f"{label}.ocm_u_mps"),
+            ocm_v_mps=_optional_finite_float(row["ocm_v_mps"], label=f"{label}.ocm_v_mps"),
+            ocm_w_mps=_optional_finite_float(row["ocm_w_mps"], label=f"{label}.ocm_w_mps"),
+            stokes_u_mps=_optional_finite_float(
+                row["stokes_u_mps"], label=f"{label}.stokes_u_mps"
+            ),
+            stokes_v_mps=_optional_finite_float(
+                row["stokes_v_mps"], label=f"{label}.stokes_v_mps"
+            ),
+            settling_w_mps=_optional_finite_float(
+                row["settling_w_mps"], label=f"{label}.settling_w_mps"
+            ),
+            velocity_qc_flags=_optional_integer(
+                row["velocity_qc_flags"], label=f"{label}.velocity_qc_flags"
             ),
         )
     return Observation(**kwargs)
@@ -578,8 +666,9 @@ def _serialize_execution(
 ) -> dict[str, Any]:
     """完整序列化一條 execution，不遺漏觀測、事件、步數或輸出游標。
 
-    execution 的資料拓撲在 2.0 與 2.1 間保持不變，差異只在 observation 欄位；writer
-    明示傳入 2.1，並由 observation serializer 保證永不產生 legacy 2.0 payload。
+    execution 的資料拓撲在 2.0／2.1／2.2 間保持不變，差異只在 observation 欄位；
+    writer 明示傳入 2.2，並由 observation serializer 保證永不產生沒有新速度欄位的舊
+    payload。讀取端則依 metadata 版本選擇對應的固定 observation 欄位集合。
     """
 
     if not execution.observations:
@@ -745,7 +834,7 @@ def build_execution_checkpoint(
     rngs: Sequence[np.random.Generator],
     triangle_hints: Sequence[int | None],
 ) -> ExecutionCheckpoint:
-    """建立 execution snapshot，供記憶體檢查及 schema 2.1 磁碟 writer 共用。
+    """建立 execution snapshot，供記憶體檢查及 schema 2.2 磁碟 writer 共用。
 
     ``run_units``、``executions``、``rngs`` 與 ``triangle_hints`` 必須逐項同序；state 的
     particle／scenario／member／站點／受體／到達時間會立即和 RunUnit 核對。這個函式只
@@ -805,12 +894,14 @@ def write_execution_checkpoint(
     triangle_hints: Sequence[int | None],
     sequence: int,
 ) -> Path:
-    """以 schema 2.1.0 原子寫入 execution checkpoint，保存完整軌跡與 RNG continuation。
+    """以 schema 2.2.0 原子寫入 execution checkpoint，保存完整軌跡與 RNG continuation。
 
     目標已存在時拒絕覆寫；寫入期間使用同父目錄的 ``.partial-*``，只有 execution JSON、
     RNG JSON、大小與 SHA-256 manifest 都成功建立後才以 ``os.replace`` 發布。空 shard、
     duplicate identity、非 PCG64DXSM、未知狀態或不一致欄位會在建立 partial 前拒絕。新
-    writer 沒有 downgrade 參數；schema 2.0 僅由 loader 相容讀取，不能由新寫入流程製造。
+    writer 沒有 downgrade 參數；schema 2.0／2.1 僅由 loader 相容讀取，不能由新寫入流程
+    製造。新 writer 固定寫出 2.2 的 11 個速度欄位，即使 observation 是 ``NOT_SAMPLED``
+    也會保存其明示的狀態與 ``None`` 缺值，而不會將舊資料偽裝成速度證據。
     """
 
     if not isinstance(binding, CheckpointBinding):
@@ -929,14 +1020,15 @@ def load_execution_checkpoint(
     expected_binding: CheckpointBinding,
     expected_run_units: Sequence[Any] | None = None,
 ) -> ExecutionCheckpoint:
-    """嚴格讀取 schema 2.0／2.1 checkpoint，並可核對同一 shard 的固定 RunUnit 順序。
+    """嚴格讀取 schema 2.0／2.1／2.2 checkpoint，並可核對同一 shard 的固定 RunUnit 順序。
 
     loader 先以 metadata 的精確 schema version 決定 observation 欄位契約：2.0 只接受舊七
-    欄並將環境 context 設為 ``NOT_SAMPLED``／``None``，2.1 必須接受全部欄位且不容許
-    unknown／missing。之後仍會拒絕 binding、checksum、檔案／觀測／事件／粒子數、duplicate
-    identity、未知 status、未知 JSON 欄位及 RNG state 不符；若提供 ``expected_run_units``，
-    其完整 identity 與 checkpoint particle order 必須逐項相同。forcing 與 geometry 不從檔案
-    讀取；2.0 只具工程重啟相容性，不可作為 F03／F09 正式垂向證據。
+    欄並將環境與速度 context 設為 ``NOT_SAMPLED``／``None``；2.1 只接受舊環境欄位；
+    2.2 才接受完整的速度 11 欄，三個版本都不容許 unknown／missing。之後仍會拒絕
+    binding、checksum、檔案／觀測／事件／粒子數、duplicate identity、未知 status、未知
+    JSON 欄位及 RNG state 不符；若提供 ``expected_run_units``，其完整 identity 與 checkpoint
+    particle order 必須逐項相同。forcing 與 geometry 不從檔案讀取；2.0／2.1 只具工程重啟
+    相容性，不可作為 F03／F09 正式垂向證據。
     """
 
     if not isinstance(expected_binding, CheckpointBinding):

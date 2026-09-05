@@ -1,5 +1,10 @@
 # 單站沉降先導執行計畫
 
+> **閱讀提示**
+> - 文件類型：單站 pilot 的選取、執行與展示補圖計畫。
+> - 它回答：如何在不縮減正式設計的前提下做工程先導與[獨立海岸底圖重繪](#獨立海岸底圖重繪)。
+> - 建議先讀：[實作狀態](../implementation_status.md)，再讀[CLI 參考](cli_reference.md)。
+
 ## 範圍與科學限制
 
 此入口只供完整已驗收來源上的工程先導，不修改正式五站 50,000 個基礎情境、十類嚴格
@@ -124,3 +129,32 @@ SHA-256（清單本身不循環自我雜湊），summary 保存計畫、設定�
 省略欄位在預覽表格為空／null，不推定為零，也不拿終止位置代替失敗查詢位置。
 發布前再核對來源文件指紋，使用同父目錄原子拒覆寫，僅清理自有暫存目錄；不支援
 排他改名時停止，改名後 fsync 失敗則保留 final 並回報耐久性未確認。
+
+## 獨立海岸底圖重繪
+
+`scripts/build_pilot_coastline_preview.py` 是已驗收 B 區 r2（20 顆粒子、203 筆模型
+保存紀錄）的專用離線補圖入口。它只讀原 preview 清單、summary、兩份 CSV，以及
+明示的 domain/open-boundary 清單與使用者已確認的海岸 GeoJSON；不讀驅動陣列或重跑模擬。
+原無底圖版及 `pilot_preview` 契約保持不變。
+
+預設 `legacy` 保留原兩張水平 PNG 與舊 manifest 契約；指定 `--style baytrace` 才建立
+新版四張 PNG：`horizontal_overview.png`、`horizontal_local.png`、`depth_age.png`、
+`terminal_counts.png`，另附新版 README 與 manifest。新版只整理 BayTrace v4.7.2
+`scripts/analyze_cases.py` 的 `plot_case` 可採用呈現方式；垂向與停止原因是本專案補充
+診斷，不將 BayTrace 語意擴張成數值或來源定義。
+
+```bash
+UV_CACHE_DIR=work/uv-cache MPLCONFIGDIR=work/matplotlib-cache \
+uv run python3 scripts/build_pilot_coastline_preview.py \
+  --style baytrace \
+  --preview-dir "$PILOT_PREVIEW" --domain "$DOMAIN_GEOMETRY" \
+  --open-boundary "$OPEN_BOUNDARY_GEOMETRY" --coastline "$COASTLINE_GEOJSON" \
+  --output-dir "$COASTLINE_PREVIEW"
+```
+
+上述輸入變數須指向本機既有檔案／目錄，輸出須是全新目錄。domain/open 語意雜湊
+必須與原 summary 一致；海岸檔保存原始 SHA 並核對製圖前後不變。登錄外框並不等於完整有效海水網格。
+新版輸出為總覽、五局部面板、垂向診斷及停止原因共四張 PNG、README.md、manifest.json；
+清單保存來源前後 SHA、20/203 與 9/8/3 停止計數、重建命令及四圖／README SHA，不對清單自身循環雜湊。
+PNG 採排他開檔，拒絕覆寫或失效連結；失敗保留新目錄供診斷，完成須檢查 manifest
+及其輸出校驗。局部圖只平移原 AEQD 座標，各面板等比例但範圍不同，詳情隨成果 README 保存。

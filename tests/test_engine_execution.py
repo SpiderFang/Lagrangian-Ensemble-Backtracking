@@ -27,7 +27,13 @@ from lagrangian_backtracking.engine import (
     run_particle,
 )
 from lagrangian_backtracking.integrators import SamplingContext, SamplingError
-from lagrangian_backtracking.models import ParticleState, ParticleStatus, SampleQC, VelocitySample
+from lagrangian_backtracking.models import (
+    ParticleState,
+    ParticleStatus,
+    SampleQC,
+    VelocitySample,
+    VelocitySampleStatus,
+)
 from lagrangian_backtracking.outputs import read_trajectory_shard, write_trajectory_shard
 from lagrangian_backtracking.runner import RunUnit
 from lagrangian_backtracking.scenarios import Scenario
@@ -133,6 +139,13 @@ def test_stepwise_execution_is_identical_to_run_particle() -> None:
     assert resumed.minimum_clamp_count == direct.minimum_clamp_count
     assert step_states == callback_states
     assert len(callback_states) == direct.step_count
+    assert [item.velocity_sample_status for item in direct.observations] == [
+        VelocitySampleStatus.TOTAL_ONLY,
+        VelocitySampleStatus.TOTAL_ONLY,
+        VelocitySampleStatus.TOTAL_ONLY,
+        VelocitySampleStatus.NOT_SAMPLED,
+    ]
+    assert resumed.observations == direct.observations
 
 
 def test_stepwise_engine_preserves_all_step_start_stop_events() -> None:
@@ -589,7 +602,7 @@ def test_diffusion_evaluation_error_omits_untrusted_exception_message(error_type
 def test_missing_or_nonfinite_context_omitted_from_event_and_roundtrips(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context: SamplingContext | None
 ) -> None:
-    """缺值政策能嚴格 JSON、中途續跑與 v2 軌跡往返，舊空屬性亦仍可讀。
+    """缺值政策能嚴格 JSON、中途續跑與 v3 軌跡往返，舊空屬性亦仍可讀。
 
     使用合成資料注入外部非標準階段；事件必須標為 unknown 並省略未知數值。
     所有檔案只寫測試暫存目錄，不變更輸出實作或檔案格式版本。
@@ -627,14 +640,14 @@ def test_missing_or_nonfinite_context_omitted_from_event_and_roundtrips(
     restored = load_execution_checkpoint(checkpoint_path, expected_binding=binding, expected_run_units=[unit])
     assert restored.executions[0] == execution
     assert restored.rng_states[0] == rng.bit_generator.state
-    assert json.loads((checkpoint_path / "checkpoint.json").read_text())["schema_version"] == "2.1.0"
+    assert json.loads((checkpoint_path / "checkpoint.json").read_text())["schema_version"] == "2.2.0"
     result = finalize_particle_execution(restored.executions[0])
     for name, event_attributes in (
         ("diagnostic", attributes), ("legacy", {}), ("ordinary", {"label": "old"}),
     ):
         candidate = replace(result, events=[replace(result.events[-1], attributes=event_attributes)])
         shard = write_trajectory_shard(tmp_path / name, [candidate], run_metadata={"run_kind": "synthetic"})
-        assert json.loads((shard / "manifest.json").read_text())["schema_version"] == "2.0.0"
+        assert json.loads((shard / "manifest.json").read_text())["schema_version"] == "3.0.0"
         assert read_trajectory_shard(shard) == (candidate,)
 
 
@@ -700,6 +713,19 @@ def test_successful_execution_matches_analytic_queries_positions_and_rng() -> No
     assert queries == expected_queries
     assert [(item.x_m, item.y_m, item.z_m) for item in result.observations] == expected_positions
     assert [item.age_seconds for item in result.observations] == [0.0, 2.0, 4.0, 5.0]
+    assert [item.velocity_sample_status for item in result.observations] == [
+        VelocitySampleStatus.TOTAL_ONLY,
+        VelocitySampleStatus.TOTAL_ONLY,
+        VelocitySampleStatus.TOTAL_ONLY,
+        VelocitySampleStatus.NOT_SAMPLED,
+    ]
+    assert all(
+        all(getattr(item, name) is None for name in (
+            "ocm_u_mps", "ocm_v_mps", "ocm_w_mps",
+            "stokes_u_mps", "stokes_v_mps", "settling_w_mps",
+        ))
+        for item in result.observations
+    )
     assert result.final_state == replace(
         _state(), x_m=position[0], y_m=position[1], z_m=position[2], time_utc_ns=time_ns,
         age_seconds=5.0, status=ParticleStatus.MAX_AGE,
@@ -716,7 +742,7 @@ def test_checkpoint_resume_retains_exact_rk_failure_diagnostics(tmp_path: Path) 
     """先成功一步、寫中途續跑檔，再於 k4 失敗；重啟與直跑須連診斷及亂數完全一致。
 
     合成流場只在固定 UTC 門檻回傳垂向不支援，不依呼叫次數或亂數選失敗情境。
-    同時以既有 v2 輸出讀回有限位置／時間／上下界，確認診斷沒有引入新格式。
+    同時以既有 v3 輸出讀回有限位置／時間／上下界，確認診斷沒有引入新格式。
     """
 
     def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
@@ -752,6 +778,13 @@ def test_checkpoint_resume_retains_exact_rk_failure_diagnostics(tmp_path: Path) 
     assert outcome.terminal and not outcome.stepped
     result = finalize_particle_execution(restored)
     assert result == direct
+    assert [item.velocity_sample_status for item in result.observations] == [
+        VelocitySampleStatus.TOTAL_ONLY,
+        VelocitySampleStatus.TOTAL_ONLY,
+    ]
+    assert [item.velocity_sample_status for item in restored.observations] == [
+        item.velocity_sample_status for item in direct.observations
+    ]
     assert restored_rng.bit_generator.state == direct_rng.bit_generator.state
     attributes = result.events[-1].attributes
     assert attributes["failure_stage"] == "k4"

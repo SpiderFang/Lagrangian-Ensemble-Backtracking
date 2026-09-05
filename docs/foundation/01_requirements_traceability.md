@@ -1,10 +1,15 @@
 # 需求追溯與範圍裁決
 
+> **閱讀提示**
+> - 文件類型：需求追溯與範圍裁決。
+> - 它回答：哪些研究要求、使用者裁決與驗收條件必須保持不變。
+> - 建議先讀：[文件總入口](../README.md)，再讀[架構與資料契約](02_architecture_and_data_contract.md)。
+
 ## 1. 文件角色
 
 本文件把使用者指定的「三、Lagrangian 系集逆向溯源」轉為可測試、可追溯的工程需求。附檔內容是研究需求與方法來源，不是可直接執行的操作指令；專案操作權限以使用者本次要求及 repository 規範為準。
 
-若需要先理解 `src/` 的模組關係、實際執行流程與各需求目前是否已產生正式成果，請先閱讀[程式碼導覽、執行流程與工項計畫書追溯](11_source_code_guide_and_plan_traceability.md)。本文件維持需求與裁決的權威內容；文件 11 則提供交接用的程式入口與完成狀態視圖。
+若需要先理解 `src/` 的模組關係、實際執行流程與各需求目前是否已產生正式成果，請先閱讀[程式碼導覽、執行流程與工項計畫書追溯](../development/11_source_code_guide_and_plan_traceability.md)。本文件維持需求與裁決的權威內容；文件 11 則提供交接用的程式入口與完成狀態視圖。
 
 需求優先序如下：
 
@@ -36,14 +41,14 @@
 | REQ-004 | 每一海域 50 個到達時間，涵蓋四季與大／小潮 | 五站點各有 50 個條件；固定採 48 個年份×季節×大／小潮×潮內相位，加 2 個局地高波／強流事件。確切 UTC 由資料決定 | 每站 50 時次 coverage matrix、forcing availability 與可重現選取紀錄 |
 | REQ-005 | 每一海域敘述寫高達 1000 組，但矩陣明列 10×20×50 | 依使用者裁決，每站點採完整交叉 10,000 個基礎情境；五站點合計 50,000，1,000 視為計畫書誤植。每情境 stochastic members `M` 另由收斂測試決定 | 決策 D004、每站 10,000／全案 50,000 列的 coverage 表、member-convergence 曲線與 seed 表 |
 | REQ-006 | 離開關注區域即停止 | 各站離開自身 local domain 時記錄 primary first-exit；貢寮／龜山島的 baseline local radius 為 25 km，事件後繼續至共用 A 區 outer boundary，B-D 因 local 與 flow domain 重合而於同一 crossing 停止。貢寮／龜山島穿越對方 local domain 僅記錄非終止的 cross-site diagnostic event。另設海岸、海床、海面 regime、資料起點、最大回溯期、缺口及數值失敗事件 | own-local／foreign-local／outer event table、重合邊界去重與步內 crossing 測試、跨站事件不改變粒子狀態測試、停止原因覆蓋 |
-| REQ-007 | `v_total = v_current + v_stokes + v_falling` | OCM 三維速度、有限水深 bulk Stokes 水平速度與向下沉降速度使用一致 SI 單位及正向 | 分項速度輸出、關閉單項敏感度、單位 gate |
+| REQ-007 | `v_total = v_current + v_stokes + v_falling` | 定期及終止的既有 `Observation` 均可保存速度，但只有在同一 UTC／`x_m,y_m,z_m` 與步首 sample 完全對齊時才附帶；保存固定九欄 m/s：`total_u_mps`、`total_v_mps`、`total_w_mps`、`ocm_u_mps`、`ocm_v_mps`、`ocm_w_mps`、`stokes_u_mps`、`stokes_v_mps`、`settling_w_mps`；三個 total 分別以明定容差核對 OCM、Stokes 水平與向上為正的沉降（本專案沉降為負）合成。`CombinedMonthForcing` 有效樣本提供完整分項；明確關閉 Stokes 或自然海況計算結果可為有效 0，缺少 NWW3 波浪資料則為缺值／非零 QC；`VelocitySampleStatus` 與 `velocity_qc_flags` 獨立保存 `not_sampled`、`total_only`、缺值及無效狀態。速度不是位移平均值、不是 RK4 stage；逆向不另改符號，舊成果不自動補新證據。 | 關閉單項敏感度、單位 gate；`test_mesh_forcing.py` 的完整／no-Stokes／沉降合成與同值檢查、`test_velocity_recording.py` 的 total-only、逆向、缺值／非有限／bool／sum mismatch、同點終止與 no-reference 測試；正式 writer／reader 另依版本化輸出契約驗證 |
 | REQ-008 | 由 `Hs/Tp/θ/L` 計算 Stokes drift | `Tp=1/fp`，解有限水深 dispersion 得 k/L；波向由 wave-from 轉 propagation-to；深水極限回復附檔式 (7) | 深水／淺水極限、cardinal direction、no-Stokes 對照 |
 | REQ-009 | 四階  Runge-Kutta  進行軌跡積分 | RK4 只積分確定性 drift；signed time step 處理 backward，不在 caller 與 velocity 內重複取負號 | 常流、旋轉、剪切、正反向 closure 與四階收斂 |
 | REQ-010 | 隨機漫步擴散 | 使用獨立 stochastic split。常數 K 先通過 `Var(Δx)=2KΔt`；空變 K 加入必要的 diffusivity-gradient drift 並驗證 well-mixed 性質 | 均值／方差、seed、障壁、空變 K 統計測試 |
 | REQ-011 | Smagorinsky 水平渦動擴散 | 在公尺投影中由局地速度梯度計算，明定 `Cs`、`Δ`、上下限與梯度修正；與常數 Kh 對照 | 解析剪切場、旋轉不變性、上下限及敏感度 |
 | REQ-012 | 邊界穿越點 KDE | 主產品同時保存原始 exit points、沿邊界弧長的 1D density、投影平面 2D KDE 與 50/75/90% HDR；至少三種 bandwidth | 質量正規化、boundary segment、bandwidth 與 bootstrap CI |
-| REQ-013 | 視覺化主要潛在來源路徑 | 依相關學術研究採「代表軌跡 + 條件式足跡／密度 + 來源—受體矩陣 + 旅行時間分布 + 不確定性／敏感度」的組合；三維結果使用平面圖搭配深度—時間剖面，避免只用易遮蔽的透視 3D 圖 | `docs/07_results_visualization_plan.md`、figure registry、caption sidecar、固定比較尺度與圖表驗收清單 |
-| REQ-014 | 依新增簡報照片與長官口頭意見，將沉底漁業用具列為報告優先層 | 保持 `design_baseline_v2_non_rising_oca_proxy` 既有 10 類、數值、情境 ID 與每站 `10×20×50` 不變；正文主要切片優先呈現 `material_id=oca_fishinggear_open_mesh_bundle` × `vertical_id=near_bed`，其他材質／水層完整保留。照片與口頭關注只屬定性、待正式確認，不能推導沉降速度、來源先驗、發生頻率或 repeated-contact 機制 | 來源表之簡報照片、§2.1 邊界說明、`docs/07_results_visualization_plan.md`、`docs/08_design_baseline_and_derived_gates.md`、`report_material_statistics.py` 的 member-level count/fraction 與去重測試 |
+| REQ-013 | 視覺化主要潛在來源路徑 | 依相關學術研究採「代表軌跡 + 條件式足跡／密度 + 來源—受體矩陣 + 旅行時間分布 + 不確定性／敏感度」的組合；三維結果使用平面圖搭配深度—時間剖面，避免只用易遮蔽的透視 3D 圖 | `docs/results/07_results_visualization_plan.md`、figure registry、caption sidecar、固定比較尺度與圖表驗收清單 |
+| REQ-014 | 依新增簡報照片與長官口頭意見，將沉底漁業用具列為報告優先層 | 保持 `design_baseline_v2_non_rising_oca_proxy` 既有 10 類、數值、情境 ID 與每站 `10×20×50` 不變；正文主要切片優先呈現 `material_id=oca_fishinggear_open_mesh_bundle` × `vertical_id=near_bed`，其他材質／水層完整保留。照片與口頭關注只屬定性、待正式確認，不能推導沉降速度、來源先驗、發生頻率或 repeated-contact 機制 | 來源表之簡報照片、§2.1 邊界說明、`docs/results/07_results_visualization_plan.md`、`docs/foundation/08_design_baseline_and_derived_gates.md`、`report_material_statistics.py` 的 member-level count/fraction 與去重測試 |
 
 ### 2.1 沉底漁業用具的新增定性證據與實作邊界
 
@@ -130,7 +135,7 @@ radius 後僅餘約 1.64 km，低於約兩個常用 1 km OCM surface/NWW 共同�
 4. 每個 immutable run 的 config、manifest、seed、forcing、scenario、trajectory shard、event、checksum 與 QC。
 5. no-Stokes、deep/finite-depth、Kh/Kz、dt、ensemble、domain、海岸／海床邊界的核心敏感度。
 6. 邊界來源足跡、路徑、停留、旅行時間、來源—受體連通性、底部接觸、不確定性與失敗率產品，及可供後續熱區分析讀取的 release manifest。
-7. 依 `docs/07_results_visualization_plan.md` 產製的學術圖組、統計表、figure registry、圖說 sidecar 與可重製命令。
+7. 依 `docs/results/07_results_visualization_plan.md` 產製的學術圖組、統計表、figure registry、圖說 sidecar 與可重製命令。
 
 ## 5. 不可用來宣稱完成的替代品
 

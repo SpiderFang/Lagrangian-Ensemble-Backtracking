@@ -1,5 +1,10 @@
 # Slice 1：SERVER v3 輸入衍生與 release contract
 
+> **閱讀提示**
+> - 文件類型：正式輸入衍生與發布契約。
+> - 它回答：已驗收 OCM／NWW3 產品如何形成可重建、可核對的 runtime 輸入。
+> - 建議先讀：[架構與資料契約](../foundation/02_architecture_and_data_contract.md)，再讀[SERVER 手冊](06_server_runbook_plan.md)。
+
 本文件定義 `input_derivation.py` 的可重建資料流與發布邊界。它是正式 Lagrangian
 runtime 的輸入前置契約，不是 SERVER 科學批次結果，也不取代 OCM／NWW3 上游產品的
 原始驗收。正式流程只能讀已驗收的 OCM schema 3 `ocm_native`、OCM schema 3

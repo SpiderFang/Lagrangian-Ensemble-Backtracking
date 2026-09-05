@@ -1,12 +1,17 @@
 # 程式碼導覽、執行流程與工項計畫書追溯
 
+> **閱讀提示**
+> - 文件類型：原始碼、資料流程、測試與需求的交接導覽。
+> - 它回答：每個模組負責什麼、資料如何流動，以及哪些工項已有可驗證實作。
+> - 建議先讀：[文件總入口](../README.md)，再開啟[互動式架構圖](../source_code_architecture_map.html)。
+
 ## 1. 文件目的與閱讀方式
 
 本文件是交接本專案時閱讀 `src/lagrangian_backtracking/` 的入口。它回答三個問題：
 
 1. 每個程式模組在整個逆向溯源流程中負責什麼？
 2. 從上游 OCM、NWW3 資料到最終來源足跡，資料如何流動？
-3. [工項3.pdf](../data/工項3.pdf) 紅框中的研究要求，已由哪些程式與測試實作，哪些仍須以實際資料完成？
+3. [工項3.pdf](../../data/工項3.pdf) 紅框中的研究要求，已由哪些程式與測試實作，哪些仍須以實際資料完成？
 
 閱讀本文件時，必須區分三種證據，不能把它們混為「已完成」：
 
@@ -24,7 +29,7 @@ ProductionBatch、schema 2 run-control 契約與 pilot／formal runtime」，不
 manifests、strict inventory topology／時間軸與逐 arrival flow 的 gap 支援 gate 控制，任何
 證據不足都會在 forcing I/O 前 fail-closed。example config 與實際 release artifacts 尚未
 到位；本輪未登入或執行 SERVER，沒有正式研究結果。完整工程稽核結論見
-[實作與 SERVER 驗證稽核](09_implementation_audit_2026-08-19.md)。
+[實作與 SERVER 驗證稽核](../archive/09_implementation_audit_2026-08-19.md)。
 
 ### 1.1 BayTrace 可用部分整合界線
 
@@ -44,22 +49,22 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 - 邊界穿越點的高斯核密度估計；
 - 主要潛在來源路徑的視覺化。
 
-計畫書中「每一處開放海域高達 1,000 組」與後續明列的 `10 × 20 × 50 = 10,000` 相互矛盾。依已記錄的使用者裁決，五個獨立研究站點各自採 10,000 個基礎情境：貢寮、龜山島、新竹、後灣、連江合計 50,000 個。每個情境若配置 `M` 個隨機系集成員，總軌跡數為各情境成員數之和；所有情境使用同一 `M` 時為 `50,000 × M`。裁決依據與完整需求文字見[需求追溯與範圍裁決](01_requirements_traceability.md)。
+計畫書中「每一處開放海域高達 1,000 組」與後續明列的 `10 × 20 × 50 = 10,000` 相互矛盾。依已記錄的使用者裁決，五個獨立研究站點各自採 10,000 個基礎情境：貢寮、龜山島、新竹、後灣、連江合計 50,000 個。每個情境若配置 `M` 個隨機系集成員，總軌跡數為各情境成員數之和；所有情境使用同一 `M` 時為 `50,000 × M`。裁決依據與完整需求文字見[需求追溯與範圍裁決](../foundation/01_requirements_traceability.md)。
 
 ## 2. 建議的閱讀順序
 
 新接手者不應從數值迴圈開始逐行閱讀。建議依下列順序建立全貌，再進入細節：
 
 1. [README](../README.md)：研究站點、情境計數、資料根目錄、目前可執行命令與正式閘門概覽。
-2. 先開啟[互動式程式架構地圖](source_code_architecture_map.html)建立全貌，再閱讀本文件第 3、4 節的五個程式群組與兩張流程圖。
-3. [設定範例](../configs/lagrangian_backtracking.example.yaml) 與 `config.py`：了解何者被鎖定為科學契約，何者尚不可用於正式發布。
+2. 先開啟[互動式程式架構地圖](../source_code_architecture_map.html)建立全貌，再閱讀本文件第 3、4 節的五個程式群組與兩張流程圖。
+3. [設定範例](../../configs/lagrangian_backtracking.example.yaml) 與 `config.py`：了解何者被鎖定為科學契約，何者尚不可用於正式發布。
 4. `models.py`、`scenarios.py`、`runner.py`、`batch_state.py`：了解一條軌跡如何由站點、受體、到達時間、行為、成員唯一識別並進入 SoA 批次。
 5. `forcing.py`、`forcing_window.py`、`mesh.py`、`stokes.py`、`diffusion.py`、`integrators.py`：了解每一時間步的速度如何取得與計算。
 6. `boundaries.py`、`engine.py`、`production.py`：了解何時記錄事件、何時停止回溯，以及 CPU batch 如何呼叫共用單步 engine。
 7. `runtime.py`、`run_control.py`、`run_locking.py`、`run_validation.py`、`cli.py`：了解 pilot／formal request、workspace、鎖定、reconcile 與命令列邊界。
 8. `outputs.py`、`checkpoint.py`、`report_material_statistics.py`、`aggregation.py`：了解如何保存可追溯結果，以及如何產生材質／底部接觸、密度與路徑統計。
 9. 對照 `tests/`：每一核心宣稱至少要有對應測試；測試通過表示程式邏輯符合該測試案例，不代表正式海域結果已產出。
-10. 最後閱讀[科學方法與驗證](03_scientific_method_and_validation.md)、[成果呈現與學術視覺化規格](07_results_visualization_plan.md)與[實作稽核](09_implementation_audit_2026-08-19.md)。
+10. 最後閱讀[科學方法與驗證](../foundation/03_scientific_method_and_validation.md)、[成果呈現與學術視覺化規格](../results/07_results_visualization_plan.md)與[實作稽核](../archive/09_implementation_audit_2026-08-19.md)。
 
 ## 3. `src` 的五個程式群組
 
@@ -142,9 +147,9 @@ flowchart LR
 
 可直接引用的靜態圖檔如下：
 
-- [圖 1 PNG：src 模組關係與資料流](output/figures/source_code_module_relationship.png)
-- [兩頁 PDF：圖 1 與圖 2](output/pdf/source_code_flow_diagrams.pdf)
-- [互動式 HTML：程式架構追蹤地圖](source_code_architecture_map.html)
+- [圖 1 PNG：src 模組關係與資料流](../output/figures/source_code_module_relationship.png)
+- [兩頁 PDF：圖 1 與圖 2](../output/pdf/source_code_flow_diagrams.pdf)
+- [互動式 HTML：程式架構追蹤地圖](../source_code_architecture_map.html)
 
 互動式地圖中的實線由腳本 `scripts/render_source_code_architecture_map.py` 直接掃描目前
 `src/lagrangian_backtracking/` 的相對匯入產生；虛線則是本文件為了說明資料與控制流程而登錄的
@@ -177,7 +182,7 @@ flowchart TD
     O2 --> A[aggregation.py<br/>入口密度、足跡、路徑與停留時間]
 ```
 
-此圖的單頁 PNG 為[圖 2：單一粒子逆向溯源的處理流程](output/figures/single_particle_backtracking_flow.png)。兩張圖的可重製來源是 `scripts/render_source_code_flow_diagrams.py`；在具備 ReportLab 的環境執行下列命令即可重新產製 PDF：
+此圖的單頁 PNG 為[圖 2：單一粒子逆向溯源的處理流程](../output/figures/single_particle_backtracking_flow.png)。兩張圖的可重製來源是 `scripts/render_source_code_flow_diagrams.py`；在具備 ReportLab 的環境執行下列命令即可重新產製 PDF：
 
 ```bash
 uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
@@ -196,7 +201,7 @@ uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
 | 撞到海岸，而非標記為開放水域的邊界段 | 寫入 `COAST_CONTACT` 並停止。 | 不是外海來源入口，不能放入開放邊界核密度估計。 |
 | 到達海床、離開表層規則、資料起點、最大回溯時間或資料／數值失敗 | 寫入各自停止狀態。 | 必須與成功離域分開統計，不能靜默從分母刪除。 |
 
-這套巢狀邊界設計針對已裁決的需求：貢寮與龜山島各自有 20 個 receptors 和 10,000 個基礎情境、local domain 可重疊、forcing 與最外層停止邊界則共用 A 區。完整幾何設計見[五站點情境與巢狀邊界設計基線](08_design_baseline_and_derived_gates.md)。
+這套巢狀邊界設計針對已裁決的需求：貢寮與龜山島各自有 20 個 receptors 和 10,000 個基礎情境、local domain 可重疊、forcing 與最外層停止邊界則共用 A 區。完整幾何設計見[五站點情境與巢狀邊界設計基線](../foundation/08_design_baseline_and_derived_gates.md)。
 
 ## 5. 紅框計畫書到原始碼、測試與成果的追溯表
 
@@ -204,18 +209,18 @@ uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
 
 | 計畫書條目 | 主要原始碼 | 已有測試或可執行證據 | 目前狀態與仍需完成事項 |
 |---|---|---|---|
-| 10 種非上浮海廢材質／形狀代理 | `scenarios.BASELINE_BEHAVIORS`、`Behavior`、`config.ProjectConfig`、`CombinedMonthForcing` | [test_cli_smoke.py](../tests/test_cli_smoke.py)、[test_config.py](../tests/test_config.py) 與 [test_scenarios.py](../tests/test_scenarios.py) 驗證 10 筆、iOcean 分類唯一、欄位完整及速度全部嚴格小於 0。 | **v2 程式契約已驗證。** 目前速度仍為 `provisional_proxy`；正式 material manifest 尚待發布，現地物性校準屬後續 gate。 |
-| 20 個三維 receptors／每站 | `geometry.py`、`mesh.py`、`receptors.py` | [test_receptors.py](../tests/test_receptors.py) 驗證長期濕潤水平選取與 4 個有效垂向層。 | **資料產製待完成。** 演算法已具備；五站正式 local/open-boundary/receptor manifests 尚未由實際網格產生。 |
-| 50 個到達時間／每站 | `arrival_times.select_arrival_times`、`scenarios.ArrivalTime` | [test_checkpoint_arrivals.py](../tests/test_checkpoint_arrivals.py) 驗證 48 個分層時刻加 2 個事件時刻。 | **資料產製待完成。** 尚未以完整資料時間軸產生五站正式 50 個 UTC 與回溯可用範圍證據。 |
-| 每站 `10 × 20 × 50 = 10,000`，全案 50,000 | `config.ProjectConfig`、`scenarios.build_scenarios`、`validate_baseline_coverage` | [test_config.py](../tests/test_config.py)、[test_scenarios.py](../tests/test_scenarios.py) 拒絕縮減計數並驗證 50,000 個唯一情境。 | **程式契約已驗證。** 尚待把正式受體、到達時間和行為表交叉成不可變的 scenario manifest。 |
-| 離開關注區域的邊界停止 | `BoundaryGeometry`、`resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` | [test_boundaries_engine.py](../tests/test_boundaries_engine.py) 驗證自站、他站、外層、海岸、海面／海床與時間步內交點。 | **邏輯已驗證；正式幾何待完成。** A 區 v4 南擴流場與五站開放水域邊界尚未生成和驗收。 |
-| 公式（6）：海流 + Stokes + 向下沉降的總平流速度；完全沉沒不加 windage | `forcing.CombinedMonthForcing`、`stokes.py` | [test_mesh_forcing.py](../tests/test_mesh_forcing.py)、[test_stokes.py](../tests/test_stokes.py) 驗證 OCM／NWW 取樣、波向與深淺水極限。 | **程式核心已驗證。** 尚未以 SERVER 全期正式 forcing 實跑與檢查單位、濕乾語意及共同有效遮罩。 |
-| 公式（7）：由波高、週期、波向與波長計算 Stokes 漂流 | `solve_wave_number`、`finite_depth_stokes`、`deep_water_stokes` | [test_stokes.py](../tests/test_stokes.py) 驗證色散關係殘差、深水極限與波向轉換。 | **程式核心已驗證。** baseline 的波浪資料版本、no-Stokes／深水／有限水深敏感度尚未以實值資料產出。 |
-| 公式（8）：逆向四階 Runge-Kutta 時間積分 | `integrators.rk4_step`、`engine.run_particle` | [test_integrators_diffusion.py](../tests/test_integrators_diffusion.py)、[test_boundaries_engine.py](../tests/test_boundaries_engine.py) 驗證負時間步長只取反一次、四個中間點與離域處理。 | **程式核心已驗證。** 正式的最小／最大時間步長和時間步收斂試驗尚待 pilot 決定。 |
-| 公式（9）：隨機漫步擴散 | `brownian_displacement`、`split_rk4_brownian_step` | [test_integrators_diffusion.py](../tests/test_integrators_diffusion.py) 驗證變異數為 `2KΔt`。 | **程式核心已驗證。** 正式水平、垂向擴散係數及系集成員數 `M` 尚待收斂試驗決定。 |
+| 10 種非上浮海廢材質／形狀代理 | `scenarios.BASELINE_BEHAVIORS`、`Behavior`、`config.ProjectConfig`、`CombinedMonthForcing` | [test_cli_smoke.py](../../tests/test_cli_smoke.py)、[test_config.py](../../tests/test_config.py) 與 [test_scenarios.py](../../tests/test_scenarios.py) 驗證 10 筆、iOcean 分類唯一、欄位完整及速度全部嚴格小於 0。 | **v2 程式契約已驗證。** 目前速度仍為 `provisional_proxy`；正式 material manifest 尚待發布，現地物性校準屬後續 gate。 |
+| 20 個三維 receptors／每站 | `geometry.py`、`mesh.py`、`receptors.py` | [test_receptors.py](../../tests/test_receptors.py) 驗證長期濕潤水平選取與 4 個有效垂向層。 | **資料產製待完成。** 演算法已具備；五站正式 local/open-boundary/receptor manifests 尚未由實際網格產生。 |
+| 50 個到達時間／每站 | `arrival_times.select_arrival_times`、`scenarios.ArrivalTime` | [test_checkpoint_arrivals.py](../../tests/test_checkpoint_arrivals.py) 驗證 48 個分層時刻加 2 個事件時刻。 | **資料產製待完成。** 尚未以完整資料時間軸產生五站正式 50 個 UTC 與回溯可用範圍證據。 |
+| 每站 `10 × 20 × 50 = 10,000`，全案 50,000 | `config.ProjectConfig`、`scenarios.build_scenarios`、`validate_baseline_coverage` | [test_config.py](../../tests/test_config.py)、[test_scenarios.py](../../tests/test_scenarios.py) 拒絕縮減計數並驗證 50,000 個唯一情境。 | **程式契約已驗證。** 尚待把正式受體、到達時間和行為表交叉成不可變的 scenario manifest。 |
+| 離開關注區域的邊界停止 | `BoundaryGeometry`、`resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` | [test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證自站、他站、外層、海岸、海面／海床與時間步內交點。 | **邏輯已驗證；正式幾何待完成。** A 區 v4 南擴流場與五站開放水域邊界尚未生成和驗收。 |
+| 公式（6）：海流 + Stokes + 向下沉降的總平流速度；完全沉沒不加 windage | `forcing.CombinedMonthForcing`、`stokes.py` | [test_mesh_forcing.py](../../tests/test_mesh_forcing.py)、[test_stokes.py](../../tests/test_stokes.py) 驗證 OCM／NWW 取樣、波向與深淺水極限。 | **程式核心已驗證。** 尚未以 SERVER 全期正式 forcing 實跑與檢查單位、濕乾語意及共同有效遮罩。 |
+| 公式（7）：由波高、週期、波向與波長計算 Stokes 漂流 | `solve_wave_number`、`finite_depth_stokes`、`deep_water_stokes` | [test_stokes.py](../../tests/test_stokes.py) 驗證色散關係殘差、深水極限與波向轉換。 | **程式核心已驗證。** baseline 的波浪資料版本、no-Stokes／深水／有限水深敏感度尚未以實值資料產出。 |
+| 公式（8）：逆向四階 Runge-Kutta 時間積分 | `integrators.rk4_step`、`engine.run_particle` | [test_integrators_diffusion.py](../../tests/test_integrators_diffusion.py)、[test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證負時間步長只取反一次、四個中間點與離域處理。 | **程式核心已驗證。** 正式的最小／最大時間步長和時間步收斂試驗尚待 pilot 決定。 |
+| 公式（9）：隨機漫步擴散 | `brownian_displacement`、`split_rk4_brownian_step` | [test_integrators_diffusion.py](../../tests/test_integrators_diffusion.py) 驗證變異數為 `2KΔt`。 | **程式核心已驗證。** 正式水平、垂向擴散係數及系集成員數 `M` 尚待收斂試驗決定。 |
 | 公式（10）：Smagorinsky 水平擴散 | `smagorinsky_horizontal_diffusivity` | 候選函式已實作；目前測試套件尚無針對解析剪切、旋轉不變性或上下限的專屬驗證。 | **僅候選功能，尚未完成驗證，更不是已發布 baseline。** 真實速度梯度、上下限、均勻混合性和敏感度尚未接入正式批次。 |
-| 公式（11）：邊界穿越點核密度估計 | `conditional_kde_2d`、`boundary_arclength_histogram` | [test_outputs_aggregation.py](../tests/test_outputs_aggregation.py) 驗證密度正規化、高密度區、邊界分母與原始計數。 | **程式核心已驗證。** 還沒有由正式全期軌跡產生的入口密度、來源足跡、頻寬敏感度與信賴區間。 |
-| 視覺化主要潛在來源路徑 | `aggregation.py` 提供繪圖資料產品；[成果呈現與學術視覺化規格](07_results_visualization_plan.md) 定義 F01–F12 圖組。 | 無正式圖表產物；目前只有合成 smoke 結果與聚合函式測試。 | **正式成果待完成。** 需先完成資料、情境、pilot、全期批次與聚合 release，才可產出正式圖表。 |
+| 公式（11）：邊界穿越點核密度估計 | `conditional_kde_2d`、`boundary_arclength_histogram` | [test_outputs_aggregation.py](../../tests/test_outputs_aggregation.py) 驗證密度正規化、高密度區、邊界分母與原始計數。 | **程式核心已驗證。** 還沒有由正式全期軌跡產生的入口密度、來源足跡、頻寬敏感度與信賴區間。 |
+| 視覺化主要潛在來源路徑 | `aggregation.py` 提供繪圖資料產品；[成果呈現與學術視覺化規格](../results/07_results_visualization_plan.md) 定義 F01–F12 圖組。 | 無正式圖表產物；目前只有合成 smoke 結果與聚合函式測試。 | **正式成果待完成。** 需先完成資料、情境、pilot、全期批次與聚合 release，才可產出正式圖表。 |
 
 ### 5.1 為什麼「有 KDE 函式」不等於「已完成來源路徑圖」
 
@@ -278,7 +283,7 @@ flowchart LR
 5. 由 pilot 決定的 `M`、擴散係數、時間步長、最大回溯期、批次大小與 checkpoint 間隔；
 6. 實值 pilot、全期 SERVER batch、aggregate release 與 F01–F12 圖表。
 
-這些不是要求使用者再提供科學資料；依既有決策，應由現有 2024–2025 資料、既定演算法和 pilot 驗證產生。詳細待辦與不可放寬的閘門見[實作與 SERVER 驗證稽核](09_implementation_audit_2026-08-19.md)第 4 節。
+這些不是要求使用者再提供科學資料；依既有決策，應由現有 2024–2025 資料、既定演算法和 pilot 驗證產生。詳細待辦與不可放寬的閘門見[實作與 SERVER 驗證稽核](../archive/09_implementation_audit_2026-08-19.md)第 4 節。
 
 ### 7.3 下一個可驗收里程碑
 

@@ -1,5 +1,10 @@
 # 科學方法與驗證規格
 
+> **閱讀提示**
+> - 文件類型：科學方法、數值方法與驗證規格。
+> - 它回答：座標、公式、時間積分、擴散、邊界與正式驗收如何定義。
+> - 建議先讀：[文件總入口](../README.md)，再讀[設計基線](08_design_baseline_and_derived_gates.md)。
+
 ## 1. 座標、狀態與符號
 
 每個 flow domain 在固定 metric CRS 中計算。粒子狀態為：
@@ -58,7 +63,7 @@ RMSE／相關外，必須以來源邊界排序、HDR weighted Jaccard、主要 e
 停留時間及 90% posterior interval coverage 驗證 Lagrangian skill。若長缺口模型未通過，
 正式 baseline 使用 gap-safe 分層 arrival windows 與可涵蓋全部 strata 的最短已收斂 horizon；
 因此研究仍有完整的基礎情境結果，只是不對資料不存在的區段作未驗證推論。完整門檻、
-文獻與 SERVER 數量見[全部可得資料、時間重建與 A 區擴域決策](10_available_data_time_reconstruction_and_a_expansion.md)。
+文獻與 SERVER 數量見[全部可得資料、時間重建與 A 區擴域決策](../operations/10_available_data_time_reconstruction_and_a_expansion.md)。
 
 ## 3. 有限水深 bulk Stokes drift
 

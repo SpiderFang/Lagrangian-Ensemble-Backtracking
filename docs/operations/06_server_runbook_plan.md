@@ -1,5 +1,10 @@
 # SERVER 執行手冊
 
+> **閱讀提示**
+> - 文件類型：SERVER 資料盤點、執行、續跑與發布手冊。
+> - 它回答：正式流程如何在核准環境中逐關檢查並保留證據。
+> - 建議先讀：[CLI 參考](cli_reference.md)，再核對[實作狀態](../implementation_status.md)。
+
 ## 1. 適用範圍
 
 本文件定義 SERVER 部署、preflight、pilot、正式 batch、checkpoint、QC 與發布程序。
@@ -24,7 +29,7 @@ fail-closed。aggregate/release 仍是後續 gate，不得以 synthetic fixture 
 連續逐時 UTC，OCM canonical 軸為 17,124 個 UTC、總缺 420 時次。後續 preflight 把前兩項
 記為 accepted provenance，把 OCM 缺口送入 reconstruction/gap-safe gate，不能再輸出「等待
 上游補資料」的建議。細節見[全部可得資料決策](10_available_data_time_reconstruction_and_a_expansion.md)
-與[更正後稽核](09_implementation_audit_2026-08-19.md)。每次 release 仍須重跑並保存
+與[更正後稽核](../archive/09_implementation_audit_2026-08-19.md)。每次 release 仍須重跑並保存
 machine-readable evidence；不得把密碼、private key 或 token 寫入 repository、設定、命令
 紀錄或報告。
 

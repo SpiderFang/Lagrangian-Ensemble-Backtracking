@@ -1,5 +1,10 @@
 # 決策與風險登錄
 
+> **閱讀提示**
+> - 文件類型：設計決策、狀態、風險與限制登錄。
+> - 它回答：每項決定的依據、目前狀態、必要閘門與未決影響是什麼。
+> - 建議先讀：[實作狀態](../implementation_status.md)，再讀[需求追溯](../foundation/01_requirements_traceability.md)。
+
 ## 1. 狀態定義
 
 - `decided`：已有範圍、依據、版本與影響；修改需新 decision record。

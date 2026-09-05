@@ -1,4 +1,4 @@
-"""execution checkpoint 2.1.0、RNG continuation 與版本相容性拒絕測試。
+"""execution checkpoint 2.2.0、RNG continuation 與版本相容性拒絕測試。
 
 本檔所有 request、位置與環境欄位都是本機建立的 synthetic 工程資料，只驗證序列化、
 恢復、checksum 與 fail-closed 邊界，不代表真實 OCM／NWW3 forcing 或任何科學成果。
@@ -22,7 +22,7 @@ from lagrangian_backtracking.checkpoint import (
 )
 from lagrangian_backtracking.diffusion import DiffusionCoefficients
 from lagrangian_backtracking.engine import EngineSettings, EnvironmentSampleStatus
-from lagrangian_backtracking.models import EventType, ParticleState
+from lagrangian_backtracking.models import EventType, ParticleState, VelocitySampleStatus
 from lagrangian_backtracking.outputs import sha256_file
 from lagrangian_backtracking.production import ProductionBatch
 from lagrangian_backtracking.runner import ReferenceParticleRequest, plan_scenario_shards
@@ -112,7 +112,7 @@ def _binding() -> CheckpointBinding:
 
 
 def _write_partial_checkpoint(destination: Path, *, master_seed: int = 5) -> Path:
-    """建立尚有可重啟狀態的 2.1 checkpoint，供完整性篡改測試重複使用。"""
+    """建立尚有可重啟狀態的 2.2 checkpoint，供完整性篡改測試重複使用。"""
 
     batch = ProductionBatch(_shard(), master_seed=master_seed, request_factory=_factory)
     batch.advance()
@@ -120,12 +120,12 @@ def _write_partial_checkpoint(destination: Path, *, master_seed: int = 5) -> Pat
 
 
 def _write_context_checkpoint(destination: Path) -> Path:
-    """建立含三種環境 context 狀態的 synthetic 2.1 checkpoint。
+    """建立含三種環境 context 狀態的 synthetic 2.2 checkpoint。
 
     第一個 observation 以有限公尺制海面／海床、合法 UTC 月份與零品質旗標代表有效
     樣本；第二個以非零品質旗標代表取樣失敗；其餘觀測保留 ``NOT_SAMPLED``。這五個
-    新增欄位（環境狀態加四個 context 值）只用來驗證 checkpoint 保存與 constructor
-    cross-field gate，並非 OCM／NWW3 實測。
+    環境欄位與 11 個速度欄位只用來驗證 checkpoint 保存與 constructor cross-field gate；
+    速度分項仍是 callback 能明示提供的 synthetic data，並非 OCM／NWW3 實測。
     """
 
     batch = ProductionBatch(_shard(), master_seed=5, request_factory=_factory)
@@ -200,9 +200,10 @@ def _set_schema_version(root: Path, schema_version: str) -> None:
 
 
 def _downgrade_fixture_to_20(root: Path) -> None:
-    """把現行 2.1 fixture 安全裁成可驗證的 2.0 legacy fixture。
+    """把現行 2.2 fixture 安全裁成可驗證的 2.0 legacy fixture。
 
-    這個 helper 只在測試目錄中移除新增欄位、重算 execution_state checksum 並改 metadata
+    2.0 的 observation 只有原始七欄，因此這裡明確移除環境五欄與速度十一欄，而不是只
+    改 metadata version。helper 只在測試目錄中重算 execution_state checksum 並改 metadata
     version，模擬既有 2.0 檔案；production writer 本身沒有 downgrade 路徑。
     """
 
@@ -215,6 +216,17 @@ def _downgrade_fixture_to_20(root: Path) -> None:
             observation.pop("bed_z_m", None)
             observation.pop("forcing_month_id", None)
             observation.pop("environment_qc_flags", None)
+            observation.pop("velocity_sample_status", None)
+            observation.pop("total_u_mps", None)
+            observation.pop("total_v_mps", None)
+            observation.pop("total_w_mps", None)
+            observation.pop("ocm_u_mps", None)
+            observation.pop("ocm_v_mps", None)
+            observation.pop("ocm_w_mps", None)
+            observation.pop("stokes_u_mps", None)
+            observation.pop("stokes_v_mps", None)
+            observation.pop("settling_w_mps", None)
+            observation.pop("velocity_qc_flags", None)
     execution_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -223,8 +235,39 @@ def _downgrade_fixture_to_20(root: Path) -> None:
     _set_schema_version(root, "2.0.0")
 
 
+def _downgrade_fixture_to_21(root: Path) -> None:
+    """把現行 2.2 fixture 精確裁成 schema 2.1 的固定觀測欄位集合。
+
+    2.1 允許原始七欄加環境五欄，但尚未保存速度紀錄；逐欄移除 11 個速度欄位可驗證
+    loader 真正依 metadata 選擇舊拓撲，而不是讓最新 ``Observation`` dataclass 污染舊檔。
+    這只是測試用的可逆 fixture 轉換，不代表 production writer 支援 downgrade。
+    """
+
+    execution_path = root / "execution_state.json"
+    payload = json.loads(execution_path.read_text(encoding="utf-8"))
+    for record in payload["records"]:
+        for observation in record["execution"]["observations"]:
+            observation.pop("velocity_sample_status", None)
+            observation.pop("total_u_mps", None)
+            observation.pop("total_v_mps", None)
+            observation.pop("total_w_mps", None)
+            observation.pop("ocm_u_mps", None)
+            observation.pop("ocm_v_mps", None)
+            observation.pop("ocm_w_mps", None)
+            observation.pop("stokes_u_mps", None)
+            observation.pop("stokes_v_mps", None)
+            observation.pop("settling_w_mps", None)
+            observation.pop("velocity_qc_flags", None)
+    execution_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _refresh_payload_checksum(root, "execution_state.json")
+    _set_schema_version(root, "2.1.0")
+
+
 def test_partial_execution_checkpoint_restores_exact_results_and_rng(tmp_path: Path) -> None:
-    """數個 sweep 後 schema 2.1 restore 必須與不中斷完成結果逐欄完全相同。"""
+    """數個 sweep 後 schema 2.2 restore 必須與不中斷完成結果逐欄完全相同。"""
 
     shard = _shard()
     uninterrupted = ProductionBatch(shard, master_seed=123, request_factory=_factory).complete()
@@ -272,12 +315,12 @@ def test_partial_execution_checkpoint_restores_exact_results_and_rng(tmp_path: P
     assert restored.checkpoint_sequence == 2
 
 
-def test_writer_publishes_schema21_with_exact_observation_fields(tmp_path: Path) -> None:
-    """新 writer 固定發布 2.1.0，且尚未取樣 context 以明示 enum 與 None 保存。"""
+def test_writer_publishes_schema22_with_exact_observation_fields(tmp_path: Path) -> None:
+    """新 writer 固定發布 2.2.0，且 11 個速度欄位以狀態與 None 明示保存。"""
 
-    root = _write_partial_checkpoint(tmp_path / "schema21-writer")
+    root = _write_partial_checkpoint(tmp_path / "schema22-writer")
     metadata = json.loads((root / "checkpoint.json").read_text(encoding="utf-8"))
-    assert metadata["schema_version"] == "2.1.0"
+    assert metadata["schema_version"] == "2.2.0"
     payload = json.loads((root / "execution_state.json").read_text(encoding="utf-8"))
     observation = payload["records"][0]["execution"]["observations"][0]
     assert set(observation) == {
@@ -293,18 +336,40 @@ def test_writer_publishes_schema21_with_exact_observation_fields(tmp_path: Path)
         "bed_z_m",
         "forcing_month_id",
         "environment_qc_flags",
+        "velocity_sample_status",
+        "total_u_mps",
+        "total_v_mps",
+        "total_w_mps",
+        "ocm_u_mps",
+        "ocm_v_mps",
+        "ocm_w_mps",
+        "stokes_u_mps",
+        "stokes_v_mps",
+        "settling_w_mps",
+        "velocity_qc_flags",
     }
     assert observation["environment_sample_status"] == "not_sampled"
     assert observation["eta_m"] is None
     assert observation["bed_z_m"] is None
     assert observation["forcing_month_id"] is None
     assert observation["environment_qc_flags"] is None
+    assert observation["velocity_sample_status"] == "total_only"
+    assert observation["total_u_mps"] == 0.2
+    assert observation["total_v_mps"] == 0.0
+    assert observation["total_w_mps"] == 0.0
+    assert observation["ocm_u_mps"] is None
+    assert observation["ocm_v_mps"] is None
+    assert observation["ocm_w_mps"] is None
+    assert observation["stokes_u_mps"] is None
+    assert observation["stokes_v_mps"] is None
+    assert observation["settling_w_mps"] is None
+    assert observation["velocity_qc_flags"] == 0
 
 
-def test_schema21_context_round_trip_preserves_valid_invalid_and_not_sampled(
+def test_schema22_context_round_trip_preserves_valid_invalid_and_not_sampled(
     tmp_path: Path,
 ) -> None:
-    """2.1 應逐欄保存有效、無效與未取樣 context，且不從位置或時間補猜資料。"""
+    """2.2 應逐欄保存環境與速度 context，且不從位置或時間補猜資料。"""
 
     root = _write_context_checkpoint(tmp_path / "context-round-trip")
     loaded = load_execution_checkpoint(root, expected_binding=_binding())
@@ -315,6 +380,12 @@ def test_schema21_context_round_trip_preserves_valid_invalid_and_not_sampled(
     assert valid.bed_z_m == -20.0
     assert valid.forcing_month_id == "202401"
     assert valid.environment_qc_flags == 0
+    assert valid.velocity_sample_status is VelocitySampleStatus.TOTAL_ONLY
+    assert valid.total_u_mps == 0.2
+    assert valid.total_v_mps == 0.0
+    assert valid.total_w_mps == 0.0
+    assert valid.ocm_u_mps is None
+    assert valid.settling_w_mps is None
 
     invalid = loaded.executions[1].observations[0]
     assert invalid.environment_sample_status is EnvironmentSampleStatus.INVALID
@@ -322,6 +393,11 @@ def test_schema21_context_round_trip_preserves_valid_invalid_and_not_sampled(
     assert invalid.bed_z_m is None
     assert invalid.forcing_month_id is None
     assert invalid.environment_qc_flags == 1
+    assert invalid.velocity_sample_status is VelocitySampleStatus.TOTAL_ONLY
+    assert invalid.total_u_mps == 0.2
+    assert invalid.total_v_mps == 0.0
+    assert invalid.total_w_mps == 0.0
+    assert invalid.velocity_qc_flags == 0
 
     not_sampled = [
         observation
@@ -339,10 +415,24 @@ def test_schema21_context_round_trip_preserves_valid_invalid_and_not_sampled(
         )
         for observation in not_sampled
     )
+    assert all(
+        observation.velocity_sample_status is VelocitySampleStatus.NOT_SAMPLED
+        and observation.total_u_mps is None
+        and observation.total_v_mps is None
+        and observation.total_w_mps is None
+        and observation.ocm_u_mps is None
+        and observation.ocm_v_mps is None
+        and observation.ocm_w_mps is None
+        and observation.stokes_u_mps is None
+        and observation.stokes_v_mps is None
+        and observation.settling_w_mps is None
+        and observation.velocity_qc_flags is None
+        for observation in not_sampled
+    )
 
 
 def test_schema20_legacy_load_defaults_context_and_preserves_resume_state(tmp_path: Path) -> None:
-    """2.0 legacy fixture 只補 NOT_SAMPLED context，identity、RNG 與 step 必須不變。"""
+    """2.0 legacy fixture 只補環境／速度 NOT_SAMPLED，identity、RNG 與 step 必須不變。"""
 
     root = _write_partial_checkpoint(tmp_path / "legacy-20")
     before = load_execution_checkpoint(root, expected_binding=_binding())
@@ -365,6 +455,17 @@ def test_schema20_legacy_load_defaults_context_and_preserves_resume_state(tmp_pa
         and observation.bed_z_m is None
         and observation.forcing_month_id is None
         and observation.environment_qc_flags is None
+        and observation.velocity_sample_status is VelocitySampleStatus.NOT_SAMPLED
+        and observation.total_u_mps is None
+        and observation.total_v_mps is None
+        and observation.total_w_mps is None
+        and observation.ocm_u_mps is None
+        and observation.ocm_v_mps is None
+        and observation.ocm_w_mps is None
+        and observation.stokes_u_mps is None
+        and observation.stokes_v_mps is None
+        and observation.settling_w_mps is None
+        and observation.velocity_qc_flags is None
         for execution in loaded.executions
         for observation in execution.observations
     )
@@ -382,6 +483,53 @@ def test_schema20_legacy_load_defaults_context_and_preserves_resume_state(tmp_pa
     ]
 
 
+def test_schema21_legacy_load_defaults_velocity_without_dataclass_pollution(
+    tmp_path: Path,
+) -> None:
+    """2.1 legacy fixture 不含速度欄位時，loader 只補未取樣，不從最新 dataclass 猜值。"""
+
+    root = _write_partial_checkpoint(tmp_path / "legacy-21")
+    _downgrade_fixture_to_21(root)
+    metadata = json.loads((root / "checkpoint.json").read_text(encoding="utf-8"))
+    assert metadata["schema_version"] == "2.1.0"
+    payload = json.loads((root / "execution_state.json").read_text(encoding="utf-8"))
+    assert all(
+        set(observation)
+        == {
+            "particle_id",
+            "time_utc_ns",
+            "age_seconds",
+            "x_m",
+            "y_m",
+            "z_m",
+            "status",
+            "environment_sample_status",
+            "eta_m",
+            "bed_z_m",
+            "forcing_month_id",
+            "environment_qc_flags",
+        }
+        for record in payload["records"]
+        for observation in record["execution"]["observations"]
+    )
+    loaded = load_execution_checkpoint(root, expected_binding=_binding())
+    assert all(
+        observation.velocity_sample_status is VelocitySampleStatus.NOT_SAMPLED
+        and observation.total_u_mps is None
+        and observation.total_v_mps is None
+        and observation.total_w_mps is None
+        and observation.ocm_u_mps is None
+        and observation.ocm_v_mps is None
+        and observation.ocm_w_mps is None
+        and observation.stokes_u_mps is None
+        and observation.stokes_v_mps is None
+        and observation.settling_w_mps is None
+        and observation.velocity_qc_flags is None
+        for execution in loaded.executions
+        for observation in execution.observations
+    )
+
+
 def test_schema20_rejects_new_observation_fields(tmp_path: Path) -> None:
     """metadata 宣稱 2.0 時若仍帶 2.1 欄位，不能因向前相容而靜默忽略。"""
 
@@ -391,12 +539,12 @@ def test_schema20_rejects_new_observation_fields(tmp_path: Path) -> None:
         load_execution_checkpoint(root, expected_binding=_binding())
 
 
-@pytest.mark.parametrize("schema_version", ("1.0.0", "2.2.0", True, []))
+@pytest.mark.parametrize("schema_version", ("1.0.0", "9.9.9", True, []))
 def test_execution_loader_rejects_unknown_schema_versions(
     tmp_path: Path,
     schema_version: Any,
 ) -> None:
-    """loader 只接受精確 2.0.0／2.1.0 字串，不將 bool、array 或未登錄版本當成相容。"""
+    """loader 只接受精確 2.0.0／2.1.0／2.2.0 字串，不將 bool、array 或未登錄版本當成相容。"""
 
     root = _write_partial_checkpoint(tmp_path / f"unknown-{len(list(tmp_path.iterdir()))}")
     _set_schema_version(root, schema_version)
@@ -409,6 +557,7 @@ def test_schema21_observation_keys_are_exact(tmp_path: Path, mutation: str) -> N
     """2.1 observation 缺欄或多欄都必須 fail closed，不能讓資料版本漂移。"""
 
     root = _write_partial_checkpoint(tmp_path / f"schema21-{mutation}")
+    _downgrade_fixture_to_21(root)
 
     def tamper(payload: dict[str, Any]) -> None:
         """只改測試 fixture 的 observation key，保留 manifest checksum 可驗證。"""
@@ -420,6 +569,15 @@ def test_schema21_observation_keys_are_exact(tmp_path: Path, mutation: str) -> N
             observation["unexpected_context"] = None
 
     _rewrite_execution_payload(root, tamper)
+    with pytest.raises(ValueError, match="欄位不符"):
+        load_execution_checkpoint(root, expected_binding=_binding())
+
+
+def test_schema21_rejects_velocity_fields_after_version_downgrade(tmp_path: Path) -> None:
+    """metadata 宣稱 2.1 時若仍帶速度欄位，不能把新欄位靜默塞進舊拓撲。"""
+
+    root = _write_partial_checkpoint(tmp_path / "schema21-with-velocity-fields")
+    _set_schema_version(root, "2.1.0")
     with pytest.raises(ValueError, match="欄位不符"):
         load_execution_checkpoint(root, expected_binding=_binding())
 
@@ -442,6 +600,7 @@ def test_schema21_rejects_invalid_environment_context(tmp_path: Path, mutation: 
     """2.1 context 的 enum、有限值、月份、品質旗標與 status cross-field gate 必須嚴格。"""
 
     root = _write_partial_checkpoint(tmp_path / f"context-invalid-{mutation}")
+    _downgrade_fixture_to_21(root)
 
     def tamper(payload: dict[str, Any]) -> None:
         """將單一合法 2.1 observation 改成一種明確非法 context。"""
@@ -741,7 +900,7 @@ def test_schema2_rejects_unknown_subdirectory_and_symlink(tmp_path: Path) -> Non
 
 
 def test_schema2_all_complete_batch_round_trip_preserves_results(tmp_path: Path) -> None:
-    """全粒子已終止時仍可寫入 schema 2.1，restore 後結果必須逐欄相同。"""
+    """全粒子已終止時仍可寫入 schema 2.2，restore 後結果必須逐欄相同。"""
 
     batch = ProductionBatch(_shard(), master_seed=17, request_factory=_factory)
     expected = batch.complete()

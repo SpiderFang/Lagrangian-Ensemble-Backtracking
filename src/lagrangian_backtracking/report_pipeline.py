@@ -47,6 +47,11 @@ _PREFLIGHT_ERROR: Final[str] = "report build preflight 驗證失敗"
 _MPLCONFIGDIR_ERROR: Final[str] = (
     "MPLCONFIGDIR 必須明示為既有、可寫、非符號連結的專用目錄"
 )
+# 正式報告可消費的 trajectory 版本必須在同一個 run 內一致；v2 保留既有環境
+# context，v3 再包含速度 context。v1 沒有正式報告所需的完整來源證據，明確拒絕。
+_FORMAL_TRAJECTORY_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset(
+    {"2.0.0", TRAJECTORY_SHARD_SCHEMA_VERSION}
+)
 
 # 這四個類別與本 pipeline 的公開語意一致；每個類別只可搭配一種 run kind，避免
 # caller 以 evidence class 文字把 synthetic／pilot／baseline 輸入冒充成另一種研究階段。
@@ -225,17 +230,19 @@ def _validate_formal_manifests(
     plan: dict[str, Any],
     progress: dict[str, Any],
 ) -> str:
-    """只讀所有正式 shard 的 manifest，精確關閉 trajectory schema 2.0.0。
+    """只讀所有正式 shard 的 manifest，接受單一 trajectory schema 2.0.0 或 3.0.0。
 
-    既有一般 reader 為工程相容性可接受 v1；正式報告則必須使用含完整 environment
-    context 的 v2 payload。這裡只解析 manifest、確認 path／identity／schema，不呼叫
-    ``read_trajectory_shard``，所以不會第二次 materialize 50,000×M 的軌跡結果。
+    一般 reader 可為工程相容性接受 v1；正式報告則必須讓所有 shard 使用同一個含環境
+    context 的 v2，或含環境與速度 context 的 v3。v1、未知版本及 v2/v3 混用都拒絕。
+    這裡只解析 manifest、確認 path／identity／schema，不呼叫 ``read_trajectory_shard``，
+    所以不會第二次 materialize 50,000×M 的軌跡結果；成功時回傳實際使用的版本。
     """
 
     plan_shards = plan.get("shards")
     progress_shards = progress.get("shards")
     if type(plan_shards) is not list or type(progress_shards) is not dict:
         raise ValueError("shard documents")
+    observed_schema_version: str | None = None
     for plan_row in plan_shards:
         if type(plan_row) is not dict:
             raise ValueError("plan shard")
@@ -253,15 +260,22 @@ def _validate_formal_manifests(
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("shard directory")
         manifest = _read_json_object(shard_root / "manifest.json")
-        if manifest.get("schema_version") != TRAJECTORY_SHARD_SCHEMA_VERSION:
+        schema_version = manifest.get("schema_version")
+        if type(schema_version) is not str or schema_version not in _FORMAL_TRAJECTORY_SCHEMA_VERSIONS:
             raise ValueError("trajectory schema")
+        if observed_schema_version is None:
+            observed_schema_version = schema_version
+        elif schema_version != observed_schema_version:
+            raise ValueError("mixed trajectory schema")
         # 這兩個欄位已由 validate_run 做完整 payload binding；在只讀 schema gate 再次
         # 比對可防止未來上游 validator 放寬時，manifest 被誤綁到另一個 run/shard。
         if manifest.get("run_metadata", {}).get("run_id") != plan.get("run_id"):
             raise ValueError("trajectory run identity")
         if manifest.get("run_metadata", {}).get("shard_id") != shard_id:
             raise ValueError("trajectory shard identity")
-    return TRAJECTORY_SHARD_SCHEMA_VERSION
+    if observed_schema_version is None:
+        raise ValueError("formal run 不可沒有 trajectory shard")
+    return observed_schema_version
 
 
 def _validate_source_identity(
