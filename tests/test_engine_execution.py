@@ -31,6 +31,7 @@ from lagrangian_backtracking.integrators import SamplingContext, SamplingError
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.models import (
     SURFACE_BOUNDARY_TOLERANCE_M,
+    VERTICAL_BOUNDARY_TOLERANCE_M,
     EventType,
     ParticleState,
     ParticleStatus,
@@ -567,31 +568,124 @@ def test_surface_stage_adjustment_does_not_create_event_when_final_rk4_is_inside
     assert (len(queries), rng.bit_generator.state) == (10, expected_rng.bit_generator.state)
 
 
-def test_surface_stage_adjustment_requires_step_start_strictly_inside_water_column() -> None:
-    """一般 5 微米取樣容許帶不能取代 stage 備援的嚴格步首水柱條件。
+def test_surface_stage_adjustment_accepts_valid_step_start_within_surface_tolerance() -> None:
+    """步首在 5 微米海面容許帶內時，可先折半再完成 k2 鏡射重查。
 
-    步首故意位於 eta 上方 2.5 微米，故一般取樣介面仍可把它視為海面並回傳有效速度；
-    但它不是 ``bed <= z <= eta`` 的水柱內狀態。反向沉降令 k2 明顯上越後，引擎不得建立
-    鏡射速度包裝器，也不得消耗布朗運動亂數。這鎖定一般取樣容差與積分器備援資格是
-    兩項不同契約。
+    步首 z 比 eta 高 2.5 微米，但參考樣本已由一般取樣介面依集中契約判定有效。第一個
+    4 秒嘗試及折半後的 2 秒嘗試都在 k2 明顯越過海面；引擎應先保留自適應折半，再於
+    下一次折半將低於 ``dt_min`` 時重算完整 RK4。鏡射後的速度刻意改成可把後續中間點
+    留在水柱內，藉此驗證容許帶只用於步首資格，不會直接接受海面以上的 k2 查詢。
     """
 
     initial = replace(_state(), z_m=0.5 * SURFACE_BOUNDARY_TOLERANCE_M)
+    queries: list[tuple[float, int]] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """容許帶內回傳有效步首；明顯越面拒絕，鏡射水柱內回傳解析測試速度。"""
+
+        del x_m, y_m
+        queries.append((z_m, time_utc_ns))
+        if z_m > SURFACE_BOUNDARY_TOLERANCE_M:
+            return VelocitySample(
+                0.0,
+                0.0,
+                -0.4,
+                0.0,
+                -100.0,
+                100.0,
+                100.0,
+                SampleQC.VERTICAL_UNSUPPORTED,
+            )
+        vertical_velocity = -0.4 if z_m >= 0.0 else 1.0
+        return VelocitySample(0.0, 0.0, vertical_velocity, 0.0, -100.0, 100.0, 100.0)
+
+    settings = _settings(
+        dt_min_seconds=2.0,
+        dt_max_seconds=4.0,
+        max_backtrack_seconds=4.0,
+        output_interval_seconds=2.0,
+    )
+    execution = initialize_particle_execution(initial, settings)
+    rng = np.random.Generator(np.random.PCG64DXSM(20260912))
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(20260912))
+    expected_rng.normal(size=3)
+    outcome = advance_particle_once(
+        execution,
+        velocity=velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=rng,
+    )
+
+    assert outcome.stepped and not outcome.terminal
+    assert execution.state.z_m < 0.0
+    assert execution.events == []
+    assert len(queries) == 10
+    above_surface_times = [
+        time_ns for z_m, time_ns in queries if z_m > SURFACE_BOUNDARY_TOLERANCE_M
+    ]
+    assert above_surface_times == [98_000_000_000, 99_000_000_000, 99_000_000_000]
+    assert any(z_m < 0.0 and time_ns == 99_000_000_000 for z_m, time_ns in queries)
+    assert rng.bit_generator.state == expected_rng.bit_generator.state
+
+
+@pytest.mark.parametrize(
+    ("initial_z_m", "eta_m", "bed_m", "vertical_velocity_mps"),
+    [
+        (
+            SURFACE_BOUNDARY_TOLERANCE_M + 1.0e-9,
+            0.0,
+            -100.0,
+            -0.4,
+        ),
+        (
+            -1.0 - VERTICAL_BOUNDARY_TOLERANCE_M - 1.0e-9,
+            0.0,
+            -1.0,
+            -2.0,
+        ),
+    ],
+    ids=("above-surface-tolerance", "below-bed-tolerance"),
+)
+def test_surface_stage_adjustment_rejects_falsely_valid_start_outside_tolerances(
+    initial_z_m: float,
+    eta_m: float,
+    bed_m: float,
+    vertical_velocity_mps: float,
+) -> None:
+    """即使合成樣本錯稱有效，步首超過集中海面／海床容差仍不得取得備援資格。
+
+    這兩個防禦案例模擬違反一般取樣契約的 provider：一例高於海面容差，另一例低於
+    海床容差，卻都回傳 ``qc=OK``。k2 隨後回傳純 ``VERTICAL_UNSUPPORTED``，引擎仍須
+    在布朗運動前封閉失敗，不得因樣本自稱有效而建立鏡射速度包裝器。
+    """
+
+    initial = replace(_state(), z_m=initial_z_m)
     queries: list[float] = []
 
     def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
-        """模擬一般介面只接受 5 微米容許帶，超過後回傳純垂向不支援。"""
+        """僅對精確步首謊稱有效，讓 k2 提供完整海面越界診斷。"""
 
         del x_m, y_m, time_utc_ns
         queries.append(z_m)
-        if z_m <= SURFACE_BOUNDARY_TOLERANCE_M:
-            return VelocitySample(0.0, 0.0, -0.4, 0.0, -100.0, 100.0, 100.0)
+        if np.isclose(z_m, initial.z_m, rtol=0.0, atol=1.0e-15):
+            return VelocitySample(
+                0.0,
+                0.0,
+                vertical_velocity_mps,
+                eta_m,
+                bed_m,
+                100.0,
+                100.0,
+            )
         return VelocitySample(
             0.0,
             0.0,
-            -0.4,
-            0.0,
-            -100.0,
+            vertical_velocity_mps,
+            eta_m,
+            bed_m,
             100.0,
             100.0,
             SampleQC.VERTICAL_UNSUPPORTED,
@@ -604,7 +698,7 @@ def test_surface_stage_adjustment_requires_step_start_strictly_inside_water_colu
         output_interval_seconds=2.0,
     )
     execution = initialize_particle_execution(initial, settings)
-    rng = np.random.Generator(np.random.PCG64DXSM(20260912))
+    rng = np.random.Generator(np.random.PCG64DXSM(20260913))
     before_rng = deepcopy(rng.bit_generator.state)
     outcome = advance_particle_once(
         execution,
@@ -621,6 +715,77 @@ def test_surface_stage_adjustment_requires_step_start_strictly_inside_water_colu
     assert execution.events[-1].event_type == EventType.NUMERICAL_FAILURE
     assert len(queries) == 3
     assert rng.bit_generator.state == before_rng
+
+
+def test_surface_stage_adjustment_accepts_valid_step_start_within_bed_tolerance() -> None:
+    """步首只低於海床 0.5 微米且參考樣本有效時，仍可證明後續 k2 海面上越。
+
+    海床側沿用集中 1 微米契約，避免 engine 與一般取樣介面對同一有效步首得出相反結論。
+    k2 的海面以上查詢仍必須先失敗，再以實際 ``[bed, eta]`` 內的鏡射深度重查；完整
+    RK4 的終點若真的越面，仍交由既有終點解析器產生事件與反射。
+    """
+
+    eta_m = 0.0
+    bed_m = -1.0
+    initial = replace(_state(), z_m=bed_m - 0.5 * VERTICAL_BOUNDARY_TOLERANCE_M)
+    queries: list[float] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """步首給足以讓 k2 越面的速度，鏡射後改用有限水柱內速度完成 RK4。"""
+
+        del x_m, y_m, time_utc_ns
+        queries.append(z_m)
+        if z_m > eta_m:
+            return VelocitySample(
+                0.0,
+                0.0,
+                -2.0,
+                eta_m,
+                bed_m,
+                100.0,
+                100.0,
+                SampleQC.VERTICAL_UNSUPPORTED,
+            )
+        vertical_velocity = (
+            -2.0
+            if np.isclose(z_m, initial.z_m, rtol=0.0, atol=1.0e-15)
+            else -0.5
+        )
+        return VelocitySample(
+            0.0,
+            0.0,
+            vertical_velocity,
+            eta_m,
+            bed_m,
+            100.0,
+            100.0,
+        )
+
+    settings = _settings(
+        dt_min_seconds=2.0,
+        dt_max_seconds=2.0,
+        max_backtrack_seconds=4.0,
+        output_interval_seconds=2.0,
+    )
+    execution = initialize_particle_execution(initial, settings)
+    rng = np.random.Generator(np.random.PCG64DXSM(20260914))
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(20260914))
+    expected_rng.normal(size=3)
+    outcome = advance_particle_once(
+        execution,
+        velocity=velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=rng,
+    )
+
+    assert outcome.stepped and not outcome.terminal
+    assert np.isclose(execution.state.z_m, -0.5 + 0.5 * VERTICAL_BOUNDARY_TOLERANCE_M)
+    assert [event.event_type for event in execution.events] == [EventType.SURFACE_CONTACT]
+    assert len(queries) == 8
+    assert rng.bit_generator.state == expected_rng.bit_generator.state
 
 
 def test_failed_surface_stage_reflected_requery_is_fail_closed_without_rng() -> None:

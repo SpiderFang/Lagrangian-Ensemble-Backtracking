@@ -1131,9 +1131,10 @@ def _is_proven_surface_stage_crossing(
     就能證明這是幾何邊界事件。這裡要求步首 reference 也有有限且相容上下界，避免
     只依賴失效查詢點的部分資訊猜測 crossing；時間缺口、乾點、域外、非有限上下界或
     非垂向品質旗標一律回傳 False。只有品質旗標精確等於 ``VERTICAL_UNSUPPORTED``、
-    步首嚴格位於實際 ``[bed, eta]``，且中間計算點 z 嚴格高於當地 eta 才成立；組合
-    旗標不會被當成純海面事件。``behavior_class`` 為上浮（``rising``）時沿用海面退出
-    政策，不走本函式的沉降／懸浮反射重試。
+    步首參考樣本有效且位於集中定義的海面／海床微米容許帶內，且中間計算點 z 嚴格高於
+    當地 eta 才成立；組合旗標不會被當成純海面事件。步首容許帶只承接一般取樣介面已
+    判定有效的邊界位置，不會放寬失敗中間點的海面上界。``behavior_class`` 為上浮
+    （``rising``）時沿用海面退出政策，不走本函式的沉降／懸浮反射重試。
     """
 
     if behavior_class == "rising" or error.stage not in {"k2", "k3", "k4"}:
@@ -1160,10 +1161,10 @@ def _is_proven_surface_stage_crossing(
     ):
         return False
     return not (
-        reference_bed > reference_eta
-        or context_bed > context_eta
-        or state_z < reference_bed
-        or state_z > reference_eta
+        reference_bed > reference_eta + VERTICAL_BOUNDARY_TOLERANCE_M
+        or context_bed > context_eta + VERTICAL_BOUNDARY_TOLERANCE_M
+        or state_z < reference_bed - VERTICAL_BOUNDARY_TOLERANCE_M
+        or state_z > reference_eta + SURFACE_BOUNDARY_TOLERANCE_M
         or context_z <= context_eta
     )
 

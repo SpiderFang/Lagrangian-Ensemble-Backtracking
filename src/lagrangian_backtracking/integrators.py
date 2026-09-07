@@ -20,7 +20,13 @@ from .diffusion import (
     brownian_displacement,
     diffusion_displacement,
 )
-from .models import ParticleState, SampleQC, VelocitySample
+from .models import (
+    SURFACE_BOUNDARY_TOLERANCE_M,
+    VERTICAL_BOUNDARY_TOLERANCE_M,
+    ParticleState,
+    SampleQC,
+    VelocitySample,
+)
 
 
 class VelocityProvider(Protocol):
@@ -88,12 +94,14 @@ class SurfaceStageVelocityProvider:
     不改變底層 forcing API，也不修改粒子 state。
 
     每個 stage 先以原始 ``x/y/z/t`` 查詢；僅當品質檢查旗標（``qc``）精確等於
-    ``VERTICAL_UNSUPPORTED``、海面與海床皆為有限相容的公尺制正向向上座標、步首嚴格
-    位於實際水柱內、行為不是上浮，且中間計算點的 z 嚴格高於 eta 時，才以
-    ``z_reflected = 2*eta - z`` 鏡射。鏡射深度必須嚴格落在該次樣本的 ``[bed, eta]``，
-    再於完全相同的 x、y、UTC 奈秒與鏡射 z 重查速度。這相當於只對中間導數施加反射
-    數值邊界條件；RK4 的原始中間幾何與最後提議位置不會被夾回，步末仍由既有垂向邊界
-    解析器判斷是否真的接觸海面。一般取樣介面的 5 微米海面容許帶不會在這裡再套一次。
+    ``VERTICAL_UNSUPPORTED``、海面與海床皆為有限相容的公尺制正向向上座標、步首參考
+    樣本有效且依集中定義的 5 微米海面／1 微米海床契約仍在水柱邊界內、行為不是上浮，
+    且中間計算點的 z 嚴格高於 eta 時，才以 ``z_reflected = 2*eta - z`` 鏡射。步首容許
+    帶只承接一般取樣介面已認定有效的微米級海面邊界定位數值殘差，不會套到失敗的中間
+    計算點。鏡射深度仍必須嚴格落在該次樣本的實際 ``[bed, eta]``，再於完全相同的 x、
+    y、UTC 奈秒與鏡射 z 重查速度。這相當於只對中間導數施加反射數值邊界條件；RK4 的
+    原始中間幾何與最後提議位置不會被夾回，步末仍由既有垂向邊界解析器判斷是否真的
+    接觸海面。
 
     重查若仍無效、速度非有限或回傳幾何與鏡射深度不相容，會立即以該鏡射查詢的實際
     座標拋出 ``SamplingError``。這可保留 dry、域外、時間缺口及其他 QC，且失敗發生在
@@ -192,10 +200,10 @@ class SurfaceStageVelocityProvider:
         ):
             return None
         if (
-            start_bed > start_eta
-            or start_z < start_bed
-            or start_z > start_eta
-            or stage_bed > stage_eta
+            start_bed > start_eta + VERTICAL_BOUNDARY_TOLERANCE_M
+            or start_z < start_bed - VERTICAL_BOUNDARY_TOLERANCE_M
+            or start_z > start_eta + SURFACE_BOUNDARY_TOLERANCE_M
+            or stage_bed > stage_eta + VERTICAL_BOUNDARY_TOLERANCE_M
             or stage_z <= stage_eta
         ):
             return None

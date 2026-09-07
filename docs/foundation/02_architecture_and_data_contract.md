@@ -159,7 +159,7 @@ expanded A 區的機器可驗證契約至少包含：
 
 這一順序與既有 SVD 的「先 node 垂向、再重心水平」政策一致，但粒子使用任意位置與原生 face，不依賴規則格網 cell。`SURFACE_BOUNDARY_TOLERANCE_M` 位於共用資料模型，供 NumPy reference、Numba kernel、Stokes、engine environment context、trajectory writer 與 report validator 共用；因此容許尺度不是各模組各自猜測的門檻。surface hold 及 query-time 幾何 gate 是移動海面下的工程取樣契約，不代表已完成真實資料的科學驗證；Smagorinsky reference 也必須使用同一端點支援與 query-time 幾何 gate。
 
-一般環境取樣與積分器的責任邊界保持分離：取樣器對超過 5 微米容許帶的海面以上查詢仍回傳 `VERTICAL_UNSUPPORTED`，不提供任意最高層速度；只有粒子引擎已完成自適應折半，且下一次折半會低於 `dt_min` 時，才可為已證實的非上浮海面 k2／k3／k4 上越建立單次 `SurfaceStageVelocityProvider`。該速度包裝器不改原始中間點的 x/y/t，只把 z 對當地 eta 鏡射後重查一次；步首與鏡射位置都必須嚴格位於實際 `[bed, eta]`，重查品質旗標必須有效。它只提供完整確定性 RK4 所需的中間導數，不改粒子狀態、不產生邊界事件、不消耗亂數產生器（RNG）；完整 RK4 成功後才套用一次既有擴散，最後提議狀態再進入 `boundaries` 模組。這項控制位於共用的 Python 積分器與引擎，不另分 NumPy／Numba 判定路徑；底層選用哪一個 OCM 插值核心，都會經過相同資格檢查與同一取樣介面。因此軌跡、事件與檢查點資料格式均不新增欄位，使用過此內部條件的限制由方法文件與測試保存。
+一般環境取樣與積分器的責任邊界保持分離：取樣器對超過 5 微米容許帶的海面以上查詢仍回傳 `VERTICAL_UNSUPPORTED`，不提供任意最高層速度；只有粒子引擎已完成自適應折半，且下一次折半會低於 `dt_min` 時，才可為已證實的非上浮海面 k2／k3／k4 上越建立單次 `SurfaceStageVelocityProvider`。步首資格承接集中契約：參考樣本必須有效，`start_z >= start_bed - VERTICAL_BOUNDARY_TOLERANCE_M`、`start_z <= start_eta + SURFACE_BOUNDARY_TOLERANCE_M`，且 eta／bed 的相容誤差不得超過 `VERTICAL_BOUNDARY_TOLERANCE_M`。這避免移動 eta 使已由一般取樣器接受的微米級步首被引擎再次否決，但不把容許帶套到失敗中間點。該速度包裝器不改原始中間點的 x/y/t，只把 z 對當地 eta 鏡射後重查一次；失敗中間點仍須嚴格 `z>eta`，鏡射位置也必須嚴格位於實際 `[bed, eta]`，重查品質旗標必須有效。它只提供完整確定性 RK4 所需的中間導數，不改粒子狀態、不產生邊界事件、不消耗亂數產生器（RNG）；完整 RK4 成功後才套用一次既有擴散，最後提議狀態再進入 `boundaries` 模組。這項控制位於共用的 Python 積分器與引擎，不另分 NumPy／Numba 判定路徑；底層選用哪一個 OCM 插值核心，都會經過相同資格檢查與同一取樣介面。因此軌跡、事件與檢查點資料格式均不新增欄位，使用過此內部條件的限制由方法文件與測試保存。
 
 ## 5. NWW3 與 Stokes 取樣器
 
