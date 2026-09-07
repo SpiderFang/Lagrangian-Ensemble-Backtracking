@@ -8,8 +8,44 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import IntFlag, StrEnum
+from typing import Final
+
+# OCM、Stokes、引擎環境 context 與輸出 validator 共用的海面上界數值政策。
+# 這個尺度只處理公尺制 z 與移動海面 eta 在海面邊界定位時，由浮點運算、RK4 stage
+# 積分與時空內插共同形成的數值殘差；其大小不能以單一機器精度（machine epsilon）解釋，
+# 也不是網格層距、物理混合層厚度或可任意放大的邊界緩衝。checkpoint-8 觀測到的最大
+# 海面邊界定位數值殘差（含浮點與積分／內插）約為 3.367686e-6 m，因此選擇 5e-6 m，
+# 在涵蓋已知證據的同時仍只相當於 5 微米；超過此距離仍必須保留原本的 invalid/QC。
+SURFACE_BOUNDARY_TOLERANCE_M: Final[float] = 5.0e-6
+
+# 海床端與「海床高於海面」的幾何一致性沿用既有 1 微米契約。它與海面上界分開，
+# 避免為修正移動海面的邊界定位數值殘差而對海底越界提供更寬的通行範圍。
+VERTICAL_BOUNDARY_TOLERANCE_M: Final[float] = 1.0e-6
+
+
+def clamp_query_z_to_surface(z_m: float, eta_m: float) -> float | None:
+    """把海面容許帶內的 query z 夾回海面，並拒絕真正的海面上越。
+
+    ``z_m`` 與 ``eta_m`` 都是公尺制、海面向上為正的垂向座標。當 query z 位於
+    ``eta_m`` 上方不超過 ``SURFACE_BOUNDARY_TOLERANCE_M`` 時，回傳 ``eta_m``，讓
+    OCM 表層支援與 Stokes profile 對同一個物理海面計算；海面下的 query 保留原值。
+    非有限輸入或超過容許尺度的上越回傳 ``None``，呼叫端必須維持既有 fail-closed
+    狀態。此函式不檢查海床、乾點、域外或時間軸，因為那些狀態必須由各自資料契約判定。
+    """
+
+    try:
+        normalized_z = float(z_m)
+        normalized_eta = float(eta_m)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(normalized_z) or not math.isfinite(normalized_eta):
+        return None
+    if normalized_z > normalized_eta + SURFACE_BOUNDARY_TOLERANCE_M:
+        return None
+    return normalized_eta if normalized_z > normalized_eta else normalized_z
 
 
 class SampleQC(IntFlag):

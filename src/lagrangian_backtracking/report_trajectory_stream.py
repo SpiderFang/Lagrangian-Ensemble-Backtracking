@@ -37,7 +37,12 @@ import numpy as np
 from .aggregate_release_records import ScenarioStratum
 from .aggregate_spec import AggregateSpec
 from .engine import EnvironmentSampleStatus, Observation, ParticleResult
-from .models import ParticleState, ParticleStatus
+from .models import (
+    SURFACE_BOUNDARY_TOLERANCE_M,
+    VERTICAL_BOUNDARY_TOLERANCE_M,
+    ParticleState,
+    ParticleStatus,
+)
 from .report_material_statistics import MaterialStatisticsAccumulator, MaterialStatisticsProduct
 from .report_pathway_statistics import PathwayGridStatistics, build_pathway_grid_statistics
 from .report_spec import ReportSpec, validate_report_spec_against_aggregate_spec
@@ -63,7 +68,6 @@ __all__ = [
 
 
 _MAX_COUNT: Final[int] = 2**63 - 1
-_ENVIRONMENT_GEOMETRY_TOLERANCE_M: Final[float] = 1.0e-6
 _MEMBER_STATUS_KEYS: Final[tuple[str, ...]] = (
     "valid",
     ParticleStatus.DATA_GAP.value,
@@ -669,9 +673,9 @@ def _validate_environment_context(
     if observation.environment_qc_flags != 0 or type(observation.environment_qc_flags) is not int:
         raise ValueError(f"{label}.environment_qc_flags 必須是原生整數 0")
     if (
-        bed_z_m > z_m + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-        or z_m > eta_m + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-        or bed_z_m > eta_m + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
+        bed_z_m > z_m + VERTICAL_BOUNDARY_TOLERANCE_M
+        or z_m > eta_m + SURFACE_BOUNDARY_TOLERANCE_M
+        or bed_z_m > eta_m + VERTICAL_BOUNDARY_TOLERANCE_M
     ):
         raise ValueError(f"{label} 的 bed_z_m、z_m、eta_m 垂向範圍不相容")
     return eta_m, bed_z_m, z_m

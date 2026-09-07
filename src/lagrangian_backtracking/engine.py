@@ -37,6 +37,8 @@ from .integrators import (
     split_rk4_brownian_step,
 )
 from .models import (
+    SURFACE_BOUNDARY_TOLERANCE_M,
+    VERTICAL_BOUNDARY_TOLERANCE_M,
     BoundaryEvent,
     EventType,
     ParticleState,
@@ -76,13 +78,11 @@ class EnvironmentSampleStatus(StrEnum):
     INVALID = "invalid"
 
 
-_ENVIRONMENT_GEOMETRY_TOLERANCE_M = 1.0e-6
 _MAX_ENVIRONMENT_QC_FLAGS = (1 << 32) - 1
 _VELOCITY_SUM_RTOL = 1.0e-12
 _VELOCITY_SUM_ATOL = 1.0e-12
 _MAX_VELOCITY_QC_FLAGS = (1 << 32) - 1
 _YYYYMM_PATTERN = re.compile(r"^[0-9]{6}$")
-_SURFACE_CROSSING_TOLERANCE_M = 1.0e-6
 EnvironmentContext = tuple[
     EnvironmentSampleStatus,
     float | None,
@@ -223,9 +223,9 @@ def _validate_observation_environment(
         if not math.isfinite(normalized_z):
             raise ValueError("valid context 的 z_m 必須是有限數值")
         if (
-            normalized_bed > normalized_z + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-            or normalized_z > normalized_eta + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-            or normalized_bed > normalized_eta + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
+            normalized_bed > normalized_z + VERTICAL_BOUNDARY_TOLERANCE_M
+            or normalized_z > normalized_eta + SURFACE_BOUNDARY_TOLERANCE_M
+            or normalized_bed > normalized_eta + VERTICAL_BOUNDARY_TOLERANCE_M
         ):
             raise ValueError("valid context 的 bed_z_m、z_m、eta_m 垂向範圍不相容")
         return normalized_eta, normalized_bed, normalized_month, 0
@@ -1156,10 +1156,10 @@ def _is_proven_surface_stage_crossing(
     ):
         return False
     return not (
-        reference_bed > reference_eta + _SURFACE_CROSSING_TOLERANCE_M
-        or context_bed > context_eta + _SURFACE_CROSSING_TOLERANCE_M
-        or state_z > reference_eta + _SURFACE_CROSSING_TOLERANCE_M
-        or context_z <= context_eta + _SURFACE_CROSSING_TOLERANCE_M
+        reference_bed > reference_eta + VERTICAL_BOUNDARY_TOLERANCE_M
+        or context_bed > context_eta + VERTICAL_BOUNDARY_TOLERANCE_M
+        or state_z > reference_eta + SURFACE_BOUNDARY_TOLERANCE_M
+        or context_z <= context_eta + SURFACE_BOUNDARY_TOLERANCE_M
     )
 
 

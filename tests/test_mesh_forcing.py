@@ -14,7 +14,7 @@ from lagrangian_backtracking.forcing import (
 )
 from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.mesh import NativeMesh, _build_triangle_neighbors, triangulate_faces
-from lagrangian_backtracking.models import SampleQC
+from lagrangian_backtracking.models import SURFACE_BOUNDARY_TOLERANCE_M, SampleQC
 from lagrangian_backtracking.stokes import finite_depth_stokes
 
 
@@ -319,6 +319,121 @@ def test_ocm_moving_surface_uses_endpoint_surface_hold_and_query_time_gate(
     assert sample.bed_z_m == -10.0
     # after endpoint 全部使用 surface hold，故該端點尺度回到保守 0.1 m。
     assert sample.vertical_scale_m == 0.1
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_ocm_surface_boundary_residual_clamps_query_but_preserves_endpoint_top_support(
+    use_numba_kernel: bool,
+) -> None:
+    """同一海面容許尺度必須同時修正 query gate 與 endpoint top-layer 支援。
+
+    第一個案例把 after endpoint 的 ``eta`` 設在最高 ``zcor`` 上方約 3.368 微米，
+    對應 checkpoint-8 的最大移動海面邊界定位數值殘差；若 top-layer 支援仍使用舊的 1 微米門檻，
+    即使 query z 已夾回 eta 也會回傳 ``VERTICAL_UNSUPPORTED``。第二個案例把 query z
+    放在 query-time eta 上方但仍在 5 微米容許帶內，驗證最後的幾何 gate 與 NumPy／Numba
+    兩條路徑都把它視為海面，而不是將微小正差交給後續物理公式。
+    """
+
+    sampler = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel)
+    endpoint_top_offset_m = 3.367686e-6
+    sampler.elev[1, :] = 1.47 + endpoint_top_offset_m
+    endpoint_surface_sample = sampler.sample(
+        2.0,
+        3.0,
+        1.47 + endpoint_top_offset_m,
+        1_000_000_000,
+    )
+    assert endpoint_surface_sample.valid
+    assert endpoint_surface_sample.eta_m == 1.47 + endpoint_top_offset_m
+
+    sampler = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel)
+    query_time_ns = 146_666_667
+    query_alpha = query_time_ns / 1_000_000_000.0
+    query_eta_m = 1.77 + query_alpha * (1.47 - 1.77)
+    near_surface_sample = sampler.sample(
+        2.0,
+        3.0,
+        query_eta_m + SURFACE_BOUNDARY_TOLERANCE_M - 1.0e-9,
+        query_time_ns,
+    )
+    assert near_surface_sample.valid
+    assert near_surface_sample.eta_m == pytest.approx(query_eta_m)
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_ocm_surface_boundary_residual_above_tolerance_and_bed_overshoot_remain_unsupported(
+    use_numba_kernel: bool,
+) -> None:
+    """超過 5 微米的海面上越與任何海床下越都不得被表層容差掩蓋。"""
+
+    sampler = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel)
+    query_time_ns = 146_666_667
+    query_alpha = query_time_ns / 1_000_000_000.0
+    query_eta_m = 1.77 + query_alpha * (1.47 - 1.77)
+    above_surface = sampler.sample(
+        2.0,
+        3.0,
+        query_eta_m + SURFACE_BOUNDARY_TOLERANCE_M + 1.0e-9,
+        query_time_ns,
+    )
+    assert not above_surface.valid
+    assert above_surface.qc == SampleQC.VERTICAL_UNSUPPORTED
+
+    below_bed = sampler.sample(
+        2.0,
+        3.0,
+        -10.0 - 0.5 * SURFACE_BOUNDARY_TOLERANCE_M,
+        query_time_ns,
+    )
+    assert not below_bed.valid
+    assert below_bed.qc == SampleQC.VERTICAL_UNSUPPORTED
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_combined_forcing_clamps_surface_boundary_residual_before_stokes(
+    use_numba_kernel: bool,
+) -> None:
+    """OCM 已接受的海面邊界定位數值殘差在合成 Stokes 時不得再變成 ``INVALID_PHYSICS``。"""
+
+    ocm = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel)
+    times = np.array([0, 1_000_000_000], dtype=np.int64)
+    nww = NWWAnalysisMonth(
+        month_id="197001",
+        lon=np.array([120.0, 122.0]),
+        lat=np.array([24.0, 26.0]),
+        time_utc_ns=times,
+        significant_wave_height=np.full((2, 2, 2), 1.5),
+        peak_frequency=np.full((2, 2, 2), 0.125),
+        peak_direction_raw_deg=np.full((2, 2, 2), 225.0),
+        valid_mask_wave=np.ones((2, 2, 2), dtype=bool),
+        qc_flags=np.zeros((2, 2, 2), dtype=np.uint16),
+        maximum_time_gap_seconds=2.0,
+    )
+    forcing = CombinedMonthForcing(
+        ocm=ocm,
+        nww=nww,
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=0.0,
+        include_stokes=True,
+    )
+    query_time_ns = 146_666_667
+    query_alpha = query_time_ns / 1_000_000_000.0
+    query_eta_m = 1.77 + query_alpha * (1.47 - 1.77)
+    near_surface = forcing.sample(
+        2.0,
+        3.0,
+        query_eta_m + SURFACE_BOUNDARY_TOLERANCE_M - 1.0e-9,
+        query_time_ns,
+    )
+    at_surface = forcing.sample(2.0, 3.0, query_eta_m, query_time_ns)
+    assert near_surface.valid and at_surface.valid
+    assert near_surface.qc == SampleQC.OK
+    assert np.allclose(
+        [near_surface.u_mps, near_surface.v_mps, near_surface.w_mps],
+        [at_surface.u_mps, at_surface.v_mps, at_surface.w_mps],
+        rtol=0.0,
+        atol=1.0e-15,
+    )
 
 
 @pytest.mark.parametrize("use_numba_kernel", [False, True])

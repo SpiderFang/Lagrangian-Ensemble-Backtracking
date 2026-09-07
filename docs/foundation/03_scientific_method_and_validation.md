@@ -32,12 +32,12 @@ V_det = (u_ocm + u_stokes, v_ocm + v_stokes, w_ocm + w_b)
 
 OCM 速度由 native unstructured mesh 直接取樣：
 
-1. 在每個 source node 的 `zcor` 柱中尋找包夾粒子 z 的兩個有限 layer；若固定 z 只在某一時間 endpoint 高於最高有限 `zcor`，使用該 endpoint 最高 layer 的控制體值作 surface hold。
-2. 對 `hvel`、`vertical_velocity` 與候選 Kz 作線性垂向內插；surface hold 僅是 endpoint 支援政策，不是任意最近值外插，且不對底層做對稱 hold。
-3. 使用所在 triangle 的 barycentric weights 作水平內插，並以 query-time 線性內插的 `eta` 與 native bed 做最後 `z ∈ [bed, eta]` gate。
-4. 使用前後兩個 OCM 時次作線性時間內插；eta、bed 或最高 layer 必要物理量非有限，以及真正越過 query-time 海面／海床的案例均維持 invalid。
+1. 在每個 source node 的 `zcor` 柱中尋找包夾粒子 z 的兩個有限 layer；若固定 z 只在某一時間 endpoint 高於最高有限 `zcor`，使用該 endpoint 最高 layer 的控制體值作 surface hold。endpoint 判定使用共用海面容許尺度 `SURFACE_BOUNDARY_TOLERANCE_M = 5e-6 m`，不把單側最近值外插當成水柱資料。
+2. 對 `hvel`、`vertical_velocity` 與候選 Kz 作線性垂向內插；若 query-time `z - eta` 在 5 微米內，先把 query z 夾回 eta，再進行 endpoint 支援與 Stokes profile；底層不對稱採用此政策。
+3. 使用所在 triangle 的 barycentric weights 作水平內插，並以 query-time 線性內插的 `eta` 與 native bed 做最後 `z ∈ [bed, eta]` gate。超過 5 微米的海面上越、海床下越、非有限幾何與不相容水柱均維持 invalid；海床端既有 1 微米幾何契約不因本次修正改變。
+4. 使用前後兩個 OCM 時次作線性時間內插；eta、bed 或最高 layer 必要物理量非有限，以及乾點、域外、時間缺口均維持各自原有 QC，不由海面容差補值或改寫。
 
-若任一必要支撐 node 無法形成雙側支撐或合法 surface hold，回傳具原因的 invalid sample，不重新正規化剩餘 node 權重。這個工程政策只處理移動海面造成的 endpoint 支援洞，不能替代真實資料的科學驗證，也避免在陡坡、海床以下、真正海面以上或海岸缺值旁製造人工速度。
+若任一必要支撐 node 無法形成雙側支撐或合法 surface hold，回傳具原因的 invalid sample，不重新正規化剩餘 node 權重。5 微米的選擇是以 checkpoint-8 最大約 `3.367686e-6 m` 的海面邊界定位數值殘差（含浮點與積分／內插）加有限安全餘裕為依據，而非物理層距的任意比例；它只適用於海面上界，不能替代真實資料的科學驗證，也避免在陡坡、海床以下、超出容許尺度的真正海面以上或海岸缺值旁製造人工速度。
 
 ### 2.1 時間去重與缺時重建
 
@@ -397,7 +397,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | CRS round-trip | WGS84→metric→WGS84 誤差低於預先登錄門檻，domain corner/center 均測 |
 | triangle/quad | 面積、方向、對角線、triangle-to-face 與 barycentric sum 通過 |
 | mask/wetdry | 合成乾濕 face、海岸 triangle 與真實 snapshot 人工圖面抽查一致 |
-| 4D interpolation | 對線性 x/y/z/t 解析場達浮點容許誤差；底層與 query-time 海面外側案例確實失敗；移動海面 endpoint surface hold 與 NumPy/Numba parity 由單元測試鎖定 |
+| 4D interpolation | 對線性 x/y/z/t 解析場達浮點容許誤差；5 微米容許帶內的海面邊界定位數值殘差可取樣、超過尺度與底床下越確實失敗；移動海面 endpoint surface hold、Stokes 夾回與 NumPy/Numba parity 由單元測試鎖定 |
 
 ### 9.2 物理與積分
 

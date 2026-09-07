@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
+from lagrangian_backtracking.models import SURFACE_BOUNDARY_TOLERANCE_M
 from lagrangian_backtracking.stokes import (
     GRAVITY_MPS2,
     deep_water_stokes,
@@ -43,6 +45,30 @@ def test_finite_profile_converges_to_deep_water_formula() -> None:
     )
     assert np.isclose(finite.u_mps, deep_u, rtol=1e-10, atol=1e-12)
     assert np.isclose(finite.v_mps, deep_v, rtol=1e-10, atol=1e-12)
+
+
+def test_finite_depth_stokes_clamps_only_surface_boundary_residual() -> None:
+    """Stokes 對海面容許帶內的正向海面邊界定位數值殘差夾回，超過尺度仍拒絕。"""
+
+    kwargs = {
+        "significant_wave_height_m": 2.0,
+        "peak_frequency_hz": 0.125,
+        "direction_raw_deg": 0.0,
+        "surface_z_m": 0.0,
+        "bed_z_m": -20.0,
+    }
+    at_surface = finite_depth_stokes(**kwargs, particle_z_m=0.0)
+    within_tolerance = finite_depth_stokes(
+        **kwargs,
+        particle_z_m=0.9 * SURFACE_BOUNDARY_TOLERANCE_M,
+    )
+    assert np.isclose(within_tolerance.u_mps, at_surface.u_mps, rtol=0.0, atol=1.0e-15)
+    assert np.isclose(within_tolerance.v_mps, at_surface.v_mps, rtol=0.0, atol=1.0e-15)
+    with pytest.raises(ValueError, match="有效海床與海面"):
+        finite_depth_stokes(
+            **kwargs,
+            particle_z_m=SURFACE_BOUNDARY_TOLERANCE_M + 1.0e-9,
+        )
 
 
 def test_wave_from_cardinal_directions_are_reversed_to_propagation() -> None:

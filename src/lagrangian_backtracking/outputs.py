@@ -26,6 +26,8 @@ import pyarrow.parquet as pq
 
 from .engine import EnvironmentSampleStatus, Observation, ParticleResult
 from .models import (
+    SURFACE_BOUNDARY_TOLERANCE_M,
+    VERTICAL_BOUNDARY_TOLERANCE_M,
     BoundaryEvent,
     EventType,
     ParticleState,
@@ -109,7 +111,6 @@ _VELOCITY_STATUS_TO_CODE = {
 _VELOCITY_CODE_TO_STATUS = {
     code: status for status, code in _VELOCITY_STATUS_TO_CODE.items()
 }
-_ENVIRONMENT_GEOMETRY_TOLERANCE_M = 1.0e-6
 _VELOCITY_SUM_RTOL = 1.0e-12
 _VELOCITY_SUM_ATOL = 1.0e-12
 _VELOCITY_COMPONENT_FIELDS = (
@@ -358,9 +359,9 @@ def _encode_environment_observation(
         z_m = _finite_environment_value(observation.z_m, label="z_m", allow_none=False)
         assert eta_m is not None and bed_z_m is not None and z_m is not None
         if (
-            bed_z_m > z_m + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-            or z_m > eta_m + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-            or bed_z_m > eta_m + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
+            bed_z_m > z_m + VERTICAL_BOUNDARY_TOLERANCE_M
+            or z_m > eta_m + SURFACE_BOUNDARY_TOLERANCE_M
+            or bed_z_m > eta_m + VERTICAL_BOUNDARY_TOLERANCE_M
         ):
             raise ValueError("valid context 的 bed_z_m、z_m、eta_m 垂向範圍不相容")
         return 1, eta_m, bed_z_m, month, 0
@@ -1072,9 +1073,9 @@ def validate_trajectory_shard(
                             or not bed_is_finite
                             or not month_is_valid
                             or qc != 0
-                            or bed > float(z_values[index]) + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-                            or float(z_values[index]) > eta + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
-                            or bed > eta + _ENVIRONMENT_GEOMETRY_TOLERANCE_M
+                            or bed > float(z_values[index]) + VERTICAL_BOUNDARY_TOLERANCE_M
+                            or float(z_values[index]) > eta + SURFACE_BOUNDARY_TOLERANCE_M
+                            or bed > eta + VERTICAL_BOUNDARY_TOLERANCE_M
                         ):
                             add(f"environment[{index}]: valid_contract")
                     elif code == 2 and (

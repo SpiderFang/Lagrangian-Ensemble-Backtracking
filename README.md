@@ -54,7 +54,7 @@
 
 受體×到達配對的實際深度與三維初始條件來自到達 UTC 的 OCM 原生動態紀錄；OCM surface 只負責到達時間篩選，不代表配對的來源深度或三維流場資料。
 
-OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾住 query z；針對移動海面，若固定 z 在某一個 before／after 端點高於該端點最高有限 `zcor`，端點可使用最高有效層的速度、垂向速度與 Kz，表示 OCM 最上層控制體的 surface hold。這不是任意最近值外插，也不把 top `zcor` 當成物理海面；完成端點取樣與時間內插後，仍以 query-time 的 `eta`／native 海床檢查 `[bed, eta]`，真正越過海面、海床以下、乾點、缺值與時間缺口均維持 fail closed。Smagorinsky 水平 current 取樣共用同一端點支援規則，但仍執行自己的 query-time 幾何範圍檢查。此為工程取樣政策與單元測試契約，不代表已完成真實資料的科學驗證。
+OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾住 query z；針對移動海面，若固定 z 在某一個 before／after 端點高於該端點最高有限 `zcor`，端點可使用最高有效層的速度、垂向速度與 Kz，表示 OCM 最上層控制體的 surface hold。這不是任意最近值外插，也不把 top `zcor` 當成物理海面。所有海面上界查詢共用 `models.py` 的 `SURFACE_BOUNDARY_TOLERANCE_M = 5e-6 m`：只有 `z - eta` 不超過 5 微米時才先夾回 query-time `eta`，讓 endpoint top-layer 支援與 Stokes profile 使用同一表面；超過此尺度仍回傳 `VERTICAL_UNSUPPORTED`／保留原有失敗 QC。這個 5 微米尺度是為涵蓋 checkpoint-8 最大約 `3.367686e-6 m` 的海面邊界定位數值殘差（含浮點與積分／內插）而設，遠小於 OCM 垂向物理層距，並非可任意放大的物理緩衝。海床與「海床高於海面」的既有 1 微米幾何契約維持不變；乾點、缺值、域外與時間缺口也不因海面容差取得通行權。Smagorinsky 水平 current 取樣共用同一端點支援與 query-time 幾何範圍檢查。此為工程取樣政策與單元測試契約，不代表已完成真實資料的科學驗證。
 
 ### Observation 速度紀錄
 

@@ -19,6 +19,8 @@ from shapely.geometry.base import BaseGeometry
 
 from .geometry import SegmentCrossing, first_polygon_crossing, polygon_crossings
 from .models import (
+    SURFACE_BOUNDARY_TOLERANCE_M,
+    VERTICAL_BOUNDARY_TOLERANCE_M,
     BoundaryEvent,
     EventType,
     ParticleState,
@@ -26,8 +28,6 @@ from .models import (
     SampleQC,
     VelocitySample,
 )
-
-_VERTICAL_BOUNDARY_TOLERANCE_M = 1.0e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,14 +385,14 @@ def recover_surface_boundary_at_step_start(
         return None
     if not all(math.isfinite(value) for value in (eta, bed, z_m)):
         return None
-    if bed > eta + _VERTICAL_BOUNDARY_TOLERANCE_M:
+    if bed > eta + VERTICAL_BOUNDARY_TOLERANCE_M:
         return None
-    if z_m <= eta + _VERTICAL_BOUNDARY_TOLERANCE_M:
+    if z_m <= eta + SURFACE_BOUNDARY_TOLERANCE_M:
         return None
     reflected_z = 2.0 * eta - z_m
     if (
-        reflected_z < bed - _VERTICAL_BOUNDARY_TOLERANCE_M
-        or reflected_z > eta + _VERTICAL_BOUNDARY_TOLERANCE_M
+        reflected_z < bed - VERTICAL_BOUNDARY_TOLERANCE_M
+        or reflected_z > eta + SURFACE_BOUNDARY_TOLERANCE_M
     ):
         return None
     event = BoundaryEvent(

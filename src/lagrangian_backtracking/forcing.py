@@ -31,13 +31,15 @@ from .diffusion import (
 )
 from .geometry import DomainProjection
 from .mesh import MeshLocation, NativeMesh
-from .models import SampleQC, VelocityComponents, VelocitySample
+from .models import (
+    SURFACE_BOUNDARY_TOLERANCE_M,
+    VERTICAL_BOUNDARY_TOLERANCE_M,
+    SampleQC,
+    VelocityComponents,
+    VelocitySample,
+    clamp_query_z_to_surface,
+)
 from .stokes import finite_depth_stokes
-
-# 這個容差只處理公尺制浮點邊界的最後幾位，不會把有限距離的海面／海床穿越
-# 改寫成有效水柱。OCM 一般取樣、Smagorinsky 與 Numba kernel 都由同一數值傳入，
-# 以避免不同加速路徑對相同 query z 產生不同邊界判定。
-_VERTICAL_BOUNDARY_TOLERANCE_M = 1.0e-6
 
 
 def _vertical_support_indices(
@@ -50,7 +52,7 @@ def _vertical_support_indices(
     ``physical_z`` 是單一時間、單一 node 的 OCM ``zcor``，單位為 m 且海面向上為正；
     ``usable`` 表示該 layer 所需物理量是否全部有限。一般水柱仍要求 target z 有
     有效的下側與上側 layer，並以兩層做線性內插。唯一例外是 target z 高於該端點最高
-    有限 ``zcor``（含 `_VERTICAL_BOUNDARY_TOLERANCE_M` 的數值容差）：此時只能使用
+    有限 ``zcor``（含海面 ``SURFACE_BOUNDARY_TOLERANCE_M`` 的數值容差）：此時只能使用
     最高 ``zcor`` layer 本身，且該 layer 的必要物理量缺值就直接失敗，不能退回更深層
     或把它描述為任意最近值外插。這是 OCM 最上層控制體的端點支援，不是海面邊界判定；
     query-time 的 ``eta``／海床範圍仍由外層最後檢查。底部不採對稱 hold，故海床下方
@@ -72,7 +74,7 @@ def _vertical_support_indices(
         return None
     top_index = int(finite_indices[np.argmax(physical_z[finite_indices])])
     top_z = float(physical_z[top_index])
-    if target_z_m >= top_z - _VERTICAL_BOUNDARY_TOLERANCE_M:
+    if target_z_m >= top_z - SURFACE_BOUNDARY_TOLERANCE_M:
         if not bool(usable[top_index]):
             return None
         return top_index, top_index
@@ -98,12 +100,33 @@ def _query_z_within_geometric_bounds(
     if geometric_bounds is None or not np.isfinite(z_m):
         return False
     eta_m, bed_z_m = geometric_bounds
-    if not np.isfinite(eta_m) or not np.isfinite(bed_z_m) or bed_z_m > eta_m + _VERTICAL_BOUNDARY_TOLERANCE_M:
+    if (
+        not np.isfinite(eta_m)
+        or not np.isfinite(bed_z_m)
+        or bed_z_m > eta_m + VERTICAL_BOUNDARY_TOLERANCE_M
+    ):
         return False
     return (
-        z_m >= bed_z_m - _VERTICAL_BOUNDARY_TOLERANCE_M
-        and z_m <= eta_m + _VERTICAL_BOUNDARY_TOLERANCE_M
+        z_m >= bed_z_m - VERTICAL_BOUNDARY_TOLERANCE_M
+        and clamp_query_z_to_surface(z_m, eta_m) is not None
     )
+
+
+def _query_z_for_vertical_support(
+    z_m: float, geometric_bounds: tuple[float, float] | None
+) -> float:
+    """為 OCM 垂向支援提供已套用海面容許帶的 query z。
+
+    ``geometric_bounds`` 是 query-time 的 ``(eta_m, bed_z_m)``；若海面幾何可用，
+    只把容許帶內的微小上越夾回 ``eta_m``，讓 NumPy 與 Numba 看到完全相同的 target。
+    超過容許帶時保留原始 z，讓後續的幾何 gate 回傳 ``VERTICAL_UNSUPPORTED``，而不把
+    真實海面上越誤變成表層速度。幾何缺值時也保留原始 z，因為缺值不能取得邊界特權。
+    """
+
+    if geometric_bounds is None:
+        return z_m
+    clamped = clamp_query_z_to_surface(z_m, geometric_bounds[0])
+    return z_m if clamped is None else clamped
 
 
 def _time_bracket(
@@ -628,11 +651,12 @@ class OCMNativeMonth:
                 SampleQC.VERTICAL_UNSUPPORTED,
                 triangle_id=location.triangle_id,
             )
+        support_z_m = _query_z_for_vertical_support(z_m, geometric_bounds)
 
         first, first_qc, first_valid_count, first_excluded_count = self._smagorinsky_time_slice(
             location,
             time_index=before,
-            z_m=z_m,
+            z_m=support_z_m,
             settings=settings,
         )
         if first is None or first_qc != SampleQC.OK:
@@ -653,7 +677,7 @@ class OCMNativeMonth:
                 self._smagorinsky_time_slice(
                     location,
                     time_index=after,
-                    z_m=z_m,
+                    z_m=support_z_m,
                     settings=settings,
                 )
             )
@@ -789,7 +813,7 @@ class OCMNativeMonth:
         if (
             not np.isfinite(eta)
             or not np.isfinite(bed)
-            or bed > eta + _VERTICAL_BOUNDARY_TOLERANCE_M
+            or bed > eta + VERTICAL_BOUNDARY_TOLERANCE_M
         ):
             return None
         return eta, bed
@@ -833,6 +857,7 @@ class OCMNativeMonth:
             after=after,
             alpha=alpha,
         )
+        support_z_m = _query_z_for_vertical_support(z_m, geometric_bounds)
         if self.use_numba_kernel:
             face = location.source_face_local_index
             wet_values = np.asarray(self.wetdry_elem[[before, after], face], dtype=np.float64)
@@ -853,8 +878,8 @@ class OCMNativeMonth:
                     alpha,
                     np.asarray(location.node_indices, dtype=np.int64),
                     np.asarray(location.barycentric_weights, dtype=np.float64),
-                    z_m,
-                    _VERTICAL_BOUNDARY_TOLERANCE_M,
+                    support_z_m,
+                    SURFACE_BOUNDARY_TOLERANCE_M,
                 )
                 if valid:
                     eta_first = float(
@@ -873,11 +898,11 @@ class OCMNativeMonth:
                     first = second = None
                     first_qc = second_qc = SampleQC.VERTICAL_UNSUPPORTED
         else:
-            first, first_qc = self._spatial_at_time(location, time_index=before, z_m=z_m)
+            first, first_qc = self._spatial_at_time(location, time_index=before, z_m=support_z_m)
             if after == before:
                 second, second_qc = first, first_qc
             else:
-                second, second_qc = self._spatial_at_time(location, time_index=after, z_m=z_m)
+                second, second_qc = self._spatial_at_time(location, time_index=after, z_m=support_z_m)
         if first is None or second is None:
             eta, bed_z = geometric_bounds if geometric_bounds is not None else (np.nan, np.nan)
             return VelocitySample(

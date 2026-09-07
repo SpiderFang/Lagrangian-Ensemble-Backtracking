@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 from scipy.optimize import brentq
 
+from .models import SURFACE_BOUNDARY_TOLERANCE_M
+
 GRAVITY_MPS2 = 9.80665
 
 
@@ -107,8 +109,16 @@ def finite_depth_stokes(
         raise ValueError("Hs 不可為負且 fp 必須為正")
     water_depth = surface_z_m - bed_z_m
     relative_z = particle_z_m - surface_z_m
-    if water_depth <= 0 or relative_z > 1e-9 or relative_z < -water_depth - 1e-9:
+    if (
+        water_depth <= 0
+        or relative_z > SURFACE_BOUNDARY_TOLERANCE_M
+        or relative_z < -water_depth - 1e-9
+    ):
         raise ValueError("粒子必須位於有效海床與海面之間")
+    # OCM query 與 Stokes 必須把同一個微小海面上越視為同一個表面點；只夾回
+    # 5 微米容許帶內的正向海面邊界定位數值殘差，真正高於海面的粒子仍在上一個 gate 被拒絕。
+    if relative_z > 0.0:
+        relative_z = 0.0
     omega = 2.0 * math.pi * peak_frequency_hz
     wave_number = solve_wave_number(
         angular_frequency_radps=omega, water_depth_m=water_depth, gravity_mps2=gravity_mps2
