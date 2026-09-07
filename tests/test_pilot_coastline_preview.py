@@ -420,6 +420,77 @@ def _load_inputs(fixture: dict[str, Path]) -> dict[str, Any]:
     )
 
 
+def _rewrite_particle_statuses(
+    preview_dir: Path,
+    statuses: list[str],
+    ages: list[float],
+) -> None:
+    """只在測試 fixture 內重寫粒子終止欄位，並同步所有既有計數契約。
+
+    這個 helper 用來建立 forcing_start 的完成／提前反例；它模擬的是已存在的
+    ``particles.csv`` 與 ``summary.json``，不會呼叫引擎或改變 renderer 的資料層規則。
+    每顆粒子的 ``status`` 與 ``age_seconds`` 仍分開保存，測試才能確認圖面分類沒有把
+    提前 forcing_start 改寫成 max_age 或其他狀態。
+    """
+
+    particles_path = preview_dir / "particles.csv"
+    particle_rows = list(csv.DictReader(particles_path.open(newline="", encoding="utf-8")))
+    assert len(particle_rows) == len(statuses) == len(ages)
+    for row, status, age in zip(particle_rows, statuses, ages, strict=True):
+        row["status"] = status
+        row["age_seconds"] = f"{age:.12f}"
+        if status == "numerical_failure":
+            row["failure_reason"] = "invalid_velocity_sample"
+            row["failure_stage"] = "step_start"
+            row["qc_flags"] = "16"
+        else:
+            row["failure_reason"] = "unknown"
+            row["failure_stage"] = "unknown"
+            row["qc_flags"] = ""
+    with particles_path.open(newline="", encoding="utf-8") as stream:
+        fields = list(csv.DictReader(stream).fieldnames or [])
+    _write_csv(particles_path, fields, particle_rows)
+
+    manifest_path = preview_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["particles.csv"] = _file_contract(particles_path)
+    _write_json(manifest_path, manifest)
+
+    summary_path = preview_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["terminal_counts"] = {
+        status: sum(row["status"] == status for row in particle_rows) for status in _TERMINAL_STATUSES
+    }
+    summary["terminal_counts_by_vertical"] = {
+        vertical_id: {
+            status: sum(
+                row["vertical_id"] == vertical_id and row["status"] == status for row in particle_rows
+            )
+            for status in _TERMINAL_STATUSES
+        }
+        for vertical_id in _VERTICAL_LEVELS
+    }
+    summary["failure_details"] = [
+        {
+            "particle_id": row["particle_id"],
+            "status": "numerical_failure",
+            "failure_reason": "invalid_velocity_sample",
+            "qc_flags": 16,
+        }
+        for row in particle_rows
+        if row["status"] == "numerical_failure"
+    ]
+    summary["diagnostics"] = [
+        {
+            "status": "numerical_failure",
+            "count": summary["terminal_counts"]["numerical_failure"],
+            "failure_reason": "invalid_velocity_sample",
+            "qc_flags": 16,
+        }
+    ]
+    _refresh_summary_contract(preview_dir, summary)
+
+
 def test_load_plot_inputs_happy_path_preserves_counts_ids_and_denominators(
     synthetic_inputs: dict[str, Path],
     allow_synthetic_coastline_sha: None,
@@ -635,7 +706,10 @@ def test_baytrace_build_emits_four_pngs_readme_and_rebuild_contract(
     assert "scripts/analyze_cases.py" in readme
     assert "plot_case" in readme
     assert "初始位置（回溯起點）" in readme
-    assert "最終位置｜完成1小時回溯" in readme
+    assert "最終位置｜到達設定回溯時間上限（1小時）" in readme
+    assert "到達：2025-01-01 12:00 UTC；回溯至：2025-01-01 11:00 UTC" in readme
+    assert "位置1–5是五個受體／指定位置，不是時間順序" in readme
+    assert "各位置以本身回溯起點為 (0,0)" in readme
     assert "B／新竹外海" in readme or "B區" in readme
     assert readme.count("| 位置") == 5
     for position in range(1, 6):
@@ -753,7 +827,7 @@ def test_baytrace_build_uses_summary_horizon_run_counts_and_depth_axis(
     _refresh_summary_contract(preview_dir, summary)
 
     data = _load_inputs(synthetic_inputs)
-    assert _TARGET._baytrace_status_labels(data)["max_age"] == "完成12小時回溯"
+    assert _TARGET._baytrace_status_labels(data)["max_age"] == "到達設定回溯時間上限（12小時）"
     assert _TARGET._depth_axis_limits_and_ticks(summary) == (720.0, [0.0, 180.0, 360.0, 540.0, 720.0])
 
     output = tmp_path / "baytrace-style-12h"
@@ -780,7 +854,7 @@ def test_baytrace_build_uses_summary_horizon_run_counts_and_depth_axis(
     }
     readme = (output / "README.md").read_text(encoding="utf-8")
     assert "回溯上限12小時" in readme
-    assert "完成12小時回溯 6 顆" in readme
+    assert "到達設定回溯時間上限（12小時） 6 顆" in readme
     assert "202 筆模型保存紀錄" in readme
     assert "1h" not in readme
     assert "1小時" not in readme
@@ -823,7 +897,7 @@ def test_baytrace_artist_markers_and_labels_keep_initial_final_semantics(
     allow_synthetic_coastline_sha: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """確認新版 artist 實際保留 20 個綠色起點及紅色 9／8／3 終點形狀。"""
+    """確認新版 artist 實際保留 20 個綠色起點及三種既有終點的獨立形狀。"""
 
     import matplotlib
 
@@ -832,11 +906,15 @@ def test_baytrace_artist_markers_and_labels_keep_initial_final_semantics(
 
     data = _load_inputs(synthetic_inputs)
     labels = _TARGET._baytrace_status_labels(data)
-    handles = _TARGET._baytrace_endpoint_handles(labels, include_boundary=False)
+    handles = _TARGET._baytrace_endpoint_handles(
+        labels,
+        include_boundary=False,
+        statuses={"max_age", "flow_domain_open_exit", "numerical_failure"},
+    )
     assert [handle.get_label() for handle in handles] == [
         "初始位置（回溯起點）",
-        "最終位置｜完成1小時回溯",
         "最終位置｜離開計算範圍",
+        "最終位置｜到達設定回溯時間上限（1小時）",
         "最終位置｜取樣失敗停止",
     ]
     assert all(handle.get_color() == _TARGET._BAYTRACE_FINAL_COLOR for handle in handles[1:])
@@ -864,6 +942,128 @@ def test_baytrace_artist_markers_and_labels_keep_initial_final_semantics(
         face == _TARGET._BAYTRACE_FINAL_COLOR
         for marker, face, _ in marker_calls
         if marker in {"^", "s", "X"}
+    )
+
+
+def test_forcing_start_near_horizon_uses_data_window_label_and_full_time_summary(
+    synthetic_inputs: dict[str, Path],
+    tmp_path: Path,
+    writable_mpl_config: None,
+    allow_synthetic_coastline_sha: None,
+) -> None:
+    """確認容差內 forcing_start 顯示資料窗端點，且不改寫原始狀態或零計數分類。"""
+
+    horizon = 3600.0
+    # 這個差值比固定 1e-4 秒容差小，模擬真資料約 1.6e-5 秒的浮點誤差。
+    _rewrite_particle_statuses(
+        synthetic_inputs["preview_dir"],
+        ["forcing_start"] * 20,
+        [horizon - 1.6e-5] * 20,
+    )
+    data = _load_inputs(synthetic_inputs)
+
+    assert {row["status"] for row in data["particles"]} == {"forcing_start"}
+    assert set(_TARGET._forcing_start_age_states(data)) == {"completed"}
+    assert _TARGET._forcing_start_label(data) == "到達本次資料時間窗起點（完成1小時回溯）"
+    assert _TARGET._time_window_label(data["summary"]) == (
+        "到達：2025-01-01 12:00 UTC；回溯至：2025-01-01 11:00 UTC"
+    )
+    assert _TARGET._baytrace_terminal_summary(data) == (
+        "20 顆到達本次資料時間窗起點（完成1小時回溯）、0 顆離域、0 顆數值失敗。"
+    )
+
+    labels = _TARGET._baytrace_status_labels(data)
+    assert labels["forcing_start"] != labels["max_age"]
+    assert labels["max_age"] == "到達設定回溯時間上限（1小時）"
+    handles = _TARGET._baytrace_endpoint_handles(
+        labels,
+        include_boundary=False,
+        forcing_start_states={"completed"},
+        forcing_start_summary=data["summary"],
+        statuses={"forcing_start", "max_age", "numerical_failure"},
+    )
+    forcing_handle = next(handle for handle in handles if "資料時間窗起點" in handle.get_label())
+    max_age_handle = next(handle for handle in handles if "設定回溯時間上限" in handle.get_label())
+    numerical_handle = next(handle for handle in handles if "數值停止" in handle.get_label())
+    assert forcing_handle.get_marker() == "D"
+    assert forcing_handle.get_color() == _TARGET._BAYTRACE_FORCING_START_COLOR
+    assert max_age_handle.get_marker() == "^"
+    assert max_age_handle.get_label() == "最終位置｜到達設定回溯時間上限（1小時）"
+    assert numerical_handle.get_marker() == "X"
+    assert numerical_handle.get_color() == _TARGET._BAYTRACE_FINAL_COLOR
+
+    output = tmp_path / "forcing-start-completed"
+    manifest = _TARGET.build_coastline_preview(
+        synthetic_inputs["preview_dir"],
+        synthetic_inputs["domain_path"],
+        synthetic_inputs["open_path"],
+        synthetic_inputs["coastline_path"],
+        output,
+        style="baytrace",
+    )
+    assert manifest["terminal_counts"]["forcing_start"] == 20
+    assert manifest["terminal_counts"]["max_age"] == 0
+    assert manifest["forcing_start_age_tolerance_seconds"] == pytest.approx(1e-4)
+    assert manifest["forcing_start_age_state_counts"] == {"completed": 20}
+    readme = (output / "README.md").read_text(encoding="utf-8")
+    assert "到達：2025-01-01 12:00 UTC；回溯至：2025-01-01 11:00 UTC" in readme
+    assert "20 顆到達本次資料時間窗起點（完成1小時回溯）、0 顆離域、0 顆數值失敗。" in readme
+    assert "最終位置｜到達設定回溯時間上限（1小時）" in readme
+    assert "0 顆完成回溯" not in readme
+
+
+def test_forcing_start_early_than_horizon_is_not_completion(
+    synthetic_inputs: dict[str, Path],
+    allow_synthetic_coastline_sha: None,
+) -> None:
+    """確認明顯早於 horizon 的 forcing_start 顯示提前，資料層仍不變。
+
+    反例刻意提前一秒；相較 1e-4 秒固定容差仍有四個數量級差距，不能被 output
+    interval 300 秒這種過寬界線吞掉。
+    """
+
+    horizon = 3600.0
+    _rewrite_particle_statuses(
+        synthetic_inputs["preview_dir"],
+        ["forcing_start"] * 20,
+        [horizon - 1.0] * 20,
+    )
+    data = _load_inputs(synthetic_inputs)
+
+    assert _TARGET._forcing_start_age_state(horizon - 0.5e-4, horizon) == "completed"
+    assert _TARGET._forcing_start_age_state(horizon - 2.0e-4, horizon) == "early"
+    assert set(_TARGET._forcing_start_age_states(data)) == {"early"}
+    assert _TARGET._forcing_start_label(data) == "提前到達驅動資料起點"
+    assert _TARGET._baytrace_terminal_summary(data) == "20 顆提前到達驅動資料起點、0 顆離域、0 顆數值失敗。"
+    assert {row["status"] for row in data["particles"]} == {"forcing_start"}
+    marker, color = _TARGET._baytrace_endpoint_style("forcing_start", "early")
+    assert marker == "D"
+    assert color == _TARGET._BAYTRACE_FORCING_START_EARLY_COLOR
+    assert color != _TARGET._BAYTRACE_FINAL_COLOR
+
+
+def test_baytrace_terminal_markers_keep_all_registered_states_distinct(
+    synthetic_inputs: dict[str, Path],
+    allow_synthetic_coastline_sha: None,
+) -> None:
+    """確認離域、海岸接觸、資料缺口等狀態各有 marker，不會退回同一個預設菱形。"""
+
+    data = _load_inputs(synthetic_inputs)
+    labels = _TARGET._baytrace_status_labels(data)
+    assert set(_TARGET._STATUS_MARKERS) == set(_TERMINAL_STATUSES)
+    assert len(set(_TARGET._STATUS_MARKERS.values())) == len(_TERMINAL_STATUSES)
+    assert labels["coast_contact"] == "接觸海岸"
+    assert labels["surface_regime_exit"] == "離開表面適用範圍"
+    assert labels["deposited"] == "沉積"
+    assert labels["data_gap"] == "資料缺口"
+    assert _TARGET._baytrace_endpoint_style("coast_contact")[0] == "P"
+    assert _TARGET._baytrace_endpoint_style("numerical_failure") == (
+        "X",
+        _TARGET._BAYTRACE_FINAL_COLOR,
+    )
+    assert _TARGET._baytrace_endpoint_style("forcing_start", "completed") == (
+        "D",
+        _TARGET._BAYTRACE_FORCING_START_COLOR,
     )
 
 

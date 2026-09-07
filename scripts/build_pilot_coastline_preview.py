@@ -26,7 +26,7 @@ import math
 import shlex
 from collections import Counter, defaultdict
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -204,11 +204,21 @@ _VERTICAL_COLORS = {
 """既有垂向層的固定圖色；顏色只表示層別，不表示來源機率。"""
 
 _STATUS_MARKERS = {
-    "max_age": "^",
     "flow_domain_open_exit": "s",
+    "coast_contact": "P",
+    "surface_regime_exit": "v",
+    "deposited": "d",
+    "forcing_start": "D",
+    "data_gap": "h",
+    "max_age": "^",
     "numerical_failure": "X",
 }
-"""三種本次試跑終止狀態的幾何標記，避免把終點混稱為來源。"""
+"""八種已登錄終止狀態各自使用固定幾何標記，避免終點被混稱為來源。
+
+``forcing_start`` 的菱形（``D``）與 ``max_age`` 的三角形、開放邊界離域的方形及
+``numerical_failure`` 的紅色叉號分開；這只是在圖面保留狀態差異，不代表任何狀態
+本身就是科學來源判定。
+"""
 
 _VERTICAL_LABELS = {
     "near_bed": "近海床",
@@ -218,8 +228,8 @@ _VERTICAL_LABELS = {
 }
 """初始水層的中文圖例，與 CSV 層別及固定顏色一一對應。"""
 
-_BAYTRACE_STYLE_VERSION = "1.0.0"
-"""新版圖面呈現契約版本；legacy 分支不使用此版本欄位。"""
+_BAYTRACE_STYLE_VERSION = "1.2.0"
+"""新版圖面呈現契約版本；1.2.0 分開設定回溯上限與資料窗端點文字。"""
 
 _BAYTRACE_VERTICAL_COLORS = {
     "near_bed": "#377eb8",
@@ -247,7 +257,15 @@ _BAYTRACE_VERTICAL_DEFINITIONS = {
 
 _BAYTRACE_INITIAL_COLOR = "#1a9850"
 _BAYTRACE_FINAL_COLOR = "#d73027"
-"""新版端點固定使用綠色起點與紅色終點，避免與水層線色混淆。"""
+_BAYTRACE_FORCING_START_COLOR = "#7b3294"
+_BAYTRACE_FORCING_START_EARLY_COLOR = "#d95f02"
+_FORCING_START_AGE_TOLERANCE_SECONDS = 1e-4
+"""新版端點顏色與 forcing_start age 核對容差；容差為固定 0.1 毫秒。
+
+本容差比本次真資料約 1.6e-5 秒的誤差大一個數量級，但仍遠小於 300 秒保存／輸出
+間隔，不會把真正提前數百秒或數秒的 forcing_start 停止吞成「完成設定時長」。紫色
+表示在容差內抵達設定 horizon，橙色表示明顯提前；兩者都不是紅色數值失敗叉號。
+"""
 
 _TERMINAL_STATUSES = (
     "flow_domain_open_exit",
@@ -283,7 +301,7 @@ _BAYTRACE_STATUS_COLORS = {
     "max_age": "#54a24b",
     "numerical_failure": "#79706e",
 }
-"""停止圖分段色；此色只表示分類，終點標記仍一律使用紅色。"""
+"""停止圖分段色；只表示分類數量，不取代水平／垂向端點的狀態標記。"""
 
 
 def _display_font():
@@ -299,15 +317,48 @@ def _display_font():
 
 
 def _subtitle(summary: dict[str, Any]) -> str:
-    """由來源到達時刻與回溯上限組合副題；不把模型保存紀錄稱為實測觀測。"""
+    """建立共用時間副題，完整列出到達時刻與回溯至的 UTC 日期時間。
 
-    arrival = datetime.fromisoformat(summary["arrival_utc"])
+    ``arrival_utc`` 是受體／指定位置的到達時刻，回溯至時間由已核對的
+    ``settings.horizon_seconds`` 計算。完整顯示兩個日期可避免跨日回溯被誤讀成同一
+    日期內的時間循環；此文字只描述資料時間窗，不把模型保存紀錄稱為實測觀測。
+    """
+
     horizon = _horizon_seconds(summary)
-    end = arrival - timedelta(seconds=horizon)
     return (
-        f"{arrival:%Y-%m-%d %H:%M} → {end:%H:%M} UTC｜"
+        f"{_time_window_label(summary)}｜"
         f"回溯{horizon / 3600:g}小時｜{summary['particle_count']}顆粒子"
     )
+
+
+def _time_window(summary: dict[str, Any]) -> tuple[datetime, datetime]:
+    """回傳以 UTC 表示的到達與回溯至時刻，拒絕沒有時區的時間字串。
+
+    preview 的 ``arrival_utc`` 是資料交換用的 ISO-8601 到達時間；本函式只依回溯
+    設定計算顯示端點，不改寫 summary，也不從粒子 ``age_seconds`` 反推事件。forcing
+    起點的標籤是否適用仍由輸入的 ``status=forcing_start`` 決定，不能因時間相減吻合
+    就把其他終止狀態改成 forcing_start。
+    """
+
+    try:
+        arrival = datetime.fromisoformat(str(summary["arrival_utc"]))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("preview arrival_utc 必須是含時區的 ISO-8601 時間") from None
+    if arrival.tzinfo is None:
+        raise ValueError("preview arrival_utc 必須明示時區")
+    arrival_utc = arrival.astimezone(UTC)
+    return arrival_utc, arrival_utc - timedelta(seconds=_horizon_seconds(summary))
+
+
+def _time_window_label(summary: dict[str, Any]) -> str:
+    """產生明示完整日期的 UTC 時間列，避免跨日回溯只剩 ``HH:MM``。
+
+    這個顯示 helper 不代表資料中每一顆粒子都一定抵達回溯至時刻；是否完成本次
+    forcing 時間窗，必須仍以各粒子的原始終止狀態判定。
+    """
+
+    arrival, start = _time_window(summary)
+    return f"到達：{arrival:%Y-%m-%d %H:%M} UTC；回溯至：{start:%Y-%m-%d %H:%M} UTC"
 
 
 def _horizon_seconds(summary: dict[str, Any]) -> float:
@@ -339,6 +390,106 @@ def _max_age_label(summary: dict[str, Any]) -> str:
     """由回溯設定建立 max-age 的中文標籤，避免把固定時長寫死。"""
 
     return f"完成{_horizon_hours_text(summary)}小時回溯"
+
+
+def _baytrace_max_age_label(summary: dict[str, Any]) -> str:
+    """建立 BayTrace 專用的 max_age 標籤，明確表示它是設定上限而非資料窗端點。
+
+    legacy 圖面仍沿用舊的 ``完成N小時回溯`` 文字；新版 BayTrace 必須與
+    ``forcing_start`` 的「到達本次資料時間窗起點（完成N小時回溯）」分開，避免
+    讀者把數值上限事件誤讀成抵達 forcing 資料窗起點。小時數直接由 summary
+    的 ``settings.horizon_seconds`` 計算，不把本次 24 小時案例寫死。
+    """
+
+    return f"到達設定回溯時間上限（{_horizon_hours_text(summary)}小時）"
+
+
+def _forcing_start_age_state(age_seconds: Any, horizon_seconds: float) -> str:
+    """依單顆粒子 age 與設定 horizon 判定 forcing_start 的顯示狀態。
+
+    ``completed`` 只在 ``abs(age_seconds - horizon_seconds)`` 不超過固定
+    ``1e-4`` 秒時成立；``early`` 表示明顯早於 horizon，其他值則保守標為
+    ``overrun`` 或 ``unverified``。這個判定只控制圖面文字與顏色，絕不修改粒子的
+    原始 ``status=forcing_start``，也不把抵達 forcing 資料窗起點推論成污染來源。
+    """
+
+    try:
+        age = float(age_seconds)
+    except (TypeError, ValueError):
+        return "unverified"
+    if not math.isfinite(age) or not math.isfinite(horizon_seconds):
+        return "unverified"
+    delta = age - horizon_seconds
+    if abs(delta) <= _FORCING_START_AGE_TOLERANCE_SECONDS:
+        return "completed"
+    if delta < -_FORCING_START_AGE_TOLERANCE_SECONDS:
+        return "early"
+    return "overrun"
+
+
+def _forcing_start_age_states(data: dict[str, Any]) -> list[str]:
+    """逐列讀取 forcing_start 粒子的 age，回傳每顆粒子的保守顯示分類。
+
+    只有原始 status 已是 ``forcing_start`` 的粒子會進入清單；其他終止狀態即使
+    age 恰好接近 horizon，也不會被標成資料窗端點。清單順序沿用 particles.csv，
+    方便 manifest 與測試追溯每顆粒子的判定數量。
+    """
+
+    horizon = _horizon_seconds(data["summary"])
+    return [
+        _forcing_start_age_state(particle.get("age_seconds"), horizon)
+        for particle in data["particles"]
+        if particle.get("status") == "forcing_start"
+    ]
+
+
+def _forcing_start_state_label(summary: dict[str, Any], state: str) -> str:
+    """回傳單一 forcing_start age 分類的中文端點標籤。"""
+
+    if state == "completed":
+        return f"到達本次資料時間窗起點（完成{_horizon_hours_text(summary)}小時回溯）"
+    if state == "early":
+        return "提前到達驅動資料起點"
+    if state == "overrun":
+        return "到達驅動資料起點（回溯時長超過設定）"
+    return "到達驅動資料起點（回溯時長未核對）"
+
+
+def _forcing_start_label(data: dict[str, Any]) -> str:
+    """由每顆 forcing_start 粒子的 age 建立整批安全的圖例／摘要標籤。
+
+    全部粒子在容差內時才使用「完成設定時長」；全部明顯提前時使用明確的「提前」
+    文案。若同一批資料混合兩種狀態，則使用不宣稱全批完成的保守文字；水平／垂向
+    renderer 仍會依每顆粒子的 age 類別使用對應顏色，避免 aggregate label 掩蓋個體
+    差異。原始 status 與 terminal_counts 永遠不被改寫。
+    """
+
+    summary = data["summary"]
+    states = set(_forcing_start_age_states(data))
+    if states == {"completed"}:
+        return _forcing_start_state_label(summary, "completed")
+    if states == {"early"}:
+        return _forcing_start_state_label(summary, "early")
+    if "early" in states:
+        return "到達驅動資料起點（含提前到達；各粒子依 age 判讀）"
+    if "overrun" in states:
+        return "到達驅動資料起點（回溯時長未全部符合設定）"
+    return "到達驅動資料起點（回溯時長未核對）"
+
+
+def _position_order_note(summary: dict[str, Any]) -> str:
+    """說明水平總覽的位置編號是受體／指定位置，不是粒子時間序列。
+
+    編號沿用 summary 的原始水平面板順序，避免讀者把位置1到位置N誤看成同一粒子
+    隨時間移動的先後順序；目前真實案例的 N=5，因此輸出「位置1–5是五個受體／指定
+    位置，不是時間順序」。
+    """
+
+    count = len(summary["horizontal_panels"])
+    count_text = {1: "一個", 2: "兩個", 3: "三個", 4: "四個", 5: "五個"}.get(
+        count, f"{count}個"
+    )
+    return f"位置1–{count}是{count_text}受體／指定位置，不是時間順序。"
 
 
 def _depth_axis_limits_and_ticks(summary: dict[str, Any]) -> tuple[float, list[float]]:
@@ -830,13 +981,71 @@ def _sampling_failure_is_verified(data: dict[str, Any]) -> bool:
 
 
 def _baytrace_status_labels(data: dict[str, Any]) -> dict[str, str]:
-    """依資料核對結果建立新版顯示名稱，底層 status 值與計數永遠不被改寫。"""
+    """依資料核對結果建立新版顯示名稱，底層 status 值與計數永遠不被改寫。
+
+    ``forcing_start`` 的文字由每顆粒子的 age 與本次回溯設定動態產生，讓圖例同時
+    交代資料窗端點與本案例的回溯時長；它只反映輸入事件的顯示語意，不會把 status
+    轉成 ``max_age``。
+    """
 
     labels = dict(_BAYTRACE_STATUS_LABELS)
-    labels["max_age"] = _max_age_label(data["summary"])
+    labels["max_age"] = _baytrace_max_age_label(data["summary"])
+    labels["forcing_start"] = _forcing_start_label(data)
     if _sampling_failure_is_verified(data):
         labels["numerical_failure"] = "取樣失敗停止"
     return labels
+
+
+def _baytrace_endpoint_style(status: str, forcing_age_state: str | None = None) -> tuple[str, str]:
+    """回傳水平／垂向終點的 marker 與顏色，保留每一種 status 的視覺差異。
+
+    所有已登錄狀態均從固定表取得形狀；``forcing_start`` 仍固定使用非紅色菱形，
+    但依單顆粒子的 age 分類選紫色（容差內完成）、橙色（明顯提前）或保守色（其他
+    未核對情況），以明確區分資料窗端點與紅色 ``X`` 的 ``numerical_failure``。未知
+    值只提供保守 fallback 給直接呼叫的繪圖 helper，正式 build 仍會在資料核對階段
+    拒絕未登錄狀態。
+    """
+
+    marker = _STATUS_MARKERS.get(status, "D")
+    if status != "forcing_start":
+        color = _BAYTRACE_FINAL_COLOR
+    elif forcing_age_state == "early":
+        color = _BAYTRACE_FORCING_START_EARLY_COLOR
+    elif forcing_age_state in {"overrun", "unverified"}:
+        color = "#756bb1"
+    else:
+        color = _BAYTRACE_FORCING_START_COLOR
+    return marker, color
+
+
+def _baytrace_terminal_summary(data: dict[str, Any]) -> str:
+    """建立停止圖頂端摘要，區分資料窗端點、一般回溯上限、離域與數值失敗。
+
+    ``forcing_start`` 只有在原始粒子 status 確實如此時才列入「到達本次資料時間窗
+    起點」；本函式同時讀取每顆粒子的 age，保留提前與完成設定時長的差異，不改寫
+    資料層。當本次 24 小時案例的 20 顆粒子全為容差內的 forcing_start 時，摘要會
+    寫出 20 顆到達資料窗起點，而不會寫成「0 顆完成回溯」。此顯示判讀仍只限於已選
+    forcing window 的端點，不是科學來源或因果判定。
+    """
+
+    summary = data["summary"]
+    counts = summary["terminal_counts"]
+    forcing_count = int(counts.get("forcing_start", 0))
+    max_age_count = int(counts.get("max_age", 0))
+    completion_parts: list[str] = []
+    if forcing_count:
+        completion_parts.append(f"{forcing_count} 顆{_forcing_start_label(data)}")
+    if max_age_count:
+        completion_parts.append(f"{max_age_count} 顆{_baytrace_max_age_label(summary)}")
+    if not completion_parts:
+        completion_parts.append("0 顆到達本次資料時間窗起點")
+    completion_parts.extend(
+        (
+            f"{int(counts.get('flow_domain_open_exit', 0))} 顆離域",
+            f"{int(counts.get('numerical_failure', 0))} 顆數值失敗",
+        )
+    )
+    return "、".join(completion_parts) + "。"
 
 
 def _baytrace_layer_label(level: str) -> str:
@@ -854,21 +1063,20 @@ def _baytrace_layer_definition(level: str) -> str:
 def _baytrace_metadata(summary: dict[str, Any]) -> str:
     """組合四張新版圖共用的研究情境摘要，不顯示 run／scenario 等內部識別碼。
 
-    時間只把既有 arrival 與 horizon 轉成易讀的 UTC 時段；不從圖面推算新的
+    時間只把既有 arrival 與 horizon 轉成完整日期的 UTC 時間列；不從圖面推算新的
     垂向高度或粒子統計。``M`` 的含義由「同一組粒子」與 README 另行說明，避免
     將成員數誤讀為已完成回溯的數量。
     """
 
-    arrival = datetime.fromisoformat(summary["arrival_utc"])
-    horizon = float(summary["settings"]["horizon_seconds"])
-    start = arrival - timedelta(seconds=horizon)
+    arrival, _ = _time_window(summary)
+    horizon = _horizon_seconds(summary)
     region = summary.get("projection", {}).get("analysis_region_id", "B")
     site = {"hsinchu": "新竹外海"}.get(summary.get("study_site_id"), "研究站點")
     return (
         f"{region}區／{site}｜{arrival:%Y-%m-%d}｜"
         f"同一組{summary['particle_count']}顆粒子｜"
         f"{len(summary['horizontal_panels'])}個初始位置×{len(summary['vertical_order'])}個初始水層｜"
-        f"單一沉降材質｜{arrival:%H:%M}→{start:%H:%M} UTC｜"
+        f"單一沉降材質｜{_time_window_label(summary)}｜"
         f"回溯上限{horizon / 3600:g}小時"
     )
 
@@ -890,8 +1098,25 @@ def _baytrace_layer_handles(levels: list[str]):
     ]
 
 
-def _baytrace_endpoint_handles(status_labels: dict[str, str], *, include_boundary: bool = True):
-    """建立「標記：端點／停止狀態」圖例；三種終點形狀全部固定為紅色。"""
+def _baytrace_endpoint_handles(
+    status_labels: dict[str, str],
+    *,
+    include_boundary: bool = True,
+    forcing_start_states: set[str] | None = None,
+    forcing_start_summary: dict[str, Any] | None = None,
+    statuses: set[str] | None = None,
+):
+    """建立「標記：端點／停止狀態」圖例，保留八種終止狀態的獨立標記。
+
+    ``forcing_start`` 在容差內完成時使用紫色菱形，明顯提前時使用橙色菱形並明示
+    「提前到達」；只有真正的 ``numerical_failure`` 使用紅色 ``X``。其他狀態仍保留
+    各自 marker 與中文名稱，不因本次資料恰好只有 forcing_start 就合併成同一類。
+    ``forcing_start_states`` 由呼叫端以每顆粒子的 age 建立；未提供時沿用傳入的
+    aggregate label，方便單元測試與其他相容呼叫。若要繪製多種 forcing_start age
+    狀態，呼叫端也必須傳入 summary，讓每個圖例項目使用同一 horizon 設定。
+    ``statuses`` 讓水平／垂向圖例只列本批實際出現的終止狀態，避免零計數項目擠壓
+    圖面；停止原因柱狀圖仍固定列出全部八種狀態與零計數。
+    """
 
     from matplotlib.lines import Line2D
 
@@ -908,15 +1133,48 @@ def _baytrace_endpoint_handles(status_labels: dict[str, str], *, include_boundar
             label="初始位置（回溯起點）",
         )
     ]
-    for status in ("max_age", "flow_domain_open_exit", "numerical_failure"):
+    selected_statuses = (
+        _TERMINAL_STATUSES
+        if statuses is None
+        else tuple(status for status in _TERMINAL_STATUSES if status in statuses)
+    )
+    for status in selected_statuses:
+        if status == "forcing_start" and forcing_start_states:
+            forcing_labels = [
+                state
+                for state in ("completed", "early", "overrun", "unverified")
+                if state in forcing_start_states
+            ]
+        else:
+            forcing_labels = []
+        if forcing_labels:
+            if forcing_start_summary is None:
+                raise ValueError("forcing_start 分類圖例缺少 summary horizon")
+            for state in forcing_labels:
+                marker, color = _baytrace_endpoint_style(status, state)
+                handles.append(
+                    Line2D(
+                        [],
+                        [],
+                        marker=marker,
+                        color=color,
+                        markerfacecolor=color,
+                        markeredgecolor=color,
+                        linestyle="None",
+                        markersize=7,
+                        label=f"最終位置｜{_forcing_start_state_label(forcing_start_summary, state)}",
+                    )
+                )
+            continue
+        marker, color = _baytrace_endpoint_style(status)
         handles.append(
             Line2D(
                 [],
                 [],
-                marker=_STATUS_MARKERS[status],
-                color=_BAYTRACE_FINAL_COLOR,
-                markerfacecolor=_BAYTRACE_FINAL_COLOR,
-                markeredgecolor=_BAYTRACE_FINAL_COLOR,
+                marker=marker,
+                color=color,
+                markerfacecolor=color,
+                markeredgecolor=color,
                 linestyle="None",
                 markersize=7,
                 label=f"最終位置｜{status_labels[status]}",
@@ -947,9 +1205,10 @@ def render_baytrace_overview(data: dict[str, Any], output_path: str | Path) -> P
     """繪製新版經緯度區域總覽，第一眼說明平面回溯問題與端點語意。
 
     軌跡仍逐粒子連接既有保存觀測；總覽用原 AEQD 的反投影顯示經度／緯度，海岸
-    僅作已確認的地理參照。四層線色固定使用藍、橙、紫、青，綠色只表示回溯起點，
-    紅色只表示追蹤停止位置；``^``、``s``、``X`` 分別保留 max_age、開放邊界離域、
-    numerical_failure 的停止形狀。這張圖不把終點解讀成已知污染來源。
+    僅作已確認的地理參照。四層線色固定使用藍、橙、紫、青，綠色只表示回溯起點；
+    終點依八種 status 使用各自形狀，forcing_start 另依每顆 age 以紫／橙菱形區分
+    容差內完成與提前抵達，numerical_failure 才使用紅色 X。這張圖不把終點解讀成
+    已知污染來源。
     """
 
     import matplotlib
@@ -964,6 +1223,9 @@ def render_baytrace_overview(data: dict[str, Any], output_path: str | Path) -> P
     curves = _ordered_baytrace_curves(data)
     levels = list(summary["vertical_order"])
     status_labels = _baytrace_status_labels(data)
+    forcing_start_states = set(_forcing_start_age_states(data))
+    terminal_statuses = {particle["status"] for particle in data["particles"]}
+    horizon_seconds = _horizon_seconds(summary)
     font = _display_font()
     fig, ax = plt.subplots(figsize=(12, 8), dpi=150)
     try:
@@ -1008,15 +1270,23 @@ def render_baytrace_overview(data: dict[str, Any], output_path: str | Path) -> P
                     linestyle="None",
                     zorder=6,
                 )
+            marker, endpoint_color = _baytrace_endpoint_style(
+                particle["status"],
+                _forcing_start_age_state(
+                    particle.get("age_seconds"), horizon_seconds
+                )
+                if particle.get("status") == "forcing_start"
+                else None,
+            )
             ax.plot(
                 float(particle["longitude"]),
                 float(particle["latitude"]),
-                marker=_STATUS_MARKERS.get(particle["status"], "D"),
+                marker=marker,
                 markersize=7.1,
-                markerfacecolor=_BAYTRACE_FINAL_COLOR,
-                markeredgecolor=_BAYTRACE_FINAL_COLOR,
+                markerfacecolor=endpoint_color,
+                markeredgecolor=endpoint_color,
                 markeredgewidth=0.8,
-                color=_BAYTRACE_FINAL_COLOR,
+                color=endpoint_color,
                 linestyle="None",
                 zorder=7,
             )
@@ -1054,7 +1324,7 @@ def render_baytrace_overview(data: dict[str, Any], output_path: str | Path) -> P
         fig.text(
             0.5,
             0.962,
-            "從指定位置往前回溯，粒子經過哪些位置？",
+            f"從指定位置往前回溯，粒子經過哪些位置？{_position_order_note(summary)}",
             ha="center",
             va="top",
             fontproperties=font,
@@ -1084,7 +1354,12 @@ def render_baytrace_overview(data: dict[str, Any], output_path: str | Path) -> P
         )
         layer_legend.get_title().set_fontproperties(font)
         endpoint_legend = fig.legend(
-            handles=_baytrace_endpoint_handles(status_labels),
+            handles=_baytrace_endpoint_handles(
+                status_labels,
+                forcing_start_states=forcing_start_states,
+                forcing_start_summary=summary,
+                statuses=terminal_statuses,
+            ),
             title="標記：端點／停止狀態",
             loc="lower center",
             bbox_to_anchor=(0.5, 0.025),
@@ -1122,6 +1397,9 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
     curves = _ordered_baytrace_curves(data)
     levels = list(summary["vertical_order"])
     status_labels = _baytrace_status_labels(data)
+    forcing_start_states = set(_forcing_start_age_states(data))
+    terminal_statuses = {particle["status"] for particle in data["particles"]}
+    horizon_seconds = _horizon_seconds(summary)
     boundary = data["projection"].project_geometry(data["open_geometry"])
     font = _display_font()
     # 資料面板維持既有 3×2 版面；右下空格再切成三個獨立子格，
@@ -1201,15 +1479,23 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
                         linestyle="None",
                         zorder=6,
                     )
+                marker, endpoint_color = _baytrace_endpoint_style(
+                    particle["status"],
+                    _forcing_start_age_state(
+                        particle.get("age_seconds"), horizon_seconds
+                    )
+                    if particle.get("status") == "forcing_start"
+                    else None,
+                )
                 ax.plot(
                     float(particle["x_m"]) - x0,
                     float(particle["y_m"]) - y0,
-                    marker=_STATUS_MARKERS.get(particle["status"], "D"),
+                    marker=marker,
                     markersize=8.2,
-                    markerfacecolor=_BAYTRACE_FINAL_COLOR,
-                    markeredgecolor=_BAYTRACE_FINAL_COLOR,
+                    markerfacecolor=endpoint_color,
+                    markeredgecolor=endpoint_color,
                     markeredgewidth=0.8,
-                    color=_BAYTRACE_FINAL_COLOR,
+                    color=endpoint_color,
                     linestyle="None",
                     zorder=7,
                 )
@@ -1236,7 +1522,12 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
         )
         layer_legend.get_title().set_fontproperties(font)
         endpoint_legend = endpoint_legend_ax.legend(
-            handles=_baytrace_endpoint_handles(status_labels),
+            handles=_baytrace_endpoint_handles(
+                status_labels,
+                forcing_start_states=forcing_start_states,
+                forcing_start_summary=summary,
+                statuses=terminal_statuses,
+            ),
             title="標記：端點／停止狀態",
             loc="center left",
             bbox_to_anchor=(0.0, 0.5),
@@ -1251,7 +1542,7 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
         caption = caption_ax.text(
             0.0,
             0.5,
-            "各位置以初始位置為原點（0,0）。\n各面板尺度不同，請依公尺刻度比較。",
+            "各位置以本身回溯起點為 (0,0)。\n各面板尺度不同，請依公尺刻度比較。",
             transform=caption_ax.transAxes,
             fontproperties=font,
             fontsize=10,
@@ -1319,6 +1610,9 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
     levels = list(summary["vertical_order"])
     horizon_minutes, age_ticks = _depth_axis_limits_and_ticks(summary)
     status_labels = _baytrace_status_labels(data)
+    forcing_start_states = set(_forcing_start_age_states(data))
+    terminal_statuses = {particle["status"] for particle in data["particles"]}
+    horizon_seconds = _horizon_seconds(summary)
     font = _display_font()
     fig, axes = plt.subplots(len(levels), 1, figsize=(11, 12), squeeze=False, sharex=True)
     try:
@@ -1375,14 +1669,22 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
                     None,
                 )
                 if terminal_index is not None:
+                    marker, endpoint_color = _baytrace_endpoint_style(
+                        particle["status"],
+                        _forcing_start_age_state(
+                            particle.get("age_seconds"), horizon_seconds
+                        )
+                        if particle.get("status") == "forcing_start"
+                        else None,
+                    )
                     ax.plot(
                         age_minutes[terminal_index],
                         z_values[terminal_index],
-                        marker=_STATUS_MARKERS.get(particle["status"], "D"),
+                        marker=marker,
                         markersize=5.7,
-                        markerfacecolor=_BAYTRACE_FINAL_COLOR,
-                        markeredgecolor=_BAYTRACE_FINAL_COLOR,
-                        color=_BAYTRACE_FINAL_COLOR,
+                        markerfacecolor=endpoint_color,
+                        markeredgecolor=endpoint_color,
+                        color=endpoint_color,
                         linestyle="None",
                         clip_on=False,
                         zorder=6,
@@ -1402,7 +1704,15 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
             Line2D([], [], color="#1b4f72", linestyle="--", linewidth=1.0, label="海面高度"),
             Line2D([], [], color="#8c510a", linestyle=":", linewidth=1.0, label="海床高度"),
         ]
-        legend_handles.extend(_baytrace_endpoint_handles(status_labels, include_boundary=False))
+        legend_handles.extend(
+            _baytrace_endpoint_handles(
+                status_labels,
+                include_boundary=False,
+                forcing_start_states=forcing_start_states,
+                forcing_start_summary=summary,
+                statuses=terminal_statuses,
+            )
+        )
         legend = fig.legend(
             handles=legend_handles,
             loc="lower center",
@@ -1486,9 +1796,10 @@ def _baytrace_terminal_table(data: dict[str, Any]) -> dict[str, dict[str, int]]:
 def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> Path:
     """繪製各初始水層的八狀態停止原因圖，保留全部粒子與零計數狀態。
 
-    圖面回答「有多少粒子完成回溯，其餘為何提前停止？」；``max_age`` 以
-    summary 的回溯上限顯示，開放邊界離域與已核對的取樣失敗則分別顯示。底層
-    status、分母及各狀態計數均直接取自輸入；這是 preview 的補充診斷，不是新的來源分析。
+    圖面回答「各粒子到達哪一種終止狀態？」；``forcing_start`` 是否可寫成完成設定
+    時長，另依每顆 particles CSV 的 ``age_seconds`` 與 summary horizon 以保守容差
+    核對。開放邊界離域與已核對的取樣失敗則分別顯示。底層 status、分母及各狀態計數
+    均直接取自輸入；這是 preview 的補充診斷，不是新的來源分析。
     """
 
     import matplotlib
@@ -1499,7 +1810,6 @@ def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> P
 
     output = _prepare_baytrace_output(output_path, "新版停止原因圖")
     summary = data["summary"]
-    counts = summary["terminal_counts"]
     levels = list(summary["vertical_order"])
     table = _baytrace_terminal_table(data)
     status_labels = _baytrace_status_labels(data)
@@ -1568,7 +1878,7 @@ def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> P
         )
         legend.get_title().set_fontproperties(font)
         fig.suptitle(
-            "停止原因｜完成回溯與提前停止的粒子數",
+            "停止原因｜各終止狀態的粒子數",
             fontproperties=font,
             fontsize=18,
             y=0.995,
@@ -1577,8 +1887,7 @@ def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> P
         fig.text(
             0.5,
             0.958,
-            f"{counts.get('max_age', 0)}顆完成回溯、{counts.get('flow_domain_open_exit', 0)}顆離開計算範圍、"
-            f"{counts.get('numerical_failure', 0)}顆{status_labels['numerical_failure']}。",
+            _baytrace_terminal_summary(data),
             ha="center",
             va="top",
             fontproperties=font,
@@ -1729,6 +2038,7 @@ def _baytrace_readme(
     panel_count = len(summary["horizontal_panels"])
     level_count = len(summary["vertical_order"])
     horizon_label = status_labels["max_age"]
+    forcing_start_states = Counter(_forcing_start_age_states(data))
     horizon_minutes, _ = _depth_axis_limits_and_ticks(summary)
     layer_totals = {level: sum(terminal_table[level].values()) for level in summary["vertical_order"]}
     layer_total_text = "、".join(
@@ -1745,7 +2055,7 @@ def _baytrace_readme(
         "## 給 PI 的閱讀方式",
         "",
         "共同研究問題是：從指定到達位置往前回溯，粒子在平面上經過哪裡、在水中的高度如何改變，"
-        f"以及哪些粒子完成回溯、哪些粒子提前停止。這些圖把一組 {particle_count} 顆粒子（"
+        f"以及各粒子到達哪一種終止狀態。這些圖把一組 {particle_count} 顆粒子（"
         f"{panel_count} 個初始位置 × {level_count} 個初始水層）放在同一個單一沉降材質情境中；"
         "它們是工程先導的條件式路徑診斷，"
         "不是已知污染來源的證明。",
@@ -1753,18 +2063,16 @@ def _baytrace_readme(
         "建議閱讀順序：",
         "",
         "1. [水平區域總覽](horizontal_overview.png)：先回答「從指定位置往前回溯，粒子經過哪些位置？」；"
-        "經緯度與已確認海岸讓整體位置關係可直接判讀。",
+        f"{_position_order_note(summary)}經緯度與已確認海岸讓整體位置關係可直接判讀。",
         f"2. [水平局部圖](horizontal_local.png)：再看位置1–{panel_count} 的原 AEQD 公尺座標，"
         "確認各位置的路徑細節；"
         f"{panel_count} 個面板各自等比例，但範圍不同。",
         "3. [垂向軌跡](depth_age.png)：回答「回溯過程中，粒子在水中的高度如何變化？」；"
         "z、海面 eta、海床 bed 都只讀保存觀測。",
-        "4. [停止原因](terminal_counts.png)：最後回答「有多少粒子完成回溯，其餘為何提前停止？」；"
+        "4. [停止原因](terminal_counts.png)：最後回答「各粒子到達哪一種終止狀態？」；"
         f"每個初始水層的粒子分母依逐格資料核對（{layer_total_text}），八種狀態都保留，包含零計數。",
         "",
-        f"這樣的順序先交代平面路徑，再補充垂向變化，最後用停止原因解釋為何不能把全部 "
-        f"{particle_count} 顆都視為"
-        f"追滿{_horizon_hours_text(summary)}小時。"
+        f"這樣的順序先交代平面路徑，再補充垂向變化，最後用停止原因說明：{_baytrace_terminal_summary(data)}"
         "終點是追蹤停止位置，不是污染來源；M=1 仍含隨機擴散，不能稱為來源機率。",
         "",
         "## 呈現參照與本專案界線",
@@ -1779,22 +2087,29 @@ def _baytrace_readme(
         "|---|---|---|",
         "| 軌跡 | 水平軌跡，逐粒子連接已保存位置 | 本專案是逆時間回溯，線段不是正向預測路徑 |",
         "| 初始 | 初始位置（回溯起點）（綠色圓點） | 指到達時刻的保存位置，不是污染源位置 |",
-        "| 最終 | 最終位置｜追蹤停止狀態（紅色 ^／s／X） | 代表停止狀態；不是已知污染來源 |",
+        "| 最終 | 最終位置｜各終止狀態（forcing_start 紫／橙色 D；numerical_failure 紅色 X） | "
+        "代表停止狀態；不是已知污染來源 |",
         "| 經度／緯度 | 區域總覽使用經度、緯度 | 局部圖改用原 AEQD 平移公尺座標，未移動或放大資料 |",
         f"| 粒子數 | 圖上明示同一組 {particle_count} 顆粒子、{panel_count} 個初始位置 × "
         f"{level_count} 個初始水層 | "
-        f"{particle_count} 顆中只有完成狀態才追滿{_horizon_hours_text(summary)}小時，M=1 且含隨機擴散 |",
+        f"是否追滿{_horizon_hours_text(summary)}小時依每顆 age_seconds 與 horizon 核對；M=1 且含隨機擴散 |",
         "| 垂向軌跡 | 專案補充診斷圖：粒子高度、海面、海床 | "
         "呈現參照沒有直接對應，z／eta／bed 均取既有 CSV |",
-        "| 停止原因 | 專案補充診斷圖：完成與提前停止的粒子數 | 呈現參照沒有直接對應，八狀態及零計數均保留 |",
+        "| 停止原因 | 專案補充診斷圖：八種終止狀態的粒子數 | 呈現參照沒有直接對應，八狀態及零計數均保留 |",
         "",
-        "新版紅色端點圖例依資料核對結果顯示「最終位置｜"
+        "新版端點圖例依資料核對結果區分八種狀態；forcing_start 依每顆 particles.csv 的"
+        f" age_seconds 與 horizon_seconds 判定，本批標籤為「{status_labels['forcing_start']}」。"
+        f"固定容差為 {_FORCING_START_AGE_TOLERANCE_SECONDS:g} 秒，不能以 300 秒 output interval 取代；"
+        "圖例仍分開列出「最終位置｜"
         f"{status_labels['max_age']}」、「最終位置｜{status_labels['flow_domain_open_exit']}」與"
-        f"「最終位置｜{status_labels['numerical_failure']}」；三者均不是已知污染來源。",
+        f"「最終位置｜{status_labels['numerical_failure']}」；只有 numerical_failure 使用紅色 X，"
+        "所有終點均不是已知污染來源。",
+        f"forcing_start age 分類計數：{dict(forcing_start_states)}；資料層 status 仍完整"
+        "保留為 forcing_start。",
         "新版與 default `legacy` 分開：legacy 仍只產生原有兩張水平 PNG 及其舊契約；"
         f"不要把 legacy 的 H1–H{panel_count}、線色或任意終點語意與本新版混用。"
         f"新版圖面統一使用「位置1–{panel_count}」、"
-        "完整中文水層名、藍／橙／紫／青線色、綠色回溯起點及紅色追蹤停止位置。",
+        "完整中文水層名、藍／橙／紫／青線色、綠色回溯起點及依狀態區分的終點標記。",
         "",
         "## 水層定義與停止統計",
         "",
@@ -1842,8 +2157,7 @@ def _baytrace_readme(
     lines += [
         "",
         f"本次圖面共保留 {len(data['particles'])} 顆粒子與 {len(data['observations'])} 筆模型保存紀錄；"
-        f"{horizon_label} {counts.get('max_age', 0)} 顆、"
-        f"離開計算範圍 {counts.get('flow_domain_open_exit', 0)} 顆。",
+        f"停止摘要：{_baytrace_terminal_summary(data)}",
         f"垂向資料缺值原樣留空：eta_m 空白 {missing_eta} 筆、bed_z_m 空白 {missing_bed} 筆，"
         f"不補成零；高度軸標示為「高度（公尺；向上為正）」，時間軸涵蓋 0–{horizon_minutes:g} 分鐘，"
         "刻度由回溯上限等分。",
@@ -1851,6 +2165,8 @@ def _baytrace_readme(
         "## 取樣失敗診斷界線",
         "",
     ]
+    if counts.get("max_age", 0):
+        lines.append(f"另有 {horizon_label} {counts['max_age']} 顆；此狀態與 forcing_start 分開保存。")
     if sampling_verified:
         lines.append(
             f"本次 {len(numerical_rows)} 顆數值失敗只有在 particles.csv 與 summary.json 雙重"
@@ -1870,6 +2186,9 @@ def _baytrace_readme(
         "",
         f"區域總覽使用經緯度；局部圖沿用 AEQD（等距方位投影）公尺座標並只作平移，中心為經度 {center[0]}、"
         f"緯度 {center[1]}。各局部面板各自等比例且範圍不同；不移除、放大或抖動任何粒子座標。",
+        "各位置以本身回溯起點為 (0,0)；水平總覽的位置編號是受體／指定位置，不是時間順序。",
+        "forcing_start 只有在每顆 age_seconds 與 horizon_seconds 差值不超過固定容差時，"
+        "才可寫成完成設定時長；提前者標為「提前到達驅動資料起點」，不能泛化成科學來源判定。",
         "海岸沿用已確認的 CRS84 `taiwan_exact_coastline.geojson`（1905 個有效 Polygon／MultiPolygon）；"
         "它只作地理參照，本次 PNG 不加入資料來源授權註記或警語。",
         "本次停止圖與垂向圖是本專案補充診斷，不能替代正式 report 的收斂、獨立觀測驗證或來源歸因。"
@@ -2063,6 +2382,8 @@ def build_coastline_preview(
         "terminal_counts": summary["terminal_counts"],
         "terminal_counts_by_vertical": terminal_table,
         "terminal_status_labels": status_labels,
+        "forcing_start_age_tolerance_seconds": _FORCING_START_AGE_TOLERANCE_SECONDS,
+        "forcing_start_age_state_counts": dict(Counter(_forcing_start_age_states(data))),
         "sampling_failure_verified": _sampling_failure_is_verified(data),
         "horizontal_panels": summary["horizontal_panels"],
         "projection": {key: summary["projection"][key] for key in ("kind", "units", "center_lonlat")},
