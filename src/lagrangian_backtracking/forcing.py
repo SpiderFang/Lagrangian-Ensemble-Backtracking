@@ -3,7 +3,9 @@
 海流資料使用海洋模式（OCM）的原始三維網格及時間軸；波浪資料使用 NWW3 分析資料。
 每個讀取器一次只以唯讀方式開啟一個月份，避免把完整兩年資料載入記憶體。跨月時由
 ``MonthlyCombinedForcing`` 依世界協調時間（UTC）選取正確月份，絕不借用最近月份資料。
-海流依序在節點垂向、三角形平面與時間上內插；若三個支撐節點任一處無法夾住指定深度、
+海流依序在節點垂向、三角形平面與時間上內插；移動海面造成固定 target z 高於某一
+端點最高 ``zcor`` 時，該端點可明確使用最高有效層的表層控制體值，但最後仍以 query-time
+``eta``／海床做幾何 gate。若三個支撐節點任一處無法取得雙側支撐或表層控制體必要值、
 網格面乾涸或時間間隔過大，會回傳明確的品質檢查旗標。波浪只有在周圍四個格點及前後
 兩個時刻的資料都有效時，才做空間與時間內插。
 Smagorinsky reference 則只使用 OCM native current，在公尺制 triangle shape function
@@ -31,6 +33,77 @@ from .geometry import DomainProjection
 from .mesh import MeshLocation, NativeMesh
 from .models import SampleQC, VelocityComponents, VelocitySample
 from .stokes import finite_depth_stokes
+
+# 這個容差只處理公尺制浮點邊界的最後幾位，不會把有限距離的海面／海床穿越
+# 改寫成有效水柱。OCM 一般取樣、Smagorinsky 與 Numba kernel 都由同一數值傳入，
+# 以避免不同加速路徑對相同 query z 產生不同邊界判定。
+_VERTICAL_BOUNDARY_TOLERANCE_M = 1.0e-6
+
+
+def _vertical_support_indices(
+    physical_z: np.ndarray,
+    usable: np.ndarray,
+    target_z_m: float,
+) -> tuple[int, int] | None:
+    """依 OCM 單柱建立垂向支援層索引，包含保守的移動海面表層控制體政策。
+
+    ``physical_z`` 是單一時間、單一 node 的 OCM ``zcor``，單位為 m 且海面向上為正；
+    ``usable`` 表示該 layer 所需物理量是否全部有限。一般水柱仍要求 target z 有
+    有效的下側與上側 layer，並以兩層做線性內插。唯一例外是 target z 高於該端點最高
+    有限 ``zcor``（含 `_VERTICAL_BOUNDARY_TOLERANCE_M` 的數值容差）：此時只能使用
+    最高 ``zcor`` layer 本身，且該 layer 的必要物理量缺值就直接失敗，不能退回更深層
+    或把它描述為任意最近值外插。這是 OCM 最上層控制體的端點支援，不是海面邊界判定；
+    query-time 的 ``eta``／海床範圍仍由外層最後檢查。底部不採對稱 hold，故海床下方
+    或沒有下側支撐時維持 fail closed。
+
+    回傳值是 ``(lower_index, upper_index)``；兩索引相同表示表層控制體 hold，呼叫端
+    應將垂向跨度記為零。``None`` 代表 z、``zcor`` 或必要物理量不足以形成合法支援。
+    """
+
+    if (
+        physical_z.ndim != 1
+        or usable.shape != physical_z.shape
+        or not np.isfinite(target_z_m)
+    ):
+        return None
+    finite_z = np.isfinite(physical_z)
+    finite_indices = np.flatnonzero(finite_z)
+    if finite_indices.size == 0:
+        return None
+    top_index = int(finite_indices[np.argmax(physical_z[finite_indices])])
+    top_z = float(physical_z[top_index])
+    if target_z_m >= top_z - _VERTICAL_BOUNDARY_TOLERANCE_M:
+        if not bool(usable[top_index]):
+            return None
+        return top_index, top_index
+    below = np.flatnonzero(usable & (physical_z <= target_z_m))
+    above = np.flatnonzero(usable & (physical_z >= target_z_m))
+    if below.size == 0 or above.size == 0:
+        return None
+    lower = int(below[np.argmax(physical_z[below])])
+    upper = int(above[np.argmin(physical_z[above])])
+    return lower, upper
+
+
+def _query_z_within_geometric_bounds(
+    z_m: float, geometric_bounds: tuple[float, float] | None
+) -> bool:
+    """判定 query-time z 是否仍在有限海床／海面水柱內。
+
+    ``geometric_bounds`` 已由同一 before/after eta、固定 native mesh 水深與 barycentric
+    權重建立；此 helper 只允許公尺制數值誤差內的邊界點。它不負責修正 z，也不會讓
+    endpoint surface hold 取代 query-time 海面；非有限幾何一律回傳 False。
+    """
+
+    if geometric_bounds is None or not np.isfinite(z_m):
+        return False
+    eta_m, bed_z_m = geometric_bounds
+    if not np.isfinite(eta_m) or not np.isfinite(bed_z_m) or bed_z_m > eta_m + _VERTICAL_BOUNDARY_TOLERANCE_M:
+        return False
+    return (
+        z_m >= bed_z_m - _VERTICAL_BOUNDARY_TOLERANCE_M
+        and z_m <= eta_m + _VERTICAL_BOUNDARY_TOLERANCE_M
+    )
 
 
 def _time_bracket(
@@ -222,11 +295,15 @@ class OCMNativeMonth:
     def _vertical_node_sample(
         self, *, time_index: int, node_index: int, z_m: float
     ) -> tuple[np.ndarray, float] | None:
-        """在單一節點的水柱中，以指定深度上下兩層內插速度與垂向擴散。
+        """在單一節點的水柱中，以指定深度取樣速度與垂向擴散。
 
         回傳的四個值依序是東向、北向、垂向速度與垂向擴散係數，另附兩層間的深度差。
-        不假設資料層號已由淺到深排序；任一必要數值缺漏時該層不可用。只用一側最近層的
-        外插會製造不可靠速度，因此粒子在海床以下或海面以上時回傳 ``None``。
+        不假設資料層號已由淺到深排序；一般位置任一必要數值缺漏時該層不可用，必須由
+        上下兩個有效 layer 夾住後線性內插。移動海面使固定 target z 在某一時間端點
+        高於最高有限 ``zcor`` 時，則使用該端點最高 layer 的值並回傳零垂向跨度，這是
+        OCM 最上層控制體的 surface hold，不是任意最近值外插，也不代表粒子已在海面上。
+        真正的 query-time ``eta``／海床 gate 在 ``sample`` 完成 before/after 時間內插後
+        執行；底層沒有對稱 hold，缺少最高層必要物理量仍回傳 ``None``。
         """
 
         physical_z = np.asarray(self.zcor[time_index, node_index], dtype=np.float64)
@@ -239,12 +316,10 @@ class OCMNativeMonth:
             )
         )
         usable = np.isfinite(physical_z) & np.all(np.isfinite(values), axis=1)
-        below = np.flatnonzero(usable & (physical_z <= z_m))
-        above = np.flatnonzero(usable & (physical_z >= z_m))
-        if below.size == 0 or above.size == 0:
+        support = _vertical_support_indices(physical_z, usable, z_m)
+        if support is None:
             return None
-        lower = int(below[np.argmax(physical_z[below])])
-        upper = int(above[np.argmin(physical_z[above])])
+        lower, upper = support
         span = float(physical_z[upper] - physical_z[lower])
         if abs(span) <= np.finfo(np.float64).eps * 16.0:
             return values[lower], 0.0
@@ -258,9 +333,12 @@ class OCMNativeMonth:
 
         這裡刻意不讀 ``vertical_velocity`` 或 OCM ``diffusivity``：Slice 2B1 的 Kh
         定義只使用 native current，Kz 則由 ``SmagorinskySettings.constant_kz_m2ps``
-        提供。仍沿用與一般速度取樣相同的上下夾層政策，故海面以上、海床以下、zcor
-        缺值或 hvel 缺值都回傳 ``None``，不做單側最近層外插。回傳的兩個水平分量單位
-        為 m/s，第二項是實際夾層深度差（m），只供資料品質與垂向支撐診斷。
+        提供。垂向支援索引沿用一般速度取樣的上下夾層與 surface hold 政策：端點固定
+        z 高於最高有限 ``zcor`` 時只能使用該端點最高 layer 的有限 ``hvel``，不做底層
+        對稱 hold 或任意最近值外插。這個 helper 本身不判斷 query-time 海面，該 gate
+        由 ``sample_smagorinsky_diffusion`` 在 before/after 幾何內插後統一執行。回傳的
+        兩個水平分量單位為 m/s，第二項是實際夾層深度差（m），只供資料品質與垂向支援
+        診斷。
         """
 
         if not np.isfinite(z_m):
@@ -270,12 +348,10 @@ class OCMNativeMonth:
             self.hvel[time_index, node_index, :, :2], dtype=np.float64
         )
         usable = np.isfinite(physical_z) & np.all(np.isfinite(horizontal_velocity), axis=1)
-        below = np.flatnonzero(usable & (physical_z <= z_m))
-        above = np.flatnonzero(usable & (physical_z >= z_m))
-        if below.size == 0 or above.size == 0:
+        support = _vertical_support_indices(physical_z, usable, z_m)
+        if support is None:
             return None
-        lower = int(below[np.argmax(physical_z[below])])
-        upper = int(above[np.argmin(physical_z[above])])
+        lower, upper = support
         span = float(physical_z[upper] - physical_z[lower])
         if abs(span) <= np.finfo(np.float64).eps * 16.0:
             sampled = horizontal_velocity[lower]
@@ -536,6 +612,22 @@ class OCMNativeMonth:
                 time_qc,
                 triangle_id=location.triangle_id,
             )
+        # Smagorinsky 共用 endpoint surface hold 時，不能只因兩端都有水平 current
+        # 就放寬粒子垂向範圍。先以同一 query-time eta／native bed 建立幾何 gate，
+        # 讓 z>eta、z<bed、eta 缺值與不相容水柱在進入 incident-triangle 計算前
+        # 便明確失敗；這與一般 OCM velocity sample 的最後 gate 完全一致。
+        geometric_bounds = self._geometric_bounds_at_time(
+            location,
+            before=before,
+            after=after,
+            alpha=alpha,
+        )
+        if not _query_z_within_geometric_bounds(z_m, geometric_bounds):
+            return _invalid_smagorinsky_sample(
+                settings,
+                SampleQC.VERTICAL_UNSUPPORTED,
+                triangle_id=location.triangle_id,
+            )
 
         first, first_qc, first_valid_count, first_excluded_count = self._smagorinsky_time_slice(
             location,
@@ -694,7 +786,11 @@ class OCMNativeMonth:
         eta_after_value = float(weights @ eta_after)
         eta = eta_before_value + float(alpha) * (eta_after_value - eta_before_value)
         bed = -float(weights @ source_depth)
-        if not np.isfinite(eta) or not np.isfinite(bed) or bed > eta + 1.0e-6:
+        if (
+            not np.isfinite(eta)
+            or not np.isfinite(bed)
+            or bed > eta + _VERTICAL_BOUNDARY_TOLERANCE_M
+        ):
             return None
         return eta, bed
 
@@ -710,7 +806,10 @@ class OCMNativeMonth:
         """取得 OCM 東、北、垂向速度、擴散係數、海面高度與水深。
 
         取樣失敗時仍回傳品質檢查旗標，讓呼叫端知道是超出範圍、時間缺口、乾涸或深度
-        資料不足，而不是只得到沒有原因的空值。``triangle_hint`` 只作 native mesh
+        資料不足，而不是只得到沒有原因的空值。端點 surface hold 只解決移動海面造成的
+        固定 z 支援洞；完成端點速度／物理量時間內插後，仍以 query-time ``eta`` 與 native
+        海床共同檢查 ``z_m``，所以真正越過海面或海床的 query 不會被 hold 放寬。端點
+        eta、海床或必要 layer 缺值仍 fail closed。``triangle_hint`` 只作 native mesh
         定位的效能提示，不是物理資料；失效或過期提示由 mesh locator 自動回退原本的
         uniform-bin 候選搜尋，因此不會改變三角形 provenance、遮罩或數值結果。
         """
@@ -740,6 +839,9 @@ class OCMNativeMonth:
             if not np.all(np.isfinite(wet_values)) or not np.allclose(wet_values, self.wet_value, atol=0.1):
                 first = second = None
                 first_qc = second_qc = SampleQC.DRY_FACE
+            elif geometric_bounds is None:
+                first = second = None
+                first_qc = second_qc = SampleQC.VERTICAL_UNSUPPORTED
             else:
                 values, vertical_scale, valid = interpolate_ocm_support_numba(
                     self.hvel,
@@ -752,6 +854,7 @@ class OCMNativeMonth:
                     np.asarray(location.node_indices, dtype=np.int64),
                     np.asarray(location.barycentric_weights, dtype=np.float64),
                     z_m,
+                    _VERTICAL_BOUNDARY_TOLERANCE_M,
                 )
                 if valid:
                     eta_first = float(
@@ -791,14 +894,11 @@ class OCMNativeMonth:
                 forcing_month_id=self.month_id,
             )
         values = first[0] + alpha * (second[0] - first[0])
-        eta = first[1] + alpha * (second[1] - first[1])
         vertical_scale = min(first[2], second[2])
-        nodes = np.asarray(location.node_indices, dtype=np.int64)
-        depth = float(
-            np.asarray(location.barycentric_weights, dtype=np.float64) @ self.mesh.source_depth_m[nodes]
-        )
-        bed_z = -depth
-        if z_m < bed_z - 1e-6 or z_m > eta + 1e-6:
+        # ``geometric_bounds`` 是 query-time 的單一權威上下界；不使用 endpoint hold
+        # 後的 layer z 來代替實際海面，也不重新以粒子位置猜測水深。
+        eta, bed_z = geometric_bounds if geometric_bounds is not None else (np.nan, np.nan)
+        if not _query_z_within_geometric_bounds(z_m, geometric_bounds):
             return VelocitySample(
                 0.0,
                 0.0,

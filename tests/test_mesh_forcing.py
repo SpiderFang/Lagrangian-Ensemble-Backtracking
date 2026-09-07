@@ -112,6 +112,71 @@ def test_native_mesh_rejects_degenerate_triangle_for_shape_gradient() -> None:
         )
 
 
+def _moving_surface_ocm_sampler(
+    *,
+    use_numba_kernel: bool = False,
+    missing_eta: bool = False,
+    missing_top_field: str | None = None,
+) -> OCMNativeMonth:
+    """建立固定 z 查詢會遇到移動海面支援洞的 OCM synthetic month。
+
+    before endpoint 的最高 ``zcor`` 為 1.77 m，after endpoint 降至 1.47 m；查詢時刻
+    ``z=1.683 m`` 位於兩端高度之間，並選在 query-time eta 約 1.726 m 的時刻。這讓
+    同一固定 z 在 before 仍可由中層與 top layer 內插、在 after 則必須使用 top-layer
+    surface hold，正好覆蓋 SERVER 診斷的移動海面案例。所有速度分量與 Kz 的單位分別
+    是 m/s 與 m²/s；三個 node 使用相同數值，測試重點是垂向支援與時間 gate，不是
+    triangle 水平梯度。
+
+    ``missing_eta`` 模擬 endpoint 海面缺值；``missing_top_field`` 模擬 after top
+    layer 的必要物理量缺值。兩者都必須 fail closed，不能退回更深 layer 或補零。
+    """
+
+    mesh = _triangle_mesh()
+    times = np.array([0, 1_000_000_000], dtype=np.int64)
+    zcor = np.empty((2, 3, 3), dtype=np.float64)
+    zcor[0, :, :] = np.array([-10.0, -5.0, 1.77])
+    zcor[1, :, :] = np.array([-10.0, -5.0, 1.47])
+    hvel = np.zeros((2, 3, 3, 2), dtype=np.float64)
+    vertical_velocity = np.zeros((2, 3, 3), dtype=np.float64)
+    diffusivity = np.zeros((2, 3, 3), dtype=np.float64)
+    # 中層值用來計算 before endpoint 的合法雙側內插；最高層值用來驗證 after hold。
+    hvel[:, :, 1, :] = np.array([0.5, -0.5])
+    vertical_velocity[:, :, 1] = 0.05
+    diffusivity[:, :, 1] = 0.02
+    hvel[0, :, 2, :] = np.array([1.0, 2.0])
+    hvel[1, :, 2, :] = np.array([3.0, 4.0])
+    vertical_velocity[0, :, 2] = 0.10
+    vertical_velocity[1, :, 2] = 0.20
+    diffusivity[0, :, 2] = 0.03
+    diffusivity[1, :, 2] = 0.04
+    elev = np.empty((2, 3), dtype=np.float64)
+    elev[0, :] = 1.77
+    elev[1, :] = 1.47
+    if missing_eta:
+        elev[1, 0] = np.nan
+    if missing_top_field == "hvel":
+        hvel[1, 0, 2, 0] = np.nan
+    elif missing_top_field == "vertical_velocity":
+        vertical_velocity[1, 0, 2] = np.nan
+    elif missing_top_field == "diffusivity":
+        diffusivity[1, 0, 2] = np.nan
+    elif missing_top_field is not None:
+        raise ValueError(f"未知的 synthetic top 欄位：{missing_top_field}")
+    return OCMNativeMonth(
+        month_id="197001",
+        mesh=mesh,
+        time_utc_ns=times,
+        hvel=hvel,
+        vertical_velocity=vertical_velocity,
+        zcor=zcor,
+        elev=elev,
+        wetdry_elem=np.zeros((2, 1), dtype=np.float64),
+        diffusivity=diffusivity,
+        maximum_time_gap_seconds=2.0,
+        use_numba_kernel=use_numba_kernel,
+    )
+
+
 def test_ocm_sampler_is_exact_for_linear_xyzt_field() -> None:
     """垂向、水平、時間皆線性的合成場應被 OCM sampler 精確重建。"""
 
@@ -209,6 +274,103 @@ def test_ocm_vertical_unsupported_preserves_finite_geometric_bounds(
     assert sample.eta_m == 0.0
     assert sample.bed_z_m == -10.0
     assert sample.u_mps == sample.v_mps == sample.w_mps == 0.0
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_ocm_moving_surface_uses_endpoint_surface_hold_and_query_time_gate(
+    use_numba_kernel: bool,
+) -> None:
+    """移動海面造成的 endpoint 支援洞應由 top hold 修復，再由 query-time eta 把關。
+
+    查詢時間的 alpha 約為 0.146666667，因此 eta 約為 1.726 m；固定 z=1.683 m
+    在 query-time 水柱內。before endpoint 的 z=1.683 m 仍落在 -5 m 與 1.77 m
+    之間，after endpoint 則高於 1.47 m top layer，必須使用 after top-layer 值。
+    測試同時比較一般 NumPy reference 與 Numba kernel，包含速度、Kz、幾何上下界與
+    垂向尺度，確保 surface hold 沒有只修到單一路徑。
+    """
+
+    sampler = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel)
+    query_time_ns = 146_666_667
+    query_alpha = query_time_ns / 1_000_000_000.0
+    target_z_m = 1.683
+    before_vertical_alpha = (target_z_m + 5.0) / (1.77 + 5.0)
+    before_values = np.array(
+        [
+            0.5 + before_vertical_alpha * (1.0 - 0.5),
+            -0.5 + before_vertical_alpha * (2.0 + 0.5),
+            0.05 + before_vertical_alpha * (0.10 - 0.05),
+            0.02 + before_vertical_alpha * (0.03 - 0.02),
+        ]
+    )
+    after_values = np.array([3.0, 4.0, 0.20, 0.04])
+    expected_values = before_values + query_alpha * (after_values - before_values)
+    expected_eta = 1.77 + query_alpha * (1.47 - 1.77)
+
+    sample = sampler.sample(2.0, 3.0, target_z_m, query_time_ns)
+
+    assert sample.valid
+    assert np.allclose(
+        [sample.u_mps, sample.v_mps, sample.w_mps, sample.diagnostics["kz_m2ps"]],
+        expected_values,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert np.isclose(sample.eta_m, expected_eta)
+    assert sample.bed_z_m == -10.0
+    # after endpoint 全部使用 surface hold，故該端點尺度回到保守 0.1 m。
+    assert sample.vertical_scale_m == 0.1
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+@pytest.mark.parametrize("target_z_m", [1.8, -11.0])
+def test_ocm_query_time_surface_or_bed_crossing_remains_fail_closed(
+    use_numba_kernel: bool,
+    target_z_m: float,
+) -> None:
+    """endpoint hold 不得取代 query-time 海面／海床 gate。"""
+
+    sampler = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel)
+    sample = sampler.sample(2.0, 3.0, target_z_m, 146_666_667)
+
+    assert not sample.valid
+    assert sample.qc == SampleQC.VERTICAL_UNSUPPORTED
+    assert np.isclose(sample.eta_m, 1.77 + (146_666_667 / 1_000_000_000.0) * (1.47 - 1.77))
+    assert sample.bed_z_m == -10.0
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_ocm_missing_eta_rejects_surface_hold_without_boundary_privilege(
+    use_numba_kernel: bool,
+) -> None:
+    """缺少任一 endpoint eta 時，不能把有限 top-layer velocity 當成合法水柱。"""
+
+    sampler = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel, missing_eta=True)
+    sample = sampler.sample(2.0, 3.0, 1.683, 146_666_667)
+
+    assert not sample.valid
+    assert sample.qc == SampleQC.VERTICAL_UNSUPPORTED
+    assert np.isnan(sample.eta_m)
+    assert np.isnan(sample.bed_z_m)
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+@pytest.mark.parametrize("missing_top_field", ["hvel", "vertical_velocity", "diffusivity"])
+def test_ocm_missing_after_top_layer_quantity_rejects_surface_hold(
+    use_numba_kernel: bool,
+    missing_top_field: str,
+) -> None:
+    """最高 zcor layer 的任一必要物理量缺值時，不得回退更深層補洞。"""
+
+    sampler = _moving_surface_ocm_sampler(
+        use_numba_kernel=use_numba_kernel,
+        missing_top_field=missing_top_field,
+    )
+    sample = sampler.sample(2.0, 3.0, 1.683, 146_666_667)
+
+    assert not sample.valid
+    assert sample.qc == SampleQC.VERTICAL_UNSUPPORTED
+    assert np.isclose(sample.eta_m, 1.77 + (146_666_667 / 1_000_000_000.0) * (1.47 - 1.77))
+    assert sample.bed_z_m == -10.0
 
 
 def test_ocm_sampler_rejects_dry_face() -> None:
@@ -670,6 +832,43 @@ def test_smagorinsky_returns_vertical_time_gap_and_outside_qc_without_fill() -> 
     outside = vertical.sample_smagorinsky_diffusion(99.0, 99.0, -5.0, 0, settings)
     assert not outside.valid
     assert outside.qc & SampleQC.OUTSIDE_HORIZONTAL_DOMAIN
+
+
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_smagorinsky_surface_hold_shares_query_time_vertical_gate(
+    use_numba_kernel: bool,
+) -> None:
+    """Smagorinsky 水平速度共用 top hold，且不可繞過一般速度的 query-time gate。
+
+    Smagorinsky reference 只取水平 ``hvel``，但其 endpoint 垂向支援仍面對相同移動
+    海面。因此 z=1.683 m 應在 after endpoint 使用最高層水平 current 並得到合法 Kh；
+    z=1.8 m 雖然也能觸發 endpoint hold，卻高於 query-time eta，必須回傳
+    ``VERTICAL_UNSUPPORTED``。兩個 ``use_numba_kernel`` 設定用來確認一般 OCM 路徑
+    的切換不會改變這個 NumPy Smagorinsky reference 的結果。
+    """
+
+    sampler = _moving_surface_ocm_sampler(use_numba_kernel=use_numba_kernel)
+    settings = SmagorinskySettings(0.2, 0.0, 100.0, 0.01)
+    valid = sampler.sample_smagorinsky_diffusion(
+        2.0,
+        3.0,
+        1.683,
+        146_666_667,
+        settings,
+    )
+    above_surface = sampler.sample_smagorinsky_diffusion(
+        2.0,
+        3.0,
+        1.8,
+        146_666_667,
+        settings,
+    )
+
+    assert valid.valid
+    assert np.isfinite(valid.coefficients.kx_m2ps)
+    assert valid.diagnostics["valid_incident_triangle_count"] == 1
+    assert not above_surface.valid
+    assert above_surface.qc == SampleQC.VERTICAL_UNSUPPORTED
 
 
 def test_smagorinsky_caches_unique_node_columns_per_time_slice() -> None:

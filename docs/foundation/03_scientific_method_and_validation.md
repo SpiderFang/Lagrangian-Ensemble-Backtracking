@@ -32,12 +32,12 @@ V_det = (u_ocm + u_stokes, v_ocm + v_stokes, w_ocm + w_b)
 
 OCM 速度由 native unstructured mesh 直接取樣：
 
-1. 在每個 source node 的 `zcor` 柱中尋找包夾粒子 z 的兩個有限 layer。
-2. 對 `hvel`、`vertical_velocity` 與候選 Kz 作線性垂向內插；禁止單側外插。
-3. 使用所在 triangle 的 barycentric weights 作水平內插。
-4. 使用前後兩個 OCM 時次作線性時間內插。
+1. 在每個 source node 的 `zcor` 柱中尋找包夾粒子 z 的兩個有限 layer；若固定 z 只在某一時間 endpoint 高於最高有限 `zcor`，使用該 endpoint 最高 layer 的控制體值作 surface hold。
+2. 對 `hvel`、`vertical_velocity` 與候選 Kz 作線性垂向內插；surface hold 僅是 endpoint 支援政策，不是任意最近值外插，且不對底層做對稱 hold。
+3. 使用所在 triangle 的 barycentric weights 作水平內插，並以 query-time 線性內插的 `eta` 與 native bed 做最後 `z ∈ [bed, eta]` gate。
+4. 使用前後兩個 OCM 時次作線性時間內插；eta、bed 或最高 layer 必要物理量非有限，以及真正越過 query-time 海面／海床的案例均維持 invalid。
 
-若任一必要支撐 node 無法包夾 z，回傳具原因的 invalid sample，不重新正規化剩餘 node 權重。此保守政策避免在陡坡、海床以下或海岸缺值旁製造人工速度。
+若任一必要支撐 node 無法形成雙側支撐或合法 surface hold，回傳具原因的 invalid sample，不重新正規化剩餘 node 權重。這個工程政策只處理移動海面造成的 endpoint 支援洞，不能替代真實資料的科學驗證，也避免在陡坡、海床以下、真正海面以上或海岸缺值旁製造人工速度。
 
 ### 2.1 時間去重與缺時重建
 
@@ -397,7 +397,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | CRS round-trip | WGS84→metric→WGS84 誤差低於預先登錄門檻，domain corner/center 均測 |
 | triangle/quad | 面積、方向、對角線、triangle-to-face 與 barycentric sum 通過 |
 | mask/wetdry | 合成乾濕 face、海岸 triangle 與真實 snapshot 人工圖面抽查一致 |
-| 4D interpolation | 對線性 x/y/z/t 解析場達浮點容許誤差；無外插案例確實失敗 |
+| 4D interpolation | 對線性 x/y/z/t 解析場達浮點容許誤差；底層與 query-time 海面外側案例確實失敗；移動海面 endpoint surface hold 與 NumPy/Numba parity 由單元測試鎖定 |
 
 ### 9.2 物理與積分
 

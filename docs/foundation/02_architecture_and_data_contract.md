@@ -153,11 +153,11 @@ expanded A 區的機器可驗證契約至少包含：
    manifest 聲稱可重建但 patch/checksum/支撐實際不存在，回報 `data_gap`；不得由 sampler
    自行最近值填補或跨未登錄缺口外插。
 2. 找到 native triangle 與 source face；檢查動態濕乾狀態。
-3. 在三個 node 上，使用各自 `zcor` 找到包夾 z 的上下有效 layer，線性取樣 `hvel`、`vertical_velocity` 與候選 `diffusivity`；禁止海面以上、海床以下或單側外插。
-4. 三個 node 全部有效後以 barycentric 權重做水平內插；任一必要支撐缺值時保持無效。
-5. 在前後時間 slice 線性內插；每次 RK stage 都使用其真正 stage time。
+3. 在三個 node 上，使用各自 `zcor` 找到包夾 z 的上下有效 layer，線性取樣 `hvel`、`vertical_velocity` 與候選 `diffusivity`。若固定 z 高於某一 before／after endpoint 的最高有限 `zcor`，可暫用該 endpoint 最高 layer 的有限值作為 OCM 最上層控制體的 surface hold；這不是任意最近值外插，且底層不採對稱 hold，最高 layer 必要物理量缺值仍保持無效。
+4. 三個 node 全部有效後以 barycentric 權重做水平內插；任一必要支撐缺值時保持無效。完成 endpoint 速度取樣與時間內插後，再以 query-time 線性內插的 `eta` 與 native mesh 海床檢查 `z ∈ [bed, eta]`；真正海面以上、海床以下、非有限幾何、乾點與時間缺口仍 fail closed。
+5. 在前後時間 slice 線性內插；每次 RK stage 都使用其真正 stage time。表層 hold 只補 endpoint 的固定 z 支援洞，不改變海面邊界政策；海面接觸仍交由既有 boundary recovery 處理。
 
-這一順序與既有 SVD 的「先 node 垂向、再重心水平」政策一致，但粒子使用任意位置與原生 face，不依賴規則格網 cell。
+這一順序與既有 SVD 的「先 node 垂向、再重心水平」政策一致，但粒子使用任意位置與原生 face，不依賴規則格網 cell。surface hold 及 query-time 幾何 gate 是移動海面下的工程取樣契約，不代表已完成真實資料的科學驗證；Smagorinsky reference 也必須使用同一端點支援與 query-time 幾何 gate。
 
 ## 5. NWW3 與 Stokes 取樣器
 

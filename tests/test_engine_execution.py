@@ -26,7 +26,9 @@ from lagrangian_backtracking.engine import (
     initialize_particle_execution,
     run_particle,
 )
+from lagrangian_backtracking.forcing import OCMNativeMonth
 from lagrangian_backtracking.integrators import SamplingContext, SamplingError
+from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.models import (
     EventType,
     ParticleState,
@@ -326,6 +328,78 @@ def test_backward_sinking_surface_stage_recovery_reflects_and_continues() -> Non
     )
     assert rng.bit_generator.state == expected_rng.bit_generator.state
     assert any(z_m > 0.0 for _, _, z_m, _ in queries)
+
+
+def test_engine_near_surface_sinking_uses_moving_surface_endpoint_hold() -> None:
+    """近海面 backward sinking 不應只因 after endpoint top-layer gap 變數值失敗。
+
+    合成 OCM 的 before 最高 ``zcor`` 為 1.77 m、after 降至 1.47 m；粒子固定 z=1.5 m
+    但 query-time eta 約為 1.62 m，因此它仍在當時水柱內。engine 每個 RK stage 都由
+    ``OCMNativeMonth.sample`` 取樣，after endpoint 必須使用最高層 surface hold，最後
+    再由 query-time eta／bed gate 判定有效。沉降速度為 -0.001 m/s（m/s、向上為正），
+    backward signed-time 只讓粒子緩慢向上移動，故本案例不應觸發海面 recovery；若
+    endpoint hold 缺失，原有行為會在 stage query 產生 ``VERTICAL_UNSUPPORTED`` 並將
+    粒子記成 ``NUMERICAL_FAILURE``。這只是數值工程 regression，不代表真實 SERVER
+    run 或科學驗證已完成。
+    """
+
+    mesh = NativeMesh(
+        node_lon=np.array([121.0, 121.001, 121.0]),
+        node_lat=np.array([25.0, 25.0, 25.001]),
+        node_xy=np.array([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0]]),
+        source_depth_m=np.full(3, 10.0),
+        source_node_bottom_index=np.zeros(3, dtype=np.int64),
+        face_nodes_local=np.array([[0, 1, 2, -1]]),
+        face_node_count=np.array([3]),
+        source_face_global_index=np.array([99]),
+    )
+    time_utc_ns = np.array([0, 1_000_000_000], dtype=np.int64)
+    zcor = np.empty((2, 3, 3), dtype=np.float64)
+    zcor[0, :, :] = np.array([-10.0, -5.0, 1.77])
+    zcor[1, :, :] = np.array([-10.0, -5.0, 1.47])
+    hvel = np.zeros((2, 3, 3, 2), dtype=np.float64)
+    vertical_velocity = np.full((2, 3, 3), -0.001, dtype=np.float64)
+    diffusivity = np.full((2, 3, 3), 0.01, dtype=np.float64)
+    elev = np.array([[1.77, 1.77, 1.77], [1.47, 1.47, 1.47]], dtype=np.float64)
+    ocm = OCMNativeMonth(
+        month_id="197001",
+        mesh=mesh,
+        time_utc_ns=time_utc_ns,
+        hvel=hvel,
+        vertical_velocity=vertical_velocity,
+        zcor=zcor,
+        elev=elev,
+        wetdry_elem=np.zeros((2, 1), dtype=np.float64),
+        diffusivity=diffusivity,
+        maximum_time_gap_seconds=2.0,
+    )
+    settings = _settings(
+        dt_min_seconds=0.01,
+        dt_max_seconds=0.1,
+        output_interval_seconds=0.1,
+        max_backtrack_seconds=0.2,
+        maximum_step_count=10,
+    )
+    initial = replace(
+        _state(time_utc_ns=500_000_000),
+        x_m=2.0,
+        y_m=3.0,
+        z_m=1.5,
+    )
+
+    result = run_particle(
+        initial,
+        velocity=ocm.sample,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=np.random.Generator(np.random.PCG64DXSM(20260907)),
+    )
+
+    assert result.final_state.status == ParticleStatus.MAX_AGE
+    assert all(event.event_type != EventType.NUMERICAL_FAILURE for event in result.events)
+    assert all(observation.status != ParticleStatus.NUMERICAL_FAILURE for observation in result.observations)
 
 
 def test_surface_stage_recovery_applies_one_nonzero_diffusion_after_reflection() -> None:
