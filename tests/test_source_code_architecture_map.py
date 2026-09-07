@@ -147,6 +147,16 @@ def test_module_catalog_covers_package_exactly() -> None:
     assert all((module.PACKAGE_ROOT / f"{module_id}.py").is_file() for module_id in built_ids)
 
 
+def test_integrator_map_records_stage_only_surface_adjustment() -> None:
+    """架構地圖須揭露最小步長海面中間點調節，但不可描述成一般取樣放寬。"""
+
+    module = _load_architecture_map_module()
+    integrator_info = module.MODULE_INFO["integrators"]
+    assert "SurfaceStageVelocityProvider" in integrator_info["entrypoints"]
+    assert "下一次折半低於 dt_min" in integrator_info["read_first"]
+    assert "完整 RK4 後" in integrator_info["read_first"]
+
+
 def test_catalog_groups_and_flow_edges_are_closed() -> None:
     """確認群組、模組說明與語意流程的 source/target 不會指向未知節點。"""
 

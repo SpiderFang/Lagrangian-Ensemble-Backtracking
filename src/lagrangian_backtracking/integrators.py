@@ -8,7 +8,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import math
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 import numpy as np
@@ -71,6 +72,160 @@ class SamplingError(RuntimeError):
         self.stage = stage
         self.qc = qc
         self.context = context
+
+
+_RK4_STAGE_NAMES = ("k1", "k2", "k3", "k4")
+
+
+@dataclass(slots=True)
+class SurfaceStageVelocityProvider:
+    """只供單次完整 RK4 重試使用的海面 stage 反射速度包裝器。
+
+    一般 ``VelocityProvider`` 必須拒絕超過其海面數值容許帶的查詢，不能為了讓積分通過
+    而接受任意水面以上位置。本包裝器因此只由 engine 在兩項條件同時成立時建立：原始
+    k2、k3 或 k4 已由同次失敗樣本證明越過當地移動海面，且再把時間步長折半會低於
+    ``dt_min``。它只服務接下來那一次完整的確定性四階 Runge-Kutta 法（RK4）重試，
+    不改變底層 forcing API，也不修改粒子 state。
+
+    每個 stage 先以原始 ``x/y/z/t`` 查詢；僅當品質檢查旗標（``qc``）精確等於
+    ``VERTICAL_UNSUPPORTED``、海面與海床皆為有限相容的公尺制正向向上座標、步首嚴格
+    位於實際水柱內、行為不是上浮，且中間計算點的 z 嚴格高於 eta 時，才以
+    ``z_reflected = 2*eta - z`` 鏡射。鏡射深度必須嚴格落在該次樣本的 ``[bed, eta]``，
+    再於完全相同的 x、y、UTC 奈秒與鏡射 z 重查速度。這相當於只對中間導數施加反射
+    數值邊界條件；RK4 的原始中間幾何與最後提議位置不會被夾回，步末仍由既有垂向邊界
+    解析器判斷是否真的接觸海面。一般取樣介面的 5 微米海面容許帶不會在這裡再套一次。
+
+    重查若仍無效、速度非有限或回傳幾何與鏡射深度不相容，會立即以該鏡射查詢的實際
+    座標拋出 ``SamplingError``。這可保留 dry、域外、時間缺口及其他 QC，且失敗發生在
+    Brownian 隨機擴散之前，不消耗亂數。包裝器依一次 RK4 固定的四次 stage 呼叫順序
+    辨識 k1--k4；同一實例不得跨兩次 RK4 嘗試重用。
+    """
+
+    velocity: VelocityProvider
+    step_start_state: ParticleState
+    step_start_sample: VelocitySample
+    behavior_class: str
+    _stage_index: int = field(default=0, init=False, repr=False)
+
+    def __call__(
+        self, x_m: float, y_m: float, z_m: float, time_utc_ns: int
+    ) -> VelocitySample:
+        """查詢一個 RK4 stage，僅在已完整證明海面越界時改以鏡射深度重查。"""
+
+        stage = _RK4_STAGE_NAMES[self._stage_index] if self._stage_index < 4 else None
+        self._stage_index += 1
+        sample = self.velocity(x_m, y_m, z_m, time_utc_ns)
+        reflected_z = self._reflected_stage_z(stage=stage, z_m=z_m, sample=sample)
+        if reflected_z is None:
+            return sample
+        # ``_reflected_stage_z`` 只會替 k2--k4 回傳數值；明示此不變量可避免失敗診斷
+        # 在未來調整呼叫順序時悄悄退化成未知階段。
+        assert stage is not None
+
+        # 直接呼叫底層 provider，避免鏡射重查被誤計為下一個 RK4 stage。x/y/t 完全保留，
+        # 唯一改變的是垂向查詢位置；這項內部調節不寫入或擴張輸出 schema。
+        reflected_sample = self.velocity(x_m, y_m, reflected_z, time_utc_ns)
+        context = SamplingContext(
+            x_m,
+            y_m,
+            reflected_z,
+            time_utc_ns,
+            reflected_sample.eta_m,
+            reflected_sample.bed_z_m,
+        )
+        if not reflected_sample.valid:
+            raise SamplingError(stage, reflected_sample.qc, context=context)
+        if not self._reflected_sample_contains_z(reflected_sample, reflected_z):
+            raise SamplingError(
+                stage,
+                SampleQC.VERTICAL_UNSUPPORTED,
+                context=context,
+            )
+        try:
+            reflected_velocity = tuple(
+                float(value)
+                for value in (
+                    reflected_sample.u_mps,
+                    reflected_sample.v_mps,
+                    reflected_sample.w_mps,
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise SamplingError(stage, SampleQC.NUMERICAL_FAILURE, context=context) from None
+        if not all(math.isfinite(value) for value in reflected_velocity):
+            raise SamplingError(stage, SampleQC.NUMERICAL_FAILURE, context=context)
+        return reflected_sample
+
+    def _reflected_stage_z(
+        self,
+        *,
+        stage: str | None,
+        z_m: float,
+        sample: VelocitySample,
+    ) -> float | None:
+        """核對 stage crossing 的完整幾何證據，回傳合法鏡射深度或 ``None``。
+
+        ``None`` 表示包裝器沒有權限調節該查詢，呼叫端會把原樣本交回既有 RK4 錯誤
+        流程。特別是 k1、組合 QC、缺值、上浮行為、步首海床以下或鏡射後海床以下，
+        都不能藉由海面反射轉成有效速度。
+        """
+
+        if (
+            stage not in {"k2", "k3", "k4"}
+            or self.behavior_class == "rising"
+            or not self.step_start_sample.valid
+            or sample.qc != SampleQC.VERTICAL_UNSUPPORTED
+        ):
+            return None
+        try:
+            start_z = float(self.step_start_state.z_m)
+            start_eta = float(self.step_start_sample.eta_m)
+            start_bed = float(self.step_start_sample.bed_z_m)
+            stage_z = float(z_m)
+            stage_eta = float(sample.eta_m)
+            stage_bed = float(sample.bed_z_m)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(
+            math.isfinite(value)
+            for value in (start_z, start_eta, start_bed, stage_z, stage_eta, stage_bed)
+        ):
+            return None
+        if (
+            start_bed > start_eta
+            or start_z < start_bed
+            or start_z > start_eta
+            or stage_bed > stage_eta
+            or stage_z <= stage_eta
+        ):
+            return None
+        reflected_z = 2.0 * stage_eta - stage_z
+        # 這裡採嚴格水柱範圍而不再使用容許帶：海面公式本身保證 reflected_z <= eta，
+        # 若大步長讓鏡射位置低於 bed，就代表不能以海面條件掩蓋海床越界。
+        if not math.isfinite(reflected_z) or reflected_z < stage_bed or reflected_z > stage_eta:
+            return None
+        return reflected_z
+
+    @staticmethod
+    def _reflected_sample_contains_z(sample: VelocitySample, reflected_z: float) -> bool:
+        """確認重查的有效樣本仍以有限相容上下界支撐鏡射深度。
+
+        真實 OCM 的 eta／bed 不隨查詢 z 改變，但合成取樣器或損毀資料可能違反此前提；
+        因此品質旗標有效仍須重驗幾何，而且採嚴格水柱範圍，不新增物理緩衝。
+        """
+
+        try:
+            eta = float(sample.eta_m)
+            bed = float(sample.bed_z_m)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return (
+            math.isfinite(eta)
+            and math.isfinite(bed)
+            and bed <= eta
+            and reflected_z >= bed
+            and reflected_z <= eta
+        )
 
 
 def _velocity_vector(
@@ -150,12 +305,12 @@ def apply_diffusion_step(
 ) -> ParticleState:
     """對已完成確定性步驟的狀態套用一次 operator-split 擴散位移。
 
-    這個入口把 Brownian 隨機位移及空間擴散的 ``+div(K)|dt|`` 漂移集中在同一處，
-    讓一般 RK4 成功路徑與「RK stage 已知越過海面、先做幾何反射」的 recovery 路徑
-    使用完全相同的擴散契約。``state`` 的時間與年齡應已代表本次確定性步驟的末端；
+    這個入口把布朗運動（Brownian）隨機位移及空間擴散的 ``+div(K)|dt|`` 漂移集中在
+    同一處，讓一般 RK4 與海面中間計算點經反射速度重查後成功的路徑使用完全相同的
+    擴散契約。``state`` 的時間與年齡應已代表本次確定性步驟的末端；
     本函式只改變三個公尺制位置，不再次取樣速度、不在 RK4 stage 中插入亂數，而且每次
-    呼叫恰消耗一次三軸 ``normal(size=3)``。若 caller 已判定邊界為終止狀態，禁止呼叫
-    本函式，因為終止 recovery 不應在停止時間之後追加 diffusion。
+    呼叫恰消耗一次三軸 ``normal(size=3)``。若呼叫端已判定邊界為終止狀態，禁止呼叫
+    本函式，因為終止邊界定位不應在停止時間之後追加擴散。
     """
 
     if isinstance(coefficients, DiffusionCoefficients):

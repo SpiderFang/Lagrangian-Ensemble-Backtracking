@@ -137,6 +137,50 @@ X_adv = X_n + dt*(k1 + 2*k2 + 2*k3 + k4)/6
 - 不跨越下一個 forcing time boundary；跨月由 month window 明確切換。
 - `dt_min`、`dt_max` 與步數上限由 config 設定，任何 clamp 都計數。
 
+### 4.2 最小步長的海面 stage 反射邊界條件
+
+一般 OCM／Stokes forcing 查詢仍受集中定義的 `SURFACE_BOUNDARY_TOLERANCE_M=5e-6 m`
+約束；超過容許帶的 `z>eta` 不會因積分需求而被取樣器（sampler）接受。新竹 24 小時 r3 診斷在
+`dt_min=0.1 s` 的 k4 觀察到約 `10.37e-6 m` 上越，顯示移動 eta、RK4 stage 位置與
+內插共同形成的邊界 crossing 可以大於一般 forcing 的微米級數值容許帶。解法不是放大
+5 微米，也不是把 top `zcor` 當成無限延伸的海面層，而是在積分器外層施加受限的反射
+數值邊界條件。BayTrace 僅提供「中間 stage 可按邊界調節、步末再解析水柱」的行為參照；
+本專案依自身 QC、signed-time、事件與隨機分離契約獨立實作，未複製其程式碼。
+
+引擎依下列固定順序處理：
+
+1. 先用一般 forcing 執行完整確定性 RK4；若 k2、k3 或 k4 可由同次失敗樣本證明為海面
+   crossing，且折半後仍不低於 `dt_min`，保持既有 adaptive halving 後從 k1 重新計算。
+2. 只有下一次折半會低於 `dt_min`，才建立一次性的 `SurfaceStageVelocityProvider`，並以
+   相同 accepted dt 從 k1 重算完整 RK4。k1 永不調節；k2--k4 只有在 QC **精確等於**
+   `VERTICAL_UNSUPPORTED` 時才可能進入鏡射，組合 QC 不符合資格。
+3. 步首 z 必須嚴格位於有限相容的實際 `[bed, eta]` 水柱內，材質行為不得為上浮
+   （`rising`）；失敗中間點的 eta／bed 亦須有限相容，且 z 必須嚴格大於當地 eta。
+4. 合法 stage 使用
+   `z_reflected = 2*eta - z`。鏡射位置必須嚴格位於該次 `[bed, eta]`；只改 z，x、y 與
+   世界協調時間（UTC）奈秒完全不變。速度須在鏡射位置重新取樣，不能沿用失敗樣本、
+   步首速度或任意最近層。
+5. 鏡射重查若仍無效，保留其 dry、outside、time-gap、vertical 或其他 QC 並 fail closed；
+   缺 eta／bed、不相容水柱、鏡射後低於海床、rising 或海床 crossing 均不能走此路徑。
+   stage 備援調節失敗後不再接續 active reference-drift 海面恢復。
+6. 原始失敗嘗試、自適應折半與失敗的鏡射重查都發生在隨機擴散前，不讀取亂數產生器
+   （RNG）。
+   只有四個 stage 全部成功後，才以原步首 `DiffusionSample` 加入恰一次
+   `+div(K)|dt|` 與 Brownian 位移，維持 seed、chunk、shard 與 restart 的消耗順序。
+7. stage 的原始幾何位置不改寫；完成 RK4 與擴散後的 proposed position 仍由
+   `resolve_vertical_boundaries` 判斷海面／海床 crossing。只有步首到步末真的 crossing
+   才建立事件；單獨的中間 stage 上越不會虛構 `SURFACE_CONTACT`。目前沒有新增輸出
+   來源追溯（provenance）欄位，以免把未必伴隨終點事件的內部調節誤綁到 event schema。
+
+這項資格判定實作在共用的 Python 積分器與粒子引擎，沒有另一套 Numba 分支；NumPy
+參考插值與 Numba 加速插值都只作底層速度重查，並接受同一組 x/y/z/t 與相同品質旗標
+檢查。因此切換 OCM 插值核心不會改變何時允許鏡射，現有雙路徑海面取樣測試仍需同時
+通過，避免底層取樣結果破壞此共同控制流程。
+
+這項政策是公尺制移動邊界的數值條件，不允許粒子狀態停留在水面以上，也不替代縮小
+`dt_min` 的敏感度檢查。r3 的 `10.37e-6 m` 是觸發修正的真資料診斷，不是修正後重跑成功
+或科學驗收證據；正式使用仍須比較時間步收斂、終止狀態比例及受影響軌跡。
+
 ## 5. 隨機擴散
 
 ### 5.1 常數係數參考案例
@@ -412,6 +456,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | Brownian statistics | mean 在信賴區間含 0，variance 在統計容許範圍含 `2K t` |
 | variable K | diffusivity barrier／well-mixed 與參考 PDE 一致後才啟用 |
 | boundary crossing | 解析線段 crossing 位置、時間、segment 與弧長一致 |
+| moving-surface RK4 stage | 在 `dt_min` 的 k4 海面上越可由同 x/y/t 的鏡射深度重查完成完整 RK4；鏡射失敗與乾點、域外、時間缺口、上浮、海床案例均封閉失敗或依既有終止邊界分類；失敗嘗試不消耗亂數，完整成功後布朗運動恰套用一次 |
 
 ### 9.3 系統與科學驗收
 

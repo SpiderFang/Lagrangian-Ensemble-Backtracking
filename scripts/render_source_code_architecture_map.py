@@ -255,11 +255,18 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": "隨機擴散在 RK4 後獨立加入，不可混入 RK4 stage。",
     },
     "integrators": {
-        "role": "負時間步的四階 Runge-Kutta 與擴散分裂",
+        "role": "負時間步的四階 Runge-Kutta、最小步長海面中間點反射與擴散分裂",
         "inputs": "ParticleState、VelocityProvider、時間步長與擴散係數",
         "outputs": "下一個 ParticleState 或 SamplingError",
-        "entrypoints": ["rk4_step", "split_rk4_brownian_step"],
-        "read_first": "確認逆向只把時間步取反一次，並把隨機位移放在積分後。",
+        "entrypoints": [
+            "SurfaceStageVelocityProvider",
+            "rk4_step",
+            "split_rk4_brownian_step",
+        ],
+        "read_first": (
+            "確認逆向只把時間步取反一次；只有下一次折半低於 dt_min 且已證實為非上浮的 "
+            "k2--k4 海面上越，才以鏡射 z 重查速度，隨機位移仍只放在完整 RK4 後。"
+        ),
     },
     "boundaries": {
         "role": "水平／垂向邊界事件與穿越點解析",
