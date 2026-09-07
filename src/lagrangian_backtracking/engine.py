@@ -22,9 +22,20 @@ from enum import StrEnum
 
 import numpy as np
 
-from .boundaries import BoundaryGeometry, resolve_horizontal_boundaries, resolve_vertical_boundaries
+from .boundaries import (
+    BoundaryGeometry,
+    recover_surface_boundary_at_step_start,
+    resolve_horizontal_boundaries,
+    resolve_vertical_boundaries,
+)
 from .diffusion import DiffusionCoefficients, DiffusionModel, choose_time_step, resolve_diffusion_sample
-from .integrators import SamplingContext, SamplingError, VelocityProvider, split_rk4_brownian_step
+from .integrators import (
+    SamplingContext,
+    SamplingError,
+    VelocityProvider,
+    apply_diffusion_step,
+    split_rk4_brownian_step,
+)
 from .models import (
     BoundaryEvent,
     EventType,
@@ -71,6 +82,7 @@ _VELOCITY_SUM_RTOL = 1.0e-12
 _VELOCITY_SUM_ATOL = 1.0e-12
 _MAX_VELOCITY_QC_FLAGS = (1 << 32) - 1
 _YYYYMM_PATTERN = re.compile(r"^[0-9]{6}$")
+_SURFACE_CROSSING_TOLERANCE_M = 1.0e-6
 EnvironmentContext = tuple[
     EnvironmentSampleStatus,
     float | None,
@@ -1044,7 +1056,7 @@ def _terminate_execution(
     return ParticleAdvanceResult(terminal=True, stepped=False, state=execution.state)
 
 
-def _recover_terminal_boundary_from_reference_drift(
+def _recover_boundary_from_reference_drift(
     state: ParticleState,
     *,
     reference: VelocitySample,
@@ -1052,13 +1064,15 @@ def _recover_terminal_boundary_from_reference_drift(
     boundaries: BoundaryGeometry,
     behavior_class: str,
 ) -> tuple[ParticleState, list[BoundaryEvent]] | None:
-    """中間計算點落到陸地或資料範圍外時，補做可驗證的邊界停止判定。
+    """中間計算點落到無法取樣的位置時，補做可驗證的邊界定位或海面反射。
 
     原始網格不能在陸地或範圍外提供速度，因此四階計算的中間點可能先失敗，來不及走到
     正常的邊界判定。此處只用步首速度建立一條簡化直線，且僅在第一個碰到的確實是海岸、
-    流場外、沉積或離開表層這類「必須停止」事件時才採用。若只是離開局部分析區，不使用
-    這個簡化結果，以免取代一般的四階計算。事件會標記此判定來源，正式驗收時應以更小
-    時間步長再次檢查差異。
+    流場外、沉積或海面反射時才採用。對 sinking／suspended 的海面 crossing，
+    ``resolve_vertical_boundaries`` 會回傳仍為 ``ACTIVE`` 的鏡射位置；只有這種有明確
+    ``SURFACE_CONTACT`` 事件的 active 結果才可恢復。若只是離開局部分析區，或上下界
+    不足以證明物理邊界，不使用簡化結果，以免把未知環境誤當作邊界。所有採用的事件都
+    標記此判定來源，正式驗收時應以更小時間步長再次檢查差異。
     """
 
     signed_dt = -dt_seconds
@@ -1086,7 +1100,10 @@ def _recover_terminal_boundary_from_reference_drift(
         ParticleStatus.DEPOSITED,
         ParticleStatus.SURFACE_REGIME_EXIT,
     }
-    if proposed.status not in terminal_statuses:
+    has_surface_reflection = any(
+        event.event_type is EventType.SURFACE_CONTACT for event in vertical_events
+    )
+    if proposed.status not in terminal_statuses and not has_surface_reflection:
         return None
     diagnosed = [
         replace(
@@ -1100,6 +1117,50 @@ def _recover_terminal_boundary_from_reference_drift(
         for event in events
     ]
     return proposed, diagnosed
+
+
+def _is_proven_surface_stage_crossing(
+    state: ParticleState,
+    *,
+    reference: VelocitySample,
+    error: SamplingError,
+    behavior_class: str,
+) -> bool:
+    """判斷 RK4 失敗是否確實來自步內越過已知海面，而非泛化 QC 放寬。
+
+    OCM 的垂向取樣只接受上下兩層都能夾住 ``z_m``；因此失效 stage 若帶有有限
+    ``eta_m``／``bed_z_m``，且步首與失效 stage 分別位於同一水柱的海面下／海面上，
+    就能證明這是幾何邊界事件。這裡要求步首 reference 也有有限且相容上下界，避免
+    只依賴失效查詢點的部分資訊猜測 crossing；時間缺口、乾點、域外、非有限上下界或
+    非垂向 QC 一律回傳 False。``behavior_class`` 為 rising 時沿用海面退出政策，
+    不走本函式的 sinking／suspended 反射重試。
+    """
+
+    if behavior_class == "rising" or error.stage not in {"k2", "k3", "k4"}:
+        return False
+    if error.qc != SampleQC.VERTICAL_UNSUPPORTED or error.context is None:
+        return False
+    context = error.context
+    try:
+        reference_eta = float(reference.eta_m)
+        reference_bed = float(reference.bed_z_m)
+        context_eta = float(context.eta_m)
+        context_bed = float(context.bed_z_m)
+        state_z = float(state.z_m)
+        context_z = float(context.z_m)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not all(
+        math.isfinite(value)
+        for value in (reference_eta, reference_bed, context_eta, context_bed, state_z, context_z)
+    ):
+        return False
+    return not (
+        reference_bed > reference_eta + _SURFACE_CROSSING_TOLERANCE_M
+        or context_bed > context_eta + _SURFACE_CROSSING_TOLERANCE_M
+        or state_z > reference_eta + _SURFACE_CROSSING_TOLERANCE_M
+        or context_z <= context_eta + _SURFACE_CROSSING_TOLERANCE_M
+    )
 
 
 def advance_particle_once(
@@ -1122,9 +1183,13 @@ def advance_particle_once(
     垂向邊界、水平邊界、minimum clamp 計數與輸出觀測順序；固定係數仍走舊版零梯度
     Brownian 路徑。步驟方向仍由 ``split_rk4_brownian_step`` 收到負秒數決定，位置與尺度
     使用公尺、年齡使用秒、時間使用 UTC 奈秒。無效擴散樣本在 choose-time-step、RK4
-    與 RNG 之前依既有 QC 終止。終止狀態會立即寫入最後觀測，因此呼叫端可以在每次
-    sweep 後安全 checkpoint；``on_step`` 只在真正完成數值步時呼叫一次。
-    失敗事件另附版本化的安全診斷；不增加取樣或改變步長、亂數、重試及邊界恢復政策。
+    與 RNG 之前依既有 QC 終止。已知海面穿越才可在 RNG 前以 ``dt`` 二分重試，或在
+    ``dt_min`` 使用帶驗證標記的 reference-drift 邊界定位；active 的海面反射 recovery
+    仍會在確定性定位後恰套用一次既有 Brownian／``+div(K)|dt|`` operator split，再解析
+    擴散後的邊界；真正終止的 boundary recovery 不追加 diffusion。其他 stage 失敗不重試。
+    終止狀態會立即寫入最後觀測，因此呼叫端可以在每次 sweep 後安全 checkpoint；
+    ``on_step`` 只在真正完成數值步時呼叫一次。失敗事件另附版本化的安全診斷，所有
+    boundary recovery 與重試都不在 RK4 stage 中插入隨機擴散。
     """
 
     if execution.terminal:
@@ -1159,8 +1224,25 @@ def advance_particle_once(
             event_type=EventType.FORCING_START,
         )
     reference = velocity(state.x_m, state.y_m, state.z_m, state.time_utc_ns)
-    # reference 已是本步唯一的步首 sample；環境欄位只 enrichment 同一 state 的最新
-    # observation，不另取樣或消耗 RNG，因此不會改變 RK4、Brownian 與輸出 cadence。
+    # OCM 對海面以上的 z 不做單側外插；若失效 sample 仍同時提供有限 eta／bed，
+    # 先依明確幾何證據鏡射回水柱內，再在同一 UTC／age 重新取樣。這不是清掉 QC：
+    # 只有 helper 證明「目前 z 高於海面且鏡射後仍在 bed--eta 水柱內」才會重試，
+    # 且重試發生在 diffusion、RK4 及 RNG 之前。其他失效原因維持原本 fail-closed。
+    if reference.qc == SampleQC.VERTICAL_UNSUPPORTED:
+        recovered_start = recover_surface_boundary_at_step_start(
+            state,
+            reference_sample=reference,
+            behavior_class=behavior_class,
+        )
+        if recovered_start is not None:
+            state, recovered_events = recovered_start
+            execution.state = state
+            execution.events.extend(recovered_events)
+            reference = velocity(state.x_m, state.y_m, state.z_m, state.time_utc_ns)
+    # reference 若已是有效步首 sample，這裡只會有原本的一次查詢；若前一個失效步首
+    # 成功被海面反射，第二次查詢是同一 state 的邊界重試，不把未知資料升格成速度，
+    # 也不消耗 RNG。環境欄位只 enrichment 同一 state 的最新 observation，不另取樣或
+    # 改變輸出 cadence。
     velocity_context = _reference_velocity_context(reference)
     environment_context = _enrich_latest_observation_from_reference(
         execution.observations,
@@ -1287,22 +1369,48 @@ def advance_particle_once(
                     attempted_dt_seconds=-decision.seconds,
                 ),
             )
-    recovered_terminal = False
-    try:
-        proposed = split_rk4_brownian_step(
-            state,
-            dt_seconds=-decision.seconds,
-            velocity=velocity,
-            coefficients=diffusion_sample,
-            rng=rng,
-        )
-    except SamplingError as error:
+    accepted_step_seconds = decision.seconds
+    surface_retry_count = 0
+    stage_error: SamplingError | None = None
+    while True:
+        try:
+            proposed = split_rk4_brownian_step(
+                state,
+                dt_seconds=-accepted_step_seconds,
+                velocity=velocity,
+                coefficients=diffusion_sample,
+                rng=rng,
+            )
+            break
+        except SamplingError as error:
+            next_step_seconds = accepted_step_seconds * 0.5
+            if (
+                _is_proven_surface_stage_crossing(
+                    state,
+                    reference=reference,
+                    error=error,
+                    behavior_class=behavior_class,
+                )
+                and next_step_seconds >= settings.dt_min_seconds
+            ):
+                # RK4 stage 失敗發生在 Brownian operator split 之前，所以縮短步長重試不會
+                # 消耗亂數。只有完整 stage 成功後才會進入一次 Brownian；若縮短後仍越面，
+                # 會繼續二分直到設定的 dt_min，避免以未證明的 clamp 取代環境資料。
+                accepted_step_seconds = next_step_seconds
+                surface_retry_count += 1
+                continue
+            stage_error = error
+            break
+
+    recovered_boundary = False
+    if stage_error is not None:
+        error = stage_error
         boundary_qc = SampleQC.OUTSIDE_HORIZONTAL_DOMAIN | SampleQC.DRY_FACE | SampleQC.VERTICAL_UNSUPPORTED
         recovery = (
-            _recover_terminal_boundary_from_reference_drift(
+            _recover_boundary_from_reference_drift(
                 state,
                 reference=reference,
-                dt_seconds=decision.seconds,
+                dt_seconds=accepted_step_seconds,
                 boundaries=boundaries,
                 behavior_class=behavior_class,
             )
@@ -1316,16 +1424,60 @@ def advance_particle_once(
                 velocity_context=velocity_context,
                 failure_attributes=_failure_attributes(
                     execution, settings, reason="rk_stage_unrecoverable", stage=error.stage,
-                    qc=error.qc, context=error.context, attempted_dt_seconds=-decision.seconds,
+                    qc=error.qc, context=error.context, attempted_dt_seconds=-accepted_step_seconds,
                 ),
             )
         proposed, recovered_events = recovery
         execution.events.extend(recovered_events)
-        recovered_terminal = True
-    if not recovered_terminal:
+        if proposed.status == ParticleStatus.ACTIVE and any(
+            event.event_type is EventType.SURFACE_CONTACT for event in recovered_events
+        ):
+            # reference drift 只負責把已證明的海面越界鏡射回水柱內；此時狀態仍是
+            # non-terminal，必須補回本 accepted step 原本應有的一次 operator-split
+            # diffusion。Brownian／+div(K)|dt| 仍發生在所有 RK stage 完成之後，且
+            # 擴散後以「反射後的末端狀態」重新解析邊界，避免跳過近海面擴散或把未知
+            # 環境盲目 clamp 成有效位置。
+            deterministic_recovery = proposed
+            diffused_recovery = apply_diffusion_step(
+                deterministic_recovery,
+                dt_seconds=-accepted_step_seconds,
+                coefficients=diffusion_sample,
+                rng=rng,
+            )
+            proposed, post_diffusion_vertical_events = resolve_vertical_boundaries(
+                deterministic_recovery,
+                diffused_recovery,
+                reference_sample=reference,
+                behavior_class=behavior_class,
+            )
+            execution.events.extend(post_diffusion_vertical_events)
+            if proposed.status == ParticleStatus.ACTIVE:
+                proposed, post_diffusion_horizontal_events = resolve_horizontal_boundaries(
+                    deterministic_recovery,
+                    proposed,
+                    boundaries,
+                )
+                execution.events.extend(post_diffusion_horizontal_events)
+        recovered_boundary = True
+    if not recovered_boundary:
         proposed, vertical_events = resolve_vertical_boundaries(
             state, proposed, reference_sample=reference, behavior_class=behavior_class
         )
+        if surface_retry_count:
+            vertical_events = [
+                replace(
+                    event,
+                    attributes={
+                        **event.attributes,
+                        "boundary_locator": "adaptive_rk4_surface_retry",
+                        "retry_count": surface_retry_count,
+                        "accepted_dt_seconds": accepted_step_seconds,
+                    },
+                )
+                if event.event_type is EventType.SURFACE_CONTACT
+                else event
+                for event in vertical_events
+            ]
         execution.events.extend(vertical_events)
         if proposed.status == ParticleStatus.ACTIVE:
             proposed, horizontal_events = resolve_horizontal_boundaries(state, proposed, boundaries)

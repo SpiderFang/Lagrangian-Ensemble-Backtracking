@@ -9,6 +9,7 @@ from shapely.geometry import LineString, box
 
 from lagrangian_backtracking.boundaries import (
     BoundaryGeometry,
+    recover_surface_boundary_at_step_start,
     resolve_horizontal_boundaries,
     resolve_vertical_boundaries,
 )
@@ -147,6 +148,61 @@ def test_rising_surface_exit_and_suspended_reflection() -> None:
     assert reflected.status == ParticleStatus.ACTIVE
     assert np.isclose(reflected.z_m, -1.0)
     assert events[0].event_type == EventType.SURFACE_CONTACT
+
+
+def test_step_start_surface_recovery_requires_provable_water_column() -> None:
+    """步首失效樣本只有在 eta／bed 完整且鏡射後仍位於水柱內時才可反射。
+
+    合成 ``VERTICAL_UNSUPPORTED`` 只表示目前 z 無法被 OCM 垂向層夾住；有限海面與
+    海床上下界可以證明粒子是在海面上方，故回傳 fraction=0 的海面接觸並鏡射。若
+    eta 缺失，或鏡射後會落到海床以下，則不能猜測是哪一個邊界，必須交回 engine
+    保留原本的 numerical-failure／data-gap 政策。
+    """
+
+    state = _state(0.0, z_m=0.5)
+    unsupported = VelocitySample(
+        0.0,
+        0.0,
+        -0.1,
+        0.0,
+        -10.0,
+        100.0,
+        10.0,
+        SampleQC.VERTICAL_UNSUPPORTED,
+    )
+    recovered = recover_surface_boundary_at_step_start(
+        state,
+        reference_sample=unsupported,
+        behavior_class="sinking",
+    )
+    assert recovered is not None
+    reflected, events = recovered
+    assert reflected.status == ParticleStatus.ACTIVE
+    assert np.isclose(reflected.z_m, -0.5)
+    assert len(events) == 1
+    assert events[0].event_type == EventType.SURFACE_CONTACT
+    assert events[0].fraction == 0.0
+    assert events[0].z_m == 0.0
+    assert events[0].attributes["boundary_locator"] == "step_start_surface_reflection"
+
+    missing_eta = replace(unsupported, eta_m=np.nan)
+    assert (
+        recover_surface_boundary_at_step_start(
+            state,
+            reference_sample=missing_eta,
+            behavior_class="sinking",
+        )
+        is None
+    )
+    reflected_below_bed = replace(state, z_m=11.0)
+    assert (
+        recover_surface_boundary_at_step_start(
+            reflected_below_bed,
+            reference_sample=unsupported,
+            behavior_class="sinking",
+        )
+        is None
+    )
 
 
 def test_reference_engine_constant_backward_flow_exits_outer_domain() -> None:

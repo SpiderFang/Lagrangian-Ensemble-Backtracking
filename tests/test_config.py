@@ -38,6 +38,15 @@ def test_example_config_has_fixed_scientific_counts() -> None:
     assert config.execution.max_resident_forcing_months == 2
 
 
+def test_receptor_candidate_domain_policy_is_versioned_and_core_aware() -> None:
+    """設定檔應明示 core∩local 與未明示 core fallback 的候選區政策。"""
+
+    payload = _payload()
+    assert payload["scenarios"]["other_site_receptor_candidate_domain"] == (
+        "site_explicit_core_intersect_local_else_local_or_flow_v1"
+    )
+
+
 def test_example_material_table_matches_runtime_baseline() -> None:
     """YAML 與程式內建表不可各自維護不同的材質、形狀、條件或速度。"""
 
@@ -134,6 +143,28 @@ def test_flow_domain_resolver_selects_formal_release_id_only_in_formal_mode() ->
         == "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     )
     assert resolve_flow_domain_id(config, "B", formal=True) == "hsinchu_cache_v3"
+
+
+@pytest.mark.parametrize("missing_field", ["anchor_lonlat", "receptor_core_radius_m"])
+def test_receptor_core_anchor_and_radius_must_be_declared_as_a_pair(missing_field: str) -> None:
+    """核心 anchor 與公尺半徑缺一時，config-check 應在讀取 inputs 前 fail closed。"""
+
+    payload = _payload()
+    hsinchu = next(site for site in payload["study_sites"] if site["study_site_id"] == "hsinchu")
+    hsinchu[missing_field] = None
+    with pytest.raises(ValueError, match="必須同時明示 anchor_lonlat 與 receptor_core_radius_m"):
+        ProjectConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("invalid_radius", [0.0, -1.0, float("inf"), float("nan")])
+def test_receptor_core_radius_must_be_finite_and_positive(invalid_radius: float) -> None:
+    """核心半徑是 AEQD 公尺距離，零、負值與非有限值不得進入幾何 intersection。"""
+
+    payload = _payload()
+    hsinchu = next(site for site in payload["study_sites"] if site["study_site_id"] == "hsinchu")
+    hsinchu["receptor_core_radius_m"] = invalid_radius
+    with pytest.raises(ValueError, match="receptor_core_radius_m 必須是有限正數"):
+        ProjectConfig.model_validate(payload)
 
 
 def test_formal_release_requires_dynamic_initial_condition_manifest_path() -> None:

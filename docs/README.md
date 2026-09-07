@@ -23,7 +23,9 @@
 
 ## 原文件路徑對照
 
-下表保留原本 18 份文件的檔名與原路徑；「狀態」只表示閱讀定位，不把工程測試通過誤寫成正式科學成果。
+下表保留原本 18 份文件的檔名與原路徑，並登錄 1 份新增的 pilot 參數紀錄；新增文件沒有
+待相容的舊根層路徑，因此 current/original 欄位相同。「狀態」只表示閱讀定位，不把工程
+測試通過誤寫成正式科學成果。
 
 | 文件 | 現行路徑 | 一句用途 | 狀態 | 原路徑 |
 |---|---|---|---|---|
@@ -41,6 +43,7 @@
 | 程式碼導覽、執行流程與工項計畫書追溯 | [development/11_source_code_guide_and_plan_traceability.md](development/11_source_code_guide_and_plan_traceability.md) | 將程式模組、資料流程、測試與工項要求連成交接地圖。 | 現行 | `docs/11_source_code_guide_and_plan_traceability.md` |
 | 聚合發布與 SERVER 正式執行實作計畫 | [results/12_aggregate_release_and_server_execution_plan.md](results/12_aggregate_release_and_server_execution_plan.md) | 規劃軌跡聚合、不可變發布、圖表產製與 SERVER 驗收。 | 現行 | `docs/12_aggregate_release_and_server_execution_plan.md` |
 | 正式成果 release 與科學圖表生產管線規劃 | [results/13_report_release_and_scientific_outputs_plan.md](results/13_report_release_and_scientific_outputs_plan.md) | 將成果圖組與驗證證據轉成可重建的發布流程。 | 現行 | `docs/13_report_release_and_scientific_outputs_plan.md` |
+| 新竹 2024-01-01 起始 24 小時 pilot 參數紀錄 | [results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md](results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md) | PI 可直接引用的 pilot UTC 視窗、輸入欄位、執行 scalar、hash／formal 界線與 BayTrace 對照。 | 現行 | `docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md` |
 | Slice 1：SERVER v3 輸入衍生與 release contract | [operations/14_input_derivation_and_release_contract.md](operations/14_input_derivation_and_release_contract.md) | 定義已驗收 OCM／NWW3 產品如何衍生並綁定 runtime 輸入。 | 現行 | `docs/14_input_derivation_and_release_contract.md` |
 | CLI 與執行介面參考 | [operations/cli_reference.md](operations/cli_reference.md) | 對照目前可執行命令、參數、輸入輸出與安全限制。 | 現行 | `docs/cli_reference.md` |
 | Git 部署與資料同步手冊 | [operations/git_deployment_and_data_sync.md](operations/git_deployment_and_data_sync.md) | 定義本機 Git、SERVER source、資料與部署驗收的邊界。 | 現行 | `docs/git_deployment_and_data_sync.md` |

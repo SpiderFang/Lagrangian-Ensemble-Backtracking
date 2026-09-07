@@ -1,4 +1,4 @@
-"""由已完成的 B 區 r2 preview 獨立重繪 legacy 或新版成果圖及來源清單。
+"""由已完成的 B 區 preview 獨立重繪 legacy 或新版成果圖及來源清單。
 
 預設 ``legacy`` 只輸出原契約的兩張水平圖；指定 ``--style baytrace`` 才增加區域／
 局部水平、垂向高度及停止原因四張新版圖，並各自保存對應的繁中 README 與 manifest。
@@ -7,8 +7,8 @@
 ``manifest.json``、``summary.json``、``particles.csv`` 與 ``observations.csv``，
 以及呼叫端明示的已驗收 B 區 domain/open-boundary manifest 和 CRS84 海岸
 FeatureCollection。它不讀海流或波浪陣列、不重新取樣、不重新積分，也不改寫任何
-輸入檔。回傳資料仍保留 CSV 的全部欄位與列順序，供後續繪圖階段使用原始 20 顆
-粒子、203 筆觀測及 summary 的 H1--H5 順序。
+輸入檔。回傳資料仍保留 CSV 的全部欄位與列順序，供後續繪圖階段使用原始粒子、
+模型保存紀錄及 summary 的原始水平面板順序。
 
 domain/open manifest 的語意雜湊沿用專案既有 ``manifests._read_json``；B 區 domain
 與 ``hsinchu_cache_v3`` flow open owner 必須同時符合 preview summary 的
@@ -86,8 +86,13 @@ def load_plot_inputs(
     summary, _, _, _ = _read_json(preview / "summary.json")
     if summary.get("artifact_kind") != "pilot-preview-v1" or summary.get("run_id") != manifest.get("run_id"):
         raise ValueError("preview summary 與 manifest 不符")
-    if summary.get("particle_count") != 20 or summary.get("observation_count") != 203:
-        raise ValueError("preview 必須是 20 粒子／203 觀測的既有 r2 結果")
+    particle_count = _integer_value(summary.get("particle_count"))
+    observation_count = _integer_value(summary.get("observation_count"))
+    if particle_count is None or particle_count <= 0:
+        raise ValueError("preview particle_count 必須是正整數")
+    if observation_count is None or observation_count < 0:
+        raise ValueError("preview observation_count 必須是非負整數")
+    _horizon_seconds(summary)
     projection_info = summary.get("projection")
     hashes = projection_info.get("geometry_canonical_hashes") if isinstance(projection_info, dict) else None
     if not isinstance(hashes, dict):
@@ -102,7 +107,7 @@ def load_plot_inputs(
 
     particles = read_csv("particles.csv")
     observations = read_csv("observations.csv")
-    if len(particles) != summary["particle_count"] or len(observations) != summary["observation_count"]:
+    if len(particles) != particle_count or len(observations) != observation_count:
         raise ValueError("preview CSV 計數與 summary 不符")
 
     domain, domain_sha, domain_canonical, _ = _read_json(domain_path)
@@ -153,7 +158,7 @@ def load_plot_inputs(
         raise ValueError("B flow open line 未與 domain exterior 相等")
 
     coastline, coastline_sha, coastline_canonical, _ = _read_json(coastline_path)
-    # 本入口專用於使用者已確認的 r2 海岸檔，不以相同 feature 數量接受另一份地圖。
+    # 本入口專用於使用者已確認的海岸檔，不以相同 feature 數量接受另一份地圖。
     if coastline_sha != "9e2e0ac9bc527aca87d89332cd428fdcb776eefbf94a85dd70f887f729b95fdd":
         raise ValueError("海岸檔 SHA-256 與本次已確認來源不符")
     crs_name = coastline.get("crs", {}).get("properties", {}).get("name")
@@ -196,7 +201,7 @@ _VERTICAL_COLORS = {
     "mid_upper_water_column": "#31a354",
     "upper_water_column": "#d73027",
 }
-"""四個既有垂向層的固定圖色；顏色只表示層別，不表示來源機率。"""
+"""既有垂向層的固定圖色；顏色只表示層別，不表示來源機率。"""
 
 _STATUS_MARKERS = {
     "max_age": "^",
@@ -263,7 +268,7 @@ _BAYTRACE_STATUS_LABELS = {
     "deposited": "沉積",
     "forcing_start": "到達驅動資料起點",
     "data_gap": "資料缺口",
-    "max_age": "完成1小時回溯",
+    "max_age": "完成回溯",
     "numerical_failure": "數值停止",
 }
 """新版停止中文名稱；數值失敗只有在 CSV／summary 雙重核對後才改成取樣失敗停止。"""
@@ -297,7 +302,7 @@ def _subtitle(summary: dict[str, Any]) -> str:
     """由來源到達時刻與回溯上限組合副題；不把模型保存紀錄稱為實測觀測。"""
 
     arrival = datetime.fromisoformat(summary["arrival_utc"])
-    horizon = float(summary["settings"]["horizon_seconds"])
+    horizon = _horizon_seconds(summary)
     end = arrival - timedelta(seconds=horizon)
     return (
         f"{arrival:%Y-%m-%d %H:%M} → {end:%H:%M} UTC｜"
@@ -305,7 +310,51 @@ def _subtitle(summary: dict[str, Any]) -> str:
     )
 
 
-def _legend_handles(levels: list[str], *, include_land: bool = False) -> list:
+def _horizon_seconds(summary: dict[str, Any]) -> float:
+    """讀取正的回溯秒數，讓所有圖面共用同一個時間設定且拒絕無效軸範圍。
+
+    ``summary.settings.horizon_seconds`` 是模擬設定的回溯上限，單位為秒；此處只做
+    顯示前的型別與有限值核對，不依據圖面資料推算時間，也不改寫 summary。零或負值
+    會讓完成狀態及深度軸失去意義，因此直接拒絕產圖。
+    """
+
+    settings = summary.get("settings")
+    value = settings.get("horizon_seconds") if isinstance(settings, dict) else None
+    try:
+        horizon = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("preview horizon_seconds 必須是有限正數") from None
+    if not math.isfinite(horizon) or horizon <= 0:
+        raise ValueError("preview horizon_seconds 必須是有限正數")
+    return horizon
+
+
+def _horizon_hours_text(summary: dict[str, Any]) -> str:
+    """把設定中的回溯秒數轉成不失真的小時文字，供圖例與 README 共用。"""
+
+    return f"{_horizon_seconds(summary) / 3600:g}"
+
+
+def _max_age_label(summary: dict[str, Any]) -> str:
+    """由回溯設定建立 max-age 的中文標籤，避免把固定時長寫死。"""
+
+    return f"完成{_horizon_hours_text(summary)}小時回溯"
+
+
+def _depth_axis_limits_and_ticks(summary: dict[str, Any]) -> tuple[float, list[float]]:
+    """回傳垂向圖的分鐘上限與四等分刻度，確保軸範圍跟隨實際回溯設定。
+
+    圖面資料的 ``age_seconds`` 仍直接來自 preview；此 helper 只把已核對的
+    ``horizon_seconds`` 轉成分鐘，並在 0 與回溯上限間建立五個等距刻度，讓不同
+    回溯長度的圖都能使用同一資料契約。
+    """
+
+    horizon_minutes = _horizon_seconds(summary) / 60.0
+    quarter = horizon_minutes / 4.0
+    return horizon_minutes, [index * quarter for index in range(5)]
+
+
+def _legend_handles(summary: dict[str, Any], levels: list[str], *, include_land: bool = False) -> list:
     """總覽與局部圖共用中文水層、起點、停止形狀及同一登錄外框圖例。"""
 
     from matplotlib.lines import Line2D
@@ -321,7 +370,7 @@ def _legend_handles(levels: list[str], *, include_land: bool = False) -> list:
         )
     )
     for status, label in (
-        ("max_age", "達回溯 1 小時"),
+        ("max_age", _max_age_label(summary)),
         ("flow_domain_open_exit", "開放邊界離域"),
         ("numerical_failure", "數值停止"),
     ):
@@ -343,7 +392,11 @@ def _legend_handles(levels: list[str], *, include_land: bool = False) -> list:
 
 
 def render_overview(data: dict[str, Any], output_path: str | Path) -> Path:
-    """以已載入的 20 顆粒子與 203 筆觀測繪製單張經緯度總覽 PNG。
+    """以已載入的粒子與模型保存紀錄繪製單張經緯度總覽 PNG。
+
+    此函式只由 ``build_coastline_preview(style="legacy")`` 呼叫，用來維持既有
+    兩圖相容成果；新版 BayTrace 圖面使用 ``render_baytrace_overview``，不共用
+    舊版輸出契約。
 
     每條線只連接同一 ``particle_id`` 的保存觀測；位置由既有
     ``DomainProjection.unproject`` 將 AEQD 公尺轉回經度、緯度，沒有重新取樣或
@@ -448,7 +501,7 @@ def render_overview(data: dict[str, Any], output_path: str | Path) -> Path:
                 zorder=6,
             )
 
-        # 使用 summary 的原始水平受體順序，避免由座標排序重新定義 H1--H5。
+        # 使用 summary 的原始水平受體順序，避免由座標排序重新定義面板標籤。
         for panel in summary["horizontal_panels"]:
             ax.annotate(
                 f"H{panel['panel']}",
@@ -484,7 +537,7 @@ def render_overview(data: dict[str, Any], output_path: str | Path) -> Path:
             fontsize=11,
         )
         ax.legend(
-            handles=_legend_handles(levels, include_land=True),
+            handles=_legend_handles(summary, levels, include_land=True),
             loc="upper center",
             bbox_to_anchor=(0.5, -0.13),
             ncol=3,
@@ -500,9 +553,12 @@ def render_overview(data: dict[str, Any], output_path: str | Path) -> Path:
 
 
 def render_local(data: dict[str, Any], output_path: str | Path) -> Path:
-    """以原 AEQD 公尺座標繪製五個局部面板，第六格放共用圖例與簡短圖說。
+    """以原 AEQD 公尺座標繪製既有局部面板，第六格放共用圖例與簡短圖說。
 
-    H1--H5 沿用 summary 的水平分組，每組四粒子。各組以第一顆粒子的初始保存 XY
+    此函式只由 ``build_coastline_preview(style="legacy")`` 呼叫，用來保留舊成果
+    的兩張水平圖；新版 BayTrace 局部圖由 ``render_baytrace_local`` 獨立處理。
+
+    summary 的水平分組與垂向層別決定各面板內容。各組以第一顆粒子的初始保存 XY
     作共同原點，只平移座標；線段、終點及已投影的 B 外框接受同量平移，不重新取樣、
     旋轉或縮放位移。各面板 x/y 等比例，範圍由保存軌跡及終點決定，再留出閱讀邊距。
     外框只畫與該範圍相交的線段，不為遠處外框擴張局部圖。第六格的圖例與圖說使用
@@ -533,8 +589,9 @@ def render_local(data: dict[str, Any], output_path: str | Path) -> Path:
     try:
         for ax, panel in zip(axes.flat, summary["horizontal_panels"], strict=False):
             selected = [p for p in data["particles"] if int(p["horizontal_panel"]) == panel["panel"]]
-            if len(selected) != 4:
-                raise ValueError("局部面板必須保留原始四個水層粒子")
+            expected_layer_count = len(summary["vertical_order"])
+            if len(selected) != expected_layer_count:
+                raise ValueError(f"局部面板必須保留原始 {expected_layer_count} 個水層粒子")
             origin = curves[selected[0]["particle_id"]][0]
             x0, y0 = float(origin["x_m"]), float(origin["y_m"])
             points = [(0.0, 0.0)]
@@ -585,7 +642,7 @@ def render_local(data: dict[str, Any], output_path: str | Path) -> Path:
             ax.set_xlim(bounds[0], bounds[2])
             ax.set_ylim(bounds[1], bounds[3])
             ax.set_aspect("equal", adjustable="box")
-            ax.set_title(f"H{panel['panel']}｜4 顆粒子", fontproperties=font, fontsize=14)
+            ax.set_title(f"H{panel['panel']}｜{len(selected)} 顆粒子", fontproperties=font, fontsize=14)
             ax.set_xlabel("東向位移 (m)", fontproperties=font)
             ax.set_ylabel("北向位移 (m)", fontproperties=font)
             ax.ticklabel_format(useOffset=False, style="plain")
@@ -601,7 +658,7 @@ def render_local(data: dict[str, Any], output_path: str | Path) -> Path:
         legend_font = font.copy()
         legend_font.set_size(10)
         legend = legend_ax.legend(
-            handles=_legend_handles(list(summary["vertical_order"])),
+            handles=_legend_handles(summary, list(summary["vertical_order"])),
             loc="upper left",
             prop=legend_font,
             frameon=False,
@@ -711,7 +768,7 @@ def _integer_value(value: Any) -> int | None:
 def _sampling_failure_is_verified(data: dict[str, Any]) -> bool:
     """只有 CSV 與 summary 的同一批失敗事件一致時，才使用「取樣失敗停止」標籤。
 
-    真實 r2 的三筆 ``numerical_failure`` 必須同時在 ``particles.csv`` 與
+    每筆 ``numerical_failure`` 必須同時在 ``particles.csv`` 與
     ``summary.json`` 的 ``failure_details``／彙總診斷中標為
     ``invalid_velocity_sample`` 且 ``qc_flags=16``。若任何欄位缺少、數量不符、
     粒子身分不一致或原因不同，呼叫端就退回較保守的「數值停止」，避免把一個
@@ -776,6 +833,7 @@ def _baytrace_status_labels(data: dict[str, Any]) -> dict[str, str]:
     """依資料核對結果建立新版顯示名稱，底層 status 值與計數永遠不被改寫。"""
 
     labels = dict(_BAYTRACE_STATUS_LABELS)
+    labels["max_age"] = _max_age_label(data["summary"])
     if _sampling_failure_is_verified(data):
         labels["numerical_failure"] = "取樣失敗停止"
     return labels
@@ -987,7 +1045,7 @@ def render_baytrace_overview(data: dict[str, Any], output_path: str | Path) -> P
         ax.grid(color="white", linewidth=0.7, alpha=0.8)
 
         fig.suptitle(
-            "水平軌跡｜回溯一小時內的平面移動路徑",
+            f"水平軌跡｜回溯{_horizon_hours_text(summary)}小時內的平面移動路徑",
             fontproperties=font,
             fontsize=18,
             y=0.995,
@@ -1044,11 +1102,11 @@ def render_baytrace_overview(data: dict[str, Any], output_path: str | Path) -> P
 
 
 def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path:
-    """繪製新版五位置局部圖，只平移原 AEQD 公尺座標且各位置獨立設範圍。
+    """繪製新版各位置局部圖，只平移原 AEQD 公尺座標且各位置獨立設範圍。
 
-    ``位置1`` 至 ``位置5`` 各自包含四個初始水層，線段與端點使用和區域總覽相同的
+    各位置依 summary 的水平面板與垂向層別分組，線段與端點使用和區域總覽相同的
     顏色／標記語意。平移原點只為便於閱讀，不移除、放大、抖動或重新積分任何座標；
-    五個面板可以有不同範圍，因此不能以印刷長度跨面板比較移動量。
+    面板可以有不同範圍，因此不能以印刷長度跨面板比較移動量。
     """
 
     import matplotlib
@@ -1066,7 +1124,7 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
     status_labels = _baytrace_status_labels(data)
     boundary = data["projection"].project_geometry(data["open_geometry"])
     font = _display_font()
-    # 五個資料面板維持原來的 3×2 版面；右下空格再切成三個獨立子格，
+    # 資料面板維持既有 3×2 版面；右下空格再切成三個獨立子格，
     # 讓水層圖例、端點圖例與兩行圖說各自有真實的版面空間，不靠同一座標軸
     # 的相對 y 值互相避讓。這也使最後的 bbox 檢查能對應三個獨立 artist。
     fig = plt.figure(figsize=(12, 16.5), dpi=150)
@@ -1077,7 +1135,7 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
     legend_grid = grid[2, 1].subgridspec(
         3,
         1,
-        # 第一列需容納圖例標題加四個水層，第二列需容納單欄五個端點項目；
+        # 第一列需容納圖例標題與水層，第二列需容納單欄端點項目；
         # 列高按實際內容預留，第三列獨立放兩行 caption，避免 artist 跨列溢出。
         height_ratios=(4.0, 5.0, 2.0),
         # 子格之間保留明確的空白帶；這個間距是版面保護的一部分，避免
@@ -1094,8 +1152,9 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
                 for particle in data["particles"]
                 if int(particle["horizontal_panel"]) == panel["panel"]
             ]
-            if len(selected) != 4:
-                raise ValueError("新版局部圖每個位置必須保留四個初始水層粒子")
+            expected_layer_count = len(levels)
+            if len(selected) != expected_layer_count:
+                raise ValueError(f"新版局部圖每個位置必須保留 {expected_layer_count} 個初始水層粒子")
             first_rows = curves.get(selected[0]["particle_id"], [])
             if first_rows:
                 x0, y0 = float(first_rows[0]["x_m"]), float(first_rows[0]["y_m"])
@@ -1200,7 +1259,7 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
         )
 
         fig.suptitle(
-            "水平軌跡｜回溯一小時內的平面移動路徑",
+            f"水平軌跡｜回溯{_horizon_hours_text(summary)}小時內的平面移動路徑",
             fontproperties=font,
             fontsize=20,
             y=0.995,
@@ -1240,7 +1299,7 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
 
 
 def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path:
-    """繪製四個初始水層的高度—回溯時間診斷圖，所有面板統一 0--60 分鐘。
+    """繪製各初始水層的高度—回溯時間診斷圖，時間軸跟隨 summary 回溯上限。
 
     粒子高度 ``z_m``、海面 ``eta_m`` 與海床 ``bed_z_m`` 直接取自既有觀測 CSV；
     空白欄位轉為 NaN 只讓圖線留空，不補零、不從 normalized_config 硬算統一公尺
@@ -1258,6 +1317,7 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
     summary = data["summary"]
     curves = _ordered_baytrace_curves(data)
     levels = list(summary["vertical_order"])
+    horizon_minutes, age_ticks = _depth_axis_limits_and_ticks(summary)
     status_labels = _baytrace_status_labels(data)
     font = _display_font()
     fig, axes = plt.subplots(len(levels), 1, figsize=(11, 12), squeeze=False, sharex=True)
@@ -1327,7 +1387,7 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
                         clip_on=False,
                         zorder=6,
                     )
-            ax.set_xlim(0.0, 60.0)
+            ax.set_xlim(0.0, horizon_minutes)
             ax.set_title(
                 f"{_baytrace_layer_label(level)}（{_baytrace_layer_definition(level)}）｜粒子數：{len(selected)}",
                 fontproperties=font,
@@ -1335,7 +1395,7 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
             )
             ax.set_ylabel("高度（公尺；向上為正）", fontproperties=font)
             ax.grid(color="#d9e2e8", linewidth=0.7)
-            ax.set_xticks((0, 15, 30, 45, 60))
+            ax.set_xticks(age_ticks)
         axes[-1, 0].set_xlabel("回溯時間（分鐘；0 為到達時刻）", fontproperties=font)
         legend_handles = [
             Line2D([], [], color="#555555", linewidth=1.4, label="粒子高度"),
@@ -1385,11 +1445,12 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
 
 
 def _baytrace_terminal_table(data: dict[str, Any]) -> dict[str, dict[str, int]]:
-    """讀取 summary 的四水層八狀態計數，保留零值並驗證每層分母為五。"""
+    """讀取 summary 的各水層八狀態計數，保留零值並以 CSV 分母逐層核對。"""
 
     summary = data["summary"]
-    if len(summary["vertical_order"]) != 4:
-        raise ValueError("新版停止圖必須有四個初始水層")
+    levels = summary.get("vertical_order")
+    if not isinstance(levels, list) or not levels:
+        raise ValueError("新版停止圖必須有至少一個初始水層")
     raw = summary.get("terminal_counts_by_vertical")
     if not isinstance(raw, dict):
         raise ValueError("新版停止圖缺少 terminal_counts_by_vertical")
@@ -1397,7 +1458,7 @@ def _baytrace_terminal_table(data: dict[str, Any]) -> dict[str, dict[str, int]]:
         (particle.get("vertical_id"), particle.get("status")) for particle in data["particles"]
     )
     table: dict[str, dict[str, int]] = {}
-    for level in summary["vertical_order"]:
+    for level in levels:
         source = raw.get(level)
         if not isinstance(source, dict):
             raise ValueError(f"新版停止圖缺少水層計數：{_baytrace_layer_label(level)}")
@@ -1413,18 +1474,21 @@ def _baytrace_terminal_table(data: dict[str, Any]) -> dict[str, dict[str, int]]:
                     f"新版停止圖 summary 與 CSV 逐格計數不符：{_baytrace_layer_label(level)}／{status}"
                 )
             row[status] = count
-        if sum(row.values()) != 5:
-            raise ValueError(f"新版停止圖每個初始水層必須是五顆粒子：{_baytrace_layer_label(level)}")
+        expected_count = sum(count for (vertical_id, _), count in csv_counts.items() if vertical_id == level)
+        if sum(row.values()) != expected_count:
+            raise ValueError(
+                f"新版停止圖水層分母與 CSV 不符：{_baytrace_layer_label(level)}"
+            )
         table[level] = row
     return table
 
 
 def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> Path:
-    """繪製四初始水層的八狀態停止原因圖，保留全部粒子與零計數狀態。
+    """繪製各初始水層的八狀態停止原因圖，保留全部粒子與零計數狀態。
 
     圖面回答「有多少粒子完成回溯，其餘為何提前停止？」；``max_age`` 以
-    「完成1小時回溯」顯示，開放邊界離域與已核對的取樣失敗則分別顯示。底層
-    status、分母及 9/8/3 計數不變；這是既有 preview 的補充診斷，不是新的來源分析。
+    summary 的回溯上限顯示，開放邊界離域與已核對的取樣失敗則分別顯示。底層
+    status、分母及各狀態計數均直接取自輸入；這是 preview 的補充診斷，不是新的來源分析。
     """
 
     import matplotlib
@@ -1439,6 +1503,10 @@ def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> P
     levels = list(summary["vertical_order"])
     table = _baytrace_terminal_table(data)
     status_labels = _baytrace_status_labels(data)
+    layer_counts = {level: sum(table[level].values()) for level in levels}
+    maximum_layer_count = max(layer_counts.values(), default=0)
+    count_label_offset = max(0.08, maximum_layer_count * 0.016)
+    axis_right = maximum_layer_count + max(0.55, maximum_layer_count * 0.11)
     font = _display_font()
     fig, ax = plt.subplots(figsize=(12, 6.8), dpi=150)
     try:
@@ -1468,12 +1536,20 @@ def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> P
                         color="white" if status not in {"data_gap", "numerical_failure"} else "#222222",
                     )
             left = [start + count for start, count in zip(left, values, strict=True)]
-        for position in y_positions:
-            ax.text(5.08, position, "總數 5", va="center", fontproperties=font, fontsize=10, color="#17324d")
+        for position, level in zip(y_positions, levels, strict=True):
+            ax.text(
+                maximum_layer_count + count_label_offset,
+                position,
+                f"總數 {layer_counts[level]}",
+                va="center",
+                fontproperties=font,
+                fontsize=10,
+                color="#17324d",
+            )
         ax.set_yticks(y_positions, [_baytrace_layer_label(level) for level in levels], fontproperties=font)
         ax.invert_yaxis()
-        ax.set_xlim(0, 5.55)
-        ax.set_xlabel("粒子數（每個初始水層共5顆）", fontproperties=font)
+        ax.set_xlim(0, axis_right)
+        ax.set_xlabel("粒子數（每個初始水層分母依資料）", fontproperties=font)
         ax.set_ylabel("初始水層", fontproperties=font)
         ax.xaxis.get_major_locator().set_params(integer=True)
         ax.grid(axis="x", color="#d9e2e8", linewidth=0.7)
@@ -1517,8 +1593,8 @@ def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> P
             fontproperties=font,
             fontsize=10,
         )
-        # 研究問題已在 README 閱讀順序說明；圖面上只保留標題、動態 9/8/3
-        # 導讀與 metadata 三列，讓 header 不與繪圖軸或彼此重疊。
+        # 研究問題已在 README 閱讀順序說明；圖面上只保留資料驅動的停止摘要
+        # 與 metadata 三列，讓 header 不與繪圖軸或彼此重疊。
         fig.tight_layout(rect=(0.08, 0.22, 0.98, 0.90))
         _save_baytrace_figure(fig, output)
     finally:
@@ -1536,11 +1612,21 @@ def _source_snapshot(paths: dict[str, Path]) -> dict[str, dict[str, Any]]:
 
 
 def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) -> str:
-    """產生 PI 可閱讀的繁中圖說、來源事實與重建命令，技術細節不擠入 PNG。"""
+    """產生 legacy 兩圖成果的繁中圖說、來源事實與重建命令。
+
+    此函式只供 ``style="legacy"`` 相容分支使用；BayTrace 四圖使用
+    ``_baytrace_readme``，因此兩種成果的文件契約不會互相覆蓋。
+    """
 
     summary = data["summary"]
     center = summary["projection"]["center_lonlat"]
     counts = summary["terminal_counts"]
+    particle_count = len(data["particles"])
+    observation_count = len(data["observations"])
+    panel_count = len(summary["horizontal_panels"])
+    level_count = len(summary["vertical_order"])
+    horizon_label = _max_age_label(summary)
+    horizon_minutes, _ = _depth_axis_limits_and_ticks(summary)
     lines = [
         "# B 區沉降粒子反向追蹤",
         "",
@@ -1548,17 +1634,19 @@ def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) ->
         _subtitle(summary) + "。",
         "",
         "- [區域總覽](horizontal_overview.png)：經緯度、陸地及本次試跑登錄外框。",
-        "- [五個局部面板](horizontal_local.png)：沿用原圖 H1–H5，每組四個初始水層。",
+        f"- [{panel_count} 個局部面板](horizontal_local.png)：沿用原圖水平面板，"
+        f"每組 {level_count} 個初始水層。",
         "",
         "## 圖面與計數",
         "",
-        "保留全部 20 顆粒子與 203 筆模型保存紀錄；203 不是實測觀測數。",
+        f"保留全部 {particle_count} 顆粒子與 {observation_count} 筆模型保存紀錄；"
+        "這些不是實測觀測數。",
         "線條依回溯時間連接保存位置，未重新取樣。圓點為回溯起點；終點取自 particles CSV。",
         "初始水層固定為近海床（藍）、中下水層（橙）、中上水層（綠）、上水層（紅）。",
-        f"停止計數：達 1 小時 {counts['max_age']}、開放邊界離域 {counts['flow_domain_open_exit']}、"
+        f"停止計數：{horizon_label} {counts['max_age']}、開放邊界離域 {counts['flow_domain_open_exit']}、"
         f"數值停止 {counts['numerical_failure']}；資料缺口 {counts['data_gap']}、"
         f"沉積 {counts['deposited']}。",
-        "三顆數值停止均屬上水層；未刪除或以其他狀態替代。",
+        f"數值停止共 {counts['numerical_failure']} 顆；未刪除或以其他狀態替代。",
         "",
         f"材質代理：`{summary['material_id']}`；正向沉降速度 "
         f"{summary['settling_velocity_mps']} m/s（向下 2 毫米／秒）。",
@@ -1572,7 +1660,7 @@ def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) ->
         "總覽以原 DomainProjection 反投影為經緯度；緯度增加方向向上為北。",
         "總覽以中心緯度補償經緯度顯示比例，並非處處等距量測圖；距離請讀局部公尺座標。",
         "各局部圖以共同初始 XY 為原點，只平移原 AEQD x/y；圖中東／北向指原投影軸。",
-        "每個面板 x/y 等比例，但五個面板的範圍各自設定，不能直接比較印刷線段長度。",
+        f"每個面板 x/y 等比例，但 {panel_count} 個面板的範圍各自設定，不能直接比較印刷線段長度。",
         "外框與軌跡接受相同座標轉換／平移；局部僅顯示外框與視窗的實際交集。",
         "土地與外框在底層，保存軌跡及起訖標記在上層；不以陸地填色遮蔽或刪除粒子。",
         "",
@@ -1622,7 +1710,7 @@ def _baytrace_readme(
     """產生新版四圖的 PI 閱讀說明、呈現對照、水層定義及來源核對摘要。
 
     README 只使用可移植的檔名與 shell 變數，不把個人絕對路徑寫入可追蹤文件。
-    圖面意義先於程式細節：先說明三類問題，再列出本次 20 顆粒子、四水層八狀態、
+    圖面意義先於程式細節：先說明三類問題，再列出本次粒子、水層與八狀態、
     缺值與取樣失敗的資料事實。新版深度／停止圖被明確標為專案補充診斷，與 default
     legacy 的兩張水平圖分開，避免把呈現參照誤寫成數值或資料契約。
     """
@@ -1637,6 +1725,15 @@ def _baytrace_readme(
     numerical_ages = sorted(float(row["age_seconds"]) for row in numerical_rows if row.get("age_seconds"))
     numerical_age_text = "、".join(f"{age:g}" for age in numerical_ages) if numerical_ages else "未提供"
     center = summary["projection"]["center_lonlat"]
+    particle_count = len(data["particles"])
+    panel_count = len(summary["horizontal_panels"])
+    level_count = len(summary["vertical_order"])
+    horizon_label = status_labels["max_age"]
+    horizon_minutes, _ = _depth_axis_limits_and_ticks(summary)
+    layer_totals = {level: sum(terminal_table[level].values()) for level in summary["vertical_order"]}
+    layer_total_text = "、".join(
+        f"{_baytrace_layer_label(level)} {layer_totals[level]} 顆" for level in summary["vertical_order"]
+    )
     lines = [
         "# B 區新版回溯成果圖",
         "",
@@ -1648,22 +1745,26 @@ def _baytrace_readme(
         "## 給 PI 的閱讀方式",
         "",
         "共同研究問題是：從指定到達位置往前回溯，粒子在平面上經過哪裡、在水中的高度如何改變，"
-        "以及哪些粒子完成回溯、哪些粒子提前停止。這些圖把一組 20 顆粒子（5 個初始位置 × "
-        "4 個初始水層）放在同一個單一沉降材質情境中；它們是工程先導的條件式路徑診斷，"
+        f"以及哪些粒子完成回溯、哪些粒子提前停止。這些圖把一組 {particle_count} 顆粒子（"
+        f"{panel_count} 個初始位置 × {level_count} 個初始水層）放在同一個單一沉降材質情境中；"
+        "它們是工程先導的條件式路徑診斷，"
         "不是已知污染來源的證明。",
         "",
         "建議閱讀順序：",
         "",
         "1. [水平區域總覽](horizontal_overview.png)：先回答「從指定位置往前回溯，粒子經過哪些位置？」；"
         "經緯度與已確認海岸讓整體位置關係可直接判讀。",
-        "2. [水平局部圖](horizontal_local.png)：再看位置1–5 的原 AEQD 公尺座標，確認各位置的路徑細節；"
-        "五個面板各自等比例，但範圍不同。",
+        f"2. [水平局部圖](horizontal_local.png)：再看位置1–{panel_count} 的原 AEQD 公尺座標，"
+        "確認各位置的路徑細節；"
+        f"{panel_count} 個面板各自等比例，但範圍不同。",
         "3. [垂向軌跡](depth_age.png)：回答「回溯過程中，粒子在水中的高度如何變化？」；"
         "z、海面 eta、海床 bed 都只讀保存觀測。",
         "4. [停止原因](terminal_counts.png)：最後回答「有多少粒子完成回溯，其餘為何提前停止？」；"
-        "每個初始水層的五顆粒子與八種狀態都保留，包含零計數。",
+        f"每個初始水層的粒子分母依逐格資料核對（{layer_total_text}），八種狀態都保留，包含零計數。",
         "",
-        "這樣的順序先交代平面路徑，再補充垂向變化，最後用停止原因解釋為何不能把全部 20 顆都視為追滿一小時。"
+        f"這樣的順序先交代平面路徑，再補充垂向變化，最後用停止原因解釋為何不能把全部 "
+        f"{particle_count} 顆都視為"
+        f"追滿{_horizon_hours_text(summary)}小時。"
         "終點是追蹤停止位置，不是污染來源；M=1 仍含隨機擴散，不能稱為來源機率。",
         "",
         "## 呈現參照與本專案界線",
@@ -1680,8 +1781,9 @@ def _baytrace_readme(
         "| 初始 | 初始位置（回溯起點）（綠色圓點） | 指到達時刻的保存位置，不是污染源位置 |",
         "| 最終 | 最終位置｜追蹤停止狀態（紅色 ^／s／X） | 代表停止狀態；不是已知污染來源 |",
         "| 經度／緯度 | 區域總覽使用經度、緯度 | 局部圖改用原 AEQD 平移公尺座標，未移動或放大資料 |",
-        "| 粒子數 | 圖上明示同一組 20 顆粒子、5 個初始位置 × 4 個初始水層 | "
-        "20 顆中只有完成狀態才追滿 1 小時，M=1 且含隨機擴散 |",
+        f"| 粒子數 | 圖上明示同一組 {particle_count} 顆粒子、{panel_count} 個初始位置 × "
+        f"{level_count} 個初始水層 | "
+        f"{particle_count} 顆中只有完成狀態才追滿{_horizon_hours_text(summary)}小時，M=1 且含隨機擴散 |",
         "| 垂向軌跡 | 專案補充診斷圖：粒子高度、海面、海床 | "
         "呈現參照沒有直接對應，z／eta／bed 均取既有 CSV |",
         "| 停止原因 | 專案補充診斷圖：完成與提前停止的粒子數 | 呈現參照沒有直接對應，八狀態及零計數均保留 |",
@@ -1690,12 +1792,13 @@ def _baytrace_readme(
         f"{status_labels['max_age']}」、「最終位置｜{status_labels['flow_domain_open_exit']}」與"
         f"「最終位置｜{status_labels['numerical_failure']}」；三者均不是已知污染來源。",
         "新版與 default `legacy` 分開：legacy 仍只產生原有兩張水平 PNG 及其舊契約；"
-        "不要把 legacy 的 H1–H5、線色或任意終點語意與本新版混用。新版圖面統一使用「位置1–5」、"
+        f"不要把 legacy 的 H1–H{panel_count}、線色或任意終點語意與本新版混用。"
+        f"新版圖面統一使用「位置1–{panel_count}」、"
         "完整中文水層名、藍／橙／紫／青線色、綠色回溯起點及紅色追蹤停止位置。",
         "",
         "## 水層定義與停止統計",
         "",
-        "上／中上／中下水層的百分比是設定目標，不把到達時刻資料硬算成四個統一公尺高度；"
+        "上／中上／中下水層的百分比是設定目標，不把到達時刻資料硬算成固定公尺高度；"
         "近床水層則是最低有效 OCM 水層中心，不是海床面。",
         "",
         "| 新版圖面水層名稱 | 設定方式 |",
@@ -1707,7 +1810,7 @@ def _baytrace_readme(
     )
     lines += [
         "",
-        "停止圖固定保留八種狀態，且每個初始水層分母均為 5：",
+        f"停止圖固定保留八種狀態；各初始水層分母依資料核對，本次為：{layer_total_text}。",
         "",
         "| 停止狀態 | 總數 | "
         + " | ".join(_baytrace_layer_label(level) for level in summary["vertical_order"])
@@ -1718,7 +1821,7 @@ def _baytrace_readme(
         columns = " | ".join(str(terminal_table[level][status]) for level in summary["vertical_order"])
         lines.append(f"| {status_labels[status]} | {counts.get(status, 0)} | {columns} |")
     # 位置對照必須保留 summary 的原始面板順序與經緯度，避免新版顯示名稱
-    # 取代或重排既有 H1--H5，讓 PI 能逐列回查原 preview 契約。
+    # 取代或重排既有水平面板名稱，讓 PI 能逐列回查原 preview 契約。
     position_rows = [
         f"| 位置{int(panel['panel'])} | 原 H{int(panel['panel'])} | "
         f"{float(panel['receptor_lon']):.8f} | {float(panel['receptor_lat']):.8f} |"
@@ -1729,7 +1832,7 @@ def _baytrace_readme(
         "",
         "### 位置對照（新版位置與原 H 標籤）",
         "",
-        "下表直接取自 `summary.horizontal_panels`，讓局部圖的「位置1–5」可回對原 preview 的 H1–H5 與經緯度。",
+        "下表直接取自 `summary.horizontal_panels`，讓局部圖的位置名稱可回對原 preview 標籤與經緯度。",
         "",
         "| 新版位置 | 原 preview 標籤 | 經度（°E） | 緯度（°N） |",
         "|---|---|---:|---:|",
@@ -1739,10 +1842,11 @@ def _baytrace_readme(
     lines += [
         "",
         f"本次圖面共保留 {len(data['particles'])} 顆粒子與 {len(data['observations'])} 筆模型保存紀錄；"
-        f"完成1小時回溯 {counts.get('max_age', 0)} 顆、"
+        f"{horizon_label} {counts.get('max_age', 0)} 顆、"
         f"離開計算範圍 {counts.get('flow_domain_open_exit', 0)} 顆。",
         f"垂向資料缺值原樣留空：eta_m 空白 {missing_eta} 筆、bed_z_m 空白 {missing_bed} 筆，"
-        "不補成零；高度軸標示為「高度（公尺；向上為正）」，時間軸統一 0–60 分鐘。",
+        f"不補成零；高度軸標示為「高度（公尺；向上為正）」，時間軸涵蓋 0–{horizon_minutes:g} 分鐘，"
+        "刻度由回溯上限等分。",
         "",
         "## 取樣失敗診斷界線",
         "",
@@ -1765,7 +1869,7 @@ def _baytrace_readme(
         "## 座標、來源與限制",
         "",
         f"區域總覽使用經緯度；局部圖沿用 AEQD（等距方位投影）公尺座標並只作平移，中心為經度 {center[0]}、"
-        f"緯度 {center[1]}。五個局部面板各自等比例且範圍不同；不移除、放大或抖動任何粒子座標。",
+        f"緯度 {center[1]}。各局部面板各自等比例且範圍不同；不移除、放大或抖動任何粒子座標。",
         "海岸沿用已確認的 CRS84 `taiwan_exact_coastline.geojson`（1905 個有效 Polygon／MultiPolygon）；"
         "它只作地理參照，本次 PNG 不加入資料來源授權註記或警語。",
         "本次停止圖與垂向圖是本專案補充診斷，不能替代正式 report 的收斂、獨立觀測驗證或來源歸因。"
@@ -1812,8 +1916,8 @@ def build_coastline_preview(
 ) -> dict[str, Any]:
     """在全新目錄建立 legacy 或新版四圖，回傳完成的 JSON 內容。
 
-    ``legacy``（預設）保留上一輪兩張水平圖、H1--H5 標籤及舊 manifest 契約；
-    ``baytrace`` 只在全新目錄寫入水平區域／局部、垂向高度、停止原因四張 PNG，並
+    ``legacy``（預設）限定用於既有舊成果相容性，保留兩張水平圖、原水平標籤及舊
+    manifest 契約；``baytrace`` 只在全新目錄寫入水平區域／局部、垂向高度、停止原因四張 PNG，並
     保存新版 style/version 與來源前後 SHA。兩個分支都先拒絕既有目錄或失效連結，
     再讀取並核對既有輸入；核對失敗均保留新目錄供診斷，不清理、不覆寫輸入或舊成果。
     新版僅使用 preview 的 CSV／summary，不讀 forcing、run 或重新積分。
@@ -1834,11 +1938,20 @@ def build_coastline_preview(
     data = load_plot_inputs(preview, domain_path, open_path, coastline_path)
     summary = data["summary"]
     counts = dict(Counter(particle["status"] for particle in data["particles"]))
-    expected = {"max_age": 9, "flow_domain_open_exit": 8, "numerical_failure": 3}
-    if summary["run_id"] != "b-fishinggear-m1-1h-r2" or counts != expected:
-        raise ValueError("必須使用本次已驗收的 B 區 r2 run 與 9/8/3 停止計數")
-    if counts != {status: count for status, count in summary["terminal_counts"].items() if count}:
-        raise ValueError("CSV 停止計數與 summary 不符")
+    if not isinstance(summary.get("run_id"), str) or not summary["run_id"]:
+        raise ValueError("preview run_id 必須是非空字串")
+    unknown_statuses = sorted(set(counts) - set(_TERMINAL_STATUSES))
+    if unknown_statuses:
+        raise ValueError(f"CSV 含未登錄停止狀態：{', '.join(unknown_statuses)}")
+    summary_counts = summary.get("terminal_counts")
+    if not isinstance(summary_counts, dict):
+        raise ValueError("preview 缺少 terminal_counts")
+    for status in _TERMINAL_STATUSES:
+        expected_count = _integer_value(summary_counts.get(status))
+        if expected_count is None or expected_count < 0 or expected_count != counts.get(status, 0):
+            raise ValueError(f"CSV 停止計數與 summary 不符：{status}")
+    if sum(counts.values()) != len(data["particles"]):
+        raise ValueError("CSV 停止計數未涵蓋全部粒子")
 
     args = [
         "uv",
@@ -1992,7 +2105,7 @@ def build_coastline_preview(
 def main(argv: Sequence[str] | None = None) -> int:
     """解析明示本機路徑與圖面 style；成功回傳 0，拒絕回傳 2 並保留診斷目錄。"""
 
-    parser = argparse.ArgumentParser(description="由 B 區已完成 r2 preview 獨立重繪水平與診斷圖")
+    parser = argparse.ArgumentParser(description="由 B 區已完成 preview 獨立重繪水平與診斷圖")
     parser.add_argument("--preview-dir", required=True, type=Path)
     parser.add_argument("--domain", required=True, type=Path)
     parser.add_argument("--open-boundary", required=True, type=Path)

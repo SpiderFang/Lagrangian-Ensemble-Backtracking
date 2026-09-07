@@ -28,6 +28,7 @@ from lagrangian_backtracking.engine import (
 )
 from lagrangian_backtracking.integrators import SamplingContext, SamplingError
 from lagrangian_backtracking.models import (
+    EventType,
     ParticleState,
     ParticleStatus,
     SampleQC,
@@ -255,6 +256,253 @@ def test_stepwise_engine_keeps_rk_stage_invalid_boundary_recovery() -> None:
     expected_rng.normal(size=3)
     assert direct_rng.bit_generator.state == resumed_rng.bit_generator.state
     assert direct_rng.bit_generator.state == expected_rng.bit_generator.state
+
+
+def test_backward_sinking_surface_stage_recovery_reflects_and_continues() -> None:
+    """反向沉降越過已知海面時先縮短 RK4，再以既有反射定位並繼續回溯。
+
+    合成速度的沉降分量為 -0.4 m/s，步首在海面下；大步長的 k4 會落到 eta=0 以上，
+    且失效 sample 仍提供有限 bed。engine 應先在不消耗 RNG 的前提下把步長二分到
+    ``dt_min``；若最小設定步長仍會越面，則沿用 reference drift 的可驗證海面定位，
+    將位置鏡射後繼續下一步。每個 active accepted step 仍只取一次 Brownian；因此
+    stage retry 不消耗亂數，但 fallback 反射後的非終止步也必須消耗一次。
+    """
+
+    boundaries = _boundaries()
+    queries: list[tuple[float, float, float, int]] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """只在海面下提供速度；海面以上回傳帶完整幾何 context 的垂向失敗。"""
+
+        del x_m
+        queries.append((0.0, 0.0, z_m, time_utc_ns))
+        if z_m > 0.0:
+            return VelocitySample(
+                0.0,
+                0.0,
+                -0.4,
+                0.0,
+                -100.0,
+                100.0,
+                100.0,
+                SampleQC.VERTICAL_UNSUPPORTED,
+            )
+        return VelocitySample(0.0, 0.0, -0.4, 0.0, -100.0, 100.0, 100.0)
+
+    settings = _settings(
+        dt_min_seconds=1.0,
+        dt_max_seconds=2.0,
+        max_backtrack_seconds=3.0,
+        output_interval_seconds=1.0,
+    )
+    initial = replace(_state(), z_m=-0.5)
+    rng = np.random.Generator(np.random.PCG64DXSM(20260907))
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(20260907))
+    result = run_particle(
+        initial,
+        velocity=velocity,
+        boundaries=boundaries,
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=rng,
+    )
+
+    expected_rng.normal(size=3)
+    expected_rng.normal(size=3)
+    expected_rng.normal(size=3)
+    assert result.final_state.status == ParticleStatus.MAX_AGE
+    assert result.step_count == 3
+    assert result.minimum_clamp_count == 0
+    assert [event.event_type for event in result.events] == [
+        EventType.SURFACE_CONTACT,
+        EventType.SURFACE_CONTACT,
+        EventType.MAX_AGE,
+    ]
+    assert all(event.event_type != EventType.NUMERICAL_FAILURE for event in result.events)
+    assert all(
+        event.attributes["boundary_locator"] == "reference_drift_after_rk_stage_invalid"
+        for event in result.events[:2]
+    )
+    assert rng.bit_generator.state == expected_rng.bit_generator.state
+    assert any(z_m > 0.0 for _, _, z_m, _ in queries)
+
+
+def test_surface_stage_recovery_applies_one_nonzero_diffusion_after_reflection() -> None:
+    """active 海面 recovery 必須先反射，再套用恰一次非零 Kh/Kz 擴散並解析邊界。
+
+    本案例故意讓 ``dt=2`` 的 RK4 k4 越過已知海面，故不能靠縮短至設定的 ``dt_min=2``
+    通過，只能進入 active reference-drift recovery。反射後的確定性末端 z 為 -0.3 m；
+    測試以固定 seed 重算一次三軸 Brownian 位移，確認水平與垂向非零擴散都被套用，且
+    stage 失敗本身沒有先消耗 RNG。此 seed 的垂向擴散會再次越過海面，因此也直接確認
+    擴散後仍沿既有垂向邊界解析流程反射，而不是把第一次 reference-drift 位置當成
+    accepted step 終點。
+    """
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """海面以上只回傳帶有限上下界的垂向失敗，海面下回傳固定沉降速度。"""
+
+        del x_m, y_m, time_utc_ns
+        if z_m > 0.0:
+            return VelocitySample(
+                0.0,
+                0.0,
+                -0.4,
+                0.0,
+                -100.0,
+                100.0,
+                100.0,
+                SampleQC.VERTICAL_UNSUPPORTED,
+            )
+        return VelocitySample(0.0, 0.0, -0.4, 0.0, -100.0, 100.0, 100.0)
+
+    settings = _settings(
+        dt_min_seconds=2.0,
+        dt_max_seconds=2.0,
+        max_backtrack_seconds=2.0,
+        output_interval_seconds=2.0,
+    )
+    coefficients = DiffusionCoefficients(1.0, 0.25, 0.005)
+    divergence = (0.1, -0.05, 0.02)
+
+    class Provider:
+        """回傳固定非零 Kh/Kz 與 div(K)，檢查 recovery 沿用完整 diffusion sample。"""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(
+            self,
+            x_m: float,
+            y_m: float,
+            z_m: float,
+            time_utc_ns: int,
+            triangle_hint: int | None = None,
+        ) -> DiffusionSample:
+            """只取樣一次步首 diffusion；輸入位置與 triangle 僅供介面相容。"""
+
+            del x_m, y_m, z_m, time_utc_ns, triangle_hint
+            self.calls += 1
+            return DiffusionSample(coefficients, divergence)
+
+    provider = Provider()
+    initial = replace(_state(), z_m=-0.5)
+    rng = np.random.Generator(np.random.PCG64DXSM(6))
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(6))
+    normal = expected_rng.normal(size=3)
+    expected_position = (
+        divergence[0] * 2.0 + normal[0] * np.sqrt(2.0 * coefficients.kx_m2ps * 2.0),
+        divergence[1] * 2.0 + normal[1] * np.sqrt(2.0 * coefficients.ky_m2ps * 2.0),
+        -0.3 + divergence[2] * 2.0 + normal[2] * np.sqrt(2.0 * coefficients.kz_m2ps * 2.0),
+    )
+    expected_position = (*expected_position[:2], -expected_position[2])
+
+    result = run_particle(
+        initial,
+        velocity=velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=provider,
+        settings=settings,
+        rng=rng,
+    )
+
+    assert result.step_count == 1
+    assert result.final_state.status == ParticleStatus.MAX_AGE
+    assert provider.calls == 1
+    # max-age 是下一次步首的 terminal 狀態，沿用同一個最後位置；這裡直接檢查
+    # final_state，避免把輸出 observation cadence 與 accepted step 的位置混為一談。
+    assert np.isclose(result.final_state.x_m, expected_position[0])
+    assert np.isclose(result.final_state.y_m, expected_position[1])
+    assert np.isclose(result.final_state.z_m, expected_position[2])
+    assert [event.event_type for event in result.events] == [
+        EventType.SURFACE_CONTACT,
+        EventType.SURFACE_CONTACT,
+        EventType.MAX_AGE,
+    ]
+    assert result.events[0].attributes["boundary_locator"] == (
+        "reference_drift_after_rk_stage_invalid"
+    )
+    assert rng.bit_generator.state == expected_rng.bit_generator.state
+
+
+def test_step_start_surface_recovery_resamples_and_preserves_unknown_failure() -> None:
+    """步首可證明海面越界時重取樣續跑；缺 eta 的真正垂向失敗仍立即停止。"""
+
+    calls: list[float] = []
+
+    def velocity(x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
+        """記錄步首反射前後的 z；未知上下界不提供任何可猜測的邊界。"""
+
+        del x_m, time_utc_ns
+        calls.append(z_m)
+        if z_m > 0.0:
+            return VelocitySample(
+                0.0,
+                0.0,
+                -0.1,
+                0.0,
+                -100.0,
+                100.0,
+                100.0,
+                SampleQC.VERTICAL_UNSUPPORTED,
+            )
+        return VelocitySample(0.0, 0.0, -0.1, 0.0, -100.0, 100.0, 100.0)
+
+    settings = _settings(
+        dt_min_seconds=1.0,
+        dt_max_seconds=1.0,
+        max_backtrack_seconds=1.0,
+        output_interval_seconds=1.0,
+    )
+    execution = initialize_particle_execution(replace(_state(), z_m=0.5), settings)
+    rng = np.random.Generator(np.random.PCG64DXSM(20260908))
+    outcome = advance_particle_once(
+        execution,
+        velocity=velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=rng,
+    )
+    assert outcome.stepped and not outcome.terminal
+    assert calls[:2] == [0.5, -0.5]
+    assert execution.events[0].event_type == EventType.SURFACE_CONTACT
+    assert execution.events[0].fraction == 0.0
+    assert execution.state.z_m == -0.4
+
+    missing_eta_execution = initialize_particle_execution(_state(), settings)
+
+    def missing_eta_velocity(
+        x_m: float, y_m: float, z_m: float, time_utc_ns: int
+    ) -> VelocitySample:
+        """保留 VERTICAL_UNSUPPORTED 但省略 eta，驗證不得把未知資料當海面。"""
+
+        del x_m, z_m, time_utc_ns
+        return VelocitySample(
+            0.0,
+            0.0,
+            -0.1,
+            np.nan,
+            -100.0,
+            100.0,
+            100.0,
+            SampleQC.VERTICAL_UNSUPPORTED,
+        )
+
+    failed = advance_particle_once(
+        missing_eta_execution,
+        velocity=missing_eta_velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=np.random.default_rng(20260908),
+    )
+    assert failed.terminal and not failed.stepped
+    assert failed.state.status == ParticleStatus.NUMERICAL_FAILURE
+    assert [event.event_type for event in missing_eta_execution.events] == [EventType.NUMERICAL_FAILURE]
 
 
 def test_finalize_adds_terminal_observation_without_advancing() -> None:

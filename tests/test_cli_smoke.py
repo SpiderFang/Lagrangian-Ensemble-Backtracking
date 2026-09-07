@@ -168,9 +168,52 @@ def test_inputs_build_cli_always_forwards_strict_and_preserves_formal_flag(
     capsys.readouterr()
     assert main(["inputs-build", *common_args, "--formal-release"]) == 0
     capsys.readouterr()
+    assert (
+        main(
+            [
+                "inputs-build",
+                *common_args,
+                "--pilot-arrival-utc",
+                "hsinchu=2024-01-02T01:00:00Z",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
 
-    assert [call["strict"] for call in calls] == [True, True]
-    assert [call["formal"] for call in calls] == [False, True]
+    assert [call["strict"] for call in calls] == [True, True, True]
+    assert [call["formal"] for call in calls] == [False, True, False]
+    assert calls[2]["pilot_arrival_utc"] == {"hsinchu": "2024-01-02T01:00:00Z"}
+
+
+def test_inputs_build_cli_rejects_formal_pilot_before_builder_or_destination_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """formal CLI 搭配 pilot 選項應在 builder 前拒絕，並保持 destination 不存在。"""
+
+    def unexpected_builder(**kwargs: object) -> object:
+        """若 CLI 錯誤地進入 builder，立即使測試失敗。"""
+
+        del kwargs
+        raise AssertionError("formal pilot 不得呼叫 input builder")
+
+    monkeypatch.setattr(cli, "build_input_derivatives", unexpected_builder)
+    destination = tmp_path / "formal-pilot-inputs"
+    with pytest.raises(ValueError, match="不得搭配 --pilot-arrival-utc"):
+        main(
+            [
+                "inputs-build",
+                "--config",
+                str(tmp_path / "config.yaml"),
+                "--destination",
+                str(destination),
+                "--formal-release",
+                "--pilot-arrival-utc",
+                "hsinchu=2024-01-02T01:00:00Z",
+            ]
+        )
+    assert not destination.exists()
 
 
 def test_run_validation_cli_exit_codes_and_external_checkpoint_root(tmp_path: Path) -> None:

@@ -82,14 +82,24 @@ NWW 月份 metadata 的 allowlist 同時保留既有
 anchor-centered baseline radius 的交集；B–D local domain 等於各自 flow domain。幾何
 manifest 保存實際 `flow_domain_id`、analysis region、source fingerprint 與方法版本。
 
-每站水平受體先從 OCM native mesh 以既有 persistent-wet、geometry、anchor-first
-maximin 選出 5 個 face，要求所有候選 arrival 均為 wet，並套用 config 的 flow-domain
-boundary margin；之後才逐一檢查候選 face 的全部 arrival 與四個垂向類別。垂向支撐必須
+每站水平受體先從 OCM native mesh 建立既有 local／static-ocean 候選區；若站點同時明示
+`anchor_lonlat` 與 `receptor_core_radius_m`，再以該 flow domain 的 AEQD 公尺投影建立核心
+圓並與候選區求交。接著才以 persistent-wet、geometry、anchor-first maximin 選出 5 個
+face，要求所有候選 arrival 均為 wet，並套用 config 的 flow-domain boundary margin；之後才逐一檢查候選 face 的全部 arrival 與四個垂向類別。垂向支撐必須
 由同一 face 的每個 node 各自提供有限 `zcor <= target` 與 `zcor >= target`，不能先對
 陡峭海床的淺／深 node 取中位數後掩蓋某一 node 缺層。任何候選 face 失敗都會在 wetdry
 候選 copy 中 deterministic blacklist，重新執行同一 maximin；不搜尋最近有效 face、不
 放寬 margin，也不以外插補足候選。候選不足時 fail closed。受體 manifest 的
 `z_m_positive_up` 仍是第一個 arrival 的模板值，不能冒充全部 arrival 的實際水深。
+
+設定檔的 `scenarios.other_site_receptor_candidate_domain` 以版本化政策
+`site_explicit_core_intersect_local_else_local_or_flow_v1` 保存上述語意：明示核心的站點
+使用「核心圓與既有 local/static-ocean 候選區」交集，未明示核心的站點維持 local；沒有
+獨立 local 時才沿用 flow。這個政策只縮小受體候選 polygon，不把 B 區新竹的
+`hsinchu_cache_v3` local domain 改成 12.5 km 核心，也不改五站各 20 個 receptor 的正式
+計數契約。`StudySiteConfig` 在 config-load 時先要求兩個核心欄位成對，並拒絕非有限或非正
+的 `receptor_core_radius_m`；實際 AEQD／ocean intersection 仍在 inputs-build 讀到 source
+geometry 後再次 fail closed。
 
 arrival selector 維持既有 48 個 season×tide strata 加 `high_wave_event`、
 `strong_current_event` 兩筆事件。候選的 OCM elevation/current 必須來自 OCM surface

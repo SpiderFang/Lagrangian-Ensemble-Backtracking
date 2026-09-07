@@ -127,6 +127,15 @@ def _inputs_build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ocm-surface-root", type=Path)
     parser.add_argument("--nww-analysis-root", type=Path)
     parser.add_argument(
+        "--pilot-arrival-utc",
+        action="append",
+        metavar="SITE=UTC",
+        help=(
+            "只供非正式 pilot 的 deterministic arrival replacement；目前唯一允許值為 "
+            "hsinchu=2024-01-02T01:00:00Z，可重複傳入但同一 site 不得重複"
+        ),
+    )
+    parser.add_argument(
         "--formal-release",
         "--formal",
         dest="formal",
@@ -698,6 +707,35 @@ def _root_from_argument_or_env(value: Path | None, env_name: str) -> Path:
     return Path(raw)
 
 
+def _parse_pilot_arrival_utc_options(values: Sequence[str] | None) -> dict[str, str]:
+    """把 CLI 的重複 ``SITE=UTC`` 選項轉成 builder 使用的 mapping。
+
+    CLI 層只處理選項結構與重複 site；精確 UTC 格式、版本化 hsinchu 時刻、產品軸與
+    gap-safe 支援仍由 ``input_derivation`` 的單一 policy gate 驗證。這樣命令列不會
+    另行實作一套可與 Python API 漂移的時間語意，也能在 formal 模式於呼叫 builder
+    前拒絕 pilot 選項而不建立 destination 或 partial directory。
+    """
+
+    if not values:
+        return {}
+    result: dict[str, str] = {}
+    for raw in values:
+        if type(raw) is not str or raw.count("=") != 1:
+            raise ValueError("--pilot-arrival-utc 必須使用 SITE=UTC 格式")
+        site_id, utc_value = raw.split("=", 1)
+        if (
+            not site_id
+            or site_id != site_id.strip()
+            or not utc_value
+            or utc_value != utc_value.strip()
+        ):
+            raise ValueError("--pilot-arrival-utc 的 SITE 與 UTC 不可為空或含前後空白")
+        if site_id in result:
+            raise ValueError(f"--pilot-arrival-utc 不可重複指定 site：{site_id}")
+        result[site_id] = utc_value
+    return result
+
+
 def run_config_check(argv: Sequence[str] | None = None) -> int:
     """執行設定驗證並輸出 canonical hash。"""
 
@@ -761,6 +799,11 @@ def run_inputs_build(argv: Sequence[str] | None = None) -> int:
     """
 
     args = _inputs_build_parser().parse_args(argv)
+    if args.formal and args.pilot_arrival_utc:
+        # 必須在 builder 讀取 config、accepted roots 或建立 destination partial 前拒絕；
+        # 這是 pilot-only policy 的副作用邊界，不讓 formal 呼叫留下半成品。
+        raise ValueError("--formal-release 不得搭配 --pilot-arrival-utc；pilot 只允許非正式 build")
+    pilot_arrival_utc = _parse_pilot_arrival_utc_options(args.pilot_arrival_utc)
     result = build_input_derivatives(
         config_path=args.config,
         destination=args.destination,
@@ -770,6 +813,7 @@ def run_inputs_build(argv: Sequence[str] | None = None) -> int:
         formal=args.formal,
         # CLI 是 production pipeline 的入口；即使是非正式 pilot，也不得以合成常值場補資料。
         strict=True,
+        pilot_arrival_utc=pilot_arrival_utc or None,
     )
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
     return 0

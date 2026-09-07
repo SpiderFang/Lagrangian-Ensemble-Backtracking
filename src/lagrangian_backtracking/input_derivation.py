@@ -31,7 +31,7 @@ from calendar import monthrange
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -42,7 +42,7 @@ from shapely.geometry import LineString, Point, Polygon, mapping
 from shapely.ops import unary_union
 
 from .arrival_times import select_arrival_times
-from .config import DomainConfig, ProjectConfig, load_config, resolve_flow_domain_id
+from .config import DomainConfig, ProjectConfig, StudySiteConfig, load_config, resolve_flow_domain_id
 from .geometry import DomainProjection, build_anchor_local_domain, densified_bbox_polygon
 from .manifests import (
     load_arrival_time_manifest,
@@ -101,6 +101,21 @@ _WETDRY_SEMANTICS_ID = "schism_wetdry_elem_0_wet_1_dry"
 NWW_METRIC_LOCATION_POLICY_ID = "anchor_first_nearest_runtime_supported_nww_cell_center_v1"
 NWW_METRIC_LOCATION_MAX_GRID_SCALES = 2.0
 ARRIVAL_SELECTION_METHOD_ID = "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
+
+# 這組 pilot policy 只為可重建的新竹 24 小時展示視窗服務；它不是正式五站 48+2
+# arrival selection 的替代品。CLI 必須明示完全相同的 site=UTC pair，避免把任意時刻
+# 偽裝成已完成的正式分層。視窗的時間端點、步長與 inclusive gap-safe horizon 都固定
+# 在此版本化常數，並會複寫到 arrival／gap-safe／dynamic provenance 及 artifact index。
+PILOT_EXPLICIT_WINDOW_POLICY_ID = "hsinchu_explicit_24h_window_replacement_v1"
+PILOT_EXPLICIT_SITE_ID = "hsinchu"
+PILOT_EXPLICIT_ARRIVAL_UTC = "2024-01-02T01:00:00Z"
+PILOT_EXPLICIT_MAX_BACKTRACK_DAYS = 1.0
+PILOT_EXPLICIT_TIDE_CLASS = "pilot_explicit_window"
+PILOT_EXPLICIT_PHASE_OR_EVENT = "explicit_24h_window"
+PILOT_ARRIVAL_SELECTION_METHOD_ID = (
+    "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_"
+    "explicit_pilot_window_v1"
+)
 
 # 這四個識別碼是既有 receptor schema 的固定垂向類別；任何新的垂向類別都必須先
 # 更新資料契約與 loader，不能在這個 helper 內以隱式的最近 layer 或外插方式擴充。
@@ -401,6 +416,102 @@ def _utc_string(time_ns: int) -> str:
     """將 epoch nanoseconds 轉為固定 UTC ISO8601 字串。"""
 
     return datetime.fromtimestamp(int(time_ns) / 1_000_000_000, tz=UTC).isoformat().replace("+00:00", "Z")
+
+
+@dataclass(frozen=True, slots=True)
+class _ExplicitPilotArrival:
+    """保存一筆已通過格式 gate 的 pilot 明示 arrival 視窗。
+
+    ``time_utc_ns`` 是 UTC epoch nanoseconds，供 OCM、NWW3 與 gap-safe mask 以整數
+    時間軸比對；``time_utc`` 是同一時刻的固定 ISO8601 ``Z`` 字串，供 provenance 與
+    metadata 交換。這個容器只代表本次 pilot 的單一替換候選，不會改寫 config 中正式
+    48+2 分層的年份、季節或潮汐定義。
+    """
+
+    study_site_id: str
+    time_utc_ns: int
+    time_utc: str
+    max_backtrack_days: float
+
+
+def _parse_explicit_pilot_arrivals(
+    value: Mapping[str, str] | None,
+) -> dict[str, _ExplicitPilotArrival]:
+    """解析並限制 pilot-only 的 ``study_site_id -> exact UTC`` 入口。
+
+    目前只登錄新竹 ``2024-01-02T01:00:00Z``；這不是一般 arrival selector 的自由
+    時刻參數，而是為了重建指定展示案例而版本化的輸入政策。解析要求明示 ``Z``、整點
+    UTC 且不接受 offset、分鐘、秒小數、NaN 或其他隱含轉換。回傳的 epoch nanoseconds
+    會交給後續產品時間軸、NWW 空間支撐及 inclusive backward gate 再次驗證。
+    """
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or not value:
+        raise InputDerivationError("pilot_arrival_utc 必須是非空的 site=UTC mapping")
+    if set(value) != {PILOT_EXPLICIT_SITE_ID}:
+        raise InputDerivationError(
+            "pilot_arrival_utc 目前只允許明示 hsinchu=2024-01-02T01:00:00Z"
+        )
+    raw = value[PILOT_EXPLICIT_SITE_ID]
+    if type(raw) is not str or not raw or raw != raw.strip() or not raw.endswith("Z"):
+        raise InputDerivationError("pilot_arrival_utc 必須是沒有空白的 UTC Z 字串")
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00")
+    except ValueError as exc:
+        raise InputDerivationError(f"pilot_arrival_utc 無法解析：{raw!r}") from exc
+    if parsed.utcoffset() != timedelta(0):
+        raise InputDerivationError("pilot_arrival_utc 必須使用 UTC offset 0")
+    if parsed.minute or parsed.second or parsed.microsecond:
+        raise InputDerivationError("pilot_arrival_utc 必須落在 exact-hour UTC")
+    canonical = parsed.isoformat().replace("+00:00", "Z")
+    if canonical != raw:
+        raise InputDerivationError(
+            "pilot_arrival_utc 必須使用固定 ISO8601 格式 2024-01-02T01:00:00Z"
+        )
+    if raw != PILOT_EXPLICIT_ARRIVAL_UTC:
+        raise InputDerivationError(
+            f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} 只登錄 {PILOT_EXPLICIT_ARRIVAL_UTC}"
+        )
+    time_ns = int(parsed.timestamp()) * 1_000_000_000 + parsed.microsecond * 1_000
+    return {
+        PILOT_EXPLICIT_SITE_ID: _ExplicitPilotArrival(
+            study_site_id=PILOT_EXPLICIT_SITE_ID,
+            time_utc_ns=time_ns,
+            time_utc=canonical,
+            max_backtrack_days=PILOT_EXPLICIT_MAX_BACKTRACK_DAYS,
+        )
+    }
+
+
+def _explicit_pilot_window_times(explicit: _ExplicitPilotArrival) -> np.ndarray:
+    """建立 pilot 明示視窗的 25 個 inclusive exact-hour UTC 節點。
+
+    視窗終點由版本化 policy 固定為 arrival，起點則是 arrival 減去一日；因此這裡
+    產生的是 ``2024-01-01T01:00:00Z`` 至 ``2024-01-02T01:00:00Z`` 的整數 epoch
+    nanoseconds，而不是由經過 rounding 的浮點日期或鄰近資料列推導。呼叫端會再用
+    OCM／surface／NWW 各自的 canonical axis 驗證每一個節點，任何一小時缺失都會
+    fail closed，不會被這個 helper 補出來。
+    """
+
+    horizon_steps = int(round(explicit.max_backtrack_days * 24.0))
+    if horizon_steps != 24 or not math.isclose(
+        horizon_steps / 24.0,
+        explicit.max_backtrack_days,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise InputDerivationError("explicit pilot window 必須是固定一日、逐時視窗")
+    start_ns = explicit.time_utc_ns - horizon_steps * _UTC_HOUR_NS
+    window = np.arange(
+        start_ns,
+        explicit.time_utc_ns + _UTC_HOUR_NS,
+        _UTC_HOUR_NS,
+        dtype=np.int64,
+    )
+    if window.size != 25 or int(window[0]) != start_ns or int(window[-1]) != explicit.time_utc_ns:
+        raise InputDerivationError("explicit pilot window 未建立 25 個 inclusive exact-hour 節點")
+    return window
 
 
 def _parse_month(month: str) -> tuple[int, int]:
@@ -2451,6 +2562,244 @@ def _merge_arrival_metric_location_binding(
     return result
 
 
+def _validate_explicit_pilot_arrival_support(
+    *,
+    explicit: _ExplicitPilotArrival,
+    product: _ProductData,
+    surface_product: _ProductData,
+    nww_product: _ProductData,
+    nww_cache: _NWWRuntimeCache,
+    context: _SiteArrivalSelectionContext,
+    expected_axis: np.ndarray,
+) -> None:
+    """逐時驗證展示視窗的三套 exact UTC 軸與 NWW 四角空間支撐。
+
+    ``product`` 是 OCM native，``surface_product`` 是只供 arrival scalar 的 OCM
+    surface，``nww_product`` 是 NWW3 analysis，``nww_cache`` 則是同一產品的 runtime-
+    equivalent 規則格網檢視。四者都必須逐筆支援同一組 25 個 UTC 節點；NWW 另以
+    ``_nww_exact_hour_samples`` 重做 metric location 的四角 static／dynamic／數值／物理
+    gate，而不是只信任 arrival endpoint 的 metadata。最後以 OCM native 的可得時間軸對
+    ``[arrival-24 h, arrival]`` 做 inclusive、逐時、不可跨缺口檢查，因此不會用 00Z
+    最近值、零值或時間內插補足 2024-01-01T01:00:00Z 起點。
+    """
+
+    time_ns = int(explicit.time_utc_ns)
+    window_times = _explicit_pilot_window_times(explicit)
+    expected_window = np.isin(window_times, np.asarray(expected_axis, dtype=np.int64))
+    if not bool(np.all(expected_window)):
+        missing = window_times[~expected_window]
+        raise InputDerivationError(
+            f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} configured expected axis 缺少逐時節點："
+            f"{_utc_string(int(missing[0]))}"
+        )
+    axis_labels = (
+        ("OCM native", product.canonical.time_utc_ns),
+        ("OCM surface", surface_product.canonical.time_utc_ns),
+        ("NWW3 analysis", nww_product.canonical.time_utc_ns),
+    )
+    for label, axis in axis_labels:
+        available_window = np.isin(window_times, np.asarray(axis, dtype=np.int64))
+        if not bool(np.all(available_window)):
+            missing = window_times[~available_window]
+            raise InputDerivationError(
+                f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} {label} exact UTC 視窗缺少逐時節點："
+                f"{_utc_string(int(missing[0]))}"
+            )
+
+    # OCM surface selector 的 mapping 已由 anchor 的 static／逐時 valid 四角 gate 建立；
+    # 這裡仍逐時重查有限 scalar，避免只因 arrival endpoint 有值就放行中間缺時。
+    for value in window_times:
+        time_key = int(value)
+        elevation = float(context.elevation.get(time_key, float("nan")))
+        speed = float(context.speed.get(time_key, float("nan")))
+        if not np.isfinite(elevation) or not np.isfinite(speed):
+            raise InputDerivationError(
+                f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} OCM surface exact UTC 支援失敗："
+                f"{_utc_string(time_key)}"
+            )
+
+    # 重新以選定 metric location 的四角資料取樣 25 個 UTC；這個旗標同時包含
+    # static mask、四角 valid_mask_wave、四角有限值與 Hs/fp/方向物理條件。不能只看
+    # context.nww_valid 的 arrival endpoint，否則中間一小時的 NWW spatial invalid 會漏過。
+    nww_series, nww_valid = _nww_exact_hour_samples(
+        nww_cache,
+        lon=float(context.metric_binding.lon),
+        lat=float(context.metric_binding.lat),
+        requested_times=tuple(int(value) for value in window_times),
+    )
+    for value in window_times:
+        time_key = int(value)
+        nww_value = float(nww_series.get(time_key, float("nan")))
+        if (
+            not bool(nww_valid.get(time_key, False))
+            or not bool(context.nww_valid.get(time_key, False))
+            or not np.isfinite(nww_value)
+            or not np.isfinite(float(context.nww_series.get(time_key, float("nan"))))
+        ):
+            raise InputDerivationError(
+                f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} NWW metric location 四角 exact UTC "
+                f"支援失敗：{_utc_string(time_key)}"
+            )
+
+    # 端點呼叫會把整段 [arrival-24h, arrival] 交給 prefix-sum gap gate；上方逐筆軸檢查
+    # 則提供能指出缺失產品與 UTC 的診斷。兩者都保留，避免 future expected-axis 變更時
+    # 只有「逐筆存在」卻沒有「連續 backward horizon」的錯誤放行。
+    supported = _backward_window_mask(
+        np.asarray([time_ns], dtype=np.int64),
+        expected_axis=expected_axis,
+        available_axis=product.canonical.time_utc_ns,
+        max_backtrack_days=explicit.max_backtrack_days,
+    )
+    if supported.shape != (1,) or not bool(supported[0]):
+        start_utc = _utc_string(int(window_times[0]))
+        raise InputDerivationError(
+            f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} inclusive gap-safe window 不完整："
+            f"{start_utc} 至 {explicit.time_utc}"
+        )
+
+
+def _replace_with_explicit_pilot_arrival(
+    *,
+    site_id: str,
+    arrivals: Sequence[ArrivalTime],
+    explicit: _ExplicitPilotArrival,
+    product: _ProductData,
+    surface_product: _ProductData,
+    nww_product: _ProductData,
+    nww_cache: _NWWRuntimeCache,
+    context: _SiteArrivalSelectionContext,
+    expected_axis: np.ndarray,
+    design_version: str,
+) -> list[ArrivalTime]:
+    """以固定 policy 替換一筆 Hsinchu baseline arrival，保留 50 筆站點 coverage。
+
+    替換規則是：若 baseline 已經選到同一 UTC，就替換該 UTC；否則在其餘 49 筆候選
+    中依 ``(time_utc_ns, arrival_time_id)`` 取排序最後一筆。這個 deterministic rule
+    不依軌跡結果或亂數，並把原始／替換 identity、25 個 inclusive hourly nodes、OCM／
+    NWW 支撐與非潮汐標籤寫進新 ArrivalTime metadata。新標籤刻意不是 spring、neap 或
+    event，故正式 48+2 loader 會拒絕它；pilot loader 則可在保持 250 arrivals／5,000
+    dynamic pairs 的前提下使用。
+    """
+
+    if site_id != explicit.study_site_id or site_id != PILOT_EXPLICIT_SITE_ID:
+        raise InputDerivationError("explicit pilot arrival 只能套用 hsinchu")
+    _validate_explicit_pilot_arrival_support(
+        explicit=explicit,
+        product=product,
+        surface_product=surface_product,
+        nww_product=nww_product,
+        nww_cache=nww_cache,
+        context=context,
+        expected_axis=expected_axis,
+    )
+    by_time = [item for item in arrivals if int(item.time_utc_ns) == explicit.time_utc_ns]
+    if len(by_time) > 1:
+        raise InputDerivationError("hsinchu baseline arrival 的 UTC 已重複，不能 deterministic 替換")
+    if by_time:
+        original = by_time[0]
+    else:
+        ordered = sorted(arrivals, key=lambda item: (int(item.time_utc_ns), item.arrival_time_id))
+        if not ordered:
+            raise InputDerivationError("hsinchu baseline arrival 不可為空")
+        original = ordered[-1]
+
+    replacement_id = stable_identifier(
+        "arr",
+        [
+            explicit.study_site_id,
+            explicit.time_utc,
+            PILOT_EXPLICIT_WINDOW_POLICY_ID,
+            design_version,
+        ],
+    )
+    if any(item.arrival_time_id == replacement_id for item in arrivals if item is not original):
+        raise InputDerivationError("explicit pilot replacement arrival_time_id 與既有 identity 衝突")
+    window_times = _explicit_pilot_window_times(explicit)
+    start_ns = int(window_times[0])
+    parsed = datetime.fromtimestamp(explicit.time_utc_ns / 1_000_000_000, tz=UTC)
+    metadata: dict[str, float | int | str] = {
+        "selection_method": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "pilot_selection_scope": "hsinchu_only",
+        "explicit_pilot_window": f"{_utc_string(start_ns)}/{explicit.time_utc}/inclusive_1h",
+        "explicit_pilot_window_start_utc": _utc_string(start_ns),
+        "explicit_pilot_window_end_utc": explicit.time_utc,
+        "explicit_pilot_window_expected_step_count": 25,
+        "explicit_pilot_window_time_support": "ocm_native_surface_nww_exact_utc_and_gap_safe_v1",
+        "pilot_replaced_arrival_time_id": original.arrival_time_id,
+        "pilot_replaced_arrival_time_utc": _utc_string(original.time_utc_ns),
+        "pilot_replacement_arrival_time_id": replacement_id,
+        "pilot_replacement_arrival_time_utc": explicit.time_utc,
+        "pilot_replacement_policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "pilot_replacement_max_backtrack_days": explicit.max_backtrack_days,
+        "tide_phase_semantics": "non_tidal_explicit_pilot_window",
+        "elevation_m": float(context.elevation[explicit.time_utc_ns]),
+        "significant_wave_height_m": float(context.nww_series[explicit.time_utc_ns]),
+        "current_speed_mps": float(context.speed[explicit.time_utc_ns]),
+    }
+    metadata.update(context.metric_binding.to_metadata())
+    replacement = ArrivalTime(
+        arrival_time_id=replacement_id,
+        study_site_id=explicit.study_site_id,
+        time_utc_ns=explicit.time_utc_ns,
+        year=parsed.year,
+        season="DJF",
+        tide_class=PILOT_EXPLICIT_TIDE_CLASS,
+        phase_or_event=PILOT_EXPLICIT_PHASE_OR_EVENT,
+        metadata=metadata,
+    )
+    result = [item for item in arrivals if item.arrival_time_id != original.arrival_time_id]
+    if any(item.time_utc_ns == explicit.time_utc_ns for item in result):
+        raise InputDerivationError("explicit pilot replacement 會造成同站 duplicate UTC")
+    result.append(replacement)
+    if len(result) != len(arrivals) or len({item.time_utc_ns for item in result}) != len(result):
+        raise InputDerivationError("explicit pilot replacement 未保留既有 arrival count／唯一 UTC")
+    return sorted(result, key=lambda item: (int(item.time_utc_ns), item.arrival_time_id))
+
+
+def _pilot_selection_summary(arrivals: Sequence[ArrivalTime]) -> dict[str, Any] | None:
+    """由 arrival metadata 建立 pilot replacement 的小型 provenance snapshot。
+
+    summary 不保存 source path 或大型資料，只保存可由 arrival manifest 重算的 policy、站點、
+    原／替換 identity 與 24 小時 horizon。沒有明示 pilot arrival 時回傳 ``None``，使
+    一般 48+2 artifact 的 root/provenance 保持既有語意。
+    """
+
+    explicit = [
+        item
+        for item in arrivals
+        if item.metadata.get("pilot_replacement_policy_id") == PILOT_EXPLICIT_WINDOW_POLICY_ID
+    ]
+    if not explicit:
+        return None
+    if len(explicit) != 1:
+        raise InputDerivationError("pilot explicit replacement 必須恰有一筆 arrival")
+    item = explicit[0]
+    metadata = item.metadata
+    required = (
+        "pilot_replaced_arrival_time_id",
+        "pilot_replacement_arrival_time_id",
+        "explicit_pilot_window_start_utc",
+        "explicit_pilot_window_end_utc",
+    )
+    if any(not isinstance(metadata.get(key), str) or not str(metadata[key]).strip() for key in required):
+        raise InputDerivationError("pilot explicit arrival metadata 缺少原／替換 identity 或視窗")
+    return {
+        "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "study_site_id": item.study_site_id,
+        "arrival_time_id": item.arrival_time_id,
+        "arrival_time_utc": _utc_string(item.time_utc_ns),
+        "replaced_arrival_time_id": metadata["pilot_replaced_arrival_time_id"],
+        "replaced_arrival_time_utc": metadata.get("pilot_replaced_arrival_time_utc"),
+        "replacement_arrival_time_id": metadata["pilot_replacement_arrival_time_id"],
+        "replacement_arrival_time_utc": metadata.get("pilot_replacement_arrival_time_utc"),
+        "window_start_utc": metadata["explicit_pilot_window_start_utc"],
+        "window_end_utc": metadata["explicit_pilot_window_end_utc"],
+        "max_backtrack_days": float(PILOT_EXPLICIT_MAX_BACKTRACK_DAYS),
+        "expected_step_count": 25,
+        "selection_scope": "hsinchu_only",
+    }
+
+
 def _site_arrival_support_by_time(
     *,
     product: _ProductData,
@@ -2724,6 +3073,58 @@ def _face_node_indices(mesh: NativeMesh, *, polygon: Polygon) -> np.ndarray:
     return np.asarray(sorted(indices), dtype=np.int64)
 
 
+def _receptor_candidate_polygon_metric(
+    *,
+    site: StudySiteConfig,
+    projection: DomainProjection,
+    local_polygon_lonlat: Polygon,
+) -> Polygon:
+    """建立單一站點的公尺制受體候選區，必要時套用明示的核心圓限制。
+
+    ``local_polygon_lonlat`` 是 geometry builder 已建立的固定候選區：A 區已是 anchor
+    與 OCM 靜態海域 polygon 的 local-domain 交集，B--D 則是各自 flow domain。這個
+    helper 只在受體選點前縮小候選範圍，不會回寫或改變 local geometry manifest。
+    若設定同時提供 ``anchor_lonlat`` 與 ``receptor_core_radius_m``，兩者會先以該 flow
+    domain 的既有 AEQD 投影轉成公尺，再求核心圓與上述候選區的交集；因此半徑是公尺制
+    幾何距離，不是以經緯度差近似的角度距離。未明示核心的站點直接回傳原本投影後的
+    local/static-ocean 候選區，保留既有 horizontal maximin 的選點結果。
+
+    ``StudySiteConfig`` 的核心欄位必須成對出現。交集若為空、退化或不是單一 Polygon，
+    便 fail closed，避免以最近 face、凸包或其他未登錄的空間補值擴張候選範圍。
+    """
+
+    candidate_metric = projection.project_geometry(local_polygon_lonlat)
+    if not isinstance(candidate_metric, Polygon):
+        raise InputDerivationError(f"receptor candidate polygon 無效：{site.study_site_id}")
+
+    anchor_lonlat = site.anchor_lonlat
+    radius_m = site.receptor_core_radius_m
+    if anchor_lonlat is None and radius_m is None:
+        # 沒有核心設定的站點必須沿用原本 local/flow candidate polygon；這是 B--D
+        # 既有行為的相容分支，不能因其他站點新增核心而連帶縮小候選範圍。
+        return candidate_metric
+    if anchor_lonlat is None or radius_m is None:
+        raise InputDerivationError(
+            f"{site.study_site_id} 的 receptor core 必須同時明示 anchor_lonlat 與 "
+            "receptor_core_radius_m"
+        )
+    radius_value = float(radius_m)
+    if not math.isfinite(radius_value) or radius_value <= 0.0:
+        raise InputDerivationError(f"{site.study_site_id} 的 receptor_core_radius_m 必須是有限正數")
+
+    anchor_x, anchor_y = projection.project(*anchor_lonlat)
+    anchor_point = Point(float(anchor_x), float(anchor_y))
+    # 以既有幾何 helper 相同的 64 段圓周近似建立公尺制核心；這只影響固定候選邊界，
+    # 不會把逐時 wet/dry 狀態帶入 local geometry 或改變 flow-domain 支撐。
+    core_polygon = anchor_point.buffer(radius_value, quad_segs=64)
+    clipped = candidate_metric.intersection(core_polygon)
+    if clipped.is_empty or not isinstance(clipped, Polygon) or not clipped.is_valid or clipped.area <= 0.0:
+        raise InputDerivationError(
+            f"{site.study_site_id} 的 receptor core 與 local/static ocean 候選區沒有有效交集"
+        )
+    return clipped
+
+
 def _receptor_payload(
     *,
     config: ProjectConfig,
@@ -2744,8 +3145,10 @@ def _receptor_payload(
 ]:
     """產生每站 5×4 receptors，並以 OCM／NWW runtime support gate 篩選。
 
-    水平候選仍由既有 persistent-wet、geometry、boundary margin 與 deterministic
-    anchor-first maximin 產生；每一輪只對被選出的少量 face 執行一次 NWW exact-hour
+    水平候選先以既有 local／static-ocean geometry 建立；若站點同時明示 receptor core
+    anchor 與半徑，這裡只把候選 polygon 與同一 AEQD 公尺投影中的核心圓求交，並不改寫
+    local geometry。之後仍由既有 persistent-wet、boundary margin 與 deterministic
+    anchor-first maximin 產生 5 個 face；每一輪只對被選出的少量 face 執行一次 NWW exact-hour
     四角 support gate，再切取所有 arrival 的 ``(node, layer)`` zcor。NWW cache 由
     build handler 依 analysis region 建立並與 arrival selector 共用；一個 horizontal
     face 的四個 vertical receptor 只會共用同一次 50-arrival 判定。任何 NWW 或垂向 gate
@@ -2795,9 +3198,11 @@ def _receptor_payload(
             mesh = _load_native_mesh(product, projection)
             meshes[product.flow_domain_id] = mesh
         polygon_lonlat = local_polygons[site_id]
-        candidate_metric = projection.project_geometry(polygon_lonlat)
-        if not isinstance(candidate_metric, Polygon):
-            raise InputDerivationError(f"receptor candidate polygon 無效：{site_id}")
+        candidate_metric = _receptor_candidate_polygon_metric(
+            site=site,
+            projection=projection,
+            local_polygon_lonlat=polygon_lonlat,
+        )
         anchor_lonlat = site.anchor_lonlat or domain.center_lonlat
         anchor_xy_array = projection.project(*anchor_lonlat)
         anchor_xy = (float(anchor_xy_array[0]), float(anchor_xy_array[1]))
@@ -3026,9 +3431,15 @@ def _receptor_payload(
         "design_version": config.design_version,
         "coordinate_reference": "EPSG:4326",
         "vertical_reference": "z_m_positive_up",
-        "generation_method_id": "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_v2",
+        "generation_method_id": (
+            "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
+            "core_intersection_v3"
+        ),
         "provenance": _provenance(
-            method_id="server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_v2",
+            method_id=(
+                "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
+                "core_intersection_v3"
+            ),
             source_hashes=source_hashes,
             counts={"study_sites": EXPECTED_STUDY_SITE_COUNT, "receptors": EXPECTED_RECEPTOR_COUNT},
             public_analysis_label_policy={"A": "A 區分析域"},
@@ -3046,6 +3457,7 @@ def _dynamic_initial_payload(
     arrivals: Sequence[ArrivalTime],
     source_hashes: Mapping[str, str],
     strict: bool,
+    pilot_selection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """建立每個 receptor×arrival 一筆的 5,000-row OCM-derived dynamic manifest。
 
@@ -3159,6 +3571,12 @@ def _dynamic_initial_payload(
             f"dynamic initial conditions 應有 5,000 筆，實際 {len(records)}；"
             f"expected_product={expected_count}"
         )
+    provenance_extra: dict[str, Any] = {
+        "counts": {"receptors": len(receptors), "arrivals": len(arrivals), "pairs": len(records)},
+        "wetdry_semantics_id": _WETDRY_SEMANTICS_ID,
+    }
+    if pilot_selection is not None:
+        provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
     return {
         "manifest_kind": "receptor_arrival_initial_condition_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -3170,8 +3588,7 @@ def _dynamic_initial_payload(
         "provenance": _provenance(
             method_id="server_v3_ocm_dynamic_receptor_arrival_initial_condition_v1",
             source_hashes=source_hashes,
-            counts={"receptors": len(receptors), "arrivals": len(arrivals), "pairs": len(records)},
-            wetdry_semantics_id=_WETDRY_SEMANTICS_ID,
+            **provenance_extra,
         ),
         "records": records,
     }
@@ -3196,22 +3613,43 @@ def _material_payload(config: ProjectConfig, *, source_hashes: Mapping[str, str]
 
 
 def _arrival_payload(
-    config: ProjectConfig, arrivals: Sequence[ArrivalTime], *, source_hashes: Mapping[str, str], strict: bool
+    config: ProjectConfig,
+    arrivals: Sequence[ArrivalTime],
+    *,
+    source_hashes: Mapping[str, str],
+    strict: bool,
+    pilot_selection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """將 ArrivalTime dataclass 轉成 strict schema 1 manifest。"""
+    """將 ArrivalTime dataclass 轉成 strict schema 1 manifest。
 
+    pilot replacement 仍保存相同 250 筆 records 與既有 schema root；差異只寫入版本化
+    ``selection_method_id`` 與 provenance，並由單筆 record metadata 保存原／替換 identity。
+    因此 artifact hash、release binding 與 run-create 仍可沿用既有 loader，而 formal
+    arrival strata loader 會因 pilot-only 非潮汐標籤明確拒絕升格。
+    """
+
+    method_id = (
+        PILOT_ARRIVAL_SELECTION_METHOD_ID
+        if pilot_selection is not None
+        else ARRIVAL_SELECTION_METHOD_ID
+    )
+    provenance_extra: dict[str, Any] = {
+        "counts": {"study_sites": EXPECTED_STUDY_SITE_COUNT, "arrivals": len(arrivals)},
+        "public_analysis_label_policy": {"A": "A 區分析域"},
+    }
+    if pilot_selection is not None:
+        provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
     return {
         "manifest_kind": "arrival_time_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
         "status": "approved" if strict else "generated",
         "design_version": config.design_version,
         "time_standard": "UTC",
-        "selection_method_id": ARRIVAL_SELECTION_METHOD_ID,
+        "selection_method_id": method_id,
         "provenance": _provenance(
-            method_id=ARRIVAL_SELECTION_METHOD_ID,
+            method_id=method_id,
             source_hashes=source_hashes,
-            counts={"study_sites": EXPECTED_STUDY_SITE_COUNT, "arrivals": len(arrivals)},
-            public_analysis_label_policy={"A": "A 區分析域"},
+            **provenance_extra,
         ),
         "records": [asdict(item) for item in arrivals],
     }
@@ -3226,16 +3664,32 @@ def _gap_safe_payload(
     source_hashes: Mapping[str, str],
     max_backtrack_days: float,
     strict: bool,
+    pilot_horizon_overrides: Mapping[str, float] | None = None,
+    pilot_selection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """建立每一 arrival 的完整 7-day backward horizon 與 gap crossing 證據。"""
+    """建立每一 arrival 的 inclusive backward horizon 與 gap crossing 證據。
+
+    一般 arrival 沿用 config／baseline 的 ``max_backtrack_days``；pilot 明示 replacement
+    可由 arrival identity 指定較短的 1 日視窗。每筆 record 都保存實際 horizon，故
+    2024-01-02T01:00:00Z 會明確呈現 2024-01-01T01:00:00Z 至自身共 25 個節點，不能
+    把 global 7 日預設誤讀成該展示案例的回推期。
+    """
 
     records: list[dict[str, Any]] = []
     expected_set = {int(value) for value in expected_axis}
-    horizon_steps = int(round(max_backtrack_days * 24.0))
-    if horizon_steps < 1 or not math.isclose(
-        horizon_steps / 24.0, max_backtrack_days, rel_tol=0.0, abs_tol=1e-12
-    ):
-        raise InputDerivationError("gap-safe baseline 目前只接受整日 max_backtrack_days")
+    overrides = {str(key): float(value) for key, value in (pilot_horizon_overrides or {}).items()}
+
+    def horizon_steps_for(value: float) -> int:
+        """把日數轉成正整數逐時步數，拒絕半日或非有限輸入。"""
+
+        steps = int(round(value * 24.0))
+        if steps < 1 or not math.isclose(steps / 24.0, value, rel_tol=0.0, abs_tol=1e-12):
+            raise InputDerivationError("gap-safe baseline 目前只接受整日 max_backtrack_days")
+        return steps
+
+    horizon_steps_for(float(max_backtrack_days))
+    for override in overrides.values():
+        horizon_steps_for(override)
     site_region = {site.study_site_id: site.analysis_region_id for site in config.study_sites}
     available_by_region = {
         region: {int(value) for value in product.canonical.time_utc_ns}
@@ -3244,6 +3698,8 @@ def _gap_safe_payload(
     for arrival in sorted(arrivals, key=lambda item: (item.study_site_id, item.time_utc_ns)):
         region = site_region[arrival.study_site_id]
         product = ocm_by_region[region]
+        effective_days = overrides.get(arrival.arrival_time_id, float(max_backtrack_days))
+        horizon_steps = horizon_steps_for(effective_days)
         start_ns = int(arrival.time_utc_ns) - horizon_steps * _UTC_HOUR_NS
         horizon = np.arange(start_ns, int(arrival.time_utc_ns) + _UTC_HOUR_NS, _UTC_HOUR_NS, dtype=np.int64)
         available_set = available_by_region[region]
@@ -3261,7 +3717,7 @@ def _gap_safe_payload(
                 "arrival_time_utc": _utc_string(arrival.time_utc_ns),
                 "horizon_start_utc": _utc_string(start_ns),
                 "horizon_end_utc": _utc_string(arrival.time_utc_ns),
-                "max_backtrack_days": max_backtrack_days,
+                "max_backtrack_days": effective_days,
                 "expected_step_count": int(horizon.size),
                 "supported_step_count": int(horizon.size - len(missing)),
                 "crossed_gap": bool(missing),
@@ -3273,6 +3729,12 @@ def _gap_safe_payload(
         status = "generated"
     else:
         status = "approved" if strict else "generated"
+    provenance_extra: dict[str, Any] = {
+        "expected_time_count": int(expected_axis.size),
+        "gap_policy": "known OCM gap cannot be crossed; no nearest/zero fill",
+    }
+    if pilot_selection is not None:
+        provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
     return {
         "manifest_kind": "ocm_gap_safe_arrival_horizon_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -3284,8 +3746,7 @@ def _gap_safe_payload(
         "provenance": _provenance(
             method_id="server_v3_ocm_gap_safe_arrival_horizon_v1",
             source_hashes=source_hashes,
-            expected_time_count=int(expected_axis.size),
-            gap_policy="known OCM gap cannot be crossed; no nearest/zero fill",
+            **provenance_extra,
         ),
         "records": records,
     }
@@ -3627,6 +4088,7 @@ def build_input_derivatives(
     nww_analysis_root: str | Path | None = None,
     formal: bool = False,
     strict: bool | None = None,
+    pilot_arrival_utc: Mapping[str, str] | None = None,
 ) -> InputDerivationResult:
     """從四域 OCM/NWW3 v3 產品建立全部 Slice 1 immutable manifests。
 
@@ -3637,8 +4099,20 @@ def build_input_derivatives(
     constant-field arrival fallback，但仍會把 manifest status 標成 ``generated``，不會誤稱
     為 approved formal data。正式資料需有 4 domains、5 sites、100 receptors、250 arrivals、
     5,000 dynamic pairs，且 NWW manifest 必須證明完整 17,544 小時。
+
+    ``pilot_arrival_utc`` 是唯一版本化的 pilot-only 明示入口，目前只接受
+    ``{"hsinchu": "2024-01-02T01:00:00Z"}``。它在任何 source 或 destination I/O 前
+    拒絕 ``formal=True``；非正式 build 則先驗證 OCM native／surface、NWW3 exact UTC、
+    NWW 四角空間支撐與 OCM native 的 1 日 inclusive gap-safe horizon，再 deterministic
+    替換一筆 Hsinchu arrival。替換不改五站 250 arrivals／5,000 dynamic pairs 契約，且
+    provenance 明示 pilot selection scope，供 release config 保持 ``generated``。
     """
 
+    pilot_arrivals = _parse_explicit_pilot_arrivals(pilot_arrival_utc)
+    if formal and pilot_arrivals:
+        raise InputDerivationError(
+            "formal input build 禁止 pilot-only explicit arrival；destination 尚未寫入"
+        )
     config_file = _assert_regular_file(config_path)
     config = load_config(config_file, formal_release=False)
     strict_mode = formal if strict is None else bool(strict)
@@ -3801,6 +4275,20 @@ def build_input_derivatives(
                 expected_axis=expected_axis,
                 strict=strict_mode,
             )
+            explicit = pilot_arrivals.get(site_id)
+            if explicit is not None:
+                selected = _replace_with_explicit_pilot_arrival(
+                    site_id=site_id,
+                    arrivals=selected,
+                    explicit=explicit,
+                    product=ocm,
+                    surface_product=surface,
+                    nww_product=nww,
+                    nww_cache=nww_runtime_caches[region],
+                    context=context,
+                    expected_axis=expected_axis,
+                    design_version=config.design_version,
+                )
             arrivals_by_site[site_id] = selected
             arrival_contexts[site_id] = context
     # A 區共用同一套 forcing 時，只要兩站都能支援，使用同一組 UTC；站點 ID 重新 hash，
@@ -3828,6 +4316,12 @@ def build_input_derivatives(
     all_arrivals = tuple(item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site])
     if len(all_arrivals) != EXPECTED_ARRIVAL_COUNT:
         raise InputDerivationError(f"arrival 應有 250 筆，實際 {len(all_arrivals)}")
+    pilot_selection = _pilot_selection_summary(all_arrivals)
+    pilot_horizon_overrides = (
+        {str(pilot_selection["arrival_time_id"]): PILOT_EXPLICIT_MAX_BACKTRACK_DAYS}
+        if pilot_selection is not None
+        else {}
+    )
     receptor_payload, receptor_index, receptor_objects, meshes, projections = _receptor_payload(
         config=config,
         products_by_region=ocm_by_region,
@@ -3840,7 +4334,13 @@ def build_input_derivatives(
         strict=strict_mode,
     )
     del receptor_index, meshes, projections
-    arrival_payload = _arrival_payload(config, all_arrivals, source_hashes=source_hashes, strict=strict_mode)
+    arrival_payload = _arrival_payload(
+        config,
+        all_arrivals,
+        source_hashes=source_hashes,
+        strict=strict_mode,
+        pilot_selection=pilot_selection,
+    )
     dynamic_payload = _dynamic_initial_payload(
         config=config,
         products_by_region=ocm_by_region,
@@ -3848,6 +4348,7 @@ def build_input_derivatives(
         arrivals=all_arrivals,
         source_hashes=source_hashes,
         strict=strict_mode,
+        pilot_selection=pilot_selection,
     )
     max_days = float(config.boundaries.max_backtrack_days or DEFAULT_MAX_BACKTRACK_DAYS)
     gap_payload = _gap_safe_payload(
@@ -3858,6 +4359,8 @@ def build_input_derivatives(
         source_hashes=source_hashes,
         max_backtrack_days=max_days,
         strict=strict_mode,
+        pilot_horizon_overrides=pilot_horizon_overrides,
+        pilot_selection=pilot_selection,
     )
     inventory_payload = _forcing_inventory_payload(
         config=config,
@@ -3901,6 +4404,14 @@ def build_input_derivatives(
         "arrival": arrival_payload,
         "initial_condition": dynamic_payload,
     }
+    source_bindings: dict[str, Any] = {
+        "config_hash": config.config_hash(),
+        "ocm_native_root_token": config.inputs.ocm_native_root_env,
+        "ocm_surface_root_token": config.inputs.ocm_surface_root_env,
+        "nww_analysis_root_token": config.inputs.nww_analysis_root_env,
+    }
+    if pilot_selection is not None:
+        source_bindings["pilot_selection_scope"] = dict(pilot_selection)
     return _write_artifact_directory(
         Path(destination),
         payloads,
@@ -3909,12 +4420,7 @@ def build_input_derivatives(
         ocm_native_root=native_root,
         ocm_surface_root=surface_root,
         nww_analysis_root=nww_root,
-        extra_source_bindings={
-            "config_hash": config.config_hash(),
-            "ocm_native_root_token": config.inputs.ocm_native_root_env,
-            "ocm_surface_root_token": config.inputs.ocm_surface_root_env,
-            "nww_analysis_root_token": config.inputs.nww_analysis_root_env,
-        },
+        extra_source_bindings=source_bindings,
     )
 
 
@@ -4317,6 +4823,58 @@ def validate_input_derivatives(
             row.get("crossed_gap") is not False for row in gap_rows if isinstance(row, Mapping)
         ):
             errors.append("gap_safe_horizon_crosses_gap")
+    # pilot replacement 維持 250 筆總量，但它的非潮汐 label 不是正式 48+2 strata；
+    # 這裡在既有 formal loader 之外再保存一個可搜尋的明確錯誤。非正式 validator 則
+    # 檢查 25-node、1 日 gap record 與 arrival metadata 是否彼此一致，避免只因 count
+    # 正確就把缺少中間支援的 pilot artifact 當成可用。
+    pilot_rows = [
+        row
+        for row in arrival_rows
+        if isinstance(row, Mapping)
+        and isinstance(row.get("metadata"), Mapping)
+        and row["metadata"].get("pilot_replacement_policy_id") == PILOT_EXPLICIT_WINDOW_POLICY_ID
+    ] if isinstance(arrival_rows, list) else []
+    if pilot_rows:
+        if formal:
+            errors.append("formal_pilot_explicit_window_not_48_plus_2")
+        if len(pilot_rows) != 1:
+            errors.append("pilot_explicit_window_record_count_invalid")
+        elif isinstance(gap_rows, list):
+            pilot_row = pilot_rows[0]
+            pilot_id = pilot_row.get("arrival_time_id")
+            matching_gap = [
+                row
+                for row in gap_rows
+                if isinstance(row, Mapping) and row.get("arrival_time_id") == pilot_id
+            ]
+            metadata = pilot_row.get("metadata")
+            if len(matching_gap) != 1 or not isinstance(metadata, Mapping):
+                errors.append("pilot_explicit_window_gap_cross_reference_invalid")
+            else:
+                gap_row = matching_gap[0]
+                raw_gap_days = gap_row.get("max_backtrack_days")
+                try:
+                    gap_days_valid = math.isclose(
+                        float(raw_gap_days),
+                        PILOT_EXPLICIT_MAX_BACKTRACK_DAYS,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                except (TypeError, ValueError):
+                    gap_days_valid = False
+                if (
+                    pilot_row.get("study_site_id") != PILOT_EXPLICIT_SITE_ID
+                    or pilot_row.get("tide_class") != PILOT_EXPLICIT_TIDE_CLASS
+                    or pilot_row.get("phase_or_event") != PILOT_EXPLICIT_PHASE_OR_EVENT
+                    or metadata.get("pilot_selection_scope") != "hsinchu_only"
+                    or metadata.get("explicit_pilot_window_expected_step_count") != 25
+                    or not gap_days_valid
+                    or gap_row.get("expected_step_count") != 25
+                    or gap_row.get("supported_step_count") != 25
+                    or gap_row.get("crossed_gap") is not False
+                    or gap_row.get("missing_utc") != []
+                ):
+                    errors.append("pilot_explicit_window_support_record_invalid")
     roots_by_token: dict[str, Path | None] = {}
     if config is not None:
         roots_by_token[config.inputs.ocm_native_root_env] = _env_root(

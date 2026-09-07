@@ -141,6 +141,37 @@ def rk4_step(state: ParticleState, *, dt_seconds: float, velocity: VelocityProvi
     )
 
 
+def apply_diffusion_step(
+    state: ParticleState,
+    *,
+    dt_seconds: float,
+    coefficients: DiffusionCoefficients | DiffusionSample,
+    rng: np.random.Generator,
+) -> ParticleState:
+    """對已完成確定性步驟的狀態套用一次 operator-split 擴散位移。
+
+    這個入口把 Brownian 隨機位移及空間擴散的 ``+div(K)|dt|`` 漂移集中在同一處，
+    讓一般 RK4 成功路徑與「RK stage 已知越過海面、先做幾何反射」的 recovery 路徑
+    使用完全相同的擴散契約。``state`` 的時間與年齡應已代表本次確定性步驟的末端；
+    本函式只改變三個公尺制位置，不再次取樣速度、不在 RK4 stage 中插入亂數，而且每次
+    呼叫恰消耗一次三軸 ``normal(size=3)``。若 caller 已判定邊界為終止狀態，禁止呼叫
+    本函式，因為終止 recovery 不應在停止時間之後追加 diffusion。
+    """
+
+    if isinstance(coefficients, DiffusionCoefficients):
+        displacement = brownian_displacement(coefficients, dt_seconds=dt_seconds, rng=rng)
+    elif isinstance(coefficients, DiffusionSample):
+        displacement = diffusion_displacement(coefficients, dt_seconds, rng)
+    else:
+        raise TypeError("coefficients 必須是 DiffusionCoefficients 或 DiffusionSample")
+    return replace(
+        state,
+        x_m=state.x_m + float(displacement[0]),
+        y_m=state.y_m + float(displacement[1]),
+        z_m=state.z_m + float(displacement[2]),
+    )
+
+
 def split_rk4_brownian_step(
     state: ParticleState,
     *,
@@ -159,18 +190,11 @@ def split_rk4_brownian_step(
     """
 
     advanced = rk4_step(state, dt_seconds=dt_seconds, velocity=velocity)
-    # 舊版呼叫端直接傳 DiffusionCoefficients；保留這條分支可維持既有 Brownian 公式、
-    # NumPy 亂數消耗順序與固定 seed 結果。新的 DiffusionSample 則把步首梯度漂移和
-    # Brownian 增量包在同一個 operator split 中，且仍只在四個 RK4 stage 完成後呼叫一次。
-    if isinstance(coefficients, DiffusionCoefficients):
-        displacement = brownian_displacement(coefficients, dt_seconds=dt_seconds, rng=rng)
-    elif isinstance(coefficients, DiffusionSample):
-        displacement = diffusion_displacement(coefficients, dt_seconds, rng)
-    else:
-        raise TypeError("coefficients 必須是 DiffusionCoefficients 或 DiffusionSample")
-    return replace(
+    # 一般完整 RK4 路徑與特殊 recovery 路徑都共用同一個 helper，確保 Brownian 與
+    # +div(K)|dt| 只在確定性計算完成後套用一次，且維持既有 seed／亂數消耗順序。
+    return apply_diffusion_step(
         advanced,
-        x_m=advanced.x_m + float(displacement[0]),
-        y_m=advanced.y_m + float(displacement[1]),
-        z_m=advanced.z_m + float(displacement[2]),
+        dt_seconds=dt_seconds,
+        coefficients=coefficients,
+        rng=rng,
     )

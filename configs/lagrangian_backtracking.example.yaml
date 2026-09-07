@@ -190,6 +190,10 @@ study_sites:
     study_site_name_zh: 新竹外海
     analysis_region_id: B
     flow_domain_id: hsinchu_cache_v3
+    # 受體核心中心沿用 B 區已登錄 flow-domain 中心；這兩個欄位只限制水平受體候選，
+    # 不改變 B 區 flow domain，也不把 local domain 從 flow domain 縮成 12.5 km 圓。
+    anchor_lonlat: [120.45, 24.75]
+    receptor_core_radius_m: 12500
     anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
     local_domain_policy: same_as_flow_domain
   - study_site_id: houwan
@@ -455,7 +459,10 @@ scenarios:
   vertical_receptor_count_per_horizontal_location: 4
   horizontal_selector: anchor_first_then_deterministic_metric_maximin_on_persistent_wet_mesh
   northeast_receptor_candidate_domain: site_receptor_core_12500m
-  other_site_receptor_candidate_domain: site_flow_domain
+  # 明示 receptor core 的站點使用 core∩local/static-ocean；未明示 core 的站點沿用
+  # 原本 local（若未另建 local，則為 flow）候選區。這個 policy 只限制受體候選，
+  # 不改寫 local domain 或正式 5 站／20 receptors 契約。
+  other_site_receptor_candidate_domain: site_explicit_core_intersect_local_else_local_or_flow_v1
   vertical_targets:
     - {vertical_id: upper_water_column, fraction_below_surface: 0.10}
     - {vertical_id: mid_upper_water_column, fraction_below_surface: 0.40}

@@ -18,9 +18,11 @@ from types import ModuleType
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "render_source_code_architecture_map.py"
 
-# 這 18 筆是原先位於 docs 根層的文件：其中 17 筆已依主題搬入子目錄，
-# implementation_status.md 仍留在根層作為目前狀態的單一索引。測試同時核對現行路徑
-# 與索引中的原路徑文字，避免整理文件時遺失任一份歷史或現行內容。
+# 前 18 筆是原先位於 docs 根層的文件：其中 17 筆已依主題搬入子目錄，
+# implementation_status.md 仍留在根層作為目前狀態的單一索引。第 19 筆是後續新增的
+# 新竹 pilot 參數紀錄，沒有待相容的舊根層路徑，因此以 current/original 相同的
+# self-alias 形式納入契約。測試同時核對現行路徑與索引中的原路徑文字，避免整理文件
+# 或新增交付文件時遺失任一份歷史、現行或新註冊內容。
 DOCUMENT_CATALOG: tuple[tuple[str, str], ...] = (
     ("docs/implementation_status.md", "docs/implementation_status.md"),
     (
@@ -62,6 +64,10 @@ DOCUMENT_CATALOG: tuple[tuple[str, str], ...] = (
     (
         "docs/results/13_report_release_and_scientific_outputs_plan.md",
         "docs/13_report_release_and_scientific_outputs_plan.md",
+    ),
+    (
+        "docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md",
+        "docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md",
     ),
     (
         "docs/operations/14_input_derivation_and_release_contract.md",
@@ -663,16 +669,16 @@ def test_readme_states_report_boundary_without_claiming_renderer_completion() ->
 
 
 def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> None:
-    """確認文件總入口涵蓋分類與原 18 份文件，且全 repo 的本地連結不斷裂。
+    """確認文件總入口涵蓋分類與 19 筆 catalog/alias 契約，且本地連結不斷裂。
 
     這裡檢查的是所有 Markdown 檔案的實際連結拓撲，包含跨分類文件、設定檔、測試、
-    圖檔與 PDF；不只檢查新加入的閱讀提示。外部 DOI 與網頁連結由掃描器排除，因為
-    它們不是本地檔案存在性可以驗收的範圍。
+    圖檔與 PDF；不只檢查新加入的閱讀提示，也確認新竹 pilot 文件以 self-alias
+    登錄。外部 DOI 與網頁連結由掃描器排除，因為它們不是本地檔案存在性可以驗收的範圍。
     """
 
     index_path = PROJECT_ROOT / "docs" / "README.md"
     index = index_path.read_text(encoding="utf-8")
-    assert len(DOCUMENT_CATALOG) == 18
+    assert len(DOCUMENT_CATALOG) == 19
     for category in ("foundation/", "operations/", "results/", "development/", "archive/"):
         assert category in index
     for current_path, original_path in DOCUMENT_CATALOG:
@@ -688,7 +694,7 @@ def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> Non
         assert "今天狀態以 [實作狀態](../implementation_status.md) 為準" in archive_text
 
     local_links = _iter_local_markdown_links()
-    assert len(local_links) == 140
+    assert len(local_links) == 142
     broken_links = [
         (
             source_path.relative_to(PROJECT_ROOT).as_posix(),

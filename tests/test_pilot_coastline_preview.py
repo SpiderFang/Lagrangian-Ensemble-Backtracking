@@ -653,6 +653,142 @@ def test_baytrace_build_emits_four_pngs_readme_and_rebuild_contract(
             assert (output / filename).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_baytrace_build_uses_summary_horizon_run_counts_and_depth_axis(
+    synthetic_inputs: dict[str, Path],
+    tmp_path: Path,
+    writable_mpl_config: None,
+    allow_synthetic_coastline_sha: None,
+) -> None:
+    """確認新版圖面由 summary 驅動 12 小時、run 身分與非舊版停止計數。
+
+    這個回歸案例刻意把合成 fixture 改成 12 小時、202 筆保存紀錄及 6／10／4
+    三種停止計數；若 renderer 仍依賴舊 r2 的 20／203、9／8／3 或 0--60 分鐘
+    常數，應在產圖前失敗。資料仍保留五個位置、四個水層與每層五顆粒子的既有
+    圖面拓樸，讓測試只隔離本次必要的資料驅動泛化行為。
+    """
+
+    preview_dir = synthetic_inputs["preview_dir"]
+    particles_path = preview_dir / "particles.csv"
+    particle_rows = list(csv.DictReader(particles_path.open(newline="", encoding="utf-8")))
+    status_sequence = (
+        ("max_age",) * 6
+        + ("flow_domain_open_exit",) * 10
+        + ("numerical_failure",) * 4
+    )
+    assert len(particle_rows) == len(status_sequence) == 20
+    status_by_particle: dict[str, str] = {}
+    for row, status in zip(particle_rows, status_sequence, strict=True):
+        row["status"] = status
+        status_by_particle[row["particle_id"]] = status
+        if status == "numerical_failure":
+            row["failure_reason"] = "invalid_velocity_sample"
+            row["failure_stage"] = "step_start"
+            row["qc_flags"] = "16"
+        else:
+            row["failure_reason"] = "unknown"
+            row["failure_stage"] = "unknown"
+            row["qc_flags"] = ""
+        row["age_seconds"] = "43200.000000000000" if status == "max_age" else "1800.000000000000"
+    with particles_path.open(newline="", encoding="utf-8") as stream:
+        particle_fields = list(csv.DictReader(stream).fieldnames or [])
+    _write_csv(particles_path, particle_fields, particle_rows)
+
+    observations_path = preview_dir / "observations.csv"
+    observations = list(csv.DictReader(observations_path.open(newline="", encoding="utf-8")))
+    assert observations
+    for row in observations:
+        particle_status = status_by_particle[row["particle_id"]]
+        original_horizon = 3600.0 if particle_status == "max_age" else 1800.0
+        fraction = float(row["age_seconds"]) / original_horizon
+        new_horizon = 43200.0 if particle_status == "max_age" else 1800.0
+        row["age_seconds"] = f"{fraction * new_horizon:.12f}"
+    observations.pop()
+    with observations_path.open(newline="", encoding="utf-8") as stream:
+        observation_fields = list(csv.DictReader(stream).fieldnames or [])
+    _write_csv(observations_path, observation_fields, observations)
+
+    preview_manifest_path = preview_dir / "manifest.json"
+    preview_manifest = json.loads(preview_manifest_path.read_text(encoding="utf-8"))
+    preview_manifest["files"]["particles.csv"] = _file_contract(particles_path)
+    preview_manifest["files"]["observations.csv"] = _file_contract(observations_path)
+    _write_json(preview_manifest_path, preview_manifest)
+
+    summary_path = preview_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["run_id"] = "b-fishinggear-m1-12h-r3"
+    preview_manifest["run_id"] = summary["run_id"]
+    _write_json(preview_manifest_path, preview_manifest)
+    summary["settings"]["horizon_seconds"] = 43200.0
+    summary["observation_count"] = len(observations)
+    summary["terminal_counts"] = {
+        status: sum(row["status"] == status for row in particle_rows) for status in _TERMINAL_STATUSES
+    }
+    summary["terminal_counts_by_vertical"] = {
+        vertical_id: {
+            status: sum(
+                row["vertical_id"] == vertical_id and row["status"] == status for row in particle_rows
+            )
+            for status in _TERMINAL_STATUSES
+        }
+        for vertical_id in _VERTICAL_LEVELS
+    }
+    summary["failure_details"] = [
+        {
+            "particle_id": row["particle_id"],
+            "status": "numerical_failure",
+            "failure_reason": "invalid_velocity_sample",
+            "qc_flags": 16,
+        }
+        for row in particle_rows
+        if row["status"] == "numerical_failure"
+    ]
+    summary["diagnostics"] = [
+        {
+            "status": "numerical_failure",
+            "count": summary["terminal_counts"]["numerical_failure"],
+            "failure_reason": "invalid_velocity_sample",
+            "qc_flags": 16,
+        }
+    ]
+    _refresh_summary_contract(preview_dir, summary)
+
+    data = _load_inputs(synthetic_inputs)
+    assert _TARGET._baytrace_status_labels(data)["max_age"] == "完成12小時回溯"
+    assert _TARGET._depth_axis_limits_and_ticks(summary) == (720.0, [0.0, 180.0, 360.0, 540.0, 720.0])
+
+    output = tmp_path / "baytrace-style-12h"
+    manifest = _TARGET.build_coastline_preview(
+        preview_dir,
+        synthetic_inputs["domain_path"],
+        synthetic_inputs["open_path"],
+        synthetic_inputs["coastline_path"],
+        output,
+        style="baytrace",
+    )
+    assert manifest["run_id"] == "b-fishinggear-m1-12h-r3"
+    assert manifest["particle_count"] == 20
+    assert manifest["observation_count"] == 202
+    assert manifest["terminal_counts"] == {
+        "coast_contact": 0,
+        "data_gap": 0,
+        "deposited": 0,
+        "flow_domain_open_exit": 10,
+        "forcing_start": 0,
+        "max_age": 6,
+        "numerical_failure": 4,
+        "surface_regime_exit": 0,
+    }
+    readme = (output / "README.md").read_text(encoding="utf-8")
+    assert "回溯上限12小時" in readme
+    assert "完成12小時回溯 6 顆" in readme
+    assert "202 筆模型保存紀錄" in readme
+    assert "1h" not in readme
+    assert "1小時" not in readme
+    assert "203 筆" not in readme
+    assert "9/8/3" not in readme
+    assert "0–60 分鐘" not in readme
+
+
 def test_legacy_build_keeps_two_png_contract_and_no_baytrace_style(
     synthetic_inputs: dict[str, Path],
     tmp_path: Path,

@@ -170,6 +170,47 @@ def test_ocm_sampler_is_exact_for_linear_xyzt_field() -> None:
     )
 
 
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_ocm_vertical_unsupported_preserves_finite_geometric_bounds(
+    use_numba_kernel: bool,
+) -> None:
+    """垂向速度不支援時保留可獨立證明的 eta／bed，卻不產生可用速度。
+
+    查詢深度 ``z_m=1`` 高於合成海面 ``eta_m=0``，故速度不能由 OCM 上下兩層夾住，
+    必須回傳 ``VERTICAL_UNSUPPORTED``。海面來自 ``elev``、海床來自 native mesh
+    ``source_depth_m``，兩者仍是有限且相容的幾何證據；此欄位讓 engine 能辨認海面
+    反射，但不會把 invalid sample 的零速度誤當成可積分速度。NumPy 與 Numba 路徑都
+    必須維持同一缺值／上下界契約。
+    """
+
+    mesh = _triangle_mesh()
+    times = np.array([0, 1_000_000_000], dtype=np.int64)
+    z_levels = np.array([-10.0, 0.0])
+    zcor = np.broadcast_to(z_levels, (2, 3, 2)).copy()
+    hvel = np.zeros((2, 3, 2, 2), dtype=np.float64)
+    vertical_velocity = np.zeros((2, 3, 2), dtype=np.float64)
+    diffusivity = np.full((2, 3, 2), 0.01, dtype=np.float64)
+    sampler = OCMNativeMonth(
+        month_id="197001",
+        mesh=mesh,
+        time_utc_ns=times,
+        hvel=hvel,
+        vertical_velocity=vertical_velocity,
+        zcor=zcor,
+        elev=np.zeros((2, 3), dtype=np.float64),
+        wetdry_elem=np.zeros((2, 1), dtype=np.float64),
+        diffusivity=diffusivity,
+        use_numba_kernel=use_numba_kernel,
+    )
+
+    sample = sampler.sample(2.0, 3.0, 1.0, 0)
+    assert not sample.valid
+    assert sample.qc == SampleQC.VERTICAL_UNSUPPORTED
+    assert sample.eta_m == 0.0
+    assert sample.bed_z_m == -10.0
+    assert sample.u_mps == sample.v_mps == sample.w_mps == 0.0
+
+
 def test_ocm_sampler_rejects_dry_face() -> None:
     """wetdry 非 wet value 時不得回傳零流速冒充有效場。"""
 

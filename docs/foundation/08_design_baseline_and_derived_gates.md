@@ -42,11 +42,17 @@
 |---|---|---|---|---|---|
 | `gongliao` | 貢寮 | A | `gongliao_local_domain_v1` | anchor 公尺制半徑 25 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.92807, 25.11245]` |
 | `guishan` | 龜山島西側 | A | `guishan_west_local_domain_v1` | anchor 公尺制半徑 25 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.951606, 24.843127]` |
-| `hsinchu` | 新竹外海 | B | `hsinchu_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |
+| `hsinchu` | 新竹外海 | B | `hsinchu_flow_domain_v1` | local domain 與 flow domain 相同；受體候選為 `[120.45,24.75]` 半徑 12.5 km 核心與既有 local 候選區的交集 | `[120.45, 24.75]` |
 | `houwan` | 後灣海生館 | C | `houwan_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |
 | `lienchiang` | 連江 | D | `lienchiang_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |
 
-貢寮與龜山島均另設半徑 12.5 km 的 `receptor_core_v1`，五個水平受體位置只在核心內選取；半徑 25 km 的 local domain 則用於辨識正向移入關注海域的入口方向。此「受體核心：local boundary = 1:2」的巢狀尺度可避免剛釋放便觸及 local boundary，亦顯著大於原 SVD 候選框。正式分析預先登錄 20 km 與 35 km local-domain 半徑敏感度；若主要入口排名或 HDR 對尺度不穩定，報告必須呈現範圍而非單一邊界結論。
+貢寮、龜山島與新竹均明示半徑 12.5 km 的 `receptor_core_v1`，五個水平受體位置只在
+各自核心圓與既有 local／static-ocean 候選區的交集內選取。貢寮與龜山島另以半徑 25 km
+local domain 辨識正向移入關注海域的入口方向；新竹的 local domain 仍與
+`hsinchu_cache_v3` flow domain 相同，核心圓只限制受體候選，不改變 flow/local 邊界。
+前兩站的「受體核心：local boundary = 1:2」巢狀尺度可避免剛釋放便觸及 local boundary，
+亦顯著大於原 SVD 候選框。正式分析預先登錄 20 km 與 35 km local-domain 半徑敏感度；若
+主要入口排名或 HDR 對尺度不穩定，報告必須呈現範圍而非單一邊界結論。
 
 SERVER preflight 以龜山島 anchor-centered Azimuthal Equidistant CRS 重算後，anchor 至現行 A 區名目南界約為 26.64 km，25 km local boundary 僅餘約 1.64 km。雖然 OCM native source nodes 的局地間距小於 1 km，正式 Stokes forcing 使用的 OCM surface／NWW analysis grid 約為 1 km，故現行 v3 未通過「所有必要 forcing 至少保留兩個共同格點」的保守 margin gate。現行 `northeast_taiwan_common_cache_v3` 只可供程式開發、幾何驗證與明確標示的 pilot；不得直接升格為龜山島 25 km 正式 baseline。
 
@@ -109,10 +115,20 @@ scenario_id = hash(
 
 ### 5.2 水平位置
 
-1. 貢寮與龜山島的候選集合限於各自半徑 12.5 km `receptor_core_v1`；其餘三站點限於各自 local/flow domain。所有候選均須具有效 OCM triangle、非陸地且可支援全部 50 個到達時間的 persistent-wet 節點或三角形中心。此 persistent-wet 條件只篩受體，不改變固定 local-domain polygon。
-2. 貢寮與龜山島以各自 anchor 的最近有效海洋位置作第一點；若 anchor 本身無有效三角形，只允許在兩個局地代表網格尺度內 snap，並保存原始 anchor、實際位置及距離。
+1. 貢寮、龜山島與新竹的候選集合限於各自明示 anchor 半徑 12.5 km `receptor_core_v1`
+   與既有 local／static-ocean 候選區的交集；後灣與連江等未明示核心的站點則限於各自
+   local/flow domain。所有候選均須具有效 OCM triangle、非陸地且可支援全部 50 個到達
+   時間的 persistent-wet 節點或三角形中心。此 persistent-wet 條件只篩受體，不改變固定
+   local-domain polygon。
+2. 貢寮、龜山島與新竹均以各自明示 anchor 作 deterministic maximin 的第一點排序依據，
+   並在 manifest 保存原始 anchor、實際受體位置及 `anchor_snap_distance_m`。目前
+   `input_derivation.py` 傳入受體 selector 的 policy 會保存實際 snap distance，但沒有把
+   「最多兩個局地代表網格尺度」作為受體 anchor 的 runtime hard gate；因此本版不把該
+   上限宣稱為已執行條件。這不要與 arrival NWW metric proxy 的「最大兩倍實際 NWW
+   grid scale」政策混同。新竹 anchor 固定為已登錄的 `[120.45, 24.75]`。
 3. 其餘四點以固定 seed 的 metric-space maximin 演算法依序選取，使最小點間距最大；並以 `lon, lat, source_face_id` 作 tie-break，確保重跑結果相同。
-4. 新竹、後灣與連江以 flow-domain center 的最近有效海洋位置作第一點，再使用相同 maximin 規則選四點。
+4. 後灣與連江以 flow-domain center 的最近有效海洋位置作第一點，再使用相同 maximin 規則
+   選四點；新竹雖與 B 區 flow center 重合，仍依設定明示的 anchor 與核心候選區執行。
 5. 候選點距海岸、無效 triangle 或 flow-domain 外界至少一個局地代表網格尺度；若此限制使候選不足，先降低為半個尺度並記錄 QC，不以陸地最近鄰補值。
 
 ### 5.3 垂向層位

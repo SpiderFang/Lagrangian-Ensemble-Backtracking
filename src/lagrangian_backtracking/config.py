@@ -10,6 +10,7 @@ manifest 的設定。這個分層避免把上游 ``trial_ready`` 名稱誤作外
 from __future__ import annotations
 
 import json
+import math
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -163,7 +164,15 @@ class DomainConfig(StrictModel):
 
 
 class StudySiteConfig(StrictModel):
-    """獨立研究站點與其 local-domain 生成政策。"""
+    """獨立研究站點與其 local-domain、受體核心生成政策。
+
+    ``anchor_lonlat`` 與 ``receptor_core_radius_m`` 是同一個受體候選核心的兩個
+    不可分欄位：前者是經緯度資料交換座標，後者是以站點 flow-domain 的既有 AEQD
+    公尺投影計算的半徑。這個 schema-level gate 先於 inputs-build 執行，避免設定只
+    填一半、或以無限／非正半徑進入幾何 intersection 後才得到難以定位的錯誤。沒有
+    明示核心的站點仍保留既有 local／flow candidate 行為；這裡不會把 local domain
+    自動縮成核心圓，也不驗證核心是否落在實際 mesh 或 ocean polygon 內。
+    """
 
     study_site_id: str
     study_site_name_zh: str
@@ -175,6 +184,35 @@ class StudySiteConfig(StrictModel):
     local_domain_baseline_radius_m: float | None = None
     local_domain_sensitivity_radii_m: list[float] = Field(default_factory=list)
     local_domain_policy: str | None = None
+
+    @model_validator(mode="after")
+    def validate_receptor_core_pair(self) -> StudySiteConfig:
+        """驗證受體核心 anchor／半徑成對，且半徑是有限正的公尺值。
+
+        Pydantic 先把 YAML 數值轉成欄位型別；此 validator 再檢查跨欄位條件與有限性。
+        ``anchor_lonlat`` 的有限性也一併驗證，因為 ``NaN`` 經緯度會讓後續 AEQD 投影
+        與 Shapely intersection 失去可重建性。這個檢查只處理設定內可判定的 schema
+        契約；核心與 local/static ocean polygon 的實際交集仍由 input derivation 在
+        讀到 domain geometry 後 fail closed。
+        """
+
+        has_anchor = self.anchor_lonlat is not None
+        has_radius = self.receptor_core_radius_m is not None
+        if has_anchor != has_radius:
+            raise ValueError(
+                f"{self.study_site_id} 的 receptor core 必須同時明示 anchor_lonlat 與 "
+                "receptor_core_radius_m"
+            )
+        if not has_anchor:
+            return self
+        assert self.anchor_lonlat is not None
+        assert self.receptor_core_radius_m is not None
+        if not all(math.isfinite(float(value)) for value in self.anchor_lonlat):
+            raise ValueError(f"{self.study_site_id} 的 anchor_lonlat 必須是有限數值")
+        radius = float(self.receptor_core_radius_m)
+        if not math.isfinite(radius) or radius <= 0.0:
+            raise ValueError(f"{self.study_site_id} 的 receptor_core_radius_m 必須是有限正數")
+        return self
 
     def resolved_flow_domain_id(self, *, formal: bool = False) -> str:
         """回傳 study site 在目前執行模式應使用的 flow-domain ID。

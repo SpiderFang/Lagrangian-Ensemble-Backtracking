@@ -94,6 +94,28 @@ uv run lbt release-config-validate "$LBT_SCRATCH_ROOT/release-2024-2025.yaml" \
 constant-field fallback。`release-config-create`、`release-config-validate` 只處理
 immutable input binding；它們不啟動粒子運算。
 
+新竹 24 小時展示可在 `inputs-build` 以版本化、pilot-only 的明示 UTC 入口替換一筆既有
+新竹 arrival：
+
+```bash
+uv run lbt inputs-build \
+  --config "$PILOT_CONFIG_TEMPLATE" \
+  --destination "$LBT_SCRATCH_ROOT/hsinchu-2024-01-01-24h-inputs-v1" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --pilot-arrival-utc hsinchu=2024-01-02T01:00:00Z
+```
+
+目前 policy 只登錄 `hsinchu=2024-01-02T01:00:00Z`。builder 會逐筆驗證
+`2024-01-01T01:00:00Z` 至 `2024-01-02T01:00:00Z` inclusive 的 25 個 exact-hour 節點
+是否同時存在於 OCM native、OCM surface、NWW3 analysis，並重做 NWW metric location 四角
+static／dynamic 支援與 OCM native gap-safe gate；缺任何一小時即 fail closed，不使用
+00Z 最近值、零值或跨缺口內插。輸出仍維持 250 arrivals／5,000 dynamic pairs，且
+arrival metadata、gap manifest、provenance 與 artifact index 會記錄 pilot scope、原／替換
+identity 及 1 日 horizon。這個選項不可與 `--formal-release` 同時使用；formal validator
+也會以非正式 `pilot_explicit_window` label 拒絕升格為 48+2 正式 arrival。
+
 ## Pilot 與 synthetic
 
 `pilot-calibrate`／`pilot-config-create` 的完整參數與 candidate gate 見

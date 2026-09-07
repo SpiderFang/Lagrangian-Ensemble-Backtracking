@@ -653,6 +653,51 @@ class OCMNativeMonth:
         vertical_scale = max(min((value for value in spans if value > 0), default=0.1), 0.1)
         return (combined, eta, vertical_scale), SampleQC.OK
 
+    def _geometric_bounds_at_time(
+        self,
+        location: MeshLocation,
+        *,
+        before: int,
+        after: int,
+        alpha: float,
+    ) -> tuple[float, float] | None:
+        """在速度垂向夾層失敗時，獨立整理仍可取得的海面／海床幾何上下文。
+
+        ``elev`` 是每個 OCM 節點的瞬時海面高程，``source_depth_m`` 是 native mesh
+        的靜態水深；兩者都使用公尺、海面向上為正。這裡只做同一個已通過時間
+        bracket 的前後時間片與目前 triangle 權重內插，不讀取速度、不做最近層外插，
+        也不把失敗速度轉成零值。回傳 ``None`` 代表海面、海床或 triangle 權重本身
+        不足以證明垂向邊界，呼叫端必須保留原本的 fail-closed 狀態。
+
+        這個幾何 context 與 ``_spatial_at_time`` 的速度支撐刻意分開：粒子可能只因
+        已經越過海面而無法由上下兩層夾住 ``z_m``，但仍可由有限 ``elev`` 與 mesh
+        水深證明「應套用海面反射」；反之，乾面、時間缺口及未知幾何不會因本 helper
+        而被放寬。
+        """
+
+        nodes = np.asarray(location.node_indices, dtype=np.int64)
+        weights = np.asarray(location.barycentric_weights, dtype=np.float64)
+        if nodes.ndim != 1 or nodes.size != 3 or weights.shape != (3,):
+            return None
+        if not np.all(np.isfinite(weights)):
+            return None
+        eta_before = np.asarray(self.elev[before, nodes], dtype=np.float64)
+        eta_after = np.asarray(self.elev[after, nodes], dtype=np.float64)
+        source_depth = np.asarray(self.mesh.source_depth_m[nodes], dtype=np.float64)
+        if not (
+            np.all(np.isfinite(eta_before))
+            and np.all(np.isfinite(eta_after))
+            and np.all(np.isfinite(source_depth))
+        ):
+            return None
+        eta_before_value = float(weights @ eta_before)
+        eta_after_value = float(weights @ eta_after)
+        eta = eta_before_value + float(alpha) * (eta_after_value - eta_before_value)
+        bed = -float(weights @ source_depth)
+        if not np.isfinite(eta) or not np.isfinite(bed) or bed > eta + 1.0e-6:
+            return None
+        return eta, bed
+
     def sample(
         self,
         x_m: float,
@@ -680,6 +725,15 @@ class OCMNativeMonth:
         )
         if time_qc != SampleQC.OK:
             return VelocitySample(0.0, 0.0, 0.0, np.nan, np.nan, np.nan, np.nan, time_qc)
+        # 先保存只依賴 elev 與 native 水深的幾何上下文。若後續速度的垂向夾層失敗，
+        # 這些有限值仍可讓 engine 判斷是否為已證明的海面穿越；若幾何本身缺值，
+        # helper 會回傳 None，失敗樣本仍以 NaN 表達未知，不會因此取得邊界特權。
+        geometric_bounds = self._geometric_bounds_at_time(
+            location,
+            before=before,
+            after=after,
+            alpha=alpha,
+        )
         if self.use_numba_kernel:
             face = location.source_face_local_index
             wet_values = np.asarray(self.wetdry_elem[[before, after], face], dtype=np.float64)
@@ -722,12 +776,13 @@ class OCMNativeMonth:
             else:
                 second, second_qc = self._spatial_at_time(location, time_index=after, z_m=z_m)
         if first is None or second is None:
+            eta, bed_z = geometric_bounds if geometric_bounds is not None else (np.nan, np.nan)
             return VelocitySample(
                 0.0,
                 0.0,
                 0.0,
-                np.nan,
-                np.nan,
+                eta,
+                bed_z,
                 np.sqrt(location.triangle_area_m2),
                 np.nan,
                 first_qc | second_qc,

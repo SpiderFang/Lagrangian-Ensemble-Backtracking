@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -17,7 +18,16 @@ from shapely.geometry import Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from .geometry import SegmentCrossing, first_polygon_crossing, polygon_crossings
-from .models import BoundaryEvent, EventType, ParticleState, ParticleStatus, VelocitySample
+from .models import (
+    BoundaryEvent,
+    EventType,
+    ParticleState,
+    ParticleStatus,
+    SampleQC,
+    VelocitySample,
+)
+
+_VERTICAL_BOUNDARY_TOLERANCE_M = 1.0e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,3 +347,72 @@ def resolve_vertical_boundaries(
         return stopped, [event]
     reflected_z = 2.0 * boundary_z - proposed.z_m
     return replace(proposed, z_m=float(reflected_z)), [event]
+
+
+def recover_surface_boundary_at_step_start(
+    state: ParticleState,
+    *,
+    reference_sample: VelocitySample,
+    behavior_class: str,
+) -> tuple[ParticleState, list[BoundaryEvent]] | None:
+    """恢復已由失效步首樣本證明的海面越界，並套用既有反射政策。
+
+    OCM 在粒子位於海面以上時不能以單側最近層外插速度，因此步首 sample 可能以
+    ``SampleQC.VERTICAL_UNSUPPORTED`` 失敗；但若同一 sample 仍提供有限且相容的
+    ``eta_m``／``bed_z_m``，並且目前 ``z_m`` 嚴格高於海面，這是可證明的海面接觸，
+    不是未知環境。對非上浮行為（例如反向回溯的 ``sinking``）將深度鏡射到海面下，
+    再由 engine 在相同 UTC／年齡重新取樣速度；此函式不替速度取樣、不清除 QC、不
+    消耗亂數。事件的 ``fraction=0`` 表示修正發生在本次步首，時間、水平位置與粒子
+    identity 完全不變。
+
+    只有海面與海床都有限、``bed_z_m <= eta_m``，且鏡射後位置仍在水柱內時才恢復。
+    缺 eta、缺 bed、乾點、時間缺口、域外、海床以下或上浮行為都回傳 ``None``，由
+    呼叫端保留原本的 data-gap／numerical-failure 或既有上浮停止政策；這裡不做盲目
+    clamp，也不把未知資料當成海面。
+    """
+
+    if (
+        behavior_class == "rising"
+        or not isinstance(reference_sample, VelocitySample)
+        or reference_sample.qc != SampleQC.VERTICAL_UNSUPPORTED
+    ):
+        return None
+    try:
+        eta = float(reference_sample.eta_m)
+        bed = float(reference_sample.bed_z_m)
+        z_m = float(state.z_m)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) for value in (eta, bed, z_m)):
+        return None
+    if bed > eta + _VERTICAL_BOUNDARY_TOLERANCE_M:
+        return None
+    if z_m <= eta + _VERTICAL_BOUNDARY_TOLERANCE_M:
+        return None
+    reflected_z = 2.0 * eta - z_m
+    if (
+        reflected_z < bed - _VERTICAL_BOUNDARY_TOLERANCE_M
+        or reflected_z > eta + _VERTICAL_BOUNDARY_TOLERANCE_M
+    ):
+        return None
+    event = BoundaryEvent(
+        particle_id=state.particle_id,
+        scenario_id=state.scenario_id,
+        member_id=state.member_id,
+        study_site_id=state.study_site_id,
+        analysis_region_id=state.analysis_region_id,
+        receptor_id=state.receptor_id,
+        event_type=EventType.SURFACE_CONTACT,
+        time_utc_ns=state.time_utc_ns,
+        x_m=state.x_m,
+        y_m=state.y_m,
+        z_m=eta,
+        fraction=0.0,
+        attributes={
+            "behavior_class": behavior_class,
+            "boundary_kind": "surface",
+            "boundary_locator": "step_start_surface_reflection",
+        },
+    )
+    reflected = replace(state, z_m=float(reflected_z))
+    return reflected, [event]

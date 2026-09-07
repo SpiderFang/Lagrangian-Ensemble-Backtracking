@@ -18,11 +18,12 @@ from typing import Any
 import numpy as np
 import pytest
 import yaml
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 
 import lagrangian_backtracking.input_derivation as input_derivation_module
 from lagrangian_backtracking.cli import main
-from lagrangian_backtracking.config import ProjectConfig, resolve_flow_domain_id
+from lagrangian_backtracking.config import ProjectConfig, StudySiteConfig, resolve_flow_domain_id
+from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.input_derivation import (
     ARTIFACT_FILENAMES,
     InputDerivationError,
@@ -33,7 +34,12 @@ from lagrangian_backtracking.input_derivation import (
     validate_release_config,
     write_canonical_json,
 )
-from lagrangian_backtracking.scenarios import ArrivalTime
+from lagrangian_backtracking.mesh import NativeMesh
+from lagrangian_backtracking.receptors import (
+    prepare_horizontal_receptor_candidates,
+    select_horizontal_receptors_from_pool,
+)
+from lagrangian_backtracking.scenarios import ArrivalTime, stable_identifier
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
@@ -331,7 +337,11 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
     nww_root = tmp_path / "nww_analysis"
     domain_specs = {
         "A": ("northeast_taiwan_common_cache_v3", (121.70, 122.20, 24.55, 25.30), (8, 10)),
-        "B": ("hsinchu_cache_v3", (120.25, 120.65, 24.55, 24.95), (4, 4)),
+        # B 區設定的 12.5 km receptor core 只縮小受體候選，不縮小 flow/local polygon；
+        # 測試網格因此提高面數，讓核心內仍有至少五個 persistent-wet face 可供正式
+        # 5×4 receptor contract 選點。這是 synthetic fixture 的解析度調整，不代表
+        # SERVER accepted mesh 的實際水平解析度。
+        "B": ("hsinchu_cache_v3", (120.25, 120.65, 24.55, 24.95), (7, 7)),
         "C": ("houwan_nmmba_cache_v3", (120.70, 121.10, 21.80, 22.20), (4, 4)),
         "D": ("lienchiang_common_cache_v3", (119.75, 120.15, 26.00, 26.40), (4, 4)),
     }
@@ -1137,7 +1147,11 @@ def test_receptor_nww_reselection_prepares_one_pool_per_site_and_caches_support(
         )
         assert calls[1] == tuple(item.source_face_local_index for item in expected)
         shared_faces = set(calls[0]).intersection(calls[1])
-        assert shared_faces
+        # 核心圓可能讓 deterministic maximin 在 blacklist 後改選完全不同的五面，
+        # 因此不再把「兩輪必須重疊」當成幾何前提；只要同一 face 重返選集，support
+        # gate 就必須由 cache 保證最多執行一次。未重疊的兩輪也各自只能執行一次。
+        observed_faces = set(calls[0]).union(calls[1])
+        assert all(support_calls[(site_id, face)] == 1 for face in observed_faces)
         assert all(support_calls[(site_id, face)] == 1 for face in shared_faces)
 
 
@@ -1429,6 +1443,311 @@ def test_inputs_build_validate_and_release_config(
     release_validation = validate_release_config(release_path, input_directory=artifact_directory)
     assert release_validation["valid"] is True, release_validation
     assert validate_release_config(release_path)["valid"] is True
+
+
+def test_hsinchu_explicit_pilot_window_is_deterministic_and_keeps_full_counts(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> None:
+    """明示新竹 pilot 視窗替換一筆 arrival，仍保留 250/5,000 與可驗證 artifact。"""
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_input_fixture
+    artifact_directory = root / "derived-inputs-hsinchu-pilot"
+    result = build_input_derivatives(
+        config_path=config_path,
+        destination=artifact_directory,
+        ocm_native_root=ocm_root,
+        ocm_surface_root=surface_root,
+        nww_analysis_root=nww_root,
+        formal=False,
+        pilot_arrival_utc={"hsinchu": "2024-01-02T01:00:00Z"},
+    )
+    arrival_payload, _ = read_canonical_json(result.paths["arrival"])
+    hsinchu_arrivals = [
+        row for row in arrival_payload["records"] if row["study_site_id"] == "hsinchu"
+    ]
+    explicit = [
+        row
+        for row in hsinchu_arrivals
+        if row["metadata"].get("pilot_replacement_policy_id")
+        == input_derivation_module.PILOT_EXPLICIT_WINDOW_POLICY_ID
+    ]
+    assert len(hsinchu_arrivals) == 50
+    assert len(explicit) == 1
+    explicit_row = explicit[0]
+    expected_time_ns = int(datetime(2024, 1, 2, 1, tzinfo=UTC).timestamp() * 1_000_000_000)
+    expected_id = stable_identifier(
+        "arr",
+        [
+            "hsinchu",
+            "2024-01-02T01:00:00Z",
+            input_derivation_module.PILOT_EXPLICIT_WINDOW_POLICY_ID,
+            ProjectConfig.model_validate(yaml.safe_load(config_path.read_text(encoding="utf-8"))).design_version,
+        ],
+    )
+    assert explicit_row["arrival_time_id"] == expected_id
+    assert explicit_row["time_utc_ns"] == expected_time_ns
+    assert explicit_row["tide_class"] == input_derivation_module.PILOT_EXPLICIT_TIDE_CLASS
+    assert explicit_row["phase_or_event"] == input_derivation_module.PILOT_EXPLICIT_PHASE_OR_EVENT
+    metadata = explicit_row["metadata"]
+    assert metadata["explicit_pilot_window"] == (
+        "2024-01-01T01:00:00Z/2024-01-02T01:00:00Z/inclusive_1h"
+    )
+    assert metadata["explicit_pilot_window_expected_step_count"] == 25
+    assert metadata["pilot_replaced_arrival_time_id"] != explicit_row["arrival_time_id"]
+    assert metadata["pilot_replacement_arrival_time_id"] == explicit_row["arrival_time_id"]
+
+    gap_payload, _ = read_canonical_json(result.paths["ocm_gap_safe_arrival_horizon"])
+    pilot_gap = next(row for row in gap_payload["records"] if row["arrival_time_id"] == expected_id)
+    assert pilot_gap["horizon_start_utc"] == "2024-01-01T01:00:00Z"
+    assert pilot_gap["horizon_end_utc"] == "2024-01-02T01:00:00Z"
+    assert pilot_gap["max_backtrack_days"] == pytest.approx(1.0)
+    assert pilot_gap["expected_step_count"] == 25
+    assert pilot_gap["supported_step_count"] == 25
+    assert pilot_gap["crossed_gap"] is False
+    assert pilot_gap["missing_utc"] == []
+
+    dynamic_payload, _ = read_canonical_json(result.paths["initial_condition"])
+    pilot_pairs = [
+        row for row in dynamic_payload["records"] if row["arrival_time_id"] == expected_id
+    ]
+    assert len(dynamic_payload["records"]) == 5_000
+    assert len(pilot_pairs) == 20
+    assert arrival_payload["selection_method_id"] == (
+        input_derivation_module.PILOT_ARRIVAL_SELECTION_METHOD_ID
+    )
+    assert arrival_payload["provenance"]["pilot_selection_scope"]["selection_scope"] == "hsinchu_only"
+
+    index_payload, _ = read_canonical_json(artifact_directory / "artifact_index.json")
+    assert index_payload["source_bindings"]["pilot_selection_scope"]["arrival_time_id"] == expected_id
+    validation = validate_input_derivatives(
+        artifact_directory,
+        config_path=config_path,
+        ocm_native_root=ocm_root,
+        ocm_surface_root=surface_root,
+        nww_analysis_root=nww_root,
+        formal=False,
+    )
+    assert validation["valid"] is True, validation
+
+    release_path = root / "hsinchu-pilot-release-config.yaml"
+    created = create_release_config(
+        config_template_path=config_path,
+        input_directory=artifact_directory,
+        output_path=release_path,
+        formal=True,
+    )
+    assert created["config_status"] == "generated"
+    assert any("formal_pilot_explicit_window_not_48_plus_2" in item for item in created["blockers"])
+    assert validate_release_config(release_path, input_directory=artifact_directory)["valid"] is True
+
+
+@pytest.mark.parametrize("missing_product", ["ocm_surface", "nww3_analysis"])
+def test_hsinchu_explicit_pilot_rejects_middle_hour_product_support(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+    missing_product: str,
+) -> None:
+    """視窗中間任一 OCM surface 或 NWW exact-hour 支援缺失時不得發布 artifact。"""
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_input_fixture
+    middle_index = 13  # 2024-01-01T13:00:00Z，刻意不是 arrival endpoint。
+    if missing_product == "ocm_surface":
+        path = surface_root / "hsinchu_cache_v3" / "months" / "202401" / "valid_mask_surface.npy"
+        values = np.load(path, mmap_mode="r+")
+        values[middle_index, ...] = 0
+        values.flush()
+    else:
+        path = nww_root / "hsinchu_cache_v3" / "months" / "202401" / "valid_mask_wave.npy"
+        values = np.load(path, mmap_mode="r+")
+        values[middle_index, ...] = 0
+        values.flush()
+
+    destination = root / f"derived-inputs-pilot-missing-{missing_product}"
+    with pytest.raises(InputDerivationError, match="explicit_24h_window|explicit_pilot_window"):
+        build_input_derivatives(
+            config_path=config_path,
+            destination=destination,
+            ocm_native_root=ocm_root,
+            ocm_surface_root=surface_root,
+            nww_analysis_root=nww_root,
+            formal=False,
+            pilot_arrival_utc={"hsinchu": "2024-01-02T01:00:00Z"},
+        )
+    assert not destination.exists()
+    assert not list(root.glob(f".{destination.name}.partial-*"))
+
+
+def test_hsinchu_explicit_pilot_formal_rejects_before_destination_write(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> None:
+    """formal=True 搭配 pilot 入口必須在讀取 source／寫入 destination 前拒絕。"""
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_input_fixture
+    destination = root / "derived-inputs-formal-pilot-rejected"
+    with pytest.raises(InputDerivationError, match="禁止 pilot-only"):
+        build_input_derivatives(
+            config_path=config_path,
+            destination=destination,
+            ocm_native_root=ocm_root,
+            ocm_surface_root=surface_root,
+            nww_analysis_root=nww_root,
+            formal=True,
+            pilot_arrival_utc={"hsinchu": "2024-01-02T01:00:00Z"},
+        )
+    assert not destination.exists()
+    assert not list(root.glob(f".{destination.name}.partial-*"))
+
+
+def test_hsinchu_explicit_pilot_does_not_register_ocm_missing_00z() -> None:
+    """未登錄的 Jan 1 00Z 入口應直接拒絕，不讓 NWW 00Z 反向擴張 OCM 視窗。"""
+
+    with pytest.raises(InputDerivationError, match="只登錄 2024-01-02T01:00:00Z"):
+        input_derivation_module._parse_explicit_pilot_arrivals(
+            {"hsinchu": "2024-01-01T00:00:00Z"}
+        )
+
+
+@pytest.mark.parametrize("missing_product", ["OCM surface", "NWW3 analysis"])
+def test_explicit_pilot_rejects_middle_hour_missing_from_product_axis(missing_product: str) -> None:
+    """三產品軸只要少一個視窗中間 exact-hour，就在 spatial sampling 前 fail closed。"""
+
+    explicit = input_derivation_module._parse_explicit_pilot_arrivals(
+        {"hsinchu": "2024-01-02T01:00:00Z"}
+    )["hsinchu"]
+    window = input_derivation_module._explicit_pilot_window_times(explicit)
+    missing_index = 12
+    full_axis = SimpleNamespace(canonical=SimpleNamespace(time_utc_ns=window))
+    missing_axis = SimpleNamespace(
+        canonical=SimpleNamespace(time_utc_ns=np.delete(window, missing_index))
+    )
+    surface_product = missing_axis if missing_product == "OCM surface" else full_axis
+    nww_product = missing_axis if missing_product == "NWW3 analysis" else full_axis
+    with pytest.raises(InputDerivationError, match=f"{missing_product} exact UTC 視窗缺少逐時節點"):
+        input_derivation_module._validate_explicit_pilot_arrival_support(
+            explicit=explicit,
+            product=full_axis,
+            surface_product=surface_product,
+            nww_product=nww_product,
+            nww_cache=object(),
+            context=SimpleNamespace(),
+            expected_axis=window,
+        )
+
+
+def test_hsinchu_receptor_core_limits_positions_without_shrinking_local_domain(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> None:
+    """新竹五個水平位置受 12.5 km 核心限制，但 B 區 local 仍精確等於 flow。"""
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_input_fixture
+    result = build_input_derivatives(
+        config_path=config_path,
+        destination=root / "derived-inputs-hsinchu-core",
+        ocm_native_root=ocm_root,
+        ocm_surface_root=surface_root,
+        nww_analysis_root=nww_root,
+        formal=False,
+    )
+    receptor_payload, _ = read_canonical_json(result.paths["receptor"])
+    domain_payload, _ = read_canonical_json(result.paths["domain_geometry"])
+    local_payload, _ = read_canonical_json(result.paths["local_geometry"])
+
+    hsinchu_records = [
+        record for record in receptor_payload["records"] if record["study_site_id"] == "hsinchu"
+    ]
+    horizontal_positions = {
+        (float(record["lon"]), float(record["lat"])) for record in hsinchu_records
+    }
+    assert len(hsinchu_records) == 20
+    assert len(horizontal_positions) == 5
+
+    # 距離必須用與 runtime 相同的 B 區 AEQD 公尺投影計算；不能以 lon/lat 差換算公里。
+    projection = DomainProjection(120.45, 24.75)
+    anchor_x, anchor_y = projection.project(120.45, 24.75)
+    distances_m = []
+    for lon, lat in horizontal_positions:
+        x_m, y_m = projection.project(lon, lat)
+        distances_m.append(float(np.hypot(x_m - anchor_x, y_m - anchor_y)))
+    assert max(distances_m) <= 12_500.0 + 1.0
+
+    domain_by_region = {record["analysis_region_id"]: record for record in domain_payload["records"]}
+    local_by_site = {record["study_site_id"]: record for record in local_payload["records"]}
+    hsinchu_domain = domain_by_region["B"]
+    hsinchu_local = local_by_site["hsinchu"]
+    assert hsinchu_domain["flow_domain_id"] == "hsinchu_cache_v3"
+    assert hsinchu_local["flow_domain_id"] == "hsinchu_cache_v3"
+    assert hsinchu_local["local_equals_flow"] is True
+    assert shape(hsinchu_local["geometry"]).equals(shape(hsinchu_domain["geometry"]))
+
+
+def test_receptor_candidate_without_core_preserves_legacy_selection() -> None:
+    """未明示 core 的站點應把原 local polygon 原樣交給既有 maximin selector。"""
+
+    projection = DomainProjection(120.45, 24.75)
+    # 以 AEQD 公尺方框反投影建立 synthetic WGS84 local polygon；實際候選仍會再投影回
+    # 同一座標系，故測試可直接比較有／無 core 兩條 candidate 建立路徑。
+    local_polygon_lonlat = projection.unproject_geometry(box(-6_000.0, -6_000.0, 6_000.0, 6_000.0))
+    site_without_core = StudySiteConfig(
+        study_site_id="no_core",
+        study_site_name_zh="無核心測試站",
+        analysis_region_id="B",
+        flow_domain_id="hsinchu_cache_v3",
+    )
+    candidate_metric = input_derivation_module._receptor_candidate_polygon_metric(
+        site=site_without_core,
+        projection=projection,
+        local_polygon_lonlat=local_polygon_lonlat,
+    )
+    legacy_candidate_metric = projection.project_geometry(local_polygon_lonlat)
+    assert candidate_metric.equals_exact(legacy_candidate_metric, tolerance=1e-6)
+
+    # 用五個固定公尺位置建立最小 NativeMesh，確認 candidate polygon 未改變時，
+    # persistent-wet pool 與 deterministic maximin 的回傳受體也完全相同。
+    centers = np.asarray([[-4_000.0, 0.0], [-2_000.0, 0.0], [0.0, 0.0], [2_000.0, 0.0], [4_000.0, 0.0]])
+    node_xy = np.asarray(
+        [
+            point
+            for center in centers
+            for point in (
+                center + np.asarray([-150.0, -150.0]),
+                center + np.asarray([150.0, -150.0]),
+                center + np.asarray([0.0, 150.0]),
+            )
+        ],
+        dtype=np.float64,
+    )
+    face_nodes = np.asarray(
+        [[index, index + 1, index + 2, -1] for index in range(0, node_xy.shape[0], 3)],
+        dtype=np.int64,
+    )
+    node_lon, node_lat = projection.unproject(node_xy[:, 0], node_xy[:, 1])
+    mesh = NativeMesh(
+        node_lon=node_lon,
+        node_lat=node_lat,
+        node_xy=node_xy,
+        source_depth_m=np.full(node_xy.shape[0], 20.0),
+        source_node_bottom_index=np.zeros(node_xy.shape[0], dtype=np.int64),
+        face_nodes_local=face_nodes,
+        face_node_count=np.full(5, 3, dtype=np.int64),
+        source_face_global_index=np.arange(5, dtype=np.int64) + 100,
+    )
+    wetdry = np.zeros((50, 5), dtype=np.float64)
+    actual_pool = prepare_horizontal_receptor_candidates(
+        study_site_id="no_core",
+        mesh=mesh,
+        candidate_polygon_metric=candidate_metric,
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=wetdry,
+    )
+    legacy_pool = prepare_horizontal_receptor_candidates(
+        study_site_id="no_core",
+        mesh=mesh,
+        candidate_polygon_metric=legacy_candidate_metric,
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=wetdry,
+    )
+    assert select_horizontal_receptors_from_pool(actual_pool) == select_horizontal_receptors_from_pool(
+        legacy_pool
+    )
 
 
 def test_source_inventory_uses_structural_fingerprint_for_large_npy(

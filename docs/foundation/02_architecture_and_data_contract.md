@@ -106,7 +106,8 @@ grid；重採樣不提升有效物理解析度，圖說與 metadata 必須保留
 - `flow_domain`：forcing 支撐與最外層停止邊界；貢寮與龜山島共用同一個 A 區 domain version 及 outer boundary，以保留兩地互通的水動力背景。
 - `study_site`：情境、seed、主要 local event 與成果的第一層獨立統計單元；貢寮與龜山島可共用 flow domain 而不共用情境。
 - `local_domain`：辨識移入關注海域入口的巢狀邊界；貢寮／龜山島採 anchor 半徑 25 km 與有效海域的交集，兩者允許重疊。每條軌跡只以自己的 local domain 產生主要 first-exit，另一站 local domain 的 crossing 只屬非終止連通診斷。
-- `receptor`：終端觀測位置／小 polygon、深度及不確定性。
+- `receptor`：終端觀測位置／小 polygon、深度及不確定性；若站點明示受體核心，核心只
+  限制水平候選，不改變 flow 或 local domain。
 - `open_boundary_segment`：排除海岸後可穿越的命名邊界，用於 first crossing 與弧長密度。
 - `reporting_region`：下游彙整單元，不改變 forcing 或軌跡。
 
@@ -225,7 +226,13 @@ OCM 與 NWW3 缺值政策分開：
 
 每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、目標水柱比例、模板代表 `z_m_positive_up`、垂向誤差、`study_site_id`、`analysis_region_id`、source face、版本與生成狀態。五站點各有 20 個、全案共 100 個；貢寮與龜山島各自完整保留 20 個，不共享 ID 或在 A 區內分配。此處的 `z_m_positive_up` 只是水平受體與 `vertical_id` 模板的候選代表值，不是所有 arrival UTC 的正式實際深度。
 
-每站點 20 個受體由 5 個水平位置 × 4 個垂向層位產生。貢寮／龜山島的水平候選限於 anchor 半徑 12.5 km receptor core，其餘站點限於 flow/local domain；第一點由 anchor 或 flow-domain center snap 至 persistent-wet mesh，其餘使用固定 tie-break 的 metric maximin。垂向模板目標為海面下 `0.10H`、`0.40H`、`0.70H` 與最低有效 OCM layer 中心；每個 arrival 的正式實際 z 必須改由 dynamic pair manifest 的 OCM `eta`／`zcor`／`wetdry` 計算與驗證。
+每站點 20 個受體由 5 個水平位置 × 4 個垂向層位產生。貢寮、龜山島與新竹的水平候選
+各限於明示 anchor 半徑 12.5 km 的 receptor core，再與既有 local／static-ocean 候選區
+求交；後灣與連江等未明示核心的站點則保留原本的 flow/local 候選區。所有半徑均在站點
+所屬 flow domain 的 AEQD 公尺投影計算，不以經緯度差近似距離。第一點由 anchor 或
+flow-domain center snap 至 persistent-wet mesh，其餘使用固定 tie-break 的 metric maximin。
+垂向模板目標為海面下 `0.10H`、`0.40H`、`0.70H` 與最低有效 OCM layer 中心；每個
+arrival 的正式實際 z 必須改由 dynamic pair manifest 的 OCM `eta`／`zcor`／`wetdry` 計算與驗證。
 
 ### 7.3 Arrival-time manifest
 
