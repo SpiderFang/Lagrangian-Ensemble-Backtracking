@@ -749,10 +749,10 @@ def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> Non
         assert "今天狀態以 [實作狀態](../implementation_status.md) 為準" in archive_text
 
     local_links = _iter_local_markdown_links()
-    # 141 是目前核定 commit 中 Git 追蹤 Markdown 的固定連結基線；本機被 .gitignore
-    # 排除的 ``data/time_reconstruction_literature/README.md`` 仍可能存在，但不屬於
-    # SERVER 可部署 checkout，故不應把它計入分母。這個數字是在收斂掃描範圍後由
-    # 本機與 SERVER detached checkout 共同核對所得，避免用改數字掩蓋兩邊拓撲差異。
+    # 141 是目前核定 commit 中 Git 追蹤 Markdown 的固定連結基線；小型時間重建
+    # 文獻索引 README 已納入追蹤，工項 3 原始 PDF 則維持本機限定且不建立失效連結。
+    # 這個數字是在收斂掃描範圍並修復兩個真實斷鏈後，由本機與 SERVER detached
+    # checkout 共同核對所得，避免用改數字掩蓋兩邊拓撲差異。
     assert len(local_links) == 141
     broken_links = [
         (

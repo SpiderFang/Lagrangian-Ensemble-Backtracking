@@ -89,10 +89,11 @@ et al. (2018) 的持續嚴重缺口案例顯示，Eulerian 流場看似可接受
 - [Hernández-Carrasco et al. (2018), Impact of HF radar current gap-filling methodologies on the Lagrangian assessment of coastal dynamics](https://doi.org/10.5194/os-14-827-2018)：同時比較 Eulerian 與 trajectory、LCS、residence-time 誤差；持續嚴重缺口不可因單一 Eulerian 指標合格而自動放行。
 - [Delandmeter and van Sebille (2019), The Parcels v2.0 Lagrangian framework](https://doi.org/10.5194/gmd-12-3571-2019)：Lagrangian 計算須先在粒子位置內插 Eulerian 場，再積分粒子 ODE，支持將 forcing 重建與數值積分分層驗證。
 
-上述四篇核心文獻的 DOI、原文頁碼及紅框短摘錄備存於
-[`data/time_reconstruction_literature/`](../../data/time_reconstruction_literature/README.md)。紅框只標記本案
-實際採用的段落；本案的潮汐項、VAR 正則化、雙向 smoother、member 數與 acceptance threshold
-均為資料驅動的實作選擇，不能被誤稱為文獻直接給定的通用參數。
+上述核心文獻的 DOI 與本專案使用邊界整理於[時間缺口重建文獻索引](../../data/time_reconstruction_literature/README.md)。
+該索引不保存原文頁碼、紅框短摘錄、附件保存位置或 checksum；原始 PDF 與標註附件另行
+保管且不屬 Git 交付，若要引用紅框段落，須另行核對保存位置與 checksum。本案的潮汐項、
+VAR 正則化、雙向 smoother、member 數與 acceptance threshold 均為資料驅動的實作選擇，
+不能被誤稱為文獻直接給定的通用參數。
 
 ## 4. 正式時間處理方法版本
 

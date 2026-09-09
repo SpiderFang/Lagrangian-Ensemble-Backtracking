@@ -52,6 +52,11 @@ data/scenario_design_literature/*
 !data/results_visualization_literature/
 data/results_visualization_literature/*
 !data/results_visualization_literature/README.md
+# 時間缺口重建文獻索引同樣是小型、可稽核的文字契約；只追蹤 README，原文與標註
+# PDF 仍維持忽略，避免把授權受限或大型附件帶入程式版本。
+!data/time_reconstruction_literature/
+data/time_reconstruction_literature/*
+!data/time_reconstruction_literature/README.md
 
 # 作業系統與編輯器暫存檔。
 .DS_Store
