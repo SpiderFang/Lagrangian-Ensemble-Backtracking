@@ -138,7 +138,7 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 正式執行所需根目錄由環境變數或 CLI 參數注入，例如 `OCM_NATIVE_ROOT`、`OCM_SURFACE_ROOT`、`NWW_ANALYSIS_ROOT`、`LBT_OUTPUT_ROOT`、`LBT_SCRATCH_ROOT` 與 `LBT_CHECKPOINT_ROOT`。SERVER 的結果儲存契約固定以 `/data/LBT` 為單一 `LBT_RESULT_NFS_ROOT`；execution package、run workspace、checkpoint、scratch、log、aggregate、report、視覺化成果與 UV／Matplotlib／XDG／temporary cache 都必須位於該 NFS mount 的嚴格子目錄。`/home` 只保留已追蹤的主專案功能模組、乾淨 checkout 與既有 `.venv`。tracked SERVER runner 會在任何 batch 寫入前檢查路徑、mount identity、剩餘空間、寫入、原子改名與跨程序鎖，失敗即停止。實際資料依序執行唯讀 `preflight` → strict `inputs-build`／`inputs-validate` → release 設定來源綁定 → `run-create` → `run-shard`／checkpoint resume → `run-reconcile` → `validate-run` → aggregate／report validator；完整參數與外置 checkpoint root 規則見[CLI 參考](docs/operations/cli_reference.md)，容量、鎖、部署與資料同步見[SERVER 執行手冊](docs/operations/06_server_runbook_plan.md)及[Git 部署與資料同步手冊](docs/operations/git_deployment_and_data_sync.md)。
 
-本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次 storage gate 與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
+本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
 

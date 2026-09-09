@@ -110,7 +110,11 @@ def _iter_local_markdown_links() -> list[tuple[Path, str, Path]]:
 
     links: list[tuple[Path, str, Path]] = []
     for source_path in sorted(PROJECT_ROOT.rglob("*.md")):
-        if any(part in NON_DELIVERABLE_MARKDOWN_DIRECTORIES for part in source_path.parts):
+        # 只以 checkout 內的相對路徑判斷執行產物目錄；SERVER checkout 常位於
+        # ``/home/mustlab/work/...``，若直接檢查絕對路徑的 parts，外層部署目錄
+        # ``work`` 會誤排除整個 repository，令連結數從 142 變成 0。
+        relative_parts = source_path.relative_to(PROJECT_ROOT).parts
+        if any(part in NON_DELIVERABLE_MARKDOWN_DIRECTORIES for part in relative_parts):
             continue
         contents = source_path.read_text(encoding="utf-8")
         for match in MARKDOWN_LINK_PATTERN.finditer(contents):
