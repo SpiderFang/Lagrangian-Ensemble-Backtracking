@@ -533,10 +533,19 @@ def test_preview_rebuild_command_uses_verified_cache_environment() -> None:
         assert variable in source
 
 
-def test_real_cli_rejects_non_nfs_without_writing_path(tmp_path: Path) -> None:
-    """真實 CLI 在非 NFS 測試目錄只失敗，不要求測試環境提供 NFS。"""
+def test_real_cli_rejects_escaped_output_without_writing_path(tmp_path: Path) -> None:
+    """真實 CLI 拒絕離開 result root 的輸出，且不洩漏測試絕對路徑。
+
+    SERVER 的 pytest 暫存根也依儲存政策放在 NFS，因此不能假設 ``tmp_path`` 位於
+    非 NFS。這裡把 output 指到同一實體檔案系統、但位於邏輯 result root 外的既有
+    目錄；無論測試由本機磁碟或 SERVER NFS 執行，都應穩定命中 strict-descendant
+    gate，同時不必為了製造反例而在 SERVER ``/home`` 或 ``/tmp`` 建立測試資料。
+    """
 
     layout = _layout(tmp_path)
+    escaped_output = layout["project_root"] / "escaped-output"
+    escaped_output.mkdir()
+    layout["output_root"] = escaped_output
     arguments = [
         "python3",
         str(SCRIPT_PATH),
@@ -555,4 +564,7 @@ def test_real_cli_rejects_non_nfs_without_writing_path(tmp_path: Path) -> None:
     assert completed.returncode == 2
     snapshot = json.loads(completed.stdout)
     assert snapshot["gate_status"] == "FAIL"
+    assert {issue["code"] for issue in snapshot["issues"]} >= {
+        "output_root_outside_result_root"
+    }
     assert str(tmp_path) not in completed.stdout
