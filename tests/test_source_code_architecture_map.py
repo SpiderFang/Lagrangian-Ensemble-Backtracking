@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -99,9 +100,49 @@ def _load_architecture_map_module() -> ModuleType:
     return module
 
 
+def _iter_tracked_markdown_paths() -> tuple[Path, ...]:
+    """取得目前 checkout 中 Git 索引所追蹤且實際存在的 Markdown 檔案。
+
+    本機可能保留未納入部署的文獻快取或其他忽略資料；直接以 ``rglob`` 掃描會把
+    這些檔案誤算進文件拓撲，造成與 SERVER 乾淨或 detached checkout 不同的連結數。
+    透過 ``git ls-files --cached`` 讀取索引，測試因此只涵蓋可由核定 checkout 部署的
+    追蹤檔案。若執行環境不是完整 Git checkout，明確拋出含 repository 根目錄的錯誤，
+    讓部署問題不會被誤判成連結數差異。
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "ls-files", "--cached", "-z", "--", "*.md"],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            f"無法從 Git checkout 取得追蹤 Markdown：{PROJECT_ROOT}；"
+            "請確認 SERVER 使用完整 detached checkout 且 git 可執行。"
+        ) from exc
+
+    paths: list[Path] = []
+    for raw_path in completed.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        relative_path = Path(raw_path.decode("utf-8"))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise RuntimeError(f"Git 回傳不合法的 Markdown 相對路徑：{relative_path}")
+        source_path = PROJECT_ROOT / relative_path
+        if not source_path.is_file():
+            raise RuntimeError(
+                f"Git 追蹤的 Markdown 在 checkout 中不存在：{relative_path}；"
+                "請重新同步完整 commit。"
+            )
+        paths.append(source_path)
+    return tuple(sorted(paths))
+
+
 def _iter_local_markdown_links() -> list[tuple[Path, str, Path]]:
     """列出全 repository Markdown 中的本地連結及其解析後目標。
 
+    來源限定為 Git 索引中的追蹤 Markdown，避免本機忽略的資料快取改變驗收分母。
     掃描以連結所在 Markdown 檔案的父目錄為基準，這樣文件搬移後的 ``../`` 層級會
     直接受到測試約束。外部 DOI、網頁與電子郵件連結不屬於本地檔案拓撲，因此排除；
     只有去除片段識別碼後的實際路徑會交由呼叫端檢查是否存在。回傳原始檔、原始目標
@@ -109,7 +150,7 @@ def _iter_local_markdown_links() -> list[tuple[Path, str, Path]]:
     """
 
     links: list[tuple[Path, str, Path]] = []
-    for source_path in sorted(PROJECT_ROOT.rglob("*.md")):
+    for source_path in _iter_tracked_markdown_paths():
         # 只以 checkout 內的相對路徑判斷執行產物目錄；SERVER checkout 常位於
         # ``/home/mustlab/work/...``，若直接檢查絕對路徑的 parts，外層部署目錄
         # ``work`` 會誤排除整個 repository，令連結數從 142 變成 0。
@@ -708,7 +749,11 @@ def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> Non
         assert "今天狀態以 [實作狀態](../implementation_status.md) 為準" in archive_text
 
     local_links = _iter_local_markdown_links()
-    assert len(local_links) == 142
+    # 141 是目前核定 commit 中 Git 追蹤 Markdown 的固定連結基線；本機被 .gitignore
+    # 排除的 ``data/time_reconstruction_literature/README.md`` 仍可能存在，但不屬於
+    # SERVER 可部署 checkout，故不應把它計入分母。這個數字是在收斂掃描範圍後由
+    # 本機與 SERVER detached checkout 共同核對所得，避免用改數字掩蓋兩邊拓撲差異。
+    assert len(local_links) == 141
     broken_links = [
         (
             source_path.relative_to(PROJECT_ROOT).as_posix(),
