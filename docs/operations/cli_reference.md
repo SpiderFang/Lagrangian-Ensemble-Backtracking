@@ -21,7 +21,7 @@
 | pilot | `pilot-calibrate`、`pilot-calibrate-validate`、`pilot-calibration-build`、`pilot-calibration-validate`、`pilot-config-create`、`pilot-config-validate` |
 | 工程驗證 | `behavior-manifest`、`synthetic-smoke`、`validate-shard`、`code-provenance`、`validate-run`、`benchmark-report` |
 | run lifecycle | `run-create`、`run-shard`、`run-reconcile` |
-| 聚合／報告 | `aggregate-spec-create`、`aggregate-build`、`aggregate-validate`、`report-spec-create`、`report-validate` |
+| 聚合／報告 | `aggregate-spec-create`、`aggregate-build`、`aggregate-validate`、`report-spec-create`、`report-validate`、`source-pathway-build`、`source-pathway-validate` |
 
 `report-build` 尚未註冊；不要用不存在的命令替代目前的 report preflight、aggregate 或
 release validator。
@@ -30,17 +30,31 @@ release validator。
 
 ```text
 LBT_PROJECT_ROOT=/path/to/Lagrangian-Ensemble-Backtracking
+LBT_RESULT_NFS_ROOT=/data/LBT
+LBT_EXECUTION_PACKAGE_ROOT=/data/LBT/execution-packages/<package-id>
 LBT_OUTPUT_ROOT=/path/to/new/output-parent
 LBT_SCRATCH_ROOT=/path/to/existing/scratch-parent
+LBT_CHECKPOINT_ROOT=/path/to/checkpoints
+LBT_UV_CACHE_ROOT=/data/LBT/cache/uv
+LBT_MPL_CACHE_ROOT=/data/LBT/cache/matplotlib
+LBT_XDG_CACHE_ROOT=/data/LBT/cache/xdg
+LBT_TMP_ROOT=/data/LBT/tmp
 OCM_NATIVE_ROOT=/path/to/accepted/ocm_native
 OCM_SURFACE_ROOT=/path/to/accepted/ocm_surface
 NWW_ANALYSIS_ROOT=/path/to/accepted/nww3_analysis
-LBT_CHECKPOINT_ROOT=/path/to/checkpoints
 ```
 
 正式 forcing 只能是已驗收的 OCM schema 3 `ocm_native`／`ocm_surface` 與 NWW3 schema 1
 `nww3_analysis`。root 可由命令列明示；省略時只讀 config 指定的環境變數，不猜測目前
 工作目錄或 SERVER 路徑。`LBT_SCRATCH_ROOT` 應已存在，以下 final child 必須尚不存在。
+
+SERVER 的部署契約另要求以 `/data/LBT` 作為單一 `LBT_RESULT_NFS_ROOT`：執行 package、output、scratch、
+checkpoint、UV／Matplotlib／XDG cache 與 temporary root 都必須是該 NFS mount 的既有嚴格
+子目錄，且 output、scratch、checkpoint 不得互相包含。專案 checkout 與既有 `.venv` 可
+留在 `/home`；正式執行必須由 tracked
+`scripts/run_b_hsinchu_expanded_matrix.sh`（後續區域採同一 gate）先驗證路徑、NFS mount、
+剩餘空間、寫入、原子改名與跨程序鎖，再進入 execution package。一般可攜 CLI 不會自行
+假設 SERVER mount，因此不得繞過這個入口直接啟動 SERVER batch。
 
 ## 設定與輸入衍生
 
@@ -212,6 +226,48 @@ uv run lbt report-validate "$LBT_OUTPUT_ROOT/<run_id>.report-v1"
 正式 trajectory gate 保留 v2 的既有位置／環境報告用途並支援 v3 速度欄位；v1 不得當正式
 垂向 evidence，v2／v3 混用的 run 保守拒絕。主線 `report-build` 尚未存在，不能以
 `report-validate` 的通過宣稱報告建置或正式科學發布完成。
+
+### 向下沉降來源路徑圖成果包
+
+`source-pathway-build` 是獨立於 F01–F12／T01–T06 registry 的 `source-pathway-v1` 產品
+入口。它只接受已通過 `aggregate-validate` 的 aggregate release、同一
+`AggregateSpec` canonical hash 的 `ReportSpec`，並在 build 前拒絕任何
+`settling_velocity_mps >= 0` 的 scenario。它不讀取 trajectory shard，也不重算統計分母；
+統計直接沿用 `build_report_statistics` 的訪格、首次通過年齡、停留時間、KDE/HDR、邊界與
+停止／QC products。
+
+```bash
+mkdir -p "$LBT_SCRATCH_ROOT/mplconfig-source-pathway"
+
+uv run lbt source-pathway-build \
+  --aggregate-release "$LBT_OUTPUT_ROOT/<run_id>.aggregate-v1" \
+  --report-spec "$LBT_OUTPUT_ROOT/<run_id>.report-spec.json" \
+  --destination "$LBT_OUTPUT_ROOT/<run_id>.source-pathway-v1" \
+  --mplconfigdir "$LBT_SCRATCH_ROOT/mplconfig-source-pathway"
+
+uv run lbt source-pathway-validate \
+  "$LBT_OUTPUT_ROOT/<run_id>.source-pathway-v1"
+```
+
+`--mplconfigdir` 必須是 caller 事先建立的絕對、可寫、非 symbolic link 目錄；destination
+必須是尚不存在且以 `.source-pathway-v1` 結尾的新 final。每站輸出 `figure.png`、
+`figure.svg`、`figure.pdf`、`grid.parquet`、`boundary.parquet`、`outcomes.parquet` 與
+`caption.json`，根目錄另有 README 與 schema 1.0.0 manifest。manifest 保存材料／沉降速度、
+vertical／arrival、scenario strata、pooled 分母語意、aggregate release manifest SHA-256、
+所有輸出 size／SHA-256；validator 不洩漏絕對路徑。
+
+圖面 A／B 成對呈現每粒子每格一次的訪格比例與首次通過年齡，D 分開呈現保留重複迴游的
+每成員停留時數；沒有樣本的格留白，低樣本格以斜線標示。`bed_first_contact_count` 與
+`bed_repeated_contact_count` 是逆向粒子的底床邊界接觸診斷，不能當沉積質量／濃度；
+`BED_DEPOSITED`、`DATA_GAP`、`NUMERICAL_FAILURE`、outer／MAX_AGE 等停止結果在 F 面板與
+outcomes sidecar 保留。pooled 結果按已執行成員數加權，條件於本次情境設計與有效成員，
+不推論材料自然比例或絕對來源機率。
+C 面板的逆向 `local_first_exit` 在條件式解讀下對應正向潛在移入入口，E 面板呈現潛在
+移入邊界區段；兩者都是邊界事件診斷，不能直接稱為確定來源。
+
+合成工程 round-trip、available／低樣本 KDE、小型 1×N 格網、零／正沉降防線與 tamper
+hash 測試位於 `tests/test_source_pathway_release.py`；測試產生的 PNG 可另以 `view_image`
+進行圖面 QA，但不代表正式 OCM／NWW3 科學成果。
 
 ## Python API 與相關 runbook
 

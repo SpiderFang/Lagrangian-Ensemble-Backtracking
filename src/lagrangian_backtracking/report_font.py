@@ -101,16 +101,48 @@ _PLANNED_SCIENTIFIC_ZH_TW_TEXT: Final[tuple[str, ...]] = (
     "正式",
     "合成工程證據",
     "圖表附錄",
+    # source-pathway-v1 六面板圖的可見標題與品質標註；先在字型 gate 登錄，
+    # 才能讓正式 renderer 在真正寫檔前拒絕缺少這些新增字元的字型。
+    "向下沉降粒子移入關注海域",
+    "訪格比例",
+    "中位首次通過年齡",
+    "局部邊界首次離開端點",
+    "每有效成員停留時數",
+    "原始計數",
+    "品質檢查",
+    "斜線",
+    "無樣本",
+    "低樣本",
+    "底床邊界接觸診斷",
+    # source-pathway-v1 renderer 的 colorbar、軸標籤與狀態註記；這些是實際會
+    # 出現在 PNG／SVG／PDF 圖面的字串，不能只依賴一般報告文字的間接涵蓋。
+    "格網內相對權重",
+    "小時／成員",
+    "空白",
+    "KDE 狀態",
+    "格網內累積權重輪廓",
+    "原始樣本",
+    "局部類別內相對比例",
+    "局部邊界分段／弧長分箱",
+    "停止原始計數",
+    "總成員分母比例",
+    "紅線",
+    "等值線",
+    "完整保留",
+    "HDR 50／75／90%",
+    "1×N 不繪輪廓",
+    "遮罩見 sidecar",
+    "失敗與截尾皆納入分母",
+    "潛在移入入口",
+    "逆向首次離開",
+    "潛在移入邊界區段",
 )
 
 # 正式圖表會使用面板／表格識別碼、英文縮寫、ASCII 數值與常用單位／數學符號；
 # 明確登錄大小寫、數字及符號可避免 renderer 在特定平台才首次觸發缺 glyph。
 _PLANNED_ASCII_AND_SYMBOL_GLYPHS: Final[str] = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "abcdefghijklmnopqrstuvwxyz"
-    "0123456789"
-    "%()[]-–—_/,.:;=+×≤≥°²μ"
-    "\u0020\u2212"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789%()[]-–—_/,.:;=+×≤≥<>°²μ"
+    "\u0020\u2212（）：；，｜／"
 )
 
 # 以 frozenset 封存 Unicode code point inventory，防止 caller 改寫必要字元；

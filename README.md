@@ -16,6 +16,7 @@
 | 物理與軌跡 | 正向物理速度、signed-time RK4、獨立擴散、巢狀邊界、trajectory shard 與事件 | 解析解、時步／成員收斂、真實敏感度與獨立觀測驗證 |
 | 續跑與產品 | `execution checkpoint`、亂數延續、固定格式、checksum、聚合統計基礎 | 發佈整合、真實敏感度與正式驗證證據 |
 | 報告與部署 | 報告前置唯讀檢核、統計介面、pilot／synthetic workspace | 主線報告建立、完整報告渲染與正式 SERVER 科學發布 |
+| 向下沉降來源路徑圖 | `source-pathway-v1` 六面板圖、grid／boundary／outcomes sidecar、manifest／checksum validator | 真實五站科學解讀仍須 formal aggregate、收斂與獨立驗證；成果不是完整 report-v1 |
 
 工程測試、pilot 與 synthetic 只證明可重現的介面或計算契約；它們不等於全期真資料研究或正式科學成果。
 
@@ -98,13 +99,46 @@ uv run lbt validate-shard "$LBT_SMOKE_PARENT/synthetic-smoke-v1"
 
 `synthetic-smoke` 只驗證 CLI、engine、trajectory I/O、Parquet、manifest 與 checksum；其 metadata 會標示非科學結果，不能替代已驗收 OCM／NWW3 或正式驗證。
 
+### 4.1 向下沉降來源路徑圖成果包
+
+`source-pathway-build` 讀取已驗證 aggregate release 與同一 `AggregateSpec` hash 的
+`ReportSpec`，只納入 `settling_velocity_mps < 0` 的情境。每站產生 300 dpi PNG／SVG／PDF
+六面板圖：訪格比例、首次通過年齡、local first-exit KDE／raw count、每有效成員停留時數、
+local boundary 弧長與完整停止／QC 結果；同時保存 `grid.parquet`、`boundary.parquet`、
+`outcomes.parquet`、caption 與含 aggregate manifest SHA-256 的 `manifest.json`。
+其中 C 的逆向 `local_first_exit` 在條件式解讀下對應正向潛在移入入口，E 呈現潛在移入
+邊界區段；兩者都是邊界事件診斷，不能直接稱為確定來源。
+
+圖面與 sidecar 的 pooled 結果是按本次已執行成員數加權、條件於情境設計與有效成員的
+「條件式來源足跡／相對來源權重」，不推論材料自然比例、絕對來源機率、沉積質量或沉積濃度。
+訪格每粒子每格只計首次訪問；停留時間保留重複迴游，兩者分圖。無樣本格留白，低樣本格以
+斜線標示；`bed_first_contact_count` 與 `bed_repeated_contact_count` 是底床邊界接觸診斷，
+不能解讀為沉積量。
+
+```bash
+uv run lbt source-pathway-build \
+  --aggregate-release "$LBT_OUTPUT_ROOT/<run_id>.aggregate-v1" \
+  --report-spec "$LBT_OUTPUT_ROOT/<run_id>.report-spec.json" \
+  --destination "$LBT_OUTPUT_ROOT/<run_id>.source-pathway-v1" \
+  --mplconfigdir "$LBT_SCRATCH_ROOT/mplconfig-source-pathway"
+
+uv run lbt source-pathway-validate \
+  "$LBT_OUTPUT_ROOT/<run_id>.source-pathway-v1"
+```
+
+`--mplconfigdir` 必須是 caller 先建立的絕對、可寫、非 symbolic link 目錄；source
+pathway writer 不覆寫既有 final。可用 `tests/test_source_pathway_release.py` 的四個
+synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metadata 與 tamper
+檢查；測試建立的 PNG 可直接以 `view_image` 檢查版面，但 synthetic fixture 不代表正式
+五站研究成果。
+
 若只要檢查速度契約，可閱讀 `tests/test_velocity_recording.py`；若要檢查舊 checkpoint 的讀取與亂數延續，閱讀 `tests/test_checkpoint_execution.py`。這些測試刻意不執行真實模型、不下載資料，也不修改既有 pilot 結果。
 
 ## 5. 實際資料與 SERVER 使用入口
 
-正式執行所需根目錄由環境變數或 CLI 參數注入，例如 `OCM_NATIVE_ROOT`、`OCM_SURFACE_ROOT`、`NWW_ANALYSIS_ROOT`、`LBT_OUTPUT_ROOT`、`LBT_SCRATCH_ROOT` 與 `LBT_CHECKPOINT_ROOT`；本專案不在程式或文件硬編碼私有 SERVER 路徑。實際資料依序執行唯讀 `preflight` → strict `inputs-build`／`inputs-validate` → release 設定來源綁定 → `run-create` → `run-shard`／checkpoint resume → `run-reconcile` → `validate-run` → aggregate／report validator；完整參數與外置 checkpoint root 規則見[CLI 參考](docs/operations/cli_reference.md)，容量、鎖、部署與資料同步見[SERVER 執行手冊](docs/operations/06_server_runbook_plan.md)及[Git 部署與資料同步手冊](docs/operations/git_deployment_and_data_sync.md)。
+正式執行所需根目錄由環境變數或 CLI 參數注入，例如 `OCM_NATIVE_ROOT`、`OCM_SURFACE_ROOT`、`NWW_ANALYSIS_ROOT`、`LBT_OUTPUT_ROOT`、`LBT_SCRATCH_ROOT` 與 `LBT_CHECKPOINT_ROOT`。SERVER 的結果儲存契約固定以 `/data/LBT` 為單一 `LBT_RESULT_NFS_ROOT`；execution package、run workspace、checkpoint、scratch、log、aggregate、report、視覺化成果與 UV／Matplotlib／XDG／temporary cache 都必須位於該 NFS mount 的嚴格子目錄。`/home` 只保留已追蹤的主專案功能模組、乾淨 checkout 與既有 `.venv`。tracked SERVER runner 會在任何 batch 寫入前檢查路徑、mount identity、剩餘空間、寫入、原子改名與跨程序鎖，失敗即停止。實際資料依序執行唯讀 `preflight` → strict `inputs-build`／`inputs-validate` → release 設定來源綁定 → `run-create` → `run-shard`／checkpoint resume → `run-reconcile` → `validate-run` → aggregate／report validator；完整參數與外置 checkpoint root 規則見[CLI 參考](docs/operations/cli_reference.md)，容量、鎖、部署與資料同步見[SERVER 執行手冊](docs/operations/06_server_runbook_plan.md)及[Git 部署與資料同步手冊](docs/operations/git_deployment_and_data_sync.md)。
 
-本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git、上游大型資料、執行工作區、trajectory、checkpoint、scratch 與發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次 preflight 前，不啟動五站 `50,000×M` 正式 batch。
+本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次 storage gate 與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
 

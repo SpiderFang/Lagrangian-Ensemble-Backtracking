@@ -34,10 +34,7 @@ class _FakeFT2Font:
     def get_charmap(self) -> dict[int, int]:
         """回傳與 FreeType ``get_charmap`` 相同語意的 code point mapping。"""
 
-        return {
-            codepoint: index
-            for index, codepoint in enumerate(self.charmaps_by_filename[self.filename])
-        }
+        return {codepoint: index for index, codepoint in enumerate(self.charmaps_by_filename[self.filename])}
 
 
 def _patch_fake_fonts(
@@ -56,10 +53,7 @@ def _patch_fake_fonts(
         calls.append((family, fallback_to_default))
         return str(paths_by_family[family])
 
-    charmaps = {
-        filename: {ord(glyph) for glyph in glyphs}
-        for filename, glyphs in glyphs_by_filename.items()
-    }
+    charmaps = {filename: {ord(glyph) for glyph in glyphs} for filename, glyphs in glyphs_by_filename.items()}
     _FakeFT2Font.charmaps_by_filename = charmaps
     _FakeFT2Font.opened_filenames = []
     monkeypatch.setattr(report_font.font_manager, "findfont", fake_findfont)
@@ -134,11 +128,42 @@ def test_constants_are_fixed_and_required_text_is_covered() -> None:
         "正式",
         "合成工程證據",
         "圖表附錄",
+        "向下沉降粒子移入關注海域",
+        "訪格比例",
+        "中位首次通過年齡",
+        "局部邊界首次離開端點",
+        "每有效成員停留時數",
+        "原始計數",
+        "品質檢查",
+        "斜線",
+        "無樣本",
+        "低樣本",
+        "底床邊界接觸診斷",
+        "格網內相對權重",
+        "小時／成員",
+        "空白",
+        "KDE 狀態",
+        "格網內累積權重輪廓",
+        "原始樣本",
+        "局部類別內相對比例",
+        "局部邊界分段／弧長分箱",
+        "停止原始計數",
+        "總成員分母比例",
+        "紅線",
+        "等值線",
+        "完整保留",
+        "HDR 50／75／90%",
+        "1×N 不繪輪廓",
+        "遮罩見 sidecar",
+        "失敗與截尾皆納入分母",
+        "潛在移入入口",
+        "逆向首次離開",
+        "潛在移入邊界區段",
     )
     for phrase in required_phrases:
         assert set(phrase) <= report_font.REQUIRED_REPORT_GLYPHS
     assert set(string.ascii_letters + string.digits) <= report_font.REQUIRED_REPORT_GLYPHS
-    assert set("%()[]-–—_/,.:;=+×≤≥°²μ") <= report_font.REQUIRED_REPORT_GLYPHS
+    assert set("%()[]-–—_/,.:;=+×≤≥<>°²μ（）：；，｜／") <= report_font.REQUIRED_REPORT_GLYPHS
     assert "\u0020" in report_font.REQUIRED_REPORT_GLYPHS
     assert "\u2212" in report_font.REQUIRED_REPORT_GLYPHS
 

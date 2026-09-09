@@ -85,6 +85,10 @@ from .runtime import (
     open_run_controller,
 )
 from .scenarios import BASELINE_BEHAVIORS, records_as_dicts
+from .source_pathway_release import (
+    build_source_pathway_release,
+    validate_source_pathway_release,
+)
 
 
 def _config_check_parser() -> argparse.ArgumentParser:
@@ -485,6 +489,36 @@ def _report_validate_parser() -> argparse.ArgumentParser:
     """
 
     parser = argparse.ArgumentParser(description="驗證 final report-v1 release")
+    parser.add_argument("release", type=Path)
+    return parser
+
+
+def _source_pathway_build_parser() -> argparse.ArgumentParser:
+    """建立向下沉降 source-pathway-v1 圖與 sidecar 的 parser。
+
+    本命令只接受已驗證 aggregate release 與同一 AggregateSpec hash 的 ReportSpec；
+    ``--mplconfigdir`` 是明示的既有 Matplotlib cache 目錄，style／繁中字型 gate
+    會在真正 import pyplot 前執行。成果包是獨立於完整 report-v1 F/T registry 的
+    條件式來源足跡產品，不讀取 trajectory shard，也不納入零沉降材質。
+    """
+
+    parser = argparse.ArgumentParser(description="建立向下沉降粒子 source-pathway-v1 圖與 sidecar")
+    parser.add_argument("--aggregate-release", required=True, type=Path)
+    parser.add_argument("--report-spec", required=True, type=Path)
+    parser.add_argument("--destination", required=True, type=Path)
+    parser.add_argument(
+        "--mplconfigdir",
+        required=True,
+        type=Path,
+        help="既有、可寫、非 symbolic link 的絕對 Matplotlib cache 目錄",
+    )
+    return parser
+
+
+def _source_pathway_validate_parser() -> argparse.ArgumentParser:
+    """建立 source-pathway-v1 唯讀 validator parser。"""
+
+    parser = argparse.ArgumentParser(description="驗證 source-pathway-v1 成果包")
     parser.add_argument("release", type=Path)
     return parser
 
@@ -1574,6 +1608,55 @@ def run_report_validate(argv: Sequence[str] | None = None) -> int:
     return 0 if isinstance(report, Mapping) and report.get("valid") is True else 2
 
 
+def run_source_pathway_build(argv: Sequence[str] | None = None) -> int:
+    """建立並驗證向下沉降 source-pathway-v1 成果包。
+
+    handler 不把 absolute source／destination 寫入 stdout；成功摘要只回傳 final
+    basename、validator summary 與 ``valid``。任何零／正沉降 scenario、來源 hash
+    錯配或 renderer gate 失敗都由 build API fail closed；低樣本則保留 raw count，
+    並在 sidecar／圖面明示 zero 或 below-minimum 狀態。
+    """
+
+    args = _source_pathway_build_parser().parse_args(argv)
+    try:
+        release_path = build_source_pathway_release(
+            aggregate_release=args.aggregate_release,
+            report_spec=args.report_spec,
+            destination=args.destination,
+            mplconfigdir=args.mplconfigdir,
+        )
+        report = validate_source_pathway_release(release_path)
+        if not isinstance(report, Mapping) or report.get("valid") is not True:
+            raise ValueError("source pathway validator 未通過")
+        summary = report.get("summary")
+        if not isinstance(summary, Mapping):
+            raise ValueError("source pathway validator summary 必須是 mapping")
+        print(
+            json.dumps(
+                {"release_name": release_path.name, "valid": True, "summary": dict(summary)},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    except RuntimeError as error:
+        if str(error) == "source pathway 已發布但 parent durability 未確認":
+            raise
+        raise ValueError("source pathway build 失敗") from None
+    except Exception:
+        raise ValueError("source pathway build 失敗") from None
+
+
+def run_source_pathway_validate(argv: Sequence[str] | None = None) -> int:
+    """原樣輸出 source-pathway-v1 validator 的 JSON-safe 報告。"""
+
+    args = _source_pathway_validate_parser().parse_args(argv)
+    report = validate_source_pathway_release(args.release)
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if isinstance(report, Mapping) and report.get("valid") is True else 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """整合 ``lbt`` 子命令；未知命令由 argparse 以狀態 2 拒絕。"""
 
@@ -1658,6 +1741,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         parents=[_report_validate_parser()],
         add_help=False,
     )
+    subparsers.add_parser(
+        "source-pathway-build",
+        parents=[_source_pathway_build_parser()],
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "source-pathway-validate",
+        parents=[_source_pathway_validate_parser()],
+        add_help=False,
+    )
     parsed, remainder = parser.parse_known_args(argv)
     # 重新交給共用 handler 解析完整參數，確保獨立與整合 entry point 行為一致。
     command_argv = list(argv if argv is not None else sys.argv[1:])[1:]
@@ -1709,6 +1802,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_report_spec_create(command_argv)
     if parsed.command == "report-validate":
         return run_report_validate(command_argv)
+    if parsed.command == "source-pathway-build":
+        return run_source_pathway_build(command_argv)
+    if parsed.command == "source-pathway-validate":
+        return run_source_pathway_validate(command_argv)
     parser.error(f"未知命令：{parsed.command}; 其餘參數={remainder}")
     return 2
 

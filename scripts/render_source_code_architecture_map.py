@@ -135,6 +135,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "report_font",
             "report_style",
             "report_render",
+            "source_pathway_release",
             "report_validation_evidence",
         ),
     },
@@ -804,6 +805,26 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "不能推定正式報告完成。"
         ),
     },
+    "source_pathway_release": {
+        "role": "向下沉降粒子條件式來源足跡的六面板圖與獨立成果包",
+        "inputs": (
+            "已驗證 aggregate release、同一 AggregateSpec hash 的 ReportSpec 與明示 MPLCONFIGDIR"
+        ),
+        "outputs": (
+            "source-pathway-v1：每站 PNG／SVG／PDF、grid／boundary／outcomes sidecar、caption、"
+            "manifest 與 checksum"
+        ),
+        "entrypoints": [
+            "build_source_pathway_release",
+            "read_source_pathway_release",
+            "validate_source_pathway_release",
+        ],
+        "read_first": (
+            "只接受 settling_velocity_mps < 0；統計沿用 build_report_statistics，訪格一次計數、"
+            "首次通過年齡、停留時間、入口 KDE/HDR、邊界弧長與完整停止／QC 分開呈現。成果是"
+            "條件式來源足跡／相對來源權重，不是絕對來源機率、沉積質量或完整 F01–F12/T01–T06 report-v1。"
+        ),
+    },
     "report_validation_evidence": {
         "role": "F12/T06 定量 evidence schema/I/O 已完成；正式科學 evidence 尚未產生",
         "inputs": (
@@ -1119,6 +1140,10 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "report_style", "target": "report_render", "label": "style／font provenance"},
     {"source": "report_records", "target": "report_render", "label": "record／product contract"},
     {"source": "report_statistics", "target": "report_render", "label": "typed report products"},
+    {"source": "aggregate_release", "target": "source_pathway_release", "label": "validated aggregate／manifest hash"},
+    {"source": "report_spec", "target": "source_pathway_release", "label": "ReportSpec／metric policy"},
+    {"source": "report_statistics", "target": "source_pathway_release", "label": "pathway／KDE／outcome products"},
+    {"source": "report_style", "target": "source_pathway_release", "label": "CJK style／MPLCONFIGDIR gate"},
     {"source": "report_render", "target": "report_release", "label": "staged artifacts"},
     {"source": "run_validation", "target": "report_pipeline", "label": "complete run／trajectory schema gate"},
     {"source": "aggregate_release", "target": "report_pipeline", "label": "aggregate release identity"},

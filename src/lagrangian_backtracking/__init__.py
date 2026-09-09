@@ -261,6 +261,13 @@ from .runtime import (
     open_run_controller,
 )
 from .scenarios import ReceptorArrivalInitialCondition
+from .source_pathway_release import (
+    SOURCE_PATHWAY_FINAL_SUFFIX,
+    SOURCE_PATHWAY_RELEASE_SCHEMA_VERSION,
+    build_source_pathway_release,
+    read_source_pathway_release,
+    validate_source_pathway_release,
+)
 
 __all__ = [
     "AGGREGATE_RELEASE_SCHEMA_VERSION",
@@ -352,6 +359,8 @@ __all__ = [
     "ReportSpec",
     "ReportStagingRenderer",
     "ReportStatistics",
+    "SOURCE_PATHWAY_FINAL_SUFFIX",
+    "SOURCE_PATHWAY_RELEASE_SCHEMA_VERSION",
     "ReceptorArrivalInitialCondition",
     "RunController",
     "RunExecutionSummary",
@@ -388,6 +397,7 @@ __all__ = [
     "build_report_comparison_statistics",
     "preflight_report_build",
     "build_report_statistics",
+    "build_source_pathway_release",
     "build_source_receptor_statistics",
     "build_trajectory_stream_statistics",
     "brownian_displacement",
@@ -428,6 +438,7 @@ __all__ = [
     "read_pilot_calibration",
     "read_report_registry",
     "read_report_release",
+    "read_source_pathway_release",
     "report_render_style_context",
     "run_particle",
     "run_production_shard",
@@ -441,6 +452,7 @@ __all__ = [
     "validate_aggregate_release",
     "validate_aggregate_spec_against_boundaries",
     "validate_report_release",
+    "validate_source_pathway_release",
     "validate_report_spec_against_aggregate_spec",
     "validate_validation_evidence",
     "validate_run",

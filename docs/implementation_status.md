@@ -50,6 +50,12 @@
 - `report_render.py` 的共同 staging、固定格式、canonical sidecar、bytes／SHA-256 與 immutable staging view 已有契約，但不是完整報告建置器。
 - `report_validation_evidence.py` 已有 schema `1.0.0` 的 immutable `ValidationMetric`／`ValidationEvidence` 及 strict canonical JSON I/O；schema／I/O 通過不表示正式測試已執行。
 - `report_pipeline.py` 的建置前唯讀 gate 會驗證 complete run、aggregate／spec binding、MPLCONFIGDIR、output／evidence policy 與 formal trajectory schema。正式可消費的 trajectory 版本是 v2 或 v3，會回報實際 manifest version；v1 明確拒絕正式垂向證據，v2／v3 混用也拒絕。
+- `source_pathway_release.py` 提供獨立 `source-pathway-v1` build／validate：由已驗證 aggregate
+  與 ReportSpec 建立向下沉降情境的每站六面板圖、三張 Parquet sidecar、caption 與 manifest。
+  它沿用 `build_report_statistics` 的訪格／first-passage／停留／KDE／停止統計，保存
+  `bed_first_contact_count`／`bed_repeated_contact_count` 的底床接觸診斷，並以
+  `aggregate_manifest_sha256` 綁定來源 release；這是條件式來源足跡工程產品，不加入完整
+  F01–F12／T01–T06 registry，也不宣稱沉積質量、絕對來源機率或正式科學 evidence。
 
 ### 尚待正式驗證或發布
 
