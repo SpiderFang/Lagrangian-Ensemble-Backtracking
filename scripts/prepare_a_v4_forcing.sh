@@ -33,9 +33,77 @@ readonly OCM_PREPROCESSED_DIRECTORY="${LBT_OCM_PREPROCESSED_ROOT:-/data/OCM-Prep
 readonly NWW_PREPROCESSED_DIRECTORY="${LBT_NWW_PREPROCESSED_ROOT:-/data/NWW-Preprocessed-Data/preprocessed}"
 readonly NWW_NATIVE_GRID_ID="${LBT_NWW_NATIVE_GRID_ID:-ww3_grd3_253x237}"
 
-# uv cache 使用本工項專屬名稱，避免依賴登入帳號的預設 cache；Python bytecode 不寫回
-# Git worktree，使 SERVER 部署目錄在 dry-run 與正式批次後仍可稽核 dirty state。
-export UV_CACHE_DIR="${LBT_WORKSPACE_UV_CACHE_ROOT:-/tmp/lbt-a-v4-uv-cache}"
+# uv cache 必須由 SERVER operator 明示為已通過 storage gate 的 NFS 子目錄；不再以
+# /tmp 或 project worktree 作為 fallback。此 lightweight boundary 先確認 result root
+# 與 cache 是已存在的普通絕對目錄，逐段拒絕 symlink，並驗證 cache canonical path
+# 是 result root 的嚴格子目錄；完整 fstype/source、空間與 flock 仍由主 runner gate
+# 驗證。Python bytecode 不寫回 Git worktree，使 SERVER 部署目錄在 dry-run 與正式批次
+# 後仍可稽核 dirty state。
+if [[ -z "${LBT_RESULT_NFS_ROOT:-}" || -z "${LBT_UV_CACHE_ROOT:-}" ]]; then
+  printf '缺少 LBT_RESULT_NFS_ROOT 或 LBT_UV_CACHE_ROOT；A 區 forcing 不可繞過 NFS boundary。\n' >&2
+  exit 2
+fi
+python3 - "$LBT_RESULT_NFS_ROOT" "$LBT_UV_CACHE_ROOT" <<'PY'
+"""驗證 A 區前處理的 result root／uv cache 邊界，不建立任何目錄。
+
+此檢查和主專案 storage gate 使用相同的「逐段 lstat、再 canonical relative_to」
+語意，但只接收 forcing 前處理實際需要的兩個根。結果與套件快取若落到 /home、
+/tmp 或另一個非預期兄弟樹，會在第一次 uv 呼叫前停止；完整 NFS fstype、source、
+可用空間與跨程序鎖定仍由 validate_server_storage.py 負責。
+"""
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def existing_directory(raw_value: str, label: str) -> Path:
+    """確認絕對普通目錄與所有既有父元件都沒有 symlink。"""
+
+    path = Path(raw_value)
+    if not path.is_absolute() or "\n" in raw_value:
+        raise SystemExit(f"{label} 必須是無換行的絕對路徑")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            component_stat = os.lstat(current)
+        except OSError as exc:
+            raise SystemExit(f"{label} 路徑元件無法讀取") from exc
+        if stat.S_ISLNK(component_stat.st_mode):
+            raise SystemExit(f"{label} 不可含 symlink 元件")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SystemExit(f"{label} 無法解析") from exc
+    if not resolved.is_dir():
+        raise SystemExit(f"{label} 必須是既有普通目錄")
+    return resolved
+
+
+def is_under(path: Path, parent: Path) -> bool:
+    """判斷 canonical path 是否位於 parent 下，包含 parent 本身。"""
+
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+result_root = existing_directory(sys.argv[1], "LBT_RESULT_NFS_ROOT")
+cache_root = existing_directory(sys.argv[2], "LBT_UV_CACHE_ROOT")
+for forbidden_root in (Path("/home"), Path("/tmp"), Path("/private/tmp")):
+    if is_under(result_root, forbidden_root) or is_under(cache_root, forbidden_root):
+        raise SystemExit("result root 與 uv cache 不可位於 /home 或 /tmp")
+try:
+    cache_relative = cache_root.relative_to(result_root)
+except ValueError as exc:
+    raise SystemExit("LBT_UV_CACHE_ROOT 必須位於 LBT_RESULT_NFS_ROOT 下") from exc
+if not cache_relative.parts:
+    raise SystemExit("LBT_UV_CACHE_ROOT 必須是 LBT_RESULT_NFS_ROOT 的嚴格子目錄")
+PY
+export UV_CACHE_DIR="$LBT_UV_CACHE_ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 
 require_file() {

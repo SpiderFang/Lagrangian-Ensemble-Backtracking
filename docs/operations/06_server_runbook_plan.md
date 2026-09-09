@@ -42,11 +42,28 @@ export OCM_SURFACE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_surface
 export NWW_ANALYSIS_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_analysis
 export NWW_NATIVE_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_native/ww3_grd3_253x237
 
-# 正式值需在容量與檔案系統檢查後核定；不可直接假設專案目錄有足夠空間。
-export LBT_OUTPUT_ROOT=/path/to/approved/lagrangian-results
-export LBT_SCRATCH_ROOT=/path/to/local-fast-scratch/lagrangian
-export LBT_UV_CACHE_ROOT=/path/to/local-fast-scratch/uv-cache/lagrangian
-export LBT_MPL_CACHE_ROOT=/path/to/local-fast-scratch/matplotlib-cache/lagrangian
+# SERVER deployment 值：project/code/venv 可在 /home；所有 execution package、成果、
+# scratch、checkpoint、logs、aggregate/report 與程式快取均在同一 NFS result root 的
+# 對應子目錄。八個子目錄必須先由 operator 建立並通過 scripts/validate_server_storage.py。
+export LBT_RESULT_NFS_ROOT=/data/LBT
+export LBT_EXECUTION_PACKAGE_ROOT=/data/LBT/execution-packages/<execution-package>
+export LBT_OUTPUT_ROOT=/data/LBT/outputs
+export LBT_SCRATCH_ROOT=/data/LBT/scratch
+export LBT_CHECKPOINT_ROOT=/data/LBT/checkpoints
+export LBT_UV_CACHE_ROOT=/data/LBT/cache/uv
+export LBT_MPL_CACHE_ROOT=/data/LBT/cache/matplotlib
+export LBT_XDG_CACHE_ROOT=/data/LBT/cache/xdg
+export LBT_TMP_ROOT=/data/LBT/tmp
+
+# tracked runner 會把這些 runtime 變數固定到已驗證 NFS root；UV_PROJECT_ENVIRONMENT
+# 固定使用 project root 下既有 .venv，避免 uv 安裝環境與研究成果混在一起。
+export UV_CACHE_DIR="$LBT_UV_CACHE_ROOT"
+export MPLCONFIGDIR="$LBT_MPL_CACHE_ROOT"
+export XDG_CACHE_HOME="$LBT_XDG_CACHE_ROOT"
+export TMPDIR="$LBT_TMP_ROOT"
+export UV_PROJECT_ENVIRONMENT="$LBT_PROJECT_ROOT/.venv"
+export PYTHONDONTWRITEBYTECODE=1
+export LBT_MIN_FREE_GB=<operator-approved-positive-integer>
 ```
 
 正式設定與程式碼只引用這些 task-specific 變數，不以 `/Users/...`、`$HOME` 或 raw data 絕對路徑硬編碼。
@@ -133,17 +150,35 @@ bash scripts/prepare_a_v4_forcing.sh all
 df -hT "$OCM_NATIVE_ROOT" "$NWW_ANALYSIS_ROOT" "$LBT_OUTPUT_ROOT" "$LBT_SCRATCH_ROOT"
 findmnt -T "$LBT_OUTPUT_ROOT"
 findmnt -T "$LBT_SCRATCH_ROOT"
+python3 scripts/validate_server_storage.py \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --project-venv "$LBT_PROJECT_ROOT/.venv" \
+  --result-nfs-root "$LBT_RESULT_NFS_ROOT" \
+  --execution-package-root "$LBT_EXECUTION_PACKAGE_ROOT" \
+  --output-root "$LBT_OUTPUT_ROOT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --uv-cache-root "$LBT_UV_CACHE_ROOT" \
+  --mpl-cache-root "$LBT_MPL_CACHE_ROOT" \
+  --xdg-cache-root "$LBT_XDG_CACHE_ROOT" \
+  --tmp-root "$LBT_TMP_ROOT" \
+  --minimum-free-gib "$LBT_MIN_FREE_GB" \
+  --snapshot-output "$LBT_SCRATCH_ROOT/server-storage-gate-manual.json"
 ```
 
-若 output 在 NFS/NAS，checkpoint 與 active shard 優先寫本機 scratch；完成 checksum 後以單一 publisher 傳到同一遠端檔案系統的 `.incoming/<run_id>/`，最後原子改名。不得讓下游看到半套正式 run。
+所有 output、active shard、checkpoint、logs 與 publisher staging 都必須留在上述同一個
+NFS result root；不能以本機 scratch 作為執行結果或 checkpoint fallback。完成 checksum
+後仍由單一 publisher 寫入 NFS 上的 `.incoming/<run_id>/`，最後原子改名；不得讓下游看到半套正式 run。
 
 ## 4. 環境建立
 
 ```bash
 cd "$LBT_PROJECT_ROOT"
 export UV_CACHE_DIR="$LBT_UV_CACHE_ROOT"
-export UV_PROJECT_ENVIRONMENT="$LBT_SCRATCH_ROOT/venv"
+export UV_PROJECT_ENVIRONMENT="$LBT_PROJECT_ROOT/.venv"
 export MPLCONFIGDIR="$LBT_MPL_CACHE_ROOT"
+export XDG_CACHE_HOME="$LBT_XDG_CACHE_ROOT"
+export TMPDIR="$LBT_TMP_ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 
 uv sync --frozen
@@ -169,10 +204,10 @@ uv run pytest -q -p no:cacheprovider
 
 ```bash
 uv run lbt-code-provenance --project-root "$LBT_PROJECT_ROOT"
-uv run lbt-validate-run "$LBT_SCRATCH_ROOT/runs/<run_id>" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints"
-uv run lbt-benchmark-report "$LBT_SCRATCH_ROOT/runs/<run_id>" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints"
+uv run lbt-validate-run "$LBT_OUTPUT_ROOT/runs/<run_id>" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
+uv run lbt-benchmark-report "$LBT_OUTPUT_ROOT/runs/<run_id>" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
 ```
 
 `validate-run` 是純讀檢查；它會驗證 run plan/progress、immutable input file checksum、
@@ -347,12 +382,12 @@ uv run lbt run-shard "$LBT_SCRATCH_ROOT/pilots/pilot-representative" \
   --resume \
   --sweep-budget 10
 
-uv run lbt run-reconcile "$LBT_SCRATCH_ROOT/pilots/pilot-representative" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints"
-uv run lbt validate-run "$LBT_SCRATCH_ROOT/pilots/pilot-representative" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints"
-uv run lbt benchmark-report "$LBT_SCRATCH_ROOT/pilots/pilot-representative" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints"
+uv run lbt run-reconcile "$LBT_OUTPUT_ROOT/pilots/pilot-representative" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
+uv run lbt validate-run "$LBT_OUTPUT_ROOT/pilots/pilot-representative" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
+uv run lbt benchmark-report "$LBT_OUTPUT_ROOT/pilots/pilot-representative" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
 ```
 
 `--pilot-scenarios-per-stratum 1` 只供工程 sanity／benchmark；selector 會由完整且已驗證的
@@ -399,7 +434,7 @@ uv run lbt run-shard "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
   --shard-id <shard-id> \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
   --sweep-budget 10
 
 uv run lbt run-shard "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
@@ -407,13 +442,13 @@ uv run lbt run-shard "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
   --shard-id <shard-id> \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
   --resume
 
 uv run lbt run-reconcile "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints"
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
 uv run lbt validate-run "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
-  --checkpoint-root "$LBT_SCRATCH_ROOT/checkpoints" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
   --require-complete
 ```
 
