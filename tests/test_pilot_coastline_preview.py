@@ -710,6 +710,8 @@ def test_baytrace_build_emits_four_pngs_readme_and_rebuild_contract(
     assert "到達：2025-01-01 12:00 UTC；回溯至：2025-01-01 11:00 UTC" in readme
     assert "位置1–5是五個受體／指定位置，不是時間順序" in readme
     assert "各位置以本身回溯起點為 (0,0)" in readme
+    assert "各粒子所在位置的海床高度（每圖 5 條）" in readme
+    assert "每條彩色實線代表 1 顆粒子的高度軌跡" in readme
     assert "B／新竹外海" in readme or "B區" in readme
     assert readme.count("| 位置") == 5
     for position in range(1, 6):
@@ -1092,6 +1094,14 @@ def test_baytrace_depth_keeps_missing_eta_and_bed_blank(
     output = tmp_path / "depth.png"
     assert _TARGET.render_baytrace_depth(data, output) == output
     assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_baytrace_depth_labels_describe_per_particle_lines_and_dynamic_bed_count() -> None:
+    """確認垂向圖說明逐粒子高度線，海床圖例只在同數時標示精確每圖數量。"""
+
+    assert _TARGET._baytrace_depth_particle_note(5) == "每條彩色實線代表 1 顆粒子的高度軌跡（共 5 顆）"
+    assert _TARGET._baytrace_depth_bed_label([5, 5, 5, 5]) == "各粒子所在位置的海床高度（每圖 5 條）"
+    assert _TARGET._baytrace_depth_bed_label([5, 4, 5, 4]) == "各粒子所在位置的海床高度（各圖數量依子圖標示）"
 
 
 def test_baytrace_terminal_table_rejects_swapped_summary_cells(

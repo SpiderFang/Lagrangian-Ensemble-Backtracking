@@ -1060,6 +1060,41 @@ def _baytrace_layer_definition(level: str) -> str:
     return _BAYTRACE_VERTICAL_DEFINITIONS.get(level, "來源設定未提供可核對的水層定義")
 
 
+def _baytrace_depth_particle_note(particle_count: int) -> str:
+    """建立垂向子圖的逐粒子實線說明，並明示該子圖實際粒子數。
+
+    垂向圖的彩色實線使用初始水層顏色，但每一條線仍是單一粒子的 ``z_m`` 保存
+    軌跡；若只在全圖底部放一條泛稱圖例，容易讓讀者以為存在未繪出的灰色資料線。
+    因此說明放在各子圖標題附近，數量直接取該水層的粒子列數，讓其他粒子數的
+    preview 也能沿用同一個 renderer。此文字只描述已保存軌跡的顯示方式，不代表
+    粒子彼此相同或具有統計獨立性。
+    """
+
+    if type(particle_count) is not int or particle_count < 0:
+        raise ValueError("垂向子圖粒子數必須是非負整數")
+    return f"每條彩色實線代表 1 顆粒子的高度軌跡（共 {particle_count} 顆）"
+
+
+def _baytrace_depth_bed_label(particle_counts: Sequence[int]) -> str:
+    """依四個水層子圖的粒子數建立海床點線圖例文字。
+
+    ``bed_z_m`` 是每顆粒子所在水平位置的海床高度，不是五個水層或一條共用海床
+    曲線；同一子圖保留每顆粒子的點線，才能呈現其水平路徑下方地形的差異。當所有
+    子圖粒子數相同時，圖例可安全地精確標示「每圖 N 條」；數量不一致時則不把某一
+    個子圖的數量誤套到全圖，改由各子圖標題的實際數字說明。這個標籤只改變呈現
+    語意，不會篩選、合併或改寫 ``bed_z_m`` 資料。
+    """
+
+    counts = tuple(particle_counts)
+    if not counts:
+        return "各粒子所在位置的海床高度"
+    if any(type(count) is not int or count < 0 for count in counts):
+        raise ValueError("垂向圖粒子數必須是非負整數")
+    if len(set(counts)) == 1:
+        return f"各粒子所在位置的海床高度（每圖 {counts[0]} 條）"
+    return "各粒子所在位置的海床高度（各圖數量依子圖標示）"
+
+
 def _baytrace_metadata(summary: dict[str, Any]) -> str:
     """組合四張新版圖共用的研究情境摘要，不顯示 run／scenario 等內部識別碼。
 
@@ -1595,7 +1630,9 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
     粒子高度 ``z_m``、海面 ``eta_m`` 與海床 ``bed_z_m`` 直接取自既有觀測 CSV；
     空白欄位轉為 NaN 只讓圖線留空，不補零、不從 normalized_config 硬算統一公尺
     高度，也不重新讀 forcing 或重跑取樣。水層名稱使用完整中文，並明確註明海床
-    只是參考線；近床水層是最低有效 OCM 水層中心，不是海床面。
+    只是參考線；近床水層是最低有效 OCM 水層中心，不是海床面。每條彩色實線是
+    一顆粒子的高度軌跡，棕色點線則是該粒子所在水平位置取出的海床高度；兩者都
+    保留逐粒子資料，不把海床線合併成範圍帶，也不把點線誤稱為不同水層。
     """
 
     import matplotlib
@@ -1614,11 +1651,16 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
     terminal_statuses = {particle["status"] for particle in data["particles"]}
     horizon_seconds = _horizon_seconds(summary)
     font = _display_font()
+    selected_by_level = {
+        level: [particle for particle in data["particles"] if particle["vertical_id"] == level]
+        for level in levels
+    }
+    particle_counts = [len(selected_by_level[level]) for level in levels]
     fig, axes = plt.subplots(len(levels), 1, figsize=(11, 12), squeeze=False, sharex=True)
     try:
         for index, level in enumerate(levels):
             ax = axes[index, 0]
-            selected = [particle for particle in data["particles"] if particle["vertical_id"] == level]
+            selected = selected_by_level[level]
             layer_color = _BAYTRACE_VERTICAL_COLORS.get(level, "#666666")
             for particle in selected:
                 rows = curves.get(particle["particle_id"], [])
@@ -1691,18 +1733,25 @@ def render_baytrace_depth(data: dict[str, Any], output_path: str | Path) -> Path
                     )
             ax.set_xlim(0.0, horizon_minutes)
             ax.set_title(
-                f"{_baytrace_layer_label(level)}（{_baytrace_layer_definition(level)}）｜粒子數：{len(selected)}",
+                f"{_baytrace_layer_label(level)}（{_baytrace_layer_definition(level)}）｜粒子數：{len(selected)}\n"
+                f"{_baytrace_depth_particle_note(len(selected))}",
                 fontproperties=font,
-                fontsize=12,
+                fontsize=11,
             )
             ax.set_ylabel("高度（公尺；向上為正）", fontproperties=font)
             ax.grid(color="#d9e2e8", linewidth=0.7)
             ax.set_xticks(age_ticks)
         axes[-1, 0].set_xlabel("回溯時間（分鐘；0 為到達時刻）", fontproperties=font)
         legend_handles = [
-            Line2D([], [], color="#555555", linewidth=1.4, label="粒子高度"),
             Line2D([], [], color="#1b4f72", linestyle="--", linewidth=1.0, label="海面高度"),
-            Line2D([], [], color="#8c510a", linestyle=":", linewidth=1.0, label="海床高度"),
+            Line2D(
+                [],
+                [],
+                color="#8c510a",
+                linestyle=":",
+                linewidth=1.0,
+                label=_baytrace_depth_bed_label(particle_counts),
+            ),
         ]
         legend_handles.extend(
             _baytrace_endpoint_handles(
@@ -2041,6 +2090,11 @@ def _baytrace_readme(
     forcing_start_states = Counter(_forcing_start_age_states(data))
     horizon_minutes, _ = _depth_axis_limits_and_ticks(summary)
     layer_totals = {level: sum(terminal_table[level].values()) for level in summary["vertical_order"]}
+    depth_particle_counts = [
+        sum(1 for particle in data["particles"] if particle.get("vertical_id") == level)
+        for level in summary["vertical_order"]
+    ]
+    depth_bed_label = _baytrace_depth_bed_label(depth_particle_counts)
     layer_total_text = "、".join(
         f"{_baytrace_layer_label(level)} {layer_totals[level]} 顆" for level in summary["vertical_order"]
     )
@@ -2093,8 +2147,8 @@ def _baytrace_readme(
         f"| 粒子數 | 圖上明示同一組 {particle_count} 顆粒子、{panel_count} 個初始位置 × "
         f"{level_count} 個初始水層 | "
         f"是否追滿{_horizon_hours_text(summary)}小時依每顆 age_seconds 與 horizon 核對；M=1 且含隨機擴散 |",
-        "| 垂向軌跡 | 專案補充診斷圖：粒子高度、海面、海床 | "
-        "呈現參照沒有直接對應，z／eta／bed 均取既有 CSV |",
+        "| 垂向軌跡 | 專案補充診斷圖：逐粒子高度軌跡、海面、各粒子所在位置的海床高度 | "
+        "每條彩色實線代表一顆粒子；棕色點線依各子圖實際粒子數保留，z／eta／bed 均取既有 CSV |",
         "| 停止原因 | 專案補充診斷圖：八種終止狀態的粒子數 | 呈現參照沒有直接對應，八狀態及零計數均保留 |",
         "",
         "新版端點圖例依資料核對結果區分八種狀態；forcing_start 依每顆 particles.csv 的"
@@ -2158,6 +2212,9 @@ def _baytrace_readme(
         "",
         f"本次圖面共保留 {len(data['particles'])} 顆粒子與 {len(data['observations'])} 筆模型保存紀錄；"
         f"停止摘要：{_baytrace_terminal_summary(data)}",
+        "垂向圖每條彩色實線代表 1 顆粒子的高度軌跡；棕色點線代表該粒子所在位置的海床高度，"
+        f"不是五個水層；海床圖例項目為「{depth_bed_label}」。"
+        "圖例只有在各子圖粒子數相同時才標示「每圖 N 條」，數量不同時以各子圖標題為準。",
         f"垂向資料缺值原樣留空：eta_m 空白 {missing_eta} 筆、bed_z_m 空白 {missing_bed} 筆，"
         f"不補成零；高度軸標示為「高度（公尺；向上為正）」，時間軸涵蓋 0–{horizon_minutes:g} 分鐘，"
         "刻度由回溯上限等分。",
@@ -2209,7 +2266,7 @@ def _baytrace_readme(
         "請在專案根目錄以自己的路徑變數執行；輸出目錄必須是全新目錄。",
         "",
         "```bash",
-        "UV_CACHE_DIR=work/uv-cache MPLCONFIGDIR=work/matplotlib-cache \\",
+        f"{_verified_server_cache_prefix()}\\",
         "uv run python3 scripts/build_pilot_coastline_preview.py \\",
         "  --style baytrace \\",
         "  --preview-dir \"$PILOT_PREVIEW\" --domain \"$DOMAIN_GEOMETRY\" \\",
@@ -2222,6 +2279,25 @@ def _baytrace_readme(
         "失敗保留新輸出目錄供診斷，既有輸出、輸入檔、原無底圖 preview 與 legacy 成果均不覆寫。",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _verified_server_cache_prefix() -> str:
+    """建立 SERVER 預覽重跑命令使用的已驗證 NFS cache 前綴。
+
+    preview 的圖面產製會呼叫 ``uv`` 與 Matplotlib；若 README 把 cache 寫死在
+    project ``work``，SERVER 即使已通過 storage gate 仍可能把大量暫存資料寫入
+    /home。故重跑命令改用 operator 在 gate 後 export 的四個 root 變數，並以
+    shell ``:?`` 在未設定或未驗證時 fail-closed。此函式只產生命令文字，不讀取、
+    建立或修改任何目錄，實際目錄安全性由 SERVER gate 負責。
+    """
+
+    return (
+        'UV_CACHE_DIR="${LBT_UV_CACHE_ROOT:?set verified NFS root}" '
+        'MPLCONFIGDIR="${LBT_MPL_CACHE_ROOT:?set verified NFS root}" '
+        'XDG_CACHE_HOME="${LBT_XDG_CACHE_ROOT:?set verified NFS root}" '
+        'TMPDIR="${LBT_TMP_ROOT:?set verified NFS root}" '
+        "PYTHONDONTWRITEBYTECODE=1 "
+    )
 
 
 def build_coastline_preview(
@@ -2290,7 +2366,7 @@ def build_coastline_preview(
     ]
     if style == "baytrace":
         args.extend(["--style", "baytrace"])
-    prefix = "UV_CACHE_DIR=work/uv-cache MPLCONFIGDIR=work/matplotlib-cache "
+    prefix = _verified_server_cache_prefix()
     invocation = prefix + shlex.join(args)
     output_argument_index = args.index("--output-dir") + 1
     args[output_argument_index] = str(output.with_name(output.name + "-rebuild"))

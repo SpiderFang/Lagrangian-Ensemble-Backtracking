@@ -29,10 +29,9 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Callable, Mapping, Sequence, Union  # noqa: UP035 - SERVER 需支援 Python 3.9
 
 NFS_FILESYSTEM_TYPES = frozenset({"nfs", "nfs4"})
 """正式 SERVER 允許的 NFS 檔案系統型別；大小寫差異會先正規化。"""
