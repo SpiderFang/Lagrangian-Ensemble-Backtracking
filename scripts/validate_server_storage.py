@@ -111,7 +111,9 @@ class StoragePolicyError(RuntimeError):
         self.code = code
 
 
-PathLike = Union[str, os.PathLike[str]]  # noqa: UP007 - 支援 SERVER 的 Python 3.9 呼叫端
+# Python 3.9.6 的 ``os.PathLike``（collections.abc）不可下標；使用未參數化
+# 形式以維持 SERVER 實機 import 相容性，呼叫端仍會先轉成絕對 ``Path`` 驗證。
+PathLike = Union[str, os.PathLike]  # noqa: UP007 - SERVER Python 3.9.6 相容形式
 MountProbe = Callable[[Path], MountInfo]
 WriteProbe = Callable[[Path], bool]
 FlockProbe = Callable[[Path], bool]
