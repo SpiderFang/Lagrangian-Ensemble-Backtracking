@@ -29,6 +29,7 @@ import numpy as np
 from .diffusion import DiffusionCoefficients, DiffusionSample, SmagorinskySettings
 from .forcing import CombinedMonthForcing, NWWAnalysisMonth, OCMNativeMonth
 from .geometry import DomainProjection
+from .integrators import StepStartSampleReuseProvider
 from .mesh import NativeMesh
 from .models import SampleQC, VelocitySample
 
@@ -127,24 +128,36 @@ class _MonthEntry:
             self.combined = {}
 
 
-class ManagedForcingProvider:
-    """只保存 manager 與 material 參數的輕量 provider facade。
+class ManagedForcingProvider(StepStartSampleReuseProvider):
+    """只保存月份快取管理器與材質參數的輕量速度取樣介面。
 
-    facade 不直接持有 ``OCMNativeMonth``、``NWWAnalysisMonth`` 或 ``CombinedMonthForcing``
-    引用；每次 sample 都回到 manager 查詢目前 UTC 月份。這是 LRU 真正能釋放月份陣列的
-    關鍵，也讓同一 manager 建立多個 material／Stokes 組合時不重複讀取 OCM。
+    這個介面不直接持有 ``OCMNativeMonth``、``NWWAnalysisMonth`` 或 ``CombinedMonthForcing``
+    引用；每次取樣都回到月份快取管理器查詢目前 UTC 月份。這是最近最少使用（LRU）快取
+    能真正釋放月份陣列的關鍵，也讓同一管理器建立多個材質／Stokes 組合時不重複讀取 OCM。
+
+    這個介面明示允許步首樣本供 RK4 的 k1 重用：OCM／NWW3 陣列以唯讀方式開啟，
+    相同座標、深度、UTC 與材質參數的樣本結果不依呼叫次數改變；月份快取管理器的
+    最近最少使用快取與三角形搜尋提示只影響快取／搜尋狀態，不改變速度、QC 或邊界資料。
+    若未來速度取樣器引入會改變物理結果的可變狀態，必須移除此標記，不能只為了減少查詢
+    而沿用它。
     """
 
     def __init__(
         self, manager: ForcingWindowManager, settling_velocity_mps: float, include_stokes: bool
     ) -> None:
-        """建立單一 material 的 facade；``include_stokes`` 僅控制 NWW lazy loading。"""
+        """建立單一材質的速度取樣介面；``include_stokes`` 僅控制 NWW 延後載入。"""
 
         self.manager = manager
         self.settling_velocity_mps = _finite_settling(settling_velocity_mps)
         if not isinstance(include_stokes, bool):
             raise TypeError("include_stokes 必須是 boolean")
         self.include_stokes = include_stokes
+
+    @property
+    def step_start_sample_reuse_safe(self) -> bool:
+        """回傳唯讀月份快取管理器介面的明示 k1 重用承諾。"""
+
+        return True
 
     def sample(
         self,
@@ -155,7 +168,7 @@ class ManagedForcingProvider:
         *,
         triangle_hint: int | None = None,
     ) -> VelocitySample:
-        """取樣並完整轉交 triangle hint，供 ``HintTrackingVelocityProvider`` 使用。"""
+        """取樣並完整轉交三角形搜尋提示，供 ``HintTrackingVelocityProvider`` 使用。"""
 
         return self.manager.sample(
             x_m,
@@ -168,7 +181,7 @@ class ManagedForcingProvider:
         )
 
     def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
-        """提供既有四參數 velocity provider 介面；無 hint 時由 manager 正常取樣。"""
+        """提供既有四參數速度取樣器介面；無搜尋提示時由月份快取管理器正常取樣。"""
 
         return self.sample(x_m, y_m, z_m, time_utc_ns)
 

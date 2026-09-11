@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from calendar import monthrange
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 import yaml
 from shapely.geometry import box, shape
 
+import lagrangian_backtracking.cli as cli
 import lagrangian_backtracking.input_derivation as input_derivation_module
 from lagrangian_backtracking.cli import main
 from lagrangian_backtracking.config import ProjectConfig, StudySiteConfig, resolve_flow_domain_id
@@ -86,8 +88,13 @@ def _write_ocm_domain(
     node_lon: np.ndarray,
     node_lat: np.ndarray,
     faces: np.ndarray,
+    days_per_month: int = 8,
 ) -> None:
-    """寫入一個符合 OCM schema 3 最小讀取契約的 synthetic native domain。"""
+    """寫入一個符合 OCM schema 3 最小讀取契約的 synthetic native domain。
+
+    ``days_per_month`` 讓支援窗 roundtrip 測試建立足以涵蓋 30 日的完整月份；預設
+    八日仍維持既有小型 fixture 的執行成本與測試語意。
+    """
 
     domain_root = root / flow_domain_id
     grid = domain_root / "grid"
@@ -116,7 +123,8 @@ def _write_ocm_domain(
     for month in months:
         year, number = int(month[:4]), int(month[4:])
         start_ns = int(datetime(year, number, 1, tzinfo=UTC).timestamp() * 1_000_000_000)
-        time_ns = start_ns + np.arange(8 * 24, dtype=np.int64) * 3_600_000_000_000
+        day_count = min(days_per_month, monthrange(year, number)[1])
+        time_ns = start_ns + np.arange(day_count * 24, dtype=np.int64) * 3_600_000_000_000
         time_count = int(time_ns.size)
         month_dir = domain_root / "months" / month
         month_dir.mkdir()
@@ -164,6 +172,7 @@ def _write_nww_domain(
     center_lon: float,
     center_lat: float,
     regular_axes: bool = False,
+    days_per_month: int = 8,
 ) -> None:
     """寫入符合 NWW3 analysis schema 1 的最小 2×2 analysis grid。
 
@@ -205,7 +214,8 @@ def _write_nww_domain(
     for month in months:
         year, number = int(month[:4]), int(month[4:])
         start_ns = int(datetime(year, number, 1, tzinfo=UTC).timestamp() * 1_000_000_000)
-        time_ns = start_ns + np.arange(8 * 24, dtype=np.int64) * 3_600_000_000_000
+        day_count = min(days_per_month, monthrange(year, number)[1])
+        time_ns = start_ns + np.arange(day_count * 24, dtype=np.int64) * 3_600_000_000_000
         time_count = int(time_ns.size)
         month_dir = domain_root / "months" / month
         month_dir.mkdir()
@@ -245,6 +255,7 @@ def _write_surface_domain(
     months: list[str],
     center_lon: float,
     center_lat: float,
+    days_per_month: int = 8,
 ) -> None:
     """寫入供 arrival selector 使用的 OCM schema 3 surface cache fixture。
 
@@ -282,7 +293,8 @@ def _write_surface_domain(
     for month in months:
         year, number = int(month[:4]), int(month[4:])
         start_ns = int(datetime(year, number, 1, tzinfo=UTC).timestamp() * 1_000_000_000)
-        time_ns = start_ns + np.arange(8 * 24, dtype=np.int64) * 3_600_000_000_000
+        day_count = min(days_per_month, monthrange(year, number)[1])
+        time_ns = start_ns + np.arange(day_count * 24, dtype=np.int64) * 3_600_000_000_000
         time_count = int(time_ns.size)
         shape_grid = (time_count, 2, 2)
         arrays = {
@@ -316,6 +328,47 @@ def _write_surface_domain(
             ),
             encoding="utf-8",
         )
+
+
+def _extend_monthly_fixture_to_full_months(root: Path, *, days_per_month: int) -> None:
+    """把小型逐時 fixture 延伸至每月完整天數，供 30 日母體測試使用。
+
+    延伸只發生在 pytest 暫存目錄：沿用最後一筆規則 synthetic 值，並同步更新月份
+    metadata 的 shape。它不代表真實 OCM/NWW3 物理資料，只讓 release binding 測試
+    確實經過 30 日的完整逐時節點，而非以 mock validator 繞過資料期檢查。
+    """
+
+    for month_dir in sorted(root.glob("*/months/*")):
+        time_path = month_dir / "time_utc_ns.npy"
+        if not time_path.is_file():
+            continue
+        month = month_dir.name
+        year, number = int(month[:4]), int(month[4:])
+        expected_count = min(days_per_month, monthrange(year, number)[1]) * 24
+        time_axis = np.load(time_path)
+        if time_axis.shape[0] >= expected_count:
+            continue
+        extra_count = expected_count - int(time_axis.shape[0])
+        extra_time = int(time_axis[-1]) + np.arange(
+            1, extra_count + 1, dtype=np.int64
+        ) * 3_600_000_000_000
+        np.save(time_path, np.concatenate((time_axis, extra_time)))
+        for array_path in sorted(month_dir.glob("*.npy")):
+            if array_path.name == "time_utc_ns.npy":
+                continue
+            array = np.load(array_path)
+            extension = np.repeat(array[-1:, ...], extra_count, axis=0)
+            np.save(array_path, np.concatenate((array, extension), axis=0))
+        metadata_path = month_dir / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        arrays = metadata.get("arrays")
+        if isinstance(arrays, dict):
+            for name, record in arrays.items():
+                if isinstance(record, dict):
+                    candidate = month_dir / name
+                    if candidate.is_file():
+                        record["shape"] = list(np.load(candidate, mmap_mode="r").shape)
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
 
 
 @pytest.fixture()
@@ -404,6 +457,56 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
             regular_axes=True,
         )
     return config_path, ocm_root, surface_root, nww_root, tmp_path
+
+
+@pytest.fixture()
+def synthetic_support_input_fixture(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> tuple[Path, Path, Path, Path, Path]:
+    """建立實際涵蓋 30 日逐時節點的共同母體 synthetic input。"""
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_input_fixture
+    for source_root in (ocm_root, surface_root, nww_root):
+        _extend_monthly_fixture_to_full_months(source_root, days_per_month=31)
+    # 原始小型 fixture 的潮位、波高與流速都是常數；這樣只能測試非 strict fallback，
+    # 無法通過正式 48+2 selector 的 spring/neap 分層。這裡只在 pytest 暫存資料中加入
+    # 可重現的潮汐與事件變化：潮位以 12 小時週期搭配 28 日振幅調制，讓每個季節都同時
+    # 有兩類潮汐強度及三種潮內相位；波高與流速則加入低幅週期變化，讓兩個全期事件
+    # 的 deterministic 排序也不依賴完全相等的 tie-break。這些數值是工程 fixture，
+    # 不代表任何 accepted OCM/NWW3 觀測或物理校正。
+    epoch_ns = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp() * 1_000_000_000)
+    for month_dir in sorted(surface_root.glob("*/months/*")):
+        time_ns = np.load(month_dir / "time_utc_ns.npy")
+        hours = (time_ns.astype(np.float64) - epoch_ns) / 3_600_000_000_000.0
+        tide = (
+            (0.8 + 0.3 * np.sin(2.0 * np.pi * hours / (24.0 * 28.0)))
+            * np.sin(2.0 * np.pi * hours / 12.0)
+        )
+        surface_shape = (time_ns.size, 2, 2)
+        eta = np.broadcast_to(tide[:, None, None], surface_shape).astype(np.float32, copy=True)
+        np.save(month_dir / "eta_m.npy", eta)
+        speed = 0.1 + 0.02 * (1.0 + np.sin(2.0 * np.pi * hours / (24.0 * 5.0)))
+        u_surface = np.broadcast_to(speed[:, None, None], surface_shape).astype(
+            np.float32, copy=True
+        )
+        np.save(month_dir / "u_surface_mps.npy", u_surface)
+    for month_dir in sorted(nww_root.glob("*/months/*")):
+        time_ns = np.load(month_dir / "time_utc_ns.npy")
+        hours = (time_ns.astype(np.float64) - epoch_ns) / 3_600_000_000_000.0
+        wave_height = 1.0 + 0.2 * np.sin(2.0 * np.pi * hours / (24.0 * 9.0))
+        wave = np.broadcast_to(wave_height[:, None, None], (time_ns.size, 2, 2)).astype(
+            np.float32, copy=True
+        )
+        np.save(month_dir / "significant_wave_height.npy", wave)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    payload["inputs"]["backtrack_support_days"] = 30
+    payload["boundaries"].update({"max_backtrack_days": 30.0, "maximum_step_count": 8_640})
+    payload["integration"].update(
+        {"dt_min_seconds": 30.0, "dt_max_seconds": 300.0, "output_interval_seconds": 3_600.0}
+    )
+    config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return config_path, ocm_root, surface_root, nww_root, root
 
 
 def test_canonical_json_binding_is_immutable_and_detects_tamper(tmp_path: Path) -> None:
@@ -1472,6 +1575,201 @@ def test_inputs_build_validate_and_release_config(
     release_validation = validate_release_config(release_path, input_directory=artifact_directory)
     assert release_validation["valid"] is True, release_validation
     assert validate_release_config(release_path)["valid"] is True
+    cli_release_path = root / "cli-release-config.yaml"
+    assert (
+        main(
+            [
+                "release-config-create",
+                "--config-template",
+                str(config_path),
+                "--input-directory",
+                str(artifact_directory),
+                "--output",
+                str(cli_release_path),
+                "--pilot",
+                "--max-backtrack-days",
+                "7",
+                "--maximum-step-count",
+                "2016",
+            ]
+        )
+        == 0
+    )
+    cli_payload = yaml.safe_load(cli_release_path.read_text(encoding="utf-8"))
+    assert cli_payload["boundaries"]["max_backtrack_days"] == 7.0
+    assert cli_payload["boundaries"]["maximum_step_count"] == 2016
+
+
+def test_release_config_cli_forwards_optional_horizon_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI 明示新 flags 時才傳遞覆寫值，舊呼叫則不注入新 keyword。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_create_release_config(**kwargs: Any) -> dict[str, Any]:
+        """記錄 CLI 傳入的核心參數，不讀取測試以外的 template 或 artifact。"""
+
+        calls.append(kwargs)
+        return {"config_status": "generated", "artifact_count": 10}
+
+    monkeypatch.setattr(cli, "create_release_config", fake_create_release_config)
+    template = tmp_path / "template.yaml"
+    input_directory = tmp_path / "input"
+    output = tmp_path / "release-30.yaml"
+    common = [
+        "release-config-create",
+        "--config-template",
+        str(template),
+        "--input-directory",
+        str(input_directory),
+        "--output",
+        str(output),
+    ]
+
+    assert main(common + ["--max-backtrack-days", "30", "--maximum-step-count", "8640"]) == 0
+    assert json.loads(capsys.readouterr().out)["config_status"] == "generated"
+    assert calls == [
+        {
+            "config_template_path": template,
+            "input_directory": input_directory,
+            "output_path": output,
+            "formal": True,
+            "max_backtrack_days": 30.0,
+            "maximum_step_count": 8640,
+        }
+    ]
+
+    calls.clear()
+    pilot_output = tmp_path / "release-legacy.yaml"
+    assert main(
+        [
+            "release-config-create",
+            "--config-template",
+            str(template),
+            "--input-directory",
+            str(input_directory),
+            "--output",
+            str(pilot_output),
+            "--pilot",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["config_status"] == "generated"
+    assert calls == [
+        {
+            "config_template_path": template,
+            "input_directory": input_directory,
+            "output_path": pilot_output,
+            "formal": False,
+        }
+    ]
+
+
+def test_shared_30_day_mother_creates_7_and_30_day_release_configs(
+    synthetic_support_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> None:
+    """同一份 30 日母體可產生 7／30 日設定，且不重選或改寫 component。"""
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_support_input_fixture
+    template_before = config_path.read_bytes()
+    artifact_directory = root / "derived-inputs-30-day"
+    build_input_derivatives(
+        config_path=config_path,
+        destination=artifact_directory,
+        ocm_native_root=ocm_root,
+        ocm_surface_root=surface_root,
+        nww_analysis_root=nww_root,
+        formal=False,
+    )
+    artifact_before = {
+        path.relative_to(artifact_directory): path.read_bytes()
+        for path in sorted(artifact_directory.iterdir())
+        if path.is_file()
+    }
+    arrival_payload, _ = read_canonical_json(artifact_directory / ARTIFACT_FILENAMES["arrival"])
+    initial_payload, _ = read_canonical_json(
+        artifact_directory / ARTIFACT_FILENAMES["initial_condition"]
+    )
+    arrival_ids = [row["arrival_time_id"] for row in arrival_payload["records"]]
+    initial_pairs = [
+        (row["receptor_id"], row["arrival_time_id"])
+        for row in initial_payload["records"]
+    ]
+
+    release_configs: dict[int, ProjectConfig] = {}
+    artifact_binding_fingerprints: dict[str, tuple[str, str, int]] | None = None
+    for days, steps in ((7, 2_016), (30, 8_640)):
+        release_path = root / f"release-{days}-day.yaml"
+        result = create_release_config(
+            config_template_path=config_path,
+            input_directory=artifact_directory,
+            output_path=release_path,
+            formal=False,
+            max_backtrack_days=days,
+            maximum_step_count=steps,
+        )
+        assert result["config_status"] == "generated"
+        assert validate_release_config(release_path, input_directory=artifact_directory, formal=False)[
+            "valid"
+        ] is True
+        release_payload = yaml.safe_load(release_path.read_text(encoding="utf-8"))
+        assert isinstance(release_payload, dict)
+        assert release_payload["boundaries"]["max_backtrack_days"] == float(days)
+        assert release_payload["boundaries"]["maximum_step_count"] == steps
+        release_binding = release_payload["release_binding"]
+        assert release_binding["backtrack_horizon_binding"]["artifact_backtrack_support_days"] == 30.0
+        current_fingerprints = {
+            item["kind"]: (item["sha256"], item["canonical_sha256"], item["size_bytes"])
+            for item in release_binding["artifacts"]
+        }
+        if artifact_binding_fingerprints is None:
+            artifact_binding_fingerprints = current_fingerprints
+        else:
+            assert current_fingerprints == artifact_binding_fingerprints
+        release_configs[days] = ProjectConfig.model_validate(release_payload)
+
+    assert config_path.read_bytes() == template_before
+    artifact_after = {
+        path.relative_to(artifact_directory): path.read_bytes()
+        for path in sorted(artifact_directory.iterdir())
+        if path.is_file()
+    }
+    assert artifact_after == artifact_before
+    assert release_configs[7].config_hash() != release_configs[30].config_hash()
+    arrival_after, _ = read_canonical_json(artifact_directory / ARTIFACT_FILENAMES["arrival"])
+    initial_after, _ = read_canonical_json(
+        artifact_directory / ARTIFACT_FILENAMES["initial_condition"]
+    )
+    assert arrival_ids == [row["arrival_time_id"] for row in arrival_after["records"]]
+    assert initial_pairs == [
+        (row["receptor_id"], row["arrival_time_id"])
+        for row in initial_after["records"]
+    ]
+
+    over_path = root / "release-31-day.yaml"
+    with pytest.raises(ValueError, match="不得超過"):
+        create_release_config(
+            config_template_path=config_path,
+            input_directory=artifact_directory,
+            output_path=over_path,
+            formal=False,
+            max_backtrack_days=31,
+            maximum_step_count=8_640,
+        )
+    assert not over_path.exists()
+    short_steps_path = root / "release-30-day-short-steps.yaml"
+    with pytest.raises(ValueError, match="maximum_step_count"):
+        create_release_config(
+            config_template_path=config_path,
+            input_directory=artifact_directory,
+            output_path=short_steps_path,
+            formal=False,
+            max_backtrack_days=30,
+            maximum_step_count=8_639,
+        )
+    assert not short_steps_path.exists()
 
 
 def test_hsinchu_explicit_pilot_window_is_deterministic_and_keeps_full_counts(

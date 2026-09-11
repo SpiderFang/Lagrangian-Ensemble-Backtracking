@@ -19,11 +19,11 @@ from types import ModuleType
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "render_source_code_architecture_map.py"
 
-# 前 18 筆是原先位於 docs 根層的文件：其中 17 筆已依主題搬入子目錄，
-# implementation_status.md 仍留在根層作為目前狀態的單一索引。第 19 筆是後續新增的
-# 新竹 pilot 參數紀錄，沒有待相容的舊根層路徑，因此以 current/original 相同的
-# self-alias 形式納入契約。測試同時核對現行路徑與索引中的原路徑文字，避免整理文件
-# 或新增交付文件時遺失任一份歷史、現行或新註冊內容。
+# 這份明示清單保存文件搬移後的現行路徑、索引中仍需可追溯的原路徑，以及沒有舊
+# 路徑可相容的新增文件。current/original 相同時代表 self-alias；它仍是有意識的
+# 文件契約，不是漏填舊路徑。新增文件即使尚未 stage，也必須先列入清單，讓本機驗收
+# 與後續乾淨 checkout 使用同一份文件拓撲；測試另外以 Git 索引限制一般掃描範圍，
+# 避免把未登錄的私人資料或執行產物算入連結分母。
 DOCUMENT_CATALOG: tuple[tuple[str, str], ...] = (
     ("docs/implementation_status.md", "docs/implementation_status.md"),
     (
@@ -81,6 +81,10 @@ DOCUMENT_CATALOG: tuple[tuple[str, str], ...] = (
     ("docs/operations/cli_reference.md", "docs/cli_reference.md"),
     ("docs/operations/git_deployment_and_data_sync.md", "docs/git_deployment_and_data_sync.md"),
     ("docs/operations/pilot_run_plan.md", "docs/pilot_run_plan.md"),
+    (
+        "docs/operations/16_performance_improvement_tracks.md",
+        "docs/operations/16_performance_improvement_tracks.md",
+    ),
 )
 
 # 只抓取一般 Markdown 連結，不把圖片語法的開頭驚嘆號當成另一個連結；外部 URL
@@ -91,6 +95,27 @@ EXTERNAL_LINK_PREFIXES = ("http://", "https://", "mailto:")
 # 排除它們可讓「全 repo 文件」驗收聚焦於可交付的 tracked 文件與本次新增索引。
 NON_DELIVERABLE_MARKDOWN_DIRECTORIES = frozenset(
     {".git", ".pytest_cache", ".venv", "BayTrace", "dist", "outputs", "tmp", "work"}
+)
+# 這些是架構圖文件拓撲必須覆蓋的穩定入口與分類目錄。它們驗證掃描器確實走過
+# README／文件索引及每一個交付分類；連結數會隨文件增加而變動，因此不以總數當作
+# 完整性代理指標。
+REQUIRED_MARKDOWN_ENTRYPOINTS = frozenset(
+    {
+        "README.md",
+        "docs/README.md",
+        "docs/implementation_status.md",
+        "docs/operations/cli_reference.md",
+        "docs/operations/16_performance_improvement_tracks.md",
+    }
+)
+REQUIRED_MARKDOWN_DIRECTORIES = frozenset(
+    {
+        "docs/foundation",
+        "docs/operations",
+        "docs/results",
+        "docs/development",
+        "docs/archive",
+    }
 )
 
 
@@ -143,10 +168,35 @@ def _iter_tracked_markdown_paths() -> tuple[Path, ...]:
     return tuple(sorted(paths))
 
 
+def _iter_markdown_paths_for_link_scan() -> tuple[Path, ...]:
+    """取得連結掃描的 Markdown 來源，兼顧 Git 基線與明示新增文件。
+
+    Git 索引仍是一般掃描的基準，避免本機忽略的快取、輸出或私人草稿改變驗收範圍。
+    ``DOCUMENT_CATALOG`` 的 current 路徑則額外加入 union；這讓尚未 stage 的新交付文件
+    也會立即接受每條本地連結檢查，stage 後則與 tracked 集合自然去重。只有清單內明示
+    且位於 checkout 的文件可走這條額外路徑，不會因此放寬成任意未追蹤 Markdown 掃描。
+    """
+
+    catalog_paths: set[Path] = set()
+    for current_path, _ in DOCUMENT_CATALOG:
+        relative_path = Path(current_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise RuntimeError(f"DOCUMENT_CATALOG 不是安全的相對路徑：{current_path}")
+        source_path = PROJECT_ROOT / relative_path
+        if not source_path.is_file():
+            raise RuntimeError(
+                f"DOCUMENT_CATALOG 指向不存在的 current 文件：{current_path}；"
+                "請先建立文件或修正 catalog。"
+            )
+        catalog_paths.add(source_path)
+    return tuple(sorted(set(_iter_tracked_markdown_paths()) | catalog_paths))
+
+
 def _iter_local_markdown_links() -> list[tuple[Path, str, Path]]:
     """列出全 repository Markdown 中的本地連結及其解析後目標。
 
-    來源限定為 Git 索引中的追蹤 Markdown，避免本機忽略的資料快取改變驗收分母。
+    來源以 Git 索引中的追蹤 Markdown 為主，並 union ``DOCUMENT_CATALOG`` 明示的
+    current 文件；因此新文件在 stage 前也會受驗收，未登錄的私人資料仍不會被掃描。
     掃描以連結所在 Markdown 檔案的父目錄為基準，這樣文件搬移後的 ``../`` 層級會
     直接受到測試約束。外部 DOI、網頁與電子郵件連結不屬於本地檔案拓撲，因此排除；
     只有去除片段識別碼後的實際路徑會交由呼叫端檢查是否存在。回傳原始檔、原始目標
@@ -154,7 +204,7 @@ def _iter_local_markdown_links() -> list[tuple[Path, str, Path]]:
     """
 
     links: list[tuple[Path, str, Path]] = []
-    for source_path in _iter_tracked_markdown_paths():
+    for source_path in _iter_markdown_paths_for_link_scan():
         # 只以 checkout 內的相對路徑判斷執行產物目錄；SERVER checkout 常位於
         # ``/home/mustlab/work/...``，若直接檢查絕對路徑的 parts，外層部署目錄
         # ``work`` 會誤排除整個 repository，令連結數從 142 變成 0。
@@ -251,6 +301,7 @@ def test_catalog_groups_and_flow_edges_are_closed() -> None:
         "run_preflight_command",
         "run_create",
         "run_shard",
+        "run_worker",
         "run_reconcile",
         "run_validate_run",
         "run_report_validate",
@@ -744,16 +795,20 @@ def test_readme_states_report_boundary_without_claiming_renderer_completion() ->
 
 
 def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> None:
-    """確認文件總入口涵蓋分類與 20 筆 catalog/alias 契約，且本地連結不斷裂。
+    """確認文件總入口涵蓋分類與 21 筆 catalog/alias 契約，且本地連結不斷裂。
 
-    這裡檢查的是所有 Markdown 檔案的實際連結拓撲，包含跨分類文件、設定檔、測試、
-    圖檔與 PDF；不只檢查新加入的閱讀提示，也確認新竹 pilot 文件以 self-alias
-    登錄。外部 DOI 與網頁連結由掃描器排除，因為它們不是本地檔案存在性可以驗收的範圍。
+    這裡檢查的是所有納入掃描範圍的 Markdown 檔案實際連結拓撲，包含跨分類文件、設定檔、
+    測試、圖檔與 PDF；不只檢查新加入的閱讀提示，也確認新竹 pilot 與效能改善文件以
+    self-alias 登錄。外部 DOI 與網頁連結由掃描器排除，因為它們不是本地檔案存在性可以
+    驗收的範圍。文件數與連結數可隨內容增加，完整性改由入口／分類覆蓋及每條連結存在性
+    驗證共同保證。
     """
 
     index_path = PROJECT_ROOT / "docs" / "README.md"
     index = index_path.read_text(encoding="utf-8")
-    assert len(DOCUMENT_CATALOG) == 20
+    assert len(DOCUMENT_CATALOG) == 21
+    current_catalog_paths = {current_path for current_path, _ in DOCUMENT_CATALOG}
+    assert len(current_catalog_paths) == len(DOCUMENT_CATALOG)
     for category in ("foundation/", "operations/", "results/", "development/", "archive/"):
         assert category in index
     for current_path, original_path in DOCUMENT_CATALOG:
@@ -768,12 +823,23 @@ def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> Non
         archive_text = archive_path.read_text(encoding="utf-8")
         assert "今天狀態以 [實作狀態](../implementation_status.md) 為準" in archive_text
 
+    scanned_markdown_paths = {
+        path.relative_to(PROJECT_ROOT).as_posix()
+        for path in _iter_markdown_paths_for_link_scan()
+    }
+    assert scanned_markdown_paths >= REQUIRED_MARKDOWN_ENTRYPOINTS
+    assert current_catalog_paths <= scanned_markdown_paths
+    scanned_directories = {
+        str(Path(path).parent)
+        for path in scanned_markdown_paths
+        if path.startswith("docs/")
+    }
+    assert scanned_directories >= REQUIRED_MARKDOWN_DIRECTORIES
+
     local_links = _iter_local_markdown_links()
-    # 147 是本次加入四區稽核文件與其六個導覽連結後，Git 追蹤 Markdown 的固定連結基線；
-    # 小型時間重建文獻索引 README 已納入追蹤，工項 3 原始 PDF 則維持本機限定且不建立失效連結。
-    # 這個數字是在收斂掃描範圍並修復兩個真實斷鏈後，由本機與 SERVER detached
-    # checkout 共同核對所得，避免用改數字掩蓋兩邊拓撲差異。
-    assert len(local_links) == 147
+    # 連結總數會隨文件內容正常變動；逐條檢查解析後目標存在，才能同時抓到新文件漏掃與
+    # 既有文件斷鏈。入口／目錄覆蓋則確保掃描器沒有只處理少數已知來源來掩蓋漏掃。
+    assert local_links
     broken_links = [
         (
             source_path.relative_to(PROJECT_ROOT).as_posix(),

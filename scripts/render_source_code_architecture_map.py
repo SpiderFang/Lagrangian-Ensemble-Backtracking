@@ -49,6 +49,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "arrival_times",
             "manifests",
             "input_derivation",
+            "input_horizon",
         ),
     },
     {
@@ -261,13 +262,16 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "inputs": "ParticleState、VelocityProvider、時間步長與擴散係數",
         "outputs": "下一個 ParticleState 或 SamplingError",
         "entrypoints": [
+            "StepStartSampleReuseProvider",
+            "supports_step_start_sample_reuse",
             "SurfaceStageVelocityProvider",
             "rk4_step",
             "split_rk4_brownian_step",
         ],
         "read_first": (
-            "確認逆向只把時間步取反一次；只有下一次折半低於 dt_min 且已證實為非上浮的 "
-            "k2--k4 海面上越，才以鏡射 z 重查速度，隨機位移仍只放在完整 RK4 後。"
+            "確認逆向只把時間步取反一次；StepStartSampleReuseProvider 只有在速度資料唯讀且同點 "
+            "結果穩定時才允許重用步首樣本，普通 provider 仍逐 stage 取樣。只有下一次折半低於 "
+            "dt_min 且已證實為非上浮的 k2--k4 海面上越，才以鏡射 z 重查速度，隨機位移仍只放在完整 RK4 後。"
         ),
     },
     "boundaries": {
@@ -348,10 +352,18 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "role": "以 CPU/NumPy 執行可暫停的分塊粒子批次",
         "inputs": "ScenarioShard、RuntimeRequestFactory、ParticleBatch 與 reference engine 單步介面",
         "outputs": "固定順序的 ParticleResult、checkpoint-ready execution state 與 batch 摘要",
-        "entrypoints": ["ProductionBatch", "run_production_shard"],
+        "entrypoints": [
+            "HintTrackingVelocityProvider",
+            "ProductionParticleRuntime",
+            "ProductionAdvanceResult",
+            "ProductionBatch",
+            "run_production_shard",
+        ],
         "read_first": (
             "確認 active mask、compaction、chunking 與 scatter 只改變執行排程，不改粒子 "
-            "identity、物理呼叫或亂數序列。"
+            "identity、物理呼叫或亂數序列。HintTrackingVelocityProvider 只傳遞不改變物理結果的 "
+            "mesh triangle hint，並把底層明示的步首樣本重用能力交給 engine；checkpoint 仍保存 "
+            "可恢復的粒子狀態、提示與 RNG continuation。"
         ),
         "baytrace_integration": (
             "借鑑 BayTrace CPU batch 的 active mask／compaction 與 chunking；本專案目前只採 "
@@ -446,10 +458,17 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "role": "依 UTC 月份 lazy 載入並限制 resident forcing cache",
         "inputs": "flow domain、NativeMesh、OCM/NWW schema 產品根目錄與粒子 UTC stage",
         "outputs": "ForcingWindowManager、material facade、CombinedMonthForcing 與 immutable cache stats",
-        "entrypoints": ["ForcingWindowManager", "ForcingWindowManager.from_roots"],
+        "entrypoints": [
+            "ForcingCacheStats",
+            "ManagedForcingProvider",
+            "ManagedSpatialDiffusionProvider",
+            "ForcingWindowManager",
+            "ForcingWindowManager.from_roots",
+        ],
         "read_first": (
             "月份選擇只依 UTC 時間，缺月、產品損壞與波浪不可用需維持不同品質狀態；"
-            "manager 是單一 process 使用的 lazy LRU。"
+            "ManagedForcingProvider 只保存 manager 與 material 設定並明示唯讀步首樣本可重用，"
+            "ManagedSpatialDiffusionProvider 則只走 OCM 路徑；manager 是單一 process 使用的 lazy LRU。"
         ),
     },
     "manifests": {
@@ -464,6 +483,22 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": (
             "先看 unknown key、缺值、跨參照、CRS、座標與公尺制物理不等式如何在 runtime 前 "
             "fail-fast。"
+        ),
+    },
+    "input_horizon": {
+        "role": "驗證共同到達母體的通用回溯支援窗與逐時缺口證據",
+        "inputs": "支援日數、執行日數、到達身分與 UTC、已綁定來源的時間範圍及缺口摘要",
+        "outputs": "有界逐時窗口、重新計算的支援節點與缺時、共同母體語意驗證結果",
+        "entrypoints": [
+            "resolve_configured_horizon",
+            "build_horizon_window",
+            "compute_horizon_coverage",
+            "validate_generic_gap_payload",
+        ],
+        "read_first": (
+            "先分清輸入要求的支援上限與單次回溯長度；以母體上限篩選共同日期，"
+            "核對逐筆到達身分、起訖與缺口。日數不使用固定選單；超長窗口先檢查"
+            "時間整數範圍與資料期，避免配置巨量陣列。來源檔案驗證由 input_derivation 負責。"
         ),
     },
     "input_derivation": {
@@ -487,7 +522,9 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": (
             "這是正式 runtime 的輸入前置閘門：只讀已驗收產品，不回讀 raw NetCDF；缺時、"
             "symbolic link、schema、幾何支援與 component hash 任一不符都要 fail-closed，"
-            "不能以最近值、零值或 synthetic fallback 補齊。"
+            "不能以最近值、零值或 synthetic fallback 補齊。共同輸入以 backtrack_support_days "
+            "要求支援窗，release config 的 max_backtrack_days 則決定各次執行長度；"
+            "重用母體仍須核對每個到達時刻的完整時間證據。"
         ),
     },
     "provenance": {
@@ -512,7 +549,8 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ],
         "read_first": (
             "plan 與 progress 的可變性、lock 順序、checkpoint generation 及 "
-            "output-before-progress crash window 都是恢復正確性的核心。"
+            "output-before-progress crash window 都是恢復正確性的核心。共用 controller 的快取"
+            "計數須扣除每次分片執行前基準，續跑只合併該分片已保存增量；狀態量使用樣本最大值。"
         ),
     },
     "run_locking": {
@@ -527,7 +565,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "inputs": "run plan/progress、scenario／seed table、lock topology、checkpoint/output checksum",
         "outputs": "JSON-safe valid/errors/summary 與 benchmark report；不修復現場檔案",
         "entrypoints": ["validate_run", "benchmark_report"],
-        "read_first": "驗證器要拒絕未知檔案、錯誤 checksum、錯誤 identity/order 與不合法 lifecycle，不能替 caller 偷修 progress 或刪除資料。",
+        "read_first": "驗證器要拒絕未知檔案、錯誤 checksum、錯誤 identity/order 與不合法 lifecycle，不能替 caller 偷修 progress 或刪除資料。工程報告只加總有明確語意的分片快取增量；歷史或不完整量測不能冒稱精確總量，常駐位元組的樣本最大值不是整機峰值。",
     },
     "pilot_matrix_validation": {
         "role": "比較多區 engineering pilot 是否沿用同一組可重現執行設定",
@@ -551,6 +589,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "run_preflight_command",
             "run_create",
             "run_shard",
+            "run_worker",
             "run_reconcile",
             "run_validate_run",
             "run_pilot_matrix_validate",
@@ -559,7 +598,8 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ],
         "read_first": (
             "正式鏈路依序閱讀 main → run_preflight_command（--formal-release）→ run_create → "
-            "run_shard／run_reconcile → run_validate_run；synthetic 與設定檢查是輔助入口，"
+            "run_shard／run_worker／run_reconcile → run_validate_run；run_worker 先驗證同一 run 的 "
+            "全部 shard ID，再在單一 controller 內依指定順序連續執行；synthetic 與設定檢查是輔助入口，"
             "不能取代 formal inventory gate。report-spec-create 只建立 renderer 規格；"
             "run_report_validate／report-validate 只讀取 caller 明示的既有 report-v1 release，"
             "不猜測路徑、不建立產品，也不把 engineering validator 通過稱為科學成果。"

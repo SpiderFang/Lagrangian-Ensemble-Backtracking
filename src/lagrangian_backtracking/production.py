@@ -29,7 +29,7 @@ from .engine import (
     finalize_particle_execution,
     initialize_particle_execution,
 )
-from .integrators import VelocityProvider
+from .integrators import VelocityProvider, supports_step_start_sample_reuse
 from .models import ParticleState, ParticleStatus, VelocitySample
 from .runner import (
     ReferenceParticleRequest,
@@ -97,6 +97,19 @@ class HintTrackingVelocityProvider:
         """在 restore 或下一個 sweep 前設定目前粒子的 mesh hint。"""
 
         self.triangle_hint = self._normalize_hint(value)
+
+    @property
+    def step_start_sample_reuse_safe(self) -> bool:
+        """回傳底層速度取樣器是否明示允許步首樣本重用。
+
+        包裝器本身會更新三角形搜尋提示，但提示只影響原生網格搜尋順序，不是物理結果的
+        來源。只有底層速度取樣器實作 ``StepStartSampleReuseProvider`` 且明示回傳 ``True``
+        時，才把這項能力傳給粒子引擎；普通四參數可呼叫物件仍保留每個階段的原始查詢次數
+        與副作用。
+        """
+
+        # 共用 integrators 的保守檢查；連同能力屬性的屬性讀取例外，都回到原始查詢路徑。
+        return supports_step_start_sample_reuse(self.provider)
 
     def sample(
         self,

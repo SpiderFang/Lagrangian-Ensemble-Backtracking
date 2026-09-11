@@ -140,6 +140,12 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
+效能改善以[四區五站正式運算與單站試跑兩條工作線](docs/operations/16_performance_improvement_tracks.md)推進，優先降低正式全矩陣的總耗時，再縮短單站小試跑的準備成本。首批提供 `run-worker` 接續執行同 run 的指定分片並重用流場管理器、正常步首速度樣本重用，以及 OCM 表面資料的少量格點取值；使用方法見[CLI 參考](docs/operations/cli_reference.md)。30 天回溯仍須完整資料支援、版本化輸入驗收與現有 SERVER 實測；局部取樣加速或短試跑完成不能代替全案工期證據。
+
+持續 worker 的快取計數按分片執行增量保存，續跑合併已保存增量，避免共用管理器的累計次數被報告重複相加；常駐位元組等狀態量以樣本最大值呈現。歷史缺少計數語意或量測不完整的紀錄須保留限制說明，不能作為精確總量。
+
+回溯日數採通用參數：`inputs.backtrack_support_days` 指定共同輸入要篩選與驗證的正整日上限，`boundaries.max_backtrack_days` 指定本次實際回溯長度。先建置並驗證支援 30 日的共同輸入，即可由 `release-config-create --max-backtrack-days` 產生 7 日、30 日等獨立執行設定，保留同一批到達時刻與情境，不必重跑整套 `inputs-build`。天數不是限定選單；超出既有輸入上限時須另建並驗證較長版本。設定範例、步數預算與來源綁定限制見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)與[CLI 參考](docs/operations/cli_reference.md)。
+
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
 
 ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。

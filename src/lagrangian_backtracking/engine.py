@@ -35,6 +35,7 @@ from .integrators import (
     SurfaceStageVelocityProvider,
     VelocityProvider,
     split_rk4_brownian_step,
+    supports_step_start_sample_reuse,
 )
 from .models import (
     SURFACE_BOUNDARY_TOLERANCE_M,
@@ -1309,6 +1310,10 @@ def advance_particle_once(
                 context=error.context,
             ),
         )
+    # 只有明示唯讀、相同輸入可重現的速度取樣器，才能把步首樣本交給 RK4 的 k1。
+    # 一般可呼叫物件不具備這個能力，仍維持「步首查詢一次，再由 RK4 查詢 k1--k4」的
+    # 原始呼叫順序；此判斷也讓後續海面階段速度包裝器重試不會誤用步首樣本。
+    step_start_sample = reference if supports_step_start_sample_reuse(velocity) else None
     try:
         # 擴散 provider 僅以步首狀態取樣一次；同一個 immutable sample 會同時供
         # choose_time_step 與 RK4 後 split 使用，避免步長與實際位移看到不同的 K。
@@ -1388,6 +1393,7 @@ def advance_particle_once(
                 velocity=velocity,
                 coefficients=diffusion_sample,
                 rng=rng,
+                step_start_sample=step_start_sample,
             )
             break
         except SamplingError as error:
@@ -1401,7 +1407,10 @@ def advance_particle_once(
             if proven_surface_crossing and next_step_seconds >= settings.dt_min_seconds:
                 # RK4 stage 失敗發生在 Brownian operator split 之前，所以縮短步長重試不會
                 # 消耗亂數。只有完整 stage 成功後才會進入一次 Brownian；若縮短後仍越面，
-                # 會繼續二分直到設定的 dt_min，避免過早改用 stage 邊界條件。
+                # 會繼續二分直到設定的 dt_min，避免過早改用階段邊界條件。第一次
+                # 嘗試以步首樣本重用 k1；一旦進入折半，後續重試重新查詢 k1，讓
+                # 速度取樣器的三角形搜尋提示／其他查詢狀態維持原本重試呼叫順序。
+                step_start_sample = None
                 accepted_step_seconds = next_step_seconds
                 surface_retry_count += 1
                 continue
@@ -1424,6 +1433,9 @@ def advance_particle_once(
                         velocity=adjusted_velocity,
                         coefficients=diffusion_sample,
                         rng=rng,
+                        # 反射包裝器的階段計數器必須從 k1 開始，且其 k1 可能
+                        # 需要重新取得原始邊界樣本；因此不能沿用原速度取樣器的步首樣本。
+                        step_start_sample=None,
                     )
                 except SamplingError as adjusted_error:
                     stage_error = adjusted_error

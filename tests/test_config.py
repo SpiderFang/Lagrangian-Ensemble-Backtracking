@@ -144,6 +144,49 @@ def test_config_hash_is_independent_of_mapping_order() -> None:
     assert first.config_hash() == second.config_hash()
 
 
+def test_omitted_backtrack_support_keeps_current_example_hash() -> None:
+    """未宣告新支援欄位時，現行範例 hash 必須維持主專案已凍結值。"""
+
+    config = ProjectConfig.model_validate(_payload())
+    assert config.config_hash() == "163ee4f9f113a567206a28354e69e783db2da4eedc6ea618276893d4c1554214"
+    assert "backtrack_support_days" not in config.normalized_payload()["inputs"]
+
+
+def test_explicit_backtrack_support_is_strict_and_bounds_requested_horizon() -> None:
+    """明示母體支援窗只接受正整日，且 requested 不得超出母體。"""
+
+    payload = _payload()
+    payload["inputs"]["backtrack_support_days"] = 30
+    payload["boundaries"].update({"max_backtrack_days": 7.0, "maximum_step_count": 10_000})
+    config = ProjectConfig.model_validate(payload)
+    assert config.inputs.backtrack_support_days == 30
+    assert config.effective_backtrack_support_days == 30
+
+    for invalid in (True, 0, -1, 30.0, "30", float("nan"), float("inf")):
+        candidate = deepcopy(payload)
+        candidate["inputs"]["backtrack_support_days"] = invalid
+        with pytest.raises((TypeError, ValueError)):
+            ProjectConfig.model_validate(candidate)
+
+    over = deepcopy(payload)
+    over["boundaries"]["max_backtrack_days"] = 31.0
+    with pytest.raises(ValueError, match="不得超過"):
+        ProjectConfig.model_validate(over)
+
+
+def test_explicit_null_backtrack_support_only_allows_preparation_config() -> None:
+    """明示 null 表示母體尚未定案；有 requested horizon 時必須 fail closed。"""
+
+    payload = _payload()
+    payload["inputs"]["backtrack_support_days"] = None
+    payload["boundaries"].update({"max_backtrack_days": None, "maximum_step_count": None})
+    assert ProjectConfig.model_validate(payload).inputs.backtrack_support_days is None
+    requested = deepcopy(payload)
+    requested["boundaries"]["max_backtrack_days"] = 7.0
+    with pytest.raises(ValueError, match="尚未定案"):
+        ProjectConfig.model_validate(requested)
+
+
 def test_legacy_config_hash_preserves_omitted_policy_semantics() -> None:
     """未含新 policy 欄位的既有設定必須保留舊 canonical hash 與 payload 語意。"""
 

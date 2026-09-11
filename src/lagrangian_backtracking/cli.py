@@ -4,7 +4,8 @@ CLI 只接受明示路徑或環境變數，不把本機／SERVER 絕對路徑寫
 輸出預設為 JSON，方便 runbook、排程器與後續 manifest 驗證使用；錯誤訊息寫到 stderr
 並以非零狀態退出，避免 shell 批次把未通過 gate 的結果當成功。run-create 只
 建立 pilot 或 formal workspace 並立即做只讀驗證；run-shard 先驗證 workspace，再依
-immutable plan 選擇 runtime mode 與 forcing root；run-reconcile 僅採認 checkpoint／progress
+immutable plan 選擇 runtime mode 與 forcing root；run-worker 在同一個 controller 內依
+命令列順序連續執行已驗證的多個 shard；run-reconcile 僅採認 checkpoint／progress
 狀態，不建立物理 request，也不啟動 forcing。aggregate-spec-create、aggregate-build、
 aggregate-validate、report-spec-create 與 report-validate 分別負責建立公尺制格網／秒制
 age 規格、串流建立並原子發布 aggregate release、輸出固定 JSON-safe aggregate 驗證報告、
@@ -27,11 +28,12 @@ import os
 import stat
 import sys
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import numpy as np
 from shapely.geometry import box
@@ -177,6 +179,16 @@ def _release_config_create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config-template", "--config", dest="config_template", required=True, type=Path)
     parser.add_argument("--input-directory", "--manifests", dest="input_directory", required=True, type=Path)
     parser.add_argument("--output", "--destination", dest="output", required=True, type=Path)
+    parser.add_argument(
+        "--max-backtrack-days",
+        type=float,
+        help="只覆寫輸出 release config 的 requested 回溯日數；不改 template 或 input artifact",
+    )
+    parser.add_argument(
+        "--maximum-step-count",
+        type=int,
+        help="只覆寫輸出 release config 的最大步數；不足以涵蓋 requested horizon 時拒絕",
+    )
     parser.set_defaults(formal=True)
     parser.add_argument("--formal-release", "--formal", dest="formal", action="store_true")
     parser.add_argument(
@@ -421,6 +433,28 @@ def _run_shard_parser() -> argparse.ArgumentParser:
     parser.add_argument("workspace", type=Path)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--shard-id", required=True)
+    parser.add_argument("--ocm-native-root", type=Path)
+    parser.add_argument("--nww-analysis-root", type=Path)
+    parser.add_argument("--checkpoint-root", type=Path)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--sweep-budget", type=_positive_cli_int)
+    return parser
+
+
+def _run_worker_parser() -> argparse.ArgumentParser:
+    """建立同一 run 內連續執行多個 shard 的 parser。
+
+    這個入口沿用 ``run-shard`` 的 workspace、config、forcing root、resume、checkpoint
+    與 sweep 選項；唯一差異是 ``--shard-id`` 可重複指定，並由 handler 先完整驗證所有
+    ID。這裡不提供自動挑選或跨 run 的選項，讓連續執行的 runtime manager 明確只屬於
+    caller 指定的單一 immutable workspace。
+    """
+
+    parser = argparse.ArgumentParser(description="在同一個 run 內連續執行指定的多個 shard")
+    parser.add_argument("workspace", type=Path)
+    parser.add_argument("--config", required=True, type=Path)
+    # 使用 append 保留 caller 的命令列順序；handler 會拒絕重複與不存在的 ID。
+    parser.add_argument("--shard-id", action="append", required=True)
     parser.add_argument("--ocm-native-root", type=Path)
     parser.add_argument("--nww-analysis-root", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
@@ -761,6 +795,43 @@ def _root_from_argument_or_env(value: Path | None, env_name: str) -> Path:
     return Path(raw)
 
 
+def _validate_worker_shard_ids(
+    plan: Mapping[str, object], requested_ids: Sequence[str]
+) -> tuple[str, ...]:
+    """驗證 worker 的完整 shard 清單，並保留 caller 指定的執行順序。
+
+    ``run-worker`` 必須在第一片開始前確認所有 ID 都屬於同一份 immutable run plan；否則
+    第一片可能已經取得鎖、建立 checkpoint 或讀取 forcing，才發現後續 ID 拼寫錯誤。
+    這裡同時拒絕命令列重複、plan 內重複與缺少的 shard，且不做自動排序、補片或跨 run
+    搜尋。真正的 scenario、seed、checkpoint、provenance 與 lock 校驗仍由既有
+    ``RunController.run_shard`` 保留執行，這個 helper 只負責 worker 的批次入口邊界。
+    """
+
+    if not requested_ids:
+        raise ValueError("run-worker 至少需要一個 --shard-id")
+    if any(type(shard_id) is not str or not shard_id for shard_id in requested_ids):
+        raise ValueError("run-worker 的 --shard-id 必須是非空字串")
+    if len(set(requested_ids)) != len(requested_ids):
+        raise ValueError("run-worker 的 --shard-id 不可重複")
+
+    raw_shards = plan.get("shards")
+    if not isinstance(raw_shards, list):
+        raise ValueError("run plan shards 必須是 list")
+    plan_ids: list[str] = []
+    for row in raw_shards:
+        if not isinstance(row, Mapping) or type(row.get("shard_id")) is not str:
+            raise ValueError("run plan shard 缺少合法 shard_id")
+        plan_ids.append(row["shard_id"])
+    if len(set(plan_ids)) != len(plan_ids):
+        raise ValueError("run plan 的 shard_id 不可重複")
+
+    plan_id_set = set(plan_ids)
+    missing = [shard_id for shard_id in requested_ids if shard_id not in plan_id_set]
+    if missing:
+        raise ValueError("run-worker 指定的 shard_id 不存在於 run plan")
+    return tuple(requested_ids)
+
+
 def _parse_pilot_arrival_utc_options(values: Sequence[str] | None) -> dict[str, str]:
     """把 CLI 的重複 ``SITE=UTC`` 選項轉成 builder 使用的 mapping。
 
@@ -896,11 +967,20 @@ def run_release_config_create(argv: Sequence[str] | None = None) -> int:
     """由 input artifact 產生新的 release config，並輸出 approved/generated 狀態。"""
 
     args = _release_config_create_parser().parse_args(argv)
+    # 舊呼叫未提供新 flags 時維持原本的關鍵字集合，讓外部 wrapper／測試的 mock
+    # 仍可相容；只在 caller 明示覆寫值時才把新參數傳給核心函式。
+    release_kwargs: dict[str, Any] = {
+        "config_template_path": args.config_template,
+        "input_directory": args.input_directory,
+        "output_path": args.output,
+        "formal": args.formal,
+    }
+    if args.max_backtrack_days is not None:
+        release_kwargs["max_backtrack_days"] = args.max_backtrack_days
+    if args.maximum_step_count is not None:
+        release_kwargs["maximum_step_count"] = args.maximum_step_count
     result = create_release_config(
-        config_template_path=args.config_template,
-        input_directory=args.input_directory,
-        output_path=args.output,
-        formal=args.formal,
+        **release_kwargs,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
@@ -1347,6 +1427,102 @@ def run_shard(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def run_worker(argv: Sequence[str] | None = None) -> int:
+    """在同一個 runtime controller 內依指定順序連續執行多個 shard。
+
+    先做一次既有 workspace validator、讀取 immutable plan 並驗證全部 ``--shard-id``；
+    只有所有 ID 都存在且不重複時，才載入 config、解析 forcing root、開啟一次
+    ``RunController``。之後每片都呼叫同一個 controller 的 ``run_shard``，讓其既有
+    RuntimeRequestFactory、流場月份管理器、網格與 lock／checkpoint／provenance gate
+    依原契約運作。某片回傳 ``PAUSED`` 即停止後續片；任何例外（包含 lock contention）
+    直接向 caller 傳出，不以跳過或部分成功掩蓋錯誤。
+
+    成功時 stdout 只輸出一份 JSON，內含所有實際執行片的 ``RunExecutionSummary``、
+    handler 前置時間與整個命令時間。時間從本 handler 開始計算，明確不包含 Python
+    啟動與模組匯入；它是單一程序的 command wall／CPU 時間，不是多 worker 整機經過時間。
+
+    ``--sweep-budget`` 會原樣套用到每一片；resume、external checkpoint root、forcing
+    root 與 config 也沿用 ``run-shard`` 的參數與驗證邊界，不跨 run 共用任何 runtime。
+    """
+
+    started_wall = time.perf_counter()
+    started_cpu = time.process_time()
+    args = _run_worker_parser().parse_args(argv)
+    validation = validate_run(
+        args.workspace,
+        require_complete=False,
+        checkpoint_root=args.checkpoint_root,
+    )
+    if not isinstance(validation, Mapping) or validation.get("valid") is not True:
+        print(json.dumps(validation, ensure_ascii=False, sort_keys=True))
+        return 2
+
+    # validator 通過後才讀 immutable plan；這一步同時阻止 config／forcing／controller
+    # 在 workspace invalid 時建立。所有指定 ID 先完整檢查，再進入任何 shard 執行。
+    plan = load_run_plan(args.workspace)
+    run_kind = plan.get("run_kind")
+    if type(run_kind) is not str or run_kind not in {"pilot", "formal"}:
+        raise ValueError("run plan run_kind 只允許 pilot 或 formal")
+    run_id = plan.get("run_id")
+    if type(run_id) is not str:
+        raise ValueError("run plan run_id 必須是字串")
+    shard_ids = _validate_worker_shard_ids(plan, args.shard_id)
+
+    config = load_config(args.config, formal_release=run_kind == "formal")
+    input_config = config.inputs
+    ocm_root = _root_from_argument_or_env(
+        args.ocm_native_root,
+        input_config.ocm_native_root_env,
+    )
+    nww_root = _optional_root_from_env(
+        args.nww_analysis_root,
+        input_config.nww_analysis_root_env,
+    )
+    controller = open_run_controller(
+        args.workspace,
+        config_path=args.config,
+        ocm_native_root=ocm_root,
+        nww_analysis_root=nww_root,
+        resume=args.resume,
+        checkpoint_root=args.checkpoint_root,
+    )
+    preflight_wall = time.perf_counter() - started_wall
+    preflight_cpu = time.process_time() - started_cpu
+
+    summaries: list[dict[str, object]] = []
+    paused_shard_id: str | None = None
+    for shard_id in shard_ids:
+        # 每一片共用同一個 controller；run-control 仍會為各 shard 取得自己的 lock，
+        # 並以既有 checkpoint／輸出 validator 判定 COMPLETE、PAUSED 或失敗。
+        summary = controller.run_shard(shard_id, sweep_budget=args.sweep_budget)
+        summaries.append(asdict(summary))
+        if summary.lifecycle == "PAUSED":
+            paused_shard_id = shard_id
+            break
+
+    command_wall = time.perf_counter() - started_wall
+    command_cpu = time.process_time() - started_cpu
+    payload = {
+        "artifact_type": "run_worker_execution_summary",
+        "schema_version": "1.0.0",
+        "run_id": run_id,
+        "requested_shard_ids": list(shard_ids),
+        "executed_shards": summaries,
+        "stopped_after_paused_shard_id": paused_shard_id,
+        "timing": {
+            "includes_python_import": False,
+            "includes_python_startup": False,
+            "preflight_wall_seconds": preflight_wall,
+            "preflight_process_cpu_seconds": preflight_cpu,
+            "command_wall_seconds": command_wall,
+            "command_process_cpu_seconds": command_cpu,
+            "scope": "單一程序 run-worker handler；不含 Python 啟動與模組匯入",
+        },
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def run_reconcile(argv: Sequence[str] | None = None) -> int:
     """只 reconcile checkpoint／progress，禁止載入 config 或進入物理計算。
 
@@ -1775,6 +1951,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers.add_parser("benchmark-report", parents=[_benchmark_report_parser()], add_help=False)
     subparsers.add_parser("run-create", parents=[_run_create_parser()], add_help=False)
     subparsers.add_parser("run-shard", parents=[_run_shard_parser()], add_help=False)
+    subparsers.add_parser("run-worker", parents=[_run_worker_parser()], add_help=False)
     subparsers.add_parser("run-reconcile", parents=[_run_reconcile_parser()], add_help=False)
     subparsers.add_parser(
         "aggregate-spec-create",
@@ -1852,6 +2029,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_create(command_argv)
     if parsed.command == "run-shard":
         return run_shard(command_argv)
+    if parsed.command == "run-worker":
+        return run_worker(command_argv)
     if parsed.command == "run-reconcile":
         return run_reconcile(command_argv)
     if parsed.command == "aggregate-spec-create":

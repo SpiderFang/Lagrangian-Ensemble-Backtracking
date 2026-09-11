@@ -57,6 +57,7 @@ from .manifests import (
     ScenarioInputs,
     load_boundary_geometries,
     load_scenario_inputs,
+    resolve_manifest_path,
 )
 from .models import ParticleState
 from .pilot_selection import (
@@ -777,6 +778,51 @@ def _validated_pilot_inventory(
     return payload
 
 
+def _validate_declared_support_release(
+    config: ProjectConfig,
+    *,
+    config_path: str | Path,
+    formal: bool,
+) -> None:
+    """在 runtime 讀取 scenario 前驗證明示支援窗的 immutable release binding。
+
+    新設定若明示 ``inputs.backtrack_support_days``，該整日數只能代表母體的要求，
+    不能取代 artifact 的實際 evidence。因此必須由 config 內的 artifact index 參照
+    找到同一份 release binding，再交給 input derivation 的既有 validator 比對 source
+    config hash、所有 component hash、gap-safe 母體與 requested horizon。這個入口只
+    讀小型 JSON metadata，不會載入 OCM/NWW 大型陣列；同時保留每個 runtime config
+    自己的 input inventory exact ``config_hash`` gate，7 日與 30 日不能共用 inventory。
+    舊 YAML 未明示新欄位時跳過這層新契約，讓既有 pilot／runtime 行為維持相容。
+    """
+
+    if "backtrack_support_days" not in config.inputs.model_fields_set:
+        return
+    extra = config.inputs.model_extra or {}
+    artifact_index_ref = extra.get("derived_input_artifact_index")
+    if type(artifact_index_ref) is not str or not artifact_index_ref.strip():
+        raise ValueError(
+            "明示 inputs.backtrack_support_days 的 runtime config 必須綁定 derived_input_artifact_index"
+        )
+    artifact_index_path = resolve_manifest_path(config_path, artifact_index_ref)
+    if artifact_index_path.name != "artifact_index.json":
+        raise ValueError("derived_input_artifact_index 必須指向 artifact_index.json")
+    from .input_derivation import validate_release_config
+
+    result = validate_release_config(
+        config_path,
+        input_directory=artifact_index_path.parent,
+        formal=formal,
+    )
+    if result.get("valid") is not True:
+        raw_errors = result.get("errors")
+        errors = (
+            [item for item in raw_errors if type(item) is str]
+            if isinstance(raw_errors, list)
+            else ["release_validator_invalid"]
+        )
+        raise ValueError("runtime release binding validation failed: " + "; ".join(errors))
+
+
 def _formal_months(config: ProjectConfig) -> tuple[str, ...]:
     """依正式研究期展開固定順序的 24 個 ``YYYYMM``。
 
@@ -1219,10 +1265,14 @@ def _validate_formal_ocm_gap_support(
             raise ValueError(f"arrival {arrival.arrival_time_id} 的 study_site_id 未登錄")
         arrival_flows.append((arrival, flow_id))
     has_residual_gaps = any(gaps_by_flow.values())
-    if not has_residual_gaps:
+    support_declared = "backtrack_support_days" in config.inputs.model_fields_set
+    if not has_residual_gaps and not support_declared:
+        # 舊設定沒有獨立的母體支援窗；維持原本「全覆蓋時不再檢查 gap-safe window」
+        # 的行為，避免新契約無意間改變既有 pilot／runtime gate。明示新欄位後，即使
+        # inventory 沒有 gap，也必須檢查 requested window 是否落在研究期內。
         return
     safe_manifest = config.inputs.ocm_gap_safe_arrival_manifest
-    if not safe_manifest:
+    if has_residual_gaps and not safe_manifest:
         raise ValueError(
             "OCM inventory 仍有 gaps；僅宣告 reconstruction manifest 或未宣告 gap-safe "
             "arrival manifest，formal runtime 必須拒絕"
@@ -1242,6 +1292,8 @@ def _validate_formal_ocm_gap_support(
             raise ValueError(
                 f"arrival {arrival.arrival_time_id} 的 gap-safe window 超出 config years 研究期"
             )
+        if not has_residual_gaps:
+            continue
         for gap_start, gap_end in gaps_by_flow[flow_id]:
             if max(window_start, gap_start) <= min(window_end, gap_end):
                 raise ValueError(
@@ -1622,6 +1674,7 @@ def load_validated_run_static_inputs(
     # forcing。dynamic initial condition 是 OCM-derived 的 receptor×arrival actual z 與
     # face provenance，不能退回 receptor 模板深度或以缺值零填補。
     config = load_config(config_path, formal_release=formal)
+    _validate_declared_support_release(config, config_path=config_path, formal=formal)
     (
         members_per_scenario,
         master_seed,
@@ -1775,6 +1828,7 @@ def initialize_run(
     # 與 manifest 前拒絕未知值，避免 caller 以任意字串觸發未定義的 fallback 路徑。
     _experiment_case_spec(experiment_case_id)
     config = load_config(config_path, formal_release=formal)
+    _validate_declared_support_release(config, config_path=config_path, formal=formal)
 
     scenario_inputs = load_scenario_inputs(
         config,
@@ -2305,10 +2359,14 @@ class RuntimeRequestFactory:
     def resource_stats(self) -> dict[str, int]:
         """回傳目前 manager cache 的扁平整數資源統計。
 
-        ``loads``、``hits`` 與 ``misses`` 分別合計每個 manager 的 OCM 與 NWW 計數；
-        ``resident_bytes`` 只使用既有 cache snapshot 的 resident ndarray bytes，不把
-        path、月份名稱、provider 或巢狀 stats 物件暴露出去。即使底層 stats 使用 NumPy
-        整數，也在此轉成原生 Python ``int``，方便 manifest／監控序列化。
+        ``loads``、``hits``、``misses`` 與 ``evictions`` 是目前 process 內各 manager
+        的累計事件 counter；``manager_count`` 與 ``resident_bytes`` 是取樣當下的 gauge，
+        不是整台 SERVER 的連續峰值。``resident_bytes`` 只使用既有 cache snapshot 的
+        resident ndarray bytes，不把 path、月份名稱、provider 或巢狀 stats 物件暴露出去。
+        controller 會在每個 shard invocation 開始時取 baseline，再以同一 baseline 計算
+        counter 增量並對 gauge 取樣本最大值。即使底層 stats 使用 NumPy 整數，也在此轉
+        成原生 Python ``int``，方便 manifest／監控序列化；這些欄位只作工程資源規劃，
+        不代表物理結果或整機 I/O 峰值。
         """
 
         loads = 0

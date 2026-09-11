@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -28,11 +29,19 @@ from .outputs import (
 )
 from .run_control import (
     _FAILURE_RE,
+    _FORCING_CACHE_COUNTER_KEYS,
+    _FORCING_CACHE_GAUGE_KEYS,
+    _FORCING_CACHE_STATS_LEGACY,
+    _FORCING_CACHE_STATS_SEMANTICS_KEY,
+    _FORCING_CACHE_STATS_SEMANTICS_V1,
+    _FORCING_CACHE_STATS_STATUS_KEY,
+    _FORCING_CACHE_STATS_STATUS_UNAVAILABLE,
     _SCENARIO_COLUMNS,
     _SEED_COLUMNS,
     _SHA256_RE,
     RunController,
     _cross_check_plan_progress,
+    _normalize_forcing_cache_stats,
     _read_json,
     _safe_slug,
     _scenario_from_row,
@@ -839,19 +848,84 @@ def benchmark_report(
     root = Path(path)
     progress = load_run_progress(root)
     plan = load_run_plan(root)
-    rows = [row for row in progress["shards"].values() if isinstance(row, dict)]
-    metrics_rows = [row.get("metrics", {}) for row in rows if isinstance(row.get("metrics"), dict)]
+    rows = [
+        (shard_id, row)
+        for shard_id, row in progress["shards"].items()
+        if isinstance(row, dict)
+    ]
+    metrics_rows = [
+        (shard_id, row.get("metrics", {}))
+        for shard_id, row in rows
+        if isinstance(row.get("metrics"), dict)
+    ]
     sum_keys = ("wall_seconds", "process_cpu_seconds", "output_bytes", "checkpoint_bytes", "particle_steps")
-    metrics = {key: sum(float(item.get(key, 0)) for item in metrics_rows) for key in sum_keys}
-    metrics["max_rss_bytes"] = max((int(item.get("max_rss_bytes", 0)) for item in metrics_rows), default=0)
-    forcing_stats: dict[str, float] = {}
-    for item in metrics_rows:
+    metrics = {
+        key: sum(float(item.get(key, 0)) for _, item in metrics_rows) for key in sum_keys
+    }
+    metrics["max_rss_bytes"] = max(
+        (int(item.get("max_rss_bytes", 0)) for _, item in metrics_rows),
+        default=0,
+    )
+
+    # 新語意 row 的 counter 已是每一個 shard invocation 增量，所以四個 counter 可以
+    # 跨 shard 相加；manager_count／resident_bytes 是 gauge，只取所有有效樣本的最大值。
+    # 未標記的歷史 row 或缺少 cache 量測的 row 不可和新 row 混算，否則會把舊版可能已
+    # 重複累計的數字報成精確總量。原始 legacy object 仍按 shard 保存，方便回查 progress。
+    precise_cache_rows: list[tuple[str, dict[str, int]]] = []
+    legacy_cache_rows: dict[str, Any] = {}
+    unavailable_cache_rows: dict[str, Any] = {}
+    unavailable_cache_shards: list[str] = []
+    for shard_id, item in metrics_rows:
         cache = item.get("forcing_cache_stats")
-        if isinstance(cache, Mapping):
-            for key, value in cache.items():
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    forcing_stats[key] = forcing_stats.get(key, 0.0) + float(value)
-    completed = sum(1 for row in rows if row.get("lifecycle") == "COMPLETE")
+        semantics = item.get(_FORCING_CACHE_STATS_SEMANTICS_KEY)
+        status = item.get(_FORCING_CACHE_STATS_STATUS_KEY)
+        if status == _FORCING_CACHE_STATS_STATUS_UNAVAILABLE:
+            unavailable_cache_shards.append(shard_id)
+            if isinstance(cache, Mapping):
+                unavailable_cache_rows[shard_id] = deepcopy(dict(cache))
+        elif (
+            isinstance(cache, Mapping)
+            and semantics == _FORCING_CACHE_STATS_SEMANTICS_V1
+        ):
+            try:
+                precise_cache_rows.append(
+                    (
+                        shard_id,
+                        _normalize_forcing_cache_stats(
+                            cache,
+                            label=f"metrics[{shard_id}].forcing_cache_stats",
+                        ),
+                    )
+                )
+            except ValueError:
+                # validate_run 已先驗證 progress；這個防禦分支讓 future schema 變動時
+                # benchmark 仍 fail-safe，不把未驗證資料轉成數值報告。
+                unavailable_cache_shards.append(shard_id)
+        elif isinstance(cache, Mapping) and semantics in {None, _FORCING_CACHE_STATS_LEGACY}:
+            legacy_cache_rows[shard_id] = deepcopy(dict(cache))
+        else:
+            unavailable_cache_shards.append(shard_id)
+
+    cache_is_precise = (
+        bool(metrics_rows)
+        and len(precise_cache_rows) == len(metrics_rows)
+        and not legacy_cache_rows
+        and not unavailable_cache_shards
+    )
+    forcing_stats: dict[str, int] = {}
+    if cache_is_precise:
+        for key in _FORCING_CACHE_COUNTER_KEYS:
+            forcing_stats[key] = sum(item[key] for _, item in precise_cache_rows)
+        for key in _FORCING_CACHE_GAUGE_KEYS:
+            forcing_stats[key] = max((item[key] for _, item in precise_cache_rows), default=0)
+        forcing_stats_semantics = _FORCING_CACHE_STATS_SEMANTICS_V1
+    else:
+        # 空 aggregate 刻意不放入舊版數字；legacy 原值另列出並帶 shard 身分，避免
+        # summary 看起來像可信的總量。若完全沒有 rows，狀態也是 unavailable。
+        forcing_stats_semantics = (
+            _FORCING_CACHE_STATS_LEGACY if legacy_cache_rows else "unavailable"
+        )
+    completed = sum(1 for _, row in rows if row.get("lifecycle") == "COMPLETE")
     summary = {
         "run_id": plan["run_id"],
         "run_lifecycle": progress["run_lifecycle"],
@@ -862,7 +936,7 @@ def benchmark_report(
         "completed_fraction": completed / plan["shard_count"] if plan["shard_count"] else 0.0,
         "scenario_count_completed": sum(
             int(row.get("scenario_stop_index", 0)) - int(row.get("scenario_start_index", 0))
-            for row in rows
+            for _, row in rows
             if row.get("lifecycle") == "COMPLETE"
         ),
         "particle_steps": int(metrics["particle_steps"]),
@@ -872,8 +946,16 @@ def benchmark_report(
         "output_bytes": int(metrics["output_bytes"]),
         "checkpoint_bytes": int(metrics["checkpoint_bytes"]),
         "forcing_cache_stats": forcing_stats,
+        "forcing_cache_stats_semantics": forcing_stats_semantics,
+        "forcing_cache_stats_precise": cache_is_precise,
         "baseline_contract": "five study sites, 50,000 base scenarios; pilot reduction is not a new baseline",
     }
+    if legacy_cache_rows:
+        summary["forcing_cache_stats_legacy_by_shard"] = legacy_cache_rows
+    if unavailable_cache_rows:
+        summary["forcing_cache_stats_unavailable_by_shard"] = unavailable_cache_rows
+    if unavailable_cache_shards:
+        summary["forcing_cache_stats_unavailable_shards"] = sorted(unavailable_cache_shards)
     return {**base, "summary": summary}
 
 

@@ -86,6 +86,18 @@ _METRIC_REQUIRED_KEYS = frozenset(
         "particle_steps",
     }
 )
+# forcing cache 的四個計數器（counter）代表本次 process 內的累計事件數；manager_count 與
+# resident_bytes 是某一時間點的狀態量（gauge）。controller 會在每個分片（shard）的單次
+# 執行（invocation）開始時取起始讀值（baseline），再把 counter 轉成該 invocation 的
+# 增量，避免共用 manager 的累計值被重複相加。
+_FORCING_CACHE_COUNTER_KEYS = ("loads", "hits", "misses", "evictions")
+_FORCING_CACHE_GAUGE_KEYS = ("manager_count", "resident_bytes")
+_FORCING_CACHE_KEYS = _FORCING_CACHE_COUNTER_KEYS + _FORCING_CACHE_GAUGE_KEYS
+_FORCING_CACHE_STATS_SEMANTICS_KEY = "forcing_cache_stats_semantics"
+_FORCING_CACHE_STATS_SEMANTICS_V1 = "invocation_delta_v1"
+_FORCING_CACHE_STATS_LEGACY = "legacy_unknown"
+_FORCING_CACHE_STATS_STATUS_KEY = "forcing_cache_stats_status"
+_FORCING_CACHE_STATS_STATUS_UNAVAILABLE = "unavailable_due_to_reporter_error"
 _SCENARIO_COLUMNS = (
     "scenario_id",
     "study_site_id",
@@ -314,7 +326,9 @@ def _validate_metrics(value: Any, *, label: str, allow_empty: bool = True) -> di
 
     metrics 只用於 SERVER 資源規劃，不參與粒子物理。初始 PLANNED row 可使用空 object；
     一旦執行便必須包含 wall time、process CPU、最大常駐記憶體、輸出／checkpoint bytes 與
-    particle steps。forcing cache 與 crash-window sweep 下界旗標可作為額外欄位保留。
+    particle steps。forcing cache 與 crash-window sweep 下界旗標可作為額外欄位保留；新
+    cache 欄位若存在，會另外驗證 counter/gauge 的非負整數與明示的語意版本。缺少語意
+    版本的歷史 progress 仍可讀取，但只能由報告層標為 legacy/unknown。
     """
 
     if not isinstance(value, dict):
@@ -334,8 +348,28 @@ def _validate_metrics(value: Any, *, label: str, allow_empty: bool = True) -> di
             raise ValueError(f"{label}.{key} 不可為負")
     for key in integer_keys:
         _nonnegative_int(value[key], label=f"{label}.{key}")
-    if "forcing_cache_stats" in value and not isinstance(value["forcing_cache_stats"], dict):
-        raise ValueError(f"{label}.forcing_cache_stats 必須是 object")
+    if "forcing_cache_stats" in value:
+        semantics = value.get(_FORCING_CACHE_STATS_SEMANTICS_KEY)
+        if semantics is not None and semantics not in {
+            _FORCING_CACHE_STATS_SEMANTICS_V1,
+            _FORCING_CACHE_STATS_LEGACY,
+        }:
+            raise ValueError(f"{label}.{_FORCING_CACHE_STATS_SEMANTICS_KEY} 不支援")
+        if semantics == _FORCING_CACHE_STATS_SEMANTICS_V1:
+            # 只有新版本語意才要求固定六欄；未標記的歷史 object 刻意保留原樣，讓舊
+            # progress 可以讀取並在 benchmark report 中被標成 legacy/unknown。
+            _normalize_forcing_cache_stats(
+                value["forcing_cache_stats"],
+                label=f"{label}.forcing_cache_stats",
+            )
+        elif not isinstance(value["forcing_cache_stats"], dict):
+            raise ValueError(f"{label}.forcing_cache_stats 必須是 object")
+    elif _FORCING_CACHE_STATS_SEMANTICS_KEY in value:
+        raise ValueError(f"{label}.{_FORCING_CACHE_STATS_SEMANTICS_KEY} 缺少 forcing_cache_stats")
+    if _FORCING_CACHE_STATS_STATUS_KEY in value:
+        status = value[_FORCING_CACHE_STATS_STATUS_KEY]
+        if type(status) is not str or status != _FORCING_CACHE_STATS_STATUS_UNAVAILABLE:
+            raise ValueError(f"{label}.{_FORCING_CACHE_STATS_STATUS_KEY} 不支援")
     if "sweeps_recovered_lower_bound" in value and type(value["sweeps_recovered_lower_bound"]) is not bool:
         raise ValueError(f"{label}.sweeps_recovered_lower_bound 必須是 bool")
     return value
@@ -1451,11 +1485,182 @@ def _safe_failure_message(error: Exception) -> str:
     return message[:1000]
 
 
+def _normalize_forcing_cache_stats(value: Mapping[str, Any], *, label: str) -> dict[str, int]:
+    """驗證一份完整的流場管理器快取統計快照。
+
+    snapshot 由同一個 process 的流場管理器提供，四個計數器（counter）是載入、命中、
+    未命中與淘汰事件的非負整數；另外兩欄是取樣當下的管理器數量與常駐陣列位元組數。
+    這兩欄是狀態量（gauge），不是事件總數。統計提供者（reporter）必須一次提供完整
+    六欄；缺欄不可以默認成零，否則會把「未量測」誤報成精確
+    的零事件。未知欄位、布林值、非有限數值、分數或負值都代表 reporter 違反資料契約，
+    必須明確失敗，不能把錯誤轉成負增量。
+
+    回傳值固定使用原生 ``int``，讓 baseline、checkpoint progress 與 JSON manifest 共享
+    同一個可序列化表示。這裡只驗證工程計數，不代表整台 SERVER 的 I/O 或記憶體峰值。
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} 必須是 mapping")
+    missing = sorted(set(_FORCING_CACHE_KEYS) - set(value))
+    if missing:
+        raise ValueError(f"{label} 缺少欄位：{','.join(missing)}")
+    unknown = sorted(set(value) - set(_FORCING_CACHE_KEYS))
+    if unknown:
+        raise ValueError(f"{label} 含未知欄位：{','.join(str(item) for item in unknown)}")
+    result: dict[str, int] = {}
+    for key in _FORCING_CACHE_KEYS:
+        raw = value[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, np.integer, np.floating)):
+            raise ValueError(f"{label}.{key} 必須是非負整數")
+        if isinstance(raw, (int, np.integer)):
+            integer = int(raw)
+        else:
+            numeric = float(raw)
+            # 浮點整數的精確整數範圍有限；超出 2**53 時不能先轉 float 再宣稱
+            # 還原原始 counter，因此明確拒絕，保護大計數不被悄悄捨入。
+            if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer() or abs(numeric) > 2**53:
+                raise ValueError(f"{label}.{key} 必須是可精確表示的非負整數")
+            integer = int(numeric)
+        if integer < 0:
+            raise ValueError(f"{label}.{key} 必須是非負整數")
+        result[key] = integer
+    return result
+
+
+def _forcing_cache_delta(
+    snapshot: Mapping[str, Any], baseline: Mapping[str, Any], *, label: str
+) -> dict[str, int]:
+    """將累計 cache snapshot 轉成單次 shard invocation 的 counter delta。
+
+    ``baseline`` 必須在 request factory、checkpoint restore 或粒子取樣前取得；因此每個
+    invocation 內任何後續 snapshot 都與同一 baseline 比較。counter 若回退，表示 manager
+    被重置、reporter 不穩定或資料損壞；此時直接拋出明確錯誤，避免以 ``max(0, ...)`` 把
+    真實問題藏成看似合理的零值。manager 數量與常駐位元組是 gauge，保留目前樣本，不做
+    減法，因為 cache 可能合法地驅逐或釋放資源。
+    """
+
+    current = _normalize_forcing_cache_stats(snapshot, label=f"{label}.snapshot")
+    origin = _normalize_forcing_cache_stats(baseline, label=f"{label}.baseline")
+    result: dict[str, int] = {}
+    for key in _FORCING_CACHE_COUNTER_KEYS:
+        if current[key] < origin[key]:
+            raise ValueError(f"{label}.{key} counter regression")
+        result[key] = current[key] - origin[key]
+    for key in _FORCING_CACHE_GAUGE_KEYS:
+        result[key] = current[key]
+    return result
+
+
+def _merge_invocation_forcing_snapshot(
+    previous: Mapping[str, Any] | None,
+    current: Mapping[str, Any] | None,
+) -> dict[str, int] | None:
+    """保留同一 invocation 內最新 counter delta 與 gauge 的觀測最大值。
+
+    每次 ``current`` 都已相對同一起始讀值（baseline）計算，因此計數器（counter）不可把
+    兩個 snapshot 再相加；較晚的 delta 已包含較早事件，直接採用即可。狀態量（gauge）會隨 cache 驅逐或 manager
+    建立而上下變動，故從 baseline 與所有後續樣本取最大值，保存該 invocation 曾觀測到
+    的最高 manager 數量／常駐位元組。這個 helper 不跨 invocation 使用；跨 invocation
+    的合併由 ``_merge_forcing_cache_metrics`` 處理。
+    """
+
+    if current is None:
+        return deepcopy(dict(previous)) if previous is not None else None
+    normalized_current = _normalize_forcing_cache_stats(current, label="current invocation cache")
+    if previous is None:
+        return normalized_current
+    normalized_previous = _normalize_forcing_cache_stats(previous, label="previous invocation cache")
+    merged = dict(normalized_current)
+    for key in _FORCING_CACHE_COUNTER_KEYS:
+        if normalized_current[key] < normalized_previous[key]:
+            # 即使兩者都沒有低於 invocation baseline，snapshot 自身也不應回退；否則
+            # 後一個較小值會覆蓋已觀測的事件，讓 report 以錯誤的精確數字收尾。
+            raise ValueError(f"current invocation {key} counter regression")
+    for key in _FORCING_CACHE_GAUGE_KEYS:
+        merged[key] = max(normalized_previous[key], normalized_current[key])
+    return merged
+
+
+def _merge_forcing_cache_metrics(
+    current: Mapping[str, Any], previous: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """合併本次 delta 與 resume 前 cache metrics，並保留 legacy 不確定性。
+
+    新語意的計數器（counter）已是單次 invocation 增量，可以和前一次同分片已保存的
+    增量相加；狀態量（gauge）則取兩次觀測的最大值。舊 progress 沒有
+    ``forcing_cache_stats_semantics`` 時，無法知道其數字是否曾把 cumulative snapshot
+    重複相加，因此仍保留原值供追溯，但整列標成 ``legacy_unknown``，下游報告不得把它
+    當成精確總量。
+    """
+
+    current_stats = current.get("forcing_cache_stats")
+    previous_stats = previous.get("forcing_cache_stats")
+    if current_stats is None and previous_stats is None:
+        return None, None
+    current_semantics = current.get(_FORCING_CACHE_STATS_SEMANTICS_KEY)
+    previous_semantics = previous.get(_FORCING_CACHE_STATS_SEMANTICS_KEY)
+    if current_stats is None and previous_stats is not None:
+        # 本次 invocation 未提供 snapshot（例如新 controller 沒有 reporter，或量測在
+        # 中途失效）；即使前一次是 v1，也不能把後半段事件默認成零。保留舊值並降級
+        # 為 legacy，讓 report 明示這段期間無法還原。
+        if not isinstance(previous_stats, dict):
+            raise ValueError("previous.metrics.forcing_cache_stats 必須是 object")
+        return deepcopy(previous_stats), _FORCING_CACHE_STATS_LEGACY
+    if current_stats is not None and current_semantics != _FORCING_CACHE_STATS_SEMANTICS_V1:
+        # 相容讀取也可能收到另一個舊 controller 寫出的 unmarked／legacy object；保留
+        # 其原樣並降級，不把它送進新六欄 snapshot validator。
+        if not isinstance(current_stats, dict):
+            raise ValueError("metrics.forcing_cache_stats 必須是 object")
+        return deepcopy(current_stats), _FORCING_CACHE_STATS_LEGACY
+    # 舊 progress 的 cache object 可能只有部分欄位或保留歷史額外診斷。不能套用新
+    # snapshot 正規化而拒絕它，也不能把它和新 delta 合成看似精確的總量；保留舊 object
+    # 原值並標成 legacy。這樣 resume 仍可讀，但本次 delta 不會冒充已知的跨 invocation
+    # 總量，報告也不公開精確 aggregate。
+    if previous_stats is not None and previous_semantics != _FORCING_CACHE_STATS_SEMANTICS_V1:
+        if not isinstance(previous_stats, dict):
+            raise ValueError("previous.metrics.forcing_cache_stats 必須是 object")
+        return deepcopy(previous_stats), _FORCING_CACHE_STATS_LEGACY
+    # previous 已經有執行 metrics 卻沒有 cache stats，代表早期 invocation 未量測
+    # cache（例如舊版 KeyboardInterrupt 或 reporter=None）。即使本次取得完整新 delta，
+    # 也無法補回早期事件，故保留本次數字但標示 legacy/unknown。
+    if current_stats is not None and previous_stats is None and previous:
+        return (
+            _normalize_forcing_cache_stats(current_stats, label="metrics.forcing_cache_stats"),
+            _FORCING_CACHE_STATS_LEGACY,
+        )
+    current_normalized = (
+        _normalize_forcing_cache_stats(current_stats, label="metrics.forcing_cache_stats")
+        if current_stats is not None
+        else {key: 0 for key in _FORCING_CACHE_KEYS}
+    )
+    previous_normalized = (
+        _normalize_forcing_cache_stats(previous_stats, label="previous.metrics.forcing_cache_stats")
+        if previous_stats is not None
+        else {key: 0 for key in _FORCING_CACHE_KEYS}
+    )
+    merged: dict[str, Any] = {}
+    for key in _FORCING_CACHE_COUNTER_KEYS:
+        merged[key] = current_normalized[key] + previous_normalized[key]
+    for key in _FORCING_CACHE_GAUGE_KEYS:
+        merged[key] = max(current_normalized[key], previous_normalized[key])
+    semantics = (
+        _FORCING_CACHE_STATS_SEMANTICS_V1
+        if (current_stats is None or current_semantics == _FORCING_CACHE_STATS_SEMANTICS_V1)
+        and (previous_stats is None or previous_semantics == _FORCING_CACHE_STATS_SEMANTICS_V1)
+        else _FORCING_CACHE_STATS_LEGACY
+    )
+    return merged, semantics
+
+
 def _merge_metrics(current: Mapping[str, Any], previous: Mapping[str, Any]) -> dict[str, Any]:
     """把 resume 前已保存的 engineering metrics 與本次 invocation 合併。
 
-    wall time、CPU time、輸出／checkpoint bytes 與 particle steps 是可累加量；RSS 取
-    所有 invocation 的最大值。這些數字只供資源規劃，不參與粒子物理或 seed 計算。
+    經過時間、CPU 時間、輸出與 checkpoint 位元組數按執行區間累加；particle_steps
+    已包含續跑前步數，不能再加一次。RSS 取所有執行區間的最大值。流場快取的
+    loads/hits/misses/evictions 只有在新語意
+    ``invocation_delta_v1`` 下才可跨 invocation 累加，manager 數量與 resident bytes 則取
+    樣本最大值。歷史 row 沒有語意標記時保留數字但標為 ``legacy_unknown``，讓報告明示
+    無法還原精確總量。這些數字只供資源規劃，不參與粒子物理或 seed 計算。
     """
 
     result = deepcopy(dict(current))
@@ -1468,6 +1673,28 @@ def _merge_metrics(current: Mapping[str, Any], previous: Mapping[str, Any]) -> d
         result["output_bytes"] = int(result["output_bytes"])
     if "checkpoint_bytes" in result:
         result["checkpoint_bytes"] = int(result["checkpoint_bytes"])
+    cache_stats, cache_semantics = _merge_forcing_cache_metrics(result, previous)
+    if cache_stats is not None:
+        result["forcing_cache_stats"] = cache_stats
+        result[_FORCING_CACHE_STATS_SEMANTICS_KEY] = cache_semantics
+    elif "forcing_cache_stats" in result:
+        # ``_merge_forcing_cache_metrics`` 只會在有 stats 時回傳 mapping；這個分支保留
+        # 防禦性清理，避免 caller 傳入不完整的 arbitrary Mapping 後留下未驗證物件。
+        result.pop("forcing_cache_stats", None)
+        result.pop(_FORCING_CACHE_STATS_SEMANTICS_KEY, None)
+    if (
+        current.get(_FORCING_CACHE_STATS_STATUS_KEY) == _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
+        or previous.get(_FORCING_CACHE_STATS_STATUS_KEY) == _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
+    ):
+        result[_FORCING_CACHE_STATS_STATUS_KEY] = _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
+    elif (
+        "forcing_cache_stats" not in result
+        and previous
+        and "forcing_cache_stats" not in previous
+    ):
+        # 已有執行歷史但從未保存 cache snapshot；新 invocation 也沒有可合併的證據，
+        # 因而明示 unavailable，而不是讓空 object 看起來像零事件的完整量測。
+        result[_FORCING_CACHE_STATS_STATUS_KEY] = _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
     return result
 
 
@@ -2025,6 +2252,14 @@ class RunController:
         }
         if isinstance(previous.get("forcing_cache_stats"), dict):
             metrics["forcing_cache_stats"] = deepcopy(previous["forcing_cache_stats"])
+            # 舊 progress 沒有語意欄位時不能假定它保存的是 invocation delta；即使後續
+            # controller 能接續執行，也要把這個歷史邊界傳到報告，避免 resume 後冒稱精確。
+            metrics[_FORCING_CACHE_STATS_SEMANTICS_KEY] = previous.get(
+                _FORCING_CACHE_STATS_SEMANTICS_KEY,
+                _FORCING_CACHE_STATS_LEGACY,
+            )
+        if previous.get(_FORCING_CACHE_STATS_STATUS_KEY) is not None:
+            metrics[_FORCING_CACHE_STATS_STATUS_KEY] = previous[_FORCING_CACHE_STATS_STATUS_KEY]
         self._mark_checkpoint_running(
             shard,
             checkpoint=selected.path,
@@ -2044,8 +2279,15 @@ class RunController:
         checkpoint_bytes: int = 0,
         output_bytes: int = 0,
         forcing_stats: Mapping[str, Any] | None = None,
+        forcing_stats_status: str | None = None,
     ) -> dict[str, Any]:
-        """建立不含路徑的 engineering metrics。"""
+        """建立不含路徑的工程 metrics 與本次 cache snapshot 增量。
+
+        ``forcing_stats`` 必須已由 invocation baseline 計算成 delta；本函式不自行讀取
+        reporter，避免同一 invocation 的 checkpoint、output 與 failure snapshot 互相累加。
+        reporter 發生錯誤時可只保存 ``forcing_stats_status``，讓原始物理例外維持為主要
+        例外，同時在 progress 中明示 cache 量測不可用。
+        """
 
         metrics: dict[str, Any] = {
             "wall_seconds": max(0.0, time.perf_counter() - started_wall),
@@ -2056,8 +2298,50 @@ class RunController:
             "particle_steps": int(particle_steps),
         }
         if forcing_stats is not None:
-            metrics["forcing_cache_stats"] = deepcopy(dict(forcing_stats))
+            metrics["forcing_cache_stats"] = _normalize_forcing_cache_stats(
+                forcing_stats,
+                label="metrics.forcing_cache_stats",
+            )
+            metrics[_FORCING_CACHE_STATS_SEMANTICS_KEY] = _FORCING_CACHE_STATS_SEMANTICS_V1
+        if forcing_stats_status is not None:
+            if forcing_stats_status != _FORCING_CACHE_STATS_STATUS_UNAVAILABLE:
+                raise ValueError("forcing_stats_status 不支援")
+            metrics[_FORCING_CACHE_STATS_STATUS_KEY] = forcing_stats_status
         return metrics
+
+    def _resource_snapshot(self) -> dict[str, int] | None:
+        """讀取並驗證目前 resource reporter 的 cache 累計 snapshot。
+
+        snapshot 發生在 controller process 內，不能解讀成整台 SERVER 的總量；它只供與
+        本次 shard invocation 起點的 baseline 相減。reporter 若回傳 malformed 欄位會直接
+        失敗，呼叫端在 failure/interrupt 清理路徑會保留原始例外並標示量測不可用。
+        """
+
+        if self.resource_reporter is None:
+            return None
+        return _normalize_forcing_cache_stats(
+            self.resource_reporter(),
+            label="resource_reporter",
+        )
+
+    def _resource_delta(self, baseline: Mapping[str, Any] | None) -> dict[str, int] | None:
+        """以 invocation 開始前的 baseline 取得目前 cache counter delta。
+
+        baseline 必須在 request factory 與 checkpoint restore 前建立；每次呼叫都重新讀
+        snapshot，但不會重新設定 baseline。counter regression 會回報錯誤，gauge 則保留
+        當下觀測值，確保 pause、resume 與 shared controller 的數字可追溯。
+        """
+
+        if baseline is None or self.resource_reporter is None:
+            return None
+        snapshot = self._resource_snapshot()
+        if snapshot is None:
+            return None
+        return _forcing_cache_delta(
+            snapshot,
+            baseline,
+            label="resource_reporter",
+        )
 
     def _write_checkpoint(
         self,
@@ -2335,7 +2619,24 @@ class RunController:
         particle_steps = int(row["particle_steps"])
         previous_metrics = row["metrics"] if isinstance(row["metrics"], dict) else {}
         checkpoint_bytes_this_invocation = 0
+        # resource reporter 的計數器（counter）在 process 內累計；起始讀值（baseline）必須
+        # 先於 request factory 與 checkpoint restore。狀態量（gauge）初值也納入本次單次
+        # 執行（invocation）的峰值，但 counter 初值不會
+        # 直接寫入結果，避免把歷史 manager 工作誤算給目前 shard。
+        resource_baseline: dict[str, int] | None = None
+        latest_forcing_stats: dict[str, int] | None = None
+        resource_stats_unavailable = False
         try:
+            try:
+                resource_baseline = self._resource_snapshot()
+            except Exception:
+                resource_stats_unavailable = True
+                raise
+            if resource_baseline is not None:
+                latest_forcing_stats = {
+                    key: 0 if key in _FORCING_CACHE_COUNTER_KEYS else resource_baseline[key]
+                    for key in _FORCING_CACHE_KEYS
+                }
             if selected is not None:
                 batch = ProductionBatch.from_checkpoint(
                     selected.path,
@@ -2377,14 +2678,22 @@ class RunController:
                         particle_steps=particle_steps,
                     )
                     checkpoint_bytes_this_invocation += checkpoint_bytes
-                    stats = self.resource_reporter() if self.resource_reporter is not None else None
+                    try:
+                        stats = self._resource_delta(resource_baseline)
+                    except Exception:
+                        resource_stats_unavailable = True
+                        raise
+                    latest_forcing_stats = _merge_invocation_forcing_snapshot(
+                        latest_forcing_stats,
+                        stats,
+                    )
                     metrics = _merge_metrics(
                         self._metrics(
                             started_wall,
                             started_cpu,
                             particle_steps=particle_steps,
                             checkpoint_bytes=checkpoint_bytes_this_invocation,
-                            forcing_stats=stats,
+                            forcing_stats=latest_forcing_stats,
                         ),
                         previous_metrics,
                     )
@@ -2420,13 +2729,22 @@ class RunController:
             output = self.output_root / shard.shard_id
             metadata = self._expected_metadata(shard)
             provenance = self.plan["code_provenance"]
+            try:
+                stats = self._resource_delta(resource_baseline)
+            except Exception:
+                resource_stats_unavailable = True
+                raise
+            latest_forcing_stats = _merge_invocation_forcing_snapshot(
+                latest_forcing_stats,
+                stats,
+            )
             resource_metrics = _merge_metrics(
                 self._metrics(
                     started_wall,
                     started_cpu,
                     particle_steps=particle_steps,
                     checkpoint_bytes=checkpoint_bytes_this_invocation,
-                    forcing_stats=self.resource_reporter() if self.resource_reporter is not None else None,
+                    forcing_stats=latest_forcing_stats,
                 ),
                 previous_metrics,
             )
@@ -2458,7 +2776,7 @@ class RunController:
                     particle_steps=particle_steps,
                     output_bytes=output_bytes,
                     checkpoint_bytes=checkpoint_bytes_this_invocation,
-                    forcing_stats=self.resource_reporter() if self.resource_reporter is not None else None,
+                    forcing_stats=latest_forcing_stats,
                 ),
                 previous_metrics,
             )
@@ -2492,12 +2810,29 @@ class RunController:
                         particle_steps=particle_steps,
                     )
                     checkpoint_bytes_this_invocation += checkpoint_bytes
+                    try:
+                        stats = self._resource_delta(resource_baseline)
+                        latest_forcing_stats = _merge_invocation_forcing_snapshot(
+                            latest_forcing_stats,
+                            stats,
+                        )
+                    except Exception:
+                        # Ctrl-C 是 operator 的原始動作；reporter 若同時損壞，不能以
+                        # 量測錯誤取代 KeyboardInterrupt。沿用最近合法值並留下 unavailable
+                        # 標記，讓後續報告不會把它當成完整精確總量。
+                        resource_stats_unavailable = True
                     metrics = _merge_metrics(
                         self._metrics(
                             started_wall,
                             started_cpu,
                             particle_steps=particle_steps,
                             checkpoint_bytes=checkpoint_bytes_this_invocation,
+                            forcing_stats=latest_forcing_stats,
+                            forcing_stats_status=(
+                                _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
+                                if resource_stats_unavailable
+                                else None
+                            ),
                         ),
                         previous_metrics,
                     )
@@ -2517,16 +2852,66 @@ class RunController:
                         particle_steps=particle_steps,
                         metrics=metrics,
                     )
+                elif "batch" not in locals():
+                    # request factory／checkpoint restore 建構期間也可能已觸發 forcing
+                    # loads；雖然不能宣告不存在的 checkpoint，仍保存目前 RUNNING row 的
+                    # engineering snapshot。這讓後續 resume 知道前一段是已量測、未完成，
+                    # 或明確 unavailable，而不把它誤當成全新 PLANNED invocation。
+                    try:
+                        stats = self._resource_delta(resource_baseline)
+                        latest_forcing_stats = _merge_invocation_forcing_snapshot(
+                            latest_forcing_stats,
+                            stats,
+                        )
+                    except Exception:
+                        resource_stats_unavailable = True
+                    metrics = _merge_metrics(
+                        self._metrics(
+                            started_wall,
+                            started_cpu,
+                            particle_steps=particle_steps,
+                            forcing_stats=latest_forcing_stats,
+                            forcing_stats_status=(
+                                _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
+                                if resource_stats_unavailable or latest_forcing_stats is None
+                                else None
+                            ),
+                        ),
+                        previous_metrics,
+                    )
+
+                    def save_running_metrics(progress: dict[str, Any]) -> None:
+                        """保存無 checkpoint 的 RUNNING 量測，維持既有生命週期。"""
+
+                        progress["shards"][shard_id]["metrics"] = deepcopy(metrics)
+
+                    self._update_progress(save_running_metrics)
             finally:
                 raise
         except Exception as error:
+            try:
+                # 物理／request factory 失敗前可能已經消耗 forcing；最後一次 best-effort
+                # snapshot 能保留這些事件。若 reporter 自身失效，絕不可讓它覆蓋原始 error，
+                # 改以 unavailable 標記交給報告層處理。
+                stats = self._resource_delta(resource_baseline)
+                latest_forcing_stats = _merge_invocation_forcing_snapshot(
+                    latest_forcing_stats,
+                    stats,
+                )
+            except Exception:
+                resource_stats_unavailable = True
             failure_metrics = _merge_metrics(
                 self._metrics(
                     started_wall,
                     started_cpu,
                     particle_steps=particle_steps,
                     checkpoint_bytes=checkpoint_bytes_this_invocation,
-                    forcing_stats=self.resource_reporter() if self.resource_reporter is not None else None,
+                    forcing_stats=latest_forcing_stats,
+                    forcing_stats_status=(
+                        _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
+                        if resource_stats_unavailable
+                        else None
+                    ),
                 ),
                 previous_metrics,
             )
@@ -2551,6 +2936,31 @@ class RunController:
 
         with acquire_run_lock(self._lock_path("run_gate.lock"), mode="exclusive", blocking=False):
             return self._reconcile_locked()
+
+    @staticmethod
+    def _published_resource_metrics(
+        validation: Mapping[str, Any], fallback: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """從已驗證 output manifest 取回 resource usage，供 reconcile 保留量測。
+
+        output 可能已在 progress 更新前成功發布；這時 manifest 內的
+        ``run_metadata.resource_usage`` 是該完成 shard 最完整的工程 snapshot，不能被
+        checkpoint 時的較舊 metrics 覆蓋。新 cache 語意與 legacy 標記會原樣保留；若是
+        舊 synthetic output 沒有這個欄位，才沿用 progress fallback。此 helper 只讀已通過
+        trajectory validator 的 mapping，不讀取大型 trajectory array，也不改變物理結果。
+        """
+
+        manifest = validation.get("manifest")
+        metadata = manifest.get("run_metadata") if isinstance(manifest, Mapping) else None
+        candidate = metadata.get("resource_usage") if isinstance(metadata, Mapping) else None
+        if isinstance(candidate, dict):
+            try:
+                return _validate_metrics(candidate, label="output.resource_usage", allow_empty=False)
+            except ValueError:
+                # validator 已先保證 strict pilot/formal 的固定六個工程欄位；對舊 synthetic
+                # output 保留既有 progress，避免 reconcile 因歷史 optional metrics 中斷。
+                pass
+        return deepcopy(dict(fallback))
 
     def _reconcile_locked(self) -> dict[str, Any]:
         """檢查 checkpoint/output 後採認可恢復的狀態；此內部方法已持有 exclusive gate。
@@ -2590,12 +3000,16 @@ class RunController:
                 if not validation["valid"]:
                     raise ValueError(f"progress COMPLETE 但 output invalid：{shard.shard_id}")
             elif validation["valid"] and state["lifecycle"] == "RUNNING":
+                metrics = self._published_resource_metrics(
+                    validation,
+                    state.get("metrics", {}),
+                )
                 self._mark_complete(
                     shard,
                     output,
                     sweeps=int(state.get("sweeps_completed", 0)),
                     particle_steps=int(state.get("particle_steps", 0)),
-                    metrics=state.get("metrics", {}),
+                    metrics=metrics,
                 )
             elif validation["valid"]:
                 # 只有 worker 已先標 RUNNING，才可能是「output publish 後尚未更新

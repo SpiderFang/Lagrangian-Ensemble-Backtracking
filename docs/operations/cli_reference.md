@@ -20,7 +20,7 @@
 | 設定／輸入 | `config-check`、`preflight`、`inputs-build`、`inputs-validate`、`release-config-create`、`release-config-validate` |
 | pilot | `pilot-calibrate`、`pilot-calibrate-validate`、`pilot-calibration-build`、`pilot-calibration-validate`、`pilot-config-create`、`pilot-config-validate` |
 | 工程驗證 | `behavior-manifest`、`synthetic-smoke`、`validate-shard`、`code-provenance`、`validate-run`、`benchmark-report`、`pilot-matrix-validate` |
-| run lifecycle | `run-create`、`run-shard`、`run-reconcile` |
+| run lifecycle | `run-create`、`run-shard`、`run-worker`、`run-reconcile` |
 | 聚合／報告 | `aggregate-spec-create`、`aggregate-build`、`aggregate-validate`、`report-spec-create`、`report-validate`、`source-pathway-build`、`source-pathway-validate` |
 
 `report-build` 尚未註冊；不要用不存在的命令替代目前的 report preflight、aggregate 或
@@ -107,6 +107,43 @@ uv run lbt release-config-validate "$LBT_SCRATCH_ROOT/release-2024-2025.yaml" \
 `inputs-build` 即使沒有 `--formal-release` 也固定 strict、fail-closed，禁止 synthetic
 constant-field fallback。`release-config-create`、`release-config-validate` 只處理
 immutable input binding；它們不啟動粒子運算。
+
+### 同一套輸入產生不同回溯長度
+
+在建置用完整 YAML 明示 `inputs.backtrack_support_days`，例如 30，先以此支援窗
+完成上面的 `inputs-build` 與 `inputs-validate`。接著可重用同一目錄產生不同回溯長度；
+以下變數須指向已驗證的共同母體、同一研究版本的完整模板及已核定的步數預算：
+
+```bash
+uv run lbt release-config-create \
+  --config-template "$COMMON_CONFIG" \
+  --input-directory "$COMMON_INPUT_DIRECTORY" \
+  --max-backtrack-days 7 \
+  --maximum-step-count "$STEP_BUDGET_7D" \
+  --output "$LBT_SCRATCH_ROOT/release-7d.yaml" \
+  --formal-release
+
+uv run lbt release-config-create \
+  --config-template "$COMMON_CONFIG" \
+  --input-directory "$COMMON_INPUT_DIRECTORY" \
+  --max-backtrack-days 30 \
+  --maximum-step-count "$STEP_BUDGET_30D" \
+  --output "$LBT_SCRATCH_ROOT/release-30d.yaml" \
+  --formal-release
+```
+
+`--max-backtrack-days` 只改新輸出 YAML 的 `boundaries.max_backtrack_days`，
+`--maximum-step-count` 只改新輸出的步數預算；省略時沿用模板。指定較長回溯時不會
+自動放大步長、降低成員數或改動母體檔案。已指定的步數至少須達
+`ceil(回溯日數 × 86400 / dt_max_seconds)`；自適應縮短步長可能需要更多步，
+此式只是必要下限，不能當成足夠的執行預算。缺少正式數值設定仍會留下發布阻擋。
+
+日數不是固定選單，新的正整日支援上限可任意設定，但執行長度不得超出母體。
+7 日與 30 日設定各自執行 `preflight`，保存不同的 runtime inventory；兩者可共用
+大型輸入，不能混用與另一份設定雜湊綁定的執行清單。更長上限、共同日期及
+不覆寫限制見[輸入契約](14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)。
+
+### 既有 24 小時工程試跑
 
 四區 24 小時工程試跑可在 `inputs-build` 以版本化、pilot-only 的明示 UTC 入口替換既有
 arrival。registry 固定使用 `2024-01-02T01:00:00Z`，回溯 24 小時並包含 25 個逐時節點。
@@ -239,6 +276,36 @@ checkpoint root 只在命令執行時傳入；run plan／progress 保存相對 t
 路徑。缺 generation、binding、checksum、particle order 或 RNG 不符時，controller 在建立
 物理 request 前停止，不從 seed 靜默重算。
 
+### 同程序接續執行多個分片
+
+```bash
+uv run lbt run-worker "$LBT_OUTPUT_ROOT/runs/$RUN_ID" \
+  --config "$PILOT_OR_FORMAL_CONFIG" \
+  --shard-id "$FIRST_SHARD_ID" \
+  --shard-id "$SECOND_SHARD_ID" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
+```
+
+兩個 ID 都必須來自同一份已驗證 run plan。`--shard-id` 可重複指定，但值不得重複；
+全部 ID 先檢查完才開始第一片，依命令列順序執行。此入口只開啟一次 controller，讓相鄰
+分片重用相同流場管理器、網格與有界月份資料窗；不跨 run 共用，不自動挑選其他工作。
+排程端應把同流場及接近的到達時段排在一起，並對不同 worker 指派互不重疊的 ID。
+
+`--resume` 與 `--checkpoint-root` 沿用單片契約；可加 `--sweep-budget N` 限制每片最多
+執行 N 輪粒子步進。任一片回報 `PAUSED` 後即停止後續片，已寫 checkpoint 可供下一次
+明示恢復。鎖衝突或其他例外亦停止，不跳過錯誤繼續運算。`COMPLETE` 仍須通過既有輸出
+驗證才視為完成，已有完成成果不重算。此入口不解除 SERVER 儲存及正式發布檢查。
+
+worker 的總計時包含本次 handler 的前置驗證與連續分片執行，不含 Python 啟動與模組
+匯入；亦不是多個 worker 的整機經過時間。原分片內部計時定義維持不變。流場載入／
+命中／未命中／淘汰的底層計數仍是管理器累計值，分片紀錄則扣除本次執行前基準，
+保存本次增量；續跑會與該分片先前已保存的增量合併。報告只加總語意可確認的分片
+計數，舊紀錄或量測不完整時明示限制。`manager_count` 與 `resident_bytes` 取已觀測
+樣本最大值，不跨片相加；大型陣列的映射位元組數不是實際 RSS 或 NFS 傳輸量，也不代表
+多程序同時使用量或連續量測峰值。完整基準規範見[效能改善工作線](16_performance_improvement_tracks.md)。
+
 ### reconcile 與唯讀驗證
 
 ```bash
@@ -256,6 +323,12 @@ uv run lbt benchmark-report "$LBT_OUTPUT_ROOT/runs/$RUN_ID" \
 `run-reconcile` 不載入 forcing、不建立物理 request；`validate-run` 與 `benchmark-report`
 是唯讀介面。benchmark 只報工程資源量測，不是科學結果。`RUNNING`、`PAUSED`、`FAILED`
 若要繼續都必須明示 `--resume`；`COMPLETE` 不重跑。
+
+新分片統計以 `forcing_cache_stats_semantics: invocation_delta_v1` 標示增量語意。
+`benchmark-report` 的 `forcing_cache_stats_precise` 只說明快取計數是否具備完整且可
+加總的紀錄，與 run 完整性驗證的 `valid` 分開判讀。若含歷史未標記或不可用的量測，
+`forcing_cache_stats` 保持空物件，並以 `forcing_cache_stats_legacy_by_shard` 或
+`forcing_cache_stats_unavailable_shards` 列出限制，不把缺資料當作零次載入。
 
 ## Aggregate 與 report
 

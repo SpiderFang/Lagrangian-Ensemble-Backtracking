@@ -44,7 +44,7 @@ byte size。`artifact_index.json` 綁定十個 component，`artifact_bindings.js
 | kind | 檔名 | 主要內容 |
 |---|---|---|
 | `forcing_inventory` | `forcing_inventory.json` | 四域各自 OCM native／OCM surface／NWW3 月份、schema、時間軸、source files、metadata provenance 與 structural fingerprint |
-| `ocm_gap_safe_arrival_horizon` | `ocm_gap_safe_arrival.json` | 每個 arrival 的 7 日 backward window、缺時與跨缺口判定 |
+| `ocm_gap_safe_arrival_horizon` | `ocm_gap_safe_arrival.json` | 每個 arrival 的回溯支援窗、缺時與跨缺口判定；舊政策為 7 日，新政策依設定的正整日上限 |
 | `nww_full_hourly` | `nww_full_hourly.json` | 四域 NWW3 完整逐時 UTC 與 grid binding |
 | `domain_geometry` | `domain.json` | 四個 flow-domain 外層幾何 |
 | `local_geometry` | `local.json` | 五個 study-site local domain |
@@ -61,7 +61,7 @@ prefer-last，並保存原始／canonical 計數與 gap 描述。正式研究期
 00:00 UTC 至 2025-12-31 23:00 UTC，共 17,544 個逐時步。
 
 OCM gap 不可用最近值或零值穿越。每一個候選 arrival 都必須檢查 inclusive
-`[arrival - 7 days, arrival]` 的每個整點是否存在；缺任何一點就將 `crossed_gap` 設為
+`[arrival - support days, arrival]` 的每個整點是否存在（舊政策為 7 日）；缺任何一點就將 `crossed_gap` 設為
 true，正式 validator 拒絕該目錄。只有已通過版本化重建與 blocked cross-validation 的
 manifest，或逐 arrival 均 gap-safe 的 arrival/horizon manifest，才能成為正式 release
 輸入。NWW3 完整逐時 analysis 不沿用 OCM 的缺時軸，也不進行統計填補；四域均須證明
@@ -74,6 +74,29 @@ NWW 月份 metadata 的 allowlist 同時保留既有
 
 `generated` 表示可供 synthetic／development 稽核的封裝，不表示已可啟動正式 run；
 `approved` 只在 strict builder 或 formal validator 的所有條件通過後出現。
+
+### 3.1 通用回溯支援與共同比較母體
+
+新建共同輸入時，在既有完整設定中加入下列欄位。這是局部設定範例，不是可單獨執行的 YAML：
+
+```yaml
+inputs:
+  backtrack_support_days: 30
+boundaries:
+  max_backtrack_days: 7
+```
+
+新版 `inputs-validate` 須提供 `--config`，以設定內的站點與區域對應驗證到達紀錄；到達紀錄沿用既有 schema，不新增區域欄位。缺少設定時會明確回報 `generic_horizon_config_required_for_site_region_binding`，不以待驗 gap 紀錄自己宣稱的區域充當獨立證據。
+
+`backtrack_support_days` 是要求建置與驗證的正整日支援窗，不是已取得的驗收證明；任意正整數皆可使用，例如 21、37 或 60，並非固定為 7／30／60。`max_backtrack_days` 是這次粒子運算的上限，不得大於明示的輸入支援窗。新欄位未出現在舊設定時，保留舊政策與設定雜湊；既有 1 日工程試跑不能因新增欄位而升格為較長共同母體。
+
+範例會以 **30 日** 支援條件選取五站各 50 筆到達時刻，建立 100 個受體及 5,000 筆動態初始配對；不是先按 7 日選樣再把標籤改為 30。A 兩站配對 UTC 也必須各自通過 30 日檢查。候選不足時回報站點及選樣失敗原因，不縮減原矩陣、不補缺值。逐時時間支援含首尾共 `24 × support_days + 1` 個節點；30 日即 721 節點。
+
+驗證器核對 gap 紀錄與實際到達 ID、站點、流場及 UTC 一對一，檢查起訖、日數與節點計數，並依綁定來源的時間範圍與缺口重新計算缺時。不能只以 `missing_utc: []` 自述通過。即使只要求執行 7 日，共同 30 日母體在較早時段有缺口仍不能當作有效母體重用。來源 root 可讀時，除重查 metadata／時間檔雜湊，還會從各月的小型時間檔重建排序、去重後的時間軸，核對月份集合、時間範圍、節點數、缺口與時間軸雜湊；不為此重讀大型流速陣列。離線封裝核對不替代現場來源驗收。時間支援也不保證整條移動軌跡的空間或垂向有效性。
+
+母體驗證後，`release-config-create --max-backtrack-days` 可分別產生 7 日、30 日設定，直接綁定同一批不可覆寫的輸入。兩者保留相同 `design_version`、到達／受體／初始條件／情境 ID 及輸入雜湊；回溯長度不同則執行設定雜湊不同，各自使用 run、checkpoint、輸出目錄與 runtime preflight inventory。原始建置設定雜湊仍作為來源證據，不改寫成後製執行設定的雜湊。
+
+若日後要跑 60 日，原 30 日母體不足，需以參數另建 60 日輸入版本；程式不需改碼。新母體可能因缺時排除更多日期。若要嚴格比較 7／30／60 日，應重新從共同通過 60 日檢查的母體建立三份執行設定，不能把兩批不同日期當成只有回溯長度不同的比較。
 
 ## 4. 幾何、受體與 arrival
 
@@ -106,7 +129,7 @@ arrival selector 維持既有 48 個 season×tide strata 加 `high_wave_event`�
 `strong_current_event` 兩筆事件。候選的 OCM elevation/current 必須來自 OCM surface
 cache 的 `eta_m`、`u_surface_mps`、`v_surface_mps`、`surface_z`、`valid_mask_surface`、
 `qc_flags` 與 UTC 軸；OCM native 的全域 `hvel` 不得被掃描來產生 arrival scalar。它們
-與 NWW3 的 runtime-equivalent exact-hour spatial sample 及 7 日 gap-safe window 一起
+與 NWW3 的 runtime-equivalent exact-hour spatial sample 及設定支援日數的 gap-safe window 一起
 篩選候選。NWW input gate 只接受 runtime 可重現的一維、有限、嚴格遞增 lon／lat 規則格網；
 站點座標必須在域內，四角 static mask 與該 UTC 的 `valid_mask_wave` 必須全為有效，四角
 Hs、peak frequency、原始波向必須有限，並使用 runtime 相同的雙線性權重、Hs≥0、fp>0

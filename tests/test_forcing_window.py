@@ -8,16 +8,25 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from shapely.geometry import box
 
-from lagrangian_backtracking.diffusion import SmagorinskySettings
+from lagrangian_backtracking.boundaries import BoundaryGeometry
+from lagrangian_backtracking.diffusion import DiffusionCoefficients, SmagorinskySettings
+from lagrangian_backtracking.engine import (
+    EngineSettings,
+    advance_particle_once,
+    initialize_particle_execution,
+)
 from lagrangian_backtracking.forcing import NWWAnalysisMonth, OCMNativeMonth
 from lagrangian_backtracking.forcing_window import (
     ForcingWindowManager,
     MissingForcingMonth,
 )
 from lagrangian_backtracking.geometry import DomainProjection
+from lagrangian_backtracking.integrators import supports_step_start_sample_reuse
 from lagrangian_backtracking.mesh import NativeMesh
-from lagrangian_backtracking.models import SampleQC
+from lagrangian_backtracking.models import ParticleState, SampleQC
+from lagrangian_backtracking.production import HintTrackingVelocityProvider
 
 
 def _mesh() -> NativeMesh:
@@ -224,6 +233,60 @@ def test_hint_is_forwarded_through_managed_facade() -> None:
     )
     assert result.valid
     assert spy.call_args.kwargs["triangle_hint"] == 0
+
+
+def test_managed_provider_and_hint_wrapper_enable_safe_k1_reuse() -> None:
+    """真實 managed forcing facade 經 hint wrapper 後，engine 只查三個後續 RK stage。"""
+
+    month = "197001"
+    manager, ocm_loader, _ = _manager({month: _ocm(month, _mesh())})
+    managed = manager.provider(-0.1, include_stokes=False)
+    wrapped = HintTrackingVelocityProvider(managed)
+    assert managed.step_start_sample_reuse_safe is True
+    assert wrapped.step_start_sample_reuse_safe is True
+    assert supports_step_start_sample_reuse(wrapped)
+
+    start_time = _sample_time(month)
+    state = ParticleState(
+        particle_id="p0",
+        scenario_id="s0",
+        member_id=0,
+        study_site_id="gongliao",
+        analysis_region_id="A",
+        receptor_id="r0",
+        x_m=5.0,
+        y_m=1.0,
+        z_m=-5.0,
+        time_utc_ns=start_time,
+    )
+    settings = EngineSettings(
+        dt_min_seconds=1.0,
+        dt_max_seconds=1.0,
+        output_interval_seconds=1.0,
+        max_backtrack_seconds=1.0,
+        maximum_step_count=10,
+        earliest_forcing_time_utc_ns=_month_start_ns(month),
+    )
+    execution = initialize_particle_execution(state, settings)
+    result = advance_particle_once(
+        execution,
+        velocity=wrapped,
+        boundaries=BoundaryGeometry(
+            own_local_domain=box(-100.0, -100.0, 100.0, 100.0),
+            flow_domain=box(-100.0, -100.0, 100.0, 100.0),
+            foreign_local_domains={},
+        ),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=np.random.default_rng(11),
+    )
+
+    assert result.stepped
+    assert execution.state.x_m == 4.0
+    assert ocm_loader.call_count == 1
+    # 初始 step-start sample 觸發一次 miss；k2、k3、k4 各命中一次，k1 沿用初始樣本。
+    assert manager.cache_stats.ocm_cache_hit_count == 3
 
 
 def test_smagorinsky_facade_shares_ocm_lru_and_never_loads_nww() -> None:

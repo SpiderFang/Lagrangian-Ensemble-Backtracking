@@ -2,15 +2,16 @@
 
 本模組以四階 Runge-Kutta 法（RK4）計算海流、波浪造成的確定移動，再另外加入隨機擴散
 造成的位移。速度資料一律表示「物理時間往後」的流速；逆向溯源時只要給負的時間步長，
-便會沿相反時間方向回推。每個中間計算點都必須重新讀取速度，若資料缺漏或位置無效，
-整步便停止，絕不把缺值當成零速度。
+便會沿相反時間方向回推。一般速度取樣器的每個中間計算點都必須重新讀取速度；只有明示
+具備唯讀穩定結果能力的速度取樣器，才可把粒子引擎取得的步首樣本重用為 RK4 的 k1。
+若資料缺漏或位置無效，整步便停止，絕不把缺值當成零速度。
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -39,6 +40,42 @@ class VelocityProvider(Protocol):
 
     def __call__(self, x_m: float, y_m: float, z_m: float, time_utc_ns: int) -> VelocitySample:
         """回傳指定位置與 UTC 時刻、物理時間往後的三向速度。"""
+
+
+@runtime_checkable
+class StepStartSampleReuseProvider(Protocol):
+    """明示允許重用步首樣本的速度取樣器能力介面。
+
+    RK4 的第一個導數（k1）與粒子引擎為選擇步長而取得的步首樣本，位置與 UTC 時刻
+    完全相同。只有底層資料是唯讀、且在相同輸入下不因呼叫次數或外部狀態改變結果的
+    速度取樣器，才可以提供這項能力；一般可呼叫物件沒有此標記時，仍會保留原本的
+    重複查詢行為。這是明示加入的能力介面，不會對所有可呼叫物件做盲目的記憶化。
+
+    ``step_start_sample_reuse_safe`` 必須是布林值 ``True``。速度取樣器仍可維護不影響
+    物理結果的快取或三角形搜尋提示；這類效能狀態不能成為速度、品質檢查旗標（QC）、
+    邊界或亂數產生器（RNG）的資料來源。
+    """
+
+    @property
+    def step_start_sample_reuse_safe(self) -> bool:
+        """回傳相同位置與 UTC 查詢是否可直接沿用既有步首樣本。"""
+
+
+def supports_step_start_sample_reuse(provider: object) -> bool:
+    """判斷速度取樣器是否明示承諾步首樣本與 RK4 k1 等價。
+
+    這項檢查只讀取速度取樣器是否明示加入這項能力；沒有標記、標記不是布林 ``True``、
+    或讀取標記時發生例外，都採保守的原始四次 RK4 取樣路徑。如此可維持一般有狀態
+    可呼叫物件的呼叫順序，也避免把任意函式的偶然屬性誤當作快取契約。
+    """
+
+    try:
+        if not isinstance(provider, StepStartSampleReuseProvider):
+            return False
+        return provider.step_start_sample_reuse_safe is True
+    except Exception:
+        # 能力標記僅是效能提示；任何非預期屬性讀取失敗都不能影響原有物理流程。
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,14 +296,26 @@ def _velocity_vector(
     return vector
 
 
-def rk4_step(state: ParticleState, *, dt_seconds: float, velocity: VelocityProvider) -> ParticleState:
+def rk4_step(
+    state: ParticleState,
+    *,
+    dt_seconds: float,
+    velocity: VelocityProvider,
+    step_start_sample: VelocitySample | None = None,
+) -> ParticleState:
     """以四階 Runge-Kutta 法計算一次不含隨機擴散的粒子移動。
 
     ``dt_seconds`` 為正代表往未來推進，為負代表往過去回溯。粒子的已追蹤時間
     ``age_seconds`` 永遠增加正值，UTC 時刻則依時間步長的正負方向改變。此函式只改變
     位置、深度與時間；碰到海面、海床、海岸或研究範圍邊界的處理，交由粒子引擎在本步
     完成後統一判定，避免不同規則互相覆蓋。失敗上下文綁定原本 k1--k4 查詢的位置與
-    時刻，不為診斷增加查詢、重試或亂數消耗。
+    時刻，不為診斷增加查詢、重試或亂數消耗。若呼叫端已由同一個步首粒子狀態取得
+    ``step_start_sample``，則該樣本可明示供 k1 重用；這只是一個顯式輸入，不會讓
+    ``rk4_step`` 自行記憶化任意可呼叫物件。未提供時維持原本的四次速度查詢。
+
+    ``step_start_sample`` 必須是與傳入的粒子狀態（``state``）位置及 UTC 時刻完全相同的有效樣本；呼叫端
+    若無法證明速度取樣器在相同輸入下具有唯讀、穩定結果，應保留 ``None``，讓一般有狀態
+    速度取樣器的原始呼叫語意不變。
     """
 
     if not np.isfinite(dt_seconds) or dt_seconds == 0:
@@ -274,9 +323,20 @@ def rk4_step(state: ParticleState, *, dt_seconds: float, velocity: VelocityProvi
     position = np.array([state.x_m, state.y_m, state.z_m], dtype=np.float64)
     dt_ns = int(round(dt_seconds * 1_000_000_000))
     half_ns = int(round(dt_seconds * 0.5 * 1_000_000_000))
+    # 未收到明示的等價樣本時，維持原本每個 RK4 階段都呼叫速度取樣器的語意；特別是
+    # 一般可能依呼叫次數改變結果的合成或外部可呼叫物件不得被猜測快取。反之，
+    # 粒子引擎只會把通過明示能力檢查的同一粒子狀態／UTC 樣本傳入；兩條路徑最後都
+    # 交給共同檢查器，因此無效、非有限速度與失敗上下文的 k1 語意完全一致。
+    k1_sample = (
+        velocity(*position, state.time_utc_ns)
+        if step_start_sample is None
+        else step_start_sample
+    )
     k1 = _velocity_vector(
-        velocity(*position, state.time_utc_ns), "k1",
-        position=position, time_utc_ns=state.time_utc_ns,
+        k1_sample,
+        "k1",
+        position=position,
+        time_utc_ns=state.time_utc_ns,
     )
     p2 = position + 0.5 * dt_seconds * k1
     k2 = _velocity_vector(
@@ -342,6 +402,7 @@ def split_rk4_brownian_step(
     velocity: VelocityProvider,
     coefficients: DiffusionCoefficients | DiffusionSample,
     rng: np.random.Generator,
+    step_start_sample: VelocitySample | None = None,
 ) -> ParticleState:
     """先依流速移動，再加入一次隨機擴散位移。
 
@@ -349,10 +410,18 @@ def split_rk4_brownian_step(
     的四階流速計算完成後加入一次，因此不會在同一時間步中被重複套用。``coefficients``
     若是舊版常數 ``DiffusionCoefficients``，只加入 ``sqrt(2K|dt|)N``；若是步首
     ``DiffusionSample``，則另外加入該樣本的 ``+div(K)|dt|`` pseudo-time 漂移。兩種
-    路徑都不會在 RK4 stage 中讀取或消耗擴散亂數。
+    路徑都不會在 RK4 階段中讀取或消耗擴散亂數。``step_start_sample`` 若由呼叫端
+    明示提供，會交給 RK4 重用為同一個粒子狀態／UTC 的 k1；未提供時維持四次階段查詢。
+    這項參數不能單獨證明等價性，粒子引擎只會在速度取樣器明示具備唯讀穩定能力時傳入，
+    反射重試的特殊包裝器也不會自動取得此能力。
     """
 
-    advanced = rk4_step(state, dt_seconds=dt_seconds, velocity=velocity)
+    advanced = rk4_step(
+        state,
+        dt_seconds=dt_seconds,
+        velocity=velocity,
+        step_start_sample=step_start_sample,
+    )
     # 一般完整 RK4 路徑與特殊 recovery 路徑都共用同一個 helper，確保 Brownian 與
     # +div(K)|dt| 只在確定性計算完成後套用一次，且維持既有 seed／亂數消耗順序。
     return apply_diffusion_step(

@@ -14,6 +14,8 @@
 
 ## 目錄結構
 
+正式研究與工程試跑的效能工作分開管理，優先順序、結果等價與 30 天回溯的 SERVER 驗收見[效能改善工作線](operations/16_performance_improvement_tracks.md)。
+
 - `foundation/`：需求、資料契約、科學方法與設計基線。
 - `operations/`：CLI、SERVER、輸入衍生、資料時間處理、Git 同步與 pilot 操作。
 - `results/`：成果圖表、聚合發布與報告發布規格。
@@ -23,13 +25,14 @@
 
 ## 原文件路徑對照
 
-下表保留原本 18 份文件的檔名與原路徑，並登錄 2 份新增的 pilot／稽核紀錄；新增文件沒有
+下表保留原本 18 份文件的檔名與原路徑，並登錄 3 份新增的 pilot／稽核及效能規劃文件；新增文件沒有
 待相容的舊根層路徑，因此 current/original 欄位相同。「狀態」只表示閱讀定位，不把工程
 測試通過誤寫成正式科學成果。
 
 | 文件 | 現行路徑 | 一句用途 | 狀態 | 原路徑 |
 |---|---|---|---|---|
 | 實作狀態與正式驗證邊界 | [implementation_status.md](implementation_status.md) | 集中說明目前程式能力、正式性界線與尚待驗證項目。 | 現行 | `docs/implementation_status.md` |
+| 正式運算及單站試跑效能改善 | [operations/16_performance_improvement_tracks.md](operations/16_performance_improvement_tracks.md) | 規範正式研究優先的加速工作線、結果等價與 30 天回溯驗收。 | 現行 | `docs/operations/16_performance_improvement_tracks.md` |
 | 需求追溯與範圍裁決 | [foundation/01_requirements_traceability.md](foundation/01_requirements_traceability.md) | 將研究需求、使用者裁決與驗收條件對應到可追查的實作。 | 現行 | `docs/01_requirements_traceability.md` |
 | 架構與資料契約 | [foundation/02_architecture_and_data_contract.md](foundation/02_architecture_and_data_contract.md) | 定義上游資料、模組邊界、狀態欄位與輸出拓撲。 | 現行 | `docs/02_architecture_and_data_contract.md` |
 | 科學方法與驗證規格 | [foundation/03_scientific_method_and_validation.md](foundation/03_scientific_method_and_validation.md) | 說明座標、公式、時間積分、擴散與科學驗收方法。 | 現行 | `docs/03_scientific_method_and_validation.md` |

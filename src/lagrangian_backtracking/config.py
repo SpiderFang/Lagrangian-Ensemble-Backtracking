@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 # 這組名稱取自海洋保育署 iOcean 海洋廢棄物管理頁於 2026-08-27 顯示的查詢類別。
 # 常數只用來驗證臺灣情境的分類追溯是否完整；該網站的清除重量與件數不含單體物性，
@@ -66,6 +66,10 @@ NORTHEAST_V3_COMMON_FORCING_PRODUCTS = frozenset(
     {"ocm_native", "ocm_surface", "nww3_analysis"}
 )
 NORTHEAST_V3_LOCAL_SITE_IDS = frozenset({"gongliao", "guishan"})
+
+# 舊正式輸入採七日缺口安全基線；此值只供相容性查詢，不把所有舊 runtime 或
+# 一日工程試跑改成七日。新欄位未明示時，既有建置／執行驗證仍各自維持原有規則。
+DEFAULT_BACKTRACK_SUPPORT_DAYS = 7
 
 
 def _validate_non_rising_material_contract(settling: Any, *, expected_count: int) -> None:
@@ -127,7 +131,14 @@ class StrictModel(BaseModel):
 
 
 class InputContract(StrictModel):
-    """上游 root、全部可得資料決策、時間正規化與重建證據。"""
+    """上游 root、資料決策、時間正規化、重建證據與回溯支援窗。
+
+    ``backtrack_support_days`` 是要求輸入建置與驗證的完整整日支援窗，填值本身不代表
+    已有資料證據。單次執行的回溯長度仍由 ``boundaries.max_backtrack_days`` 指定，且
+    不得超過明示的支援上限。欄位採正整數，拒絕布林值、字串、浮點數、零與負數；
+    ``None`` 只適合尚未定案的準備性設定，不能建成新版共同母體。未出現在舊 YAML 時，
+    保留舊流程的驗證規則，並在設定雜湊中省略由 Pydantic 補出的預設欄位。
+    """
 
     ocm_native_root_env: str
     ocm_surface_root_env: str
@@ -137,9 +148,19 @@ class InputContract(StrictModel):
     nww_contract: dict[str, Any]
     available_data_contract: dict[str, Any]
     time_axis_contract: dict[str, Any]
+    backtrack_support_days: StrictInt | None = None
     ocm_gap_reconstruction_manifest: str | None = None
     ocm_gap_safe_arrival_manifest: str | None = None
     nww_full_hourly_analysis_manifest: str | None = None
+
+    @model_validator(mode="after")
+    def validate_backtrack_support_days(self) -> InputContract:
+        """確認明示的母體支援窗是正整日；未明示欄位保留舊設定語意。"""
+
+        value = self.backtrack_support_days
+        if value is not None and (type(value) is not int or value < 1):
+            raise ValueError("inputs.backtrack_support_days 必須是正整數日")
+        return self
 
 
 class StudyAreaConfig(StrictModel):
@@ -379,9 +400,34 @@ class ProjectConfig(StrictModel):
     geometry: dict[str, Any]
     outputs: dict[str, Any]
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_new_horizon_coercion(cls, value: Any) -> Any:
+        """在新支援窗契約啟用時，先拒絕 Pydantic 可能悄悄轉型的布林／字串。
+
+        舊 YAML 沒有 ``backtrack_support_days`` 時完全跳過這個 before gate，以免
+        改變既有設定的載入行為。新契約的 requested horizon 若寫成 ``true``、字串
+        或其他非數值，不能等 Pydantic 轉成 ``1.0`` 後再判定，否則會把錯誤設定誤認
+        成一日執行窗。
+        """
+
+        if not isinstance(value, dict):
+            return value
+        inputs = value.get("inputs")
+        if not isinstance(inputs, dict) or "backtrack_support_days" not in inputs:
+            return value
+        requested = (value.get("boundaries") or {}).get("max_backtrack_days")
+        if requested is not None and (
+            isinstance(requested, bool) or not isinstance(requested, (int, float))
+        ):
+            raise ValueError("boundaries.max_backtrack_days 必須是有限正數")
+        return value
+
     @model_validator(mode="after")
     def validate_scientific_contract(self) -> ProjectConfig:
-        """驗證五站完整交叉、唯一 ID 與 A 區共用 forcing 契約。"""
+        """驗證五站完整交叉、回溯支援窗、唯一 ID 與 A 區共用 forcing 契約。"""
+
+        self._validate_backtrack_support_contract()
 
         if self.time_standard != "UTC":
             raise ValueError("time_standard 必須固定為 UTC")
@@ -433,6 +479,54 @@ class ProjectConfig(StrictModel):
             raise ValueError("foreign-local crossing 不得改變 study_site_id")
         self.assert_research_domain_policy()
         return self
+
+    @property
+    def effective_backtrack_support_days(self) -> int | None:
+        """回傳輸入母體可供執行設定使用的支援日數。
+
+        舊 YAML 未寫 ``inputs.backtrack_support_days`` 時，回傳 7 日相容基線，供
+        legacy artifact 的 release 摘要保持可讀；若 YAML 明示 ``null``，則保留
+        「尚未具備支援證據」的狀態。這個屬性只讀設定，不宣告實際產品已通過
+        validator；實際支援仍須由 input artifact 的逐到達時刻紀錄證明，也不會把
+        7 日預設倒灌到舊 runtime 的研究期檢查。
+        """
+
+        if "backtrack_support_days" not in self.inputs.model_fields_set:
+            return DEFAULT_BACKTRACK_SUPPORT_DAYS
+        return self.inputs.backtrack_support_days
+
+    def _validate_backtrack_support_contract(self) -> None:
+        """驗證研究期與輸入母體支援窗的關係，避免執行設定超出實際檢查範圍。
+
+        ``max_backtrack_days`` 保留浮點型別以支援既有 pilot 的小於一日視窗；新支援窗
+        契約啟用且已指定執行日數時，必須是有限正數，並且不得超過明示的整日支援窗。
+        若支援欄位明示 ``null``，代表母體尚未定案，只有同樣未指定研究期的準備性
+        config 可以載入。這裡是設定層的必要邊界，實際資料是否真的覆蓋仍由
+        ``input_derivation``、release binding 與 runtime inventory 各自驗證。
+        """
+
+        # 舊 YAML 沒有這個欄位時，所有新增支援窗檢查都必須停用；舊 selector、pilot
+        # 與 runtime 的既有 horizon 規則仍由各自模組維持，不能因 Pydantic 補出 None
+        # 而改變舊 run 的拒絕時機或可接受範圍。
+        if "backtrack_support_days" not in self.inputs.model_fields_set:
+            return
+        support_days = self.inputs.backtrack_support_days
+        requested = self.boundaries.max_backtrack_days
+        if requested is None:
+            return
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+            raise ValueError("boundaries.max_backtrack_days 必須是有限正數")
+        requested_float = float(requested)
+        if not math.isfinite(requested_float) or requested_float <= 0.0:
+            raise ValueError("boundaries.max_backtrack_days 必須是有限正數")
+        if support_days is None:
+            raise ValueError(
+                "已指定 boundaries.max_backtrack_days，但 inputs.backtrack_support_days 尚未定案"
+            )
+        if requested_float > float(support_days):
+            raise ValueError(
+                "boundaries.max_backtrack_days 不得超過 inputs.backtrack_support_days"
+            )
 
     def assert_research_domain_policy(self) -> None:
         """驗證研究範圍 policy 與 domain／site source binding 的完整契約。
@@ -613,6 +707,16 @@ class ProjectConfig(StrictModel):
         """
 
         payload = self.model_dump(mode="json", exclude_none=False)
+        inputs_payload = payload.get("inputs")
+        if (
+            isinstance(inputs_payload, dict)
+            and "backtrack_support_days" in inputs_payload
+            and "backtrack_support_days" not in self.inputs.model_fields_set
+        ):
+            # 未明示的新欄位只是 Pydantic 為了型別完整性補上的 None。刪除它可讓
+            # 舊 YAML 保留既有 canonical hash；若 YAML 明示 null，欄位仍會留下來，
+            # 讓「尚未具備支援證據」的意圖可被追溯。
+            del inputs_payload["backtrack_support_days"]
         domain_payloads = payload.get("domains")
         if isinstance(domain_payloads, list):
             for domain, domain_payload in zip(self.domains, domain_payloads, strict=False):

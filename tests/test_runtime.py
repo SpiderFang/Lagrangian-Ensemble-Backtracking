@@ -866,6 +866,50 @@ def test_fractional_day_factory_and_formal_gap_safe_share_exact_window(
         runtime._validate_formal_ocm_gap_support(config, data["inputs"], ocm_axes=touching_axes)
 
 
+def test_explicit_support_checks_no_gap_window_against_formal_period_and_legacy_omitted_is_compatible(
+    runtime_fixture: dict[str, Any],
+) -> None:
+    """明示 30 日即使沒有 gap 也要檢查研究期；舊設定省略欄位則保留原行為。
+
+    到達時刻固定放在 2024-01-15：7 日窗口仍在正式研究期內，但 30 日窗口會回到
+    2023-12-16。兩次呼叫都使用沒有任何 gap 的 OCM time-axis，藉此鎖定新 gate 是
+    「明示共同支援窗後的研究期邊界」而不是把 residual gap 當成必要前提；同一個
+    arrival 與 no-gap inventory 在 legacy omitted config 下仍應通過。
+    """
+
+    arrival_time_ns = int(datetime(2024, 1, 15, tzinfo=UTC).timestamp()) * 1_000_000_000
+    data = _formal_test_data(runtime_fixture, arrival_time_ns=arrival_time_ns)
+    legacy_config = data["config"]
+    flow_ids = runtime._formal_flow_domain_ids(legacy_config)
+    no_gap_axes = [
+        ("ocm_native", flow_id, 3_600_000_000_000, ())
+        for flow_id in flow_ids
+    ]
+
+    # 舊 YAML 未明示新欄位；no-gap 時沿用原本不檢查 arrival window 的行為。
+    assert "backtrack_support_days" not in legacy_config.inputs.model_fields_set
+    runtime._validate_formal_ocm_gap_support(
+        legacy_config,
+        data["inputs"],
+        ocm_axes=no_gap_axes,
+    )
+
+    explicit_inputs = legacy_config.inputs.model_copy(update={"backtrack_support_days": 30})
+    explicit_boundaries = legacy_config.boundaries.model_copy(
+        update={"max_backtrack_days": 30.0}
+    )
+    explicit_config = legacy_config.model_copy(
+        update={"inputs": explicit_inputs, "boundaries": explicit_boundaries}
+    )
+    assert "backtrack_support_days" in explicit_config.inputs.model_fields_set
+    with pytest.raises(ValueError, match="超出 config years 研究期"):
+        runtime._validate_formal_ocm_gap_support(
+            explicit_config,
+            data["inputs"],
+            ocm_axes=no_gap_axes,
+        )
+
+
 @pytest.mark.parametrize("days", [
     1e-12, 1.05e-8 / 86_400, math.nextafter(1 / 24, math.inf), math.nextafter(1 / 24, 0.0),
     float("inf"), float("nan"), 1e308, 107_000.0, 0.0, -1.0, None, True, "1",
@@ -2705,6 +2749,69 @@ def test_open_pilot_run_controller_rejects_each_plan_binding_before_factory(
             config_path=EXAMPLE_CONFIG,
             ocm_native_root=tmp_path / "ocm-native",
         )
+    assert factory_calls == []
+
+
+def test_open_pilot_run_controller_rejects_explicit_support_without_release_binding_before_factory(
+    runtime_fixture: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """明示 30 日 support 但未綁定 release artifact 時，必須在 factory 前拒絕。
+
+    先以舊設定建立真實 immutable workspace，再只把 open 時載入的 config 替換成明示
+    support=30 的版本。這能隔離新 release binding gate：workspace validator 仍讀取真實
+    磁碟內容，而 config 進入 static loader 後若缺少 ``derived_input_artifact_index``，
+    就不得繼續載入 scenario、建立 RuntimeRequestFactory 或接觸 forcing。
+    """
+
+    data = runtime_fixture
+    workspace, _ = _initialize_pilot_test_run(
+        data,
+        tmp_path,
+        monkeypatch,
+        run_id="pilot-open-support-without-release",
+    )
+    explicit_inputs = data["config"].inputs.model_copy(
+        update={"backtrack_support_days": 30}
+    )
+    explicit_config = data["config"].model_copy(update={"inputs": explicit_inputs})
+    assert "backtrack_support_days" in explicit_config.inputs.model_fields_set
+
+    config_calls: list[dict[str, Any]] = []
+    scenario_calls: list[dict[str, Any]] = []
+    factory_calls: list[dict[str, Any]] = []
+
+    def fake_load_config(path: str | Path, *, formal_release: bool) -> ProjectConfig:
+        """回傳明示 support 的 config，模擬 caller 未附 release binding 的設定。"""
+
+        config_calls.append({"path": path, "formal_release": formal_release})
+        return explicit_config
+
+    def blocked_load_scenario_inputs(*args: Any, **kwargs: Any) -> ScenarioInputs:
+        """若 release binding gate 失效，scenario loader 會留下明確呼叫紀錄。"""
+
+        scenario_calls.append({"args": args, "kwargs": kwargs})
+        raise AssertionError("缺少 release binding 時不得載入 scenario inputs")
+
+    def blocked_factory(**kwargs: Any) -> None:
+        """若 static release gate 失效，factory 建構會留下明確呼叫紀錄。"""
+
+        factory_calls.append(kwargs)
+        raise AssertionError("缺少 release binding 時不得建立 RuntimeRequestFactory")
+
+    monkeypatch.setattr(runtime, "load_config", fake_load_config)
+    monkeypatch.setattr(runtime, "load_scenario_inputs", blocked_load_scenario_inputs)
+    monkeypatch.setattr(runtime, "RuntimeRequestFactory", blocked_factory)
+
+    with pytest.raises(ValueError, match="derived_input_artifact_index"):
+        runtime.open_pilot_run_controller(
+            workspace,
+            config_path=EXAMPLE_CONFIG,
+            ocm_native_root=tmp_path / "ocm-native",
+        )
+    assert config_calls == [{"path": EXAMPLE_CONFIG, "formal_release": False}]
+    assert scenario_calls == []
     assert factory_calls == []
 
 

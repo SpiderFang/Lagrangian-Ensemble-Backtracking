@@ -56,6 +56,17 @@ from .config import (
     resolve_flow_domain_id,
 )
 from .geometry import DomainProjection, build_anchor_local_domain, densified_bbox_polygon
+from .input_horizon import (
+    GENERIC_HORIZON_METHOD_ID,
+    GENERIC_HORIZON_POLICY_ID,
+    HorizonContractError,
+    HorizonSettings,
+    build_horizon_window,
+    compute_horizon_coverage,
+    resolve_configured_horizon,
+    validate_generic_gap_payload,
+    validate_support_against_period,
+)
 from .manifests import (
     load_arrival_time_manifest,
     load_boundary_geometries,
@@ -2436,6 +2447,11 @@ def _surface_series_for_location(
     elevation 與水平速度模長；native 不在這裡掃描全域節點或垂向 hvel，只在 geometry、
     wetdry、receptor 與 dynamic pair 的必要切片中讀取。``surface_z`` 與 ``qc_flags``
     雖不直接進 scalar，仍逐月驗證 shape，確保 surface cache 的完整資料契約未被錯配。
+    取值時先依列優先順序攤平（C-order flatten）契約換算必要格點的多維座標，再對
+    少量四角與最近格點做 ``float64`` 轉換；這保留列優先順序結果，也避免將每個逐時
+    整張 float32 網格複製成 float64。索引只使用多維座標 tuple，因此對 C-order、欄
+    優先順序（Fortran-order）及非連續陣列檢視（non-contiguous ndarray view）都不依賴
+    ``ravel`` 是否能建立大型連續副本。
     """
 
     spatial_shape, spatial_indices, flat_index, static_valid = _grid_spatial_support(
@@ -2443,6 +2459,15 @@ def _surface_series_for_location(
         product_label="OCM surface",
         lon=lon,
         lat=lat,
+    )
+    # ``_grid_spatial_support`` 的整數索引是依列優先順序攤平（C-order）契約產生；
+    # 先轉成多維座標後，後續每個逐時網格只會擷取四角及最近格點。這個轉換放在月份
+    # 迴圈外，既保持原本支撐點的順序，也不要求來源 NPY 的記憶體布局必須是連續排列。
+    support_coordinates = np.unravel_index(
+        np.asarray(spatial_indices, dtype=np.intp), spatial_shape, order="C"
+    )
+    nearest_coordinates = np.unravel_index(
+        np.asarray(flat_index, dtype=np.intp), spatial_shape, order="C"
     )
     elevation: dict[int, float] = {}
     speed: dict[int, float] = {}
@@ -2460,26 +2485,50 @@ def _surface_series_for_location(
         ):
             raise InputDerivationError(f"OCM surface {month.label} 陣列時間／空間 shape 不符")
         for local, time_ns in enumerate(month.time_ns):
-            u_frame = np.asarray(u_surface[local], dtype=np.float64).ravel()
-            v_frame = np.asarray(v_surface[local], dtype=np.float64).ravel()
-            surface_z_frame = np.asarray(surface_z[local], dtype=np.float64).ravel()
-            eta_frame = np.asarray(eta[local], dtype=np.float64).ravel()
-            valid_frame = np.asarray(valid_surface[local], dtype=bool).ravel()
-            support = list(spatial_indices)
-            available = static_valid and all(bool(valid_frame[index]) for index in support)
+            # 先以多維座標擷取（gather）必要格點，再轉成計算所需資料型別。這種以座標
+            # 陣列取值的索引結果最多只有四個值，故不會把整個逐時網格轉成 float64；
+            # 直接座標索引也能正確處理欄優先順序或非連續的逐時網格檢視。
+            u_support = np.asarray(
+                u_surface[local][support_coordinates], dtype=np.float64
+            )
+            v_support = np.asarray(
+                v_surface[local][support_coordinates], dtype=np.float64
+            )
+            surface_z_support = np.asarray(
+                surface_z[local][support_coordinates], dtype=np.float64
+            )
+            eta_support = np.asarray(
+                eta[local][support_coordinates], dtype=np.float64
+            )
+            valid_support = np.asarray(
+                valid_surface[local][support_coordinates], dtype=bool
+            )
+            available = static_valid and bool(np.all(valid_support))
             if available:
                 support_values = np.concatenate(
                     (
-                        u_frame[support],
-                        v_frame[support],
-                        surface_z_frame[support],
-                        eta_frame[support],
+                        u_support,
+                        v_support,
+                        surface_z_support,
+                        eta_support,
                     )
                 )
                 available = bool(np.all(np.isfinite(support_values)))
             if available:
-                elevation[int(time_ns)] = float(eta_frame[flat_index])
-                speed[int(time_ns)] = float(np.hypot(u_frame[flat_index], v_frame[flat_index]))
+                # 最近格點單一值必須沿用既有 flat_index，而不是把四角值做雙線性
+                # 平均；只把這一個 scalar 轉成 float64，保持 arrival selector 的既有
+                # 最近點語意與速度模長數值。
+                u_nearest = np.asarray(
+                    u_surface[local][nearest_coordinates], dtype=np.float64
+                )
+                v_nearest = np.asarray(
+                    v_surface[local][nearest_coordinates], dtype=np.float64
+                )
+                eta_nearest = np.asarray(
+                    eta[local][nearest_coordinates], dtype=np.float64
+                )
+                elevation[int(time_ns)] = float(eta_nearest)
+                speed[int(time_ns)] = float(np.hypot(u_nearest, v_nearest))
             else:
                 elevation[int(time_ns)] = float("nan")
                 speed[int(time_ns)] = float("nan")
@@ -4094,6 +4143,7 @@ def _arrival_payload(
     *,
     source_hashes: Mapping[str, str],
     strict: bool,
+    horizon_settings: HorizonSettings | None = None,
     pilot_selection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """將 ArrivalTime dataclass 轉成 strict schema 1 manifest。
@@ -4115,6 +4165,16 @@ def _arrival_payload(
     }
     if pilot_selection is not None:
         provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
+    if horizon_settings is not None and horizon_settings.is_generic:
+        # arrival 的 48+2 分層方法仍然不變；這裡額外保存它使用哪一套共同回溯母體，
+        # 讓 7／30 執行設定能追溯到同一批通過 support gate 的 arrival，而不是只看
+        # selection method 名稱猜測窗口長度。
+        provenance_extra["shared_arrival_horizon"] = {
+            "policy": GENERIC_HORIZON_POLICY_ID,
+            "method_id": GENERIC_HORIZON_METHOD_ID,
+            "support_days": horizon_settings.support_days,
+            "requested_max_backtrack_days": horizon_settings.requested_days,
+        }
     return {
         "manifest_kind": "arrival_time_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -4140,6 +4200,7 @@ def _gap_safe_payload(
     source_hashes: Mapping[str, str],
     max_backtrack_days: float,
     strict: bool,
+    horizon_settings: HorizonSettings | None = None,
     pilot_horizon_overrides: Mapping[str, float] | None = None,
     pilot_selection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -4154,6 +4215,103 @@ def _gap_safe_payload(
     records: list[dict[str, Any]] = []
     expected_set = {int(value) for value in expected_axis}
     overrides = {str(key): float(value) for key, value in (pilot_horizon_overrides or {}).items()}
+
+    if horizon_settings is not None and horizon_settings.is_generic:
+        # generic shared horizon 的每筆窗口都用共同 support 上限計算；pilot replacement
+        # 是另一個版本化流程，若混入此母體會讓「7 日與 30 日只差執行設定」失去同一
+        # arrival 分母，因此在任何資料列建立前直接拒絕。expected_axis 只提供全域期別，
+        # 實際可用節點由每個 OCM canonical axis 的 bounds／gaps 重新計算，避免相信
+        # gap manifest 自己宣稱的 missing 清單。
+        if overrides or pilot_selection is not None:
+            raise InputDerivationError("generic shared horizon 不得混入 pilot arrival window")
+        support_days = horizon_settings.support_days
+        if support_days is None:
+            raise InputDerivationError("generic shared horizon 缺少正整日 support_days")
+        if not math.isclose(
+            float(max_backtrack_days),
+            float(support_days),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise InputDerivationError("generic shared horizon 的 max_backtrack_days 必須等於 support_days")
+        expected_start_ns = int(expected_axis[0])
+        expected_end_ns = int(expected_axis[-1])
+        site_region = {site.study_site_id: site.analysis_region_id for site in config.study_sites}
+        for arrival in sorted(arrivals, key=lambda item: (item.study_site_id, item.time_utc_ns)):
+            region = site_region.get(arrival.study_site_id)
+            if region is None or region not in ocm_by_region:
+                raise InputDerivationError(
+                    f"generic shared horizon 找不到 arrival 對應的 OCM region：{arrival.study_site_id}"
+                )
+            product = ocm_by_region[region]
+            try:
+                window = build_horizon_window(
+                    arrival.time_utc_ns,
+                    support_days,
+                    expected_start_ns=expected_start_ns,
+                    expected_end_ns=expected_end_ns,
+                    context=f"arrival[{arrival.arrival_time_id}]",
+                )
+                coverage = compute_horizon_coverage(
+                    window,
+                    expected_start_ns=expected_start_ns,
+                    expected_end_ns=expected_end_ns,
+                    canonical_start_ns=int(product.canonical.time_utc_ns[0]),
+                    canonical_end_ns=int(product.canonical.time_utc_ns[-1]),
+                    canonical_gaps=product.canonical.gaps,
+                )
+            except (HorizonContractError, IndexError, ValueError) as exc:
+                raise InputDerivationError(
+                    f"generic shared horizon 無法建立 {arrival.arrival_time_id} 的 support window：{exc}"
+                ) from exc
+            if coverage.crossed_gap and strict:
+                raise InputDerivationError(
+                    f"generic shared horizon 遇到未支援節點：{arrival.arrival_time_id}"
+                )
+            missing = coverage.missing_time_ns
+            records.append(
+                {
+                    "arrival_time_id": arrival.arrival_time_id,
+                    "study_site_id": arrival.study_site_id,
+                    "analysis_region_id": region,
+                    "flow_domain_id": product.flow_domain_id,
+                    "arrival_time_utc": _utc_string(window.arrival_time_ns),
+                    "horizon_start_utc": _utc_string(window.start_time_ns),
+                    "horizon_end_utc": _utc_string(window.end_time_ns),
+                    "max_backtrack_days": int(support_days),
+                    "support_days": int(support_days),
+                    "expected_step_count": window.expected_step_count,
+                    "supported_step_count": coverage.supported_step_count,
+                    "crossed_gap": coverage.crossed_gap,
+                    "missing_utc": [_utc_string(value) for value in missing],
+                    "time_support_policy": GENERIC_HORIZON_POLICY_ID,
+                }
+            )
+        status = (
+            "generated"
+            if any(item["crossed_gap"] for item in records)
+            else ("approved" if strict else "generated")
+        )
+        return {
+            "manifest_kind": "ocm_gap_safe_arrival_horizon_manifest",
+            "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
+            "status": status,
+            "design_version": config.design_version,
+            "time_standard": "UTC",
+            "policy": GENERIC_HORIZON_POLICY_ID,
+            "max_backtrack_days": int(support_days),
+            "support_days": int(support_days),
+            "requested_max_backtrack_days": horizon_settings.requested_days,
+            "provenance": _provenance(
+                method_id=GENERIC_HORIZON_METHOD_ID,
+                source_hashes=source_hashes,
+                expected_time_count=int(expected_axis.size),
+                support_days=int(support_days),
+                requested_max_backtrack_days=horizon_settings.requested_days,
+                gap_policy="canonical OCM bounds and gaps; no nearest/zero fill",
+            ),
+            "records": records,
+        }
 
     def horizon_steps_for(value: float) -> int:
         """把日數轉成正整數逐時步數，拒絕半日或非有限輸入。"""
@@ -4323,6 +4481,7 @@ def _forcing_inventory_payload(
                     ],
                     "canonical_time": {
                         "policy": axis.policy,
+                        "expected_timestep_hours": axis.expected_timestep_hours,
                         "input_time_count": axis.input_time_count,
                         "canonical_time_count": int(axis.time_utc_ns.size),
                         "reordered_time_step_count": axis.reordered_time_step_count,
@@ -4630,11 +4789,23 @@ def build_input_derivatives(
         )
     config_file = _assert_regular_file(config_path)
     config = load_config(config_file, formal_release=False)
+    try:
+        horizon_settings = resolve_configured_horizon(config)
+    except HorizonContractError as exc:
+        raise InputDerivationError(f"回溯 horizon 設定無效：{exc}") from exc
+    if horizon_settings.is_generic and pilot_arrivals:
+        raise InputDerivationError(
+            "generic shared horizon 不得同時使用 pilot_arrival_utc；請以同一母體選取 arrival"
+        )
     # 先在任何 forcing root 讀取前鎖定研究範圍與 source binding；新 v3 policy 可用
     # ``formal=False, strict=True`` 產生準備性 geometry/input，但不能因目錄中另有 v4
     # 就改變來源版本。
     config.assert_research_domain_policy()
     strict_mode = formal if strict is None else bool(strict)
+    # generic shared 母體的 arrival 分層必須以 support 上限驗證；即使 caller 只是建立
+    # generated 準備資料，也不能因日期不足而走 legacy synthetic fallback，否則 7／30
+    # 比較會共用一批其實只通過短窗的 arrival。legacy 非 strict fixture 才保留 fallback。
+    selection_strict = strict_mode or horizon_settings.is_generic
     native_root = _env_root(ocm_native_root, config.inputs.ocm_native_root_env)
     nww_root = _env_root(nww_analysis_root, config.inputs.nww_analysis_root_env)
     surface_root = _env_root(ocm_surface_root, config.inputs.ocm_surface_root_env)
@@ -4643,7 +4814,7 @@ def build_input_derivatives(
     months = _months_for_config(config)
     if formal and [int(year) for year in config.inputs.years] != [2024, 2025]:
         raise InputDerivationError("formal input build 的 years 必須 exact 為 [2024, 2025]")
-    if formal and not math.isclose(
+    if formal and not horizon_settings.is_generic and not math.isclose(
         float(config.boundaries.max_backtrack_days or 0.0),
         float(DEFAULT_MAX_BACKTRACK_DAYS),
         rel_tol=0.0,
@@ -4655,6 +4826,23 @@ def build_input_derivatives(
         or len(config.study_sites) != EXPECTED_STUDY_SITE_COUNT
     ):
         raise InputDerivationError("Slice 1 必須有四個 flow domains 與五個 study sites")
+    # expected period 只由 config 月份與 hourly contract 決定；先建立這個小型 metadata 軸
+    # 並檢查 generic support 的基本容量，再讀取三套大型產品，讓不可能的超長日數早退。
+    expected_axis = _expected_hourly_axis(
+        months, step_hours=float(config.inputs.time_axis_contract["expected_timestep_hours"])
+    )
+    if horizon_settings.is_generic:
+        support_days = horizon_settings.support_days
+        if support_days is None:
+            raise InputDerivationError("generic shared horizon 缺少 support_days")
+        try:
+            validate_support_against_period(
+                support_days,
+                expected_start_ns=int(expected_axis[0]),
+                expected_end_ns=int(expected_axis[-1]),
+            )
+        except HorizonContractError as exc:
+            raise InputDerivationError(f"generic shared horizon 超出 config 資料期：{exc}") from exc
     products_by_region: dict[str, tuple[_ProductData, _ProductData, _ProductData]] = {}
     ocm_by_region: dict[str, _ProductData] = {}
     nww_by_region: dict[str, _ProductData] = {}
@@ -4742,9 +4930,6 @@ def build_input_derivatives(
                 findings=[],
             )
         )
-    expected_axis = _expected_hourly_axis(
-        months, step_hours=float(config.inputs.time_axis_contract["expected_timestep_hours"])
-    )
     # 來源 hash 只取第一個 loop 的整套產品；四域各自保留 key，供所有 component closure。
     all_products = [item for pair in products_by_region.values() for item in pair]
     source_hashes = _source_hashes_for_products(all_products)
@@ -4789,10 +4974,10 @@ def build_input_derivatives(
                 nww_cache=nww_runtime_caches[region],
                 ocm_elevation=elevation,
                 ocm_speed=speed,
-                max_backtrack_days=float(config.boundaries.max_backtrack_days or DEFAULT_MAX_BACKTRACK_DAYS),
+                max_backtrack_days=horizon_settings.selection_days,
                 design_version=config.design_version,
                 expected_axis=expected_axis,
-                strict=strict_mode,
+                strict=selection_strict,
             )
             explicit = pilot_arrivals.get(site_id)
             # A 區 exact pair 必須先建立共同 UTC，再各自套用明示 replacement；若在
@@ -4831,11 +5016,9 @@ def build_input_derivatives(
             guishan_context=guishan_context,
             guishan_product=guishan_product,
             expected_axis=expected_axis,
-            max_backtrack_days=float(
-                config.boundaries.max_backtrack_days or DEFAULT_MAX_BACKTRACK_DAYS
-            ),
+            max_backtrack_days=horizon_settings.selection_days,
             design_version=config.design_version,
-            strict=strict_mode,
+            strict=selection_strict,
         )
         if set(pilot_arrivals) == {"gongliao", "guishan"}:
             # paired clone 完成後，兩站都以自己的 baseline arrival identity 建立固定
@@ -4889,6 +5072,7 @@ def build_input_derivatives(
         all_arrivals,
         source_hashes=source_hashes,
         strict=strict_mode,
+        horizon_settings=horizon_settings,
         pilot_selection=pilot_selection,
     )
     dynamic_payload = _dynamic_initial_payload(
@@ -4900,7 +5084,7 @@ def build_input_derivatives(
         strict=strict_mode,
         pilot_selection=pilot_selection,
     )
-    max_days = float(config.boundaries.max_backtrack_days or DEFAULT_MAX_BACKTRACK_DAYS)
+    max_days = horizon_settings.selection_days
     gap_payload = _gap_safe_payload(
         config=config,
         ocm_by_region=ocm_by_region,
@@ -4909,6 +5093,7 @@ def build_input_derivatives(
         source_hashes=source_hashes,
         max_backtrack_days=max_days,
         strict=strict_mode,
+        horizon_settings=horizon_settings,
         pilot_horizon_overrides=pilot_horizon_overrides,
         pilot_selection=pilot_selection,
     )
@@ -5204,6 +5389,225 @@ def _validate_source_file_bindings(
     return errors
 
 
+def _validate_canonical_axis_bindings(
+    inventory: Mapping[str, Any],
+    *,
+    roots_by_token: Mapping[str, Path | None],
+) -> list[str]:
+    """從已綁定月份的 ``time_utc_ns.npy`` 重建 canonical summary。
+
+    `_validate_source_file_bindings` 已驗證每一檔的大小、header 與小檔 hash，但若只相信
+    inventory 的 ``canonical_time`` summary，攻擊者仍可只改 summary、重簽 component
+    sidecar，讓 gap／count 看似完整。這裡在 caller 提供實際 root 時重新讀取每個產品的
+    exact flow-domain／month time axis，依同一 canonicalization policy 重建 count、排序、
+    去重、bounds、gap 與 canonical hash，再逐欄對比 inventory。時間軸是小型 metadata，
+    因此不會讀取大型 forcing payload；root 未提供時只保留離線結構驗證，不能把它標成
+    已完成來源重建。
+    """
+
+    errors: list[str] = []
+    products = inventory.get("products")
+    expected_period = inventory.get("expected_period")
+    if not isinstance(products, list) or not isinstance(expected_period, Mapping):
+        return ["canonical_axis_rebuild_inventory_period_invalid"]
+    try:
+        period_start = datetime.fromisoformat(
+            str(expected_period["start_utc"]).replace("Z", "+00:00")
+        )
+        period_end = datetime.fromisoformat(str(expected_period["end_utc"]).replace("Z", "+00:00"))
+        if period_start.utcoffset() != timedelta(0) or period_end.utcoffset() != timedelta(0):
+            raise ValueError("expected period 必須是 UTC")
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        expected_start_ns = int((period_start - epoch).total_seconds()) * 1_000_000_000
+        expected_end_ns = int((period_end - epoch).total_seconds()) * 1_000_000_000
+        raw_expected_count = expected_period["hourly_step_count"]
+        if isinstance(raw_expected_count, bool) or not isinstance(raw_expected_count, int):
+            raise ValueError("expected period 筆數必須是整數")
+        expected_count = int(raw_expected_count)
+        if (
+            expected_count < 1
+            or expected_end_ns < expected_start_ns
+            or (expected_end_ns - expected_start_ns) % _UTC_HOUR_NS
+            or (expected_end_ns - expected_start_ns) // _UTC_HOUR_NS + 1 != expected_count
+        ):
+            raise ValueError("expected period 不合法")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ["canonical_axis_rebuild_expected_period_invalid"]
+
+    for product in products:
+        if not isinstance(product, Mapping):
+            errors.append("canonical_axis_rebuild_product_invalid")
+            continue
+        token = product.get("root_token")
+        root = roots_by_token.get(str(token))
+        # 沒有實際 root 時不能把 metadata-only 的 self-consistency 說成來源驗收；
+        # `_validate_source_file_bindings` 仍會檢查 token/path/header/hash 結構。
+        if root is None:
+            continue
+        product_name = product.get("product")
+        region = product.get("analysis_region_id")
+        flow_domain_id = product.get("flow_domain_id")
+        canonical_summary = product.get("canonical_time")
+        months_payload = product.get("months")
+        files = product.get("files")
+        if (
+            not isinstance(token, str)
+            or not isinstance(product_name, str)
+            or not isinstance(region, str)
+            or not isinstance(flow_domain_id, str)
+            or not isinstance(canonical_summary, Mapping)
+            or not isinstance(months_payload, list)
+            or not isinstance(files, list)
+        ):
+            errors.append(f"canonical_axis_rebuild_metadata_invalid:{product_name}:{region}")
+            continue
+
+        month_labels: list[str] = []
+        for month in months_payload:
+            if not isinstance(month, Mapping) or not isinstance(month.get("month"), str):
+                errors.append(f"canonical_axis_rebuild_month_record_invalid:{product_name}:{region}")
+                continue
+            label = str(month["month"])
+            try:
+                _parse_month(label)
+            except (TypeError, ValueError):
+                errors.append(f"canonical_axis_rebuild_month_label_invalid:{product_name}:{label}")
+                continue
+            if label in month_labels:
+                errors.append(f"canonical_axis_rebuild_duplicate_month:{product_name}:{label}")
+            month_labels.append(label)
+            expected_month_path = f"${token}/{flow_domain_id}/months/{label}"
+            if month.get("path") != expected_month_path:
+                errors.append(f"canonical_axis_rebuild_month_path_mismatch:{product_name}:{label}")
+        month_labels.sort()
+        if not month_labels:
+            errors.append(f"canonical_axis_rebuild_months_empty:{product_name}:{region}")
+            continue
+        # inventory 的 month list 不能自己縮短成「看起來連續」的小樣本；expected period
+        # 由同一份 forcing inventory 宣告，因此直接展開其涵蓋的曆月集合做 exact 比對。
+        expected_month_labels: list[str] = []
+        cursor = datetime(period_start.year, period_start.month, 1, tzinfo=UTC)
+        last_month = datetime(period_end.year, period_end.month, 1, tzinfo=UTC)
+        while cursor <= last_month:
+            expected_month_labels.append(f"{cursor.year}{cursor.month:02d}")
+            if cursor.month == 12:
+                cursor = datetime(cursor.year + 1, 1, 1, tzinfo=UTC)
+            else:
+                cursor = datetime(cursor.year, cursor.month + 1, 1, tzinfo=UTC)
+        if month_labels != expected_month_labels:
+            errors.append(f"canonical_axis_rebuild_month_set_mismatch:{product_name}:{region}")
+            continue
+
+        expected_product_prefix = f"${token}/{flow_domain_id}/"
+        for record in files:
+            if not isinstance(record, Mapping):
+                continue
+            raw_path = record.get("path")
+            if not isinstance(raw_path, str) or not raw_path.startswith(expected_product_prefix):
+                errors.append(f"canonical_axis_rebuild_product_path_mismatch:{product_name}:{region}")
+                break
+
+        expected_time_paths = {
+            f"${token}/{flow_domain_id}/months/{label}/time_utc_ns.npy" for label in month_labels
+        }
+        time_records: dict[str, Mapping[str, Any]] = {}
+        for record in files:
+            if not isinstance(record, Mapping) or record.get("file_kind") != "time_axis":
+                continue
+            path = record.get("path")
+            if not isinstance(path, str):
+                errors.append(f"canonical_axis_rebuild_time_path_invalid:{product_name}:{region}")
+                continue
+            if path in time_records:
+                errors.append(f"canonical_axis_rebuild_duplicate_time_record:{product_name}:{path}")
+            time_records[path] = record
+        if set(time_records) != expected_time_paths:
+            errors.append(f"canonical_axis_rebuild_time_month_set_mismatch:{product_name}:{region}")
+            continue
+
+        chunks: list[TimeChunk] = []
+        invalid_product = False
+        for label in month_labels:
+            path = f"${token}/{flow_domain_id}/months/{label}/time_utc_ns.npy"
+            relative_suffix = Path(flow_domain_id) / "months" / label / "time_utc_ns.npy"
+            try:
+                values = _load_npy(root / relative_suffix, dtype=np.dtype("int64"))
+                if values.ndim != 1 or values.size < 2 or np.any(np.diff(values) <= 0):
+                    raise InputDerivationError("time axis 必須是嚴格遞增一維 int64")
+                month_record = next(
+                    item
+                    for item in months_payload
+                    if isinstance(item, Mapping) and item.get("month") == label
+                )
+                if (
+                    month_record.get("time_count") != int(values.size)
+                    or month_record.get("time_start_utc") != _utc_string(int(values[0]))
+                    or month_record.get("time_end_utc") != _utc_string(int(values[-1]))
+                ):
+                    errors.append(f"canonical_axis_rebuild_month_summary_mismatch:{product_name}:{label}")
+                chunks.append(TimeChunk(label, np.asarray(values)))
+            except Exception as exc:
+                errors.append(f"canonical_axis_rebuild_time_unreadable:{product_name}:{path}:{type(exc).__name__}")
+                invalid_product = True
+        if invalid_product or not chunks:
+            continue
+        try:
+            policy = canonical_summary.get("policy")
+            expected_timestep = float(canonical_summary.get("expected_timestep_hours", 1.0))
+            axis = canonicalize_time_chunks(
+                chunks,
+                policy=policy,  # type: ignore[arg-type]
+                expected_timestep_hours=expected_timestep,
+            )
+            actual_hash = sha256(
+                np.asarray(axis.time_utc_ns, dtype="<i8").tobytes()
+            ).hexdigest()
+            actual_gaps = [
+                {
+                    "before_utc": _utc_string(item.before_utc_ns),
+                    "after_utc": _utc_string(item.after_utc_ns),
+                    "gap_hours": item.gap_hours,
+                    "missing_step_count": item.missing_step_count,
+                }
+                for item in axis.gaps
+            ]
+            period_mask = (axis.time_utc_ns >= expected_start_ns) & (
+                axis.time_utc_ns <= expected_end_ns
+            )
+            available_period_count = int(np.count_nonzero(period_mask))
+            expected_summary = {
+                "policy": axis.policy,
+                "expected_timestep_hours": axis.expected_timestep_hours,
+                "input_time_count": axis.input_time_count,
+                "canonical_time_count": int(axis.time_utc_ns.size),
+                "reordered_time_step_count": axis.reordered_time_step_count,
+                "dropped_duplicate_time_step_count": axis.dropped_duplicate_time_step_count,
+                "expected_period_time_count": expected_count,
+                "available_period_time_count": available_period_count,
+                "missing_period_time_count": expected_count - available_period_count,
+                "continuous_hourly": bool(
+                    axis.time_utc_ns.size == expected_count
+                    and int(axis.time_utc_ns[0]) == expected_start_ns
+                    and int(axis.time_utc_ns[-1]) == expected_end_ns
+                    and not axis.gaps
+                ),
+                "time_start_utc": _utc_string(int(axis.time_utc_ns[0])),
+                "time_end_utc": _utc_string(int(axis.time_utc_ns[-1])),
+                "time_sha256": actual_hash,
+                "gaps": actual_gaps,
+            }
+            for field, actual in expected_summary.items():
+                # expected_timestep_hours 是新 inventory 的明示欄位；legacy artifact 未
+                # 保存它時以既有 hourly contract 重建，但不因缺少新欄位而改判舊產物。
+                if field == "expected_timestep_hours" and field not in canonical_summary:
+                    continue
+                if canonical_summary.get(field) != actual:
+                    errors.append(f"canonical_axis_summary_mismatch:{product_name}:{region}:{field}")
+        except Exception as exc:
+            errors.append(f"canonical_axis_rebuild_invalid:{product_name}:{region}:{type(exc).__name__}")
+    return errors
+
+
 def validate_input_derivatives(
     directory: str | Path,
     *,
@@ -5265,6 +5669,58 @@ def validate_input_derivatives(
             )
         except Exception as exc:
             errors.append(f"inventory_flow_domain_binding_invalid:{type(exc).__name__}")
+    horizon_settings: HorizonSettings | None = None
+    if config is not None:
+        try:
+            horizon_settings = resolve_configured_horizon(config)
+        except HorizonContractError as exc:
+            errors.append(f"horizon_config_invalid:{exc}")
+    # generic policy 一旦出現就必須走完整的 shared semantic validator；即使 config 沒有
+    # 提供，也不能因 unknown/missing policy 自動套回 legacy 7 日檢查。validator 會只讀
+    # forcing inventory 的 expected period 與 OCM canonical bounds/gaps 重算每筆 row。
+    gap_provenance = gap.get("provenance")
+    gap_rows_for_policy = gap.get("records")
+    generic_gap_marked = (
+        gap.get("support_days") is not None
+        or gap.get("requested_max_backtrack_days") is not None
+        or (
+            isinstance(gap_provenance, Mapping)
+            and gap_provenance.get("method_id") == GENERIC_HORIZON_METHOD_ID
+        )
+        or (
+            isinstance(gap_rows_for_policy, list)
+            and any(
+                isinstance(row, Mapping) and row.get("support_days") is not None
+                for row in gap_rows_for_policy
+            )
+        )
+    )
+    if (
+        horizon_settings is not None and horizon_settings.is_generic
+    ) or gap.get("policy") == GENERIC_HORIZON_POLICY_ID or generic_gap_marked:
+        generic_result = validate_generic_gap_payload(
+            gap,
+            arrival,
+            forcing,
+            config=config,
+            # 共同母體的完整支援窗是重用前提，與本次是否正式發布無關。即使只跑
+            # 七日工程驗證，三十日母體較早的缺口也不能降為警告而繼續執行。
+            strict=True,
+        )
+        errors.extend(generic_result.errors)
+        warnings.extend(generic_result.warnings)
+        summary.update(
+            {
+                "shared_horizon_policy": generic_result.summary.get("policy"),
+                "shared_horizon_support_days": generic_result.summary.get("support_days"),
+                "shared_horizon_arrival_records_checked": generic_result.summary.get(
+                    "arrival_records_checked", 0
+                ),
+                "shared_horizon_arrival_records_crossing_gap": generic_result.summary.get(
+                    "arrival_records_crossing_gap", 0
+                ),
+            }
+        )
     if config is not None:
         try:
             load_material_manifest(paths["material"], config, formal=formal)
@@ -5303,7 +5759,10 @@ def validate_input_derivatives(
             # 重新建立版本化契約，不可沿用 2024–2025 的 17,544 小時聲明。
             if [int(year) for year in config.inputs.years] != [2024, 2025]:
                 errors.append("formal_years_must_be_2024_2025")
-            if not math.isclose(
+            if (
+                horizon_settings is None
+                or not horizon_settings.is_generic
+            ) and not math.isclose(
                 float(config.boundaries.max_backtrack_days or 0.0),
                 float(DEFAULT_MAX_BACKTRACK_DAYS),
                 rel_tol=0.0,
@@ -5487,8 +5946,28 @@ def validate_input_derivatives(
         roots_by_token[config.inputs.nww_analysis_root_env] = _env_root(
             nww_analysis_root, config.inputs.nww_analysis_root_env, required=False
         )
+    inventory_products = forcing.get("products")
+    source_tokens = {
+        str(item.get("root_token"))
+        for item in inventory_products
+        if isinstance(item, Mapping) and isinstance(item.get("root_token"), str)
+    } if isinstance(inventory_products, list) else set()
+    source_roots_complete = bool(source_tokens) and all(
+        roots_by_token.get(token) is not None for token in source_tokens
+    )
+    summary["source_canonical_axis_rebuilt"] = source_roots_complete
+    if not source_roots_complete:
+        # 沒有 caller 明示的三套 accepted-product root 時，只能做 artifact／metadata
+        # 自洽檢查；保留這個 warning 讓離線報告不會被誤讀成現場來源已重建。
+        warnings.append("source_canonical_axis_rebuild_skipped_without_roots")
     errors.extend(
         _validate_source_file_bindings(
+            forcing,
+            roots_by_token=roots_by_token,
+        )
+    )
+    errors.extend(
+        _validate_canonical_axis_bindings(
             forcing,
             roots_by_token=roots_by_token,
         )
@@ -5705,6 +6184,16 @@ def _config_for_inventory_validation(
         return config
     inventory_flow_ids = _flow_domain_ids_from_inventory(inventory)
     payload = config.model_dump(mode="json", exclude_none=False)
+    # ``model_dump`` 會把 Pydantic 為舊 YAML 補出的新欄位也寫回 mapping；若不先移除，
+    # 後面的 model_validate 會把「舊設定未明示 support」誤記成「明示 null」，使 legacy
+    # artifact 在 inventory flow-domain 對齊後錯誤觸發 generic 未定案 gate。只有原始
+    # YAML 真正寫過欄位時才保留它，與 ProjectConfig.normalized_payload 的 hash 相容政策一致。
+    inputs_payload = payload.get("inputs")
+    if (
+        isinstance(inputs_payload, dict)
+        and "backtrack_support_days" not in config.inputs.model_fields_set
+    ):
+        inputs_payload.pop("backtrack_support_days", None)
     _bind_inventory_flow_domains(payload, inventory_flow_ids=inventory_flow_ids)
     domains = payload["domains"]
     sites = payload["study_sites"]
@@ -5716,12 +6205,128 @@ def _config_for_inventory_validation(
     return ProjectConfig.model_validate(payload)
 
 
+def _release_horizon_override(value: Any, *, label: str) -> float:
+    """驗證 release 輸出的回溯日數覆寫值，不讓 YAML／CLI 偷換型別。
+
+    release config 的 ``max_backtrack_days`` 仍保留浮點型別，以相容既有 pilot 的
+    小於一日視窗；這裡只負責拒絕布林、非有限值與非正值。是否超過母體支援窗，
+    會在完整 ``ProjectConfig`` 與 gap-safe artifact 證據都載入後再判定。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{label} 必須是有限正數")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{label} 必須是有限正數")
+    return normalized
+
+
+def _release_step_count_override(value: Any, *, label: str) -> int:
+    """驗證 release 輸出的最大步數覆寫值，保留原生正整數語意。"""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{label} 必須是正整數")
+    return int(value)
+
+
+def _release_step_budget_error(config: ProjectConfig) -> str | None:
+    """回傳 requested horizon 與既有 dt／最大步數不相容時的錯誤訊息。
+
+    只有三個欄位都已定案才做數值比較；準備性設定缺少 dt 或 step budget 時，保留
+    ``generated`` 與原有 formal blocker，不能由這個 helper 偷填研究參數。最低需求
+    以 ``ceil(H 秒 / dt_max)`` 計算，確保單一粒子在允許的最大步長下仍有足夠迭代額度。
+    """
+
+    requested_days = config.boundaries.max_backtrack_days
+    dt_max = config.integration.dt_max_seconds
+    step_count = config.boundaries.maximum_step_count
+    if requested_days is None or dt_max is None or step_count is None:
+        return None
+    if isinstance(dt_max, bool) or not isinstance(dt_max, (int, float)):
+        return "integration.dt_max_seconds 必須是有限正數"
+    dt_max_float = float(dt_max)
+    if not math.isfinite(dt_max_float) or dt_max_float <= 0.0:
+        return "integration.dt_max_seconds 必須是有限正數"
+    required_steps = math.ceil(float(requested_days) * 86_400.0 / dt_max_float)
+    if int(step_count) < required_steps:
+        return "boundaries.maximum_step_count 不足以涵蓋 requested max_backtrack_days"
+    return None
+
+
+def _release_support_evidence(
+    input_root: Path,
+    *,
+    source_config: ProjectConfig,
+    requested_days: float | None,
+) -> dict[str, Any]:
+    """讀取小型 release artifact 證據，確認母體 hash 與支援窗沒有被偷換。
+
+    這個檢查只讀 ``artifact_index.json`` 與 gap-safe component，
+    不開啟 OCM/NWW 大型陣列。明示 ``backtrack_support_days`` 時，artifact index
+    必須保留可格式驗證的來源 config hash，且 gap 根節點必須與該支援窗 exact 相同；
+    實際 component／每筆 arrival 的完整性仍交由共用 ``validate_input_derivatives``
+    驗證。因此「YAML 宣告 30 日」不能單獨取代 30 日母體證據。未明示新欄位的舊
+    設定沿用原有寬鬆流程；回傳摘要只會寫入 release binding，供之後 validator 再次
+    比對，不會修改任何來源檔案。
+    """
+
+    index, _ = read_canonical_json(input_root / "artifact_index.json")
+    source_bindings = index.get("source_bindings")
+    support_declared = "backtrack_support_days" in source_config.inputs.model_fields_set
+    if support_declared:
+        if not isinstance(source_bindings, Mapping):
+            raise InputDerivationError("input artifact 缺少 source_bindings，不能建立 release config")
+        source_hash = source_bindings.get("config_hash")
+        if type(source_hash) is not str or _SHA256_RE.fullmatch(source_hash) is None:
+            raise InputDerivationError("input artifact source_config_hash 格式不合法")
+    else:
+        source_hash = (
+            source_bindings.get("config_hash")
+            if isinstance(source_bindings, Mapping)
+            else None
+        )
+
+    gap, _ = read_canonical_json(input_root / ARTIFACT_FILENAMES["ocm_gap_safe_arrival_horizon"])
+    raw_root_days = gap.get("max_backtrack_days")
+    if isinstance(raw_root_days, bool) or not isinstance(raw_root_days, (int, float)):
+        raise InputDerivationError("gap-safe artifact 缺少有限正數 max_backtrack_days")
+    root_days = float(raw_root_days)
+    if not math.isfinite(root_days) or root_days <= 0.0:
+        raise InputDerivationError("gap-safe artifact max_backtrack_days 必須是有限正數")
+
+    support_days = source_config.inputs.backtrack_support_days if support_declared else None
+    if support_days is not None and not math.isclose(
+        root_days, float(support_days), rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise InputDerivationError(
+            "gap-safe artifact 的母體支援日數與 source config 宣告不一致"
+        )
+    if support_declared and requested_days is not None and requested_days > root_days:
+        raise InputDerivationError(
+            "release config requested max_backtrack_days 超過 gap-safe 母體支援窗"
+        )
+
+    records = gap.get("records")
+    if not isinstance(records, list) or not records:
+        raise InputDerivationError("gap-safe artifact 缺少 arrival records，不能證明母體支援窗")
+    return {
+        # 這裡保存 artifact 建置時的來源 hash；它是 provenance，不要求等於後續
+        # 補齊 dt／members／step 等執行參數後的 release config hash。
+        "source_config_hash": source_hash,
+        "source_backtrack_support_days": support_days,
+        "artifact_backtrack_support_days": root_days,
+        "requested_max_backtrack_days": requested_days,
+    }
+
+
 def create_release_config(
     *,
     config_template_path: str | Path,
     input_directory: str | Path,
     output_path: str | Path,
     formal: bool = True,
+    max_backtrack_days: float | None = None,
+    maximum_step_count: int | None = None,
 ) -> dict[str, Any]:
     """由範例設定建立新的 release config，並以 exact artifact hash 寫入 binding。
 
@@ -5738,9 +6343,45 @@ def create_release_config(
     _assert_no_symlink_components(output.parent, allow_missing_leaf=True)
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"不可覆寫既有 release config：{output}")
+    source_config = load_config(template_path, formal_release=False)
+    normalized_max_days = (
+        None
+        if max_backtrack_days is None
+        else _release_horizon_override(max_backtrack_days, label="max_backtrack_days")
+    )
+    normalized_max_steps = (
+        None
+        if maximum_step_count is None
+        else _release_step_count_override(maximum_step_count, label="maximum_step_count")
+    )
+    # 先在 manifest rewriter 之前檢查 requested 是否超過 source config 已明示的共同
+    # 母體支援窗。這個順序很重要：rewriter 會重新綁定 flow-domain，若讓不可能的
+    # 31 日設定先進入那條路徑，錯誤可能被誤報成 A 區研究範圍契約，而不是實際的
+    # horizon 超限。source 欄位未明示時保留 legacy 行為；明示 null 則只能建立尚未
+    # 指定 requested 的準備性設定，不能藉 release override 越過「尚未定案」狀態。
+    support_declared = "backtrack_support_days" in source_config.inputs.model_fields_set
+    if support_declared and normalized_max_days is not None:
+        source_support_days = source_config.inputs.backtrack_support_days
+        if source_support_days is None:
+            raise ValueError(
+                "已指定 release max_backtrack_days，但 inputs.backtrack_support_days 尚未定案"
+            )
+        if normalized_max_days > float(source_support_days):
+            raise ValueError(
+                "release config requested max_backtrack_days 不得超過 "
+                "inputs.backtrack_support_days"
+            )
     config_payload = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     if not isinstance(config_payload, dict):
         raise ValueError("config template root 必須是 mapping")
+    if normalized_max_days is not None or normalized_max_steps is not None:
+        boundaries = config_payload.get("boundaries")
+        if not isinstance(boundaries, dict):
+            raise ValueError("config template boundaries 必須是 mapping")
+        if normalized_max_days is not None:
+            boundaries["max_backtrack_days"] = normalized_max_days
+        if normalized_max_steps is not None:
+            boundaries["maximum_step_count"] = normalized_max_steps
     # forcing inventory 是 builder 對三套 accepted product 的共同來源紀錄。先從它
     # 解析每個 region 的實際 ID，再把 release config 的 formal 欄位與 site-level
     # runtime binding 一次綁定；不能只從 template 的 base ID 或任意資料夾名稱猜測。
@@ -5749,6 +6390,17 @@ def create_release_config(
     rewritten = _replace_manifest_references(config_payload, config_output=output, input_directory=input_root)
     _bind_inventory_flow_domains(rewritten, inventory_flow_ids=inventory_flow_ids)
     rewritten["config_status"] = "generated"
+    candidate_config = ProjectConfig.model_validate(rewritten)
+    requested_days = candidate_config.boundaries.max_backtrack_days
+    support_evidence = _release_support_evidence(
+        input_root,
+        source_config=source_config,
+        requested_days=None if requested_days is None else float(requested_days),
+    )
+    support_evidence["requested_maximum_step_count"] = candidate_config.boundaries.maximum_step_count
+    step_budget_error = _release_step_budget_error(candidate_config)
+    if step_budget_error is not None:
+        raise ValueError(step_budget_error)
     # 非 formal validator 要驗證 artifact 內的實際 flow-domain ID；它使用 base ID 作為
     # pilot provenance，但將 component cross-reference 的 view 對齊 inventory 實際 ID。
     # 這個 view 只存在於記憶體，絕不把 template 的 base ID 靜默改寫成 artifact ID。
@@ -5810,9 +6462,13 @@ def create_release_config(
     rewritten["release_binding"] = {
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
         "source_config_template_sha256": _sha256_file(template_path),
+        # 這個 hash 取自 artifact 建置時的 source binding，代表母體 provenance；7 日
+        # 與 30 日輸出可各自擁有不同 config hash，但不能把母體 hash 改寫成 target hash。
+        "source_config_hash": support_evidence["source_config_hash"],
         "input_directory_artifact_index_sha256": artifact_index_fp["sha256"],
         "artifacts": artifact_bindings,
         "approved_only_after_exact_hash_validation": True,
+        "backtrack_horizon_binding": support_evidence,
     }
     if not blockers and formal:
         rewritten["config_status"] = "approved"
@@ -5858,6 +6514,16 @@ def validate_release_config(
     if not isinstance(binding, Mapping):
         errors.append("release_binding_missing")
         return {"valid": False, "errors": errors, "warnings": []}
+    raw_inputs = payload.get("inputs")
+    support_declared = isinstance(raw_inputs, Mapping) and "backtrack_support_days" in raw_inputs
+    release_config: ProjectConfig | None = None
+    try:
+        release_config = ProjectConfig.model_validate(payload)
+    except Exception as exc:
+        # 舊 release config 沒有新支援窗欄位時，保留原有 path/hash validator 的輸出；
+        # 新欄位一旦出現則必須先通過完整 schema，否則不能藉 generated 狀態繞過 gate。
+        if support_declared or "backtrack_horizon_binding" in binding:
+            errors.append(f"release_config_schema_invalid:{type(exc).__name__}")
     if binding.get("source_config_template_sha256") and not _SHA256_RE.fullmatch(
         str(binding["source_config_template_sha256"])
     ):
@@ -5889,6 +6555,115 @@ def validate_release_config(
             _, artifact_index_fp = read_canonical_json(input_root / "artifact_index.json")
             if binding.get("input_directory_artifact_index_sha256") != artifact_index_fp["sha256"]:
                 errors.append("artifact_index_binding_mismatch")
+            artifact_index_payload, _ = read_canonical_json(input_root / "artifact_index.json")
+            artifact_source_bindings = artifact_index_payload.get("source_bindings")
+            horizon_binding = binding.get("backtrack_horizon_binding")
+            if horizon_binding is not None and not isinstance(horizon_binding, Mapping):
+                errors.append("release_horizon_binding_invalid")
+                horizon_binding = None
+            if support_declared and horizon_binding is None:
+                errors.append("release_horizon_binding_missing")
+            gap_payload: Mapping[str, Any] | None = None
+            if isinstance(horizon_binding, Mapping):
+                try:
+                    raw_gap_payload, _ = read_canonical_json(
+                        input_root / ARTIFACT_FILENAMES["ocm_gap_safe_arrival_horizon"]
+                    )
+                    gap_payload = raw_gap_payload
+                except Exception as exc:
+                    errors.append(f"release_support_evidence_invalid:{type(exc).__name__}")
+            if release_config is not None and support_declared:
+                # 新支援窗配置必須同時綁定 source artifact 與 gap-safe 根節點；只看
+                # release YAML 宣告的整日數，不足以證明母體真的建立過相同 horizon。
+                if not isinstance(artifact_source_bindings, Mapping):
+                    errors.append("release_source_binding_missing")
+                else:
+                    source_hash = artifact_source_bindings.get("config_hash")
+                    bound_source_hash = binding.get("source_config_hash")
+                    if type(source_hash) is not str or _SHA256_RE.fullmatch(source_hash) is None:
+                        errors.append("release_artifact_source_config_hash_invalid")
+                    if bound_source_hash != source_hash:
+                        errors.append("release_source_config_hash_mismatch")
+                try:
+                    if gap_payload is None:
+                        raise ValueError("gap-safe component unreadable")
+                    artifact_support = gap_payload.get("max_backtrack_days")
+                    if isinstance(artifact_support, bool) or not isinstance(
+                        artifact_support, (int, float)
+                    ) or not math.isfinite(float(artifact_support)):
+                        raise ValueError("artifact support 非有限數")
+                    support_days = release_config.inputs.backtrack_support_days
+                    requested_days = release_config.boundaries.max_backtrack_days
+                    if support_days is not None:
+                        if not math.isclose(
+                            float(artifact_support),
+                            float(support_days),
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        ):
+                            errors.append("release_support_evidence_mismatch")
+                        if requested_days is not None and float(requested_days) > float(artifact_support):
+                            errors.append("release_requested_horizon_exceeds_artifact_support")
+                except Exception as exc:
+                    errors.append(f"release_support_evidence_invalid:{type(exc).__name__}")
+            if isinstance(horizon_binding, Mapping) and release_config is not None:
+                step_budget_error = _release_step_budget_error(release_config)
+                if step_budget_error is not None:
+                    errors.append("release_step_budget_insufficient")
+                requested_bound = horizon_binding.get("requested_max_backtrack_days")
+                requested_value = release_config.boundaries.max_backtrack_days
+                if requested_value is None:
+                    if requested_bound is not None:
+                        errors.append("release_requested_horizon_binding_mismatch")
+                elif (
+                    isinstance(requested_bound, bool)
+                    or not isinstance(requested_bound, (int, float))
+                    or not math.isfinite(float(requested_bound))
+                    or not math.isclose(
+                        float(requested_bound), float(requested_value), rel_tol=0.0, abs_tol=1e-12
+                    )
+                ):
+                    errors.append("release_requested_horizon_binding_mismatch")
+                bound_source_hash = horizon_binding.get("source_config_hash")
+                if isinstance(artifact_source_bindings, Mapping):
+                    if bound_source_hash != artifact_source_bindings.get("config_hash"):
+                        errors.append("release_horizon_source_hash_mismatch")
+                elif bound_source_hash is not None:
+                    errors.append("release_horizon_source_hash_mismatch")
+                expected_support = (
+                    release_config.inputs.backtrack_support_days
+                    if support_declared
+                    else None
+                )
+                bound_support = horizon_binding.get("source_backtrack_support_days")
+                if bound_support != expected_support:
+                    errors.append("release_support_binding_mismatch")
+                expected_step_count = release_config.boundaries.maximum_step_count
+                if horizon_binding.get("requested_maximum_step_count") != expected_step_count:
+                    errors.append("release_step_count_binding_mismatch")
+                if "artifact_backtrack_support_days" not in horizon_binding:
+                    errors.append("release_artifact_support_binding_missing")
+                else:
+                    try:
+                        if gap_payload is None:
+                            raise ValueError("gap-safe component unreadable")
+                        gap_support = gap_payload.get("max_backtrack_days")
+                        bound_artifact_support = horizon_binding.get(
+                            "artifact_backtrack_support_days"
+                        )
+                        if (
+                            isinstance(bound_artifact_support, bool)
+                            or not isinstance(bound_artifact_support, (int, float))
+                            or not math.isclose(
+                                float(bound_artifact_support),
+                                float(gap_support),
+                                rel_tol=0.0,
+                                abs_tol=1e-12,
+                            )
+                        ):
+                            errors.append("release_artifact_support_binding_mismatch")
+                    except (TypeError, ValueError):
+                        errors.append("release_artifact_support_binding_mismatch")
             if binding.get("schema_version") != DERIVED_INPUT_SCHEMA_VERSION:
                 errors.append("release_binding_schema_version_invalid")
             if binding.get("approved_only_after_exact_hash_validation") is not True:
