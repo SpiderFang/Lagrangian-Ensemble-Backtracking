@@ -95,6 +95,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "pilot_config",
             "provenance",
             "run_control",
+            "engineering_window",
             "run_locking",
             "run_validation",
             "pilot_matrix_validation",
@@ -551,6 +552,34 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "plan 與 progress 的可變性、lock 順序、checkpoint generation 及 "
             "output-before-progress crash window 都是恢復正確性的核心。共用 controller 的快取"
             "計數須扣除每次分片執行前基準，續跑只合併該分片已保存增量；狀態量使用樣本最大值。"
+        ),
+    },
+    "engineering_window": {
+        "role": "建立單站、單到達時刻的 engineering-only 回溯 artifact，並接入 pilot controller",
+        "inputs": (
+            "已驗收 source config／derived component JSON、OCM native、NWW3 analysis、"
+            "站點／材質／垂向層位與 exact-hour UTC 回溯窗口"
+        ),
+        "outputs": (
+            "帶 source hash、Horizon coverage、actual-z 與 engineering_only 標記的 artifact，"
+            "以及由 RunController 回傳的逐 shard RunExecutionSummary"
+        ),
+        "entrypoints": [
+            "EngineeringWindowError",
+            "EngineeringHorizon",
+            "EngineeringWindowArtifact",
+            "parse_arrival_utc",
+            "build_engineering_horizon",
+            "prepare_engineering_window",
+            "run_engineering_window",
+        ],
+        "read_first": (
+            "這是單站工程測速 adapter，不是正式五站 inputs-build 或 formal selector。"
+            "prepare 只驗證來源並產生 immutable artifact，不建立 run_plan；run 才以該 artifact"
+            "初始化或恢復 pilot workspace，並在 controller 產生的 run_plan 中解析 shard ID。"
+            "回溯日數由呼叫端傳入，不寫死 7／30／60；OCM／NWW3 的時間支援只代表候選窗口，"
+            "完整軌跡空間 gate 仍由 runtime 執行。舊 calibration、舊 artifact 與 engineering"
+            "子集均不可升格為 formal 科學成果。"
         ),
     },
     "run_locking": {
@@ -1099,6 +1128,9 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "cli", "target": "runtime", "label": "run-create／pilot+formal"},
     {"source": "cli", "target": "run_control", "label": "run-shard／run-reconcile"},
     {"source": "cli", "target": "pilot_matrix_validation", "label": "pilot-matrix-validate／跨區共同設定"},
+    {"source": "engineering_window", "target": "input_derivation", "label": "source component／hash validation"},
+    {"source": "engineering_window", "target": "runtime", "label": "engineering artifact／pilot request"},
+    {"source": "engineering_window", "target": "run_control", "label": "workspace／shard resume"},
     {"source": "config", "target": "preflight", "label": "設定約束"},
     {"source": "preflight", "target": "time_axis", "label": "時間支援"},
     {"source": "geometry", "target": "mesh", "label": "座標／網格"},

@@ -3983,8 +3983,11 @@ def _dynamic_initial_payload(
     source_hashes: Mapping[str, str],
     strict: bool,
     pilot_selection: Mapping[str, Any] | None = None,
+    expected_pair_count: int | None = None,
+    generation_method_id: str = "server_v3_ocm_dynamic_receptor_arrival_initial_condition_v1",
+    provenance_extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """建立每個 receptor×arrival 一筆的 5,000-row OCM-derived dynamic manifest。
+    """建立每個 receptor×arrival 一筆的 OCM-derived dynamic manifest。
 
     建立前先按 flow domain 建立唯讀 cache，將網格拓撲、月份時間索引與 OCM 的 zcor、
     elev、wetdry 陣列各載入一次。這不只改善 5,000 pair 的執行時間，也避免同一個
@@ -3993,7 +3996,23 @@ def _dynamic_initial_payload(
     因而不會把模板 receptor 的 z 值誤當成所有 arrival 共用的固定深度。每個 pair
     會再以同一個 `_build_face_vertical_support` 檢查目前 UTC 的各 face node 與指定
     vertical class；若 receptor gate 與實際 zcor／eta 不一致，直接 fail closed。
+    ``expected_pair_count`` 預設為既有正式流程的 5,000 筆；只有明確傳入時才允許
+    工程性小範圍 adapter 使用另一個已驗收的 receptor×arrival 數量，因此不會改變正式
+    wrapper 的固定計數。``generation_method_id`` 與 ``provenance_extra`` 讓工程 artifact
+    能標示自己的來源與限制；它們只會加入新 manifest 的 provenance，不會把舊 accepted
+    hash 或正式狀態重新綁定到新設定。
     """
+
+    if expected_pair_count is not None and (
+        isinstance(expected_pair_count, bool)
+        or not isinstance(expected_pair_count, int)
+        or expected_pair_count < 1
+    ):
+        raise InputDerivationError("expected_pair_count 必須是正整數或 None")
+    if not isinstance(generation_method_id, str) or not generation_method_id.strip():
+        raise InputDerivationError("generation_method_id 不可為空白")
+    if provenance_extra is not None and not isinstance(provenance_extra, Mapping):
+        raise InputDerivationError("provenance_extra 必須是 mapping 或 None")
 
     site_by_id = {site.study_site_id: site for site in config.study_sites}
     domain_by_region = {domain.analysis_region_id: domain for domain in config.domains}
@@ -4090,18 +4109,31 @@ def _dynamic_initial_payload(
                 "ocm_time_origin": "observed",
             }
             records.append(record)
-    expected_count = len(receptors) * (len(arrivals) // len(site_by_id)) if site_by_id else 0
-    if len(records) != EXPECTED_DYNAMIC_INITIAL_CONDITION_COUNT:
+    # 診斷訊息也依 site 配對計算，避免工程單站只傳一筆 arrival 時因完整五站 config
+    # 而顯示 0；這只影響 mismatch 的說明文字，不改正式 5,000-row gate。
+    expected_product = sum(
+        sum(1 for receptor in receptors if receptor.study_site_id == site_id) * len(site_arrivals)
+        for site_id, site_arrivals in arrival_by_site.items()
+    )
+    expected_count = (
+        EXPECTED_DYNAMIC_INITIAL_CONDITION_COUNT if expected_pair_count is None else expected_pair_count
+    )
+    if len(records) != expected_count:
         raise InputDerivationError(
-            f"dynamic initial conditions 應有 5,000 筆，實際 {len(records)}；"
-            f"expected_product={expected_count}"
+            f"dynamic initial conditions 應有 {expected_count} 筆，實際 {len(records)}；"
+            f"expected_product={expected_product}"
         )
-    provenance_extra: dict[str, Any] = {
+    provenance_payload: dict[str, Any] = {
         "counts": {"receptors": len(receptors), "arrivals": len(arrivals), "pairs": len(records)},
         "wetdry_semantics_id": _WETDRY_SEMANTICS_ID,
     }
     if pilot_selection is not None:
-        provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
+        provenance_payload["pilot_selection_scope"] = dict(pilot_selection)
+    if provenance_extra is not None:
+        # caller 的 mapping 可能是 immutable proxy；只複製第一層，避免 builder 在建立
+        # provenance 時意外改寫呼叫端保存的工程 lineage。巢狀資料會由 canonical JSON
+        # writer 在輸出前檢查是否可序列化。
+        provenance_payload.update(dict(provenance_extra))
     return {
         "manifest_kind": "receptor_arrival_initial_condition_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -4109,11 +4141,11 @@ def _dynamic_initial_payload(
         "design_version": config.design_version,
         "vertical_reference": "z_m_positive_up",
         "time_standard": "UTC",
-        "generation_method_id": "server_v3_ocm_dynamic_receptor_arrival_initial_condition_v1",
+        "generation_method_id": generation_method_id,
         "provenance": _provenance(
-            method_id="server_v3_ocm_dynamic_receptor_arrival_initial_condition_v1",
+            method_id=generation_method_id,
             source_hashes=source_hashes,
-            **provenance_extra,
+            **provenance_payload,
         ),
         "records": records,
     }
