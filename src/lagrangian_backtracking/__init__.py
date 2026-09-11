@@ -129,6 +129,12 @@ from .pilot_config import (
     create_pilot_execution_config,
     validate_pilot_execution_config,
 )
+from .pilot_matrix_validation import (
+    MAX_PILOT_MATRIX_JSON_BYTES,
+    PILOT_MATRIX_SCHEMA_VERSION,
+    canonical_pilot_matrix_json,
+    validate_pilot_matrix,
+)
 from .pilot_selection import (
     PILOT_SCENARIO_SELECTION_POLICY,
     PILOT_SCENARIO_SELECTION_RANKING_POLICY,
@@ -328,6 +334,8 @@ __all__ = [
     "PilotCalibration",
     "PILOT_EXECUTION_BINDING_SCHEMA_VERSION",
     "PILOT_EXECUTION_BINDING_STATUS",
+    "PILOT_MATRIX_SCHEMA_VERSION",
+    "MAX_PILOT_MATRIX_JSON_BYTES",
     "PILOT_SCENARIO_SELECTION_RANKING_POLICY",
     "PILOT_SCENARIO_SELECTION_POLICY",
     "PILOT_SCENARIO_SELECTION_SCHEMA_VERSION",
@@ -459,6 +467,8 @@ __all__ = [
     "validate_input_derivatives",
     "validate_pilot_calibration",
     "validate_pilot_execution_config",
+    "validate_pilot_matrix",
+    "canonical_pilot_matrix_json",
     "validate_scenario_selection_binding_shape",
     "validate_release_config",
     "initialize_run_workspace",

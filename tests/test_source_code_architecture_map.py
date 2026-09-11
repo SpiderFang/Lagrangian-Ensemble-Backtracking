@@ -71,6 +71,10 @@ DOCUMENT_CATALOG: tuple[tuple[str, str], ...] = (
         "docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md",
     ),
     (
+        "docs/results/15_four_region_first_pilot_audit.md",
+        "docs/results/15_four_region_first_pilot_audit.md",
+    ),
+    (
         "docs/operations/14_input_derivation_and_release_contract.md",
         "docs/14_input_derivation_and_release_contract.md",
     ),
@@ -259,6 +263,21 @@ def test_catalog_groups_and_flow_edges_are_closed() -> None:
     )
     assert any(
         edge == {"source": "config", "target": "runtime", "label": "pilot/formal config"}
+        for edge in module.FLOW_EDGES
+    )
+    matrix_module_info = module.MODULE_INFO["pilot_matrix_validation"]
+    assert {
+        "validate_pilot_matrix",
+        "canonical_pilot_matrix_json",
+    }.issubset(matrix_module_info["entrypoints"])
+    assert "只讀小型 immutable JSON" in matrix_module_info["read_first"]
+    assert any(
+        edge
+        == {
+            "source": "cli",
+            "target": "pilot_matrix_validation",
+            "label": "pilot-matrix-validate／跨區共同設定",
+        }
         for edge in module.FLOW_EDGES
     )
 
@@ -560,6 +579,7 @@ def test_render_html_contains_new_nodes_and_replaces_placeholders(tmp_path: Path
 
     for module_id in (
         "runtime",
+        "pilot_matrix_validation",
         "batch_state",
         "production",
         "run_control",
@@ -724,7 +744,7 @@ def test_readme_states_report_boundary_without_claiming_renderer_completion() ->
 
 
 def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> None:
-    """確認文件總入口涵蓋分類與 19 筆 catalog/alias 契約，且本地連結不斷裂。
+    """確認文件總入口涵蓋分類與 20 筆 catalog/alias 契約，且本地連結不斷裂。
 
     這裡檢查的是所有 Markdown 檔案的實際連結拓撲，包含跨分類文件、設定檔、測試、
     圖檔與 PDF；不只檢查新加入的閱讀提示，也確認新竹 pilot 文件以 self-alias
@@ -733,7 +753,7 @@ def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> Non
 
     index_path = PROJECT_ROOT / "docs" / "README.md"
     index = index_path.read_text(encoding="utf-8")
-    assert len(DOCUMENT_CATALOG) == 19
+    assert len(DOCUMENT_CATALOG) == 20
     for category in ("foundation/", "operations/", "results/", "development/", "archive/"):
         assert category in index
     for current_path, original_path in DOCUMENT_CATALOG:
@@ -749,11 +769,11 @@ def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> Non
         assert "今天狀態以 [實作狀態](../implementation_status.md) 為準" in archive_text
 
     local_links = _iter_local_markdown_links()
-    # 141 是目前核定 commit 中 Git 追蹤 Markdown 的固定連結基線；小型時間重建
-    # 文獻索引 README 已納入追蹤，工項 3 原始 PDF 則維持本機限定且不建立失效連結。
+    # 147 是本次加入四區稽核文件與其六個導覽連結後，Git 追蹤 Markdown 的固定連結基線；
+    # 小型時間重建文獻索引 README 已納入追蹤，工項 3 原始 PDF 則維持本機限定且不建立失效連結。
     # 這個數字是在收斂掃描範圍並修復兩個真實斷鏈後，由本機與 SERVER detached
     # checkout 共同核對所得，避免用改數字掩蓋兩邊拓撲差異。
-    assert len(local_links) == 141
+    assert len(local_links) == 147
     broken_links = [
         (
             source_path.relative_to(PROJECT_ROOT).as_posix(),

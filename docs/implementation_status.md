@@ -14,7 +14,57 @@
 | 情境與執行 | 五站點 scenario builder、固定排序、pilot／formal workspace、shard／chunk、progress／lock、reconcile／validate | formal 仍須 approved config、完整 inventory、gap-safe／full-product evidence |
 | checkpoint | execution checkpoint writer schema `2.2.0`；讀取 schema `2.0.0`、`2.1.0`、`2.2.0`；完整 observation、event、triangle hint 與 PCG64DXSM RNG continuation | 2.0／2.1 僅是舊檔工程相容格式；舊資料沒有速度證據 |
 | trajectory | 新 writer schema `3.0.0`，含環境與速度 payload；reader／validator 可讀 `1.0.0`、`2.0.0`、`3.0.0` 的固定拓撲 | v1 不得作正式垂向證據；v2 保留既有位置／環境報告用途；同一正式 run 不混用版本 |
+| 跨區 pilot 矩陣 | `pilot-matrix-validate` 只讀各 run 的 `run_plan.json` 與 `normalized_config.json`，比較 M／seed、experiment、積分／邊界／Stokes、材質、scalar snapshot 與 deployment provenance；明示區域 identity、輸入／幾何 binding 與 Kh／Kz／Smagorinsky cap 可不同 | 只證明工程設定是否可比較，不驗 trajectory／forcing 內容、不判定 run 完成，也不構成正式科學 evidence |
 | 聚合與報告基礎 | aggregate／report statistics、trajectory stream、source binding、release I/O、共同 staging／格式／checksum 基礎 | caller 必須提供已驗證 products；不能由 typed facade 或 synthetic release 推導科學完成 |
+
+## A 區本期政策與尚缺的實測門檻
+
+本期 A 區不南向擴域，現行 `northeast_taiwan_common_cache_v3` bbox 為
+`[121.306315, 122.793685, 24.600844, 25.499156]`。本期 geometry／design 身分採
+`design_baseline_v3_non_rising_a_v3_local20_20260909`，範圍政策為
+`formal_domain_policy=v3_local20km_20260909_v1`：貢寮與龜山島各有 12.5 km receptor
+core、20 km local domain，共用原 outer stop。原 material v2 non-rising 物理契約仍承接，
+但舊 25 km geometry、南擴 v4 候選與 35 km A 敏感度只作歷史／延期依據，不是本期 formal
+產製目標；不新增 15／23 km。B–D 原 `expanded_domain` 敏感度仍保留，與 A 政策分開
+驗證；legacy `formal_domain_policy=expanded_domain_v1` 僅供舊設定相容讀取。
+
+新政策可供 strict preparation，但尚未解除 formal gate。仍缺現行 v3 實際 OCM native、OCM
+surface 與 NWW analysis 的共同 forcing 邊界餘裕證據（至少兩個共同有效格點），以及完整
+field、mask、UTC、arrivals 與正式輸入 manifest 驗收；目前 existing gate 只做 receptor
+native 篩選，不是 20 km 邊界的三 forcing／兩共同格點驗證。正式 gate 未通過前不稱 20 km
+已被科學證實足夠，也不以準備工作節省承諾端到端加速或日期提升。
+
+## ABCD 第一次工程試跑稽核
+
+目前已取得 A 區貢寮與龜山島兩站各 20 粒子（合計 40）、B／C／D 各 20 粒子，均為 24 小時、
+4 shards、`M=1` 的第一次工程試跑紀錄；
+明示輸入 registry 固定為 `2024-01-02T01:00:00Z` 到前一日同時刻、inclusive 25 個逐時節點。
+A 區必須以貢寮與龜山島 exact pair 建立，B／C／D 各自以單站建立。完整數值與限制見
+[ABCD 第一次試跑稽核](results/15_four_region_first_pilot_audit.md)。
+
+稽核已確認既有結果不能直接稱為「相同設定」：A 使用 `no_stokes`，B／C／D 使用
+`finite_depth_stokes`。各區因資料與校準可有不同的 Kh、Kz 與 Smagorinsky cap，這些是
+`pilot-matrix-validate` 白名單允許的區域差異；Stokes 實驗、M／seed、積分／邊界、材質與
+部署 provenance 則必須 exact match。A 需以 `finite_depth_stokes` 和共同乾淨 snapshot 重跑，
+四區也要統一程式 tree 與環境後，才可重新判讀跨區比較。
+
+第一次稽核的工程診斷是：貢寮 `forcing_start=19` 且有 1 個 `numerical_failure`；龜山島
+`forcing_start=11`、`max_age=1`、`flow_domain_open_exit=6`、`coast_contact=2`；B
+有 5,780 筆 observation 與 825,070 steps；C 有 14 個 `data_gap`、5 個 `max_age`、
+1 個 `numerical_failure` 與 3,097 筆 observation；D 有 12 個 `data_gap`、8 個 `max_age`、
+4,397 筆 observation 與 824,794 steps。C／D 的 `data_gap` 帶 `QC=32`（NWW 波浪空間支援
+不足）；C 的失敗階段為 `step_start/k2/k4=1/8/5`，D 為 `4/4/4`。這些是待解釋的工程診斷，
+不能以零值或圖面完整性掩蓋。
+
+## NFS preview／figure 發布標記的語意
+
+`pilot_preview` 與海岸圖面的 NFS `nfs_completion_marker_v1` 會在同一父目錄鎖、完整 staging
+自我驗證、逐檔 durable move、manifest／程式指紋／儲存閘門綁定後，最後建立 `.complete`。
+`.complete` 只代表 preview／figure artifact 的 inventory、bytes 與 provenance 可供 reader
+讀取；它不是 run lifecycle 的完成旗標。run 是否完成仍必須由 `run_progress.json`、
+`run-reconcile` 及 `validate-run --require-complete` 判定。A 早期圖面因 NFS 不支援
+`renameat2(RENAME_NOREPLACE)` 未發布，但其 run／reconcile／benchmark／checksum 檢查已通過；
+B／C／D 圖面可讀不會改變其 pilot-only 性質。
 
 ## 逐點速度紀錄契約
 

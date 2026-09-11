@@ -33,6 +33,7 @@ lbt-validate-shard = "lagrangian_backtracking.cli:validate_shard_main"
 lbt-code-provenance = "lagrangian_backtracking.cli:code_provenance_main"
 lbt-validate-run = "lagrangian_backtracking.cli:validate_run_main"
 lbt-benchmark-report = "lagrangian_backtracking.cli:benchmark_report_main"
+lbt-pilot-matrix-validate = "lagrangian_backtracking.cli:pilot_matrix_validate_main"
 
 [dependency-groups]
 dev = [

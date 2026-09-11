@@ -9,7 +9,7 @@
 | 給 PI 快速看 | 先看[實作狀態](implementation_status.md)，再看[設計基線](foundation/08_design_baseline_and_derived_gates.md)與[成果呈現規格](results/07_results_visualization_plan.md)。 |
 | 第一次接手 | 先看[原始碼導覽](development/11_source_code_guide_and_plan_traceability.md)，再回看[架構與資料契約](foundation/02_architecture_and_data_contract.md)、[科學方法](foundation/03_scientific_method_and_validation.md)與[CLI 參考](operations/cli_reference.md)。 |
 | SERVER 執行 | 依序看[CLI 參考](operations/cli_reference.md)、[SERVER 執行手冊](operations/06_server_runbook_plan.md)、[輸入衍生契約](operations/14_input_derivation_and_release_contract.md)，最後核對[實作狀態](implementation_status.md)。 |
-| 成果報告 | 先看[成果呈現規格](results/07_results_visualization_plan.md)，再看[成果 release 管線](results/13_report_release_and_scientific_outputs_plan.md)、[聚合發布計畫](results/12_aggregate_release_and_server_execution_plan.md)與[實作狀態](implementation_status.md)。 |
+| 成果報告 | 先看[成果呈現規格](results/07_results_visualization_plan.md)，再看[四區試跑稽核](results/15_four_region_first_pilot_audit.md)、[成果 release 管線](results/13_report_release_and_scientific_outputs_plan.md)、[聚合發布計畫](results/12_aggregate_release_and_server_execution_plan.md)與[實作狀態](implementation_status.md)。 |
 | 查科學方法 | 依序看[科學方法與驗證](foundation/03_scientific_method_and_validation.md)、[設計基線](foundation/08_design_baseline_and_derived_gates.md)、[資料與時間缺口決策](operations/10_available_data_time_reconstruction_and_a_expansion.md)及[需求追溯](foundation/01_requirements_traceability.md)。 |
 
 ## 目錄結構
@@ -23,7 +23,7 @@
 
 ## 原文件路徑對照
 
-下表保留原本 18 份文件的檔名與原路徑，並登錄 1 份新增的 pilot 參數紀錄；新增文件沒有
+下表保留原本 18 份文件的檔名與原路徑，並登錄 2 份新增的 pilot／稽核紀錄；新增文件沒有
 待相容的舊根層路徑，因此 current/original 欄位相同。「狀態」只表示閱讀定位，不把工程
 測試通過誤寫成正式科學成果。
 
@@ -44,6 +44,7 @@
 | 聚合發布與 SERVER 正式執行實作計畫 | [results/12_aggregate_release_and_server_execution_plan.md](results/12_aggregate_release_and_server_execution_plan.md) | 規劃軌跡聚合、不可變發布、圖表產製與 SERVER 驗收。 | 現行 | `docs/12_aggregate_release_and_server_execution_plan.md` |
 | 正式成果 release 與科學圖表生產管線規劃 | [results/13_report_release_and_scientific_outputs_plan.md](results/13_report_release_and_scientific_outputs_plan.md) | 將成果圖組與驗證證據轉成可重建的發布流程。 | 現行 | `docs/13_report_release_and_scientific_outputs_plan.md` |
 | 涵蓋 2024-01-01 的新竹外海 24 小時工程試跑紀錄 | [results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md](results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md) | SERVER r5 執行、完整性驗證、後處理與參數／hash 證據；供 pilot 工程追溯，不代表正式研究成果。 | 現行 | `docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md` |
+| ABCD 第一次 24 小時試跑稽核 | [results/15_four_region_first_pilot_audit.md](results/15_four_region_first_pilot_audit.md) | 彙整 A／B／C／D 實測狀態、設定一致性差異、NFS 成果標記語意與正式 gate 缺口；供工程稽核，不代表正式研究成果。 | 現行 | `docs/results/15_four_region_first_pilot_audit.md` |
 | Slice 1：SERVER v3 輸入衍生與 release contract | [operations/14_input_derivation_and_release_contract.md](operations/14_input_derivation_and_release_contract.md) | 定義已驗收 OCM／NWW3 產品如何衍生並綁定 runtime 輸入。 | 現行 | `docs/14_input_derivation_and_release_contract.md` |
 | CLI 與執行介面參考 | [operations/cli_reference.md](operations/cli_reference.md) | 對照目前可執行命令、參數、輸入輸出與安全限制。 | 現行 | `docs/cli_reference.md` |
 | Git 部署與資料同步手冊 | [operations/git_deployment_and_data_sync.md](operations/git_deployment_and_data_sync.md) | 定義本機 Git、SERVER source、資料與部署驗收的邊界。 | 現行 | `docs/git_deployment_and_data_sync.md` |

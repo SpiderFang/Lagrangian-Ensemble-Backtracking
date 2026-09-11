@@ -147,7 +147,7 @@ def synthetic_inputs(tmp_path: Path) -> dict[str, Path]:
         "records": [
             {
                 "analysis_region_id": "B",
-                "flow_domain_id": "B-flow",
+                "flow_domain_id": "hsinchu_cache_v3",
                 "geometry": mapping(domain_polygon),
             }
         ],
@@ -160,7 +160,7 @@ def synthetic_inputs(tmp_path: Path) -> dict[str, Path]:
         "records": [
             {
                 "owner_kind": "flow_domain",
-                "owner_id": "B-flow",
+                "owner_id": "hsinchu_cache_v3",
                 "analysis_region_id": "B",
                 "segment_id": "B-exterior",
                 "geometry": mapping(open_line),
@@ -170,13 +170,15 @@ def synthetic_inputs(tmp_path: Path) -> dict[str, Path]:
     _write_json(domain_path, domain_payload)
     _write_json(open_path, open_payload)
 
-    # 45 欄 × 43 列取前 1905 個小 polygon；全數落在合成 B domain 內且各自有效。
+    # 45 欄 × 43 列取前 1905 個小 polygon；整體 bounds 涵蓋合成 B domain，且至少
+    # 有一列 land feature 與 domain 相交。這是底圖 coverage gate 的工程 fixture，
+    # 不代表真實海岸線資料。
     coastline_features = []
     for index in range(1905):
         column = index % 45
         row = index // 45
-        lon = 120.005 + column * 0.004
-        lat = 24.705 + row * 0.004
+        lon = 119.995 + column * 0.0047
+        lat = 24.695 + row * 0.00498
         land = Polygon(
             [
                 (lon, lat),
@@ -314,6 +316,7 @@ def synthetic_inputs(tmp_path: Path) -> dict[str, Path]:
         "material_id": "synthetic-settling-material",
         "projection": {
             "analysis_region_id": "B",
+            "flow_domain_id": "hsinchu_cache_v3",
             "center_lonlat": [center_lon, center_lat],
             "kind": "source_geometry_AEQD",
             "units": "m",
@@ -515,6 +518,165 @@ def test_load_plot_inputs_happy_path_preserves_counts_ids_and_denominators(
         {"max_age": 9, "flow_domain_open_exit": 8, "numerical_failure": 3}
     )
     assert len(data["land_geometries"]) == 1905
+
+
+@pytest.mark.parametrize(
+    ("region", "site", "flow_domain"),
+    (
+        ("A", "gongliao", "northeast_taiwan_common_cache_v3"),
+        ("A", "guishan", "northeast_taiwan_common_cache_v3"),
+        ("B", "hsinchu", "hsinchu_cache_v3"),
+        ("C", "houwan", "houwan_nmmba_cache_v3"),
+        ("D", "lienchiang", "lienchiang_common_cache_v3"),
+    ),
+)
+def test_site_context_accepts_all_five_station_contracts(
+    region: str, site: str, flow_domain: str
+) -> None:
+    """確認 A 兩站、B、C、D 的 region／site／flow-domain 組合均可被同一契約辨識。
+
+    這個單元測試只驗站點身分 allow-list，不宣稱對應 forcing 或海岸資料已驗收；真正
+    的圖面載入仍會另外核對 domain/open manifest、幾何 hash 與海岸 coverage。
+    """
+
+    summary = {
+        "study_site_id": site,
+        "projection": {"analysis_region_id": region, "flow_domain_id": flow_domain},
+    }
+    assert _TARGET._site_context(summary) == (region, site, _TARGET._SITE_LABEL_ZH[site], flow_domain)
+
+
+@pytest.mark.parametrize(
+    "summary",
+    (
+        {
+            "study_site_id": "hsinchu",
+            "projection": {"analysis_region_id": "C", "flow_domain_id": "hsinchu_cache_v3"},
+        },
+        {
+            "study_site_id": "houwan",
+            "projection": {"analysis_region_id": "C", "flow_domain_id": "hsinchu_cache_v3"},
+        },
+        {
+            "study_site_id": "lienchiang",
+            "projection": {"analysis_region_id": "D", "flow_domain_id": "wrong_domain"},
+        },
+    ),
+)
+def test_site_context_rejects_region_site_or_flow_mismatch(summary: dict[str, Any]) -> None:
+    """錯配的站點身分或 flow-domain 必須在讀取圖面前 fail closed。"""
+
+    with pytest.raises(ValueError, match="preview (study site|flow domain)"):
+        _TARGET._site_context(summary)
+
+
+def test_coastline_coverage_requires_bounds_and_intersection() -> None:
+    """海岸底圖須涵蓋 domain 且至少一個 land feature 相交，避免誤畫他區底圖。
+
+    bounds gate 僅保證資料範圍足夠，不能代替空間相交；第二個案例刻意用兩個分離
+    feature 形成完整 aggregate bounds，確認缺少實際相交仍會拒絕。
+    """
+
+    domain = Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)])
+    with pytest.raises(ValueError, match="bounds"):
+        _TARGET._validate_coastline_coverage(domain, [Polygon([(-1, -1), (0.5, -1), (0.5, 1), (-1, 1)])])
+
+    separated = [
+        Polygon([(-2, -1), (-1, -1), (-1, 2), (-2, 2), (-2, -1)]),
+        Polygon([(2, -1), (3, -1), (3, 2), (2, 2), (2, -1)]),
+    ]
+    with pytest.raises(ValueError, match="相交"):
+        _TARGET._validate_coastline_coverage(domain, separated)
+
+
+def test_c_houwan_candidate_regions_are_provenance_only(
+    synthetic_inputs: dict[str, Path],
+    allow_synthetic_coastline_sha: None,
+    writable_mpl_config: None,
+    tmp_path: Path,
+) -> None:
+    """C／後灣圖面保存候選 2+3 metadata，但不把候選 polygon 畫成 forcing 邊界。
+
+    測試把合成 B fixture 的站點身分改成 C，讓 loader 走與正式資料相同的五站契約；候選
+    polygon 只進 README／manifest provenance，總覽仍只繪製 1905 個海岸 land feature。
+    """
+
+    domain_path = synthetic_inputs["domain_path"]
+    domain = json.loads(domain_path.read_text(encoding="utf-8"))
+    domain["records"][0]["analysis_region_id"] = "C"
+    domain["records"][0]["flow_domain_id"] = "houwan_nmmba_cache_v3"
+    _write_json(domain_path, domain)
+
+    open_path = synthetic_inputs["open_path"]
+    open_boundary = json.loads(open_path.read_text(encoding="utf-8"))
+    open_boundary["records"][0]["analysis_region_id"] = "C"
+    open_boundary["records"][0]["owner_id"] = "houwan_nmmba_cache_v3"
+    _write_json(open_path, open_boundary)
+
+    preview_dir = synthetic_inputs["preview_dir"]
+    summary_path = preview_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["study_site_id"] = "houwan"
+    summary["projection"]["analysis_region_id"] = "C"
+    summary["projection"]["flow_domain_id"] = "houwan_nmmba_cache_v3"
+    summary["projection"]["geometry_canonical_hashes"] = {
+        "domain": _canonical_hash(domain),
+        "open_boundary": _canonical_hash(open_boundary),
+    }
+    summary["receptor_candidate_selection"] = {
+        "policy_id": _TARGET._BAYTRACE_CANDIDATE_POLICY_ID,
+        "require_each_region": True,
+        "total_horizontal_count": 5,
+    }
+    summary["receptor_candidate_regions"] = [
+        {
+            "region_id": "c_west_coast",
+            "name_zh": "西岸候選子區",
+            "allocation_count": 2,
+            "coordinate_reference": "EPSG:4326",
+            "geometry": mapping(
+                Polygon([(120.005, 24.705), (120.075, 24.705), (120.075, 24.79), (120.005, 24.79)])
+            ),
+        },
+        {
+            "region_id": "c_south_tip",
+            "name_zh": "南端候選子區",
+            "allocation_count": 3,
+            "coordinate_reference": "EPSG:4326",
+            "geometry": mapping(
+                Polygon([(120.08, 24.79), (120.195, 24.79), (120.195, 24.895), (120.08, 24.895)])
+            ),
+        },
+    ]
+    summary["receptor_candidate_regions_provenance"] = {
+        "source_artifact": "synthetic-red-frame-reference.png",
+        "digitization_method": "synthetic_fixture",
+    }
+    _refresh_summary_contract(preview_dir, summary)
+
+    manifest = _TARGET.build_coastline_preview(
+        preview_dir,
+        domain_path,
+        open_path,
+        synthetic_inputs["coastline_path"],
+        tmp_path / "c-houwan-figures",
+        style="baytrace",
+    )
+    readme = (tmp_path / "c-houwan-figures" / "README.md").read_text(encoding="utf-8")
+    assert manifest["geometry_owner"] == {
+        "analysis_region_id": "C",
+        "study_site_id": "houwan",
+        "flow_domain_id": "houwan_nmmba_cache_v3",
+    }
+    assert manifest["receptor_candidate_selection"]["total_horizontal_count"] == 5
+    assert [item["allocation_count"] for item in manifest["receptor_candidate_regions"]] == [2, 3]
+    assert manifest["receptor_candidate_regions_provenance"]["digitization_method"] == "synthetic_fixture"
+    assert "C區後灣" in readme
+    assert "研究候選來自 receptor manifest" in readme
+    assert "polygon 只作科學 provenance" in readme
+    # README 可以揭露候選 provenance，但不得把候選 polygon 宣稱成圖面 forcing
+    # 邊界或新增放大框；真正的空間圖層仍只有 coastline land features。
+    assert "紅框研究區放大" not in readme
 
 
 def test_loader_rejects_csv_checksum_mismatch(synthetic_inputs: dict[str, Path]) -> None:

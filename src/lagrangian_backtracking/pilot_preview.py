@@ -8,7 +8,9 @@ UTC 奈秒及回溯秒數原樣保留，缺環境或診斷不補零。來源與�
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import fcntl
 import io
 import json
 import math
@@ -129,6 +131,31 @@ def _safe_path(value: str | Path) -> Path:
     return path.resolve()
 
 
+# 網路檔案系統（NFS）不一定提供 Linux ``renameat2(RENAME_NOREPLACE)`` 或 Darwin
+# ``renameatx_np(RENAME_EXCL)``；因此預覽另提供明示啟用的完成標記協定。這不是把
+# 逐檔搬移誤稱為整體原子操作，而是以同一父目錄的 cooperative flock、完整 staging
+# 自我驗證及最後排他建立的完成標記，定義下游 reader 可以接受的交付邊界。
+# 未通過已驗證的 SERVER 儲存閘門時，這條路徑永遠不會被隱含啟用。
+_NFS_MARKER_PROTOCOL = "nfs_completion_marker_v1"
+_COMPLETION_MARKER_NAME = ".complete"
+_STORAGE_GATE_SCHEMA_VERSION = "1.0.0"
+_STORAGE_ROOT_LABELS = frozenset(
+    {
+        "result_nfs_root",
+        "execution_package_root",
+        "output_root",
+        "scratch_root",
+        "checkpoint_root",
+        "uv_cache_root",
+        "mpl_cache_root",
+        "xdg_cache_root",
+        "tmp_root",
+    }
+)
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+
+
 def _finite(value: Any) -> float | None:
     """僅將已有有限數值轉為 Python float；缺值與非有限值維持不可用，不補零。"""
 
@@ -149,6 +176,420 @@ def _small_json(path: Path) -> dict:
     if len(raw) > _METADATA_BYTE_LIMIT:
         raise PilotPreviewError("preview 來源中繼文件超過容量上限")
     return json.loads(raw)
+
+
+def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
+    """以預覽共用的固定 JSON 排版產生可驗證位元組。
+
+    完成標記與 manifest 是跨主機傳遞的稽核資料；固定 UTF-8、排序欄位及換行，讓
+    reader 能辨識內容遭截斷或改寫，而不把「能被 JSON parser 讀取」誤當成完整發布。
+    此函式不放入動態絕對路徑，避免成果把 SERVER 私有位置帶出。
+    """
+
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def _verified_storage_gate_evidence(path: str | Path) -> dict[str, str]:
+    """驗證已保存的 SERVER 儲存閘門，回傳完成標記所需的安全摘要。
+
+    完成標記只可在操作端明示提供儲存閘門證據時啟用。此驗證要求九個結果／執行根目錄
+    都是已通過的 NFS、共享同一 source token，且同主機檔案鎖（``flock``）測試明示
+    PASS；缺少任一項便停止，不以本機可寫性猜測替代。回傳只含閘門版本、證據檔 SHA-256
+    與共同 token，不保存證據檔的絕對路徑。
+    """
+
+    evidence = _safe_path(path)
+    if not evidence.is_file() or evidence.stat().st_size > _METADATA_BYTE_LIMIT:
+        raise PilotPreviewError("preview storage gate evidence 不是普通小型檔案")
+    try:
+        document = json.loads(evidence.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise PilotPreviewError("preview storage gate evidence 無法解析") from None
+    if not isinstance(document, dict):
+        raise PilotPreviewError("preview storage gate evidence root 無效")
+    if document.get("schema_version") != _STORAGE_GATE_SCHEMA_VERSION:
+        raise PilotPreviewError("preview storage gate schema 不符")
+    if document.get("gate_status") != "PASS" or document.get("issues") != []:
+        raise PilotPreviewError("preview storage gate 未通過")
+    probes = document.get("probes")
+    if not isinstance(probes, list):
+        raise PilotPreviewError("preview storage gate 缺少 probes")
+    probe_status = {
+        row.get("label"): row.get("gate_status")
+        for row in probes
+        if isinstance(row, dict)
+    }
+    if probe_status.get("write_probe") != "PASS":
+        raise PilotPreviewError("preview storage gate write_probe 未通過")
+    if probe_status.get("same_host_flock_probe") != "PASS":
+        raise PilotPreviewError("preview storage gate same_host_flock_probe 未通過")
+    roots = document.get("roots")
+    if not isinstance(roots, list) or len(roots) != len(_STORAGE_ROOT_LABELS):
+        raise PilotPreviewError("preview storage gate roots 不完整")
+    root_labels = {row.get("label") for row in roots if isinstance(row, dict)}
+    if root_labels != _STORAGE_ROOT_LABELS:
+        raise PilotPreviewError("preview storage gate roots label 不符")
+    minimum_free = document.get("minimum_free_bytes")
+    if type(minimum_free) is not int or minimum_free <= 0:
+        raise PilotPreviewError("preview storage gate minimum free bytes 無效")
+    source_tokens: set[str] = set()
+    for row in roots:
+        if not isinstance(row, dict):
+            raise PilotPreviewError("preview storage gate root record 無效")
+        if row.get("gate_status") != "PASS" or str(row.get("fstype", "")).lower() not in {"nfs", "nfs4"}:
+            raise PilotPreviewError("preview storage gate root 未通過 NFS 條件")
+        token = row.get("source_token_hash")
+        free_bytes = row.get("free_bytes")
+        if not isinstance(token, str) or _HEX64.fullmatch(token) is None:
+            raise PilotPreviewError("preview storage gate source token 無效")
+        if type(free_bytes) is not int or free_bytes < minimum_free:
+            raise PilotPreviewError("preview storage gate free bytes 不足")
+        source_tokens.add(token)
+    if len(source_tokens) != 1:
+        raise PilotPreviewError("preview storage gate roots source token 不一致")
+    return {
+        "schema_version": _STORAGE_GATE_SCHEMA_VERSION,
+        "sha256": sha256_file(evidence),
+        "source_token_hash": next(iter(source_tokens)),
+    }
+
+
+def _verified_release_provenance(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """核對完成標記必須保存的基準 commit、Git tree、dirty 清單與 diff 摘要。
+
+    這些值由執行包的明示 code provenance 產生，不能在預覽內從任意工作目錄猜 Git 狀態。
+    ``base_tree`` 是 40 位 Git tree object，不是 deployment tree 的 SHA-256。dirty file
+    只允許 repository-relative 名稱；完成標記因此可供稽核而不洩漏 SERVER 絕對路徑。
+    """
+
+    if not isinstance(value, Mapping):
+        raise PilotPreviewError("preview marker 缺少 release provenance")
+    base_commit = value.get("base_commit")
+    base_tree = value.get("base_tree")
+    diff_sha = value.get("diff_sha256")
+    dirty_files = value.get("dirty_files")
+    if not isinstance(base_commit, str) or _GIT_COMMIT.fullmatch(base_commit) is None:
+        raise PilotPreviewError("preview marker base commit 無效")
+    if not isinstance(base_tree, str) or _GIT_COMMIT.fullmatch(base_tree) is None:
+        raise PilotPreviewError("preview marker base tree 無效")
+    if not isinstance(diff_sha, str) or _HEX64.fullmatch(diff_sha) is None:
+        raise PilotPreviewError("preview marker diff hash 無效")
+    if not isinstance(dirty_files, (list, tuple)):
+        raise PilotPreviewError("preview marker dirty files 無效")
+    normalized_files = []
+    for item in dirty_files:
+        if (
+            not isinstance(item, str)
+            or not item
+            or Path(item).is_absolute()
+            or ".." in Path(item).parts
+            or "\\" in item
+        ):
+            raise PilotPreviewError("preview marker dirty file 非 repository-relative")
+        normalized_files.append(item)
+    if normalized_files != sorted(set(normalized_files)):
+        raise PilotPreviewError("preview marker dirty files 必須排序且不可重複")
+    return {
+        "base_commit": base_commit,
+        "base_tree": base_tree,
+        "dirty_files": normalized_files,
+        "diff_sha256": diff_sha,
+    }
+
+
+def _regular_preview_file(path: Path) -> None:
+    """要求節點是普通檔，拒絕完成標記／成果路徑的 symbolic link。"""
+
+    try:
+        node = path.lstat()
+    except OSError:
+        raise PilotPreviewError("preview 目錄缺少普通檔") from None
+    if not stat.S_ISREG(node.st_mode):
+        raise PilotPreviewError("preview 目錄含非普通檔節點")
+
+
+def _validate_completion_marker(
+    preview: Path,
+    *,
+    expected_artifact_kind: str = "pilot-preview-v1",
+    storage_gate_evidence: str | Path | None = None,
+) -> dict[str, Any]:
+    """在 reader 使用預覽任何資料前驗證完成標記及其 manifest binding。
+
+    完成標記是 NFS 逐檔發布的唯一可讀宣告；它必須是 canonical JSON、和 manifest
+    SHA-256 相符，並攜帶程式／dirty／儲存閘門指紋。若 caller 再提供閘門證據，會重新
+    驗證其 PASS、同主機 ``flock`` 與共同 source token，防止只竄改標記文字就繞過環境閘門。
+    """
+
+    marker = _safe_path(preview / _COMPLETION_MARKER_NAME)
+    _regular_preview_file(marker)
+    if marker.stat().st_size > 64 * 1024:
+        raise PilotPreviewError("preview completion marker 超過容量上限")
+    try:
+        raw = marker.read_bytes()
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise PilotPreviewError("preview completion marker 無法解析") from None
+    expected_keys = {
+        "schema_version",
+        "artifact_kind",
+        "publish_protocol",
+        "manifest_sha256",
+        "base_commit",
+        "base_tree",
+        "dirty_files",
+        "diff_sha256",
+        "storage_gate_snapshot_sha256",
+        "storage_root_source_token_hash",
+    }
+    if not isinstance(document, dict) or set(document) != expected_keys:
+        raise PilotPreviewError("preview completion marker 欄位不符")
+    if raw != _canonical_json_bytes(document):
+        raise PilotPreviewError("preview completion marker 非 canonical bytes")
+    if document["schema_version"] != _STORAGE_GATE_SCHEMA_VERSION:
+        raise PilotPreviewError("preview completion marker schema 不符")
+    if (
+        document["artifact_kind"] != expected_artifact_kind
+        or document["publish_protocol"] != _NFS_MARKER_PROTOCOL
+    ):
+        raise PilotPreviewError("preview completion marker artifact 不符")
+    if _HEX64.fullmatch(document["manifest_sha256"]) is None:
+        raise PilotPreviewError("preview completion marker manifest hash 無效")
+    if _HEX64.fullmatch(document["storage_gate_snapshot_sha256"]) is None:
+        raise PilotPreviewError("preview completion marker storage hash 無效")
+    if _HEX64.fullmatch(document["storage_root_source_token_hash"]) is None:
+        raise PilotPreviewError("preview completion marker source token 無效")
+    provenance = _verified_release_provenance(document)
+    manifest = _safe_path(preview / "manifest.json")
+    _regular_preview_file(manifest)
+    if sha256_file(manifest) != document["manifest_sha256"]:
+        raise PilotPreviewError("preview completion marker manifest binding 不符")
+    manifest_document = _small_json(manifest)
+    if (
+        manifest_document.get("artifact_kind") != document["artifact_kind"]
+        or manifest_document.get("publish_protocol") != document["publish_protocol"]
+        or manifest_document.get("release_provenance")
+        != {
+            **provenance,
+            "storage_gate_snapshot_sha256": document["storage_gate_snapshot_sha256"],
+            "storage_root_source_token_hash": document["storage_root_source_token_hash"],
+        }
+    ):
+        raise PilotPreviewError("preview completion marker provenance binding 不符")
+    # marker 只宣告整批 artifact 可讀；reader 仍須重新核對發布時寫入的完整 inventory
+    # 與每個產品 hash。這能拒絕發布後新增的檔案、遺失的檔案、替換的 symbolic link
+    # 或只改檔案內容卻未同步 manifest 的竄改，避免下游把「marker 存在」誤當成資料完整。
+    products = manifest_document.get("files")
+    if not isinstance(products, Mapping):
+        raise PilotPreviewError("preview completion marker manifest files 無效")
+    expected_names = set(products) | {"manifest.json", _COMPLETION_MARKER_NAME}
+    try:
+        actual_names = {path.name for path in preview.iterdir()}
+    except OSError:
+        raise PilotPreviewError("preview completion marker 目錄無法列舉") from None
+    if actual_names != expected_names:
+        raise PilotPreviewError("preview completion marker inventory 不符")
+    for name, contract in products.items():
+        if not isinstance(name, str) or Path(name).name != name or name.startswith("."):
+            raise PilotPreviewError("preview completion marker product name 無效")
+        if not isinstance(contract, Mapping):
+            raise PilotPreviewError("preview completion marker product contract 無效")
+        product = _safe_path(preview / name)
+        _regular_preview_file(product)
+        if (
+            type(contract.get("size_bytes")) is not int
+            or contract["size_bytes"] < 0
+            or product.stat().st_size != contract["size_bytes"]
+            or not isinstance(contract.get("sha256"), str)
+            or _HEX64.fullmatch(contract["sha256"]) is None
+            or sha256_file(product) != contract["sha256"]
+        ):
+            raise PilotPreviewError("preview completion marker product bytes/hash 不符")
+    if storage_gate_evidence is not None:
+        gate = _verified_storage_gate_evidence(storage_gate_evidence)
+        if (
+            gate["sha256"] != document["storage_gate_snapshot_sha256"]
+            or gate["source_token_hash"] != document["storage_root_source_token_hash"]
+        ):
+            raise PilotPreviewError("preview completion marker storage gate binding 不符")
+    return document
+
+
+def validate_published_preview(
+    preview: str | Path,
+    *,
+    storage_gate_evidence: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """驗證預覽的發布協定，供 CSV reader 與 BayTrace wrapper 共用。
+
+    新的 NFS marker artifact 必須先通過 ``.complete``；未帶 marker 的既有成果仍保留
+    exclusive-directory-rename 相容性。若 caller 明示 gate evidence，則要求預覽使用
+    marker protocol，避免把閘門驗證誤套在 legacy 目錄或直接寫入的半成品上。
+    """
+
+    return validate_published_artifact(
+        preview,
+        expected_artifact_kind="pilot-preview-v1",
+        storage_gate_evidence=storage_gate_evidence,
+    )
+
+
+def validate_published_artifact(
+    preview: str | Path,
+    *,
+    expected_artifact_kind: str,
+    storage_gate_evidence: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """驗證任一 marker-enabled 預覽／圖面 artifact，供 BayTrace reader 共用。
+
+    ``expected_artifact_kind`` 將 pilot 原始預覽與 coastline 四圖分開綁定；兩者都必須
+    先通過相同 marker、manifest、程式 provenance 與儲存閘門檢查。未宣告 marker 的舊
+    exclusive release 只在沒有 gate evidence 時保留相容性，不能被拿來冒充本次 NFS 產物。
+    """
+
+    root = _safe_path(preview)
+    marker = root / _COMPLETION_MARKER_NAME
+    if marker.exists() or marker.is_symlink():
+        return _validate_completion_marker(
+            root,
+            expected_artifact_kind=expected_artifact_kind,
+            storage_gate_evidence=storage_gate_evidence,
+        )
+    try:
+        manifest = _small_json(root / "manifest.json")
+    except PilotPreviewError:
+        # 逐檔發布若在 manifest 搬入前中止，final 可能只剩部分產品；不能以缺少
+        # manifest 猜測它是舊版成果，統一視為沒有完成宣告的 invalid release。
+        raise PilotPreviewError("preview completion marker 缺失") from None
+    if manifest.get("publish_protocol") == _NFS_MARKER_PROTOCOL:
+        raise PilotPreviewError("preview completion marker 缺失")
+    if storage_gate_evidence is not None:
+        raise PilotPreviewError("preview storage gate evidence 需要 completion marker")
+    return None
+
+
+def _validate_staged_preview(staging: Path, manifest: Mapping[str, Any]) -> None:
+    """在發布前核對 staging 的完整 ordinary-file inventory 與每個產品雜湊。
+
+    逐檔 marker 協定允許 final 目錄在發布途中暫時存在，因此自我驗證必須先封閉所有
+    檔案與 manifest contract；任何額外節點、symbolic link、bytes 或大小差異都停止發布。
+    此處不刪除 staging，讓操作端能保留失敗證據。
+    """
+
+    products = manifest.get("files")
+    if not isinstance(products, Mapping):
+        raise PilotPreviewError("preview staging manifest files 無效")
+    expected = set(products) | {"manifest.json"}
+    actual = {path.name for path in staging.iterdir()}
+    if actual != expected:
+        raise PilotPreviewError("preview staging inventory 不符")
+    for path in staging.iterdir():
+        _regular_preview_file(path)
+    manifest_path = staging / "manifest.json"
+    if manifest_path.read_bytes() != _canonical_json_bytes(manifest):
+        raise PilotPreviewError("preview staging manifest bytes 不符")
+    for name, contract in products.items():
+        if not isinstance(name, str) or Path(name).name != name or name.startswith("."):
+            raise PilotPreviewError("preview staging product name 無效")
+        if not isinstance(contract, Mapping):
+            raise PilotPreviewError("preview staging product contract 無效")
+        path = staging / name
+        if path.stat().st_size != contract.get("size_bytes") or sha256_file(path) != contract.get("sha256"):
+            raise PilotPreviewError("preview staging product bytes 不符")
+
+
+def _acquire_nfs_publish_lock(parent: Path, destination: Path) -> int:
+    """在成果父目錄取得同主機 cooperative flock，拒絕鎖競爭與符號連結。
+
+    儲存閘門已先驗證目前 NFS 的跨程序鎖定能力；這個 lock descriptor 會從 staging
+    自我驗證前後一直持有到 final marker 與 parent fsync 完成。鎖檔保留在 parent 作為
+    固定 cooperative protocol 名稱，避免成功後刪除／重建鎖檔造成不同程序各持有不同
+    inode；它不是成果 manifest 的資料檔，也不會被搬入 final 目錄。
+    """
+
+    if not hasattr(fcntl, "flock"):
+        raise PilotPreviewError("preview NFS marker 缺少 flock 支援")
+    lock_path = parent / f".{destination.name}.publish.lock"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise PilotPreviewError("preview 發布鎖忙碌") from None
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise PilotPreviewError("preview 發布鎖無法建立") from None
+    if descriptor is None:
+        raise PilotPreviewError("preview 發布鎖 descriptor 無效")
+    return descriptor
+
+
+def _release_nfs_publish_lock(descriptor: int) -> None:
+    """釋放預覽 cooperative flock；釋放失敗不掩蓋已保存的發布例外。"""
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_preview_file(path: Path) -> None:
+    """以 no-follow descriptor 同步已搬入 final 的普通檔位元組。"""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise PilotPreviewError("preview final 含非普通檔")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_nfs_marker_preview(
+    staging: Path,
+    destination: Path,
+    *,
+    parent_identity: tuple[int, int],
+    marker: Mapping[str, Any],
+) -> None:
+    """以逐檔 durable move、最後 exclusive marker 發布 NFS preview。
+
+    final 目錄先以 ``mkdir`` 做 exclusive claim，之後才把已驗證 staging 的普通檔逐一
+    搬入並 fsync；這不是整體原子 rename。任何中途錯誤都保留無 ``.complete`` 的 invalid
+    final，reader 因而無法消費，也不以 copy/delete 模擬原子性。只有全部檔案、final
+    directory 與 marker bytes 都完成 fsync，且 parent identity 未變，才回傳成功。
+    """
+
+    destination.mkdir(mode=0o750, exist_ok=False)
+    for source in sorted(staging.iterdir(), key=lambda item: item.name):
+        _regular_preview_file(source)
+        target = destination / source.name
+        # 同父 cooperative flock 已序列化本協定 writer；這個明示檢查仍拒絕任何
+        # 非預期的目錄／符號連結碰撞，避免 os.rename 在異常狀態下覆寫既有節點。
+        if target.exists() or target.is_symlink():
+            raise FileExistsError("preview final product collision")
+        os.rename(source, target)
+        _fsync_preview_file(target)
+    _fsync_directory(destination)
+    manifest_path = destination / "manifest.json"
+    if sha256_file(manifest_path) != marker["manifest_sha256"]:
+        raise PilotPreviewError("preview final manifest hash 不符")
+    marker_path = destination / _COMPLETION_MARKER_NAME
+    _write_exclusive_durable_bytes(marker_path, _canonical_json_bytes(marker))
+    _fsync_directory(destination)
+    _fsync_directory(destination.parent, expected_identity=parent_identity)
+    with contextlib.suppress(OSError):
+        staging.rmdir()
 
 
 def _trajectory_metadata(root: Path, plan: Mapping) -> dict:
@@ -811,6 +1252,9 @@ def build_pilot_preview(
     max_particles: int = 2000,
     max_observations: int = 250_000,
     max_curves_per_vertical: int = 20,
+    storage_gate_evidence: str | Path | None = None,
+    nfs_marker_protocol: bool = False,
+    release_provenance: Mapping[str, Any] | None = None,
 ) -> dict:
     """以已驗證完整先導建立新目錄，回傳無私有路徑的來源／輸出校驗清單。
 
@@ -820,15 +1264,20 @@ def build_pilot_preview(
     讀回後再驗實數；單次最多一個分片加有界表格，不載入 forcing。MPLCONFIGDIR 必須
     由 caller 明示且已存在；字型可指定，無合格中文字碼時圖用英文，繁中說明仍保留。
 
-    來源驗證與讀取成功後才建自有同父暫存目錄，原子拒覆寫發布；目的已存在時拋出
-    FileExistsError，其他拒絕拋出 PilotPreviewError，皆不洩漏底層私有路徑。失敗僅清理
-    身分仍吻合的自有 staging；改名後 fsync 失敗保留 final 並回報耐久性未確認。
+    來源驗證與讀取成功後才建自有同父暫存目錄，預設使用平台提供的原子拒覆寫發布。
+    若明示 ``nfs_marker_protocol`` 與已驗證的 ``storage_gate_evidence``／release provenance，
+    則改用同父 cooperative flock、逐檔 durable move 與最後 exclusive ``.complete``；沒有
+    marker 的 final 永遠不被 reader 接受。目的已存在時拋出 FileExistsError，其他拒絕拋出
+    PilotPreviewError，皆不洩漏底層私有路徑。失敗僅清理身分仍吻合且尚未搬移的 staging；
+    marker 發布途中失敗會保留沒有 marker 的 invalid final 供稽核。
     """
 
     staging = None
     staging_identity = None
     parent_identity = None
     published = False
+    storage_gate = None
+    normalized_provenance = None
     phase = "source"
     try:
         root, config = _safe_path(run), _safe_path(config_path)
@@ -864,6 +1313,13 @@ def build_pilot_preview(
         if not stat.S_ISDIR(parent_stat.st_mode):
             raise PilotPreviewError("preview 父層必須為既有普通目錄")
         parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        if nfs_marker_protocol:
+            if storage_gate_evidence is None:
+                raise PilotPreviewError("preview NFS marker 需要明示 storage gate evidence")
+            storage_gate = _verified_storage_gate_evidence(storage_gate_evidence)
+            normalized_provenance = _verified_release_provenance(release_provenance)
+        elif storage_gate_evidence is not None or release_provenance is not None:
+            raise PilotPreviewError("preview storage gate evidence 僅可搭配 NFS marker")
         source_hashes, shard_sources = _source_snapshot(root, config, static.plan)
         if (
             early_plan != _plain(static.plan)
@@ -912,8 +1368,29 @@ def build_pilot_preview(
             "coastline_shown": False,
             "center_lonlat": list(domain.center_lonlat),
             "analysis_region_id": domain.analysis_region_id,
+            "flow_domain_id": domain.flow_domain_id,
             "geometry_canonical_hashes": _plain(static.plan["geometry_canonical_hashes"]),
         }
+        # 候選子區是輸入衍生階段從設定檔帶入的 receptor provenance；只複寫已驗證的
+        # 小型設定資料，讓下游圖面能保存數位化 polygon、配額與來源影像雜湊。這些欄位
+        # 只描述受體候選，不是 OCM／NWW forcing 支援，也不在本模組重畫或重新判定。
+        study_site_id = str(summary["study_site_id"])
+        site_config = next(
+            item for item in config_data.study_sites if item.study_site_id == study_site_id
+        )
+        candidate_extras = site_config.model_extra or {}
+        candidate_values = {
+            "receptor_candidate_selection": site_config.receptor_candidate_selection,
+            "receptor_candidate_regions": site_config.receptor_candidate_regions,
+            "receptor_candidate_regions_provenance": site_config.receptor_candidate_regions_provenance,
+        }
+        for key, value in candidate_values.items():
+            if value is not None:
+                summary[key] = _plain(value)
+            elif key in candidate_extras:
+                # 舊版 in-memory model 可能把新增欄位留在 extra；相容讀取仍保留
+                # 明示 provenance，但不為缺少設定的站點建立空候選資料。
+                summary[key] = _plain(candidate_extras[key])
         summary["source"] = {
             "files": source_hashes,
             "trajectory_shards": shard_sources,
@@ -957,25 +1434,54 @@ def build_pilot_preview(
             "source": summary["source"],
             "files": products,
         }
+        if nfs_marker_protocol:
+            manifest["publish_protocol"] = _NFS_MARKER_PROTOCOL
+            manifest["completion_marker"] = _COMPLETION_MARKER_NAME
+            manifest["release_provenance"] = {
+                **normalized_provenance,
+                "storage_gate_snapshot_sha256": storage_gate["sha256"],
+                "storage_root_source_token_hash": storage_gate["source_token_hash"],
+            }
+        else:
+            # 標示原有平台原子目錄發布；舊 manifest 沒有此欄位時 reader 仍維持相容性。
+            manifest["publish_protocol"] = "exclusive_directory_rename_v1"
         _write_exclusive_durable_bytes(
             staging / "manifest.json",
-            (
-                json.dumps(
-                    manifest,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    indent=2,
-                    allow_nan=False,
-                )
-                + "\n"
-            ).encode(),
+            _canonical_json_bytes(manifest),
         )
+        _validate_staged_preview(staging, manifest)
         if _source_snapshot(root, config, static.plan) != (source_hashes, shard_sources):
             raise PilotPreviewError("preview 來源在產製期間變動，拒絕發布")
         phase = "publish"
         _safe_path(parent)
         _fsync_directory(staging)
-        _atomic_exclusive_directory_rename(staging, destination, expected_parent_identity=parent_identity)
+        if nfs_marker_protocol:
+            gate_after = _verified_storage_gate_evidence(storage_gate_evidence)
+            if gate_after != storage_gate:
+                raise PilotPreviewError("preview storage gate 在發布前變動")
+            lock_descriptor = _acquire_nfs_publish_lock(parent, destination)
+            try:
+                if _source_snapshot(root, config, static.plan) != (source_hashes, shard_sources):
+                    raise PilotPreviewError("preview 來源在鎖定後變動，拒絕發布")
+                marker = {
+                    "schema_version": _STORAGE_GATE_SCHEMA_VERSION,
+                    "artifact_kind": manifest["artifact_kind"],
+                    "publish_protocol": _NFS_MARKER_PROTOCOL,
+                    "manifest_sha256": sha256_file(staging / "manifest.json"),
+                    **normalized_provenance,
+                    "storage_gate_snapshot_sha256": storage_gate["sha256"],
+                    "storage_root_source_token_hash": storage_gate["source_token_hash"],
+                }
+                _publish_nfs_marker_preview(
+                    staging,
+                    destination,
+                    parent_identity=parent_identity,
+                    marker=marker,
+                )
+            finally:
+                _release_nfs_publish_lock(lock_descriptor)
+        else:
+            _atomic_exclusive_directory_rename(staging, destination, expected_parent_identity=parent_identity)
         published = True
         try:
             _fsync_directory(parent, expected_identity=parent_identity)
@@ -1003,4 +1509,10 @@ def build_pilot_preview(
                 pass
 
 
-__all__ = ["PILOT_PREVIEW_SCHEMA_VERSION", "PilotPreviewError", "build_pilot_preview"]
+__all__ = [
+    "PILOT_PREVIEW_SCHEMA_VERSION",
+    "PilotPreviewError",
+    "build_pilot_preview",
+    "validate_published_artifact",
+    "validate_published_preview",
+]

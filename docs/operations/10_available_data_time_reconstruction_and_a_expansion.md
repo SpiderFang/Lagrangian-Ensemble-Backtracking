@@ -206,34 +206,35 @@ I/O 損毀；這類事件是異常 QC，不是預定的資料政策。
 相符的 WAVEWATCH III legacy 方向定義已構成研究端版本化採用證據，不再標記為等待
 provider confirmation。日後只有取得反證時才另立 contract version 並重做受影響成果。
 
-## 8. A 區 expanded forcing domain
+## 8. A 區版本政策與歷史南向擴張
 
-使用者不需先擴區再交付。本專案可直接由 SERVER 既有 `/CWA-OCM` raw NetCDF 與完整
-NWW native 執行上游前處理；兩者空間範圍均涵蓋所需擴區。新 domain 不覆寫 v3：
+2026-09-09 的本期裁決是 A 區不南擴。正式準備以既有
+`northeast_taiwan_common_cache_v3` 的 bbox 與版本化 policy 建立新 geometry／design
+identity；正式流程仍只能讀取已驗收的 OCM／NWW3 products，不直接讀 raw NetCDF 或以 raw
+目錄存在推定可用。A 區本期契約如下：
 
-| 欄位 | 決策 |
+| 欄位 | 本期決策 |
 |---|---|
-| `flow_domain_id` | `northeast_taiwan_common_cache_v4_lbt_south_expanded` |
-| bbox | `[121.306315, 122.793685, 24.480000, 25.499156]` |
-| grid spacing | 1,000 m |
-| source margin | 0.08° |
-| 共用站點 | 貢寮、龜山島；各自 receptor/local domain/scenario 不合併 |
+| `flow_domain_id` | `northeast_taiwan_common_cache_v3` |
+| bbox | `[121.306315, 122.793685, 24.600844, 25.499156]` |
+| `formal_domain_policy` | `v3_local20km_20260909_v1` |
+| `receptor_core_radius` | 12.5 km（貢寮、龜山島各自） |
+| `local_domain_radius` | 20 km（貢寮、龜山島各自） |
+| outer stop | 沿用 A 區共用 outer boundary；不因 local radius 改變 |
+| 本期排除 | A 南向擴張、35 km sensitivity、另行新增 15 km／23 km case |
 
-龜山島 anchor `24.843127°N` 的 35 km geodesic 南緣約為 `24.527152°N`；新南界提供約
-5.22 km 幾何餘裕，超過預先登錄的兩個 1 km 共同格點，亦比僅設 `24.50°N` 的約 3.01 km
-保留更多實際 mask 誤差空間。正式驗收仍以 OCM native、OCM surface、NWW analysis 的
-共同有效格點與 20/25/35 km local polygons 實測，不以 bbox 算術直接通過。
+現有 v3 三類產品即使可見 24 個月份目錄，仍須逐項驗證 schema、UTC、欄位、mask、共同
+boundary 與 20 km local-to-outer margin；三產品至少兩個共同有效格點的 validator／producer
+證據尚未完成。既有 receptor native 篩選只支援 strict preparation，不能視為 20 km 邊界
+的 forcing margin 驗收；因此 formal scope 維持 blocked。舊
+`formal_domain_policy=expanded_domain_v1` 只作 legacy configuration 的預設相容身分，
+B-D 原有 `expanded_domain` 敏感度依其自身驗證保留。
 
-SERVER 現行 A 區 OCM native 約 1.7 TB；南擴面積約增加 13.5%，初估新增約 0.23 TB native
-及少量 surface/NWW analysis。`/data` 查核時尚有約 9.9 TB 可用，足以產製，但每月
-`.partial`、正式檔與其他使用者同時 I/O 仍須由 preflight 記錄。執行順序為：
-
-1. 新版單-domain config dry-run，確認 2024–2025 raw inventory 與預估空間；
-2. 先產製一個完整月並驗證 mesh、surface grid、source margin、checksum 與真實圖面；
-3. tmux 執行 24 個月 OCM native/surface，不覆寫 v3；
-4. 以完整 17,544 小時 NWW native 產製新 A 區 hourly analysis；
-5. 產生 static ocean/local/open-boundary/receptor manifests，實測 20/25/35 km margin；
-6. 通過後將 LBT formal config 的 A 區 ID 切換到 v4，v3 僅保留 pilot provenance。
+原先 `northeast_taiwan_common_cache_v4_lbt_south_expanded` 與 bbox
+`[121.306315,122.793685,24.480000,25.499156]` 是歷史南向擴張候選，現已延後，不是本期
+正式輸入。舊 25 km geometry、manifest、shard 與 hash 不沿用；若日後恢復南擴，必須另立
+domain policy、重新產製三類 products、共同 margin evidence 與 release identity，不能把
+歷史 partial 或舊指紋轉成 current formal。
 
 ## 9. 尚待衍生而非待使用者確認的項目
 
@@ -241,7 +242,7 @@ SERVER 現行 A 區 OCM native 約 1.7 TB；南擴面積約增加 13.5%，初估
 
 - OCM blocked reconstruction validation 與 immutable patch manifest；
 - NWW 17,544 小時新 analysis manifest；
-- expanded A 產品與共同 margin manifest；
+- A v3 policy 的三產品共同 margin manifest／validator evidence；
 - 五站 receptors、50 arrival UTC、dt/horizon/Kh/Kz/M/shard convergence；
 - production batch、聚合、圖表及學術成果報告。
 

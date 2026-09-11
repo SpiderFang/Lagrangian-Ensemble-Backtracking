@@ -105,7 +105,7 @@ grid；重採樣不提升有效物理解析度，圖說與 metadata 必須保留
 
 - `flow_domain`：forcing 支撐與最外層停止邊界；貢寮與龜山島共用同一個 A 區 domain version 及 outer boundary，以保留兩地互通的水動力背景。
 - `study_site`：情境、seed、主要 local event 與成果的第一層獨立統計單元；貢寮與龜山島可共用 flow domain 而不共用情境。
-- `local_domain`：辨識移入關注海域入口的巢狀邊界；貢寮／龜山島採 anchor 半徑 25 km 與有效海域的交集，兩者允許重疊。每條軌跡只以自己的 local domain 產生主要 first-exit，另一站 local domain 的 crossing 只屬非終止連通診斷。
+- `local_domain`：辨識移入關注海域入口的巢狀邊界；貢寮／龜山島採 anchor 半徑 20 km 與有效海域的交集，兩者允許重疊。每條軌跡只以自己的 local domain 產生主要 first-exit，另一站 local domain 的 crossing 只屬非終止連通診斷。
 - `receptor`：終端觀測位置／小 polygon、深度及不確定性；若站點明示受體核心，核心只
   限制水平候選，不改變 flow 或 local domain。
 - `open_boundary_segment`：排除海岸後可穿越的命名邊界，用於 first crossing 與弧長密度。
@@ -119,18 +119,26 @@ grid；重採樣不提升有效物理解析度，圖說與 metadata 必須保留
 
 ### 3.1 A 區 domain version 契約
 
-現行 `northeast_taiwan_common_cache_v3` 的 bbox 南界為 `24.600844°N`。SERVER preflight 顯示龜山島 25 km local boundary 至該南界僅餘約 1.64 km，未達兩個約 1 km OCM surface／NWW 共同格點，因此它的 `domain_role` 固定為 `development_and_pilot`。正式 release 不得就地改寫此上游識別碼或 metadata，而須引用新的 expanded `flow_domain_id`。
+本期 A 區不南向擴域，現行 `northeast_taiwan_common_cache_v3` 的 bbox 固定為
+`[121.306315, 122.793685, 24.600844, 25.499156]`。A 區的版本化正式範圍契約為
+`formal_domain_policy=v3_local20km_20260909_v1`，貢寮／龜山島各自保留 12.5 km
+receptor core 與 20 km local domain，共用原 outer stop，並與
+`design_baseline_v3_non_rising_a_v3_local20_20260909` 的 geometry/design identity 綁定。此裁決不新增 15／23 km，
+本期也不執行 A 區 25／35 km 敏感度；B–D 原登錄的 `expanded_domain` 敏感度仍保留。
 
-expanded A 區的機器可驗證契約至少包含：
+A 區目前可供 strict input preparation，但在下列證據完成前仍不能標成 formal ready：
 
-- 新 ID 固定為 `northeast_taiwan_common_cache_v4_lbt_south_expanded`，候選 bbox 為
-  `[121.306315, 122.793685, 24.480000, 25.499156]`；龜山島 35 km geodesic 南緣約
-  `24.527152°N`，至名目南界約保留 5.22 km。bbox 是產製目標，正式驗收仍以實際共同
-  有效格網為準；
-- OCM native triangle、OCM surface 與 NWW analysis 對 25 km baseline 及 35 km sensitivity 的 open-water arcs 均至少保留兩個共同有效格點；
-- OCM/NWW 的 grid、month、time、mask、schema、status、input fingerprint 與方向／單位決策均重新進入 G0/G1，而不是沿用舊 domain 的通過紀錄；
-- 含 Stokes baseline 不得只利用已延伸的 OCM native source margin，因現行 NWW analysis 並未覆蓋該 margin；
-- `flow_domain_id` 與 outer-boundary segment IDs 隨新版本建立，所有 scenario 仍保留原本的五站點與 50,000 基礎情境定義。
+- OCM native、OCM surface 與 NWW analysis 必須對現行 20 km local boundary 提供實際
+  共同 forcing 邊界餘裕，至少有兩個共同有效格點；現行 receptor-native gate 只做受體
+  篩選，不等同三產品共同邊界驗證。
+- `flow_domain_id` 保留現行 `northeast_taiwan_common_cache_v3`；geometry identity、
+  config／design identity、manifest、shard 與 input hash 必須依本期政策重新建立。舊
+  25 km geometry 與舊 expanded 產物不能直接沿用。現有三類 v3 產品目錄或 metadata
+  齊全也不等於已完成 schema、UTC、field、mask、共同邊界與 arrivals 驗收。
+- 歷史候選 `northeast_taiwan_common_cache_v4_lbt_south_expanded` 及其南界
+  `24.480000°N` 只保留為延期／歷史依據，不是本期 A 產製目標；legacy
+  `formal_domain_policy=expanded_domain_v1` 僅作舊設定相容讀取，不可替代本期 A 政策的
+  formal gate；B–D 的 `expanded_domain` 敏感度仍按各自 evidence gate 驗證。
 
 ## 4. OCM native mesh 取樣器
 

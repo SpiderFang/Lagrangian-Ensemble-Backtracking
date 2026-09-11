@@ -17,6 +17,13 @@
 來源受體恰好有一筆情境，不缺、不增、不重複。現行 5 水平×4 垂向形成 20 個情境，
 **粒子數為情境數×M**；來源集合檢查不以寫死的 20 代替受體識別碼比對。
 
+四區第一次共同視窗的輸入入口由版本化 registry 固定管理：貢寮／龜山島必須成對明示，
+新竹、後灣與連江各自單站明示；四者都使用 `2024-01-02T01:00:00Z` 到前一日同時刻的
+24 小時回溯與 inclusive 25 個逐時節點。這個 registry 只定義 pilot-only 的時間入口，仍
+要逐時通過 OCM native、OCM surface、NWW3 與 gap-safe 支援檢查；不能把節點數寫入設定就
+當成 forcing 已存在。B 區舊成果的 `hsinchu_explicit_24h_window_replacement_v1` 只供
+唯讀相容驗證，不供新建 C／D 或 A 試跑。
+
 ## 公開入口及持久化
 
 - 純選擇函式：`pilot_selection.select_exact_pilot_scenarios(scenarios, receptors,
@@ -123,6 +130,26 @@ legacy 因環境欄位不可用而拒絕此預覽，不改一般讀取器的舊�
 SHA-256（清單本身不循環自我雜湊），summary 保存計畫、設定、來源 component／geometry、
 軌跡清單及程式指紋、OCM／NWW 來源契約、沉降速度、Kh/Kz 設定、dt、horizon、M、seed。
 
+若輸出位於 NFS，命令只有在明示 `--storage-gate-evidence` 後才採用
+`nfs_completion_marker_v1`。同父目錄的 cooperative lock、staging 完整性檢查、逐檔 durable
+move 與最後建立的 `.complete` 共同定義 artifact reader 的可讀邊界；marker 會綁定 manifest、
+程式版本／dirty diff 與儲存閘門 snapshot。`.complete` 只代表 preview／figure artifact
+完整可讀，不代表粒子 run 已完成，也不取代 `run_progress.json`。run lifecycle 仍須依序由
+`run-reconcile` 與 `validate-run --require-complete` 判定；NFS 逐檔發布中斷時，沒有 marker
+的 final 目錄必須保留為 invalid，供稽核使用。
+
+可在四個 run root 產製後執行唯讀共同設定檢核：
+
+```bash
+uv run lbt pilot-matrix-validate \
+  "$A_RUN_ROOT" "$B_RUN_ROOT" "$C_RUN_ROOT" "$D_RUN_ROOT" \
+  > "$PILOT_SCRATCH_ROOT/abcd-first-pilot-matrix.json"
+```
+
+此命令只比較 `run_plan.json`／`normalized_config.json` 的共同設定，不驗 trajectory 或
+forcing 內容。通過只表示矩陣可比較；四區第一次實測目前仍須依
+[稽核紀錄](../results/15_four_region_first_pilot_audit.md) 解讀為 engineering pilot。
+
 診斷使用實際失敗事件 `failure_reason`／`failure_stage`／`qc_flags`、
 `diagnostic_version`、`attempted_dt_seconds`、步數／下限累計／上限與
 `sample_x_m/y_m/z_m/time_utc_ns/eta_m/bed_z_m`。來源 availability 布林值原樣保留；
@@ -144,7 +171,11 @@ SHA-256（清單本身不循環自我雜湊），summary 保存計畫、設定�
 診斷，不將 BayTrace 語意擴張成數值或來源定義。
 
 ```bash
-UV_CACHE_DIR=work/uv-cache MPLCONFIGDIR=work/matplotlib-cache \
+UV_CACHE_DIR="${LBT_UV_CACHE_ROOT:?set verified NFS root}" \
+MPLCONFIGDIR="${LBT_MPL_CACHE_ROOT:?set verified NFS root}" \
+XDG_CACHE_HOME="${LBT_XDG_CACHE_ROOT:?set verified NFS root}" \
+TMPDIR="${LBT_TMP_ROOT:?set verified NFS root}" \
+PYTHONDONTWRITEBYTECODE=1 \
 uv run python3 scripts/build_pilot_coastline_preview.py \
   --style baytrace \
   --preview-dir "$PILOT_PREVIEW" --domain "$DOMAIN_GEOMETRY" \

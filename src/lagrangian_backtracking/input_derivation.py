@@ -13,9 +13,11 @@ dynamic receptor×arrival 初始條件均以既有模組的演算法為基礎，
 的輸入。
 
 本模組保存「條件式來源足跡」所需的資料來源識別與 fingerprint；它不把 A 區的實際
-flow-domain 改名成公開標籤。若來源是南擴產品，manifest 仍會保存真實 domain ID、bbox、
-schema 與檔案 hash，而圖面可使用 ``A 區分析域`` 作為公開顯示文字。Smagorinsky、正式
-軌跡執行、報告 renderer 與互動式架構地圖不在本 Slice 範圍。
+flow-domain 改名成公開標籤。legacy ``expanded_domain_v1`` 若使用南擴產品，manifest
+仍會保存真實 domain ID、bbox、schema 與檔案 hash；新的 ``v3_local20km_20260909_v1``
+則只綁定 ``northeast_taiwan_common_cache_v3``，並記錄尚待共同 forcing 驗證的狀態。
+圖面可使用 ``A 區分析域`` 作為公開顯示文字。Smagorinsky、正式軌跡執行、報告
+renderer 與互動式架構地圖不在本 Slice 範圍。
 """
 
 from __future__ import annotations
@@ -38,11 +40,21 @@ from typing import Any
 
 import numpy as np
 import yaml
-from shapely.geometry import LineString, Point, Polygon, mapping
+from shapely.geometry import LineString, Point, Polygon, mapping, shape
 from shapely.ops import unary_union
 
 from .arrival_times import select_arrival_times
-from .config import DomainConfig, ProjectConfig, StudySiteConfig, load_config, resolve_flow_domain_id
+from .config import (
+    FORMAL_DOMAIN_POLICY_EXPANDED_V1,
+    FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
+    NORTHEAST_V3_BBOX_LON_LAT,
+    NORTHEAST_V3_FLOW_DOMAIN_ID,
+    DomainConfig,
+    ProjectConfig,
+    StudySiteConfig,
+    load_config,
+    resolve_flow_domain_id,
+)
 from .geometry import DomainProjection, build_anchor_local_domain, densified_bbox_polygon
 from .manifests import (
     load_arrival_time_manifest,
@@ -102,12 +114,18 @@ NWW_METRIC_LOCATION_POLICY_ID = "anchor_first_nearest_runtime_supported_nww_cell
 NWW_METRIC_LOCATION_MAX_GRID_SCALES = 2.0
 ARRIVAL_SELECTION_METHOD_ID = "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
 
-# 這組 pilot policy 只為可重建的新竹 24 小時展示視窗服務；它不是正式五站 48+2
-# arrival selection 的替代品。CLI 必須明示完全相同的 site=UTC pair，避免把任意時刻
-# 偽裝成已完成的正式分層。視窗的時間端點、步長與 inclusive gap-safe horizon 都固定
-# 在此版本化常數，並會複寫到 arrival／gap-safe／dynamic provenance 及 artifact index。
-PILOT_EXPLICIT_WINDOW_POLICY_ID = "hsinchu_explicit_24h_window_replacement_v1"
-PILOT_EXPLICIT_SITE_ID = "hsinchu"
+# 這組 pilot policy 只提供固定 24 小時工程視窗；它不是正式五站 48+2 arrival
+# selection 的替代品。registry 以「可接受站點組合」集中描述入口：B／C／D 各可
+# 單站執行，A 區則必須一次明示 gongliao 與 guishan 的 exact pair。所有登錄時次、
+# horizon 與 inclusive 節點固定在同一版本，避免 CLI／Python API 各自散落站點判斷。
+PILOT_EXPLICIT_WINDOW_POLICY_ID = "site_scoped_explicit_24h_window_replacement_v1"
+# B 區 r5 已發布 immutable artifact 仍使用舊 policy；它只供唯讀相容驗證，不能由
+# 新建流程套用至其他站點。這個常數不能刪除，否則既有 B 成果將無法被驗收器重讀。
+PILOT_EXPLICIT_LEGACY_WINDOW_POLICY_ID = "hsinchu_explicit_24h_window_replacement_v1"
+PILOT_EXPLICIT_LEGACY_SITE_ID = "hsinchu"
+# 舊版測試／唯讀 loader 仍可能引用這個名稱；它只代表 legacy artifact 的站點，不會
+# 限制新版 registry 的 B/C/D/A pilot 入口。
+PILOT_EXPLICIT_SITE_ID = PILOT_EXPLICIT_LEGACY_SITE_ID
 PILOT_EXPLICIT_ARRIVAL_UTC = "2024-01-02T01:00:00Z"
 PILOT_EXPLICIT_MAX_BACKTRACK_DAYS = 1.0
 PILOT_EXPLICIT_TIDE_CLASS = "pilot_explicit_window"
@@ -116,6 +134,46 @@ PILOT_ARRIVAL_SELECTION_METHOD_ID = (
     "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_"
     "explicit_pilot_window_v1"
 )
+
+# C 區紅框候選是研究者明示的兩個近岸子區，不得再退回舊版 12.5 km 圓形核心。
+# policy 只描述選點契約；實際 EPSG:4326 座標由 pilot config 的
+# ``receptor_candidate_regions`` 保存，並在 input derivation 時重新投影及驗證。
+RED_FRAME_CANDIDATE_POLICY_ID = (
+    "houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1"
+)
+RED_FRAME_CANDIDATE_CONFIG_KEY = "receptor_candidate_regions"
+RED_FRAME_SELECTION_CONFIG_KEY = "receptor_candidate_selection"
+
+# registry 的 key 是單站或 A 區 exact pair；value 保存研究區域、站點集合與新建政策
+# 是否可用。站點組合以 tuple 排序後比對，故 A 區不能只傳一站，也不能混入 B/C/D。
+# 所有組合共用同一個 2024-01-02T01:00:00Z／24 h／25 nodes policy，讓 provenance
+# 能明確說明「相同設定試跑」而不是任意替換時刻。
+PILOT_EXPLICIT_REGISTRY: dict[tuple[str, ...], dict[str, Any]] = {
+    ("gongliao", "guishan"): {
+        "analysis_region_id": "A",
+        "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "selection_scope": "A_pair_only",
+    },
+    ("hsinchu",): {
+        "analysis_region_id": "B",
+        "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "selection_scope": "hsinchu_only",
+    },
+    ("houwan",): {
+        "analysis_region_id": "C",
+        "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "selection_scope": "houwan_only",
+    },
+    ("lienchiang",): {
+        "analysis_region_id": "D",
+        "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "selection_scope": "lienchiang_only",
+    },
+}
+_PILOT_EXPLICIT_POLICY_IDS = frozenset(
+    {PILOT_EXPLICIT_WINDOW_POLICY_ID, PILOT_EXPLICIT_LEGACY_WINDOW_POLICY_ID}
+)
+_PILOT_EXPLICIT_EXPECTED_STEP_COUNT = 25
 
 # 這四個識別碼是既有 receptor schema 的固定垂向類別；任何新的垂向類別都必須先
 # 更新資料契約與 loader，不能在這個 helper 內以隱式的最近 layer 或外插方式擴充。
@@ -146,6 +204,140 @@ _OCM_SURFACE_REQUIRED_MONTH_ARRAYS = (
 
 class InputDerivationError(ValueError):
     """衍生輸入無法安全完成時使用的明確例外類別。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateRegionSpec:
+    """一個明示候選子區的幾何、配額與可公開追溯欄位。
+
+    ``geometry_lonlat`` 保持設定檔中的 WGS84 Polygon；選點時才由 caller 的
+    ``DomainProjection`` 投影為公尺制。``allocation_count`` 是該子區必須產生的
+    水平位置數，不足時直接 fail closed，不得從另一子區借點或以最近 face 補足。
+    """
+
+    region_id: str
+    name_zh: str
+    allocation_count: int
+    geometry_lonlat: Polygon
+
+
+def _candidate_region_specs(site: StudySiteConfig) -> tuple[_CandidateRegionSpec, ...]:
+    """解析站點設定中的明示 EPSG:4326 候選 Polygon，並驗證 2+3 配額契約。
+
+    候選區是設定的一級輸入，不從附件像素或既有 receptor 座標臨時推測。每個 geometry
+    必須是有效、非退化且座標順序為經度／緯度的 Polygon；紅框子區總配額必須恰為五個
+    水平位置，且選點 policy 必須要求所有子區各自完成。未設定時回傳空 tuple，保留
+    A、B、D 與舊 C caller 的原有全域 selector 行為。這裡只驗證候選描述，不宣稱
+    forcing 支援；後續 caller 仍會與 approved local/flow geometry 交集並通過 OCM/NWW gate。
+    """
+
+    extras = site.model_extra or {}
+    raw_regions = site.receptor_candidate_regions
+    if raw_regions is None:
+        # 舊版 caller 可能以 extra 欄位載入尚未升級的 model；保留唯讀相容讀取，
+        # 但新 YAML 會由 StudySiteConfig 的明示欄位納入 normalized config hash。
+        raw_regions = extras.get("receptor_candidate_regions")
+    if raw_regions is None:
+        return ()
+    if not isinstance(raw_regions, list) or not raw_regions:
+        raise InputDerivationError(f"{site.study_site_id} 的 receptor_candidate_regions 必須是非空 list")
+    specs: list[_CandidateRegionSpec] = []
+    seen_ids: set[str] = set()
+    for index, raw in enumerate(raw_regions):
+        if not isinstance(raw, Mapping):
+            raise InputDerivationError(f"候選子區[{index}] 必須是 mapping")
+        region_id = raw.get("region_id")
+        name_zh = raw.get("name_zh")
+        allocation = raw.get("allocation_count")
+        crs = raw.get("coordinate_reference")
+        geometry_payload = raw.get("geometry")
+        if (
+            not isinstance(region_id, str)
+            or not region_id.strip()
+            or region_id != region_id.strip()
+            or region_id in seen_ids
+        ):
+            raise InputDerivationError(f"候選子區[{index}].region_id 必須唯一且非空")
+        if not isinstance(name_zh, str) or not name_zh.strip() or name_zh != name_zh.strip():
+            raise InputDerivationError(f"候選子區[{index}].name_zh 必須是非空文字")
+        if isinstance(allocation, bool) or not isinstance(allocation, int) or allocation < 1:
+            raise InputDerivationError(f"候選子區[{index}].allocation_count 必須是正整數")
+        if crs != "EPSG:4326":
+            raise InputDerivationError(f"候選子區[{index}] 必須明示 coordinate_reference=EPSG:4326")
+        if not isinstance(geometry_payload, Mapping):
+            raise InputDerivationError(f"候選子區[{index}].geometry 必須是 GeoJSON mapping")
+        try:
+            geometry = shape(dict(geometry_payload))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise InputDerivationError(f"候選子區[{index}].geometry 無法解析") from exc
+        if not isinstance(geometry, Polygon) or not geometry.is_valid or geometry.area <= 0.0:
+            raise InputDerivationError(f"候選子區[{index}].geometry 必須是有效、非退化 Polygon")
+        min_lon, min_lat, max_lon, max_lat = geometry.bounds
+        if not (-180.0 <= min_lon <= max_lon <= 180.0 and -90.0 <= min_lat <= max_lat <= 90.0):
+            raise InputDerivationError(f"候選子區[{index}].geometry 超出 EPSG:4326 bounds")
+        seen_ids.add(region_id)
+        specs.append(
+            _CandidateRegionSpec(
+                region_id=region_id,
+                name_zh=name_zh,
+                allocation_count=allocation,
+                geometry_lonlat=geometry,
+            )
+        )
+    policy = site.receptor_candidate_selection
+    if policy is None:
+        policy = extras.get("receptor_candidate_selection")
+    if not isinstance(policy, Mapping):
+        raise InputDerivationError(f"{site.study_site_id} 缺少 receptor_candidate_selection policy")
+    if policy.get("policy_id") != RED_FRAME_CANDIDATE_POLICY_ID:
+        raise InputDerivationError("候選子區 policy_id 未登錄")
+    if policy.get("require_each_region") is not True:
+        raise InputDerivationError("候選子區必須要求每個子區各自有有效取得點")
+    expected_total = policy.get("total_horizontal_count")
+    if isinstance(expected_total, bool) or not isinstance(expected_total, int) or expected_total != 5:
+        raise InputDerivationError("候選子區 total_horizontal_count 必須為 5")
+    actual_total = sum(item.allocation_count for item in specs)
+    if actual_total != expected_total:
+        raise InputDerivationError(f"候選子區配額總數不符：{actual_total} != {expected_total}")
+    return tuple(specs)
+
+
+def _candidate_region_provenance(
+    specs: Sequence[_CandidateRegionSpec],
+    *,
+    source_region_records: Mapping[str, Mapping[str, Any]],
+    source_provenance: Mapping[str, Any] | None = None,
+    selection_policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """將候選子區的幾何、來源影像與每階段計數整理成 JSON-safe provenance。
+
+    ``source_provenance`` 只保存設定檔已登錄的數位化來源；``source_region_records``
+    來自實際 persistent-wet／static mask／垂向 gate 選點結果。兩者並列可區分「紅框
+    的來源」與「forcing 支援的實測篩選」，避免圖面紅框被誤讀為有效流場範圍。
+    """
+
+    regions: list[dict[str, Any]] = []
+    for spec in specs:
+        base = source_region_records.get(spec.region_id, {})
+        regions.append(
+            {
+                "region_id": spec.region_id,
+                "name_zh": spec.name_zh,
+                "allocation_count": spec.allocation_count,
+                "coordinate_reference": "EPSG:4326",
+                "geometry": mapping(spec.geometry_lonlat),
+                **dict(base),
+            }
+        )
+    return {
+        "policy_id": RED_FRAME_CANDIDATE_POLICY_ID,
+        "selection_policy": dict(selection_policy or {}),
+        "source_digitization_provenance": dict(source_provenance or {}),
+        "coordinate_reference": "EPSG:4326",
+        "require_each_region": True,
+        "total_horizontal_count": 5,
+        "regions": regions,
+    }
 
 
 def _reject_json_constant(value: str) -> None:
@@ -432,56 +624,66 @@ class _ExplicitPilotArrival:
     time_utc_ns: int
     time_utc: str
     max_backtrack_days: float
+    selection_scope: str
 
 
 def _parse_explicit_pilot_arrivals(
     value: Mapping[str, str] | None,
 ) -> dict[str, _ExplicitPilotArrival]:
-    """解析並限制 pilot-only 的 ``study_site_id -> exact UTC`` 入口。
+    """依版本化 registry 解析 pilot-only 的 ``study_site_id -> exact UTC`` 入口。
 
-    目前只登錄新竹 ``2024-01-02T01:00:00Z``；這不是一般 arrival selector 的自由
-    時刻參數，而是為了重建指定展示案例而版本化的輸入政策。解析要求明示 ``Z``、整點
-    UTC 且不接受 offset、分鐘、秒小數、NaN 或其他隱含轉換。回傳的 epoch nanoseconds
-    會交給後續產品時間軸、NWW 空間支撐及 inclusive backward gate 再次驗證。
+    B／C／D 只接受各自單站；A 區必須同時明示 ``gongliao`` 與 ``guishan``，不得傳入
+    單一 A 站或混合不同研究區。所有登錄組合共用 ``2024-01-02T01:00:00Z``、一日
+    backward horizon 與 25 個 inclusive exact-hour 節點。這不是一般 arrival selector
+    的自由時刻參數，而是為相同設定試跑保存的版本化入口；回傳 epoch nanoseconds 後，仍
+    會交給產品時間軸、NWW 空間支撐及 gap-safe gate 再次驗證。
     """
 
     if value is None:
         return {}
     if not isinstance(value, Mapping) or not value:
         raise InputDerivationError("pilot_arrival_utc 必須是非空的 site=UTC mapping")
-    if set(value) != {PILOT_EXPLICIT_SITE_ID}:
+    if not all(type(site_id) is str and site_id.strip() == site_id for site_id in value):
+        raise InputDerivationError("pilot_arrival_utc 的站點鍵必須是沒有空白的文字")
+    selected_sites = tuple(sorted(value))
+    registry_entry = PILOT_EXPLICIT_REGISTRY.get(selected_sites)
+    if registry_entry is None:
+        allowed = ", ".join("+".join(key) for key in sorted(PILOT_EXPLICIT_REGISTRY))
         raise InputDerivationError(
-            "pilot_arrival_utc 目前只允許明示 hsinchu=2024-01-02T01:00:00Z"
+            "pilot_arrival_utc 站點組合未登錄；僅允許 B/C/D 各自單站或 A 區 "
+            f"gongliao+guishan exact pair（可用組合：{allowed}）"
         )
-    raw = value[PILOT_EXPLICIT_SITE_ID]
-    if type(raw) is not str or not raw or raw != raw.strip() or not raw.endswith("Z"):
-        raise InputDerivationError("pilot_arrival_utc 必須是沒有空白的 UTC Z 字串")
-    try:
-        parsed = datetime.fromisoformat(raw[:-1] + "+00:00")
-    except ValueError as exc:
-        raise InputDerivationError(f"pilot_arrival_utc 無法解析：{raw!r}") from exc
-    if parsed.utcoffset() != timedelta(0):
-        raise InputDerivationError("pilot_arrival_utc 必須使用 UTC offset 0")
-    if parsed.minute or parsed.second or parsed.microsecond:
-        raise InputDerivationError("pilot_arrival_utc 必須落在 exact-hour UTC")
-    canonical = parsed.isoformat().replace("+00:00", "Z")
-    if canonical != raw:
-        raise InputDerivationError(
-            "pilot_arrival_utc 必須使用固定 ISO8601 格式 2024-01-02T01:00:00Z"
-        )
-    if raw != PILOT_EXPLICIT_ARRIVAL_UTC:
-        raise InputDerivationError(
-            f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} 只登錄 {PILOT_EXPLICIT_ARRIVAL_UTC}"
-        )
-    time_ns = int(parsed.timestamp()) * 1_000_000_000 + parsed.microsecond * 1_000
-    return {
-        PILOT_EXPLICIT_SITE_ID: _ExplicitPilotArrival(
-            study_site_id=PILOT_EXPLICIT_SITE_ID,
+    parsed_by_site: dict[str, _ExplicitPilotArrival] = {}
+    for site_id in selected_sites:
+        raw = value[site_id]
+        if type(raw) is not str or not raw or raw != raw.strip() or not raw.endswith("Z"):
+            raise InputDerivationError("pilot_arrival_utc 必須是沒有空白的 UTC Z 字串")
+        try:
+            parsed = datetime.fromisoformat(raw[:-1] + "+00:00")
+        except ValueError as exc:
+            raise InputDerivationError(f"pilot_arrival_utc 無法解析：{raw!r}") from exc
+        if parsed.utcoffset() != timedelta(0):
+            raise InputDerivationError("pilot_arrival_utc 必須使用 UTC offset 0")
+        if parsed.minute or parsed.second or parsed.microsecond:
+            raise InputDerivationError("pilot_arrival_utc 必須落在 exact-hour UTC")
+        canonical = parsed.isoformat().replace("+00:00", "Z")
+        if canonical != raw:
+            raise InputDerivationError(
+                "pilot_arrival_utc 必須使用固定 ISO8601 格式 2024-01-02T01:00:00Z"
+            )
+        if raw != PILOT_EXPLICIT_ARRIVAL_UTC:
+            raise InputDerivationError(
+                f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} 只登錄 {PILOT_EXPLICIT_ARRIVAL_UTC}"
+            )
+        time_ns = int(parsed.timestamp()) * 1_000_000_000 + parsed.microsecond * 1_000
+        parsed_by_site[site_id] = _ExplicitPilotArrival(
+            study_site_id=site_id,
             time_utc_ns=time_ns,
             time_utc=canonical,
             max_backtrack_days=PILOT_EXPLICIT_MAX_BACKTRACK_DAYS,
+            selection_scope=str(registry_entry["selection_scope"]),
         )
-    }
+    return parsed_by_site
 
 
 def _explicit_pilot_window_times(explicit: _ExplicitPilotArrival) -> np.ndarray:
@@ -1387,16 +1589,36 @@ def _authoritative_flow_domain_bbox_lon_lat(
 ) -> tuple[float, float, float, float]:
     """解析實際 accepted flow-domain 所註冊的權威 WGS84 bbox。
 
-    ``actual_flow_domain_id`` 必須與設定中的 base、formal 或明示 expanded candidate
-    完全相同；函式不依目錄名稱或 ID 字串推測空間範圍。base source 使用
-    ``domain.bbox_lon_lat``，expanded/formal source 則必須在 ``model_extra`` 提供
-    ``expanded_bbox_lon_lat``。expanded bbox 會檢查四個有限數值的順序與設定中心是否位於
-    範圍內，讓 source ID、outer geometry、inventory 與 release config 不可能各自綁定不同
-    的空間版本。回傳順序固定為 ``(lon_min, lon_max, lat_min, lat_max)``，單位為度。
+    ``expanded_domain_v1`` 的舊設定仍可由 base、formal 或明示 expanded candidate
+    綁定；函式不依目錄名稱或 ID 字串推測空間範圍。對
+    ``v3_local20km_20260909_v1``，accepted ID 必須是唯一的
+    ``northeast_taiwan_common_cache_v3``，只使用固定 base bbox，絕不讀取同根目錄的
+    v4 candidate。expanded bbox 會檢查四個有限數值的順序與設定中心是否位於範圍內，讓
+    舊版 source ID、outer geometry、inventory 與 release config 不可能各自綁定不同的
+    空間版本。回傳順序固定為 ``(lon_min, lon_max, lat_min, lat_max)``，單位為度。
     """
 
     if not isinstance(actual_flow_domain_id, str) or not actual_flow_domain_id.strip():
         raise InputDerivationError("actual flow-domain ID 必須是非空字串")
+    if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+        # ProjectConfig 已在整體 schema gate 驗證新 policy；此處仍重做 source-level
+        # exact check，防止 caller 以 model_copy 或人工建立的 DomainConfig 繞過整體 gate。
+        # 20 km policy 尚未有共同有效網格證據，這個 resolver 只允許準備性 strict input
+        # 讀取原始 v3，不把任何 candidate 目錄升格成 formal source。
+        if (
+            domain.analysis_region_id != "A"
+            or domain.flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID
+            or domain.formal_release_flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID
+            or tuple(float(value) for value in domain.bbox_lon_lat) != NORTHEAST_V3_BBOX_LON_LAT
+            or actual_flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID
+        ):
+            raise InputDerivationError(
+                "v3_local20km_20260909_v1 僅接受 A 區 exact northeast_taiwan_common_cache_v3 "
+                "及固定 v3 bbox"
+            )
+        return tuple(float(value) for value in domain.bbox_lon_lat)
+    if domain.formal_domain_policy != FORMAL_DOMAIN_POLICY_EXPANDED_V1:
+        raise InputDerivationError(f"未知 formal_domain_policy：{domain.formal_domain_policy!r}")
     base_id = domain.flow_domain_id
     formal_id = domain.formal_release_flow_domain_id
     candidate_id = domain.model_extra.get("expanded_domain_candidate_id") if domain.model_extra else None
@@ -1453,10 +1675,12 @@ def _geometry_payloads(
     """由四個 flow domain 與五個 study site 生成三份 strict geometry manifest。
 
     flow polygon 來自 authoritative resolver 選出的 base 或 expanded registered bbox，
-    再建立加密 WGS84 boundary；A 區 local polygon 則在 OCM face-derived static ocean
-    polygon 與 anchor-centered 25 km buffer 的交集建立。B-D local 等於 flow。這樣 geometry
-    不會因某一個 arrival 的 wet/dry 狀態改變，同時保留 domain/local/open-boundary 的來源
-    provenance、真實 flow-domain ID 與其共同註冊的 bbox 版本。
+    再建立加密 WGS84 boundary；A 區 local polygon 依 policy 使用 legacy 25 km 或新 v3
+    20 km 的 anchor-centered buffer，再與 OCM face-derived static ocean polygon 求交。
+    B-D local 等於 flow。這樣 geometry 不會因某一個 arrival 的 wet/dry 狀態改變，同時
+    保留 domain/local/open-boundary 的來源 provenance、真實 flow-domain ID 與其共同註冊
+    的 bbox 版本。新 v3 local policy 會把 20 km 幾何版本 token 寫入 identity，避免沿用
+    舊 25 km candidate 的 manifest 識別碼。
     """
 
     domain_records: list[dict[str, Any]] = []
@@ -1470,11 +1694,20 @@ def _geometry_payloads(
     flow_id_by_region: dict[str, str] = {}
     bbox_by_region: dict[str, tuple[float, float, float, float]] = {}
     bbox_registration_by_region: dict[str, str] = {}
+    has_v3_policy = any(
+        domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+        for domain in config.domains
+    )
 
     for region in sorted(domain_by_region):
         domain = domain_by_region[region]
         product = products_by_region[region]
         flow_id = product.flow_domain_id
+        geometry_policy_token = (
+            "v3_local20km_20260909_v1"
+            if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+            else "v1"
+        )
         flow_id_by_region[region] = flow_id
         bbox_by_region[region] = _authoritative_flow_domain_bbox_lon_lat(domain, flow_id)
         bbox_registration_by_region[region] = _flow_domain_bbox_registration(domain, flow_id)
@@ -1488,7 +1721,8 @@ def _geometry_payloads(
                 "flow_domain_id": flow_id,
                 "geometry": mapping(polygon),
                 "source_geometry_id": (
-                    f"{product.product}_{flow_id}_{bbox_registration_by_region[region]}_bbox_v1"
+                    f"{product.product}_{flow_id}_{bbox_registration_by_region[region]}_bbox_"
+                    f"{geometry_policy_token}"
                 ),
             }
         )
@@ -1500,7 +1734,8 @@ def _geometry_payloads(
                 "segment_id": f"{flow_id}_flow_open_boundary",
                 "geometry": mapping(LineString(polygon.exterior.coords)),
                 "source_geometry_id": (
-                    f"{flow_id}_{bbox_registration_by_region[region]}_bbox_exterior_open_boundary_v1"
+                    f"{flow_id}_{bbox_registration_by_region[region]}_bbox_exterior_open_boundary_"
+                    f"{geometry_policy_token}"
                 ),
             }
         )
@@ -1512,6 +1747,11 @@ def _geometry_payloads(
         domain = domain_by_region[region]
         polygon = flow_polygons[flow_id]
         local_equals_flow = region != "A"
+        geometry_policy_token = (
+            "v3_local20km_20260909_v1"
+            if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+            else "v1"
+        )
         if local_equals_flow:
             local = polygon
         else:
@@ -1523,6 +1763,21 @@ def _geometry_payloads(
             radius = site.local_domain_baseline_radius_m
             if anchor is None or radius is None:
                 raise InputDerivationError(f"A 區 study site 缺少 anchor/radius：{site_id}")
+            flow_metric = projection.project_geometry(polygon)
+            anchor_x, anchor_y = projection.project(*anchor)
+            local_buffer = Point(float(anchor_x), float(anchor_y)).buffer(float(radius), quad_segs=64)
+            # 先驗證完整 local 圓是否落在 authoritative flow bbox，再與靜態海域求交。
+            # 若先 clip，越界會被悄悄裁掉，後續看似有 geometry 卻沒有證明 20 km 邊界
+            # 的 forcing 支援；這裡只建立準備性 strict input，不替未完成的共同格網
+            # validator 宣稱通過。
+            if (
+                domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+                and not flow_metric.covers(local_buffer)
+            ):
+                raise InputDerivationError(
+                    f"{site_id} local radius {float(radius):g} m 超出 authoritative flow-domain "
+                    "bbox；不得以 clip 隱藏越界"
+                )
             # candidate geometry 先與 flow bbox 交集，避免 static mesh convex hull 因邊界
             # 三角形數量很少而意外越過設定 outer domain。
             local = build_anchor_local_domain(
@@ -1531,7 +1786,6 @@ def _geometry_payloads(
                 radius_m=float(radius),
                 static_ocean_polygon_metric=static_ocean,
             )
-            flow_metric = projection.project_geometry(polygon)
             clipped = local.intersection(flow_metric)
             if clipped.is_empty or not isinstance(clipped, Polygon):
                 raise InputDerivationError(f"local geometry 與 flow geometry 無有效交集：{site_id}")
@@ -1548,7 +1802,8 @@ def _geometry_payloads(
                 "local_equals_flow": local_equals_flow,
                 "geometry": mapping(local),
                 "source_geometry_id": (
-                    f"{flow_id}_{bbox_registration_by_region[region]}_{site_id}_local_domain_v1"
+                    f"{flow_id}_{bbox_registration_by_region[region]}_{site_id}_local_domain_"
+                    f"{geometry_policy_token}"
                 ),
             }
         )
@@ -1562,7 +1817,7 @@ def _geometry_payloads(
                     "geometry": mapping(LineString(local.exterior.coords)),
                     "source_geometry_id": (
                         f"{flow_id}_{bbox_registration_by_region[region]}_"
-                        f"{site_id}_local_exterior_open_boundary_v1"
+                        f"{site_id}_local_exterior_open_boundary_{geometry_policy_token}"
                     ),
                 }
             )
@@ -1583,6 +1838,12 @@ def _geometry_payloads(
             for region in sorted(bbox_by_region)
         },
     }
+    if has_v3_policy:
+        # 新 policy 才需要在 geometry provenance 明示版本；legacy payload 保持原欄位
+        # 語意，避免預設值改變既有 artifact canonical fingerprint。
+        common_extra["formal_domain_policy_by_region"] = {
+            region: domain_by_region[region].formal_domain_policy for region in sorted(domain_by_region)
+        }
     domain_payload = {
         "manifest_kind": "domain_geometry_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -1603,7 +1864,11 @@ def _geometry_payloads(
         "design_version": config.design_version,
         "coordinate_reference": "EPSG:4326",
         "provenance": _provenance(
-            method_id="server_v3_anchor_local_geometry_v1",
+            method_id=(
+                "server_v3_anchor_local_geometry_v3_local20km_20260909_v1"
+                if has_v3_policy
+                else "server_v3_anchor_local_geometry_v1"
+            ),
             source_hashes=source_hashes,
             **common_extra,
         ),
@@ -1616,7 +1881,11 @@ def _geometry_payloads(
         "design_version": config.design_version,
         "coordinate_reference": "EPSG:4326",
         "provenance": _provenance(
-            method_id="server_v3_open_boundary_geometry_v1",
+            method_id=(
+                "server_v3_open_boundary_geometry_v3_local20km_20260909_v1"
+                if has_v3_policy
+                else "server_v3_open_boundary_geometry_v1"
+            ),
             source_hashes=source_hashes,
             **common_extra,
         ),
@@ -2671,7 +2940,7 @@ def _replace_with_explicit_pilot_arrival(
     expected_axis: np.ndarray,
     design_version: str,
 ) -> list[ArrivalTime]:
-    """以固定 policy 替換一筆 Hsinchu baseline arrival，保留 50 筆站點 coverage。
+    """以固定 policy 替換一筆站點 baseline arrival，保留 50 筆站點 coverage。
 
     替換規則是：若 baseline 已經選到同一 UTC，就替換該 UTC；否則在其餘 49 筆候選
     中依 ``(time_utc_ns, arrival_time_id)`` 取排序最後一筆。這個 deterministic rule
@@ -2681,8 +2950,8 @@ def _replace_with_explicit_pilot_arrival(
     dynamic pairs 的前提下使用。
     """
 
-    if site_id != explicit.study_site_id or site_id != PILOT_EXPLICIT_SITE_ID:
-        raise InputDerivationError("explicit pilot arrival 只能套用 hsinchu")
+    if site_id != explicit.study_site_id:
+        raise InputDerivationError("explicit pilot arrival 只能套用 registry 登錄的相同站點")
     _validate_explicit_pilot_arrival_support(
         explicit=explicit,
         product=product,
@@ -2719,7 +2988,7 @@ def _replace_with_explicit_pilot_arrival(
     parsed = datetime.fromtimestamp(explicit.time_utc_ns / 1_000_000_000, tz=UTC)
     metadata: dict[str, float | int | str] = {
         "selection_method": PILOT_EXPLICIT_WINDOW_POLICY_ID,
-        "pilot_selection_scope": "hsinchu_only",
+        "pilot_selection_scope": explicit.selection_scope,
         "explicit_pilot_window": f"{_utc_string(start_ns)}/{explicit.time_utc}/inclusive_1h",
         "explicit_pilot_window_start_utc": _utc_string(start_ns),
         "explicit_pilot_window_end_utc": explicit.time_utc,
@@ -2759,45 +3028,102 @@ def _replace_with_explicit_pilot_arrival(
 def _pilot_selection_summary(arrivals: Sequence[ArrivalTime]) -> dict[str, Any] | None:
     """由 arrival metadata 建立 pilot replacement 的小型 provenance snapshot。
 
-    summary 不保存 source path 或大型資料，只保存可由 arrival manifest 重算的 policy、站點、
-    原／替換 identity 與 24 小時 horizon。沒有明示 pilot arrival 時回傳 ``None``，使
-    一般 48+2 artifact 的 root/provenance 保持既有語意。
+    summary 不保存 source path 或大型資料，只保存可由 arrival manifest 重算的 policy、站點
+    集合、原／替換 identity 與 24 小時 horizon。A 區 exact pair 會保留兩筆 arrival ID，
+    讓 gap-safe component 對兩站各自套用一日 override；B／C／D 單站則保留既有
+    ``arrival_time_id`` 欄位以維持舊 artifact／下游讀取相容性。沒有明示 pilot arrival 時
+    回傳 ``None``，使一般 48+2 artifact 的 root/provenance 保持既有語意。
     """
 
     explicit = [
         item
         for item in arrivals
-        if item.metadata.get("pilot_replacement_policy_id") == PILOT_EXPLICIT_WINDOW_POLICY_ID
+        if item.metadata.get("pilot_replacement_policy_id") in _PILOT_EXPLICIT_POLICY_IDS
     ]
     if not explicit:
         return None
-    if len(explicit) != 1:
-        raise InputDerivationError("pilot explicit replacement 必須恰有一筆 arrival")
-    item = explicit[0]
-    metadata = item.metadata
-    required = (
-        "pilot_replaced_arrival_time_id",
-        "pilot_replacement_arrival_time_id",
-        "explicit_pilot_window_start_utc",
-        "explicit_pilot_window_end_utc",
-    )
-    if any(not isinstance(metadata.get(key), str) or not str(metadata[key]).strip() for key in required):
-        raise InputDerivationError("pilot explicit arrival metadata 缺少原／替換 identity 或視窗")
-    return {
-        "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
-        "study_site_id": item.study_site_id,
-        "arrival_time_id": item.arrival_time_id,
-        "arrival_time_utc": _utc_string(item.time_utc_ns),
-        "replaced_arrival_time_id": metadata["pilot_replaced_arrival_time_id"],
-        "replaced_arrival_time_utc": metadata.get("pilot_replaced_arrival_time_utc"),
-        "replacement_arrival_time_id": metadata["pilot_replacement_arrival_time_id"],
-        "replacement_arrival_time_utc": metadata.get("pilot_replacement_arrival_time_utc"),
-        "window_start_utc": metadata["explicit_pilot_window_start_utc"],
-        "window_end_utc": metadata["explicit_pilot_window_end_utc"],
+    policies = {item.metadata.get("pilot_replacement_policy_id") for item in explicit}
+    if len(policies) != 1:
+        raise InputDerivationError("pilot explicit replacement 不可混用新舊 policy")
+    policy_id = str(next(iter(policies)))
+    site_ids = tuple(sorted(item.study_site_id for item in explicit))
+    if len(site_ids) != len(set(site_ids)):
+        raise InputDerivationError("pilot explicit replacement 不可重複同一站點")
+    if policy_id == PILOT_EXPLICIT_LEGACY_WINDOW_POLICY_ID:
+        if site_ids != (PILOT_EXPLICIT_LEGACY_SITE_ID,):
+            raise InputDerivationError("legacy pilot artifact 只允許 hsinchu 單站")
+        registry_entry: Mapping[str, Any] = {
+            "analysis_region_id": "B",
+            "selection_scope": "hsinchu_only",
+        }
+    else:
+        registry_entry = PILOT_EXPLICIT_REGISTRY.get(site_ids, {})
+        if not registry_entry:
+            raise InputDerivationError("pilot explicit replacement 站點組合不在 registry")
+
+    records: list[dict[str, Any]] = []
+    for item in sorted(explicit, key=lambda value: (value.study_site_id, int(value.time_utc_ns))):
+        metadata = item.metadata
+        required = (
+            "pilot_replaced_arrival_time_id",
+            "pilot_replacement_arrival_time_id",
+            "explicit_pilot_window_start_utc",
+            "explicit_pilot_window_end_utc",
+        )
+        if any(
+            not isinstance(metadata.get(key), str) or not str(metadata[key]).strip()
+            for key in required
+        ):
+            raise InputDerivationError("pilot explicit arrival metadata 缺少原／替換 identity 或視窗")
+        if _utc_string(item.time_utc_ns) != PILOT_EXPLICIT_ARRIVAL_UTC:
+            raise InputDerivationError("pilot explicit arrival UTC 不符合 registry 固定時次")
+        if metadata.get("explicit_pilot_window_expected_step_count") != _PILOT_EXPLICIT_EXPECTED_STEP_COUNT:
+            raise InputDerivationError("pilot explicit arrival 必須保存 25 個 inclusive 節點")
+        if metadata.get("pilot_selection_scope") != registry_entry["selection_scope"]:
+            raise InputDerivationError("pilot explicit arrival selection scope 與 registry 不一致")
+        records.append(
+            {
+                "study_site_id": item.study_site_id,
+                "arrival_time_id": item.arrival_time_id,
+                "arrival_time_utc": _utc_string(item.time_utc_ns),
+                "replaced_arrival_time_id": metadata["pilot_replaced_arrival_time_id"],
+                "replaced_arrival_time_utc": metadata.get("pilot_replaced_arrival_time_utc"),
+                "replacement_arrival_time_id": metadata["pilot_replacement_arrival_time_id"],
+                "replacement_arrival_time_utc": metadata.get("pilot_replacement_arrival_time_utc"),
+                "window_start_utc": metadata["explicit_pilot_window_start_utc"],
+                "window_end_utc": metadata["explicit_pilot_window_end_utc"],
+            }
+        )
+    arrival_times = {record["arrival_time_utc"] for record in records}
+    if arrival_times != {PILOT_EXPLICIT_ARRIVAL_UTC}:
+        raise InputDerivationError("pilot explicit replacement 的站點 UTC 必須完全相同")
+    result: dict[str, Any] = {
+        "policy_id": policy_id,
+        "site_ids": list(site_ids),
+        "arrival_time_ids": [record["arrival_time_id"] for record in records],
+        "arrival_times": records,
+        "window_start_utc": records[0]["window_start_utc"],
+        "window_end_utc": records[0]["window_end_utc"],
         "max_backtrack_days": float(PILOT_EXPLICIT_MAX_BACKTRACK_DAYS),
-        "expected_step_count": 25,
-        "selection_scope": "hsinchu_only",
+        "expected_step_count": _PILOT_EXPLICIT_EXPECTED_STEP_COUNT,
+        "selection_scope": registry_entry["selection_scope"],
     }
+    if len(records) == 1:
+        # 舊下游只讀這些單筆欄位；保留它們不影響新的 A pair schema。
+        result.update(
+            {
+                "study_site_id": records[0]["study_site_id"],
+                "arrival_time_id": records[0]["arrival_time_id"],
+                "arrival_time_utc": records[0]["arrival_time_utc"],
+                "replaced_arrival_time_id": records[0]["replaced_arrival_time_id"],
+                "replaced_arrival_time_utc": records[0]["replaced_arrival_time_utc"],
+                "replacement_arrival_time_id": records[0]["replacement_arrival_time_id"],
+                "replacement_arrival_time_utc": records[0]["replacement_arrival_time_utc"],
+            }
+        )
+    elif site_ids != ("gongliao", "guishan") or len(records) != 2:
+        raise InputDerivationError("pilot explicit replacement 多站只允許 A 區 exact pair")
+    return result
 
 
 def _site_arrival_support_by_time(
@@ -3155,6 +3481,13 @@ def _receptor_payload(
     失敗的 face 會在候選 wetdry copy 中永久
     blacklist，再重新執行同一 maximin；這使水平選擇保持站點獨立、可重現且有限終止，
     不會刪除 arrival/receptor/scenario 或以最近有效值補填。
+
+    若站點設定了 ``receptor_candidate_regions``，候選面會先依每個紅框子區的
+    GeoJSON 多邊形與已驗收 local／static-ocean flow polygon 求交，再按
+    ``receptor_candidate_selection`` 的明示配額分區執行相同的 wet/dry、邊界距離與
+    NWW 垂向支撐檢查。紅框只代表受體候選選擇的數位化來源與空間限制，不代表 OCM
+    或 NWW forcing 支援；所有 forcing、靜態海域、持續濕點與垂向遮罩 gate 仍必須
+    通過，且選出的 face 會在 metadata 與 provenance 保留其 ``candidate_region_id``。
     """
 
     site_by_id = {site.study_site_id: site for site in config.study_sites}
@@ -3163,6 +3496,9 @@ def _receptor_payload(
     rows: list[dict[str, Any]] = []
     meshes: dict[str, NativeMesh] = {}
     projections: dict[str, DomainProjection] = {}
+    # 只有明示紅框候選的站點才會填入這份索引；它同時供 receptor metadata 與
+    # provenance 使用，讓每個最終 face 能回溯到指定的研究子區，而不是靠座標事後猜測。
+    candidate_region_selection_by_site: dict[str, dict[str, Any]] = {}
     # build_input_derivatives 會把每個 analysis region 的 cache 傳進來；直接使用此
     # internal helper 的小型 caller 若未提供 mapping，才保留 lazy 建立的相容行為。
     shared_nww_runtime_caches = dict(nww_runtime_caches or {})
@@ -3198,11 +3534,25 @@ def _receptor_payload(
             mesh = _load_native_mesh(product, projection)
             meshes[product.flow_domain_id] = mesh
         polygon_lonlat = local_polygons[site_id]
-        candidate_metric = _receptor_candidate_polygon_metric(
-            site=site,
-            projection=projection,
-            local_polygon_lonlat=polygon_lonlat,
-        )
+        candidate_specs = _candidate_region_specs(site)
+        if candidate_specs:
+            # 紅框候選是新的研究空間契約：先與 approved local/flow geometry 求交，
+            # 但不再套用舊版 12,500 m 圓形核心。核心欄位仍由 config 保留作舊版
+            # provenance，避免把研究者明示的兩個子區偷偷縮回舊中心附近。
+            candidate_metric = projection.project_geometry(polygon_lonlat)
+            if (
+                not isinstance(candidate_metric, Polygon)
+                or candidate_metric.is_empty
+                or not candidate_metric.is_valid
+                or candidate_metric.area <= 0.0
+            ):
+                raise InputDerivationError(f"{site_id} approved local/flow 候選區無效")
+        else:
+            candidate_metric = _receptor_candidate_polygon_metric(
+                site=site,
+                projection=projection,
+                local_polygon_lonlat=polygon_lonlat,
+            )
         anchor_lonlat = site.anchor_lonlat or domain.center_lonlat
         anchor_xy_array = projection.project(*anchor_lonlat)
         anchor_xy = (float(anchor_xy_array[0]), float(anchor_xy_array[1]))
@@ -3335,55 +3685,171 @@ def _receptor_payload(
                 raise InputDerivationError(f"{site_id} receptor face 沒有可用的 OCM arrival")
             return first_support
 
-        # geometry、persistent-wet 與 boundary margin 只在本站建立一次 pool；後續
-        # blacklist rounds 只對 pool 內的公尺制候選重跑 maximin，不再逐輪建立 Shapely
-        # Point 或掃描全部 source face。pool 的 array 是唯讀 copy，不能被 blacklist 改寫。
-        candidate_pool = prepare_horizontal_receptor_candidates(
-            study_site_id=site_id,
-            mesh=mesh,
-            candidate_polygon_metric=candidate_metric,
-            anchor_xy=anchor_xy,
-            wetdry_at_arrivals=wetdry,
-            boundary_margin_m=margin,
-            wet_value=0.0,
-        )
-        # 任一候選的任一 arrival NWW 或垂向支撐失敗，就以 source face local index
-        # 加入本站 persistent blacklist，再用完全相同的 deterministic pool selector
-        # 重選。每次至少排除一個 face，故重選輪次有限且不會回到已知壞 face。
+        # geometry、persistent-wet 與 boundary margin 只在本站（或本站的每一個紅框
+        # 子區）建立一次 immutable pool；後續 blacklist rounds 只對 pool 內的公尺制候選
+        # 重跑 maximin，不再逐輪建立 Shapely Point 或掃描全部 source face。紅框分支
+        # 對每一個子區獨立配額，禁止跨區借點補足。
         blacklisted_faces: set[int] = set()
         template_supports: dict[int, _FaceVerticalSupport] = {}
-        candidate_count = int(candidate_pool.candidate_face_local_indices.size)
-        for _attempt in range(candidate_count + 1):
-            try:
-                horizontal = select_horizontal_receptors_from_pool(
-                    candidate_pool,
-                    count=5,
-                    excluded_face_indices=blacklisted_faces,
+        region_id_by_face: dict[int, str] = {}
+
+        if candidate_specs:
+            horizontal = []
+            used_faces: set[int] = set()
+            region_records: dict[str, dict[str, Any]] = {}
+            for spec in candidate_specs:
+                region_metric = projection.project_geometry(spec.geometry_lonlat)
+                scoped_metric = candidate_metric.intersection(region_metric)
+                if (
+                    not isinstance(scoped_metric, Polygon)
+                    or scoped_metric.is_empty
+                    or not scoped_metric.is_valid
+                    or scoped_metric.area <= 0.0
+                ):
+                    raise InputDerivationError(
+                        f"{site_id}/{spec.region_id} 紅框候選與 approved local/flow geometry 無有效交集"
+                    )
+                # representative_point 保證落在子區內，作為每子區 anchor-first 的
+                # 公尺制 anchor；不使用舊站點 anchor，避免西岸子區被遠端中心牽引。
+                region_anchor = scoped_metric.representative_point()
+                region_anchor_xy = (float(region_anchor.x), float(region_anchor.y))
+                region_pool = prepare_horizontal_receptor_candidates(
+                    study_site_id=f"{site_id}:{spec.region_id}",
+                    mesh=mesh,
+                    candidate_polygon_metric=scoped_metric,
+                    anchor_xy=region_anchor_xy,
+                    wetdry_at_arrivals=wetdry,
+                    boundary_margin_m=margin,
+                    wet_value=0.0,
                 )
-            except ValueError as exc:
-                raise InputDerivationError(
-                    f"{site_id} 垂向支撐淘汰後 persistent-wet 候選不足：{exc}"
-                ) from exc
-            failed_faces: list[int] = []
-            for horizontal_item in horizontal:
-                face_index = int(horizontal_item.source_face_local_index)
-                try:
-                    support = face_support(horizontal_item)
-                except InputDerivationError as exc:
-                    # 將 combined gate 的失敗也快取；下一輪若 deterministic maximin
-                    # 仍因其他 face 淘汰而碰到同一個 face，不能重做相同的 NWW／OCM I/O。
-                    face_support_cache[face_index] = None
-                    face_support_errors[face_index] = str(exc)
-                    failed_faces.append(face_index)
+                candidate_count = int(region_pool.candidate_face_local_indices.size)
+                scope_blacklist: set[int] = set()
+                scope_template_supports: dict[int, _FaceVerticalSupport] = {}
+                for _attempt in range(candidate_count + 1):
+                    try:
+                        selected_scope = select_horizontal_receptors_from_pool(
+                            region_pool,
+                            count=spec.allocation_count,
+                            excluded_face_indices=scope_blacklist | used_faces,
+                        )
+                    except ValueError as exc:
+                        raise InputDerivationError(
+                            f"{site_id}/{spec.region_id} 紅框子區在垂向支撐淘汰後候選不足：{exc}"
+                        ) from exc
+                    failed_faces: list[int] = []
+                    for horizontal_item in selected_scope:
+                        face_index = int(horizontal_item.source_face_local_index)
+                        try:
+                            support = face_support(horizontal_item)
+                        except InputDerivationError as exc:
+                            # NWW exact-hour 或 OCM 四垂向層位任一失敗都永久列入
+                            # 此站點 blacklist；下一輪仍用相同 tie-break 與 anchor。
+                            face_support_cache[face_index] = None
+                            face_support_errors[face_index] = str(exc)
+                            failed_faces.append(face_index)
+                        else:
+                            face_support_cache[face_index] = support
+                            scope_template_supports[face_index] = support
+                    if not failed_faces:
+                        break
+                    scope_blacklist.update(failed_faces)
                 else:
-                    face_support_cache[face_index] = support
+                    raise InputDerivationError(
+                        f"{site_id}/{spec.region_id} 紅框子區垂向支撐重選超過有限迭代次數"
+                    )
+                anchor_lon, anchor_lat = projection.unproject(
+                    float(region_anchor.x), float(region_anchor.y)
+                )
+                for horizontal_item in selected_scope:
+                    face_index = int(horizontal_item.source_face_local_index)
+                    if face_index in used_faces:
+                        raise InputDerivationError(
+                            f"{site_id}/{spec.region_id} 選到其他子區已使用 face：{face_index}"
+                        )
+                    used_faces.add(face_index)
+                    region_id_by_face[face_index] = spec.region_id
+                    support = scope_template_supports.get(face_index)
+                    if support is None:
+                        raise InputDerivationError(
+                            f"{site_id}/{spec.region_id} 最終 receptor face 未通過垂向 gate：{face_index}"
+                        )
                     template_supports[face_index] = support
-            if not failed_faces:
-                break
-            for face_index in sorted(set(failed_faces)):
-                blacklisted_faces.add(face_index)
+                blacklisted_faces.update(scope_blacklist)
+                region_records[spec.region_id] = {
+                    "candidate_face_count_persistent_wet_margin": candidate_count,
+                    "blacklist_face_count": len(scope_blacklist),
+                    "blacklist_face_local_indices": sorted(scope_blacklist),
+                    "selected_face_local_indices": [
+                        int(item.source_face_local_index) for item in selected_scope
+                    ],
+                    "selected_face_global_indices": [
+                        int(item.source_face_global_index) for item in selected_scope
+                    ],
+                    "selected_positions_lonlat": [
+                        {"lon": float(item.lon), "lat": float(item.lat)}
+                        for item in selected_scope
+                    ],
+                    "anchor_lonlat": [float(anchor_lon), float(anchor_lat)],
+                    "anchor_xy_m": [float(region_anchor.x), float(region_anchor.y)],
+                }
+                horizontal.extend(selected_scope)
+            candidate_region_selection_by_site[site_id] = _candidate_region_provenance(
+                candidate_specs,
+                source_region_records=region_records,
+                source_provenance=(
+                    site.receptor_candidate_regions_provenance
+                    or (site.model_extra or {}).get("receptor_candidate_regions_provenance")
+                ),
+                selection_policy=(
+                    site.receptor_candidate_selection
+                    or (site.model_extra or {}).get("receptor_candidate_selection")
+                ),
+            )
         else:
-            raise InputDerivationError(f"{site_id} 垂向支撐重選超過有限迭代次數")
+            candidate_pool = prepare_horizontal_receptor_candidates(
+                study_site_id=site_id,
+                mesh=mesh,
+                candidate_polygon_metric=candidate_metric,
+                anchor_xy=anchor_xy,
+                wetdry_at_arrivals=wetdry,
+                boundary_margin_m=margin,
+                wet_value=0.0,
+            )
+            candidate_count = int(candidate_pool.candidate_face_local_indices.size)
+            # 任一候選的任一 arrival NWW 或垂向支撐失敗，就以 source face local index
+            # 加入本站 persistent blacklist，再用完全相同的 deterministic pool selector
+            # 重選。每次至少排除一個 face，故重選輪次有限且不會回到已知壞 face。
+            for _attempt in range(candidate_count + 1):
+                try:
+                    horizontal = select_horizontal_receptors_from_pool(
+                        candidate_pool,
+                        count=5,
+                        excluded_face_indices=blacklisted_faces,
+                    )
+                except ValueError as exc:
+                    raise InputDerivationError(
+                        f"{site_id} 垂向支撐淘汰後 persistent-wet 候選不足：{exc}"
+                    ) from exc
+                failed_faces = []
+                for horizontal_item in horizontal:
+                    face_index = int(horizontal_item.source_face_local_index)
+                    try:
+                        support = face_support(horizontal_item)
+                    except InputDerivationError as exc:
+                        # 將 combined gate 的失敗也快取；下一輪若 deterministic maximin
+                        # 仍因其他 face 淘汰而碰到同一個 face，不能重做相同的 NWW／OCM I/O。
+                        face_support_cache[face_index] = None
+                        face_support_errors[face_index] = str(exc)
+                        failed_faces.append(face_index)
+                    else:
+                        face_support_cache[face_index] = support
+                        template_supports[face_index] = support
+                if not failed_faces:
+                    break
+                for face_index in sorted(set(failed_faces)):
+                    blacklisted_faces.add(face_index)
+            else:
+                raise InputDerivationError(f"{site_id} 垂向支撐重選超過有限迭代次數")
 
         for horizontal_item in horizontal:
             face_index = int(horizontal_item.source_face_local_index)
@@ -3409,6 +3875,9 @@ def _receptor_payload(
                     else "near_bed_lowest_layer_center",
                     "template_bracket_span_m": target.bracket_span_m,
                 }
+                candidate_region_id = region_id_by_face.get(face_index)
+                if candidate_region_id is not None:
+                    metadata["candidate_region_id"] = candidate_region_id
                 receptors.append(
                     Receptor(
                         receptor_id=receptor_id,
@@ -3424,6 +3893,24 @@ def _receptor_payload(
                 rows.append(asdict(receptors[-1]))
     if len(receptors) != EXPECTED_RECEPTOR_COUNT:
         raise InputDerivationError(f"receptor 應有 100 筆，實際 {len(receptors)}")
+    receptor_method_id = (
+        "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
+        "red_frame_regions_v1"
+        if candidate_region_selection_by_site
+        else "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
+        "core_intersection_v3"
+    )
+    provenance = _provenance(
+        method_id=receptor_method_id,
+        source_hashes=source_hashes,
+        counts={"study_sites": EXPECTED_STUDY_SITE_COUNT, "receptors": EXPECTED_RECEPTOR_COUNT},
+        public_analysis_label_policy={"A": "A 區分析域"},
+    )
+    if candidate_region_selection_by_site:
+        # provenance 以 site id 分層保存紅框 polygon、子區配額、persistent-wet 候選數、
+        # blacklist 與最終 source face；JSON validator 會再檢查 hash closure，這裡不保存
+        # 大型 mesh 或逐時 wetdry 陣列。
+        provenance["candidate_regions_by_site"] = candidate_region_selection_by_site
     payload = {
         "manifest_kind": "receptor_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -3431,19 +3918,8 @@ def _receptor_payload(
         "design_version": config.design_version,
         "coordinate_reference": "EPSG:4326",
         "vertical_reference": "z_m_positive_up",
-        "generation_method_id": (
-            "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
-            "core_intersection_v3"
-        ),
-        "provenance": _provenance(
-            method_id=(
-                "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
-                "core_intersection_v3"
-            ),
-            source_hashes=source_hashes,
-            counts={"study_sites": EXPECTED_STUDY_SITE_COUNT, "receptors": EXPECTED_RECEPTOR_COUNT},
-            public_analysis_label_policy={"A": "A 區分析域"},
-        ),
+        "generation_method_id": receptor_method_id,
+        "provenance": provenance,
         "records": rows,
     }
     return payload, {item.receptor_id: item for item in receptors}, tuple(receptors), meshes, projections
@@ -3764,6 +4240,10 @@ def _forcing_inventory_payload(
 
     products: list[dict[str, Any]] = []
     domain_by_region = {domain.analysis_region_id: domain for domain in config.domains}
+    has_v3_policy = any(
+        domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+        for domain in config.domains
+    )
     for region in sorted(products_by_region):
         # products_by_region 的 tuple 固定包含 ``ocm_native``、``ocm_surface`` 與
         # ``nww3_analysis``；逐一展開可保留三套產品各自的時間軸、grid schema、來源
@@ -3781,10 +4261,32 @@ def _forcing_inventory_payload(
         actual_flow_domain_id = next(iter(actual_ids))
         resolved_bbox = _authoritative_flow_domain_bbox_lon_lat(domain, actual_flow_domain_id)
         bbox_registration = _flow_domain_bbox_registration(domain, actual_flow_domain_id)
+        domain_extra = domain.model_extra or {}
+        common_margin = domain_extra.get("minimum_common_forcing_margin_grid_cells")
+        required_forcings = domain_extra.get("margin_required_for_forcings")
         for product in region_products:
             axis = product.canonical
             expected = np.asarray(expected_axis, dtype=np.int64)
             available = np.isin(expected, axis.time_utc_ns)
+            grid_metadata = {
+                "schema_version": product.grid_metadata.get("cache_schema_version")
+                or product.grid_metadata.get("schema_version"),
+                "bbox_lon_lat": list(resolved_bbox),
+                "bbox_registration": bbox_registration,
+            }
+            if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+                # 這些欄位把本期三套 forcing 的共同邊界需求與尚待驗證狀態帶入
+                # inventory；它們不代表實際格網 margin 已被量測或核准。
+                grid_metadata.update(
+                    {
+                        "formal_domain_policy": domain.formal_domain_policy,
+                        "minimum_common_forcing_margin_grid_cells": common_margin,
+                        "margin_required_for_forcings": list(required_forcings)
+                        if isinstance(required_forcings, (list, tuple))
+                        else required_forcings,
+                        "common_forcing_support_status": "pending_common_support",
+                    }
+                )
             products.append(
                 {
                     "analysis_region_id": region,
@@ -3802,12 +4304,7 @@ def _forcing_inventory_payload(
                         ],
                         "deep_content_audit": "optional_not_run_by_default",
                     },
-                    "grid_metadata": {
-                        "schema_version": product.grid_metadata.get("cache_schema_version")
-                        or product.grid_metadata.get("schema_version"),
-                        "bbox_lon_lat": list(resolved_bbox),
-                        "bbox_registration": bbox_registration,
-                    },
+                    "grid_metadata": grid_metadata,
                     "metadata_provenance": {
                         "grid": _metadata_provenance(product.grid_metadata),
                         "months": {
@@ -3857,6 +4354,17 @@ def _forcing_inventory_payload(
         f"preflight:{index}": sha256(canonical_json_bytes(report.to_dict())).hexdigest()
         for index, report in enumerate(preflight_reports)
     }
+    provenance_extra: dict[str, Any] = {
+        # 這是建置時載入的 config 語意 hash；release config 之後會增加 immutable
+        # manifest path 與 approval 欄位，因此不把它誤當成 release YAML bytes hash。
+        "config_hash": config.config_hash(),
+        "public_analysis_label_policy": {"A": "A 區分析域"},
+    }
+    if has_v3_policy:
+        provenance_extra["formal_domain_policy_by_region"] = {
+            region: domain_by_region[region].formal_domain_policy
+            for region in sorted(domain_by_region)
+        }
     return {
         "manifest_kind": "forcing_inventory",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -3880,10 +4388,7 @@ def _forcing_inventory_payload(
         "provenance": _provenance(
             method_id="server_v3_forcing_inventory_and_fingerprint_v1",
             source_hashes=source_hashes,
-            # 這是建置時載入的 config 語意 hash；release config 之後會增加 immutable
-            # manifest path 與 approval 欄位，因此不把它誤當成 release YAML bytes hash。
-            config_hash=config.config_hash(),
-            public_analysis_label_policy={"A": "A 區分析域"},
+            **provenance_extra,
         ),
     }
 
@@ -4062,17 +4567,23 @@ class InputDerivationResult:
 
 
 def _resolve_flow_product_id(config: ProjectConfig, region: str, root: Path, *, formal: bool) -> str:
-    """依 config resolver 找 source domain；A 候選 expanded ID 只在明示目錄存在時採用。
+    """依 config resolver 找 source domain，並依 versioned policy 決定是否可 fallback。
 
-    這個 fallback 解決「release config 還未填正式 ID，但 SERVER 已提供候選 v4 目錄」的
-    建置順序問題；它不從路徑名稱猜測任意 domain。候選 ID 必須存在於 config 的
-    ``expanded_domain_candidate_id``，且最後的 release config 仍會以正式 resolver 重驗。
+    ``expanded_domain_v1`` 的舊設定仍可在非 formal build 讀取 config 明示的
+    ``expanded_domain_candidate_id``，解決 release config 尚未填 formal ID 但候選目錄已
+    存在的建置順序問題；它不從路徑名稱猜測任意 domain。對
+    ``v3_local20km_20260909_v1``，resolver 結果固定是 v3，v3 缺失時保留該 ID 交由
+    product loader 報缺產品，絕不讀取同一 root 下的 v4 candidate。
     """
 
     expected = resolve_flow_domain_id(config, region, formal=formal)
     if (root / expected).is_dir():
         return expected
     domain = next(item for item in config.domains if item.analysis_region_id == region)
+    if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+        return expected
+    if domain.formal_domain_policy != FORMAL_DOMAIN_POLICY_EXPANDED_V1:
+        raise InputDerivationError(f"未知 formal_domain_policy：{domain.formal_domain_policy!r}")
     candidate = domain.model_extra.get("expanded_domain_candidate_id") if domain.model_extra else None
     if not formal and isinstance(candidate, str) and candidate and (root / candidate).is_dir():
         return candidate
@@ -4100,12 +4611,16 @@ def build_input_derivatives(
     為 approved formal data。正式資料需有 4 domains、5 sites、100 receptors、250 arrivals、
     5,000 dynamic pairs，且 NWW manifest 必須證明完整 17,544 小時。
 
-    ``pilot_arrival_utc`` 是唯一版本化的 pilot-only 明示入口，目前只接受
-    ``{"hsinchu": "2024-01-02T01:00:00Z"}``。它在任何 source 或 destination I/O 前
-    拒絕 ``formal=True``；非正式 build 則先驗證 OCM native／surface、NWW3 exact UTC、
-    NWW 四角空間支撐與 OCM native 的 1 日 inclusive gap-safe horizon，再 deterministic
-    替換一筆 Hsinchu arrival。替換不改五站 250 arrivals／5,000 dynamic pairs 契約，且
-    provenance 明示 pilot selection scope，供 release config 保持 ``generated``。
+    ``pilot_arrival_utc`` 是唯一版本化的 pilot-only 明示入口。B、C、D 各接受一個
+    已登錄站點鍵（分別為 ``hsinchu``、``houwan``、``lienchiang``），A 只能以
+    ``{"gongliao": ..., "guishan": ...}`` 的 exact pair 方式提交；本次登錄值固定為
+    ``2024-01-02T01:00:00Z``，並由同一版本化窗口產生 24 小時、含首尾共 25 個節點。
+    它在任何 source 或 destination I/O 前拒絕 ``formal=True``；非正式 build 則先驗證
+    OCM native／surface、NWW3 exact UTC、NWW 四角空間支撐與 OCM native 的 1 日
+    inclusive gap-safe horizon，再 deterministic 替換對應站點的 arrival。替換不改
+    五站 250 arrivals／5,000 dynamic pairs 契約，且 provenance 明示 pilot selection
+    scope，供 release config 保持 ``generated``；舊 Hsinchu artifact 的 policy ID 仍可
+    由唯讀驗證路徑相容讀取。
     """
 
     pilot_arrivals = _parse_explicit_pilot_arrivals(pilot_arrival_utc)
@@ -4115,6 +4630,10 @@ def build_input_derivatives(
         )
     config_file = _assert_regular_file(config_path)
     config = load_config(config_file, formal_release=False)
+    # 先在任何 forcing root 讀取前鎖定研究範圍與 source binding；新 v3 policy 可用
+    # ``formal=False, strict=True`` 產生準備性 geometry/input，但不能因目錄中另有 v4
+    # 就改變來源版本。
+    config.assert_research_domain_policy()
     strict_mode = formal if strict is None else bool(strict)
     native_root = _env_root(ocm_native_root, config.inputs.ocm_native_root_env)
     nww_root = _env_root(nww_analysis_root, config.inputs.nww_analysis_root_env)
@@ -4276,7 +4795,12 @@ def build_input_derivatives(
                 strict=strict_mode,
             )
             explicit = pilot_arrivals.get(site_id)
-            if explicit is not None:
+            # A 區 exact pair 必須先建立共同 UTC，再各自套用明示 replacement；若在
+            # gongliao loop 內先替換，後面的 guishan paired clone 會把 gongliao 的
+            # replacement metadata 當成來源，造成兩站 provenance 互相指向。B/C/D
+            # 單站則在各自 selector 完成後立即替換。
+            a_pair_pilot = set(pilot_arrivals) == {"gongliao", "guishan"}
+            if explicit is not None and not (a_pair_pilot and site_id in {"gongliao", "guishan"}):
                 selected = _replace_with_explicit_pilot_arrival(
                     site_id=site_id,
                     arrivals=selected,
@@ -4313,15 +4837,41 @@ def build_input_derivatives(
             design_version=config.design_version,
             strict=strict_mode,
         )
+        if set(pilot_arrivals) == {"gongliao", "guishan"}:
+            # paired clone 完成後，兩站都以自己的 baseline arrival identity 建立固定
+            # pilot replacement；OCM／NWW support 仍各自重新驗證，不能只複製另一站結果。
+            for pilot_site_id in ("gongliao", "guishan"):
+                pilot_site = next(
+                    item for item in config.study_sites if item.study_site_id == pilot_site_id
+                )
+                pilot_region = pilot_site.analysis_region_id
+                pilot_surface = products_by_region[pilot_region][1]
+                arrivals_by_site[pilot_site_id] = _replace_with_explicit_pilot_arrival(
+                    site_id=pilot_site_id,
+                    arrivals=arrivals_by_site[pilot_site_id],
+                    explicit=pilot_arrivals[pilot_site_id],
+                    product=ocm_by_region[pilot_region],
+                    surface_product=pilot_surface,
+                    nww_product=nww_by_region[pilot_region],
+                    nww_cache=nww_runtime_caches[pilot_region],
+                    context=arrival_contexts[pilot_site_id],
+                    expected_axis=expected_axis,
+                    design_version=config.design_version,
+                )
     all_arrivals = tuple(item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site])
     if len(all_arrivals) != EXPECTED_ARRIVAL_COUNT:
         raise InputDerivationError(f"arrival 應有 250 筆，實際 {len(all_arrivals)}")
     pilot_selection = _pilot_selection_summary(all_arrivals)
-    pilot_horizon_overrides = (
-        {str(pilot_selection["arrival_time_id"]): PILOT_EXPLICIT_MAX_BACKTRACK_DAYS}
-        if pilot_selection is not None
-        else {}
-    )
+    if pilot_selection is None:
+        pilot_horizon_overrides: dict[str, float] = {}
+    else:
+        pilot_arrival_ids = pilot_selection.get("arrival_time_ids")
+        if not isinstance(pilot_arrival_ids, list):
+            pilot_arrival_ids = [pilot_selection["arrival_time_id"]]
+        pilot_horizon_overrides = {
+            str(arrival_id): PILOT_EXPLICIT_MAX_BACKTRACK_DAYS
+            for arrival_id in pilot_arrival_ids
+        }
     receptor_payload, receptor_index, receptor_objects, meshes, projections = _receptor_payload(
         config=config,
         products_by_region=ocm_by_region,
@@ -4381,6 +4931,13 @@ def build_input_derivatives(
         # formal build 必須在發布前 fail closed。這裡不以「目錄已寫出」代替核准；若
         # OCM gap-safe window、NWW 完整逐時或 forcing inventory 尚未達到正式閘門，連
         # partial directory 都不發布，避免 operator 誤把 generated artifact 當 release。
+        if formal and any(
+            domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+            for domain in config.domains
+        ):
+            raise InputDerivationError(
+                "formal input build 未通過：v3/20km共同forcing邊界支援尚待實際驗證"
+            )
         formal_blockers = [
             f"{kind}_not_approved"
             for kind, payload in (
@@ -4410,6 +4967,22 @@ def build_input_derivatives(
         "ocm_surface_root_token": config.inputs.ocm_surface_root_env,
         "nww_analysis_root_token": config.inputs.nww_analysis_root_env,
     }
+    if any(
+        domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+        for domain in config.domains
+    ):
+        # A 區新 policy 的 source binding 明確保留 domain/site formal ID、bbox 與尚待
+        # 驗證狀態；這是 provenance，不是把 input artifact 標成 approved source。
+        region_a = next(domain for domain in config.domains if domain.analysis_region_id == "A")
+        source_bindings["formal_domain_policy"] = region_a.formal_domain_policy
+        source_bindings["formal_domain_id"] = region_a.formal_release_flow_domain_id
+        source_bindings["formal_domain_bbox_lon_lat"] = list(region_a.bbox_lon_lat)
+        source_bindings["formal_domain_status"] = region_a.formal_release_domain_status
+        source_bindings["formal_site_ids"] = {
+            site.study_site_id: site.formal_release_flow_domain_id
+            for site in config.study_sites
+            if site.analysis_region_id == "A"
+        }
     if pilot_selection is not None:
         source_bindings["pilot_selection_scope"] = dict(pilot_selection)
     return _write_artifact_directory(
@@ -4832,49 +5405,77 @@ def validate_input_derivatives(
         for row in arrival_rows
         if isinstance(row, Mapping)
         and isinstance(row.get("metadata"), Mapping)
-        and row["metadata"].get("pilot_replacement_policy_id") == PILOT_EXPLICIT_WINDOW_POLICY_ID
+        and row["metadata"].get("pilot_replacement_policy_id") in _PILOT_EXPLICIT_POLICY_IDS
     ] if isinstance(arrival_rows, list) else []
     if pilot_rows:
         if formal:
             errors.append("formal_pilot_explicit_window_not_48_plus_2")
-        if len(pilot_rows) != 1:
-            errors.append("pilot_explicit_window_record_count_invalid")
-        elif isinstance(gap_rows, list):
-            pilot_row = pilot_rows[0]
-            pilot_id = pilot_row.get("arrival_time_id")
-            matching_gap = [
-                row
-                for row in gap_rows
-                if isinstance(row, Mapping) and row.get("arrival_time_id") == pilot_id
-            ]
-            metadata = pilot_row.get("metadata")
-            if len(matching_gap) != 1 or not isinstance(metadata, Mapping):
-                errors.append("pilot_explicit_window_gap_cross_reference_invalid")
+        policy_ids = {
+            str(row["metadata"].get("pilot_replacement_policy_id"))
+            for row in pilot_rows
+            if isinstance(row.get("metadata"), Mapping)
+        }
+        if len(policy_ids) != 1:
+            errors.append("pilot_explicit_window_policy_mixed")
+        else:
+            policy_id = next(iter(policy_ids))
+            site_ids = tuple(sorted(str(row.get("study_site_id")) for row in pilot_rows))
+            expected_scope: str | None = None
+            if policy_id == PILOT_EXPLICIT_LEGACY_WINDOW_POLICY_ID:
+                expected_sites = (PILOT_EXPLICIT_LEGACY_SITE_ID,)
+                expected_scope = "hsinchu_only"
             else:
-                gap_row = matching_gap[0]
-                raw_gap_days = gap_row.get("max_backtrack_days")
-                try:
-                    gap_days_valid = math.isclose(
-                        float(raw_gap_days),
-                        PILOT_EXPLICIT_MAX_BACKTRACK_DAYS,
-                        rel_tol=0.0,
-                        abs_tol=1e-12,
-                    )
-                except (TypeError, ValueError):
-                    gap_days_valid = False
-                if (
-                    pilot_row.get("study_site_id") != PILOT_EXPLICIT_SITE_ID
-                    or pilot_row.get("tide_class") != PILOT_EXPLICIT_TIDE_CLASS
-                    or pilot_row.get("phase_or_event") != PILOT_EXPLICIT_PHASE_OR_EVENT
-                    or metadata.get("pilot_selection_scope") != "hsinchu_only"
-                    or metadata.get("explicit_pilot_window_expected_step_count") != 25
-                    or not gap_days_valid
-                    or gap_row.get("expected_step_count") != 25
-                    or gap_row.get("supported_step_count") != 25
-                    or gap_row.get("crossed_gap") is not False
-                    or gap_row.get("missing_utc") != []
-                ):
-                    errors.append("pilot_explicit_window_support_record_invalid")
+                registry_entry = PILOT_EXPLICIT_REGISTRY.get(site_ids)
+                expected_sites = site_ids if registry_entry is not None else ()
+                expected_scope = (
+                    str(registry_entry["selection_scope"]) if registry_entry is not None else None
+                )
+            if site_ids != expected_sites or len(site_ids) != len(set(site_ids)):
+                errors.append("pilot_explicit_window_record_count_invalid")
+            if isinstance(gap_rows, list):
+                for pilot_row in pilot_rows:
+                    pilot_id = pilot_row.get("arrival_time_id")
+                    matching_gap = [
+                        row
+                        for row in gap_rows
+                        if isinstance(row, Mapping) and row.get("arrival_time_id") == pilot_id
+                    ]
+                    metadata = pilot_row.get("metadata")
+                    if len(matching_gap) != 1 or not isinstance(metadata, Mapping):
+                        errors.append("pilot_explicit_window_gap_cross_reference_invalid")
+                        continue
+                    gap_row = matching_gap[0]
+                    raw_gap_days = gap_row.get("max_backtrack_days")
+                    try:
+                        gap_days_valid = math.isclose(
+                            float(raw_gap_days),
+                            PILOT_EXPLICIT_MAX_BACKTRACK_DAYS,
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                    except (TypeError, ValueError):
+                        gap_days_valid = False
+                    expected_time_valid = False
+                    with suppress(TypeError, ValueError, OverflowError):
+                        expected_time_valid = (
+                            _utc_string(int(pilot_row.get("time_utc_ns")))
+                            == PILOT_EXPLICIT_ARRIVAL_UTC
+                        )
+                    if (
+                        policy_id not in _PILOT_EXPLICIT_POLICY_IDS
+                        or pilot_row.get("tide_class") != PILOT_EXPLICIT_TIDE_CLASS
+                        or pilot_row.get("phase_or_event") != PILOT_EXPLICIT_PHASE_OR_EVENT
+                        or metadata.get("pilot_selection_scope") != expected_scope
+                        or metadata.get("explicit_pilot_window_expected_step_count")
+                        != _PILOT_EXPLICIT_EXPECTED_STEP_COUNT
+                        or not expected_time_valid
+                        or not gap_days_valid
+                        or gap_row.get("expected_step_count") != _PILOT_EXPLICIT_EXPECTED_STEP_COUNT
+                        or gap_row.get("supported_step_count") != _PILOT_EXPLICIT_EXPECTED_STEP_COUNT
+                        or gap_row.get("crossed_gap") is not False
+                        or gap_row.get("missing_utc") != []
+                    ):
+                        errors.append("pilot_explicit_window_support_record_invalid")
     roots_by_token: dict[str, Path | None] = {}
     if config is not None:
         roots_by_token[config.inputs.ocm_native_root_env] = _env_root(
@@ -4977,16 +5578,23 @@ def _bind_inventory_flow_domains(
 ) -> dict[str, Any]:
     """把 inventory 的真實 source ID 綁定到 release config 的 formal 欄位。
 
-    每個 ID 必須出現在該 domain 的 base、formal 或明示 candidate 欄位中；因此 expanded
-    A 只能來自 config 已登錄的 `expanded_domain_candidate_id`／formal ID，不能從任意
-    目錄名稱推導。domain base ID 保留作 pilot provenance，formal ID 與所有同區 site 的
-    formal site ID 改寫為同一實際 source；公開分析標籤不在此函式中變更。
+    ``expanded_domain_v1`` 的每個 ID 必須出現在該 domain 的 base、formal 或明示
+    candidate 欄位中；因此舊 expanded A 只能來自 config 已登錄的
+    ``expanded_domain_candidate_id``／formal ID，不能從任意目錄名稱推導。對
+    ``v3_local20km_20260909_v1``，inventory 必須 exact 綁定 v3；domain/site 的 formal
+    ID 與 bbox 會維持 v3／原值，狀態維持 ``pending_common_support``，不會被此函式 mint
+    成 ``approved_source_bound_by_inventory``。公開分析標籤不在此函式中變更。
     """
 
     domains = config_payload.get("domains")
     sites = config_payload.get("study_sites")
     if not isinstance(domains, list) or not isinstance(sites, list):
         raise InputDerivationError("config 必須含 domains 與 study_sites array")
+    try:
+        validated_config = ProjectConfig.model_validate(config_payload)
+        validated_config.assert_research_domain_policy()
+    except Exception as exc:
+        raise InputDerivationError("config 的 formal_domain_policy／研究範圍契約不合法") from exc
     domain_by_region: dict[str, dict[str, Any]] = {}
     for domain in domains:
         if not isinstance(domain, dict) or not isinstance(domain.get("analysis_region_id"), str):
@@ -5006,6 +5614,47 @@ def _bind_inventory_flow_domains(
         base_id = domain.get("flow_domain_id")
         formal_id = domain.get("formal_release_flow_domain_id")
         candidate_id = domain.get("expanded_domain_candidate_id")
+        if domain_model.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+            if any(
+                field in domain
+                for field in (
+                    "expanded_domain_candidate_id",
+                    "expanded_bbox_lon_lat",
+                    "expanded_south_boundary_at_or_south_of_deg",
+                    "radius_25000_formal_requires_expanded_domain",
+                    "radius_35000_formal_requires_expanded_domain",
+                )
+            ):
+                raise InputDerivationError(
+                    "v3_local20km_20260909_v1 inventory binding 禁止 expanded candidate 欄位"
+                )
+            if (
+                region != "A"
+                or actual_id != NORTHEAST_V3_FLOW_DOMAIN_ID
+                or base_id != NORTHEAST_V3_FLOW_DOMAIN_ID
+                or formal_id != NORTHEAST_V3_FLOW_DOMAIN_ID
+                or domain.get("formal_release_domain_status") != "pending_common_support"
+            ):
+                raise InputDerivationError(
+                    "v3_local20km_20260909_v1 inventory binding 必須 exact 使用 v3，"
+                    "且 domain formal status 維持 pending_common_support"
+                )
+            resolved_bbox = _authoritative_flow_domain_bbox_lon_lat(domain_model, actual_id)
+            if list(domain.get("bbox_lon_lat", ())) != list(resolved_bbox):
+                raise InputDerivationError("v3_local20km_20260909_v1 inventory binding 不得改寫 A 區 bbox")
+            for site in sites:
+                if not isinstance(site, dict) or site.get("analysis_region_id") != region:
+                    continue
+                if (
+                    site.get("flow_domain_id") != NORTHEAST_V3_FLOW_DOMAIN_ID
+                    or site.get("formal_release_flow_domain_id") != NORTHEAST_V3_FLOW_DOMAIN_ID
+                ):
+                    raise InputDerivationError(
+                        f"{site.get('study_site_id', region)} 的 v3 policy formal source 必須 exact v3"
+                    )
+            continue
+        if domain_model.formal_domain_policy != FORMAL_DOMAIN_POLICY_EXPANDED_V1:
+            raise InputDerivationError(f"未知 formal_domain_policy：{domain_model.formal_domain_policy!r}")
         allowed_ids = {
             value for value in (base_id, formal_id, candidate_id) if isinstance(value, str) and value.strip()
         }

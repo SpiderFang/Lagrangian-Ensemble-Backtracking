@@ -19,7 +19,7 @@
 |---|---|
 | 設定／輸入 | `config-check`、`preflight`、`inputs-build`、`inputs-validate`、`release-config-create`、`release-config-validate` |
 | pilot | `pilot-calibrate`、`pilot-calibrate-validate`、`pilot-calibration-build`、`pilot-calibration-validate`、`pilot-config-create`、`pilot-config-validate` |
-| 工程驗證 | `behavior-manifest`、`synthetic-smoke`、`validate-shard`、`code-provenance`、`validate-run`、`benchmark-report` |
+| 工程驗證 | `behavior-manifest`、`synthetic-smoke`、`validate-shard`、`code-provenance`、`validate-run`、`benchmark-report`、`pilot-matrix-validate` |
 | run lifecycle | `run-create`、`run-shard`、`run-reconcile` |
 | 聚合／報告 | `aggregate-spec-create`、`aggregate-build`、`aggregate-validate`、`report-spec-create`、`report-validate`、`source-pathway-build`、`source-pathway-validate` |
 
@@ -108,8 +108,10 @@ uv run lbt release-config-validate "$LBT_SCRATCH_ROOT/release-2024-2025.yaml" \
 constant-field fallback。`release-config-create`、`release-config-validate` 只處理
 immutable input binding；它們不啟動粒子運算。
 
-新竹 24 小時展示可在 `inputs-build` 以版本化、pilot-only 的明示 UTC 入口替換一筆既有
-新竹 arrival：
+四區 24 小時工程試跑可在 `inputs-build` 以版本化、pilot-only 的明示 UTC 入口替換既有
+arrival。registry 固定使用 `2024-01-02T01:00:00Z`，回溯 24 小時並包含 25 個逐時節點。
+A 區必須同時明示貢寮與龜山島；B／C／D 各自明示單站。新建流程使用共同 policy，既有
+B 區 r5 成果的舊 policy 僅供唯讀相容驗證：
 
 ```bash
 uv run lbt inputs-build \
@@ -121,7 +123,20 @@ uv run lbt inputs-build \
   --pilot-arrival-utc hsinchu=2024-01-02T01:00:00Z
 ```
 
-目前 policy 只登錄 `hsinchu=2024-01-02T01:00:00Z`。builder 會逐筆驗證
+A 區的入口改為：
+
+```bash
+uv run lbt inputs-build \
+  --config "$PILOT_CONFIG_TEMPLATE" \
+  --destination "$LBT_SCRATCH_ROOT/a-2024-01-01-24h-inputs-v1" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --pilot-arrival-utc gongliao=2024-01-02T01:00:00Z \
+  --pilot-arrival-utc guishan=2024-01-02T01:00:00Z
+```
+
+其餘區域只把 `--pilot-arrival-utc` 的站點鍵換成 `houwan` 或 `lienchiang`。builder 會逐筆驗證
 `2024-01-01T01:00:00Z` 至 `2024-01-02T01:00:00Z` inclusive 的 25 個 exact-hour 節點
 是否同時存在於 OCM native、OCM surface、NWW3 analysis，並重做 NWW metric location 四角
 static／dynamic 支援與 OCM native gap-safe gate；缺任何一小時即 fail closed，不使用
@@ -137,6 +152,26 @@ identity 及 1 日 horizon。這個選項不可與 `--formal-release` 同時使�
 evidence，不是正式參數或成果。`behavior-manifest` 可建立十種全負沉降的材質／形狀代理
 manifest；它不替代正式 source manifest。
 
+### ABCD pilot 共同設定檢核
+
+`pilot-matrix-validate` 是唯讀的跨區設定比較器。它至少接受兩個 run root，分別讀取其中的
+`run_plan.json` 與 `normalized_config.json`，不讀 trajectory、forcing 或 checkpoint 大檔。
+它要求 `run_kind`、experiment、M／seed、selection、shard／chunk／checkpoint、完整積分與
+邊界設定、Stokes 與無效波政策、選用材質／沉降、execution scalar snapshot 以及程式／依賴
+provenance 完全一致；研究站點、flow domain、arrival／scenario identity、輸入／幾何 hash／path
+及區域校準的 Kh／Kz／Smagorinsky cap 才是明示允許的差異。
+
+```bash
+uv run lbt pilot-matrix-validate \
+  "$A_RUN_ROOT" "$B_RUN_ROOT" "$C_RUN_ROOT" "$D_RUN_ROOT" \
+  > "$LBT_SCRATCH_ROOT/abcd-first-pilot-matrix.json"
+```
+
+成功回傳 shell status `0`，不通過或輸入缺欄位、symbolic link、格式錯誤與超過大小上限回傳
+`2`；stdout 是可保存的 canonical JSON。通過只表示設定可比較，不表示任何 run 已完成，
+也不表示 forcing、trajectory、輸入產品或科學 gate 已驗收。ABCD 第一次試跑的實測診斷與
+目前 A／B／C／D 設定差異見[四區試跑稽核](../results/15_four_region_first_pilot_audit.md)。
+
 不需真資料的端到端 smoke：
 
 ```bash
@@ -147,6 +182,17 @@ uv run lbt validate-shard "$LBT_SCRATCH_ROOT/synthetic-smoke-v1"
 `synthetic-smoke-v1` 必須是尚不存在的 child；不要把已由 `mktemp -d` 建立的根目錄直接
 當成 `--output`。輸出 metadata 會標示 `synthetic_smoke_not_scientific_result`，只能驗證
 CLI、engine、trajectory I/O、Parquet、manifest 與 checksum。
+
+### NFS preview／figure 的完成標記
+
+`build_pilot_preview.py` 與 `build_pilot_coastline_preview.py` 只有在 caller 明示通過的
+storage gate evidence 下才啟用 NFS `nfs_completion_marker_v1`。流程使用同父目錄 cooperative
+lock、完整 staging inventory、逐檔 durable move，最後建立 `.complete`，並把 marker 綁定到
+manifest SHA-256、程式 commit／tree／dirty diff 與九個儲存根目錄的 gate snapshot。`.complete`
+只代表 preview／figure artifact 可由 reader 安全讀取，不是 run 完成旗標；run 完成仍以
+`run_progress.json` 加上 `run-reconcile` 與 `validate-run --require-complete` 判定。沒有
+`.complete` 的逐檔發布目錄不能當成 marker artifact，舊的 exclusive-directory-rename 目錄
+只在未啟用 NFS gate 時保留相容性。
 
 ## Run workspace、shard 與外置 checkpoint
 

@@ -7,7 +7,7 @@
 
 ## 1. 文件地位
 
-本文件記錄 2026-08-17 完成並於 2026-08-27 依研究主持人意見修訂的設計裁決。最新版本 `design_baseline_v2_non_rising_oca_proxy` 取消中性懸浮與所有上浮物性速度，改以海洋保育署十個海廢統計項目建立材質／形狀代理情境。使用者已明示沒有可再提供的單體物性資料，因此只有必須由 SERVER 實際資料、OCM 網格、現地樣本或先導試驗計算出的數值保留為「衍生閘門」。
+本文件記錄 2026-08-17 完成、2026-08-27 依研究主持人意見修訂，並於 2026-09-09 由 A 區範圍裁決更新的設計基線。原 `design_baseline_v2_non_rising_oca_proxy` 的十個非上浮材質／形狀代理、嚴格負沉降速度與物性限制仍沿用；本期 A 區幾何與 domain 身分改採 `design_baseline_v3_non_rising_a_v3_local20_20260909` 及 `formal_domain_policy=v3_local20km_20260909_v1`。使用者已明示沒有可再提供的單體物性資料，因此只有必須由 SERVER 實際資料、OCM 網格、現地樣本或先導試驗計算出的數值保留為「衍生閘門」。
 
 本裁決的核心原則是：**四個 forcing flow domains 不等於四個情境統計單元**。貢寮與龜山島共用同一套東北台灣 OCM/NWW forcing，但兩者是獨立研究站點，各自具有 20 個受體、50 個到達時間與完整 `10×20×50` 情境矩陣。
 
@@ -21,7 +21,7 @@
 | `OCM-SVD-Analysis/configs/guishan_surface_svd_available_2024_2025.json` | `58d79fc374aff88841ac354f34d407256048bff24d46dfb840d73c82c398bcf4` | 龜山島西側 anchor 與舊候選框 provenance；舊框不作本專案 local domain |
 | [海洋保育署 iOcean 海洋廢棄物管理頁](https://iocean.oca.gov.tw/OCA_OceanConservation/PUBLIC/Marine_Litter_v2.aspx) | 動態網頁；2026-08-27 查閱 | 採用查詢介面顯示的十個海廢項目作情境分類名稱；不採用重量／件數推估物性或來源先驗 |
 
-上游兩個候選框的線性尺度不足以作逆向傳輸的 local boundary。依使用者最新裁決，本專案只沿用其 anchor 與 provenance，**不沿用候選 bbox**；改以公尺制等距緩衝建立較大的 Lagrangian local domain。這不回寫或改變上游 SVD 的核定狀態。
+上游兩個候選框的線性尺度不足以作逆向傳輸的 local boundary。依使用者最新裁決，本專案只沿用其 anchor 與 provenance，**不沿用候選 bbox**；改以公尺制等距緩衝建立版本化的 Lagrangian local domain。這不回寫或改變上游 SVD 的核定狀態。
 
 ## 3. 四個 flow domains 與五個獨立站點
 
@@ -38,38 +38,42 @@
 
 ### 3.2 站點層
 
-| `study_site_id` | 中文名稱 | region | local domain | 幾何政策 | anchor |
+| `study_site_id` | 中文名稱 | region | logical local_domain_id | 幾何政策 | anchor |
 |---|---|---|---|---|---|
-| `gongliao` | 貢寮 | A | `gongliao_local_domain_v1` | anchor 公尺制半徑 25 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.92807, 25.11245]` |
-| `guishan` | 龜山島西側 | A | `guishan_west_local_domain_v1` | anchor 公尺制半徑 25 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.951606, 24.843127]` |
+| `gongliao` | 貢寮 | A | `gongliao_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.92807, 25.11245]` |
+| `guishan` | 龜山島西側 | A | `guishan_west_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.951606, 24.843127]` |
 | `hsinchu` | 新竹外海 | B | `hsinchu_flow_domain_v1` | local domain 與 flow domain 相同；受體候選為 `[120.45,24.75]` 半徑 12.5 km 核心與既有 local 候選區的交集 | `[120.45, 24.75]` |
 | `houwan` | 後灣海生館 | C | `houwan_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |
 | `lienchiang` | 連江 | D | `lienchiang_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |
 
 貢寮、龜山島與新竹均明示半徑 12.5 km 的 `receptor_core_v1`，五個水平受體位置只在
-各自核心圓與既有 local／static-ocean 候選區的交集內選取。貢寮與龜山島另以半徑 25 km
+各自核心圓與既有 local／static-ocean 候選區的交集內選取。貢寮與龜山島本期另以半徑 20 km
 local domain 辨識正向移入關注海域的入口方向；新竹的 local domain 仍與
 `hsinchu_cache_v3` flow domain 相同，核心圓只限制受體候選，不改變 flow/local 邊界。
-前兩站的「受體核心：local boundary = 1:2」巢狀尺度可避免剛釋放便觸及 local boundary，
-亦顯著大於原 SVD 候選框。正式分析預先登錄 20 km 與 35 km local-domain 半徑敏感度；若
-主要入口排名或 HDR 對尺度不穩定，報告必須呈現範圍而非單一邊界結論。
+本期 20 km local domain 與 12.5 km receptor core 是新的 geometry／design identity；表中
+logical `local_domain_id` 可延續既有站點標籤，但其 geometry binding 必須帶入本期 policy、
+新 config／design 身分與新 hash。原 25 km baseline 與 20/35 km 敏感度規劃已移出本期，亦不
+自行加入 15 km 或 23 km case。
+若後續要恢復其他半徑，必須建立新的範圍決策與完整 manifest，不得沿用舊 geometry 或 hash。
 
-SERVER preflight 以龜山島 anchor-centered Azimuthal Equidistant CRS 重算後，anchor 至現行 A 區名目南界約為 26.64 km，25 km local boundary 僅餘約 1.64 km。雖然 OCM native source nodes 的局地間距小於 1 km，正式 Stokes forcing 使用的 OCM surface／NWW analysis grid 約為 1 km，故現行 v3 未通過「所有必要 forcing 至少保留兩個共同格點」的保守 margin gate。現行 `northeast_taiwan_common_cache_v3` 只可供程式開發、幾何驗證與明確標示的 pilot；不得直接升格為龜山島 25 km 正式 baseline。
+現行 A 區 `northeast_taiwan_common_cache_v3` 的 bbox 固定為
+`[121.306315,122.793685,24.600844,25.499156]`，本期不南擴。現有三類產品的月份目錄與
+metadata／UTC 訊息可供 strict preparation 盤點，但不等於 OCM native、OCM surface 與 NWW
+analysis 的欄位、mask、時間及共同 boundary margin 已驗收；目前受體 native 篩選 gate
+也不等於 20 km 邊界的三產品、兩共同有效格點證明。formal scope 在實際共同 forcing
+margin evidence validator／producer 完成前維持 blocked。
 
-正式 A 區建立不覆寫 v3 的
-`northeast_taiwan_common_cache_v4_lbt_south_expanded`，候選 bbox 固定為
-`[121.306315,122.793685,24.480000,25.499156]`。龜山島 35 km geodesic 南緣約
-`24.527152°N`，至候選南界名目距離約 5.22 km，比 `24.50°N` 約 3.01 km 的餘裕更保守，
-且預估 native 儲存只較 v3 增加約 13.5%（約 0.23 TB）。正式驗收仍須以實際 OCM native
-topology、OCM surface grid、由完整 NWW native 重建的 analysis mask 與所有必要時次，證明
-25 km baseline 及 35 km sensitivity 均保有至少兩個共同有效格點；不能只修改 bbox 名稱或
-只擴 OCM。若 v4 實測 margin 仍不足，應建立下一 domain version 繼續南擴，不縮回舊候選框。
+原先的 `northeast_taiwan_common_cache_v4_lbt_south_expanded` 與 bbox
+`[121.306315,122.793685,24.480000,25.499156]` 只作南向擴張的歷史候選，不是本期正式
+domain；舊 expanded geometry、manifest、shard 與 hash 均不相容，不能沿用。舊
+`formal_domain_policy=expanded_domain_v1` 僅保留為 legacy configuration 的預設相容身分，
+不改變本期 A 範圍；B–D 的 `expanded_domain` 敏感度仍依各自 gate 驗證。
 
-所有圓形距離都在以 anchor 為中心的 Azimuthal Equidistant CRS 計算，不以經緯度差近似公里。local-domain polygon 使用固定的 OCM native mesh／海岸拓撲建立 `static_ocm_ocean_polygon`，不得隨到達時間改變；陸地、島體及無有效三角形區域必須剔除。動態濕乾只用於受體與逐步 forcing 有效性 gate，避免讓 local boundary 因五十個時次的選取結果而循環改變。兩 anchor 的近似大圓距離約 30.0 km，故兩個半徑 25 km local domains 將自然形成重疊區；此重疊代表相連水動力環境，不代表情境合併，所有受體、scenario、seed、主要事件及統計仍由 `study_site_id` 隔離。
+所有圓形距離都在以 anchor 為中心的 Azimuthal Equidistant CRS 計算，不以經緯度差近似公里。local-domain polygon 使用固定的 OCM native mesh／海岸拓撲建立 `static_ocm_ocean_polygon`，不得隨到達時間改變；陸地、島體及無有效三角形區域必須剔除。動態濕乾只用於受體與逐步 forcing 有效性 gate，避免讓 local boundary 因五十個時次的選取結果而循環改變。兩 anchor 的近似大圓距離約 30.0 km，故兩個半徑 20 km local domains 將自然形成重疊區；此重疊代表相連水動力環境，不代表情境合併，所有受體、scenario、seed、主要事件及統計仍由 `study_site_id` 隔離。
 
 每條軌跡只以其 `study_site_id` 所屬 local boundary 定義主要 `local_domain_first_exit`。軌跡穿越另一站 local domain 時不得停止、不得改變 `study_site_id`、不得轉移 scenario 或併入另一站主要入口分母；可另寫 `other_site_local_domain_enter`／`other_site_local_domain_exit` 非終止事件，供計算跨站穿越比例、共享傳輸走廊與 local-domain footprint overlap。此診斷回答「到達某站的軌跡是否曾經過另一站周邊」，不把它誤稱為兩站之間的實測交換率或絕對轉移機率。
 
-`local_domain_first_exit` 只配置在 25 km 圓周所形成且連接有效外海的 open-water arcs；矩形／圓形與海岸相交形成的岸線仍是 `coast_contact`，不可計入 local entry KDE。此分類使「移入關注海域入口」不會被陸地邊界污染。
+`local_domain_first_exit` 只配置在 20 km 圓周所形成且連接有效外海的 open-water arcs；矩形／圓形與海岸相交形成的岸線仍是 `coast_contact`，不可計入 local entry KDE。此分類使「移入關注海域入口」不會被陸地邊界污染。
 
 ## 4. 情境矩陣與識別碼
 
@@ -247,12 +251,12 @@ intra-tidal phases:
 | SERVER 路徑、24 個月份、schema、濕乾語意與容量 | 唯讀 preflight、metadata、實值 QC；現有資料為完整 available 母體，不要求供應者補件 | manifest 外 schema/checksum/I/O 異常未排除前只可做合成測試與 TRIAL |
 | OCM canonical 軸與缺時重建 | stable sort/prefer-last；依 1/23/24/25/49-step 實際缺口做多變量 EOF-harmonic state-space blocked validation與 Lagrangian skill 檢定 | 未通過者以 gap-safe arrival/horizon 作 baseline，不得 runtime 臨時補值 |
 | NWW full-hour analysis | 從 17,544/17,544 完整 native UTC 重採樣到四個 OCM 靜態格網；方向依既定契約作圓形內插 | 產物未通過時含 Stokes run 不啟動；不對波浪時間作統計填補 |
-| 12.5/25 km 巢狀 ocean polygons 與 100 個三維 receptor records | anchor-centered metric buffers、OCM static ocean polygon、50 時次 wet/dry gate 與 deterministic selector | 未產出前不可凍結正式 scenario table |
+| 12.5/20 km 巢狀 ocean polygons 與 100 個三維 receptor records | 依本期 A policy 建立 12.5 km receptor core、20 km local domain；OCM static ocean polygon、50 時次 wet/dry gate 與 deterministic selector | 未產出前不可凍結正式 scenario table |
 | 五站點各 50 個確切 UTC | 到達時間 selector 與 forcing coverage gate | 未產出前不可啟動正式 batch |
 | 常數 `Kh/Kz` baseline | Brownian／well-mixed 驗證與文獻合理範圍 pilot | 未通過時只跑無擴散解析或標記 trial |
 | `M` | exit ranking、HDR、travel time、path density 的 member-convergence | 決定正式總軌跡數 |
-| A 區 expanded forcing domain | 產製 v4 候選 ID 與 bbox `[121.306315,122.793685,24.480000,25.499156]`；共同驗證 OCM native、OCM surface 與 NWW analysis 的空間、時間、mask、schema 及 input fingerprint | 現行 v3 可作 pilot；v4 未通過前不發布龜山島 25 km baseline 與 35 km sensitivity |
-| local/outer boundary margin | 以實際投影格網驗證 25/35 km local boundary 至 A 區外界對所有必要 forcing 均至少保留兩個共同有效格點 | margin 不足時阻擋該 domain version，不縮回舊候選框或只引用 native source margin |
+| A 區版本化 domain policy | 依 `formal_domain_policy=v3_local20km_20260909_v1` 使用 v3 bbox、12.5 km receptor core 與 20 km local domain；共同驗證 OCM native、OCM surface 與 NWW analysis 的空間、時間、mask、schema 及 input fingerprint | strict preparation 可進行；共同 forcing margin evidence validator／producer 未完成前 formal 維持 blocked |
+| local/outer boundary margin | 以實際投影格網驗證 20 km local boundary 至 A 區 outer boundary 對 OCM native、OCM surface、NWW analysis 均至少保留兩個共同有效格點 | margin 不足或證據未完成時阻擋本期 A policy；不沿用舊 geometry、manifest、shard 或 hash，也不以 native source margin 代替三產品證據 |
 | `max_backtrack_days` | 比較 7、14、30、60 日的 exit/censor、HDR 與排名穩定性，取最小穩定值 | 決定正式 horizon，不改變 50,000 個基礎情境 |
 | `dt`、output interval、shard、checkpoint 與並行度 | dt 收斂、particle-step benchmark、RAM/I/O/容量 | 決定數值與工程配置 |
 

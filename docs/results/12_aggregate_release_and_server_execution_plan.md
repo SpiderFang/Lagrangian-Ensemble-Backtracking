@@ -486,8 +486,12 @@ checkpoint root、帳密及其他絕對部署路徑不得寫入 release manifest
   receptor、分母與來源足跡。own-local first exit 記錄後繼續回溯，foreign-local crossing
   只作診斷，離開共同 outer boundary 才停止；local open-water arc 與岸線不得混算。
 - 正式 forcing 必須重新驗證 OCM `hvel`、`vertical_velocity`、`zcor`、`elev`、
-  `wetdry_elem`、`diffusivity`，以及 NWW3 連續 17,544 小時 analysis。A 區 25/35 km
-  local-domain margin 只能由南向擴充且 OCM/NWW 共同有效的 flow domain 證明。
+  `wetdry_elem`、`diffusivity`，以及 NWW3 連續 17,544 小時 analysis。A 區本期依
+  `formal_domain_policy=v3_local20km_20260909_v1` 採 12.5 km receptor core／20 km
+  local domain，formal gate 仍須由 OCM native、OCM surface、NWW analysis 對實際共同
+  邊界提供至少兩個共同有效格點的 margin evidence；南向擴域與 25／35 km A 敏感度延期，
+  B–D 原 `expanded_domain` 敏感度保留並分開驗證；legacy
+  `formal_domain_policy=expanded_domain_v1` 僅作舊設定相容讀取。
 - 已知 OCM 時間缺口只能用通過 blocked Eulerian/Lagrangian validation 的 immutable
   reconstruction，否則採 gap-safe arrival/horizon；不得讓正式 baseline 大量軌跡在已知
   缺口停止，也不得以最近值或零值補齊。

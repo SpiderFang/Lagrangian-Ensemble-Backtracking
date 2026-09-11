@@ -96,6 +96,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "run_control",
             "run_locking",
             "run_validation",
+            "pilot_matrix_validation",
         ),
     },
     {
@@ -229,7 +230,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "outputs": "OCMNativeMonth、NWWAnalysisMonth、CombinedMonthForcing",
         "entrypoints": ["OCMNativeMonth.sample", "NWWAnalysisMonth.sample", "CombinedMonthForcing"],
         "read_first": (
-            "確認海流、Stokes 漂流、向下沉降與擴散係數的資料來源與遮罩；正式 v2 不含上浮情境。"
+            "確認海流、Stokes 漂流、向下沉降與擴散係數的資料來源與遮罩；目前沉降材質契約不含上浮情境。"
         ),
     },
     "accelerated": {
@@ -528,6 +529,19 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "entrypoints": ["validate_run", "benchmark_report"],
         "read_first": "驗證器要拒絕未知檔案、錯誤 checksum、錯誤 identity/order 與不合法 lifecycle，不能替 caller 偷修 progress 或刪除資料。",
     },
+    "pilot_matrix_validation": {
+        "role": "比較多區 engineering pilot 是否沿用同一組可重現執行設定",
+        "inputs": "兩個以上 run root 的 run_plan.json 與 normalized_config.json",
+        "outputs": "canonical pilot matrix JSON；逐 run 身分、共同設定差異與固定錯誤碼",
+        "entrypoints": ["validate_pilot_matrix", "canonical_pilot_matrix_json"],
+        "read_first": (
+            "只讀小型 immutable JSON，不讀 forcing、trajectory 或 checkpoint；移除明示的區域"
+            "站點／domain／arrival／scenario、輸入與幾何 binding、Kh／Kz／Smagorinsky cap 差異後，"
+            "對 M／seed、experiment、integration、boundaries、Stokes、材質、scalar snapshot 與"
+            "deployment provenance 做 exact compare。通過只表示試跑設定可比較，不表示 run 完成、"
+            "資料已驗收或研究成果已正式發布。"
+        ),
+    },
     "cli": {
         "role": "正式 preflight、run workspace、分片執行、reconcile、aggregate 與 report 唯讀驗證入口",
         "inputs": "命令列參數、設定檔與資料根目錄",
@@ -539,6 +553,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "run_shard",
             "run_reconcile",
             "run_validate_run",
+            "run_pilot_matrix_validate",
             "run_report_validate",
             "report-validate",
         ],
@@ -1043,6 +1058,7 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "cli", "target": "config", "label": "run-create／設定"},
     {"source": "cli", "target": "runtime", "label": "run-create／pilot+formal"},
     {"source": "cli", "target": "run_control", "label": "run-shard／run-reconcile"},
+    {"source": "cli", "target": "pilot_matrix_validation", "label": "pilot-matrix-validate／跨區共同設定"},
     {"source": "config", "target": "preflight", "label": "設定約束"},
     {"source": "preflight", "target": "time_axis", "label": "時間支援"},
     {"source": "geometry", "target": "mesh", "label": "座標／網格"},

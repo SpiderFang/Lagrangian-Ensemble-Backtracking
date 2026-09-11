@@ -310,9 +310,9 @@ known-source 驗證。
 
 | 邊界／狀態 | 基線 | 必要敏感度或備註 |
 |---|---|---|
-| 貢寮／龜山島 own local boundary | anchor 半徑 25 km 圓周中連接有效外海的 arc first crossing，記錄 segment、弧長與 backward age 後繼續；岸線不計入 | 20/35 km 半徑敏感度；兩站 local domains 可重疊但主要事件與分母依 `study_site_id` 保存 |
+| 貢寮／龜山島 own local boundary | 依 `formal_domain_policy=v3_local20km_20260909_v1`，在 anchor 半徑 20 km 圓周中取連接有效外海的 arc first crossing，記錄 segment、弧長與 backward age 後繼續；岸線不計入 | 本期 A 不做 25／35 km 或 15／23 km 半徑敏感度；兩站 local domains 可重疊但主要事件與分母依 `study_site_id` 保存，B–D 原登錄的 `expanded_domain` 敏感度仍分開保存 |
 | 另一站 local boundary | 穿越時寫 `other_site_local_domain_enter/exit` 後繼續；不得停止、改變 scenario 所屬或取代 own first-exit | 跨站穿越率、配對 UTC pathway/HDR overlap 與共享傳輸走廊診斷 |
-| A 區共用 flow-domain open boundary | 貢寮與龜山島使用同一 outer boundary；計算線段 first crossing，記錄 segment 與弧長後停止 | 擴域前後比較 exit time、HDR 與 ranking；避免用任意站界切斷水動力連通 |
+| A 區共用 flow-domain open boundary | 貢寮與龜山島使用同一 outer boundary；計算線段 first crossing，記錄 segment 與弧長後停止；本期 outer stop 不因 local 20 km 調整 | A 南向擴域延期；待現行 v3 三產品共同邊界餘裕證據完成後，才可比較 exit time、HDR 與 ranking，避免用任意站界切斷水動力連通 |
 | 海岸／陸地 | 不允許跨越；記錄 coast contact 並停止 | reflect 作敏感度，不混入基準 |
 | 海面 | 十個 sinking 代理因亂流擴散越界時反射並記錄 contact | 不代表物件具有向上的物性速度；正式設定不接受 rising 類別，完全沉沒 baseline 亦不加 windage |
 | 海床 | 十個 sinking／near-bed 代理首次接觸即 deposit 並停止 | 無再懸浮參數時不宣稱完整底床交換 |
@@ -471,7 +471,7 @@ N_{\mathrm{trajectory,total}}=\sum_{s=1}^{50{,}000}M_s.
 | checkpoint/restart | 同 config/seed 分片中斷續跑後 row count、ID、event 與 checksum 等價 |
 | dt convergence | dt 減半後 exit ranking、90% HDR、median travel time 與 path density 變化低於預先登錄值 |
 | ensemble convergence | 隨 members 增加，主要統計與 bootstrap interval 穩定；由曲線決定正式 M |
-| domain adequacy | 現行 A v3 僅作 pilot；正式候選 `northeast_taiwan_common_cache_v4_lbt_south_expanded` bbox 南界為 `24.480000°N`，且 OCM native、OCM surface、NWW analysis 對貢寮／龜山島 25/35 km local boundary 均保留至少兩個共同有效格點；擴域前後主要 entry/exit/path/HDR 指標變化預設低於 10%，否則報告尺度依賴性或繼續調整 domain version |
+| domain adequacy | 現行 A 依 `formal_domain_policy=v3_local20km_20260909_v1` 採 12.5 km receptor core／20 km local domain；strict preparation 可先進行，但 formal gate 必須由 OCM native、OCM surface、NWW analysis 對實際共同邊界提供至少兩個共同有效格點的 margin evidence，現行 receptor-native gate 不足以替代；A 南向擴域與 25／35 km 敏感度延期，B–D `expanded_domain` 仍另行驗證；legacy `formal_domain_policy=expanded_domain_v1` 僅作舊設定相容讀取 |
 | cross-site semantics | 軌跡穿越 foreign local domain 前後位置、時間與方向可重現；`study_site_id`、scenario、seed、own-local first-exit 與 outer-stop state 不變；跨站比例以原站有效 members 為分母，不把兩站先合併 |
 | known-source synthetic | 正向已知來源到受體案例，其來源落入逆向 footprint 的核定 HDR，並量化 coverage |
 | forcing ablation | current-only、no-Stokes、deep/finite Stokes、Kh/Kz cases 可比較且命名不混淆 |

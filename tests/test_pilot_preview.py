@@ -132,6 +132,62 @@ def _build(case, **kwargs):
     return preview.build_pilot_preview(root, config_path=config, output=output, **kwargs)
 
 
+def _nfs_marker_kwargs(tmp_path):
+    """建立測試專用 gate snapshot 與 code provenance，不把合成值誤當 SERVER 證據。
+
+    marker writer 只應接受 gate 的固定 schema、九個共同 source token 及 flock PASS；
+    fixture 因而完整模擬這些欄位，但不宣稱測試目錄真的具備 NFS 耐久性。
+    """
+
+    token = "a" * 64
+    labels = (
+        "result_nfs_root",
+        "execution_package_root",
+        "output_root",
+        "scratch_root",
+        "checkpoint_root",
+        "uv_cache_root",
+        "mpl_cache_root",
+        "xdg_cache_root",
+        "tmp_root",
+    )
+    document = {
+        "gate_status": "PASS",
+        "issues": [],
+        "minimum_free_bytes": 100,
+        "probes": [
+            {"gate_status": "PASS", "label": "write_probe"},
+            {"gate_status": "PASS", "label": "same_host_flock_probe"},
+        ],
+        "roots": [
+            {
+                "free_bytes": 1000,
+                "fstype": "nfs",
+                "gate_status": "PASS",
+                "label": label,
+                "source_token_hash": token,
+            }
+            for label in labels
+        ],
+        "schema_version": "1.0.0",
+    }
+    evidence = tmp_path / "storage-gate.json"
+    evidence.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "storage_gate_evidence": evidence,
+        "nfs_marker_protocol": True,
+        "release_provenance": {
+            "base_commit": "1" * 40,
+            "base_tree": "2" * 40,
+            "dirty_files": [
+                "src/lagrangian_backtracking/pilot_preview.py",
+                "tests/test_pilot_preview.py",
+            ],
+            "diff_sha256": "3" * 64,
+        },
+    }
+
+
 @pytest.fixture(scope="module")
 def rendered_preview(preview_template, tmp_path_factory):
     """實際產圖一次並保存可供圖面 QA 的工程樣本；固定只畫每垂向五條但統計四十粒子。"""
@@ -229,6 +285,100 @@ def test_complete_counts_units_and_readable_png(rendered_preview):
         assert (output / name).stat().st_size == contract["size_bytes"]
     assert str(output.parent) not in (output / "summary.json").read_text()
     assert "逆向時間曲線變淺不表示" in (output / "README.md").read_text()
+
+
+def test_nfs_marker_success_and_reader_gate(preview_case):
+    """NFS marker 成功時保存完整指紋，reader 只能在 marker 與 manifest 綁定後讀取。"""
+
+    output = preview_case[2]
+    kwargs = _nfs_marker_kwargs(output.parent)
+    manifest = _build(preview_case, **kwargs)
+    marker_path = output / ".complete"
+    assert marker_path.is_file()
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["publish_protocol"] == "nfs_completion_marker_v1"
+    assert marker["manifest_sha256"] == sha256_file(output / "manifest.json")
+    assert marker["storage_gate_snapshot_sha256"] == sha256_file(kwargs["storage_gate_evidence"])
+    assert manifest["publish_protocol"] == marker["publish_protocol"]
+    assert preview.validate_published_preview(output, storage_gate_evidence=kwargs["storage_gate_evidence"])
+
+
+def test_nfs_marker_collision_preserves_existing_release(preview_case):
+    """目的地碰撞必須拒絕，既有完整 marker 與檔案不可被覆寫。"""
+
+    output = preview_case[2]
+    kwargs = _nfs_marker_kwargs(output.parent)
+    _build(preview_case, **kwargs)
+    before = (output / ".complete").read_bytes()
+    with pytest.raises(FileExistsError):
+        _build(preview_case, **kwargs)
+    assert (output / ".complete").read_bytes() == before
+
+
+def test_nfs_marker_mid_publish_failure_leaves_invalid_final(preview_case, monkeypatch):
+    """逐檔發布中途失敗須保留 final 但不建立 marker，reader 必須 fail closed。"""
+
+    output = preview_case[2]
+    kwargs = _nfs_marker_kwargs(output.parent)
+    real_fsync = preview._fsync_preview_file
+    calls = 0
+
+    def fail_second(path):
+        """模擬第二個 final product durable fsync 失敗，不刪除 invalid final 證據。"""
+
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic fsync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(preview, "_fsync_preview_file", fail_second)
+    with pytest.raises(preview.PilotPreviewError):
+        _build(preview_case, **kwargs)
+    assert output.is_dir() and not (output / ".complete").exists()
+    with pytest.raises(preview.PilotPreviewError, match="completion marker"):
+        preview.validate_published_preview(output)
+
+
+def test_nfs_marker_source_drift_aborts_before_final_claim(preview_case, monkeypatch):
+    """取得 flock 後若來源 SHA 改變，不能建立 final 或 completion marker。"""
+
+    output = preview_case[2]
+    kwargs = _nfs_marker_kwargs(output.parent)
+    real_snapshot = preview._source_snapshot
+    calls = 0
+
+    def drift_after_lock(root, config, plan):
+        """只在發布鎖取得後注入不可接受的來源摘要變化。"""
+
+        nonlocal calls
+        calls += 1
+        snapshot = real_snapshot(root, config, plan)
+        if calls >= 3:
+            hashes, shards = snapshot
+            hashes = dict(hashes)
+            hashes["run_plan.json"] = "f" * 64
+            return hashes, shards
+        return snapshot
+
+    monkeypatch.setattr(preview, "_source_snapshot", drift_after_lock)
+    with pytest.raises(preview.PilotPreviewError, match="來源"):
+        _build(preview_case, **kwargs)
+    assert not output.exists()
+
+
+def test_nfs_marker_tamper_is_rejected_before_reader(preview_case):
+    """marker bytes 或 manifest binding 被竄改時，reader 不得讀 CSV 或繪圖輸入。"""
+
+    output = preview_case[2]
+    kwargs = _nfs_marker_kwargs(output.parent)
+    _build(preview_case, **kwargs)
+    marker_path = output / ".complete"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["manifest_sha256"] = "e" * 64
+    marker_path.write_text(json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(preview.PilotPreviewError, match="marker"):
+        preview.validate_published_preview(output)
 
 
 def test_v2_preview_writes_new_velocity_columns_as_blank(preview_case):

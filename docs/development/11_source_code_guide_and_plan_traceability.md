@@ -28,8 +28,10 @@ ProductionBatch、schema 2 run-control 契約與 pilot／formal runtime」，不
 `RuntimeRequestFactory` 與 `open_run_controller` 已接通兩種模式；`lbt run-create`、
 `lbt run-shard` 與 `lbt run-reconcile` 已提供對應入口。formal 由正式 config、approved
 manifests、strict inventory topology／時間軸與逐 arrival flow 的 gap 支援 gate 控制，任何
-證據不足都會在 forcing I/O 前 fail-closed。example config 與實際 release artifacts 尚未
-到位；本輪未登入或執行 SERVER，沒有正式研究結果。完整工程稽核結論見
+證據不足都會在 forcing I/O 前 fail-closed。目前已有 A／B／C／D 第一次 24 小時
+engineering pilot；A 的兩站使用 `no_stokes`，B／C／D 使用 `finite_depth_stokes`，因此
+這些是可稽核的工程紀錄，不能當成同設定跨區比較或正式研究結果。完整數值、圖面狀態與
+後續 gate 見 `../results/15_four_region_first_pilot_audit.md` 及
 [實作與 SERVER 驗證稽核](../archive/09_implementation_audit_2026-08-19.md)。
 
 ### 1.1 BayTrace 可用部分整合界線
@@ -62,7 +64,7 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 4. `models.py`、`scenarios.py`、`runner.py`、`batch_state.py`：了解一條軌跡如何由站點、受體、到達時間、行為、成員唯一識別並進入 SoA 批次。
 5. `forcing.py`、`forcing_window.py`、`mesh.py`、`stokes.py`、`diffusion.py`、`integrators.py`：了解每一時間步的速度如何取得與計算。
 6. `boundaries.py`、`engine.py`、`production.py`：了解何時記錄事件、何時停止回溯，以及 CPU batch 如何呼叫共用單步 engine。
-7. `runtime.py`、`run_control.py`、`run_locking.py`、`run_validation.py`、`cli.py`：了解 pilot／formal request、workspace、鎖定、reconcile 與命令列邊界。
+7. `runtime.py`、`run_control.py`、`run_locking.py`、`run_validation.py`、`pilot_matrix_validation.py`、`cli.py`：了解 pilot／formal request、workspace、鎖定、reconcile、跨區共同設定比較與命令列邊界。
 8. `outputs.py`、`checkpoint.py`、`report_material_statistics.py`、`aggregation.py`：了解如何保存可追溯結果，以及如何產生材質／底部接觸、密度與路徑統計。
 9. 對照 `tests/`：每一核心宣稱至少要有對應測試；測試通過表示程式邏輯符合該測試案例，不代表正式海域結果已產出。
 10. 最後閱讀[科學方法與驗證](../foundation/03_scientific_method_and_validation.md)、[成果呈現與學術視覺化規格](../results/07_results_visualization_plan.md)與[實作稽核](../archive/09_implementation_audit_2026-08-19.md)。
@@ -77,7 +79,7 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 | 資料與幾何 | `preflight.py`、`time_axis.py` | OCM／NWW3 月份 metadata 與 UTC 軸 | 唯讀盤點上游檔案、建立跨月唯一 UTC 軸、列出缺時與資料契約問題。 | `run_preflight`、`canonicalize_time_chunks` |
 | 資料與幾何 | `geometry.py`、`mesh.py` | 經緯度、原始 OCM 節點與網格面 | 轉為公尺座標、建立局部分析區，並以原始三角形定位粒子。 | `DomainProjection`、`build_anchor_local_domain`、`NativeMesh.locate` |
 | 資料與幾何 | `receptors.py`、`arrival_times.py` | 可長期濕潤的網格面、各時段資料品質指標 | 選取每站 5 個水平位置 × 4 個垂向層位，以及 48 個分層時刻加 2 個事件時刻。 | `select_horizontal_receptors`、`build_vertical_targets`、`select_arrival_times` |
-| 資料與幾何 | `manifests.py` | 已產製的 component／geometry JSON 與 config resolver | 嚴格驗證 material、receptor、arrival、dynamic pair 與巢狀邊界；formal A 依 resolver 綁定 expanded flow-domain ID。 | `load_scenario_inputs`、`load_boundary_geometries` |
+| 資料與幾何 | `manifests.py` | 已產製的 component／geometry JSON 與 config resolver | 嚴格驗證 material、receptor、arrival、dynamic pair 與巢狀邊界；formal A 依 resolver 綁定當期 `formal_domain_policy` 與 v3 flow-domain ID，舊 `formal_domain_policy=expanded_domain_v1` 僅作相容讀取。 | `load_scenario_inputs`、`load_boundary_geometries` |
 | 物理與邊界 | `models.py` | 無 | 定義所有模組共用的粒子狀態、速度樣本、品質旗標、事件與停止狀態。 | `ParticleState`、`VelocitySample`、`BoundaryEvent` |
 | 物理與邊界 | `forcing.py`、`forcing_window.py` | OCM／NWW3 產品、時間、粒子位置與 UTC stage | 取樣海流、波浪、Stokes、沉降與擴散資料；以月份 lazy window 管理 resident cache。 | `CombinedMonthForcing`、`ForcingWindowManager` |
 | 物理與邊界 | `accelerated.py`、`stokes.py`、`diffusion.py`、`integrators.py` | 欄位、波浪條件、擴散係數與速度取樣器 | 提供 OCM 內插加速、有限水深 Stokes、隨機擴散與逆向四階時間積分。 | `interpolate_ocm_support_numba`、`finite_depth_stokes`、`brownian_displacement`、`rk4_step` |
@@ -88,6 +90,7 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 | 執行控制 | `cli.py`、`runtime.py` | 命令列參數、run workspace、manifest、config 與 forcing roots | 提供 `run-create`、`run-shard`、`run-reconcile`；依 run kind 建立 `RuntimeRequestFactory` 與 controller，formal 先通過 strict inventory／manifest gate。 | `main`、`initialize_run`、`initialize_formal_run`、`RuntimeRequestFactory`、`open_run_controller` |
 | 執行控制 | `provenance.py`、`run_control.py` | 部署指紋、run plan/progress、ProductionBatch 與 checkpoint/output | 綁定程式來源、schema 2 immutable plan、atomic progress、lock topology、shard 執行與 reconcile。 | `collect_code_provenance`、`initialize_run_workspace`、`RunController` |
 | 執行控制 | `run_locking.py`、`run_validation.py` | lock file、validator 輸入與 checksum | 以 Unix `flock` 保護互斥；唯讀驗證 lifecycle、identity、order、checkpoint/output 與工程摘要。 | `acquire_run_lock`、`validate_run`、`benchmark_report` |
+| 執行控制 | `pilot_matrix_validation.py` | 兩個以上 pilot run root 的 `run_plan.json` 與 `normalized_config.json` | 唯讀比較跨區共同設定與 deployment provenance；允許明示的站點／domain／arrival／scenario、輸入／幾何 binding 與區域 Kh／Kz／Smagorinsky cap 差異。它不判定 run lifecycle、不讀 forcing／trajectory，也不是 formal gate。 | `validate_pilot_matrix`、`canonical_pilot_matrix_json` |
 | 輸出與聚合 | `outputs.py` | 完成的 `ParticleResult` 清單 | 原子寫出粒子摘要、事件、軌跡一維陣列與檢查資料；拒絕覆寫或不完整結果。 | `write_trajectory_shard`、`validate_trajectory_shard` |
 | 輸出與聚合 | `aggregation.py` | 已驗證的事件與軌跡 | 計算邊界密度、二維條件式足跡、高密度區、路徑訪格比例、停留時間與跨站連通；正式成果仍待資料 release。 | `conditional_kde_2d`、`pathway_residence_grid`、`boundary_arclength_histogram` |
 | 輸出與聚合 | `report_material_statistics.py` | `Scenario`／`ScenarioStratum` 與一次串流的 `ParticleResult` | 依 `study_site_id × material_id` 產生有效 member 分母、首次海床接觸／沉積 member count 與 fraction；沉底漁具優先層僅是定性排序，不改速度或來源先驗，重複接觸按 member 去重，基線不含再懸浮。 | `MaterialStatisticsAccumulator`、`build_material_statistics` |
@@ -118,6 +121,7 @@ flowchart LR
         RT[runtime.py<br/>RuntimeRequestFactory]
         RC[run_control.py<br/>RunController]
         VAL[run_validation.py<br/>唯讀 validator]
+        PMV[pilot_matrix_validation.py<br/>跨區共同設定 validator]
     end
     subgraph E[輸出與聚合]
         OUT[outputs.py<br/>shard／events]
@@ -128,6 +132,7 @@ flowchart LR
     MAN --> RT
     CLI --> RT
     CLI --> RC
+    CLI --> PMV
     SCN --> RT
     RT --> FOR
     FOR --> RC
@@ -210,18 +215,18 @@ uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
 
 | 計畫書條目 | 主要原始碼 | 已有測試或可執行證據 | 目前狀態與仍需完成事項 |
 |---|---|---|---|
-| 10 種非上浮海廢材質／形狀代理 | `scenarios.BASELINE_BEHAVIORS`、`Behavior`、`config.ProjectConfig`、`CombinedMonthForcing` | [test_cli_smoke.py](../../tests/test_cli_smoke.py)、[test_config.py](../../tests/test_config.py) 與 [test_scenarios.py](../../tests/test_scenarios.py) 驗證 10 筆、iOcean 分類唯一、欄位完整及速度全部嚴格小於 0。 | **v2 程式契約已驗證。** 目前速度仍為 `provisional_proxy`；正式 material manifest 尚待發布，現地物性校準屬後續 gate。 |
+| 10 種非上浮海廢材質／形狀代理 | `scenarios.BASELINE_BEHAVIORS`、`Behavior`、`config.ProjectConfig`、`CombinedMonthForcing` | [test_cli_smoke.py](../../tests/test_cli_smoke.py)、[test_config.py](../../tests/test_config.py) 與 [test_scenarios.py](../../tests/test_scenarios.py) 驗證 10 筆、iOcean 分類唯一、欄位完整及速度全部嚴格小於 0。 | **目前 v3 design 承接既有 non-rising material contract，程式契約已驗證。** 目前速度仍為 `provisional_proxy`；正式 material manifest 尚待發布，現地物性校準屬後續 gate。 |
 | 20 個三維 receptors／每站 | `geometry.py`、`mesh.py`、`receptors.py` | [test_receptors.py](../../tests/test_receptors.py) 驗證長期濕潤水平選取與 4 個有效垂向層。 | **資料產製待完成。** 演算法已具備；五站正式 local/open-boundary/receptor manifests 尚未由實際網格產生。 |
 | 50 個到達時間／每站 | `arrival_times.select_arrival_times`、`scenarios.ArrivalTime` | [test_checkpoint_arrivals.py](../../tests/test_checkpoint_arrivals.py) 驗證 48 個分層時刻加 2 個事件時刻。 | **資料產製待完成。** 尚未以完整資料時間軸產生五站正式 50 個 UTC 與回溯可用範圍證據。 |
 | 每站 `10 × 20 × 50 = 10,000`，全案 50,000 | `config.ProjectConfig`、`scenarios.build_scenarios`、`validate_baseline_coverage` | [test_config.py](../../tests/test_config.py)、[test_scenarios.py](../../tests/test_scenarios.py) 拒絕縮減計數並驗證 50,000 個唯一情境。 | **程式契約已驗證。** 尚待把正式受體、到達時間和行為表交叉成不可變的 scenario manifest。 |
-| 離開關注區域的邊界停止 | `BoundaryGeometry`、`resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` | [test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證自站、他站、外層、海岸、海面／海床與時間步內交點。 | **邏輯已驗證；正式幾何待完成。** A 區 v4 南擴流場與五站開放水域邊界尚未生成和驗收。 |
+| 離開關注區域的邊界停止 | `BoundaryGeometry`、`resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` | [test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證自站、他站、外層、海岸、海面／海床與時間步內交點。 | **邏輯已驗證；正式幾何待完成。** A 區本期依 `formal_domain_policy=v3_local20km_20260909_v1` 重建 20 km local／12.5 km receptor core；實際三產品共同 margin、五站開放水域邊界與新 geometry identity 尚未完成驗收。 |
 | 公式（6）：海流 + Stokes + 向下沉降的總平流速度；完全沉沒不加 windage | `forcing.CombinedMonthForcing`、`stokes.py` | [test_mesh_forcing.py](../../tests/test_mesh_forcing.py)、[test_stokes.py](../../tests/test_stokes.py) 驗證 OCM／NWW 取樣、波向與深淺水極限。 | **程式核心已驗證。** 尚未以 SERVER 全期正式 forcing 實跑與檢查單位、濕乾語意及共同有效遮罩。 |
 | 公式（7）：由波高、週期、波向與波長計算 Stokes 漂流 | `solve_wave_number`、`finite_depth_stokes`、`deep_water_stokes` | [test_stokes.py](../../tests/test_stokes.py) 驗證色散關係殘差、深水極限與波向轉換。 | **程式核心已驗證。** baseline 的波浪資料版本、no-Stokes／深水／有限水深敏感度尚未以實值資料產出。 |
 | 公式（8）：逆向四階 Runge-Kutta 時間積分 | `integrators.rk4_step`、`engine.run_particle` | [test_integrators_diffusion.py](../../tests/test_integrators_diffusion.py)、[test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證負時間步長只取反一次、四個中間點與離域處理。 | **程式核心已驗證。** 正式的最小／最大時間步長和時間步收斂試驗尚待 pilot 決定。 |
 | 公式（9）：隨機漫步擴散 | `brownian_displacement`、`split_rk4_brownian_step` | [test_integrators_diffusion.py](../../tests/test_integrators_diffusion.py) 驗證變異數為 `2KΔt`。 | **程式核心已驗證。** 正式水平、垂向擴散係數及系集成員數 `M` 尚待收斂試驗決定。 |
 | 公式（10）：Smagorinsky 水平擴散 | `smagorinsky_horizontal_diffusivity` | 候選函式已實作；目前測試套件尚無針對解析剪切、旋轉不變性或上下限的專屬驗證。 | **僅候選功能，尚未完成驗證，更不是已發布 baseline。** 真實速度梯度、上下限、均勻混合性和敏感度尚未接入正式批次。 |
 | 公式（11）：邊界穿越點核密度估計 | `conditional_kde_2d`、`boundary_arclength_histogram` | [test_outputs_aggregation.py](../../tests/test_outputs_aggregation.py) 驗證密度正規化、高密度區、邊界分母與原始計數。 | **程式核心已驗證。** 還沒有由正式全期軌跡產生的入口密度、來源足跡、頻寬敏感度與信賴區間。 |
-| 視覺化主要潛在來源路徑 | `aggregation.py` 提供繪圖資料產品；[成果呈現與學術視覺化規格](../results/07_results_visualization_plan.md) 定義 F01–F12 圖組。 | 無正式圖表產物；目前只有合成 smoke 結果與聚合函式測試。 | **正式成果待完成。** 需先完成資料、情境、pilot、全期批次與聚合 release，才可產出正式圖表。 |
+| 視覺化主要潛在來源路徑 | `aggregation.py`、`source_pathway_release.py` 提供繪圖資料／成果包；[成果呈現與學術視覺化規格](../results/07_results_visualization_plan.md) 定義 F01–F12 圖組。 | B／C／D 已有 engineering pilot 四圖；A 的舊 NFS 發布未完成；另有聚合函式測試與成果包 round-trip 測試。 | **工程 pilot 圖面已具備，但正式圖表仍待完成。** 需先完成資料、情境、收斂、accepted input、全期批次與聚合 release，才可產出正式圖表。 |
 
 ### 5.1 為什麼「有 KDE 函式」不等於「已完成來源路徑圖」
 
@@ -279,7 +284,7 @@ flowchart LR
 
 1. OCM 缺時重建或 gap-safe 到達／回溯窗 manifest；
 2. NWW3 完整逐時 analysis manifest；
-3. 南向擴充的 A 區正式 flow domain 與五站 domain、開放邊界、受體 manifests；
+3. 本期 A v3 flow-domain policy（12.5 km receptor core、20 km local domain）與五站 domain、開放邊界、受體 manifests；三產品共同 margin evidence validator／producer 尚未完成前，formal 維持 blocked；
 4. 五站各 50 個到達時刻、10 種非上浮材質／形狀代理及 50,000 個 scenario manifest；
 5. 由 pilot 決定的 `M`、擴散係數、時間步長、最大回溯期、批次大小與 checkpoint 間隔；
 6. 實值 pilot、全期 SERVER batch、aggregate release 與 F01–F12 圖表。
@@ -290,7 +295,7 @@ flowchart LR
 
 下一個正確的里程碑不是直接跑 50,000 × `M` 條軌跡，而是建立一組可審查的「實值 pilot 證據包」：
 
-1. A 區南擴與其餘三區的 forcing／幾何／受體／到達時刻 manifests；
+1. A 區 v3 policy 的 forcing／幾何／受體／到達時刻 manifests，以及 OCM native、OCM surface、NWW analysis 的實際共同 margin evidence；B-D 原有 expanded-domain 敏感度另依各自 manifest 驗證；
 2. 代表性站點與行為的 reference pilot shards；
 3. 時間步長、回溯期、擴散係數與成員數的收斂結果；
 4. local entry、outer exit、海岸與資料停止原因的摘要；

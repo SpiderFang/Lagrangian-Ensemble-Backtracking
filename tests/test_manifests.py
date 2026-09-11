@@ -78,7 +78,7 @@ def _material_payload() -> dict[str, object]:
 
     return {
         "schema_version": "2.0.0",
-        "design_version": "design_baseline_v2_non_rising_oca_proxy",
+        "design_version": "design_baseline_v3_non_rising_a_v3_local20_20260909",
         "classification_source": "synthetic iOcean category fixture",
         "velocity_unit": "m s-1; z positive-up; all values must be strictly negative",
         "velocity_source": "design_sensitivity_grid_not_oca_measurement",
@@ -110,7 +110,7 @@ def _receptor_payload(*, per_site: int = 20, wrong_region: bool = False) -> dict
         "manifest_kind": "receptor_manifest",
         "schema_version": "1.0.0",
         "status": "approved",
-        "design_version": "design_baseline_v2_non_rising_oca_proxy",
+        "design_version": "design_baseline_v3_non_rising_a_v3_local20_20260909",
         "coordinate_reference": "EPSG:4326",
         "vertical_reference": "z_m_positive_up",
         "generation_method_id": "synthetic_receptor_fixture_v1",
@@ -184,7 +184,7 @@ def _arrival_payload(*, per_site: int = 50, wrong_year: bool = False) -> dict[st
         "manifest_kind": "arrival_time_manifest",
         "schema_version": "1.0.0",
         "status": "approved",
-        "design_version": "design_baseline_v2_non_rising_oca_proxy",
+        "design_version": "design_baseline_v3_non_rising_a_v3_local20_20260909",
         "time_standard": "UTC",
         "selection_method_id": "synthetic_arrival_fixture_v1",
         "provenance": _provenance(),
@@ -379,7 +379,7 @@ def _geometry_payloads(
     root_base = {
         "schema_version": "1.0.0",
         "status": "approved",
-        "design_version": "design_baseline_v2_non_rising_oca_proxy",
+        "design_version": "design_baseline_v3_non_rising_a_v3_local20_20260909",
         "coordinate_reference": "EPSG:4326",
         "provenance": _provenance(),
     }
@@ -502,7 +502,7 @@ def test_select_arrival_times_output_passes_manifest_loader(tmp_path: Path) -> N
         current_speed_mps=current,
         valid_forcing=np.ones(count, dtype=bool),
         backward_window_available=np.ones(count, dtype=bool),
-        design_version="design_baseline_v2_non_rising_oca_proxy",
+        design_version="design_baseline_v3_non_rising_a_v3_local20_20260909",
     )
     payload = _arrival_payload(per_site=1)
     payload["status"] = "generated"
@@ -632,14 +632,26 @@ def test_full_scenario_inputs_are_deterministic_and_hash_bound(tmp_path: Path) -
 
 
 def test_dynamic_initial_condition_resolves_formal_a_domain_and_pilot_base(tmp_path: Path) -> None:
-    """formal A 區使用 expanded ID，pilot 與其他 region 使用 base flow-domain ID。"""
+    """legacy expanded policy 的 formal A 區使用 expanded ID，pilot 維持 base。"""
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     payload["scenarios"]["receptor_arrival_initial_condition_manifest"] = None
+    payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
     payload["domains"][0]["formal_release_flow_domain_id"] = (
         "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     )
+    payload["domains"][0]["formal_release_domain_status"] = "approved"
+    payload["domains"][0]["expanded_domain_candidate_id"] = (
+        "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+    )
+    payload["domains"][0]["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
+    for site in payload["study_sites"]:
+        if site["analysis_region_id"] == "A":
+            site["formal_release_flow_domain_id"] = (
+                "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+            )
     config = ProjectConfig.model_validate(payload)
     receptor_payload = _receptor_payload()
     arrival_payload = _arrival_payload()
@@ -934,15 +946,25 @@ def test_formal_geometry_builds_metric_nested_boundaries_and_foreign_domains(tmp
 
 
 def test_geometry_formal_uses_resolved_a_v4_and_pilot_keeps_base_id(tmp_path: Path) -> None:
-    """formal A 只接受設定解析出的 v4；pilot 仍接受同一設定的 base v3。"""
+    """legacy expanded policy 的 formal A 只接受設定解析出的 v4；pilot 維持 base v3。"""
 
     formal_flow = "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
     payload["domains"][0]["formal_release_flow_domain_id"] = formal_flow
+    payload["domains"][0]["formal_release_domain_status"] = "approved"
+    payload["domains"][0]["expanded_domain_candidate_id"] = formal_flow
+    payload["domains"][0]["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
+    for site in payload["study_sites"]:
+        if site["analysis_region_id"] == "A":
+            site["formal_release_flow_domain_id"] = formal_flow
     config = ProjectConfig.model_validate(payload)
 
     formal_domain, formal_local, formal_open = _geometry_payloads(a_flow_id=formal_flow)
+    for geometry_payload in (formal_domain, formal_local, formal_open):
+        geometry_payload["design_version"] = config.design_version
     formal_paths = [
         tmp_path / name
         for name in ("formal-domain.json", "formal-local.json", "formal-open.json")
@@ -953,6 +975,8 @@ def test_geometry_formal_uses_resolved_a_v4_and_pilot_keeps_base_id(tmp_path: Pa
     assert formal_bundle["gongliao"].flow_boundary_segment_id.startswith(f"{formal_flow}_")
 
     base_domain, base_local, base_open = _geometry_payloads()
+    for geometry_payload in (base_domain, base_local, base_open):
+        geometry_payload["design_version"] = config.design_version
     base_paths = [tmp_path / name for name in ("base-domain.json", "base-local.json", "base-open.json")]
     for path, value in zip(base_paths, (base_domain, base_local, base_open), strict=True):
         _write_json(path, value)

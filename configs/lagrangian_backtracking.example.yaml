@@ -1,12 +1,14 @@
-# 本檔固定 design_baseline_v2_non_rising_oca_proxy 的科學與工程規則，但仍不是可直接送入
-# 正式批次的 release config。v2 依研究主持人意見取消中性懸浮與所有上浮情境，並為十個
-# 嚴格負值沉降格點指定 iOcean 分類、代表材質、形狀、適用條件及證據等級。
+# 本檔固定 design_baseline_v3_non_rising_a_v3_local20_20260909 的科學與工程規則，但仍不是
+# 可直接送入正式批次的 release config。v3 依研究主持人意見保留 A 區 v3 forcing source，
+# 將貢寮與龜山島 local domain 定為 20 km、receptor core 定為 12.5 km，並將本期 A 區
+# 35 km／南擴 sensitivity 排除在研究範圍外；十個嚴格負值沉降格點仍指定 iOcean 分類、
+# 代表材質、形狀、適用條件及證據等級。
 # local-domain polygon、受體座標、50 個 UTC、M、擴散係數與 SERVER 路徑必須依已決定的
 # 演算法由實際網格、forcing 與先導試驗衍生；null 表示「尚未產出衍生 manifest」，不是
 # 等待研究人員任意選值。正式批次只接受所有 derived gate 均通過的 approved release config。
 schema_version: "0.4.0"
-config_status: design_baseline_example
-design_version: design_baseline_v2_non_rising_oca_proxy
+config_status: design_pending
+design_version: design_baseline_v3_non_rising_a_v3_local20_20260909
 project_id: lagrangian_ensemble_backtracking
 time_standard: UTC
 
@@ -123,19 +125,14 @@ domains:
     center_lonlat: [122.05, 25.05]
     bbox_lon_lat: [121.306315, 122.793685, 24.600844, 25.499156]
     metric_crs_policy: local_azimuthal_equidistant
-    # SERVER preflight 顯示龜山島 25 km local boundary 至本 bbox 南界只餘約 1.64 km，
-    # 小於兩個約 1 km OCM surface/NWW 共同格點。現行 v3 可作開發與 pilot，正式
-    # release 必須使用不覆寫 v3 的 expanded domain；新識別碼由產物生成後填入。
+    # 本期 A 區研究範圍保留 OCM-Data-Preprocessing flow-domain v3；20 km local
+    # boundary 的三套 OCM native／surface／NWW analysis 共同有效格網尚待實際驗證。
+    formal_domain_policy: v3_local20km_20260909_v1
     current_domain_role: development_and_pilot
-    formal_release_flow_domain_id: null
-    formal_release_domain_status: expanded_domain_generation_required
-    expanded_domain_candidate_id: northeast_taiwan_common_cache_v4_lbt_south_expanded
-    expanded_bbox_lon_lat: [121.306315, 122.793685, 24.480000, 25.499156]
-    expanded_south_boundary_at_or_south_of_deg: 24.48
+    formal_release_flow_domain_id: northeast_taiwan_common_cache_v3
+    formal_release_domain_status: pending_common_support
     minimum_common_forcing_margin_grid_cells: 2
     margin_required_for_forcings: [ocm_native, ocm_surface, nww3_analysis]
-    radius_25000_formal_requires_expanded_domain: true
-    radius_35000_formal_requires_expanded_domain: true
   - analysis_region_id: B
     analysis_region_name_zh: 新竹外海
     flow_domain_id: hsinchu_cache_v3
@@ -157,19 +154,19 @@ domains:
 
 study_sites:
   # 貢寮與龜山島不沿用過小的 surface-SVD candidate bbox。兩站均以 anchor 為中心，
-  # 在 Azimuthal Equidistant CRS 產生半徑 12.5 km 受體核心與 25 km local domain，
+  # 在 Azimuthal Equidistant CRS 產生半徑 12.5 km 受體核心與 20 km local domain，
   # 再與 A 區固定 OCM ocean polygon 相交。動態 wet/dry 只篩受體與 forcing stage，
-  # 不得使 boundary 隨 arrival time 改變；20/35 km 是預先登錄的尺度敏感度。
+  # 不得使 boundary 隨 arrival time 改變；本期 A 區不登錄 35 km sensitivity。
   - study_site_id: gongliao
     study_site_name_zh: 貢寮
     analysis_region_id: A
     flow_domain_id: northeast_taiwan_common_cache_v3
+    formal_release_flow_domain_id: northeast_taiwan_common_cache_v3
     anchor_lonlat: [121.92807, 25.11245]
     receptor_core_radius_m: 12500
-    local_domain_baseline_radius_m: 25000
-    local_domain_sensitivity_radii_m: [20000, 35000]
+    local_domain_baseline_radius_m: 20000
+    local_domain_sensitivity_radii_m: []
     minimum_flow_domain_margin_local_grid_scales: 2
-    radius_35000_requires_expanded_flow_domain: true
     geometry_generator: anchor_centered_azimuthal_equidistant_buffer_intersect_static_ocm_ocean_polygon
     local_domain_overlap_policy: allowed_preserve_site_identity
     legacy_candidate_bbox_lon_lat_provenance_only: [121.91, 122.06, 25.00, 25.15]
@@ -177,12 +174,12 @@ study_sites:
     study_site_name_zh: 龜山島西側
     analysis_region_id: A
     flow_domain_id: northeast_taiwan_common_cache_v3
+    formal_release_flow_domain_id: northeast_taiwan_common_cache_v3
     anchor_lonlat: [121.951606, 24.843127]
     receptor_core_radius_m: 12500
-    local_domain_baseline_radius_m: 25000
-    local_domain_sensitivity_radii_m: [20000, 35000]
+    local_domain_baseline_radius_m: 20000
+    local_domain_sensitivity_radii_m: []
     minimum_flow_domain_margin_local_grid_scales: 2
-    radius_35000_requires_expanded_flow_domain: true
     geometry_generator: anchor_centered_azimuthal_equidistant_buffer_intersect_static_ocm_ocean_polygon
     local_domain_overlap_policy: allowed_preserve_site_identity
     legacy_candidate_bbox_lon_lat_provenance_only: [121.81, 121.97, 24.76, 24.92]
@@ -200,12 +197,81 @@ study_sites:
     study_site_name_zh: 後灣海生館
     analysis_region_id: C
     flow_domain_id: houwan_nmmba_cache_v3
+    # C 區受體 anchor 與 12.5 km core 是位置候選的初始範圍；紅框子區另以兩個
+    # receptor_candidate_regions 明示西岸／南端配額。紅框只限制受體選點，不能取代
+    # OCM static ocean、persistent wet/dry、NWW 四角或垂向 zcor 支援檢查。
+    anchor_lonlat: [120.893355, 22.0]
+    receptor_core_radius_m: 12500
     anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
     local_domain_policy: same_as_flow_domain
+    receptor_candidate_selection:
+      policy_id: houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1
+      require_each_region: true
+      total_horizontal_count: 5
+      distance_coordinate_system: local_azimuthal_equidistant_m
+      boundary_policy: approved_C_flow_local_intersection_plus_persistent_wet_margin
+    # 座標由研究者提供的 overview 手繪紅框數位化而來；影像 hash 與像素範圍讓
+    # polygon 可以由同一附件重建。這是候選區 provenance，不是 forcing 支援證據。
+    receptor_candidate_regions_provenance:
+      source_artifact: horizontal_overview.png
+      source_sha256: 0c28a19f9707f5d4717799b4936bb99195a868b76aec1322c21c725192132beb
+      image_width_px: 1236
+      image_height_px: 832
+      plot_bbox_pixels_xy: [65, 46, 1180, 789]
+      plot_bbox_lon_lat: [120.16671, 121.62, 21.550844, 22.449156]
+      digitization_method: manual_red_frame_vertex_trace_v1
+    receptor_candidate_regions:
+      - region_id: c_west_coast
+        name_zh: 屏東西南沿岸紅框
+        allocation_count: 2
+        coordinate_reference: EPSG:4326
+        geometry:
+          type: Polygon
+          coordinates:
+            - - [120.67242885, 22.13359822]
+              - [120.62941668, 22.12876208]
+              - [120.60465210, 22.09128204]
+              - [120.58770791, 22.03203939]
+              - [120.58119091, 21.97158771]
+              - [120.58249431, 21.93652573]
+              - [120.59683170, 21.91718120]
+              - [120.64636087, 21.90025472]
+              - [120.66591186, 21.93652573]
+              - [120.68024925, 21.98246901]
+              - [120.70240703, 22.02720326]
+              - [120.70501383, 22.05742910]
+              - [120.69328324, 22.09490914]
+              - [120.67242885, 22.13359822]
+      - region_id: c_south_tip
+        name_zh: 恆春半島南端近岸紅框
+        allocation_count: 3
+        coordinate_reference: EPSG:4326
+        geometry:
+          type: Polygon
+          coordinates:
+            - - [120.71153083, 21.94619800]
+              - [120.77018378, 21.95345220]
+              - [120.82883674, 21.95345220]
+              - [120.86663532, 21.93773477]
+              - [120.89531010, 21.91597216]
+              - [120.91616448, 21.88816439]
+              - [120.92007468, 21.86035661]
+              - [120.87706251, 21.84584821]
+              - [120.83796054, 21.83617594]
+              - [120.77409398, 21.83496691]
+              - [120.72065462, 21.84463918]
+              - [120.68546284, 21.86640178]
+              - [120.67633905, 21.89300052]
+              - [120.67894585, 21.92080830]
+              - [120.71153083, 21.94619800]
   - study_site_id: lienchiang
     study_site_name_zh: 連江
     analysis_region_id: D
     flow_domain_id: lienchiang_common_cache_v3
+    # D 區先以 flow-domain 中心作為明示受體 anchor，再以 12.5 km 公尺制核心限制
+    # 水平候選。實際 receptor 仍須通過 static/persistent wet 與逐時垂向支援 gate。
+    anchor_lonlat: [119.95, 26.2]
+    receptor_core_radius_m: 12500
     anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
     local_domain_policy: same_as_flow_domain
 
@@ -448,6 +514,10 @@ boundaries:
     - bed_reflect
     - near_bed_deposit
     - expanded_domain
+  # expanded_domain 仍是 B-D 的既有規劃 case；本期 A 區 v3/20 km policy 明示排除。
+  # 此欄只登錄 runner 未來應消費的研究 scope，並不表示 sensitivity 已執行。
+  sensitivity_case_region_exclusions:
+    expanded_domain: [A]
 
 scenarios:
   receptor_manifest: null

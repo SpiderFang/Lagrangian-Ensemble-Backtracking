@@ -66,6 +66,10 @@ from .pilot_config import (
     create_pilot_execution_config,
     validate_pilot_execution_config,
 )
+from .pilot_matrix_validation import (
+    canonical_pilot_matrix_json,
+    validate_pilot_matrix,
+)
 from .preflight import run_preflight
 from .provenance import collect_code_provenance
 from .report_release import validate_report_release
@@ -284,6 +288,22 @@ def _pilot_config_validate_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
     )
+    return parser
+
+
+def _pilot_matrix_validate_parser() -> argparse.ArgumentParser:
+    """建立跨區 pilot 試跑共同設定驗證 parser。
+
+    每個 positional root 都必須是已發布 run workspace，且同時含有 immutable
+    ``run_plan.json`` 與 ``normalized_config.json``。validator 只做 JSON／設定 contract
+    比較，不讀 trajectory、forcing 或 checkpoint 大檔；至少兩個 root 的要求由公開
+    validator 回報，讓 CLI 能穩定輸出 JSON 並使用狀態 2 表示拒絕。
+    """
+
+    parser = argparse.ArgumentParser(
+        description="驗證多個區域 pilot run 是否使用相同試跑設定與部署版本"
+    )
+    parser.add_argument("run_roots", nargs="+", type=Path, metavar="RUN_ROOT")
     return parser
 
 
@@ -995,6 +1015,41 @@ def run_pilot_config_validate(argv: Sequence[str] | None = None) -> int:
     return 0 if result.get("valid") is True else 2
 
 
+def run_pilot_matrix_validate(argv: Sequence[str] | None = None) -> int:
+    """唯讀比較多個 pilot run 的共同設定並輸出 canonical JSON。
+
+    run roots 必須由 caller 明示；validator 會在每個 root 內讀取 immutable plan/config，
+    只將 ``valid`` 映射成 shell 狀態 0 或 2。輸出採 canonical JSON（排序 key、無多餘
+    空白），讓 SERVER runbook 可以直接保存、hash 或與其他區域的檢查結果比對。
+    """
+
+    args = _pilot_matrix_validate_parser().parse_args(argv)
+    report = validate_pilot_matrix(args.run_roots)
+    print(canonical_pilot_matrix_json(report))
+    return 0 if report.get("valid") is True else 2
+
+
+def _current_design_version() -> str:
+    """取得 behavior manifest 的目前設計版本，避免 CLI 固定寫死歷史版本。
+
+    ``CURRENT_DESIGN_VERSION`` 由設定模組維護，代表目前可接受的 material component
+    identity。延後 import 是為了讓設定模組在載入期間不形成循環依賴；若舊部署尚未提供
+    常數，則從同一個 source checkout 的 example config 讀取其 design_version，仍拒絕
+    回退到歷史 v2 或自行猜測版本。
+    """
+
+    from . import config as config_module
+
+    current = getattr(config_module, "CURRENT_DESIGN_VERSION", None)
+    if isinstance(current, str) and current.strip() and current == current.strip():
+        return current
+    example_path = Path(__file__).resolve().parents[2] / "configs" / "lagrangian_backtracking.example.yaml"
+    try:
+        return load_config(example_path, formal_release=False).design_version
+    except Exception as exc:
+        raise RuntimeError("config 未提供 CURRENT_DESIGN_VERSION，且無法讀取 example config") from exc
+
+
 def run_behavior_manifest(argv: Sequence[str] | None = None) -> int:
     """原子寫出十種非上浮海廢代理；既有檔案不覆寫。
 
@@ -1009,7 +1064,7 @@ def run_behavior_manifest(argv: Sequence[str] | None = None) -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": "2.0.0",
-        "design_version": "design_baseline_v2_non_rising_oca_proxy",
+        "design_version": _current_design_version(),
         "classification_source": ("海洋保育署 iOcean 海洋廢棄物管理頁；2026-08-27 查閱；只作分類命名"),
         "velocity_unit": "m s-1; z positive-up; all values must be strictly negative",
         "velocity_source": "design_sensitivity_grid_not_oca_measurement",
@@ -1707,6 +1762,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parents=[_pilot_config_validate_parser()],
         add_help=False,
     )
+    subparsers.add_parser(
+        "pilot-matrix-validate",
+        parents=[_pilot_matrix_validate_parser()],
+        add_help=False,
+    )
     subparsers.add_parser("behavior-manifest", parents=[_behavior_manifest_parser()], add_help=False)
     subparsers.add_parser("synthetic-smoke", parents=[_synthetic_smoke_parser()], add_help=False)
     subparsers.add_parser("validate-shard", parents=[_validate_shard_parser()], add_help=False)
@@ -1774,6 +1834,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_pilot_config_create(command_argv)
     if parsed.command == "pilot-config-validate":
         return run_pilot_config_validate(command_argv)
+    if parsed.command == "pilot-matrix-validate":
+        return run_pilot_matrix_validate(command_argv)
     if parsed.command == "behavior-manifest":
         return run_behavior_manifest(command_argv)
     if parsed.command == "synthetic-smoke":
@@ -1874,3 +1936,9 @@ def benchmark_report_main() -> None:
     """benchmark-report console script wrapper。"""
 
     raise SystemExit(run_benchmark_report())
+
+
+def pilot_matrix_validate_main() -> None:
+    """pilot-matrix-validate console script wrapper。"""
+
+    raise SystemExit(run_pilot_matrix_validate())

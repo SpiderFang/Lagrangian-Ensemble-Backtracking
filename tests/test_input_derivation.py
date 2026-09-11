@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -323,12 +324,34 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    # 這組 coarse 8×10/2×2 mesh 只驗證既有 schema 連接，不能冒充新 policy 所要求的
+    # 三套 forcing 共同 margin 證據；明示 legacy policy 以保留 margin=0 的 synthetic
+    # fixture 語意與舊 geometry／scenario identity。
+    payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
+    payload["domains"][0]["expanded_domain_candidate_id"] = (
+        "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+    )
+    payload["domains"][0]["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
+    payload["domains"][0]["formal_release_flow_domain_id"] = None
+    payload["domains"][0]["formal_release_domain_status"] = "expanded_domain_generation_required"
     # 將 synthetic mesh 的 face scale 設為零 margin；正式資料仍由 config 登錄的兩格
     # margin gate 決定。這個測試只隔離 receptor／dynamic 的 schema 連接，不放寬 production
     # 預設值本身。
     for site in payload["study_sites"]:
         if site["analysis_region_id"] == "A":
+            site["formal_release_flow_domain_id"] = None
+            site["local_domain_baseline_radius_m"] = 25000
+            site["local_domain_sensitivity_radii_m"] = [20000, 35000]
             site["minimum_flow_domain_margin_local_grid_scales"] = 0
+            site["radius_35000_requires_expanded_flow_domain"] = True
+        if site["study_site_id"] == "houwan":
+            # 多數 synthetic 測試驗證舊版核心／全域 selector 的相容路徑；紅框契約
+            # 另由專用測試以明示 candidate regions 驗證，避免低解析度 fixture 用
+            # 不覆蓋西岸紅框的網格錯誤代表正式資料不足。
+            site.pop("receptor_candidate_regions", None)
+            site.pop("receptor_candidate_selection", None)
+            site.pop("receptor_candidate_regions_provenance", None)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
     months = [f"{year}{month:02d}" for year in (2024, 2025) for month in range(1, 13)]
@@ -342,8 +365,14 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
         # 5×4 receptor contract 選點。這是 synthetic fixture 的解析度調整，不代表
         # SERVER accepted mesh 的實際水平解析度。
         "B": ("hsinchu_cache_v3", (120.25, 120.65, 24.55, 24.95), (7, 7)),
-        "C": ("houwan_nmmba_cache_v3", (120.70, 121.10, 21.80, 22.20), (4, 4)),
-        "D": ("lienchiang_common_cache_v3", (119.75, 120.15, 26.00, 26.40), (4, 4)),
+        # C 區舊版相容測試會在 fixture 上另行明示 12.5 km receptor core；紅框專用測試
+        # 使用真實候選 polygon／配額契約，避免以低解析度 fixture 偽造 production
+        # 紅框的「候選不足」資料限制。
+        "C": ("houwan_nmmba_cache_v3", (120.70, 121.10, 21.80, 22.20), (7, 7)),
+        # D 區現在也明示 12.5 km core；提高 synthetic 網格解析度，避免 coarse face
+        # 尺度讓核心內只剩一個 persistent-wet face，這是 fixture 解析度限制而非正式
+        # receptor 配額的放寬。
+        "D": ("lienchiang_common_cache_v3", (119.75, 120.15, 26.00, 26.40), (7, 7)),
     }
     for domain in payload["domains"]:
         region = domain["analysis_region_id"]
@@ -1606,6 +1635,75 @@ def test_hsinchu_explicit_pilot_does_not_register_ocm_missing_00z() -> None:
         )
 
 
+@pytest.mark.parametrize("site_id", ["hsinchu", "houwan", "lienchiang"])
+def test_explicit_pilot_registry_accepts_each_bcd_single_site(site_id: str) -> None:
+    """版本化 registry 允許 B/C/D 各自單站，且固定相同 24 h／25 nodes 視窗。"""
+
+    parsed = input_derivation_module._parse_explicit_pilot_arrivals(
+        {site_id: "2024-01-02T01:00:00Z"}
+    )
+    assert tuple(parsed) == (site_id,)
+    explicit = parsed[site_id]
+    assert explicit.selection_scope == f"{site_id}_only"
+    assert input_derivation_module._explicit_pilot_window_times(explicit).size == 25
+
+
+def test_explicit_pilot_registry_requires_a_exact_pair() -> None:
+    """A 區 pilot 不能只替換一站或與 B/C/D 混合。"""
+
+    with pytest.raises(InputDerivationError, match="exact pair"):
+        input_derivation_module._parse_explicit_pilot_arrivals(
+            {"gongliao": "2024-01-02T01:00:00Z"}
+        )
+    with pytest.raises(InputDerivationError, match="exact pair"):
+        input_derivation_module._parse_explicit_pilot_arrivals(
+            {
+                "gongliao": "2024-01-02T01:00:00Z",
+                "guishan": "2024-01-02T01:00:00Z",
+                "hsinchu": "2024-01-02T01:00:00Z",
+            }
+        )
+
+
+def test_explicit_pilot_summary_preserves_a_pair_ids() -> None:
+    """A pair summary 必須列出兩站 arrival IDs，讓兩站 gap-safe override 各自綁定。"""
+
+    parsed = input_derivation_module._parse_explicit_pilot_arrivals(
+        {
+            "gongliao": "2024-01-02T01:00:00Z",
+            "guishan": "2024-01-02T01:00:00Z",
+        }
+    )
+    arrivals = []
+    for site_id, explicit in parsed.items():
+        replacement_id = f"replacement-{site_id}"
+        arrivals.append(
+            ArrivalTime(
+                arrival_time_id=replacement_id,
+                study_site_id=site_id,
+                time_utc_ns=explicit.time_utc_ns,
+                year=2024,
+                season="DJF",
+                tide_class=input_derivation_module.PILOT_EXPLICIT_TIDE_CLASS,
+                phase_or_event=input_derivation_module.PILOT_EXPLICIT_PHASE_OR_EVENT,
+                metadata={
+                    "pilot_replacement_policy_id": input_derivation_module.PILOT_EXPLICIT_WINDOW_POLICY_ID,
+                    "pilot_selection_scope": explicit.selection_scope,
+                    "pilot_replaced_arrival_time_id": f"original-{site_id}",
+                    "pilot_replacement_arrival_time_id": replacement_id,
+                    "explicit_pilot_window_start_utc": "2024-01-01T01:00:00Z",
+                    "explicit_pilot_window_end_utc": explicit.time_utc,
+                    "explicit_pilot_window_expected_step_count": 25,
+                },
+            )
+        )
+    summary = input_derivation_module._pilot_selection_summary(arrivals)
+    assert summary is not None
+    assert summary["site_ids"] == ["gongliao", "guishan"]
+    assert summary["arrival_time_ids"] == ["replacement-gongliao", "replacement-guishan"]
+    assert summary["selection_scope"] == "A_pair_only"
+
+
 @pytest.mark.parametrize("missing_product", ["OCM surface", "NWW3 analysis"])
 def test_explicit_pilot_rejects_middle_hour_missing_from_product_axis(missing_product: str) -> None:
     """三產品軸只要少一個視窗中間 exact-hour，就在 spatial sampling 前 fail closed。"""
@@ -1748,6 +1846,24 @@ def test_receptor_candidate_without_core_preserves_legacy_selection() -> None:
     assert select_horizontal_receptors_from_pool(actual_pool) == select_horizontal_receptors_from_pool(
         legacy_pool
     )
+
+
+def test_houwan_candidate_regions_keep_registered_geometry_and_2plus3_quota() -> None:
+    """C 區候選 helper 應保留兩個 GeoJSON 子區，並對錯誤配額 fail closed。"""
+
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG)
+    houwan = next(site for site in config.study_sites if site.study_site_id == "houwan")
+    specs = input_derivation_module._candidate_region_specs(houwan)
+    assert [spec.region_id for spec in specs] == ["c_west_coast", "c_south_tip"]
+    assert [spec.allocation_count for spec in specs] == [2, 3]
+    assert all(spec.geometry_lonlat.is_valid and spec.geometry_lonlat.area > 0.0 for spec in specs)
+
+    regions = deepcopy(houwan.receptor_candidate_regions)
+    assert regions is not None
+    regions[0]["allocation_count"] = 1
+    invalid_houwan = houwan.model_copy(update={"receptor_candidate_regions": regions})
+    with pytest.raises(InputDerivationError, match="配額總數"):
+        input_derivation_module._candidate_region_specs(invalid_houwan)
 
 
 def test_source_inventory_uses_structural_fingerprint_for_large_npy(
@@ -2007,7 +2123,18 @@ def test_expanded_candidate_without_registered_bbox_fails_closed() -> None:
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     a_domain = next(domain for domain in payload["domains"] if domain["analysis_region_id"] == "A")
-    candidate_id = a_domain["expanded_domain_candidate_id"]
+    # 這是 legacy expanded resolver 的回歸測試；新 v3 policy 不得含 candidate 欄位，
+    # 因此 fixture 先明示舊 policy 與候選，再移除 bbox 觸發原本的 fail-closed gate。
+    payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    a_domain["formal_domain_policy"] = "expanded_domain_v1"
+    candidate_id = "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+    a_domain["expanded_domain_candidate_id"] = candidate_id
+    a_domain["formal_release_flow_domain_id"] = candidate_id
+    a_domain["formal_release_domain_status"] = "approved"
+    a_domain["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
+    for site in payload["study_sites"]:
+        if site["analysis_region_id"] == "A":
+            site["formal_release_flow_domain_id"] = candidate_id
     a_domain.pop("expanded_bbox_lon_lat", None)
     inventory_flow_ids = {
         "A": candidate_id,
@@ -2019,6 +2146,139 @@ def test_expanded_candidate_without_registered_bbox_fails_closed() -> None:
         input_derivation_module._bind_inventory_flow_domains(
             payload,
             inventory_flow_ids=inventory_flow_ids,
+        )
+
+
+def test_v3_policy_binds_exact_source_and_preserves_pending_status() -> None:
+    """新 policy 的三套 inventory source 必須 exact v3，binding 不得 mint approved status。"""
+
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    result = input_derivation_module._bind_inventory_flow_domains(
+        payload,
+        inventory_flow_ids={
+            "A": "northeast_taiwan_common_cache_v3",
+            "B": "hsinchu_cache_v3",
+            "C": "houwan_nmmba_cache_v3",
+            "D": "lienchiang_common_cache_v3",
+        },
+    )
+    a_domain = next(domain for domain in result["domains"] if domain["analysis_region_id"] == "A")
+    assert a_domain["formal_release_flow_domain_id"] == "northeast_taiwan_common_cache_v3"
+    assert a_domain["bbox_lon_lat"] == [121.306315, 122.793685, 24.600844, 25.499156]
+    assert a_domain["formal_release_domain_status"] == "pending_common_support"
+    assert a_domain["formal_release_domain_status"] != "approved_source_bound_by_inventory"
+    assert {
+        site["formal_release_flow_domain_id"]
+        for site in result["study_sites"]
+        if site["analysis_region_id"] == "A"
+    } == {"northeast_taiwan_common_cache_v3"}
+
+
+def test_v3_policy_resolver_does_not_fallback_to_v4(tmp_path: Path) -> None:
+    """A 區 v3 缺失時即使同根目錄有 v4，也只能回報 v3 待載入，不得 fallback。"""
+
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG)
+    root = tmp_path / "ocm"
+    (root / "northeast_taiwan_common_cache_v4_lbt_south_expanded").mkdir(parents=True)
+    resolved = input_derivation_module._resolve_flow_product_id(config, "A", root, formal=False)
+    assert resolved == "northeast_taiwan_common_cache_v3"
+    with pytest.raises(InputDerivationError, match="exact northeast_taiwan_common_cache_v3"):
+        input_derivation_module._authoritative_flow_domain_bbox_lon_lat(
+            config.domains[0], "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+        )
+
+
+def _geometry_policy_test_products(
+    tmp_path: Path, config: ProjectConfig
+) -> dict[str, input_derivation_module._ProductData]:
+    """建立只含 A 區靜態 mesh 的 geometry 測試產品容器。
+
+    ``_geometry_payloads`` 對 B-D 只需要產品的識別資料；A 區則需要一個涵蓋固定 v3
+    bbox 的原生 face mesh，才能實際測試完整 local circle 的 pre-clip 檢查。這裡不建立
+    月份或 forcing time axis，因此不會把 geometry 單元測試誤當成 source coverage 驗收。
+    """
+
+    products: dict[str, input_derivation_module._ProductData] = {}
+    for domain in config.domains:
+        product_root = tmp_path / domain.analysis_region_id
+        grid_dir = product_root / domain.flow_domain_id / "grid"
+        if domain.analysis_region_id == "A":
+            node_lon, node_lat, faces = _rectangular_grid(
+                lon_min=domain.bbox_lon_lat[0],
+                lon_max=domain.bbox_lon_lat[1],
+                lat_min=domain.bbox_lon_lat[2],
+                lat_max=domain.bbox_lon_lat[3],
+                nx=8,
+                ny=10,
+            )
+            _write_ocm_domain(
+                product_root,
+                flow_domain_id=domain.flow_domain_id,
+                months=[],
+                node_lon=node_lon,
+                node_lat=node_lat,
+                faces=faces,
+            )
+        products[domain.analysis_region_id] = input_derivation_module._ProductData(
+            product="ocm_native",
+            flow_domain_id=domain.flow_domain_id,
+            root=product_root,
+            root_token=f"TEST_{domain.analysis_region_id}",
+            grid_dir=grid_dir,
+            grid_metadata={"cache_schema_version": "3.0.0"},
+            months=(),
+            canonical=SimpleNamespace(),
+            required_arrays=(),
+            source_file_records=(),
+        )
+    return products
+
+
+def test_v3_geometry_identity_and_preclip_fail_closed(tmp_path: Path) -> None:
+    """v3 geometry 必須帶 20 km identity，且越界 local 不得先 clip 後掩蓋。"""
+
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG)
+    products = _geometry_policy_test_products(tmp_path, config)
+    source_hashes = {"geometry-test": "a" * 64}
+    domain_payload, local_payload, open_payload, _, _ = input_derivation_module._geometry_payloads(
+        config=config,
+        products_by_region=products,
+        source_hashes=source_hashes,
+        strict=False,
+    )
+
+    a_domain = next(row for row in domain_payload["records"] if row["analysis_region_id"] == "A")
+    a_locals = [row for row in local_payload["records"] if row["analysis_region_id"] == "A"]
+    a_open = [
+        row
+        for row in open_payload["records"]
+        if row["analysis_region_id"] == "A" and row["owner_kind"] == "local_domain"
+    ]
+    assert a_domain["source_geometry_id"].endswith("_base_bbox_v3_local20km_20260909_v1")
+    assert {row["study_site_id"] for row in a_locals} == {"gongliao", "guishan"}
+    assert all("_local_domain_v3_local20km_20260909_v1" in row["source_geometry_id"] for row in a_locals)
+    assert all(
+        "_local_exterior_open_boundary_v3_local20km_20260909_v1" in row["source_geometry_id"]
+        for row in a_open
+    )
+    assert domain_payload["provenance"]["method_id"] == "server_v3_domain_bbox_geometry_v1"
+    assert local_payload["provenance"]["method_id"].endswith("v3_local20km_20260909_v1")
+    assert open_payload["provenance"]["method_id"].endswith("v3_local20km_20260909_v1")
+
+    drifted_sites = [
+        site.model_copy(update={"local_domain_baseline_radius_m": 50_000.0})
+        if site.study_site_id == "gongliao"
+        else site
+        for site in config.study_sites
+    ]
+    drifted_config = config.model_copy(deep=True, update={"study_sites": drifted_sites})
+    with pytest.raises(InputDerivationError, match="不得以 clip 隱藏越界"):
+        input_derivation_module._geometry_payloads(
+            config=drifted_config,
+            products_by_region=products,
+            source_hashes=source_hashes,
+            strict=False,
         )
 
 

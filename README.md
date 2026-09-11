@@ -28,8 +28,8 @@
 
 | 研究站點 | 流場區域 | 說明 |
 |---|---|---|
-| 貢寮 | A | 與龜山島共用 A 區流場資料；正式版須通過南擴與共同有效格網檢核 |
-| 龜山島西側 | A | 與貢寮共用 A 區流場資料，但局部區域、受體與統計獨立 |
+| 貢寮 | A | 使用 `northeast_taiwan_common_cache_v3` 與 `formal_domain_policy=v3_local20km_20260909_v1`；12.5 km 受體核心、20 km 局部區域，與龜山島共用最外層停止邊界，正式驗收尚待共同邊界餘裕證據 |
+| 龜山島西側 | A | 使用同一 v3 A 區海流資料與範圍規範；12.5 km 受體核心、20 km 局部區域，局部區域、受體與統計維持獨立 |
 | 新竹外海 | B | 使用 `hsinchu_cache_v3` 流場區域；local domain 仍等於 flow domain，水平受體候選限於 `[120.45, 24.75]` 半徑 12.5 km 核心；24 小時展示 pilot 入口與參數見[紀錄](docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md) |
 | 後灣海生館 | C | 使用 C 流場區域 |
 | 連江 | D | 使用 D 流場區域 |
@@ -38,7 +38,7 @@
 
 所有本專案沉降速度均為負值、物理方向以向上為正；不允許上升物性，也不對完全沉沒物體加入風壓效應。缺少密度、阻力、再懸浮參數時，不宣稱已完成沉積—再懸浮動力。
 
-貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。A 區正式使用的擴張區域仍須由 OCM／NWW3 共同有效格網與邊界餘裕證明，不能只改名稱或範圍框。
+貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。本期 A 區不南擴，沿用 `northeast_taiwan_common_cache_v3` 的 bbox `[121.306315,122.793685,24.600844,25.499156]`，以 anchor 半徑 12.5 km 的受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`，最外層停止邊界維持原 A 區設定。原先 25 km 基準、35 km 敏感度與南向擴張屬歷史規劃，移出本期；不自行加入 15 km 或 23 km case。舊 25 km 幾何、manifest、shard 與 hash 不沿用，必須依新規範重建。現有 v3 三類產品即使有 24 個月份目錄，也仍須由 `OCM native`、`OCM surface` 與 `NWW3` 的共同邊界餘裕證據完成實測驗收；目前程序只涵蓋受體的原生篩選，不能代替 20 km 邊界的三產品、兩共同格點證明，因此可先進行嚴格輸入準備，但正式驗收尚未通過、正式運算尚未開放。舊 `formal_domain_policy=expanded_domain_v1` 只保留舊設定相容讀取，不是本期 A 範圍。
 
 每個受體×到達配對的實際初始深度來自到達 UTC 的已驗證動態紀錄；不以模板深度代替所有到達時間。投影座標、公尺距離、步長限制、統計網格與軌跡計算使用公尺制座標，圖面可將公尺座標轉為經緯度顯示，但經緯度不進入粒子物理運算。
 
@@ -141,6 +141,16 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
+
+ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。
+四區的明示 pilot registry 共用 `2024-01-02T01:00:00Z`、24 小時回溯與 25 個逐時節點；A
+區必須同時選貢寮與龜山島，B／C／D 則各自選單站。既有試跑仍須以
+`pilot-matrix-validate` 檢查共同設定；目前 A 使用 `no_stokes`，B／C／D 使用
+`finite_depth_stokes`，因此不能把它們宣稱為同設定比較或正式研究結果。
+
+在 NFS 上，preview／figure 的 `.complete` 只表示該成果目錄已通過逐檔位元組、manifest、程式
+指紋與儲存閘門綁定，可供成果 reader 讀取；它不表示粒子 run 完成。run 的生命週期仍以
+`run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
 
 ## 6. 文件導覽
 

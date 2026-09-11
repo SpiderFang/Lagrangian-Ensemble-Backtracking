@@ -1259,9 +1259,10 @@ def _pilot_provenance(*, dirty: bool = False) -> CodeProvenance:
 def _formal_config(data: dict[str, Any], *, gap_safe: bool = False) -> ProjectConfig:
     """把小型 runtime fixture 補成 formal loader 可接受的設定 snapshot。
 
-    測試只把第一個 domain 換成 expanded formal ID，並填入正式 gate 所需的 manifest、
-    diffusion、時間與部署決策；scenario／geometry loader 仍由 monkeypatch 提供一筆小
-    fixture，避免建立 50,000 情境或讀取真實 forcing。
+    這是 legacy expanded-domain runtime fixture：只把第一個 domain 換成 expanded formal
+    ID，並填入正式 gate 所需的 manifest、diffusion、時間與部署決策；scenario／geometry
+    loader 仍由 monkeypatch 提供一筆小 fixture，避免建立 50,000 情境或讀取真實 forcing。
+    新 v3/20 km policy 的 formal gate 另由設定測試證明即使欄位填滿仍會阻擋。
     """
 
     base = data["config"]
@@ -1279,10 +1280,25 @@ def _formal_config(data: dict[str, Any], *, gap_safe: bool = False) -> ProjectCo
     domains = list(base.domains)
     domains[0] = domains[0].model_copy(
         update={
+            "formal_domain_policy": "expanded_domain_v1",
             "formal_release_flow_domain_id": "northeast_taiwan_common_cache_v4_lbt_south_expanded",
             "formal_release_domain_status": "approved",
+            "expanded_domain_candidate_id": "northeast_taiwan_common_cache_v4_lbt_south_expanded",
+            "expanded_bbox_lon_lat": [121.306315, 122.793685, 24.480000, 25.499156],
         }
     )
+    sites = [
+        site.model_copy(
+            update={
+                "formal_release_flow_domain_id": (
+                    "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+                    if site.analysis_region_id == "A"
+                    else site.formal_release_flow_domain_id
+                )
+            }
+        )
+        for site in base.study_sites
+    ]
     scenarios = base.scenarios.model_copy(
         update={
             "receptor_manifest": "manifests/receptor.json",
@@ -1329,8 +1345,12 @@ def _formal_config(data: dict[str, Any], *, gap_safe: bool = False) -> ProjectCo
     formal = base.model_copy(
         update={
             "config_status": "approved",
+            # 此 fixture 驗證 legacy expanded resolver；本期 v3 design 只能搭配
+            # v3_local20km_20260909_v1，不能以改 policy 偽裝成 expanded formal run。
+            "design_version": "design_baseline_v2_non_rising_oca_proxy",
             "inputs": inputs,
             "domains": domains,
+            "study_sites": sites,
             "scenarios": scenarios,
             "geometry": geometry,
             "physics": physics,

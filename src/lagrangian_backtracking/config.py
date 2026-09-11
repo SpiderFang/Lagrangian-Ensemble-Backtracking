@@ -2,9 +2,11 @@
 
 example config 同時保存已定案設計與尚待 SERVER／pilot 衍生的 ``null`` 欄位。開發模式
 允許這些欄位存在，以便合成測試與 pilot 前進；``formal_release=True`` 接受研究團隊核定的
-全部可得 2024–2025 資料契約，但仍拒絕缺少重建驗證、expanded A、M/時步/回溯期等
-manifest 的設定。這個分層避免把上游 ``trial_ready`` 名稱誤作外部補件阻擋，也不會讓
-尚未驗證的缺口重建被直接送入正式兩年批次。
+全部可得 2024–2025 資料契約，並依明示的 ``formal_domain_policy`` 套用來源範圍 gate。
+舊 ``expanded_domain_v1`` 維持 A 區 expanded source 的既有檢查；新的
+``v3_local20km_20260909_v1`` 在三套 forcing 共同有效格網與 20 km 邊界證據尚未由
+validator／producer 實際驗證前，必定 fail closed。這個分層避免把上游 ``trial_ready``
+名稱誤作外部補件阻擋，也不會讓尚未驗證的缺口重建被直接送入正式兩年批次。
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import json
 import math
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -35,6 +37,35 @@ EXPECTED_OCA_CATEGORIES_ZH = frozenset(
         "其他/可回收",
     }
 )
+
+# 設計版本是整個設定／manifest／checkpoint 身分的一部分，不能讓不同模組自行拼接
+# 版本字串。CURRENT_DESIGN_VERSION 代表本期 A 區 v3/20 km 與沉降基線；v2 只作為
+# 舊設定的相容邊界，並不表示目前範例仍採用 v2。凡是正式或 pilot 設定若使用 v3
+# design，A 區都必須明示對應的 versioned formal_domain_policy；反向也同樣成立。
+CURRENT_DESIGN_VERSION = "design_baseline_v3_non_rising_a_v3_local20_20260909"
+LEGACY_DESIGN_VERSION_V2 = "design_baseline_v2_non_rising_oca_proxy"
+# 提供較短的舊版本別名給既有外部工具／測試；兩個名稱代表完全相同的 v2 legacy
+# 字串，實際驗證仍集中在 _validate_design_domain_binding。
+LEGACY_DESIGN_VERSION = LEGACY_DESIGN_VERSION_V2
+
+# 這些識別碼是設定資料契約的一部分。``expanded_domain_v1`` 是未明示新政策的
+# 舊設定所採用的相容語意；它保留既有 A 區南擴 candidate／formal source 流程。
+# ``v3_local20km_20260909_v1`` 則只描述本期已決定的 A 區研究範圍：兩個站點共用
+# ``northeast_taiwan_common_cache_v3``，local 半徑為 20 km。後者尚未代表三套 forcing
+# 已完成共同有效網格與邊界驗證，因此正式發布 gate 仍會無條件阻擋。
+FORMAL_DOMAIN_POLICY_EXPANDED_V1 = "expanded_domain_v1"
+FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1 = "v3_local20km_20260909_v1"
+FormalDomainPolicy = Literal[
+    "expanded_domain_v1",
+    "v3_local20km_20260909_v1",
+]
+
+NORTHEAST_V3_FLOW_DOMAIN_ID = "northeast_taiwan_common_cache_v3"
+NORTHEAST_V3_BBOX_LON_LAT = (121.306315, 122.793685, 24.600844, 25.499156)
+NORTHEAST_V3_COMMON_FORCING_PRODUCTS = frozenset(
+    {"ocm_native", "ocm_surface", "nww3_analysis"}
+)
+NORTHEAST_V3_LOCAL_SITE_IDS = frozenset({"gongliao", "guishan"})
 
 
 def _validate_non_rising_material_contract(settling: Any, *, expected_count: int) -> None:
@@ -125,7 +156,13 @@ class StudyAreaConfig(StrictModel):
 
 
 class DomainConfig(StrictModel):
-    """單一 forcing domain 的 bbox、投影與發布角色。"""
+    """單一 forcing domain 的 bbox、投影與發布角色。
+
+    ``formal_domain_policy`` 是 versioned research scope，而不是檔案系統中產品是否
+    已驗收的旗標。缺少此欄位時固定回到 ``expanded_domain_v1``，讓既有設定維持原本
+    的 normalized payload／hash 語意；新設定必須明示 ``v3_local20km_20260909_v1``，
+    才會套用 A 區 v3 與 20 km local 的跨欄位契約。
+    """
 
     analysis_region_id: str
     analysis_region_name_zh: str
@@ -133,6 +170,7 @@ class DomainConfig(StrictModel):
     center_lonlat: tuple[float, float]
     bbox_lon_lat: tuple[float, float, float, float]
     metric_crs_policy: str
+    formal_domain_policy: FormalDomainPolicy = FORMAL_DOMAIN_POLICY_EXPANDED_V1
     current_domain_role: str | None = None
     formal_release_flow_domain_id: str | None = None
     formal_release_domain_status: str | None = None
@@ -184,6 +222,14 @@ class StudySiteConfig(StrictModel):
     local_domain_baseline_radius_m: float | None = None
     local_domain_sensitivity_radii_m: list[float] = Field(default_factory=list)
     local_domain_policy: str | None = None
+    # C 區研究者明示的候選子區以 GeoJSON mapping 保存，讓紅框數位化座標、2+3
+    # 配額、選點 policy 與來源影像 provenance 進入 normalized config hash。這些欄位
+    # 只限制 receptor 候選，不代表 OCM/NWW forcing 支援；實際 input derivation 仍須
+    # 與 approved flow/local geometry 交集，並通過 static ocean、persistent wet/dry、
+    # NWW 四角及垂向 zcor gate。未設定時保留其他站點的原有 local/flow selector。
+    receptor_candidate_regions: list[dict[str, Any]] | None = None
+    receptor_candidate_selection: dict[str, Any] | None = None
+    receptor_candidate_regions_provenance: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def validate_receptor_core_pair(self) -> StudySiteConfig:
@@ -385,12 +431,215 @@ class ProjectConfig(StrictModel):
         )
         if self.boundaries.other_site_local_domain_changes_study_site:
             raise ValueError("foreign-local crossing 不得改變 study_site_id")
+        self.assert_research_domain_policy()
         return self
 
-    def normalized_payload(self) -> dict[str, Any]:
-        """回傳排序前可 JSON 序列化內容，供 hash、manifest 與差異比較。"""
+    def assert_research_domain_policy(self) -> None:
+        """驗證研究範圍 policy 與 domain／site source binding 的完整契約。
 
-        return self.model_dump(mode="json", exclude_none=False)
+        ``expanded_domain_v1`` 維持既有行為：formal A 區可使用設定明示的 expanded
+        source，並由 ``assert_formal_release_ready`` 繼續執行原本的 formal gate。
+        ``v3_local20km_20260909_v1`` 只允許 A 區精確使用 ``northeast_taiwan_common_cache_v3``
+        與原始 bbox，且貢寮、龜山島必須各自保留 20,000 m local、12,500 m receptor core、
+        空的本期 local sensitivity 與三套 forcing 的 2 格 margin 宣告。這裡只檢查設定
+        內可判定的研究設計與來源綁定；三套產品的實際共同有效格網／20 km 邊界證據仍由
+        後續 validator／producer 產出，不能用 ``approved``、任意 boolean 或非空路徑繞過。
+
+        此方法會在 ``ProjectConfig`` schema 驗證及 input derivation 開始時呼叫，讓未知
+        policy、A 區錯誤 ID、半徑、核心或 margin 在任何 source I/O 前被拒絕。缺少
+        ``formal_domain_policy`` 的舊模型已由欄位預設為 ``expanded_domain_v1``，因此
+        不會把舊設定誤套用本期 v3 設計。
+        """
+
+        # 版本與 scope 必須雙向綁定。DomainConfig 的 default 只服務 v2 舊 YAML 的
+        # hash／載入相容性；若本期 v3 design 省略 policy，這裡不得把 default 當成
+        # v3，而要在任何 forcing I/O 前直接拒絕。反向若 policy 已寫成 v3，design
+        # 也必須 exact 使用目前唯一版本，避免以任意新舊字串借用本期研究範圍。
+        region_a_candidates = [
+            domain for domain in self.domains if domain.analysis_region_id == "A"
+        ]
+        if len(region_a_candidates) != 1:
+            raise ValueError("研究範圍版本綁定要求恰有一個 A 區 domain")
+        region_a_policy = region_a_candidates[0].formal_domain_policy
+        region_a_policy_explicit = "formal_domain_policy" in region_a_candidates[0].model_fields_set
+        if self.design_version == CURRENT_DESIGN_VERSION:
+            if (
+                not region_a_policy_explicit
+                or region_a_policy != FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+            ):
+                raise ValueError(
+                    f"{CURRENT_DESIGN_VERSION} 必須明示 A 區 formal_domain_policy="
+                    f"{FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1}"
+                )
+        elif region_a_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+            raise ValueError(
+                f"A 區 {FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1} 只能搭配 "
+                f"{CURRENT_DESIGN_VERSION}"
+            )
+        elif self.design_version != LEGACY_DESIGN_VERSION_V2:
+            raise ValueError(
+                "design_version 必須是目前 CURRENT_DESIGN_VERSION 或已登錄的 v2 legacy："
+                f"{CURRENT_DESIGN_VERSION}、{LEGACY_DESIGN_VERSION_V2}"
+            )
+
+        allowed_policies = {
+            FORMAL_DOMAIN_POLICY_EXPANDED_V1,
+            FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
+        }
+        invalid = [
+            f"{domain.analysis_region_id}={domain.formal_domain_policy!r}"
+            for domain in self.domains
+            if domain.formal_domain_policy not in allowed_policies
+        ]
+        if invalid:
+            raise ValueError("未知 formal_domain_policy：" + ", ".join(invalid))
+
+        v3_domains = [
+            domain
+            for domain in self.domains
+            if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+        ]
+        if not v3_domains:
+            return
+        if len(v3_domains) != 1 or v3_domains[0].analysis_region_id != "A":
+            raise ValueError("v3_local20km_20260909_v1 只能且必須套用 A 區")
+
+        region_a = v3_domains[0]
+        if region_a.flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID:
+            raise ValueError("v3_local20km_20260909_v1 的 A 區 flow_domain_id 必須 exact v3")
+        if region_a.formal_release_flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID:
+            raise ValueError("v3_local20km_20260909_v1 的 A 區 formal flow-domain 必須 exact v3")
+        if tuple(float(value) for value in region_a.bbox_lon_lat) != NORTHEAST_V3_BBOX_LON_LAT:
+            raise ValueError("v3_local20km_20260909_v1 的 A 區 bbox 必須維持 northeast v3 bbox")
+        if region_a.formal_release_domain_status != "pending_common_support":
+            raise ValueError(
+                "v3_local20km_20260909_v1 的 A 區 formal_release_domain_status 必須是 "
+                "pending_common_support"
+            )
+
+        # 新 policy 不接受任何 expanded candidate 欄位；即使同一根目錄仍有 v4，也不
+        # 能由 resolver 轉讀。這些欄位只在 legacy fixture／舊 expanded config 中存在。
+        expanded_fields = {
+            "expanded_domain_candidate_id",
+            "expanded_bbox_lon_lat",
+            "expanded_south_boundary_at_or_south_of_deg",
+            "radius_25000_formal_requires_expanded_domain",
+            "radius_35000_formal_requires_expanded_domain",
+        }
+        active_expanded = sorted(
+            field for field in expanded_fields if field in (region_a.model_extra or {})
+        )
+        if active_expanded:
+            raise ValueError(
+                "v3_local20km_20260909_v1 不得含 expanded candidate／mandatory 欄位："
+                + ", ".join(active_expanded)
+            )
+
+        domain_extra = region_a.model_extra or {}
+        domain_margin = domain_extra.get("minimum_common_forcing_margin_grid_cells")
+        if (
+            isinstance(domain_margin, bool)
+            or not isinstance(domain_margin, (int, float))
+            or not math.isfinite(float(domain_margin))
+            or not math.isclose(float(domain_margin), 2.0, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            raise ValueError(
+                "v3_local20km_20260909_v1 的 A 區 minimum_common_forcing_margin_grid_cells "
+                "必須明示為 2"
+            )
+        forcing_names = domain_extra.get("margin_required_for_forcings")
+        if (
+            not isinstance(forcing_names, (list, tuple))
+            or not all(isinstance(name, str) for name in forcing_names)
+            or set(forcing_names) != NORTHEAST_V3_COMMON_FORCING_PRODUCTS
+            or len(forcing_names) != len(NORTHEAST_V3_COMMON_FORCING_PRODUCTS)
+        ):
+            raise ValueError(
+                "v3_local20km_20260909_v1 必須明示 ocm_native、ocm_surface、nww3_analysis "
+                "三套 forcing margin"
+            )
+
+        sites_a = [site for site in self.study_sites if site.analysis_region_id == "A"]
+        if {site.study_site_id for site in sites_a} != NORTHEAST_V3_LOCAL_SITE_IDS:
+            raise ValueError("v3_local20km_20260909_v1 的 A 區必須恰含 gongliao 與 guishan")
+        for site in sites_a:
+            if site.flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID:
+                raise ValueError(f"{site.study_site_id} 的 v3 policy flow-domain 必須 exact v3")
+            if site.formal_release_flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID:
+                raise ValueError(f"{site.study_site_id} 的 v3 policy formal flow-domain 必須 exact v3")
+            if "radius_35000_requires_expanded_flow_domain" in (site.model_extra or {}):
+                raise ValueError(
+                    f"{site.study_site_id} 的 v3 policy 不得含 expanded radius mandatory 欄位"
+                )
+            if site.receptor_core_radius_m is None or not math.isclose(
+                float(site.receptor_core_radius_m), 12_500.0, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(f"{site.study_site_id} 的 v3 policy receptor core 必須是 12500 m")
+            if site.local_domain_baseline_radius_m is None or not math.isclose(
+                float(site.local_domain_baseline_radius_m), 20_000.0, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(f"{site.study_site_id} 的 v3 policy local radius 必須是 20000 m")
+            if site.local_domain_sensitivity_radii_m:
+                raise ValueError(
+                    f"{site.study_site_id} 的 v3 policy 本期 local sensitivity 必須是空列表"
+                )
+            site_extra = site.model_extra or {}
+            site_margin = site_extra.get("minimum_flow_domain_margin_local_grid_scales")
+            if (
+                isinstance(site_margin, bool)
+                or not isinstance(site_margin, (int, float))
+                or not math.isfinite(float(site_margin))
+                or not math.isclose(float(site_margin), 2.0, rel_tol=0.0, abs_tol=1e-12)
+            ):
+                raise ValueError(
+                    f"{site.study_site_id} 的 v3 policy local flow-domain margin 必須明示為 2"
+                )
+
+        exclusions = (self.boundaries.model_extra or {}).get("sensitivity_case_region_exclusions")
+        expanded_exclusion = exclusions.get("expanded_domain") if isinstance(exclusions, dict) else None
+        if not isinstance(expanded_exclusion, list) or expanded_exclusion != ["A"]:
+            raise ValueError(
+                "v3_local20km_20260909_v1 必須明示 expanded_domain 對 A 區的本期 scope exclusion"
+            )
+
+    def normalized_payload(self) -> dict[str, Any]:
+        """回傳排序前可 JSON 序列化內容，供 hash、manifest 與差異比較。
+
+        新增 policy 欄位採用明示即入 hash 的相容策略。對由舊 YAML 載入、未曾提供
+        ``formal_domain_policy`` 的 nested ``DomainConfig``，只在 canonical payload 移除
+        Pydantic 的預設值，保留舊 run／checkpoint 的 config hash；只要來源 YAML 明示
+        ``expanded_domain_v1`` 或本期 v3 policy，欄位便會留在 payload，形成有意義的
+        version boundary。
+        """
+
+        payload = self.model_dump(mode="json", exclude_none=False)
+        domain_payloads = payload.get("domains")
+        if isinstance(domain_payloads, list):
+            for domain, domain_payload in zip(self.domains, domain_payloads, strict=False):
+                if (
+                    isinstance(domain_payload, dict)
+                    and "formal_domain_policy" in domain_payload
+                    and "formal_domain_policy" not in domain.model_fields_set
+                ):
+                    del domain_payload["formal_domain_policy"]
+        # C 區候選設定是本期新增的 optional schema。舊 v2 YAML 沒有這三個 key 時，
+        # Pydantic 仍會以 default 建立欄位；若直接將 default 寫入 canonical payload，
+        # 會讓既有 run/checkpoint hash 無科學變更地漂移。因此只有 YAML 曾明示欄位時才
+        # 讓候選資料進入 hash；明示 null 仍保留，讓人工刪除／停用意圖可被追溯。
+        site_payloads = payload.get("study_sites")
+        if isinstance(site_payloads, list):
+            candidate_fields = (
+                "receptor_candidate_regions",
+                "receptor_candidate_selection",
+                "receptor_candidate_regions_provenance",
+            )
+            for site, site_payload in zip(self.study_sites, site_payloads, strict=False):
+                if not isinstance(site_payload, dict):
+                    continue
+                for field_name in candidate_fields:
+                    if field_name in site_payload and field_name not in site.model_fields_set:
+                        del site_payload[field_name]
+        return payload
 
     def config_hash(self) -> str:
         """以 canonical JSON 計算 SHA-256；與 YAML 排版及 key 順序無關。"""
@@ -405,9 +654,14 @@ class ProjectConfig(StrictModel):
 
         這裡只驗證設定本身；上游月份的 schema、可用 coverage、canonical UTC 與物理
         reconstruction skill 仍由 preflight／reconstruction manifests 驗證。兩層 gate 都
-        通過前，CLI 不得啟動正式 run。
+        通過前，CLI 不得啟動正式 run。對 ``v3_local20km_20260909_v1``，即使其他
+        formal 欄位全部填滿，也必須保留 ``v3/20km共同forcing邊界支援尚待實際驗證``
+        blocker；本輪沒有 validator／producer 可提供三套 forcing 的共同有效格網證據，
+        因此不可用 approved status、boolean 或非空 manifest path 偽造通過。舊的
+        ``expanded_domain_v1`` 則維持原本 expanded A formal ID gate。
         """
 
+        self.assert_research_domain_policy()
         blockers: list[str] = []
         if self.config_status != "approved":
             blockers.append("config_status 必須是 approved")
@@ -473,17 +727,22 @@ class ProjectConfig(StrictModel):
         if self.execution.checkpoint_interval_sweeps is None or self.execution.checkpoint_interval_sweeps < 1:
             blockers.append("正式 checkpoint_interval_sweeps 尚未核定")
         region_a = next(item for item in self.domains if item.analysis_region_id == "A")
-        if not region_a.formal_release_flow_domain_id:
-            blockers.append("A 區 expanded formal_release_flow_domain_id 尚未產出")
-        if region_a.formal_release_flow_domain_id == region_a.flow_domain_id:
-            blockers.append("A 區正式 domain 不得沿用僅供 pilot 的現行 v3 ID")
-        for site in self.study_sites:
-            if (
-                site.analysis_region_id == "A"
-                and site.formal_release_flow_domain_id is not None
-                and site.formal_release_flow_domain_id != region_a.formal_release_flow_domain_id
-            ):
-                blockers.append(f"{site.study_site_id} formal flow domain 未與 A 區 source 一致")
+        if region_a.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+            # 此 blocker 刻意不讀取任何「已批准」欄位；實際共同有效格網與 20 km
+            # 邊界證據尚未由 validator／producer 建立前，任何完整設定都不能啟動 formal。
+            blockers.append("v3/20km共同forcing邊界支援尚待實際驗證")
+        else:
+            if not region_a.formal_release_flow_domain_id:
+                blockers.append("A 區 expanded formal_release_flow_domain_id 尚未產出")
+            if region_a.formal_release_flow_domain_id == region_a.flow_domain_id:
+                blockers.append("A 區正式 domain 不得沿用僅供 pilot 的現行 v3 ID")
+            for site in self.study_sites:
+                if (
+                    site.analysis_region_id == "A"
+                    and site.formal_release_flow_domain_id is not None
+                    and site.formal_release_flow_domain_id != region_a.formal_release_flow_domain_id
+                ):
+                    blockers.append(f"{site.study_site_id} formal flow domain 未與 A 區 source 一致")
         if blockers:
             raise ValueError("正式發布設定未通過：" + "；".join(blockers))
 

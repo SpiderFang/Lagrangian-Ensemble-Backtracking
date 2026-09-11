@@ -9,7 +9,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from lagrangian_backtracking.config import ProjectConfig, load_config, resolve_flow_domain_id
+from lagrangian_backtracking.config import (
+    CURRENT_DESIGN_VERSION,
+    FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
+    LEGACY_DESIGN_VERSION_V2,
+    ProjectConfig,
+    load_config,
+    resolve_flow_domain_id,
+)
 from lagrangian_backtracking.scenarios import BASELINE_BEHAVIORS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +29,39 @@ def _payload() -> dict:
     value = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(value, dict)
     return value
+
+
+def _legacy_hash_payload() -> dict:
+    """由現行範例還原未含 policy 的舊設定快照，避免測試依賴 git 指令。"""
+
+    payload = deepcopy(_payload())
+    payload["config_status"] = "design_baseline_example"
+    payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    a_domain = payload["domains"][0]
+    a_domain.pop("formal_domain_policy", None)
+    a_domain["formal_release_flow_domain_id"] = None
+    a_domain["formal_release_domain_status"] = "expanded_domain_generation_required"
+    a_domain["expanded_domain_candidate_id"] = "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+    a_domain["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
+    a_domain["expanded_south_boundary_at_or_south_of_deg"] = 24.48
+    a_domain["radius_25000_formal_requires_expanded_domain"] = True
+    a_domain["radius_35000_formal_requires_expanded_domain"] = True
+    for site in payload["study_sites"]:
+        if site["analysis_region_id"] == "A":
+            site["formal_release_flow_domain_id"] = None
+            site["local_domain_baseline_radius_m"] = 25_000
+            site["local_domain_sensitivity_radii_m"] = [20_000, 35_000]
+            site["radius_35000_requires_expanded_flow_domain"] = True
+        if site["study_site_id"] in {"houwan", "lienchiang"}:
+            # 這兩個欄位是本期 v3/試跑回寫；舊 v2 snapshot 本來沒有它們，移除後
+            # 測試才是在比對原始 v2 canonical hash，而不是把新站點設定誤算進 legacy。
+            site.pop("anchor_lonlat", None)
+            site.pop("receptor_core_radius_m", None)
+        site.pop("receptor_candidate_regions", None)
+        site.pop("receptor_candidate_selection", None)
+        site.pop("receptor_candidate_regions_provenance", None)
+    payload["boundaries"].pop("sensitivity_case_region_exclusions", None)
+    return payload
 
 
 def test_example_config_has_fixed_scientific_counts() -> None:
@@ -51,8 +91,38 @@ def test_example_material_table_matches_runtime_baseline() -> None:
     """YAML 與程式內建表不可各自維護不同的材質、形狀、條件或速度。"""
 
     payload = _payload()
-    assert payload["design_version"] == "design_baseline_v2_non_rising_oca_proxy"
+    assert payload["design_version"] == "design_baseline_v3_non_rising_a_v3_local20_20260909"
     assert payload["physics"]["settling"]["material_classes"] == [asdict(item) for item in BASELINE_BEHAVIORS]
+
+
+def test_example_registers_c_and_d_receptor_anchors_and_c_red_frame_quota() -> None:
+    """目前試跑回寫的 C／D 受體 anchor、核心與 C 區 2+3 配額必須進入設定。"""
+
+    config = load_config(EXAMPLE_CONFIG)
+    sites = {site.study_site_id: site for site in config.study_sites}
+    assert config.design_version == CURRENT_DESIGN_VERSION
+    assert sites["houwan"].anchor_lonlat == (120.893355, 22.0)
+    assert sites["houwan"].receptor_core_radius_m == 12_500
+    assert sites["lienchiang"].anchor_lonlat == (119.95, 26.2)
+    assert sites["lienchiang"].receptor_core_radius_m == 12_500
+    assert sites["houwan"].receptor_candidate_selection["total_horizontal_count"] == 5
+    assert [item["allocation_count"] for item in sites["houwan"].receptor_candidate_regions] == [2, 3]
+
+
+def test_design_version_and_a_policy_binding_is_bidirectional() -> None:
+    """v3 design 缺 A policy 或 legacy design 借用 v3 policy 都必須 fail closed。"""
+
+    payload = _payload()
+    assert payload["domains"][0]["formal_domain_policy"] == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+    missing_policy = deepcopy(payload)
+    missing_policy["domains"][0].pop("formal_domain_policy")
+    with pytest.raises(ValueError, match="必須明示 A 區 formal_domain_policy"):
+        ProjectConfig.model_validate(missing_policy)
+
+    legacy_with_v3 = deepcopy(payload)
+    legacy_with_v3["design_version"] = LEGACY_DESIGN_VERSION_V2
+    with pytest.raises(ValueError, match="只能搭配"):
+        ProjectConfig.model_validate(legacy_with_v3)
 
 
 @pytest.mark.parametrize("invalid_velocity", [0.0, 0.001])
@@ -72,6 +142,18 @@ def test_config_hash_is_independent_of_mapping_order() -> None:
     reordered = dict(reversed(list(_payload().items())))
     second = ProjectConfig.model_validate(reordered)
     assert first.config_hash() == second.config_hash()
+
+
+def test_legacy_config_hash_preserves_omitted_policy_semantics() -> None:
+    """未含新 policy 欄位的既有設定必須保留舊 canonical hash 與 payload 語意。"""
+
+    config = ProjectConfig.model_validate(_legacy_hash_payload())
+    assert config.config_hash() == (
+        "d7151792e1432b919ce46a8f2a40571f7c78977a500d2d2f472cccdbc921d711"
+    )
+    assert config.domains[0].formal_domain_policy == "expanded_domain_v1"
+    assert "formal_domain_policy" not in config.domains[0].model_fields_set
+    assert "formal_domain_policy" not in config.normalized_payload()["domains"][0]
 
 
 def test_rejects_region_a_site_merging() -> None:
@@ -94,7 +176,7 @@ def test_rejects_reduced_scenario_count() -> None:
 
 
 def test_example_is_intentionally_blocked_for_formal_release() -> None:
-    """design example 尚缺 M、時步、horizon 與 expanded A ID，正式模式必須 fail closed。"""
+    """新 v3 design example 尚缺衍生 manifest，正式模式必須 fail closed。"""
 
     with pytest.raises(ValueError, match="approved reconstruction 或 gap-safe"):
         load_config(EXAMPLE_CONFIG, formal_release=True)
@@ -130,12 +212,26 @@ def test_legacy_checkpoint_interval_field_is_rejected_locally() -> None:
 
 
 def test_flow_domain_resolver_selects_formal_release_id_only_in_formal_mode() -> None:
-    """A 區 formal 使用 expanded ID；pilot 與 B-D 維持各自 base flow-domain。"""
+    """legacy expanded policy 的 A 區 formal 使用 expanded ID；pilot 維持 base。"""
 
     payload = _payload()
+    # expanded_domain_v1 是 v2 legacy scope；v3 design 必須和本期 v3 policy 雙向綁定，
+    # 不可藉改 policy 將現行 v3 config 降回舊來源。
+    payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
     payload["domains"][0]["formal_release_flow_domain_id"] = (
         "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     )
+    payload["domains"][0]["formal_release_domain_status"] = "approved"
+    payload["domains"][0]["expanded_domain_candidate_id"] = (
+        "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+    )
+    payload["domains"][0]["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
+    for site in payload["study_sites"]:
+        if site["analysis_region_id"] == "A":
+            site["formal_release_flow_domain_id"] = (
+                "northeast_taiwan_common_cache_v4_lbt_south_expanded"
+            )
     config = ProjectConfig.model_validate(payload)
     assert resolve_flow_domain_id(config, "A") == "northeast_taiwan_common_cache_v3"
     assert (
@@ -143,6 +239,100 @@ def test_flow_domain_resolver_selects_formal_release_id_only_in_formal_mode() ->
         == "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     )
     assert resolve_flow_domain_id(config, "B", formal=True) == "hsinchu_cache_v3"
+
+
+def test_v3_local20_policy_loads_but_formal_release_stays_blocked() -> None:
+    """A 區核准的 v3/20 km scope 可載入，但共同 forcing 邊界未驗證時必須阻擋 formal。"""
+
+    config = load_config(EXAMPLE_CONFIG)
+    assert config.domains[0].formal_domain_policy == "v3_local20km_20260909_v1"
+    assert resolve_flow_domain_id(config, "A", formal=True) == "northeast_taiwan_common_cache_v3"
+    with pytest.raises(ValueError, match="v3/20km共同forcing邊界支援尚待實際驗證"):
+        config.assert_formal_release_ready()
+
+
+def test_v3_formal_gate_ignores_fake_approved_evidence() -> None:
+    """新 policy 即使填滿 approved／path 欄位，也不得偽造共同 forcing 邊界證據。"""
+
+    payload = _payload()
+    payload["config_status"] = "approved"
+    payload["inputs"].update(
+        {
+            "ocm_gap_safe_arrival_manifest": "manifests/fake-ocm-gap-safe.json",
+            "nww_full_hourly_analysis_manifest": "manifests/fake-nww-hourly.json",
+        }
+    )
+    payload["scenarios"].update(
+        {
+            "members_per_scenario": 64,
+            "master_seed": 20260909,
+            "receptor_manifest": "manifests/fake-receptor.json",
+            "arrival_time_manifest": "manifests/fake-arrival.json",
+            "material_manifest": "manifests/fake-material.json",
+            "receptor_arrival_initial_condition_manifest": "manifests/fake-initial.json",
+        }
+    )
+    payload["geometry"].update(
+        {
+            "domain_manifest": "manifests/fake-domain.json",
+            "local_domain_manifest": "manifests/fake-local.json",
+            "open_boundary_manifest": "manifests/fake-open.json",
+            "receptor_manifest": "manifests/fake-receptor-geometry.json",
+        }
+    )
+    payload["physics"]["settling"]["material_manifest"] = "manifests/fake-material.json"
+    payload["physics"]["horizontal_diffusion"]["constant_kh_m2ps"] = 1.0
+    payload["physics"]["vertical_diffusion"]["constant_kz_m2ps"] = 0.001
+    payload["forcing"]["ocm"]["wetdry_semantics_decision_status"] = "approved"
+    payload["integration"].update(
+        {
+            "output_interval_seconds": 3600.0,
+            "dt_min_seconds": 30.0,
+            "dt_max_seconds": 300.0,
+        }
+    )
+    payload["boundaries"].update({"max_backtrack_days": 7.0, "maximum_step_count": 20_160})
+    payload["execution"].update({"shard_scenario_count": 1_000, "checkpoint_interval_sweeps": 10})
+
+    config = ProjectConfig.model_validate(payload)
+    with pytest.raises(ValueError, match="v3/20km共同forcing邊界支援尚待實際驗證"):
+        config.assert_formal_release_ready()
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (
+            ("domains", 0, "formal_release_flow_domain_id"),
+            "northeast_taiwan_common_cache_v4",
+            "formal flow domain",
+        ),
+        (("study_sites", 0, "local_domain_baseline_radius_m"), 35_000, "local radius"),
+        (("study_sites", 1, "receptor_core_radius_m"), 20_000, "receptor core"),
+        (("study_sites", 0, "local_domain_sensitivity_radii_m"), [35_000], "sensitivity"),
+        (("study_sites", 0, "radius_35000_requires_expanded_flow_domain"), True, "expanded radius mandatory"),
+        (("domains", 0, "minimum_common_forcing_margin_grid_cells"), 0, "margin"),
+    ],
+)
+def test_v3_local20_policy_rejects_scope_drift(
+    path: tuple[str, int, str], value: object, message: str
+) -> None:
+    """v3 policy 的來源、半徑、sensitivity 與 margin 不能退回未核准的研究設計。"""
+
+    payload = _payload()
+    section, index, field = path
+    payload[section][index][field] = value
+    with pytest.raises(ValueError, match=message):
+        ProjectConfig.model_validate(payload)
+
+
+def test_v3_local20_policy_rejects_unknown_policy() -> None:
+    """未知 policy 不得由 extra=allow 靜默變成 legacy 或 v3。"""
+
+    payload = _payload()
+    payload["domains"][0]["formal_domain_policy"] = "v3_local20km_unregistered"
+    with pytest.raises(ValueError, match="formal_domain_policy"):
+        ProjectConfig.model_validate(payload)
 
 
 @pytest.mark.parametrize("missing_field", ["anchor_lonlat", "receptor_core_radius_m"])

@@ -9,11 +9,17 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
+from test_pilot_matrix_validation import _write_run as _write_pilot_matrix_run
 from test_run_control import _first_shard, _request, _workspace
 
 import lagrangian_backtracking.cli as cli
 from lagrangian_backtracking.cli import main
+from lagrangian_backtracking.config import load_config
+from lagrangian_backtracking.manifests import load_material_manifest
 from lagrangian_backtracking.run_control import RunController, RunExecutionSummary
+
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,13 +111,14 @@ def test_integrated_synthetic_smoke_and_validator(tmp_path: Path) -> None:
 
 
 def test_behavior_manifest_has_ten_records(tmp_path: Path) -> None:
-    """CLI 產生的十類代理須具名、可追溯且全部嚴格沉降。"""
+    """CLI 產生的十類代理須具名、可追溯、版本同步且能被 config loader 接受。"""
 
     output = tmp_path / "behaviors.json"
     assert main(["behavior-manifest", "--output", str(output)]) == 0
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["schema_version"] == "2.0.0"
-    assert payload["design_version"] == "design_baseline_v2_non_rising_oca_proxy"
+    config = load_config(EXAMPLE_CONFIG, formal_release=False)
+    assert payload["design_version"] == config.design_version
     assert payload["positive_or_zero_velocity_policy"] == "reject_config"
     assert len(payload["records"]) == 10
     assert len({item["oca_category_zh"] for item in payload["records"]}) == 10
@@ -119,6 +126,25 @@ def test_behavior_manifest_has_ten_records(tmp_path: Path) -> None:
     assert {item["behavior_class"] for item in payload["records"]} == {"sinking"}
     assert all(item["material_family_zh"] for item in payload["records"])
     assert all(item["representative_shape_zh"] for item in payload["records"])
+    assert len(load_material_manifest(output, config, formal=False)) == 10
+
+
+def test_pilot_matrix_validate_cli_outputs_canonical_json_and_exit_codes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """整合 CLI 應比較至少兩個 root，輸出 canonical JSON 並以 0／2 回報。"""
+
+    first = _write_pilot_matrix_run(tmp_path / "matrix-a")
+    second = _write_pilot_matrix_run(tmp_path / "matrix-b")
+    assert main(["pilot-matrix-validate", str(first), str(second)]) == 0
+    rendered = capsys.readouterr().out
+    assert rendered == rendered.strip() + "\n"
+    payload = json.loads(rendered)
+    assert payload["valid"] is True
+    assert payload["run_count"] == 2
+    assert payload["errors"] == []
+    assert main(["pilot-matrix-validate", str(first)]) == 2
+    assert json.loads(capsys.readouterr().out)["valid"] is False
 
 
 def test_inputs_build_cli_always_forwards_strict_and_preserves_formal_flag(

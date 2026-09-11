@@ -1,17 +1,17 @@
-"""由已完成的 B 區 preview 獨立重繪 legacy 或新版成果圖及來源清單。
+"""由已完成的 A／B／C／D 四區五站 preview 獨立重繪 legacy 或新版成果圖及來源清單。
 
 預設 ``legacy`` 只輸出原契約的兩張水平圖；指定 ``--style baytrace`` 才增加區域／
 局部水平、垂向高度及停止原因四張新版圖，並各自保存對應的繁中 README 與 manifest。
 
 本模組只讀既有 preview 目錄中的
 ``manifest.json``、``summary.json``、``particles.csv`` 與 ``observations.csv``，
-以及呼叫端明示的已驗收 B 區 domain/open-boundary manifest 和 CRS84 海岸
+以及呼叫端明示的已驗收站點 domain/open-boundary manifest 和 CRS84 海岸
 FeatureCollection。它不讀海流或波浪陣列、不重新取樣、不重新積分，也不改寫任何
 輸入檔。回傳資料仍保留 CSV 的全部欄位與列順序，供後續繪圖階段使用原始粒子、
 模型保存紀錄及 summary 的原始水平面板順序。
 
-domain/open manifest 的語意雜湊沿用專案既有 ``manifests._read_json``；B 區 domain
-與 ``hsinchu_cache_v3`` flow open owner 必須同時符合 preview summary 的
+domain/open manifest 的語意雜湊沿用專案既有 ``manifests._read_json``；各區 domain
+與各自 flow open owner 必須同時符合 preview summary 的
 ``geometry_canonical_hashes``。海岸資料只作地理參考線，不被當成流場有效網格或
 粒子遮罩。命令列只建立全新輸出目錄；來源前後 SHA-256 必須相同，PNG、README
 與 JSON 清單皆以排他建立方式落檔。失敗保留新目錄供診斷，不清理或覆寫原始結果。
@@ -24,6 +24,7 @@ import csv
 import json
 import math
 import shlex
+import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,67 @@ from shapely.geometry import LineString, MultiPolygon, Polygon, shape
 from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.manifests import _read_json
 from lagrangian_backtracking.outputs import sha256_file
+from lagrangian_backtracking.pilot_preview import (
+    _acquire_nfs_publish_lock,
+    _canonical_json_bytes,
+    _publish_nfs_marker_preview,
+    _release_nfs_publish_lock,
+    _safe_path,
+    _validate_staged_preview,
+    _verified_storage_gate_evidence,
+    validate_published_artifact,
+    validate_published_preview,
+)
+
+
+# 預覽成果會保存可重建的 shell 命令，但不能把本機或 SERVER 的實際絕對路徑寫入
+# README／manifest。這四個 LBT_* 根目錄必須先由 SERVER 儲存政策閘門驗證；命令執行時
+# 再由 shell 將它們分別提供給 uv、Matplotlib、XDG 快取與暫存檔，且在變數未設定時
+# 立即停止，避免重建時回退到未驗證的專案相對路徑或主機暫存區。
+def _verified_server_cache_prefix() -> str:
+    """建立使用已驗證 NFS 根目錄的 fail-closed shell 環境前綴。
+
+    README 與 manifest 只能保存環境變數名稱，不能保存產製者主機的實際路徑。
+    shell ``:?`` 展開會在任一根目錄未設定時中止重建命令，確保操作端先完成
+    SERVER 儲存政策閘門，再把同一組四個根目錄提供給 uv、Matplotlib、XDG
+    快取與暫存檔。``PYTHONDONTWRITEBYTECODE`` 則避免預覽重建把未登錄的
+    Python bytecode 寫入結果或程式目錄。
+    """
+
+    return (
+        'UV_CACHE_DIR="${LBT_UV_CACHE_ROOT:?set verified NFS root}" '
+        'MPLCONFIGDIR="${LBT_MPL_CACHE_ROOT:?set verified NFS root}" '
+        'XDG_CACHE_HOME="${LBT_XDG_CACHE_ROOT:?set verified NFS root}" '
+        'TMPDIR="${LBT_TMP_ROOT:?set verified NFS root}" '
+        "PYTHONDONTWRITEBYTECODE=1 "
+    )
+
+
+def _validate_coastline_coverage(domain_geometry: Polygon, land_geometries: Sequence[Any]) -> None:
+    """驗證海岸資料的整體 bounds 涵蓋 domain，且至少有一個 land feature 相交。
+
+    海岸 GeoJSON 只作經緯度底圖參照，不能被當成 forcing mask；這個 gate 的目的只是
+    防止誤傳另一區或截短的海岸檔，讓圖面外框與底圖空間範圍可被解讀。先以所有有效
+    feature 的 bounds 組成涵蓋範圍，再要求至少一個 feature 與 domain 相交；不以
+    feature 數量或單一 polygon 的大小代替五站各自的 domain 綁定。
+    """
+
+    if not land_geometries:
+        raise ValueError("海岸 GeoJSON 不得為空")
+    coastline_min_x = min(float(geometry.bounds[0]) for geometry in land_geometries)
+    coastline_min_y = min(float(geometry.bounds[1]) for geometry in land_geometries)
+    coastline_max_x = max(float(geometry.bounds[2]) for geometry in land_geometries)
+    coastline_max_y = max(float(geometry.bounds[3]) for geometry in land_geometries)
+    domain_min_x, domain_min_y, domain_max_x, domain_max_y = domain_geometry.bounds
+    if not (
+        coastline_min_x <= domain_min_x
+        and coastline_min_y <= domain_min_y
+        and coastline_max_x >= domain_max_x
+        and coastline_max_y >= domain_max_y
+    ):
+        raise ValueError("海岸資料 bounds 未涵蓋站點 domain")
+    if not any(geometry.intersects(domain_geometry) for geometry in land_geometries):
+        raise ValueError("海岸資料沒有 land feature 與站點 domain 相交")
 
 
 def load_plot_inputs(
@@ -42,6 +104,8 @@ def load_plot_inputs(
     domain_path: str | Path,
     open_path: str | Path,
     coastline_path: str | Path,
+    *,
+    storage_gate_evidence: str | Path | None = None,
 ) -> dict[str, Any]:
     """讀取並核對海岸版圖面輸入，回傳不含重新取樣資料的唯讀組合。
 
@@ -50,20 +114,23 @@ def load_plot_inputs(
     欄位刪減，列中的文字值也原樣保留，讓後續繪圖仍可追溯到原 preview。
 
     ``domain_path`` 與 ``open_path`` 必須是 schema 1.0.0、approved 的 JSON。只選取
-    analysis region ``B`` 的 domain record 及其 ``flow_domain`` open record，並以
+    summary 指定 analysis region 的 domain record 及其 ``flow_domain`` open record，並以
     summary 的 canonical geometry hash 綁定；open line 還必須與 domain polygon
-    exterior 相等，避免把 A 區或 local record 誤畫成 B 區外框。海岸 GeoJSON 必須
+    exterior 相等，避免把其他區或 local record 誤畫成目前站點外框。海岸 GeoJSON 必須
     明示 OGC CRS84（座標順序為 longitude、latitude），每個 land feature 轉為
     Shapely Polygon/MultiPolygon。載入器不繪圖；繪圖函式可填灰色背景，但不以陸地
     判定粒子是否有效。
 
-    回傳包含原始 payload、CSV 全列、B 區 Shapely 幾何、以 summary 中心建立的
+    若 preview 由 NFS completion-marker 協定發布，必須先驗證 ``.complete``、manifest
+    SHA、Git／dirty provenance 與 storage gate binding；未完成目錄不會進入 CSV reader。
+    回傳包含原始 payload、CSV 全列、站點 Shapely 幾何、以 summary 中心建立的
     ``DomainProjection`` 與原始／語意 SHA。CSV 附 bytes 計數，完整檔案大小由 build
     wrapper 記錄。此函式只讀檔；缺檔拋出 ``OSError``，內容或來源綁定不符拋出
     ``ValueError``。
     """
 
     preview = Path(preview_dir)
+    validate_published_preview(preview, storage_gate_evidence=storage_gate_evidence)
     manifest, manifest_sha, manifest_canonical, _ = _read_json(preview / "manifest.json")
     if manifest.get("artifact_kind") != "pilot-preview-v1":
         raise ValueError("preview artifact_kind 不符")
@@ -131,31 +198,36 @@ def load_plot_inputs(
 
     region = projection_info.get("analysis_region_id")
     center = projection_info.get("center_lonlat")
-    if region != "B" or not isinstance(center, list) or len(center) != 2:
-        raise ValueError("preview projection 不是 B 區 AEQD")
-    domain_rows = [row for row in domain.get("records", []) if row.get("analysis_region_id") == "B"]
+    site_region, _, _, expected_flow_domain = _site_context(summary)
+    if region != site_region or not isinstance(center, list) or len(center) != 2:
+        raise ValueError("preview projection 不是已登錄站點 AEQD")
+    domain_rows = [
+        row for row in domain.get("records", []) if row.get("analysis_region_id") == site_region
+    ]
     if len(domain_rows) != 1:
-        raise ValueError("domain manifest 的 B record 不唯一")
+        raise ValueError("domain manifest 的站點 record 不唯一")
     domain_record = domain_rows[0]
     flow_domain_id = domain_record.get("flow_domain_id")
+    if flow_domain_id != expected_flow_domain:
+        raise ValueError("domain manifest 的 flow_domain_id 與五站契約不符")
     open_rows = [
         row
         for row in open_boundary.get("records", [])
         if row.get("owner_kind") == "flow_domain"
         and row.get("owner_id") == flow_domain_id
-        and row.get("analysis_region_id") == "B"
+        and row.get("analysis_region_id") == site_region
     ]
     if len(open_rows) != 1:
-        raise ValueError("open manifest 的 B flow owner 不唯一")
+        raise ValueError("open manifest 的站點 flow owner 不唯一")
     open_record = open_rows[0]
     domain_geometry = shape(domain_record["geometry"])
     open_geometry = shape(open_record["geometry"])
     if not isinstance(domain_geometry, Polygon) or not domain_geometry.is_valid:
-        raise ValueError("B domain geometry 不是有效 Polygon")
+        raise ValueError("站點 domain geometry 不是有效 Polygon")
     if not isinstance(open_geometry, LineString) or not open_geometry.is_valid:
-        raise ValueError("B flow open geometry 不是有效 LineString")
+        raise ValueError("站點 flow open geometry 不是有效 LineString")
     if not open_geometry.equals(domain_geometry.exterior):
-        raise ValueError("B flow open line 未與 domain exterior 相等")
+        raise ValueError("站點 flow open line 未與 domain exterior 相等")
 
     coastline, coastline_sha, coastline_canonical, _ = _read_json(coastline_path)
     # 本入口專用於使用者已確認的海岸檔，不以相同 feature 數量接受另一份地圖。
@@ -168,9 +240,10 @@ def load_plot_inputs(
     if (
         len(land_geometries) != 1905
         or not all(isinstance(geometry, (Polygon, MultiPolygon)) for geometry in land_geometries)
-        or not all(geometry.is_valid for geometry in land_geometries)
+        or not all(geometry.is_valid and not geometry.is_empty for geometry in land_geometries)
     ):
         raise ValueError("海岸 GeoJSON features 不符合既有 1905 筆有效 land polygons")
+    _validate_coastline_coverage(domain_geometry, land_geometries)
 
     return {
         "preview_manifest": manifest,
@@ -278,6 +351,62 @@ _TERMINAL_STATUSES = (
     "numerical_failure",
 )
 """停止圖的固定八狀態順序；即使計數為零也必須保留。"""
+
+_SITE_BY_REGION = {
+    "A": frozenset({"gongliao", "guishan"}),
+    "B": frozenset({"hsinchu"}),
+    "C": frozenset({"houwan"}),
+    "D": frozenset({"lienchiang"}),
+}
+_SITE_LABEL_ZH = {
+    "gongliao": "貢寮",
+    "guishan": "龜山島",
+    "hsinchu": "新竹外海",
+    "houwan": "後灣",
+    "lienchiang": "連江",
+}
+_FLOW_DOMAIN_BY_SITE = {
+    "gongliao": "northeast_taiwan_common_cache_v3",
+    "guishan": "northeast_taiwan_common_cache_v3",
+    "hsinchu": "hsinchu_cache_v3",
+    "houwan": "houwan_nmmba_cache_v3",
+    "lienchiang": "lienchiang_common_cache_v3",
+}
+"""五站固定的 analysis-region、study-site 與 flow-domain 來源契約。"""
+_BAYTRACE_CANDIDATE_POLICY_ID = "houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1"
+"""C 區候選子區政策識別碼；只作 provenance 核對，不將 polygon 當 forcing mask。"""
+
+
+def _site_context(summary: dict[str, Any]) -> tuple[str, str, str, str]:
+    """由 preview summary 核對 region／site／flow-domain，回傳圖面標題語境。
+
+    A 區含貢寮與龜山島兩個獨立站點；它們可共用 A 的 flow-domain geometry，但
+    preview、受體、粒子分母與成果目錄必須由各自 summary 綁定。此 allow-list 只防止
+    未登錄站點借用其他區圖面契約；flow-domain 也必須符合五站已核定的來源 ID，
+    不重建或推測 forcing／海岸資料。
+    """
+
+    projection = summary.get("projection")
+    region = projection.get("analysis_region_id") if isinstance(projection, dict) else None
+    site = summary.get("study_site_id")
+    if (
+        not isinstance(region, str)
+        or not isinstance(site, str)
+        or site not in _SITE_BY_REGION.get(region, frozenset())
+    ):
+        raise ValueError("preview study site 與 analysis region 繫結不符")
+    expected_flow_domain = _FLOW_DOMAIN_BY_SITE[site]
+    declared_flow_domain = projection.get("flow_domain_id") if isinstance(projection, dict) else None
+    if declared_flow_domain is not None and declared_flow_domain != expected_flow_domain:
+        raise ValueError("preview flow domain 與 study site 繫結不符")
+    return region, site, _SITE_LABEL_ZH[site], expected_flow_domain
+
+
+def _site_title(summary: dict[str, Any]) -> str:
+    """建立站點化圖面標題，不把回溯終點誤稱為來源。"""
+
+    region, _, site_label, _ = _site_context(summary)
+    return f"{region}區{site_label}沉降粒子反向追蹤"
 
 _BAYTRACE_STATUS_LABELS = {
     "flow_domain_open_exit": "離開計算範圍",
@@ -552,7 +681,7 @@ def render_overview(data: dict[str, Any], output_path: str | Path) -> Path:
     每條線只連接同一 ``particle_id`` 的保存觀測；位置由既有
     ``DomainProjection.unproject`` 將 AEQD 公尺轉回經度、緯度，沒有重新取樣或
     重新積分。海岸 FeatureCollection 交給 Shapely 的 ``plot_polygon`` 處理，因而
-    保留 Polygon/MultiPolygon 的孔洞；B 開放邊界只畫一次。土地置於底層，軌跡、起點
+    保留 Polygon/MultiPolygon 的孔洞；各站 flow open boundary 只畫一次。土地置於底層，軌跡、起點
     圓點與依停止狀態區分的終點標記置於上層，圖面不以陸地遮蔽資料。
 
     ``output_path`` 必須是尚不存在的 PNG 路徑；函式只建立其父目錄並拒絕覆寫，回傳
@@ -677,7 +806,7 @@ def render_overview(data: dict[str, Any], output_path: str | Path) -> Path:
         ax.set_ylabel("緯度 latitude (°)", fontproperties=font)
         ax.grid(color="white", linewidth=0.7, alpha=0.8)
 
-        ax.set_title("B 區沉降粒子反向追蹤", fontproperties=font, fontsize=18, pad=36)
+        ax.set_title(_site_title(summary), fontproperties=font, fontsize=18, pad=36)
         ax.text(
             0.5,
             1.025,
@@ -710,7 +839,7 @@ def render_local(data: dict[str, Any], output_path: str | Path) -> Path:
     的兩張水平圖；新版 BayTrace 局部圖由 ``render_baytrace_local`` 獨立處理。
 
     summary 的水平分組與垂向層別決定各面板內容。各組以第一顆粒子的初始保存 XY
-    作共同原點，只平移座標；線段、終點及已投影的 B 外框接受同量平移，不重新取樣、
+    作共同原點，只平移座標；線段、終點及已投影的站點外框接受同量平移，不重新取樣、
     旋轉或縮放位移。各面板 x/y 等比例，範圍由保存軌跡及終點決定，再留出閱讀邊距。
     外框只畫與該範圍相交的線段，不為遠處外框擴張局部圖。第六格的圖例與圖說使用
     分離子面板，繪製後再檢查文字框不相交。輸出含失效連結均拒絕，以 ``xb`` 寫 PNG。
@@ -831,7 +960,7 @@ def render_local(data: dict[str, Any], output_path: str | Path) -> Path:
             va="top",
             linespacing=1.8,
         )
-        fig.suptitle("B 區沉降粒子反向追蹤", fontproperties=font, fontsize=20, y=0.985)
+        fig.suptitle(_site_title(summary), fontproperties=font, fontsize=20, y=0.985)
         fig.text(0.5, 0.955, _subtitle(summary), ha="center", fontproperties=font, fontsize=12)
         fig.tight_layout(rect=(0.02, 0.01, 0.98, 0.93), h_pad=3.0, w_pad=2.5)
         fig.canvas.draw()
@@ -873,6 +1002,64 @@ def _ordered_baytrace_curves(data: dict[str, Any]) -> dict[str, list[dict[str, s
     for rows in curves.values():
         rows.sort(key=lambda row: float(row["age_seconds"]))
     return curves
+
+
+def _baytrace_candidate_regions(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """驗證設定檔保存的候選子區，供 README／manifest provenance 使用。
+
+    候選 polygon 是 input derivation 從設定檔保存的 WGS84 GeoJSON；這裡只核對其
+    CRS、有效性與 C 區 2+3 配額，不使用粒子座標反推框線，也不把候選邊界當成海陸
+    或 forcing mask。此 helper 不繪圖；缺少候選欄位的 A／B／D 與舊 B preview 回傳
+    空清單，維持各站既有圖面契約。
+    """
+
+    raw_regions = summary.get("receptor_candidate_regions")
+    raw_policy = summary.get("receptor_candidate_selection")
+    if raw_regions is None and raw_policy is None:
+        return []
+    if not isinstance(raw_regions, list) or not isinstance(raw_policy, dict):
+        raise ValueError("preview candidate regions／selection 必須同時存在")
+    if raw_policy.get("policy_id") != _BAYTRACE_CANDIDATE_POLICY_ID:
+        raise ValueError("preview candidate region policy 未登錄")
+    if raw_policy.get("require_each_region") is not True or raw_policy.get("total_horizontal_count") != 5:
+        raise ValueError("preview candidate region 必須要求兩子區各自完成且總數為 5")
+    if len(raw_regions) != 2:
+        raise ValueError("preview C 區 candidate regions 必須恰有兩個子區")
+    regions: list[dict[str, Any]] = []
+    allocation_total = 0
+    seen_ids: set[str] = set()
+    for index, raw_region in enumerate(raw_regions):
+        if not isinstance(raw_region, dict):
+            raise ValueError(f"preview candidate region[{index}] 必須是 mapping")
+        region_id = raw_region.get("region_id")
+        allocation = raw_region.get("allocation_count")
+        if (
+            not isinstance(region_id, str)
+            or not region_id.strip()
+            or region_id in seen_ids
+            or type(allocation) is not int
+            or allocation < 1
+        ):
+            raise ValueError(f"preview candidate region[{index}] 的 id／配額無效")
+        if raw_region.get("coordinate_reference") != "EPSG:4326":
+            raise ValueError(f"preview candidate region[{index}] 必須是 EPSG:4326")
+        try:
+            geometry = shape(raw_region["geometry"])
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ValueError(f"preview candidate region[{index}] geometry 無法解析") from exc
+        if (
+            not isinstance(geometry, Polygon)
+            or geometry.is_empty
+            or not geometry.is_valid
+            or geometry.area <= 0.0
+        ):
+            raise ValueError(f"preview candidate region[{index}] geometry 無效")
+        regions.append({**raw_region, "geometry": geometry})
+        allocation_total += allocation
+        seen_ids.add(region_id)
+    if allocation_total != 5:
+        raise ValueError(f"preview candidate region 配額總數不符：{allocation_total} != 5")
+    return regions
 
 
 def _plot_value(value: Any) -> float:
@@ -1105,8 +1292,7 @@ def _baytrace_metadata(summary: dict[str, Any]) -> str:
 
     arrival, _ = _time_window(summary)
     horizon = _horizon_seconds(summary)
-    region = summary.get("projection", {}).get("analysis_region_id", "B")
-    site = {"hsinchu": "新竹外海"}.get(summary.get("study_site_id"), "研究站點")
+    region, _, site, _ = _site_context(summary)
     return (
         f"{region}區／{site}｜{arrival:%Y-%m-%d}｜"
         f"同一組{summary['particle_count']}顆粒子｜"
@@ -1437,11 +1623,23 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
     horizon_seconds = _horizon_seconds(summary)
     boundary = data["projection"].project_geometry(data["open_geometry"])
     font = _display_font()
+    endpoint_handles = _baytrace_endpoint_handles(
+        status_labels,
+        forcing_start_states=forcing_start_states,
+        forcing_start_summary=summary,
+        statuses=terminal_statuses,
+    )
+    # 終止狀態依站點的實際 CSV 而變動；例如龜山島同時有離岸、離域、資料窗起點與
+    # 回溯上限，端點圖例會比只有兩種狀態的站點高。依圖例項目數增加右下說明列，讓
+    # 繪圖保留獨立的「水層圖例／端點圖例／兩行圖說」區域，而不是把長中文壓到下一列。
+    # 這只改變印刷版面，不改變任何軌跡、狀態、座標或分母；最後仍以 renderer 的
+    # 實際 bounding box 交疊檢查作為發布前的 fail-closed 閘門。
+    bottom_grid_ratio = 1.35 + max(0, len(endpoint_handles) - 5) * 0.35
     # 資料面板維持既有 3×2 版面；右下空格再切成三個獨立子格，
     # 讓水層圖例、端點圖例與兩行圖說各自有真實的版面空間，不靠同一座標軸
     # 的相對 y 值互相避讓。這也使最後的 bbox 檢查能對應三個獨立 artist。
     fig = plt.figure(figsize=(12, 16.5), dpi=150)
-    grid = fig.add_gridspec(3, 2)
+    grid = fig.add_gridspec(3, 2, height_ratios=(1.0, 1.0, bottom_grid_ratio))
     axes = [[fig.add_subplot(grid[row, column]) for column in range(2)] for row in range(3)]
     panel_axes = [axes[0][0], axes[0][1], axes[1][0], axes[1][1], axes[2][0]]
     fig.delaxes(axes[2][1])
@@ -1557,12 +1755,7 @@ def render_baytrace_local(data: dict[str, Any], output_path: str | Path) -> Path
         )
         layer_legend.get_title().set_fontproperties(font)
         endpoint_legend = endpoint_legend_ax.legend(
-            handles=_baytrace_endpoint_handles(
-                status_labels,
-                forcing_start_states=forcing_start_states,
-                forcing_start_summary=summary,
-                statuses=terminal_statuses,
-            ),
+            handles=endpoint_handles,
             title="標記：端點／停止狀態",
             loc="center left",
             bbox_to_anchor=(0.0, 0.5),
@@ -1985,10 +2178,11 @@ def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) ->
     level_count = len(summary["vertical_order"])
     horizon_label = _max_age_label(summary)
     horizon_minutes, _ = _depth_axis_limits_and_ticks(summary)
+    region, _, site_label, _ = _site_context(summary)
     lines = [
-        "# B 區沉降粒子反向追蹤",
+        f"# {region}區{site_label}沉降粒子反向追蹤",
         "",
-        f"Run：`{summary['run_id']}`；站點：B／hsinchu／{data['domain_record']['flow_domain_id']}。",
+        f"Run：`{summary['run_id']}`；站點：{region}／{site_label}／{data['domain_record']['flow_domain_id']}。",
         _subtitle(summary) + "。",
         "",
         "- [區域總覽](horizontal_overview.png)：經緯度、陸地及本次試跑登錄外框。",
@@ -2027,10 +2221,10 @@ def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) ->
         "海岸使用已確認的 `taiwan_exact_coastline.geojson`：CRS84（經度、緯度），"
         "1905 個有效 Polygon／MultiPolygon；原始供應者、年代與授權未附。",
         "本次用於內部 PI 地理參照，不宣稱為官方精確岸線，亦不套用其他資料的授權。",
-        f"B 外框來源方法：`{data['domain_manifest']['provenance']['method_id']}`。",
+        f"{region} 外框來源方法：`{data['domain_manifest']['provenance']['method_id']}`。",
         "這是 accepted manifest 已登錄的加密經緯度矩形幾何，不是完整濕網格或有效海水邊界；"
         "外框內不保證全部都是有效水域。",
-        "B 的 flow_domain 開放邊界與 polygon 外環相等，因此只畫一條登錄開放邊界線。",
+        f"{region} 的 flow_domain 開放邊界與 polygon 外環相等，因此只畫一條登錄開放邊界線。",
         "domain/open 的語意 SHA 已與原 summary 綁定；各檔原始 bytes 與 SHA 如下。",
         "",
         "| 輸入 | bytes | SHA-256 |",
@@ -2098,13 +2292,34 @@ def _baytrace_readme(
     layer_total_text = "、".join(
         f"{_baytrace_layer_label(level)} {layer_totals[level]} 顆" for level in summary["vertical_order"]
     )
+    region, _, site_label, _ = _site_context(summary)
+    candidate_regions = _baytrace_candidate_regions(summary)
+    candidate_note_lines: list[str] = []
+    if candidate_regions:
+        candidate_note_lines = [
+            "",
+            "本次 C 區研究候選來自 receptor manifest 的明示 EPSG:4326 polygon；候選",
+            "polygon 只作科學 provenance，視覺圖面不呈現候選區域。兩個子區各自通過",
+            "受體選取所需的支援閘門後，固定配置如下：",
+            "",
+            "| 候選子區 | 水平位置配額 |",
+            "|---|---:|",
+            *[
+                f"| {region['name_zh']}（`{region['region_id']}`） | {region['allocation_count']} |"
+                for region in candidate_regions
+            ],
+            "",
+            "候選不足時整體 fail closed，不跨區補點；polygon、影像 hash 與重建資訊另保存在",
+            "`summary.json`、`manifest.json` 的 candidate region 欄位。",
+        ]
     lines = [
-        "# B 區新版回溯成果圖",
+        f"# {region}區{site_label}新版回溯成果圖",
         "",
         "本目錄是由已完成 preview 獨立重繪的新版圖面；不讀 forcing、不重新取樣、不重新積分，"
         "也不改變原始 CSV、summary 或舊成果。輸出只包含兩張水平圖、一張垂向診斷圖及一張停止原因圖，"
         "沒有新增直方圖或其他分析。",
         f"圖上共通情境：{_baytrace_metadata(summary)}。",
+        *candidate_note_lines,
         "",
         "## 給 PI 的閱讀方式",
         "",
@@ -2281,25 +2496,6 @@ def _baytrace_readme(
     return "\n".join(lines) + "\n"
 
 
-def _verified_server_cache_prefix() -> str:
-    """建立 SERVER 預覽重跑命令使用的已驗證 NFS cache 前綴。
-
-    preview 的圖面產製會呼叫 ``uv`` 與 Matplotlib；若 README 把 cache 寫死在
-    project ``work``，SERVER 即使已通過 storage gate 仍可能把大量暫存資料寫入
-    /home。故重跑命令改用 operator 在 gate 後 export 的四個 root 變數，並以
-    shell ``:?`` 在未設定或未驗證時 fail-closed。此函式只產生命令文字，不讀取、
-    建立或修改任何目錄，實際目錄安全性由 SERVER gate 負責。
-    """
-
-    return (
-        'UV_CACHE_DIR="${LBT_UV_CACHE_ROOT:?set verified NFS root}" '
-        'MPLCONFIGDIR="${LBT_MPL_CACHE_ROOT:?set verified NFS root}" '
-        'XDG_CACHE_HOME="${LBT_XDG_CACHE_ROOT:?set verified NFS root}" '
-        'TMPDIR="${LBT_TMP_ROOT:?set verified NFS root}" '
-        "PYTHONDONTWRITEBYTECODE=1 "
-    )
-
-
 def build_coastline_preview(
     preview_dir: str | Path,
     domain_path: str | Path,
@@ -2308,6 +2504,7 @@ def build_coastline_preview(
     output_dir: str | Path,
     *,
     style: str = "legacy",
+    storage_gate_evidence: str | Path | None = None,
 ) -> dict[str, Any]:
     """在全新目錄建立 legacy 或新版四圖，回傳完成的 JSON 內容。
 
@@ -2315,7 +2512,9 @@ def build_coastline_preview(
     manifest 契約；``baytrace`` 只在全新目錄寫入水平區域／局部、垂向高度、停止原因四張 PNG，並
     保存新版 style/version 與來源前後 SHA。兩個分支都先拒絕既有目錄或失效連結，
     再讀取並核對既有輸入；核對失敗均保留新目錄供診斷，不清理、不覆寫輸入或舊成果。
-    新版僅使用 preview 的 CSV／summary，不讀 forcing、run 或重新積分。
+    新版僅使用 preview 的 CSV／summary，不讀 forcing、run 或重新積分。讀取 preview 前
+    先驗證 completion marker；若 caller 明示 storage gate evidence，缺 marker 或 gate
+    binding 不符即拒絕，避免將逐檔發布中的 final 誤當完整圖面來源。
     """
 
     if style not in {"legacy", "baytrace"}:
@@ -2324,13 +2523,36 @@ def build_coastline_preview(
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"輸出目錄已存在，拒絕覆寫：{output}")
     preview = Path(preview_dir)
+    preview_marker = validate_published_preview(preview, storage_gate_evidence=storage_gate_evidence)
+    marker_publish = storage_gate_evidence is not None
+    gate = None
+    provenance = None
+    if marker_publish:
+        if not isinstance(preview_marker, dict):
+            raise ValueError("NFS 圖面發布需要已完成的 preview marker")
+        gate = _verified_storage_gate_evidence(storage_gate_evidence)
+        if (
+            gate["sha256"] != preview_marker.get("storage_gate_snapshot_sha256")
+            or gate["source_token_hash"] != preview_marker.get("storage_root_source_token_hash")
+        ):
+            raise ValueError("preview marker 的 storage gate binding 不符")
+        provenance = {
+            key: preview_marker[key]
+            for key in ("base_commit", "base_tree", "dirty_files", "diff_sha256")
+        }
     paths = {
         name: preview / name
         for name in ("manifest.json", "summary.json", "particles.csv", "observations.csv")
     }
     paths.update(domain=Path(domain_path), open_boundary=Path(open_path), coastline=Path(coastline_path))
     before = _source_snapshot(paths)
-    data = load_plot_inputs(preview, domain_path, open_path, coastline_path)
+    data = load_plot_inputs(
+        preview,
+        domain_path,
+        open_path,
+        coastline_path,
+        storage_gate_evidence=storage_gate_evidence,
+    )
     summary = data["summary"]
     counts = dict(Counter(particle["status"] for particle in data["particles"]))
     if not isinstance(summary.get("run_id"), str) or not summary["run_id"]:
@@ -2366,17 +2588,31 @@ def build_coastline_preview(
     ]
     if style == "baytrace":
         args.extend(["--style", "baytrace"])
+    if storage_gate_evidence is not None:
+        args.extend(["--storage-gate-evidence", str(storage_gate_evidence)])
+    # manifest 中的 invocation/rebuild 只保存已驗證根目錄的環境變數名稱，讓
+    # 讀取成果的人可以在同一 SERVER 儲存政策下重建，而不會誤用產生者的實際路徑。
     prefix = _verified_server_cache_prefix()
     invocation = prefix + shlex.join(args)
     output_argument_index = args.index("--output-dir") + 1
     args[output_argument_index] = str(output.with_name(output.name + "-rebuild"))
     rebuild = prefix + shlex.join(args)
-    output.mkdir(parents=True, exist_ok=False)
+    render_output = output
+    parent_identity = None
+    if marker_publish:
+        parent = _safe_path(output).parent
+        parent_stat = parent.stat()
+        if not parent_stat or not parent.is_dir():
+            raise ValueError("圖面輸出 parent 必須是既有普通目錄")
+        parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        render_output = Path(tempfile.mkdtemp(prefix=f".{output.name}.partial-", dir=parent))
+    else:
+        output.mkdir(parents=True, exist_ok=False)
     if style == "legacy":
         # 預設分支完整保留上一輪兩圖與 manifest 欄位，讓舊成果仍可由同一命令重建。
-        render_overview(data, output / "horizontal_overview.png")
-        render_local(data, output / "horizontal_local.png")
-        with (output / "README.md").open("x", encoding="utf-8") as stream:
+        render_overview(data, render_output / "horizontal_overview.png")
+        render_local(data, render_output / "horizontal_local.png")
+        with (render_output / "README.md").open("x", encoding="utf-8") as stream:
             stream.write(_output_readme(data, before, rebuild))
         after = _source_snapshot(paths)
         if before != after:
@@ -2399,7 +2635,8 @@ def build_coastline_preview(
                 name: data["source"][name]["canonical_sha256"] for name in ("domain", "open_boundary")
             },
             "geometry_owner": {
-                "analysis_region_id": "B",
+                "analysis_region_id": _site_context(summary)[0],
+                "study_site_id": _site_context(summary)[1],
                 "flow_domain_id": data["domain_record"]["flow_domain_id"],
             },
             "coastline_provenance": {
@@ -2413,25 +2650,66 @@ def build_coastline_preview(
             "invocation_command": invocation,
             "rebuild_command": rebuild,
             "files": {
-                name: {"size_bytes": (output / name).stat().st_size, "sha256": sha256_file(output / name)}
+                name: {
+                    "size_bytes": (render_output / name).stat().st_size,
+                    "sha256": sha256_file(render_output / name),
+                }
                 for name in ("horizontal_overview.png", "horizontal_local.png", "README.md")
             },
         }
-        with (output / "manifest.json").open("x", encoding="utf-8") as stream:
-            json.dump(manifest, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write("\n")
+        if marker_publish:
+            manifest["publish_protocol"] = "nfs_completion_marker_v1"
+            manifest["completion_marker"] = ".complete"
+            manifest["release_provenance"] = {
+                **provenance,
+                "storage_gate_snapshot_sha256": gate["sha256"],
+                "storage_root_source_token_hash": gate["source_token_hash"],
+            }
+        with (render_output / "manifest.json").open("xb") as stream:
+            stream.write(_canonical_json_bytes(manifest))
+        if marker_publish:
+            _validate_staged_preview(render_output, manifest)
+            marker = {
+                "schema_version": "1.0.0",
+                "artifact_kind": manifest["artifact_kind"],
+                "publish_protocol": "nfs_completion_marker_v1",
+                "manifest_sha256": sha256_file(render_output / "manifest.json"),
+                **provenance,
+                "storage_gate_snapshot_sha256": gate["sha256"],
+                "storage_root_source_token_hash": gate["source_token_hash"],
+            }
+            gate_after = _verified_storage_gate_evidence(storage_gate_evidence)
+            if gate_after != gate:
+                raise ValueError("storage gate 在圖面發布前變動")
+            lock_descriptor = _acquire_nfs_publish_lock(parent, output)
+            try:
+                if before != _source_snapshot(paths):
+                    raise ValueError("來源前後 bytes/SHA 不一致；拒絕發布圖面")
+                _publish_nfs_marker_preview(
+                    render_output,
+                    output,
+                    parent_identity=parent_identity,
+                    marker=marker,
+                )
+                validate_published_artifact(
+                    output,
+                    expected_artifact_kind=manifest["artifact_kind"],
+                    storage_gate_evidence=storage_gate_evidence,
+                )
+            finally:
+                _release_nfs_publish_lock(lock_descriptor)
         return manifest
 
     # 新版只增加四張圖與新版說明，不回讀 forcing 或改動既有 preview 資料。
-    render_baytrace_overview(data, output / "horizontal_overview.png")
-    render_baytrace_local(data, output / "horizontal_local.png")
-    render_baytrace_depth(data, output / "depth_age.png")
-    render_baytrace_terminal(data, output / "terminal_counts.png")
+    render_baytrace_overview(data, render_output / "horizontal_overview.png")
+    render_baytrace_local(data, render_output / "horizontal_local.png")
+    render_baytrace_depth(data, render_output / "depth_age.png")
+    render_baytrace_terminal(data, render_output / "terminal_counts.png")
     after = _source_snapshot(paths)
     if before != after:
         raise ValueError("來源前後 bytes/SHA 不一致；保留新目錄供診斷，不建立完成清單")
     status_labels = _baytrace_status_labels(data)
-    with (output / "README.md").open("x", encoding="utf-8") as stream:
+    with (render_output / "README.md").open("x", encoding="utf-8") as stream:
         stream.write(_baytrace_readme(data, before, after, status_labels))
     # README 落檔不會改動七個來源，但仍在建立 manifest 前再核對一次，縮小競爭窗口。
     after = _source_snapshot(paths)
@@ -2447,6 +2725,11 @@ def build_coastline_preview(
         "README.md",
     )
     terminal_table = _baytrace_terminal_table(data)
+    site_region, site_id, _, _ = _site_context(summary)
+    # C 區候選子區只以已驗證的 summary provenance 寫入 manifest；繪圖函式不把
+    # polygon 當 forcing mask，也不在此階段重新選點。沒有候選欄位的其他站點維持
+    # 原有 manifest 形狀，避免把空值誤解成「候選已驗證」。
+    candidate_regions = _baytrace_candidate_regions(summary)
     manifest = {
         "artifact_kind": "pilot-coastline-preview-v1",
         "schema_version": "1.0.0",
@@ -2475,7 +2758,8 @@ def build_coastline_preview(
             name: data["source"][name]["canonical_sha256"] for name in ("domain", "open_boundary")
         },
         "geometry_owner": {
-            "analysis_region_id": "B",
+            "analysis_region_id": site_region,
+            "study_site_id": site_id,
             "flow_domain_id": data["domain_record"]["flow_domain_id"],
         },
         "coastline_provenance": {
@@ -2489,26 +2773,80 @@ def build_coastline_preview(
         "invocation_command": invocation,
         "rebuild_command": rebuild,
         "files": {
-            name: {"size_bytes": (output / name).stat().st_size, "sha256": sha256_file(output / name)}
+            name: {
+                "size_bytes": (render_output / name).stat().st_size,
+                "sha256": sha256_file(render_output / name),
+            }
             for name in output_names
         },
     }
-    with (output / "manifest.json").open("x", encoding="utf-8") as stream:
-        json.dump(manifest, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
+    if candidate_regions:
+        for key in (
+            "receptor_candidate_selection",
+            "receptor_candidate_regions",
+            "receptor_candidate_regions_provenance",
+        ):
+            if key in summary:
+                manifest[key] = summary[key]
+    if marker_publish:
+        manifest["publish_protocol"] = "nfs_completion_marker_v1"
+        manifest["completion_marker"] = ".complete"
+        manifest["release_provenance"] = {
+            **provenance,
+            "storage_gate_snapshot_sha256": gate["sha256"],
+            "storage_root_source_token_hash": gate["source_token_hash"],
+        }
+    with (render_output / "manifest.json").open("xb") as stream:
+        stream.write(_canonical_json_bytes(manifest))
+    if marker_publish:
+        _validate_staged_preview(render_output, manifest)
+        marker = {
+            "schema_version": "1.0.0",
+            "artifact_kind": manifest["artifact_kind"],
+            "publish_protocol": "nfs_completion_marker_v1",
+            "manifest_sha256": sha256_file(render_output / "manifest.json"),
+            **provenance,
+            "storage_gate_snapshot_sha256": gate["sha256"],
+            "storage_root_source_token_hash": gate["source_token_hash"],
+        }
+        gate_after = _verified_storage_gate_evidence(storage_gate_evidence)
+        if gate_after != gate:
+            raise ValueError("storage gate 在圖面發布前變動")
+        lock_descriptor = _acquire_nfs_publish_lock(parent, output)
+        try:
+            if before != _source_snapshot(paths):
+                raise ValueError("來源前後 bytes/SHA 不一致；拒絕發布圖面")
+            _publish_nfs_marker_preview(
+                render_output,
+                output,
+                parent_identity=parent_identity,
+                marker=marker,
+            )
+            validate_published_artifact(
+                output,
+                expected_artifact_kind=manifest["artifact_kind"],
+                storage_gate_evidence=storage_gate_evidence,
+            )
+        finally:
+            _release_nfs_publish_lock(lock_descriptor)
     return manifest
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """解析明示本機路徑與圖面 style；成功回傳 0，拒絕回傳 2 並保留診斷目錄。"""
 
-    parser = argparse.ArgumentParser(description="由 B 區已完成 preview 獨立重繪水平與診斷圖")
+    parser = argparse.ArgumentParser(description="由已完成 A／B／C／D 四區五站 preview 獨立重繪水平與診斷圖")
     parser.add_argument("--preview-dir", required=True, type=Path)
     parser.add_argument("--domain", required=True, type=Path)
     parser.add_argument("--open-boundary", required=True, type=Path)
     parser.add_argument("--coastline", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--style", choices=("legacy", "baytrace"), default="legacy")
+    parser.add_argument(
+        "--storage-gate-evidence",
+        type=Path,
+        help="若 preview 使用 NFS marker，重新驗證同一份 storage gate evidence",
+    )
     args = parser.parse_args(argv)
     try:
         manifest = build_coastline_preview(
@@ -2518,6 +2856,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.coastline,
             args.output_dir,
             style=args.style,
+            storage_gate_evidence=args.storage_gate_evidence,
         )
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({"valid": False, "error": str(error)}, ensure_ascii=False))

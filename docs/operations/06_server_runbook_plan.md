@@ -94,12 +94,12 @@ find "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT" \
 此輸出需保存為 G0 evidence，但它還不能取代 `time_utc_ns.npy` 的逐值檢查。正式 `lbt-preflight` 會另外驗證：
 
 - 設定恰有 A-D 四個 `analysis_region_id`／`flow_domain_id` 與五個唯一 `study_site_id`；貢寮、龜山島均對應 A 區，但情境與輸出不可合併。
-- 貢寮／龜山島以 anchor 產生 12.5 km receptor core、25 km local domain 及 20/35 km 敏感度 polygon，與固定 OCM ocean polygon 相交；兩個 local domains 重疊時須完整保留，不作 Voronoi 切割。圓周外海 arc 與岸線必須分段，只有前者可計入 local-entry KDE。
+- 貢寮／龜山島以本期 policy 產生 12.5 km receptor core、20 km local domain，與固定 OCM ocean polygon 相交；兩個 local domains 重疊時須完整保留，不作 Voronoi 切割。圓周外海 arc 與岸線必須分段，只有前者可計入 local-entry KDE；本期不建立 A 的 35 km sensitivity，也不自行加入 15 km／23 km case。
 - 貢寮／龜山島引用同一 A 區 forcing-domain ID 與 outer-boundary geometry；每條軌跡只以 own local domain 產生主要 first-exit。foreign-local crossing 必須是非終止診斷事件，不得改變 `study_site_id`、scenario、seed 或主要入口分母。
-- 現行 A v3 bbox 南界 `24.600844°N` 只允許 `development_and_pilot`。正式候選採
-  `northeast_taiwan_common_cache_v4_lbt_south_expanded` 與 bbox
-  `[121.306315,122.793685,24.480000,25.499156]`，並對 OCM native、OCM surface、NWW
-  analysis 逐一證明 25/35 km local boundary 至 outer boundary 至少兩個共同有效格點。
+- 現行 A v3 bbox 南界 `24.600844°N` 是本期不南擴的正式準備範圍；`formal_domain_policy`
+  為 `v3_local20km_20260909_v1`，貢寮／龜山島各使用 12.5 km receptor core 與 20 km
+  local domain。OCM native、OCM surface、NWW analysis 必須共同證明 20 km local boundary
+  至 outer boundary 至少兩個共同有效格點；目前僅有 receptor native 篩選不構成此證據。
 - 月份內原始 UTC 可含重複或亂序；先 stable sort/prefer-last，再驗證 canonical UTC 嚴格
   遞增與唯一，並保存來源月份/local index。
 - 實際 start/end、正常間距、缺口長度與跨月銜接。已知 gap 是 reconstruction inventory，
@@ -129,20 +129,12 @@ find "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT" \
 模板候選值，不能取代 pair actual z；若 manifest 尚不存在，formal gate 應停止而不是猜測
 深度或以模板值補齊。
 
-A 區 v4 的 OCM/NWW 上游產製已封裝為可重啟入口；其 config hash 會進入 OCM metadata，
-OCM partial month 保留 coverage，NWW 則直接使用每月 native UTC 建 full-hour analysis：
-
-```bash
-cd "$LBT_PROJECT_ROOT"
-bash scripts/prepare_a_v4_forcing.sh dry-run
-bash scripts/prepare_a_v4_forcing.sh month 2025 1
-# 單月 OCM/NWW validator 與實際共同 margin 通過後才執行：
-bash scripts/prepare_a_v4_forcing.sh all
-```
-
-入口不使用 `--overwrite`。若新 domain 已有月份目錄，先由上游 validator 驗收；驗收失敗
-即停止並保留現場，不能自動刪除或重建。`dry-run` 不寫大型 forcing，可直接用於確認 raw
-月份、partial coverage、輸出路徑與參數。
+A 區本期 G0 只盤點並衍生 v3 policy 所需的 accepted-product inventory、UTC／mask／schema
+與共同 margin evidence；不執行南向擴張，也不把 raw NetCDF 直接交給正式 LBT runtime。
+`inputs-build`／`inputs-validate` 可在 strict、fail-closed 條件下準備新 20 km geometry、
+receptor 與 arrival manifest，但在 OCM native、OCM surface、NWW analysis 三產品的實際
+共同 margin validator／producer 證據完成前，不得寫入 `approved` formal release。歷史
+`northeast_taiwan_common_cache_v4_lbt_south_expanded` 只保留為舊規劃識別，不是本期產製入口。
 
 ### 3.4 容量與檔案系統
 
@@ -244,8 +236,9 @@ canonical time inventory、duplicate source choice、gap shapes、reconstruction
 manifest、array bytes、coverage、unit/direction decision、CRS/mesh QC、domain role、own/foreign
 local-domain topology、各必要 forcing 的共同 margin、預估 working set 與輸出空間。
 `trial_ready`/partial month 依 available-data contract 記錄為 accepted info，不得再當成等待外部
-補件的錯誤。若 A 區仍為現行 v3，輸出必須明示 `PILOT_ONLY`，config validator 不得只因
-metadata `status=ready` 就允許正式龜山島 25 km baseline。
+補件的錯誤。A 區 v3 可進入本期 strict preparation，但輸出仍須明示
+`formal_domain_policy=v3_local20km_20260909_v1` 與 margin evidence 狀態；config validator
+不得只因 metadata `status=ready` 或 receptor native 篩選成功，就允許正式 20 km local domain。
 
 runtime experiment case 由 `EXPERIMENT_CASE_SPECS` 唯一登錄五個值：
 `finite_depth_stokes` 是 formal baseline 候選，`no_stokes` 是常數擴散敏感度，
@@ -397,11 +390,11 @@ scenario/receptor manifests 依 `(study_site_id, receptor.vertical_id)` 重算�
 order-independent ID hash 與 strata，static loader 在 `run-shard` 前會重算並比對；formal
 command 禁止此參數且永遠使用完整 50,000 情境。
 
-Pilot 報告需以五站點各固定 10,000、A 區 20,000、全案 50,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time；並比較 7/14/30/60 日 horizon 及貢寮／龜山島 20/25/35 km local boundary。A 區 paired-UTC shards 應共用同一 staged forcing time window，報告須證明沒有為兩站各自重複跨 NFS 載入同一 OCM/NWW 月窗。benchmark 用於衍生最小收斂 `M`、horizon、shard、並行度與儲存策略，不得據此把任一站完整交叉改回 1,000 或把五站合併為 10,000。
+Pilot 報告需以五站點各固定 10,000、A 區 20,000、全案 50,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time；並比較 7/14/30/60 日 horizon 及貢寮／龜山島本期 12.5 km receptor core／20 km local domain。A 區 paired-UTC shards 應共用同一 staged forcing time window，報告須證明沒有為兩站各自重複跨 NFS 載入同一 OCM/NWW 月窗。benchmark 用於衍生最小收斂 `M`、horizon、shard、並行度與儲存策略，不得據此把任一站完整交叉改回 1,000 或把五站合併為 10,000。
 
 ### 5.4 正式 batch（runtime／CLI 已接，release 證據仍須備妥）
 
-正式 run 只能使用 `status=approved` 的 config、behavior、local-domain、每站 20／全案 100 receptor templates、每站 50／全案 250 arrival-time、每站 1,000／全案 5,000 dynamic pair initial-condition records、每站 10,000／全案 50,000 情境 coverage 與 member-convergence manifests。每個 material 共用 pair actual z，不得以模板 z 取代；A 區貢寮與龜山島必須引用同一個已通過共同 forcing margin 的 expanded flow-domain ID；現行 `northeast_taiwan_common_cache_v3` 不得出現在正式 release config。
+正式 run 只能使用 `status=approved` 的 config、behavior、local-domain、每站 20／全案 100 receptor templates、每站 50／全案 250 arrival-time、每站 1,000／全案 5,000 dynamic pair initial-condition records、每站 10,000／全案 50,000 情境 coverage 與 member-convergence manifests。每個 material 共用 pair actual z，不得以模板 z 取代；A 區貢寮與龜山島必須引用同一個 `northeast_taiwan_common_cache_v3` 與 `formal_domain_policy=v3_local20km_20260909_v1`，並通過 OCM native／OCM surface／NWW analysis 的 20 km 共同 forcing margin 證據；證據未完成時不得建立 approved formal release。舊 `formal_domain_policy=expanded_domain_v1` 只作相容讀取，B-D 的 `expanded_domain` sensitivity 另依各自 evidence gate。
 
 正式鏈路固定為 formal preflight、建立 workspace、逐 shard 執行／暫停／恢復、reconcile，
 最後要求完整驗證。第一次 `run-shard` 可用 sweep budget 在 checkpoint 邊界產生 `PAUSED`；
@@ -535,6 +528,6 @@ factory；formal 會先重驗 config、manifest bindings 與 strict inventory，
 | authentication/path | 不反覆猜密碼；由資料管理者提供已認證環境或 inventory |
 | input schema/time | manifest 外 schema/checksum/UTC 改變時停止受影響 domain/month；已知缺口則回到 reconstruction 或 gap-safe selector，不要求供應者補資料，也不在 runtime 臨時外插 |
 | disk quota | 停止啟動新 shard，保留完整 checkpoint；調整 output/scratch 後續跑 |
-| NFS I/O wait | active write 移至本機 scratch，單一 publisher；不並行灌 NAS |
+| NFS I/O wait | active write 與 scratch 均留在 `/data/LBT` 嚴格子目錄，採單一 publisher、節流或降低並行；不得移至 `/home` 或其他未納入結果契約的 scratch |
 | numerical failure | 保存 particle/scenario/step/forcing/event 診斷，以相同 seed 最小化重現 |
 | code/config change | 新 run ID；舊 checkpoint 不相容，不在原 run 上覆寫 |

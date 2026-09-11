@@ -78,9 +78,10 @@ NWW 月份 metadata 的 allowlist 同時保留既有
 ## 4. 幾何、受體與 arrival
 
 四個 flow domain 依 config bbox 建立 WGS84 GeoJSON，實際計算仍由既有
-`DomainProjection` 投影到公尺座標。A 區 local domain 使用 OCM native face 支撐與站點
-anchor-centered baseline radius 的交集；B–D local domain 等於各自 flow domain。幾何
-manifest 保存實際 `flow_domain_id`、analysis region、source fingerprint 與方法版本。
+`DomainProjection` 投影到公尺座標。A 區本期依
+`formal_domain_policy=v3_local20km_20260909_v1` 使用原 v3 bbox、12.5 km receptor core
+與 20 km local domain；B–D local domain 等於各自 flow domain。幾何 manifest 保存實際
+`flow_domain_id`、analysis region、source fingerprint、policy 與方法版本。
 
 每站水平受體先從 OCM native mesh 建立既有 local／static-ocean 候選區；若站點同時明示
 `anchor_lonlat` 與 `receptor_core_radius_m`，再以該 flow domain 的 AEQD 公尺投影建立核心
@@ -150,11 +151,12 @@ gate 與 pair 實際 zcor 不一致，dynamic 建置直接失敗。這份 pair m
 
 公開圖表的 A 區顯示文字固定為 `A 區分析域`。這只是 presentation label；任何內部
 record、geometry、inventory、dynamic initial condition 與 provenance 都保留真正的
-`flow_domain_id`、與該 ID 同一註冊的 base／expanded bbox、schema major、root token、source
-files、metadata/time SHA-256、NPY structural fingerprint 與 config hash。expanded source
-建立 release config 時會把明示的 expanded bbox 同步寫入 runtime domain 設定；不得以公開
-標籤或舊 v3 bbox 代替實際來源空間。
-因此不能把 expanded source 重新命名成不存在的資料夾，也不能用公開標籤取代來源識別。
+`flow_domain_id`、本期 `formal_domain_policy=v3_local20km_20260909_v1`、v3 bbox、schema
+major、root token、source files、metadata/time SHA-256、NPY structural fingerprint 與
+config hash。A v3 policy 建立 release config 時須將 12.5 km receptor core、20 km local
+domain 與共用 outer boundary 同步綁定；不得以公開標籤、舊 25 km geometry 或歷史 expanded
+bbox 代替實際來源空間。
+因此不能把歷史 expanded source 重新命名成不存在的資料夾，也不能用公開標籤取代來源識別。
 
 ## 7. Release config 閘門
 
@@ -169,8 +171,9 @@ surface／NWW analysis 三個 accepted roots。validator 失敗時 partial 會�
 目錄不會建立；不會在 final 路徑驗證、降低 validator gate 或形成遞迴發布。只有下列
 條件全部成立才可寫入 `config_status: approved`：component immutable binding
 可讀且 hash 一致、四域／五站及 10／100／250／5,000 計數正確、NWW 四域均為 17,544
-小時、每個 gap-safe horizon 不跨缺口、strict manifest loader 通過、config formal gate
-通過，以及所有 config reference exact 指向同一批 artifact。其他情況仍可產生
+小時、每個 gap-safe horizon 不跨缺口、strict manifest loader 通過、A 當期 domain policy
+與三產品共同 margin evidence gate 通過、config formal gate 通過，以及所有 config reference
+exact 指向同一批 artifact。其他情況仍可產生
 `config_status: generated` 與 blocker，供人工稽核；`release-config-validate` 會再以唯讀
 方式驗證，不會自動修復 binding。
 CLI 的 `inputs-build` 即使是非正式 pilot 也固定以 strict 模式 fail-closed，不允許
@@ -206,9 +209,10 @@ uv run lbt release-config-validate configs/release-2024-2025.yaml \
   --formal-release
 ```
 
-正式 SERVER validation 仍須由具權限的執行環境提供實際四域 root、expanded A formal
-domain ID、OCM native／surface 與 NWW source metadata、磁碟／權限檢查、完整 NWW analysis 建置結果，以及
-必要的 OCM reconstruction 或逐 arrival gap-safe 證據。本 slice 已提供重建與驗證入口，
+正式 SERVER validation 仍須由具權限的執行環境提供實際四域 root、A v3 policy domain ID、
+OCM native／surface 與 NWW source metadata、磁碟／權限檢查、完整 NWW analysis 建置結果、
+A 20 km local-to-outer 三產品共同 margin evidence，以及必要的 OCM reconstruction 或逐
+arrival gap-safe 證據。本 slice 已提供重建與驗證入口，
 但未登入 SERVER、未修改上游產品、未啟動正式軌跡或宣稱任何科學成果。
 
 ## 9. Slice 3A pilot calibration evidence
