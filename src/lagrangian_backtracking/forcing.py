@@ -16,7 +16,7 @@ Smagorinsky reference 則只使用 OCM native current，在公尺制 triangle sh
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -152,15 +152,34 @@ def _time_bracket(
     return before, after, float(alpha), SampleQC.OK
 
 
+def _interpolate_optional_float(first: float, second: float, alpha: float) -> float:
+    """在失敗診斷需要時內插兩端有限幾何值，否則保留 ``NaN`` 缺值語意。"""
+
+    if not np.isfinite(first) or not np.isfinite(second):
+        return np.nan
+    return float(first + alpha * (second - first))
+
+
 @dataclass(frozen=True, slots=True)
 class WaveSample:
-    """一筆 NWW3 波浪摘要資料；原始波向尚未轉為傳播方向向量。"""
+    """一筆 NWW3 波浪摘要資料；保留波向圓向量供跨月原語意內插。
+
+    ``significant_wave_height_m``、``peak_frequency_hz`` 與
+    ``peak_direction_raw_deg`` 是四角空間內插後的波浪摘要。NWW3 的方向不是普通
+    線性角度；``direction_x`` 與 ``direction_y`` 保存空間內插階段實際累積的
+    ``sin(direction)``／``cos(direction)`` 加權值，讓跨月份時能先對原始波浪欄位與
+    圓向量做時間內插，再轉回角度。這兩個欄位對既有 caller 保持 optional；舊的
+    synthetic callback 若只建立五欄 ``WaveSample``，仍維持原本資料格式，但跨月
+    合成會拒絕缺少圓向量的波浪端點，避免用已轉回的角度猜回向量權重。
+    """
 
     significant_wave_height_m: float
     peak_frequency_hz: float
     peak_direction_raw_deg: float
     qc_flags: int
     qc: SampleQC = SampleQC.OK
+    direction_x: float | None = None
+    direction_y: float | None = None
 
     @property
     def valid(self) -> bool:
@@ -742,6 +761,120 @@ class OCMNativeMonth:
             diagnostics=diagnostics,
         )
 
+    def sample_smagorinsky_diffusion_at_time_index(
+        self,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+        time_index: int,
+        settings: SmagorinskySettings,
+        *,
+        triangle_hint: int | None = None,
+        support_z_m: float | None = None,
+        enforce_geometric_bounds: bool = True,
+    ) -> DiffusionSample:
+        """在單一 OCM 時間列計算非線性 Smagorinsky endpoint。
+
+        這是跨月份時間軸的明示 endpoint 介面。它先在該時間列完成每個 incident
+        triangle 的速度梯度、面積加權 nodal ``Kh`` 以及 floor/cap，再回傳該 endpoint
+        的粒子 ``Kh``、梯度與診斷；manager 之後才對兩個 endpoint 的結果做時間線性
+        內插。因此不會把已經合成的總速度或不同月份的 Kh candidate 先相加，並且與
+        將兩端列放入同一個連續 provider 後由原方法分別計算再內插的順序一致。
+
+        ``support_z_m`` 和 ``enforce_geometric_bounds`` 的用途與
+        ``sample_at_time_index`` 相同：跨月 caller 以兩端海面內插得到共同 query-time
+        垂向支援值，端點只驗證 OCM layer／遮罩，最後再由 caller 做一次共同幾何 gate。
+        省略時則使用該 endpoint 的海面政策，保持直接 caller 的獨立取樣語意。
+        """
+
+        if not isinstance(settings, SmagorinskySettings):
+            raise TypeError("settings 必須是 SmagorinskySettings")
+        settings.validate()
+        index = self._validate_time_index(time_index)
+        location = self.mesh.locate(x_m, y_m, triangle_hint=triangle_hint)
+        if location is None:
+            return _invalid_smagorinsky_sample(
+                settings,
+                SampleQC.OUTSIDE_HORIZONTAL_DOMAIN,
+                triangle_id=None,
+            )
+        geometric_bounds = self._geometric_bounds_at_time(
+            location,
+            before=index,
+            after=index,
+            alpha=0.0,
+        )
+        if enforce_geometric_bounds and not _query_z_within_geometric_bounds(z_m, geometric_bounds):
+            return _invalid_smagorinsky_sample(
+                settings,
+                SampleQC.VERTICAL_UNSUPPORTED,
+                triangle_id=location.triangle_id,
+            )
+        target_z = z_m if support_z_m is None else support_z_m
+        if not np.isfinite(target_z):
+            return _invalid_smagorinsky_sample(
+                settings,
+                SampleQC.VERTICAL_UNSUPPORTED,
+                triangle_id=location.triangle_id,
+            )
+        endpoint, endpoint_qc, valid_count, excluded_count = self._smagorinsky_time_slice(
+            location,
+            time_index=index,
+            z_m=target_z,
+            settings=settings,
+        )
+        if endpoint is None or endpoint_qc != SampleQC.OK:
+            return _invalid_smagorinsky_sample(
+                settings,
+                endpoint_qc,
+                triangle_id=location.triangle_id,
+                valid_incident_triangle_count=valid_count,
+                excluded_incident_triangle_count=excluded_count,
+            )
+        nodal_kh = np.asarray(endpoint.nodal_kh_m2ps, dtype=np.float64)
+        weights = np.asarray(location.barycentric_weights, dtype=np.float64)
+        particle_kh = float(weights @ nodal_kh)
+        try:
+            gradient_x, gradient_y = self.mesh.triangle_linear_gradient(
+                location.triangle_id,
+                nodal_kh,
+            )
+        except (TypeError, ValueError, IndexError):
+            return _invalid_smagorinsky_sample(
+                settings,
+                SampleQC.NUMERICAL_FAILURE,
+                triangle_id=location.triangle_id,
+                valid_incident_triangle_count=valid_count,
+                excluded_incident_triangle_count=excluded_count,
+            )
+        diagnostics: dict[str, bool | float | int | str] = {
+            "method": _smagorinsky_method_name(),
+            "coefficient_cs": settings.coefficient_cs,
+            "kh_m2ps": particle_kh,
+            "d_kh_dx_mps": float(gradient_x),
+            "d_kh_dy_mps": float(gradient_y),
+            "raw_current_triangle_kh_m2ps": float(endpoint.raw_current_triangle_kh_m2ps),
+            "floor_hit": bool(endpoint.floor_hit),
+            "cap_hit": bool(endpoint.cap_hit),
+            "valid_incident_triangle_count": int(valid_count),
+            "excluded_incident_triangle_count": int(excluded_count),
+            "valid_incident_triangle_count_before": int(valid_count),
+            "valid_incident_triangle_count_after": int(valid_count),
+            "excluded_incident_triangle_count_before": int(excluded_count),
+            "excluded_incident_triangle_count_after": int(excluded_count),
+            "triangle_id": int(location.triangle_id),
+        }
+        return DiffusionSample(
+            coefficients=DiffusionCoefficients(
+                particle_kh,
+                particle_kh,
+                settings.constant_kz_m2ps,
+            ),
+            diffusivity_divergence_mps=(float(gradient_x), float(gradient_y), 0.0),
+            qc=SampleQC.OK,
+            diagnostics=diagnostics,
+        )
+
     def _spatial_at_time(
         self, location: MeshLocation, *, time_index: int, z_m: float
     ) -> tuple[tuple[np.ndarray, float, float] | None, SampleQC]:
@@ -817,6 +950,190 @@ class OCMNativeMonth:
         ):
             return None
         return eta, bed
+
+    def _validate_time_index(self, time_index: int) -> int:
+        """驗證單一 endpoint 的時間索引，避免跨月 adapter 讀錯列。
+
+        endpoint API 只接受這個月份自身 ``time_utc_ns`` 的整數列索引。索引不是
+        UTC 時刻，因此不能由 caller 以負值、浮點或布林值偷偷繞過月份時間軸檢查；
+        超出範圍也直接上拋，讓月份管理器把真正的產品／程式錯誤與可回傳的時間 QC
+        分開。這個驗證不修改任何 memory-map 陣列。
+        """
+
+        if isinstance(time_index, bool) or not isinstance(time_index, (int, np.integer)):
+            raise TypeError("time_index 必須是真正的 integer，不可為 bool")
+        normalized = int(time_index)
+        if normalized < 0 or normalized >= self.time_utc_ns.size:
+            raise IndexError(f"time_index 超出 OCM 月份範圍：{normalized}")
+        return normalized
+
+    def geometry_at_time_index(
+        self,
+        x_m: float,
+        y_m: float,
+        time_index: int,
+        *,
+        triangle_hint: int | None = None,
+    ) -> tuple[MeshLocation | None, tuple[float, float] | None]:
+        """回傳單一 OCM endpoint 的 mesh location 與 ``(eta, bed)`` 幾何上下界。
+
+        跨月份 manager 需要先以兩端的海面／海床建立 query-time 幾何，再決定固定
+        ``z_m`` 應送入哪一個 endpoint 的垂向層。此方法只讀同一月份的 ``elev``、native
+        靜態水深與 mesh 權重，不讀取或合成速度，也不對缺值做任何補值。水平域外會
+        回傳 ``(None, None)``；合法索引但幾何缺值則保留 location 並回傳 ``None``，
+        讓呼叫端維持原本 ``VERTICAL_UNSUPPORTED`` 的 fail-closed 語意。
+        """
+
+        index = self._validate_time_index(time_index)
+        location = self.mesh.locate(x_m, y_m, triangle_hint=triangle_hint)
+        if location is None:
+            return None, None
+        return location, self._geometric_bounds_at_time(
+            location,
+            before=index,
+            after=index,
+            alpha=0.0,
+        )
+
+    def sample_at_time_index(
+        self,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+        time_index: int,
+        *,
+        triangle_hint: int | None = None,
+        support_z_m: float | None = None,
+        enforce_geometric_bounds: bool = True,
+    ) -> VelocitySample:
+        """在一個 OCM 時間列取出原始 current／Kz endpoint，不進行時間內插。
+
+        ``time_index`` 指向這個月份實際的 UTC 時間列；跨月流程會先從兩個月份
+        建立全域 before／after，再用本方法各取一次。水平三角形、垂向 ``zcor``、
+        ``wetdry``、OCM current、垂向速度、擴散係數與海面幾何沿用一般
+        ``sample`` 的支援規則，故不會把缺值、乾面或海床下方轉成零速度。
+
+        ``support_z_m`` 是 manager 依兩端內插後的 query-time 海面所決定的固定
+        垂向查詢值；省略時才由此 endpoint 自己的海面容許帶推導。跨月 caller
+        應傳入前者，並將 ``enforce_geometric_bounds=False``，最後在兩端原始值
+        內插後用 query-time ``eta``／海床做一次共同 gate。這個例外只避免 endpoint
+        surface hold 依月份各自判定，並不放寬垂向層支援或資料品質。
+        """
+
+        index = self._validate_time_index(time_index)
+        location = self.mesh.locate(x_m, y_m, triangle_hint=triangle_hint)
+        if location is None:
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                SampleQC.OUTSIDE_HORIZONTAL_DOMAIN,
+                forcing_month_id=self.month_id,
+            )
+        geometric_bounds = self._geometric_bounds_at_time(
+            location,
+            before=index,
+            after=index,
+            alpha=0.0,
+        )
+        target_z = z_m if support_z_m is None else support_z_m
+        if not np.isfinite(target_z):
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                *(geometric_bounds or (np.nan, np.nan)),
+                np.sqrt(location.triangle_area_m2),
+                np.nan,
+                SampleQC.VERTICAL_UNSUPPORTED,
+                source_face_id=location.source_face_global_index,
+                triangle_id=location.triangle_id,
+                forcing_month_id=self.month_id,
+            )
+        if self.use_numba_kernel:
+            face = location.source_face_local_index
+            wet_value = float(self.wetdry_elem[index, face])
+            if not np.isfinite(wet_value) or not np.isclose(wet_value, self.wet_value, atol=0.1):
+                values: np.ndarray | None = None
+                vertical_scale = np.nan
+                endpoint_qc = SampleQC.DRY_FACE
+            elif geometric_bounds is None:
+                values = None
+                vertical_scale = np.nan
+                endpoint_qc = SampleQC.VERTICAL_UNSUPPORTED
+            else:
+                values, vertical_scale, valid = interpolate_ocm_support_numba(
+                    self.hvel,
+                    self.vertical_velocity,
+                    self.zcor,
+                    self.diffusivity,
+                    index,
+                    index,
+                    0.0,
+                    np.asarray(location.node_indices, dtype=np.int64),
+                    np.asarray(location.barycentric_weights, dtype=np.float64),
+                    target_z,
+                    SURFACE_BOUNDARY_TOLERANCE_M,
+                )
+                endpoint_qc = SampleQC.OK if valid else SampleQC.VERTICAL_UNSUPPORTED
+        else:
+            sampled, endpoint_qc = self._spatial_at_time(
+                location,
+                time_index=index,
+                z_m=target_z,
+            )
+            if sampled is None:
+                values = None
+                vertical_scale = np.nan
+            else:
+                values, _, vertical_scale = sampled
+        eta, bed_z = geometric_bounds if geometric_bounds is not None else (np.nan, np.nan)
+        if values is None or endpoint_qc != SampleQC.OK:
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                eta,
+                bed_z,
+                np.sqrt(location.triangle_area_m2),
+                float(vertical_scale),
+                endpoint_qc,
+                source_face_id=location.source_face_global_index,
+                triangle_id=location.triangle_id,
+                forcing_month_id=self.month_id,
+            )
+        if enforce_geometric_bounds and not _query_z_within_geometric_bounds(z_m, geometric_bounds):
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                eta,
+                bed_z,
+                np.sqrt(location.triangle_area_m2),
+                float(vertical_scale),
+                SampleQC.VERTICAL_UNSUPPORTED,
+                source_face_id=location.source_face_global_index,
+                triangle_id=location.triangle_id,
+                forcing_month_id=self.month_id,
+            )
+        return VelocitySample(
+            u_mps=float(values[0]),
+            v_mps=float(values[1]),
+            w_mps=float(values[2]),
+            eta_m=eta,
+            bed_z_m=bed_z,
+            horizontal_scale_m=float(np.sqrt(location.triangle_area_m2)),
+            vertical_scale_m=float(vertical_scale),
+            qc=SampleQC.OK,
+            source_face_id=location.source_face_global_index,
+            triangle_id=location.triangle_id,
+            forcing_month_id=self.month_id,
+            diagnostics={"kz_m2ps": float(values[3])},
+        )
 
     def sample(
         self,
@@ -1027,8 +1344,14 @@ class NWWAnalysisMonth:
             qc_flags=load(month, "qc_flags.npy"),
         )
 
-    def sample(self, lon: float, lat: float, time_utc_ns: int) -> WaveSample:
-        """僅在四個周圍格點都有效時做空間與時間內插；波向以正弦、餘弦避免 0/360 度斷點。"""
+    def _sample_spatial_at_time(self, lon: float, lat: float, time_index: int) -> WaveSample:
+        """對單一 NWW3 時間列做四角空間內插，保留尚未正規化的方向圓向量。
+
+        這個 helper 不碰時間軸；它只讀 ``time_index`` 的四個水平角點，並沿用原有
+        valid mask、QC 聯集、有限值、波高／頻率與方向物理檢查。方向向量的大小不能
+        被丟掉，因為跨月時間內插必須和單一連續月份 provider 的
+        ``direction_x``／``direction_y`` 累加順序一致。
+        """
 
         if lon < self.lon[0] or lon > self.lon[-1] or lat < self.lat[0] or lat > self.lat[-1]:
             return WaveSample(np.nan, np.nan, np.nan, 0, SampleQC.OUTSIDE_HORIZONTAL_DOMAIN)
@@ -1038,44 +1361,143 @@ class NWWAnalysisMonth:
         y0, y1 = y_after - 1, y_after
         wx = float((lon - self.lon[x0]) / (self.lon[x1] - self.lon[x0]))
         wy = float((lat - self.lat[y0]) / (self.lat[y1] - self.lat[y0]))
+        corners = [(y0, x0), (y0, x1), (y1, x0), (y1, x1)]
+        spatial_weights = np.array(
+            [(1 - wy) * (1 - wx), (1 - wy) * wx, wy * (1 - wx), wy * wx],
+            dtype=np.float64,
+        )
+        mask = np.array([self.valid_mask_wave[time_index, y, x] for y, x in corners], dtype=bool)
+        qc_union = int(
+            np.bitwise_or.reduce([self.qc_flags[time_index, y, x] for y, x in corners])
+        )
+        if not np.all(mask):
+            return WaveSample(np.nan, np.nan, np.nan, qc_union, SampleQC.WAVE_UNSUPPORTED)
+        hs_values = np.array(
+            [self.significant_wave_height[time_index, y, x] for y, x in corners],
+            dtype=np.float64,
+        )
+        fp_values = np.array(
+            [self.peak_frequency[time_index, y, x] for y, x in corners],
+            dtype=np.float64,
+        )
+        directions = np.deg2rad(
+            np.array(
+                [self.peak_direction_raw_deg[time_index, y, x] for y, x in corners],
+                dtype=np.float64,
+            )
+        )
+        if not (
+            np.all(np.isfinite(hs_values))
+            and np.all(np.isfinite(fp_values))
+            and np.all(np.isfinite(directions))
+        ):
+            return WaveSample(np.nan, np.nan, np.nan, qc_union, SampleQC.WAVE_UNSUPPORTED)
+        hs = float(spatial_weights @ hs_values)
+        fp = float(spatial_weights @ fp_values)
+        direction_x = float(spatial_weights @ np.sin(directions))
+        direction_y = float(spatial_weights @ np.cos(directions))
+        if hs < 0 or fp <= 0 or abs(direction_x) + abs(direction_y) <= 1e-15:
+            return WaveSample(
+                hs,
+                fp,
+                np.nan,
+                qc_union,
+                SampleQC.INVALID_PHYSICS,
+                direction_x=direction_x,
+                direction_y=direction_y,
+            )
+        raw_direction = float(np.degrees(np.arctan2(direction_x, direction_y)) % 360.0)
+        return WaveSample(
+            hs,
+            fp,
+            raw_direction,
+            qc_union,
+            SampleQC.OK,
+            direction_x=direction_x,
+            direction_y=direction_y,
+        )
+
+    def _validate_time_index(self, time_index: int) -> int:
+        """驗證 NWW3 單一 endpoint 時間列，拒絕隱式負索引與非整數。"""
+
+        if isinstance(time_index, bool) or not isinstance(time_index, (int, np.integer)):
+            raise TypeError("time_index 必須是真正的 integer，不可為 bool")
+        normalized = int(time_index)
+        if normalized < 0 or normalized >= self.time_utc_ns.size:
+            raise IndexError(f"time_index 超出 NWW 月份範圍：{normalized}")
+        return normalized
+
+    def sample_at_time_index(self, lon: float, lat: float, time_index: int) -> WaveSample:
+        """回傳單一 NWW3 endpoint 的四角空間內插結果，不進行時間內插。
+
+        跨月份 manager 以兩個月份的實際時間列建立全域 before／after，再呼叫本方法。
+        返回值保留方向圓向量，呼叫端可先內插 ``Hs``、``fp`` 與向量後再交給有限水深
+        Stokes 公式；缺角點、遮罩、非有限值與物理失敗維持原本非零 QC。
+        """
+
+        index = self._validate_time_index(time_index)
+        return self._sample_spatial_at_time(lon, lat, index)
+
+    def sample(self, lon: float, lat: float, time_utc_ns: int) -> WaveSample:
+        """僅在四個周圍格點都有效時做空間與時間內插；方向以圓向量處理。
+
+        時間內插先對每個 endpoint 的 ``Hs``、``fp`` 與未正規化方向向量做線性運算，
+        再把向量轉回角度。這個順序也供跨月 manager 使用，避免在 0／360 度邊界把
+        已轉成角度的數值直接平均。
+        """
+
         before, after, alpha, time_qc = _time_bracket(
-            self.time_utc_ns, time_utc_ns, maximum_gap_ns=self.maximum_time_gap_ns
+            self.time_utc_ns,
+            time_utc_ns,
+            maximum_gap_ns=self.maximum_time_gap_ns,
         )
         if time_qc != SampleQC.OK:
             return WaveSample(np.nan, np.nan, np.nan, 0, time_qc)
-        corners = [(y0, x0), (y0, x1), (y1, x0), (y1, x1)]
-        spatial_weights = np.array([(1 - wy) * (1 - wx), (1 - wy) * wx, wy * (1 - wx), wy * wx])
-        time_indices = [before] if before == after else [before, after]
-        time_weights = [1.0] if before == after else [1.0 - alpha, alpha]
-        hs = 0.0
-        fp = 0.0
-        direction_x = 0.0
-        direction_y = 0.0
-        qc_union = 0
-        for time_index, time_weight in zip(time_indices, time_weights, strict=True):
-            mask = np.array([self.valid_mask_wave[time_index, y, x] for y, x in corners], dtype=bool)
-            qc_union |= int(np.bitwise_or.reduce([self.qc_flags[time_index, y, x] for y, x in corners]))
-            if not np.all(mask):
-                return WaveSample(np.nan, np.nan, np.nan, qc_union, SampleQC.WAVE_UNSUPPORTED)
-            hs_values = np.array([self.significant_wave_height[time_index, y, x] for y, x in corners])
-            fp_values = np.array([self.peak_frequency[time_index, y, x] for y, x in corners])
-            directions = np.deg2rad(
-                np.array([self.peak_direction_raw_deg[time_index, y, x] for y, x in corners])
-            )
-            if not (
-                np.all(np.isfinite(hs_values))
-                and np.all(np.isfinite(fp_values))
-                and np.all(np.isfinite(directions))
-            ):
-                return WaveSample(np.nan, np.nan, np.nan, qc_union, SampleQC.WAVE_UNSUPPORTED)
-            hs += time_weight * float(spatial_weights @ hs_values)
-            fp += time_weight * float(spatial_weights @ fp_values)
-            direction_x += time_weight * float(spatial_weights @ np.sin(directions))
-            direction_y += time_weight * float(spatial_weights @ np.cos(directions))
+        first = self.sample_at_time_index(lon, lat, before)
+        if not first.valid:
+            return first
+        if after == before:
+            return first
+        second = self.sample_at_time_index(lon, lat, after)
+        if not second.valid:
+            # 舊版逐 endpoint 迴圈在第二端失敗前已累積第一端的 QC flags；保留第二端
+            # 的非零 SampleQC，同時把兩端空間四角的原始旗標聯集，避免跨時間失敗時
+            # 遺失已讀取 endpoint 的資料品質 provenance。
+            return replace(second, qc_flags=int(first.qc_flags | second.qc_flags))
+        if first.direction_x is None or first.direction_y is None:
+            return WaveSample(np.nan, np.nan, np.nan, first.qc_flags, SampleQC.WAVE_UNSUPPORTED)
+        if second.direction_x is None or second.direction_y is None:
+            return WaveSample(np.nan, np.nan, np.nan, second.qc_flags, SampleQC.WAVE_UNSUPPORTED)
+        interpolation = float(alpha)
+        hs = first.significant_wave_height_m + interpolation * (
+            second.significant_wave_height_m - first.significant_wave_height_m
+        )
+        fp = first.peak_frequency_hz + interpolation * (
+            second.peak_frequency_hz - first.peak_frequency_hz
+        )
+        direction_x = first.direction_x + interpolation * (second.direction_x - first.direction_x)
+        direction_y = first.direction_y + interpolation * (second.direction_y - first.direction_y)
+        qc_union = int(first.qc_flags | second.qc_flags)
         if hs < 0 or fp <= 0 or abs(direction_x) + abs(direction_y) <= 1e-15:
-            return WaveSample(hs, fp, np.nan, qc_union, SampleQC.INVALID_PHYSICS)
+            return WaveSample(
+                hs,
+                fp,
+                np.nan,
+                qc_union,
+                SampleQC.INVALID_PHYSICS,
+                direction_x=direction_x,
+                direction_y=direction_y,
+            )
         raw_direction = float(np.degrees(np.arctan2(direction_x, direction_y)) % 360.0)
-        return WaveSample(hs, fp, raw_direction, qc_union)
+        return WaveSample(
+            hs,
+            fp,
+            raw_direction,
+            qc_union,
+            SampleQC.OK,
+            direction_x=direction_x,
+            direction_y=direction_y,
+        )
 
 
 class CombinedMonthForcing:
@@ -1202,6 +1624,296 @@ class CombinedMonthForcing:
                 ocm_u_mps=current.u_mps,
                 ocm_v_mps=current.v_mps,
                 ocm_w_mps=current.w_mps,
+                stokes_u_mps=stokes_u,
+                stokes_v_mps=stokes_v,
+                settling_w_mps=self.settling_velocity_mps,
+            ),
+        )
+
+    def sample_from_endpoints(
+        self,
+        *,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+        time_utc_ns: int,
+        ocm_before: VelocitySample,
+        ocm_after: VelocitySample,
+        ocm_alpha: float,
+        nww_before: WaveSample | None = None,
+        nww_after: WaveSample | None = None,
+        nww_alpha: float = 0.0,
+        forcing_month_id: str | None = None,
+        endpoint_month_before: str | None = None,
+        endpoint_month_after: str | None = None,
+        endpoint_nww_month_before: str | None = None,
+        endpoint_nww_month_after: str | None = None,
+    ) -> VelocitySample:
+        """以兩個實際時間列合成跨月份速度，保留原始物理運算順序。
+
+        ``ocm_before``／``ocm_after`` 已由各自月份的 endpoint API 在固定座標與垂向
+        支援值取樣；本方法只對 OCM 原始 ``u/v/w/Kz`` 與幾何 ``eta/bed`` 做時間線性
+        內插。若啟用 Stokes，NWW 端點的 ``Hs``、峰值頻率與未正規化方向圓向量另以
+        ``nww_alpha`` 內插，之後才在查詢時刻對內插後的波浪與 query-time 水柱套用
+        一次 ``finite_depth_stokes``。所以結果等同把相同兩端點放進單一連續月份
+        provider，不會對已合成的 total velocity 做時間內插。
+
+        端點任何一項不是有效樣本時，保留其原有 QC；幾何、triangle 或方向圓向量
+        不一致則 fail closed。``forcing_month_id`` 必須由 manager 傳入單一合法
+        ``YYYYMM``，以符合 observation/checkpoint 輸出欄位。有效樣本的兩端實際月份
+        不重複寫入 diagnostics，應由這個欄位搭配輸入 manifest 重建；失敗樣本才保留
+        endpoint identity 診斷，避免把混合來源誤標成單一資料檔。
+        """
+
+        if not isinstance(ocm_before, VelocitySample) or not isinstance(ocm_after, VelocitySample):
+            raise TypeError("ocm_before/ocm_after 必須是 VelocitySample")
+        if not isinstance(nww_alpha, (int, float, np.integer, np.floating)) or isinstance(
+            nww_alpha, (bool, np.bool_)
+        ):
+            raise TypeError("nww_alpha 必須是有限數值")
+        if not isinstance(ocm_alpha, (int, float, np.integer, np.floating)) or isinstance(
+            ocm_alpha, (bool, np.bool_)
+        ):
+            raise TypeError("ocm_alpha 必須是有限數值")
+        ocm_weight = float(ocm_alpha)
+        nww_weight = float(nww_alpha)
+        if not np.isfinite(ocm_weight) or not 0.0 <= ocm_weight <= 1.0:
+            raise ValueError("ocm_alpha 必須位於 0 與 1 之間")
+        if not np.isfinite(nww_weight) or not 0.0 <= nww_weight <= 1.0:
+            raise ValueError("nww_alpha 必須位於 0 與 1 之間")
+        if forcing_month_id is None:
+            forcing_month_id = endpoint_month_after or endpoint_month_before
+        if forcing_month_id is not None and (
+            len(forcing_month_id) != 6 or not forcing_month_id.isdigit()
+        ):
+            raise ValueError("forcing_month_id 必須是 YYYYMM 或 None")
+        source_face_id = (
+            ocm_before.source_face_id
+            if ocm_before.source_face_id == ocm_after.source_face_id
+            else None
+        )
+        triangle_id = (
+            ocm_before.triangle_id if ocm_before.triangle_id == ocm_after.triangle_id else None
+        )
+        diagnostics: dict[str, bool | float | int | str] = {
+            "cross_month_endpoint": 1,
+            "endpoint_month_before": endpoint_month_before or "",
+            "endpoint_month_after": endpoint_month_after or "",
+        }
+        if endpoint_nww_month_before is not None:
+            diagnostics["endpoint_nww_month_before"] = endpoint_nww_month_before
+        if endpoint_nww_month_after is not None:
+            diagnostics["endpoint_nww_month_after"] = endpoint_nww_month_after
+        if source_face_id is None or triangle_id is None:
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                SampleQC.NUMERICAL_FAILURE,
+                forcing_month_id=forcing_month_id,
+                diagnostics={**diagnostics, "endpoint_identity_mismatch": 1},
+            )
+        if not ocm_before.valid or not ocm_after.valid:
+            qc = ocm_before.qc | ocm_after.qc
+            eta = _interpolate_optional_float(ocm_before.eta_m, ocm_after.eta_m, ocm_weight)
+            bed = _interpolate_optional_float(ocm_before.bed_z_m, ocm_after.bed_z_m, ocm_weight)
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                eta,
+                bed,
+                min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+                np.nan,
+                qc,
+                source_face_id=source_face_id,
+                triangle_id=triangle_id,
+                forcing_month_id=forcing_month_id,
+                diagnostics=diagnostics,
+            )
+
+        u = ocm_before.u_mps + ocm_weight * (ocm_after.u_mps - ocm_before.u_mps)
+        v = ocm_before.v_mps + ocm_weight * (ocm_after.v_mps - ocm_before.v_mps)
+        w = ocm_before.w_mps + ocm_weight * (ocm_after.w_mps - ocm_before.w_mps)
+        eta = ocm_before.eta_m + ocm_weight * (ocm_after.eta_m - ocm_before.eta_m)
+        bed = ocm_before.bed_z_m + ocm_weight * (ocm_after.bed_z_m - ocm_before.bed_z_m)
+        vertical_scale = min(ocm_before.vertical_scale_m, ocm_after.vertical_scale_m)
+        if not (
+            np.all(np.isfinite((u, v, w, eta, bed, vertical_scale)))
+            and bed <= eta + VERTICAL_BOUNDARY_TOLERANCE_M
+            and _query_z_within_geometric_bounds(z_m, (eta, bed))
+        ):
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                eta,
+                bed,
+                min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+                vertical_scale,
+                SampleQC.VERTICAL_UNSUPPORTED,
+                source_face_id=source_face_id,
+                triangle_id=triangle_id,
+                forcing_month_id=forcing_month_id,
+                diagnostics=diagnostics,
+            )
+        # 有效樣本的 diagnostics 必須與既有 CombinedMonthForcing 完全相同，避免把
+        # endpoint provenance 欄位誤當成速度物理量。兩端來源仍由 forcing_month_id 與
+        # manager 的輸入 manifest 追蹤；只有失敗樣本才保留上面的 identity 診斷。
+        diagnostics = {}
+        kz_before = ocm_before.diagnostics.get("kz_m2ps")
+        kz_after = ocm_after.diagnostics.get("kz_m2ps")
+        if kz_before is not None and kz_after is not None:
+            try:
+                diagnostics["kz_m2ps"] = float(kz_before) + ocm_weight * (
+                    float(kz_after) - float(kz_before)
+                )
+            except (TypeError, ValueError):
+                diagnostics["kz_m2ps"] = np.nan
+        stokes_u = 0.0
+        stokes_v = 0.0
+        if self.include_stokes:
+            if nww_before is None or nww_after is None:
+                return VelocitySample(
+                    u,
+                    v,
+                    w + self.settling_velocity_mps,
+                    eta,
+                    bed,
+                    min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+                    vertical_scale,
+                    SampleQC.WAVE_UNSUPPORTED,
+                    source_face_id=source_face_id,
+                    triangle_id=triangle_id,
+                    forcing_month_id=forcing_month_id,
+                    diagnostics={**diagnostics, "nww_month_missing": 1},
+                )
+            if not nww_before.valid or not nww_after.valid:
+                return VelocitySample(
+                    u,
+                    v,
+                    w + self.settling_velocity_mps,
+                    eta,
+                    bed,
+                    min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+                    vertical_scale,
+                    nww_before.qc | nww_after.qc,
+                    source_face_id=source_face_id,
+                    triangle_id=triangle_id,
+                    forcing_month_id=forcing_month_id,
+                    diagnostics={
+                        **diagnostics,
+                        "nww_qc_flags": int(nww_before.qc_flags | nww_after.qc_flags),
+                    },
+                )
+            if (
+                nww_before.direction_x is None
+                or nww_before.direction_y is None
+                or nww_after.direction_x is None
+                or nww_after.direction_y is None
+            ):
+                return VelocitySample(
+                    u,
+                    v,
+                    w + self.settling_velocity_mps,
+                    eta,
+                    bed,
+                    min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+                    vertical_scale,
+                    SampleQC.WAVE_UNSUPPORTED,
+                    source_face_id=source_face_id,
+                    triangle_id=triangle_id,
+                    forcing_month_id=forcing_month_id,
+                    diagnostics={**diagnostics, "nww_direction_vector_missing": 1},
+                )
+            hs = nww_before.significant_wave_height_m + nww_weight * (
+                nww_after.significant_wave_height_m - nww_before.significant_wave_height_m
+            )
+            fp = nww_before.peak_frequency_hz + nww_weight * (
+                nww_after.peak_frequency_hz - nww_before.peak_frequency_hz
+            )
+            direction_x = nww_before.direction_x + nww_weight * (
+                nww_after.direction_x - nww_before.direction_x
+            )
+            direction_y = nww_before.direction_y + nww_weight * (
+                nww_after.direction_y - nww_before.direction_y
+            )
+            if hs < 0 or fp <= 0 or abs(direction_x) + abs(direction_y) <= 1e-15:
+                return VelocitySample(
+                    u,
+                    v,
+                    w + self.settling_velocity_mps,
+                    eta,
+                    bed,
+                    min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+                    vertical_scale,
+                    SampleQC.INVALID_PHYSICS,
+                    source_face_id=source_face_id,
+                    triangle_id=triangle_id,
+                    forcing_month_id=forcing_month_id,
+                    diagnostics=diagnostics,
+                )
+            raw_direction = float(np.degrees(np.arctan2(direction_x, direction_y)) % 360.0)
+            try:
+                stokes = finite_depth_stokes(
+                    significant_wave_height_m=float(hs),
+                    peak_frequency_hz=float(fp),
+                    direction_raw_deg=raw_direction,
+                    particle_z_m=z_m,
+                    surface_z_m=eta,
+                    bed_z_m=bed,
+                )
+            except ValueError:
+                return VelocitySample(
+                    u,
+                    v,
+                    w + self.settling_velocity_mps,
+                    eta,
+                    bed,
+                    min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+                    vertical_scale,
+                    SampleQC.INVALID_PHYSICS,
+                    source_face_id=source_face_id,
+                    triangle_id=triangle_id,
+                    forcing_month_id=forcing_month_id,
+                    diagnostics=diagnostics,
+                )
+            stokes_u, stokes_v = stokes.u_mps, stokes.v_mps
+            diagnostics.update(
+                {
+                    "stokes_u_mps": stokes_u,
+                    "stokes_v_mps": stokes_v,
+                    "stokes_kh": stokes.kh,
+                    "wave_steepness_ka": stokes.steepness_ka,
+                }
+            )
+        total_u = u + stokes_u
+        total_v = v + stokes_v
+        total_w = w + self.settling_velocity_mps
+        return VelocitySample(
+            u_mps=total_u,
+            v_mps=total_v,
+            w_mps=total_w,
+            eta_m=eta,
+            bed_z_m=bed,
+            horizontal_scale_m=min(ocm_before.horizontal_scale_m, ocm_after.horizontal_scale_m),
+            vertical_scale_m=vertical_scale,
+            qc=SampleQC.OK,
+            source_face_id=source_face_id,
+            triangle_id=triangle_id,
+            forcing_month_id=forcing_month_id,
+            diagnostics=diagnostics,
+            components=VelocityComponents(
+                total_u_mps=total_u,
+                total_v_mps=total_v,
+                total_w_mps=total_w,
+                ocm_u_mps=u,
+                ocm_v_mps=v,
+                ocm_w_mps=w,
                 stokes_u_mps=stokes_u,
                 stokes_v_mps=stokes_v,
                 settling_w_mps=self.settling_velocity_mps,

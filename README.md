@@ -55,6 +55,19 @@
 
 受體×到達配對的實際深度與三維初始條件來自到達 UTC 的 OCM 原生動態紀錄；OCM surface 只負責到達時間篩選，不代表配對的來源深度或三維流場資料。
 
+月份目錄只是產品分割與延遲載入的索引；執行階段會依每個 OCM／NWW3 產品實際的
+`time_utc_ns`，在必要時從相鄰月份尋找 before／after 時間端點。相鄰月份的時間軸連續且
+未超過產品允許的最大時間間隔時，才進行合法時間內插；真正的時間缺口仍回傳
+`TIME_GAP`，不以零值、最近值或外插補齊。OCM 與 NWW3 會各自依自身時間軸選取端點，
+因此同一查詢時刻可以使用不同月份的 OCM／NWW3 原始資料，並在保留原始物理欄位後完成
+Stokes 合成。正式運算設定的 `execution.max_resident_forcing_months` 應設定至少為
+`2`（對應 manager constructor 的 `max_resident_months=2`），讓跨月兩端可常駐並避免
+每個邊界 stage 反覆重載月份；設定為 `1` 仍維持數值正確性，但只適合記憶體受限的測試
+或低頻取樣，可能產生月界 I/O thrash。
+同月安全查詢會直接沿用 `CombinedMonthForcing`；暖機後 cache stats 的每次普通
+no-Stokes sample 只增加一次 OCM hit，Stokes sample 再增加一次 NWW hit。跨月、月尾
+或可能有 halo duplicate 的查詢才會記錄必要的 endpoint 探查命中。
+
 OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾住 query z；針對移動海面，若固定 z 在某一個 before／after 端點高於該端點最高有限 `zcor`，端點可使用最高有效層的速度、垂向速度與 Kz，表示 OCM 最上層控制體的 surface hold。這不是任意最近值外插，也不把 top `zcor` 當成物理海面。所有海面上界查詢共用 `models.py` 的 `SURFACE_BOUNDARY_TOLERANCE_M = 5e-6 m`：只有 `z - eta` 不超過 5 微米時才先夾回 query-time `eta`，讓 endpoint top-layer 支援與 Stokes profile 使用同一表面；超過此尺度仍回傳 `VERTICAL_UNSUPPORTED`／保留原有失敗 QC。這個 5 微米尺度是為涵蓋 checkpoint-8 最大約 `3.367686e-6 m` 的海面邊界定位數值殘差（含浮點與積分／內插）而設，遠小於 OCM 垂向物理層距，並非可任意放大的物理緩衝。海床與「海床高於海面」的既有 1 微米幾何契約維持不變；乾點、缺值、域外與時間缺口也不因海面容差取得通行權。Smagorinsky 水平 current 取樣共用同一端點支援與 query-time 幾何範圍檢查。此為工程取樣政策與單元測試契約，不代表已完成真實資料的科學驗證。
 
 上述 5 微米仍是一般環境取樣介面（`forcing API`）的唯一海面上界容許尺度，不因四階 Runge-Kutta 法（RK4）的中間點越界而放大。新竹 24 小時 r3 曾在 `dt_min=0.1 s` 的 k4 觀察約 `z-eta=10.37e-6 m` 上越；r4 又在 k2 觀察三筆約 `2.27583e-4` 至 `2.37189e-4 m` 的明確上越。r4 顯示步首參考樣本可先由一般取樣器依 5 微米契約判定有效，但移動 eta 到 k2 時已下降；若引擎再要求步首嚴格 `z<=eta`，反而會否定同一集中契約。故步首資格要求參考樣本有效，且 `z` 位於 `bed-1e-6 m` 至 `eta+5e-6 m`；eta／bed 相容性也沿用既有 1 微米契約。這只承接已驗證的步首微米級邊界位置，不會放寬失敗中間點：k2／k3／k4 仍須回傳精確 `VERTICAL_UNSUPPORTED` 且 `z>eta`，並只在下一次自適應折半會低於 `dt_min` 時建立一次性的中間點垂向速度包裝器（`SurfaceStageVelocityProvider`）。包裝器以 `z_reflected=2*eta-z` 將該深度鏡射進實際水柱，再於相同 x、y、世界協調時間（UTC）重查；鏡射點仍須嚴格位於 `[bed,eta]`。重查若為乾點、域外、時間缺口、缺值、組合品質旗標或其他無效狀態，整步維持封閉式失敗。只有完整確定性 RK4 成功後才消耗一次布朗運動（Brownian）亂數，最終提議位置仍交由一般海面／海床解析器處理。單獨的中間點上越不會建立終點事件，也未擴張軌跡／事件資料格式；這是反射數值邊界條件，不表示粒子可存在於海面以上，亦不代表 r4 已完成修正後重跑驗收。

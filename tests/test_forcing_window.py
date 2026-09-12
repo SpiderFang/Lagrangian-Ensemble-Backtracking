@@ -17,7 +17,11 @@ from lagrangian_backtracking.engine import (
     advance_particle_once,
     initialize_particle_execution,
 )
-from lagrangian_backtracking.forcing import NWWAnalysisMonth, OCMNativeMonth
+from lagrangian_backtracking.forcing import (
+    CombinedMonthForcing,
+    NWWAnalysisMonth,
+    OCMNativeMonth,
+)
 from lagrangian_backtracking.forcing_window import (
     ForcingWindowManager,
     MissingForcingMonth,
@@ -52,6 +56,15 @@ def _month_start_ns(month_id: str) -> int:
     return int(start.timestamp()) * 1_000_000_000
 
 
+def _utc_ns(value: str) -> int:
+    """將 exact UTC ISO 時刻轉成整數奈秒，避免測試依賴本機時區或浮點四捨五入。"""
+
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("測試 UTC 時刻必須帶有時區")
+    return int(parsed.timestamp()) * 1_000_000_000
+
+
 def _ocm(month_id: str, mesh: NativeMesh, *, eastward_mps: float = 1.0) -> OCMNativeMonth:
     """建立兩個逐時支撐點的有效 OCM month；所有面保持 wet。"""
 
@@ -78,6 +91,65 @@ def _ocm(month_id: str, mesh: NativeMesh, *, eastward_mps: float = 1.0) -> OCMNa
     )
 
 
+def _ocm_cross_month(
+    month_id: str,
+    times_ns: list[int],
+    *,
+    maximum_time_gap_seconds: float = 7_200.0,
+    reference_ns: int | None = None,
+    use_numba_kernel: bool = False,
+) -> OCMNativeMonth:
+    """建立跨月端點共用同一解析場的 OCM 月份。
+
+    每個欄位都依絕對 UTC 小時產生，因此 July 尾端 00:00 與 August 首端 01:00
+    在分月產品和連續參考產品中具有完全相同的 endpoint 值。速度、海面高程與
+    ``diffusivity`` 都保留時間變化，才能檢查跨月內插沒有退回任一側最近值。
+    ``use_numba_kernel`` 只切換 OCM 端點的加速實作，數值結果仍應與 NumPy 路徑一致。
+    """
+
+    mesh = _mesh()
+    times = np.asarray(times_ns, dtype=np.int64)
+    origin_ns = (
+        _utc_ns("2024-08-01T00:00:00Z") if reference_ns is None else int(reference_ns)
+    )
+    hours = (times.astype(np.float64) - origin_ns) / 3_600_000_000_000.0
+    z_levels = np.array([-10.0, 0.0])
+    zcor = np.broadcast_to(z_levels, (times.size, 3, 2)).copy()
+    hvel = np.empty((times.size, 3, 2, 2), dtype=np.float64)
+    vertical_velocity = np.empty((times.size, 3, 2), dtype=np.float64)
+    diffusivity = np.empty((times.size, 3, 2), dtype=np.float64)
+    elev = np.empty((times.size, 3), dtype=np.float64)
+    for time_index, hour in enumerate(hours):
+        for node_index in range(3):
+            for layer_index in range(2):
+                hvel[time_index, node_index, layer_index, 0] = (
+                    0.15 + 0.02 * hour + 0.01 * node_index + 0.005 * layer_index
+                )
+                hvel[time_index, node_index, layer_index, 1] = (
+                    -0.03 + 0.01 * hour + 0.003 * node_index + 0.002 * layer_index
+                )
+                vertical_velocity[time_index, node_index, layer_index] = (
+                    0.001 + 0.0002 * hour + 0.0001 * layer_index
+                )
+                diffusivity[time_index, node_index, layer_index] = (
+                    0.004 + 0.0005 * hour + 0.0001 * node_index + 0.0002 * layer_index
+                )
+            elev[time_index, node_index] = 0.3 + 0.01 * hour + 0.001 * node_index
+    return OCMNativeMonth(
+        month_id=month_id,
+        mesh=mesh,
+        time_utc_ns=times,
+        hvel=hvel,
+        vertical_velocity=vertical_velocity,
+        zcor=zcor,
+        elev=elev,
+        wetdry_elem=np.zeros((times.size, 1)),
+        diffusivity=diffusivity,
+        maximum_time_gap_seconds=maximum_time_gap_seconds,
+        use_numba_kernel=use_numba_kernel,
+    )
+
+
 def _nww(month_id: str) -> NWWAnalysisMonth:
     """建立覆蓋測試位置的有效 NWW analysis month。"""
 
@@ -97,6 +169,640 @@ def _nww(month_id: str) -> NWWAnalysisMonth:
         qc_flags=np.zeros(shape, dtype=np.uint16),
         maximum_time_gap_seconds=7_200.0,
     )
+
+
+def _nww_cross_month(
+    month_id: str,
+    times_ns: list[int],
+    *,
+    maximum_time_gap_seconds: float = 7_200.0,
+    reference_ns: int | None = None,
+) -> NWWAnalysisMonth:
+    """建立跨月四角有效的 NWW fixture，並讓波向在 0/360 度附近連續變化。"""
+
+    times = np.asarray(times_ns, dtype=np.int64)
+    origin_ns = (
+        _utc_ns("2024-08-01T00:00:00Z") if reference_ns is None else int(reference_ns)
+    )
+    hours = (times.astype(np.float64) - origin_ns) / 3_600_000_000_000.0
+    corner_hs = np.array([[1.0, 1.4], [1.8, 2.2]], dtype=np.float64)
+    corner_fp = np.array([[0.08, 0.10], [0.12, 0.14]], dtype=np.float64)
+    corner_direction = np.array([[350.0, 10.0], [355.0, 5.0]], dtype=np.float64)
+    hs = np.stack([corner_hs + 0.1 * hour for hour in hours])
+    fp = np.stack([corner_fp + 0.005 * hour for hour in hours])
+    directions = np.stack([(corner_direction + 4.0 * hour) % 360.0 for hour in hours])
+    shape = (times.size, 2, 2)
+    return NWWAnalysisMonth(
+        month_id=month_id,
+        lon=np.array([120.0, 122.0]),
+        lat=np.array([24.0, 26.0]),
+        time_utc_ns=times,
+        significant_wave_height=hs,
+        peak_frequency=fp,
+        peak_direction_raw_deg=directions,
+        valid_mask_wave=np.ones(shape, dtype=bool),
+        qc_flags=np.zeros(shape, dtype=np.uint16),
+        maximum_time_gap_seconds=maximum_time_gap_seconds,
+    )
+
+
+def _assert_velocity_equivalent(actual, expected) -> None:
+    """逐欄比對跨月與連續參考速度，排除只代表來源月份名稱的 provenance 欄位。"""
+
+    for field in (
+        "u_mps",
+        "v_mps",
+        "w_mps",
+        "eta_m",
+        "bed_z_m",
+        "horizontal_scale_m",
+        "vertical_scale_m",
+    ):
+        assert np.isclose(getattr(actual, field), getattr(expected, field), rtol=1e-12, atol=1e-12)
+    assert actual.qc == expected.qc
+    assert actual.source_face_id == expected.source_face_id
+    assert actual.triangle_id == expected.triangle_id
+    assert actual.components is not None and expected.components is not None
+    for field in (
+        "total_u_mps",
+        "total_v_mps",
+        "total_w_mps",
+        "ocm_u_mps",
+        "ocm_v_mps",
+        "ocm_w_mps",
+        "stokes_u_mps",
+        "stokes_v_mps",
+        "settling_w_mps",
+    ):
+        assert np.isclose(
+            getattr(actual.components, field),
+            getattr(expected.components, field),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    assert actual.diagnostics.keys() == expected.diagnostics.keys()
+    for key, actual_value in actual.diagnostics.items():
+        expected_value = expected.diagnostics[key]
+        if isinstance(actual_value, (float, int)) and isinstance(expected_value, (float, int)):
+            assert np.isclose(actual_value, expected_value, rtol=1e-12, atol=1e-12)
+        else:
+            assert actual_value == expected_value
+
+
+def test_cross_month_velocity_matches_single_continuous_provider_at_all_boundary_times() -> None:
+    """OCM/NWW 分月產品在月界四個時刻應等價於同端點的連續參考 provider。
+
+    OCM July 尾端固定包含 2024-08-01 00:00，August 首端固定包含 01:00；00:30
+    與 00:59:45 必須使用兩個月份的實際端點做時間內插。NWW 同時以四角不同的
+    ``Hs``、``fp`` 與 350/10 度附近波向測試空間、時間及 circular interpolation。
+    連續參考產品保留完全相同的絕對時間端點，故比較涵蓋 primitive 派生欄位、有限水深
+    Stokes、沉降後總速度、海面、海床、垂向擴散與品質旗標；月份名稱本身不屬於數值等價條件。
+    """
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T01:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    continuous_times = july_end[:1] + july_end[1:] + august_start
+    split_ocm = {
+        "202407": _ocm_cross_month("202407", july_end),
+        "202408": _ocm_cross_month("202408", august_start),
+    }
+    split_nww = {
+        "202407": _nww_cross_month("202407", july_end),
+        "202408": _nww_cross_month("202408", august_start),
+    }
+    manager, ocm_loader, nww_loader = _manager(split_ocm, split_nww)
+    continuous_ocm = _ocm_cross_month("continuous", continuous_times)
+    continuous_nww = _nww_cross_month("continuous", continuous_times)
+    reference = CombinedMonthForcing(
+        ocm=continuous_ocm,
+        nww=continuous_nww,
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=-0.002,
+        include_stokes=True,
+    )
+
+    query_times = (
+        _utc_ns("2024-08-01T00:00:00Z"),
+        _utc_ns("2024-08-01T00:30:00Z"),
+        _utc_ns("2024-08-01T00:59:45Z"),
+        _utc_ns("2024-08-01T01:00:00Z"),
+    )
+    provider = manager.provider(-0.002, include_stokes=True)
+    for time_ns in query_times:
+        actual = provider.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        expected = reference.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        assert actual.valid, (time_ns, actual.qc, actual.diagnostics)
+        assert expected.valid
+        _assert_velocity_equivalent(actual, expected)
+        primitive = continuous_ocm.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        assert primitive.valid
+        assert actual.components is not None
+        assert np.isclose(actual.components.ocm_u_mps, primitive.u_mps, rtol=1e-12, atol=1e-12)
+        assert np.isclose(actual.components.ocm_v_mps, primitive.v_mps, rtol=1e-12, atol=1e-12)
+        assert np.isclose(actual.components.ocm_w_mps, primitive.w_mps, rtol=1e-12, atol=1e-12)
+        assert np.isclose(actual.eta_m, primitive.eta_m, rtol=1e-12, atol=1e-12)
+        assert np.isclose(actual.bed_z_m, primitive.bed_z_m, rtol=1e-12, atol=1e-12)
+        assert np.isclose(
+            actual.diagnostics["kz_m2ps"],
+            primitive.diagnostics["kz_m2ps"],
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    wave = continuous_nww.sample(121.0, 25.0, _utc_ns("2024-08-01T00:59:45Z"))
+    assert wave.valid
+    assert min(wave.peak_direction_raw_deg, 360.0 - wave.peak_direction_raw_deg) < 10.0
+    assert ocm_loader.call_count >= 2
+    assert nww_loader.call_count >= 2
+
+
+def test_leading_halo_changes_before_boundary_query_and_exact_duplicate_prefers_last() -> None:
+    """下一月份的前置 halo 必須參與月界前查詢，且 exact duplicate 採後月份資料。
+
+    這個 fixture 刻意讓 July 只有 22:00／23:00，August 則以不同數值重複 23:00，
+    再保存 00:00。若 manager 只看 query 所屬曆月與 July 的首末列，22:30 會錯誤
+    沿用 July 內插結果；正確的 canonical prefer-last 應使用 August 的 23:00 作為
+    after endpoint。23:00 exact 也必須直接選 August 那筆重複資料，不能因為它位於
+    July 的末列而保留較早月份的值。
+    """
+
+    july_times = [
+        _utc_ns("2024-07-31T22:00:00Z"),
+        _utc_ns("2024-07-31T23:00:00Z"),
+    ]
+    august_times = [
+        _utc_ns("2024-07-31T23:00:00Z"),
+        _utc_ns("2024-08-01T00:00:00Z"),
+    ]
+    july = _ocm_cross_month("202407", july_times)
+    august = _ocm_cross_month("202408", august_times)
+    # August 的 leading halo 與 July 的末列是同一 UTC，但內容刻意不同，才能驗證
+    # prefer-last 的來源選擇，而不是只驗證兩端時間相同。
+    august.hvel[0, ..., 0] += 1.0
+    manager, _, _ = _manager({"202407": july, "202408": august})
+
+    continuous = _ocm_cross_month(
+        "continuous",
+        [
+            _utc_ns("2024-07-31T22:00:00Z"),
+            _utc_ns("2024-07-31T23:00:00Z"),
+            _utc_ns("2024-08-01T00:00:00Z"),
+        ],
+    )
+    continuous.hvel[1, ..., 0] = august.hvel[0, ..., 0]
+    reference = CombinedMonthForcing(
+        ocm=continuous,
+        nww=None,
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=-0.002,
+        include_stokes=False,
+    )
+    provider = manager.provider(-0.002, include_stokes=False)
+
+    leading_query = _utc_ns("2024-07-31T22:30:00Z")
+    actual_leading = provider.sample(1.0, 1.0, -5.0, leading_query, triangle_hint=0)
+    expected_leading = reference.sample(1.0, 1.0, -5.0, leading_query, triangle_hint=0)
+    assert actual_leading.valid
+    assert expected_leading.valid
+    assert np.isclose(actual_leading.u_mps, expected_leading.u_mps, rtol=1e-12, atol=1e-12)
+    assert actual_leading.forcing_month_id == "202408"
+
+    exact_query = _utc_ns("2024-07-31T23:00:00Z")
+    actual_exact = provider.sample(1.0, 1.0, -5.0, exact_query, triangle_hint=0)
+    expected_exact = reference.sample(1.0, 1.0, -5.0, exact_query, triangle_hint=0)
+    assert actual_exact.valid
+    assert expected_exact.valid
+    assert np.isclose(actual_exact.u_mps, expected_exact.u_mps, rtol=1e-12, atol=1e-12)
+    assert actual_exact.forcing_month_id == "202408"
+
+
+def test_staggered_ocm_and_nww_exact_endpoint_uses_each_product_month() -> None:
+    """OCM／NWW 月界端點錯開時，exact query 仍須分別採用各自實際月份資料。"""
+
+    july_ocm_times = [
+        _utc_ns("2024-07-31T23:00:00Z"),
+        _utc_ns("2024-08-01T00:00:00Z"),
+    ]
+    august_ocm_times = [
+        _utc_ns("2024-08-01T01:00:00Z"),
+        _utc_ns("2024-08-01T02:00:00Z"),
+    ]
+    july_nww_times = [
+        _utc_ns("2024-07-31T22:00:00Z"),
+        _utc_ns("2024-07-31T23:00:00Z"),
+    ]
+    august_nww_times = [
+        _utc_ns("2024-08-01T00:00:00Z"),
+        _utc_ns("2024-08-01T01:00:00Z"),
+    ]
+    manager, _, _ = _manager(
+        {
+            "202407": _ocm_cross_month("202407", july_ocm_times),
+            "202408": _ocm_cross_month("202408", august_ocm_times),
+        },
+        {
+            "202407": _nww_cross_month("202407", july_nww_times),
+            "202408": _nww_cross_month("202408", august_nww_times),
+        },
+    )
+    continuous_times = [
+        _utc_ns("2024-07-31T23:00:00Z"),
+        _utc_ns("2024-08-01T00:00:00Z"),
+        _utc_ns("2024-08-01T01:00:00Z"),
+    ]
+    reference = CombinedMonthForcing(
+        ocm=_ocm_cross_month("continuous", continuous_times),
+        nww=_nww_cross_month("continuous", continuous_times),
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=-0.002,
+        include_stokes=True,
+    )
+    target_ns = _utc_ns("2024-08-01T00:00:00Z")
+    actual = manager.provider(-0.002, include_stokes=True).sample(
+        1.0,
+        1.0,
+        -5.0,
+        target_ns,
+        triangle_hint=0,
+    )
+    expected = reference.sample(1.0, 1.0, -5.0, target_ns, triangle_hint=0)
+    assert actual.valid
+    assert expected.valid
+    _assert_velocity_equivalent(actual, expected)
+    # OCM exact endpoint 來自 7 月 halo；不能因 query 的曆月是 8 月而改用 8 月 OCM。
+    assert actual.forcing_month_id == "202407"
+
+
+def test_cross_month_triangle_hint_reaches_both_ocm_endpoints() -> None:
+    """跨月 endpoint 取樣仍須把同一 triangle hint 傳給兩個 OCM 時間列。"""
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T01:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    july_ocm = _ocm_cross_month("202407", july_end)
+    august_ocm = _ocm_cross_month("202408", august_start)
+    geometry_spies = {}
+    endpoint_spies = {}
+    for month_id, ocm in (("202407", july_ocm), ("202408", august_ocm)):
+        geometry_spies[month_id] = Mock(wraps=ocm.geometry_at_time_index)
+        endpoint_spies[month_id] = Mock(wraps=ocm.sample_at_time_index)
+        ocm.geometry_at_time_index = geometry_spies[month_id]  # type: ignore[method-assign]
+        ocm.sample_at_time_index = endpoint_spies[month_id]  # type: ignore[method-assign]
+    manager, _, _ = _manager({"202407": july_ocm, "202408": august_ocm})
+    result = manager.provider(-0.002, include_stokes=False).sample(
+        1.0,
+        1.0,
+        -5.0,
+        _utc_ns("2024-08-01T00:30:00Z"),
+        triangle_hint=0,
+    )
+    assert result.valid
+    for spy in (*geometry_spies.values(), *endpoint_spies.values()):
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["triangle_hint"] == 0
+
+
+def test_cross_month_numba_ocm_matches_continuous_provider() -> None:
+    """跨月 OCM 啟用 Numba 時，兩端結果仍應等同連續 NumPy 參考 provider。"""
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T01:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    manager, _, _ = _manager(
+        {
+            "202407": _ocm_cross_month("202407", july_end, use_numba_kernel=True),
+            "202408": _ocm_cross_month("202408", august_start, use_numba_kernel=True),
+        }
+    )
+    continuous = _ocm_cross_month(
+        "continuous",
+        july_end + august_start,
+        use_numba_kernel=False,
+    )
+    reference = CombinedMonthForcing(
+        ocm=continuous,
+        nww=None,
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=-0.002,
+        include_stokes=False,
+    )
+    target_ns = _utc_ns("2024-08-01T00:30:00Z")
+    actual = manager.provider(-0.002, include_stokes=False).sample(
+        1.0,
+        1.0,
+        -5.0,
+        target_ns,
+        triangle_hint=0,
+    )
+    expected = reference.sample(1.0, 1.0, -5.0, target_ns, triangle_hint=0)
+    assert actual.valid
+    assert expected.valid
+    _assert_velocity_equivalent(actual, expected)
+
+
+def test_cross_month_gap_over_maximum_time_gap_remains_time_gap() -> None:
+    """跨月端點間隔超過上限時必須回傳 TIME_GAP，不可採最近值或外插。"""
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T02:00:00Z"), _utc_ns("2024-08-01T03:00:00Z")]
+    manager, _, _ = _manager(
+        {
+            "202407": _ocm_cross_month("202407", july_end, maximum_time_gap_seconds=3_600.0),
+            "202408": _ocm_cross_month(
+                "202408", august_start, maximum_time_gap_seconds=3_600.0
+            ),
+        }
+    )
+    actual = manager.provider(-0.002, include_stokes=False).sample(
+        1.0,
+        1.0,
+        -5.0,
+        _utc_ns("2024-08-01T01:00:00Z"),
+        triangle_hint=0,
+    )
+    continuous = _ocm_cross_month(
+        "continuous",
+        july_end[:1] + july_end[1:] + august_start,
+        maximum_time_gap_seconds=3_600.0,
+    ).sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T01:00:00Z"), triangle_hint=0)
+    assert not continuous.valid
+    assert continuous.qc == SampleQC.TIME_GAP
+    assert not actual.valid
+    assert actual.qc == SampleQC.TIME_GAP
+    assert np.isnan(actual.eta_m)
+    assert np.isnan(actual.bed_z_m)
+    assert actual.components is None
+
+
+def test_cross_month_nww_invalid_corner_remains_wave_unsupported() -> None:
+    """跨月 NWW 任一必要四角失效時仍須回傳 WAVE_UNSUPPORTED，不可補零 Stokes。"""
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T01:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    july_nww = _nww_cross_month("202407", july_end)
+    august_nww = _nww_cross_month("202408", august_start)
+    # 只遮罩一個四角即可使保守 bilinear 規則失效；其餘角仍保留有效數值，避免
+    # 測試退化成整月缺失（那應由另一個既有測試負責）。
+    august_nww.valid_mask_wave[0, 0, 0] = False
+    manager, _, nww_loader = _manager(
+        {
+            "202407": _ocm_cross_month("202407", july_end),
+            "202408": _ocm_cross_month("202408", august_start),
+        },
+        {"202407": july_nww, "202408": august_nww},
+    )
+    sample = manager.provider(-0.002, include_stokes=True).sample(
+        1.0,
+        1.0,
+        -5.0,
+        _utc_ns("2024-08-01T00:59:45Z"),
+        triangle_hint=0,
+    )
+    assert not sample.valid
+    assert sample.qc == SampleQC.WAVE_UNSUPPORTED
+    assert sample.components is None
+    assert nww_loader.call_count >= 2
+
+
+def test_cross_month_nww_gap_over_maximum_time_gap_remains_time_gap() -> None:
+    """NWW 跨月時間端點間隔過大時應保留 TIME_GAP，而非沿用鄰近波浪值。"""
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T02:00:00Z"), _utc_ns("2024-08-01T03:00:00Z")]
+    manager, _, _ = _manager(
+        {
+            "202407": _ocm_cross_month("202407", july_end),
+            "202408": _ocm_cross_month("202408", august_start),
+        },
+        {
+            "202407": _nww_cross_month(
+                "202407", july_end, maximum_time_gap_seconds=3_600.0
+            ),
+            "202408": _nww_cross_month(
+                "202408", august_start, maximum_time_gap_seconds=3_600.0
+            ),
+        },
+    )
+    sample = manager.provider(-0.002, include_stokes=True).sample(
+        1.0,
+        1.0,
+        -5.0,
+        _utc_ns("2024-08-01T01:00:00Z"),
+        triangle_hint=0,
+    )
+    assert not sample.valid
+    assert sample.qc == SampleQC.TIME_GAP
+    assert not np.isnan(sample.eta_m)
+    assert sample.components is None
+
+
+def test_nww_second_endpoint_failure_preserves_prior_qc_flags() -> None:
+    """NWW 第二時間端點失效時，仍保留第一端已累積的角點 QC flags。"""
+
+    times = [_utc_ns("2024-08-01T00:00:00Z"), _utc_ns("2024-08-01T01:00:00Z")]
+    nww = _nww_cross_month("202408", times)
+    nww.qc_flags[0, ...] = np.uint16(0x0001)
+    nww.qc_flags[1, ...] = np.uint16(0x0002)
+    nww.valid_mask_wave[1, 0, 0] = False
+    result = nww.sample(121.0, 25.0, _utc_ns("2024-08-01T00:30:00Z"))
+    assert not result.valid
+    assert result.qc == SampleQC.WAVE_UNSUPPORTED
+    assert result.qc_flags == 0x0003
+
+
+def _assert_diffusion_equivalent(actual, expected) -> None:
+    """逐欄比對跨月 Smagorinsky sample 與連續 OCM 參考結果。"""
+
+    assert actual.qc == expected.qc
+    for field in ("kx_m2ps", "ky_m2ps", "kz_m2ps"):
+        assert np.isclose(
+            getattr(actual.coefficients, field),
+            getattr(expected.coefficients, field),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    assert np.allclose(
+        actual.diffusivity_divergence_mps,
+        expected.diffusivity_divergence_mps,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert actual.diagnostics.keys() == expected.diagnostics.keys()
+    for key, actual_value in actual.diagnostics.items():
+        expected_value = expected.diagnostics[key]
+        if isinstance(actual_value, (float, int)) and isinstance(expected_value, (float, int)):
+            assert np.isclose(actual_value, expected_value, rtol=1e-12, atol=1e-12)
+        else:
+            assert actual_value == expected_value
+
+
+def test_cross_month_smagorinsky_matches_continuous_ocm_and_keeps_nww_lazy() -> None:
+    """Smagorinsky 跨月取樣應等價於連續 OCM，且仍不載入 NWW。"""
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T01:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    manager, _, nww_loader = _manager(
+        {
+            "202407": _ocm_cross_month("202407", july_end),
+            "202408": _ocm_cross_month("202408", august_start),
+        },
+        {
+            "202407": _nww_cross_month("202407", july_end),
+            "202408": _nww_cross_month("202408", august_start),
+        },
+    )
+    settings = SmagorinskySettings(
+        coefficient_cs=0.15,
+        floor_m2ps=0.0001,
+        cap_m2ps=10.0,
+        constant_kz_m2ps=0.02,
+    )
+    continuous = _ocm_cross_month(
+        "continuous",
+        july_end + august_start,
+    )
+    provider = manager.smagorinsky_provider(settings)
+    for time_ns in (
+        _utc_ns("2024-08-01T00:30:00Z"),
+        _utc_ns("2024-08-01T00:59:45Z"),
+    ):
+        actual = provider.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        expected = continuous.sample_smagorinsky_diffusion(
+            1.0,
+            1.0,
+            -5.0,
+            time_ns,
+            settings,
+            triangle_hint=0,
+        )
+        assert actual.valid
+        assert expected.valid
+        _assert_diffusion_equivalent(actual, expected)
+    assert nww_loader.call_count == 0
+
+
+@pytest.mark.parametrize("max_resident_months", [1, 2])
+def test_cross_month_lru_capacity_keeps_samples_correct_and_stats_bounded(
+    max_resident_months: int,
+) -> None:
+    """cache 容量為 1／2 時跨月載入與淘汰不應改變取樣值或突破 resident 上限。"""
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T01:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    manager, ocm_loader, _ = _manager(
+        {
+            "202407": _ocm_cross_month("202407", july_end),
+            "202408": _ocm_cross_month("202408", august_start),
+        },
+        max_resident_months=max_resident_months,
+    )
+    continuous = _ocm_cross_month("continuous", july_end + august_start)
+    provider = manager.provider(-0.002, include_stokes=False)
+    for time_ns in (
+        _utc_ns("2024-07-31T23:30:00Z"),
+        _utc_ns("2024-08-01T00:30:00Z"),
+        _utc_ns("2024-08-01T01:30:00Z"),
+        _utc_ns("2024-08-01T00:59:45Z"),
+    ):
+        actual = provider.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        expected = CombinedMonthForcing(
+            ocm=continuous,
+            nww=None,
+            projection=DomainProjection(121.0, 25.0),
+            settling_velocity_mps=-0.002,
+            include_stokes=False,
+        ).sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        assert actual.valid
+        _assert_velocity_equivalent(actual, expected)
+    stats = manager.cache_stats
+    assert len(stats.resident_month_ids) <= max_resident_months
+    assert stats.ocm_load_count >= 2
+    assert stats.ocm_cache_miss_count >= 2
+    assert stats.resident_ndarray_bytes > 0
+    if max_resident_months == 1:
+        assert stats.eviction_count >= 1
+    assert ocm_loader.call_count == stats.ocm_load_count
+
+
+def test_cross_year_duplicate_endpoint_prefers_later_month_and_keeps_december_january() -> None:
+    """跨年月界若兩產品重複同一 exact 時刻，應採後月份 endpoint 並維持連續結果。"""
+
+    december_times = [
+        _utc_ns("2024-12-31T23:00:00Z"),
+        _utc_ns("2025-01-01T00:00:00Z"),
+    ]
+    january_times = [
+        _utc_ns("2025-01-01T00:00:00Z"),
+        _utc_ns("2025-01-01T01:00:00Z"),
+    ]
+    january_origin_ns = january_times[0]
+    december_ocm = _ocm_cross_month(
+        "202412", december_times, reference_ns=january_origin_ns
+    )
+    january_ocm = _ocm_cross_month("202501", january_times, reference_ns=january_origin_ns)
+    december_nww = _nww_cross_month("202412", december_times, reference_ns=january_origin_ns)
+    january_nww = _nww_cross_month("202501", january_times, reference_ns=january_origin_ns)
+    # 後月份的重複 endpoint 特意使用不同值；若合併器採前一筆，exact 00:00 與
+    # 00:30 的 current／wave／Stokes 都會出現可觀察的不連續。
+    january_ocm.hvel[0, ..., 0] += 0.4
+    january_ocm.hvel[0, ..., 1] -= 0.2
+    january_ocm.vertical_velocity[0] += 0.01
+    january_ocm.diffusivity[0] += 0.02
+    january_ocm.elev[0] += 0.4
+    january_nww.significant_wave_height[0] += 0.4
+    january_nww.peak_frequency[0] += 0.01
+    january_nww.peak_direction_raw_deg[0] = (
+        january_nww.peak_direction_raw_deg[0] + 20.0
+    ) % 360.0
+
+    manager, _, _ = _manager(
+        {"202412": december_ocm, "202501": january_ocm},
+        {"202412": december_nww, "202501": january_nww},
+    )
+    continuous_ocm = _ocm_cross_month(
+        "continuous",
+        [december_times[0], january_times[0], january_times[1]],
+        reference_ns=january_origin_ns,
+    )
+    continuous_nww = _nww_cross_month(
+        "continuous",
+        [december_times[0], january_times[0], january_times[1]],
+        reference_ns=january_origin_ns,
+    )
+    for target, source in (
+        (continuous_ocm.hvel[1], january_ocm.hvel[0]),
+        (continuous_ocm.vertical_velocity[1], january_ocm.vertical_velocity[0]),
+        (continuous_ocm.zcor[1], january_ocm.zcor[0]),
+        (continuous_ocm.elev[1], january_ocm.elev[0]),
+        (continuous_ocm.wetdry_elem[1], january_ocm.wetdry_elem[0]),
+        (continuous_ocm.diffusivity[1], january_ocm.diffusivity[0]),
+    ):
+        target[...] = source
+    for target, source in (
+        (continuous_nww.significant_wave_height[1], january_nww.significant_wave_height[0]),
+        (continuous_nww.peak_frequency[1], january_nww.peak_frequency[0]),
+        (continuous_nww.peak_direction_raw_deg[1], january_nww.peak_direction_raw_deg[0]),
+        (continuous_nww.valid_mask_wave[1], january_nww.valid_mask_wave[0]),
+        (continuous_nww.qc_flags[1], january_nww.qc_flags[0]),
+    ):
+        target[...] = source
+    reference = CombinedMonthForcing(
+        ocm=continuous_ocm,
+        nww=continuous_nww,
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=-0.002,
+        include_stokes=True,
+    )
+    provider = manager.provider(-0.002, include_stokes=True)
+    for time_ns in (
+        _utc_ns("2024-12-31T23:59:59Z"),
+        _utc_ns("2025-01-01T00:00:00Z"),
+        _utc_ns("2025-01-01T00:30:00Z"),
+    ):
+        actual = provider.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        expected = reference.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0)
+        assert actual.valid
+        assert expected.valid
+        _assert_velocity_equivalent(actual, expected)
+    assert manager.cache_stats.ocm_load_count == 2
+    assert manager.cache_stats.resident_month_ids == ("202412", "202501")
 
 
 def _manager(
@@ -145,6 +851,36 @@ def test_same_month_material_facades_share_ocm_and_no_stokes_never_loads_nww() -
     assert stats.ocm_cache_miss_count == 1
     assert stats.ocm_cache_hit_count >= 1
     assert stats.resident_ndarray_bytes > 0
+
+
+def test_same_month_hot_path_counts_one_hit_per_product_after_warmup() -> None:
+    """同月安全查詢暖機後每次只記一次 OCM hit，Stokes 再記一次 NWW hit。
+
+    測試使用月份內的半小時查詢，避免月尾 halo 與跨月 endpoint；因此若 manager 在
+    建立全域 bracket 前直接沿用單月 ``CombinedMonthForcing``，統計增量應只包含
+    一次 query 月 OCM cache hit。Stokes 先由 no-Stokes 查詢暖機 OCM，再以一次 NWW
+    load 建立 wave facade，後續暖機查詢應只增加一個 OCM 與一個 NWW hit，不能因
+    重複探查同一月份污染正式 Phase 3B 的 cache 指標。
+    """
+
+    month = "197001"
+    manager, _, _ = _manager({month: _ocm(month, _mesh())}, {month: _nww(month)})
+    time_ns = _sample_time(month)
+    no_stokes = manager.provider(-0.1, include_stokes=False)
+    assert no_stokes.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0).valid
+    before_no_stokes = manager.cache_stats
+    assert no_stokes.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0).valid
+    after_no_stokes = manager.cache_stats
+    assert after_no_stokes.ocm_cache_hit_count - before_no_stokes.ocm_cache_hit_count == 1
+    assert after_no_stokes.nww_cache_hit_count - before_no_stokes.nww_cache_hit_count == 0
+
+    stokes = manager.provider(-0.1, include_stokes=True)
+    assert stokes.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0).valid
+    before_stokes = manager.cache_stats
+    assert stokes.sample(1.0, 1.0, -5.0, time_ns, triangle_hint=0).valid
+    after_stokes = manager.cache_stats
+    assert after_stokes.ocm_cache_hit_count - before_stokes.ocm_cache_hit_count == 1
+    assert after_stokes.nww_cache_hit_count - before_stokes.nww_cache_hit_count == 1
 
 
 def test_stokes_loads_nww_lazily_once_after_no_stokes() -> None:
