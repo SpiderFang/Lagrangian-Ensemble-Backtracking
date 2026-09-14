@@ -931,6 +931,28 @@ def test_schema2_rejects_duplicate_particle_order_after_checksum_refresh(tmp_pat
         load_execution_checkpoint(root, expected_binding=_binding())
 
 
+def test_schema22_fixture_writer_rejects_duplicate_particle_id(tmp_path: Path) -> None:
+    """schema 2.2 fixture 建立前即拒絕重複粒子識別，避免產生不可載入的舊檔。"""
+
+    batch = ProductionBatch(_shard(), master_seed=5, request_factory=_factory)
+    batch.advance()
+    units = list(batch.units)
+    units[1] = replace(units[1], particle_id=units[0].particle_id)
+    target = tmp_path / "duplicate-particle-id"
+    with pytest.raises(ValueError, match="particle_id 必須唯一"):
+        _write_execution_checkpoint_schema22(
+            target,
+            binding=_binding(),
+            run_units=units,
+            executions=[runtime.execution for runtime in batch.runtimes],
+            rngs=[runtime.rng for runtime in batch.runtimes],
+            triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+            sequence=1,
+        )
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(f".{target.name}.partial-*"))
+
+
 def test_schema2_rejects_unknown_subdirectory_and_symlink(tmp_path: Path) -> None:
     """schema 2.x 目錄只能含三個實體檔案，不接受未知子目錄或 symlink。"""
 

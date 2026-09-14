@@ -37,7 +37,7 @@ engineering pilot；A 的兩站使用 `no_stokes`，B／C／D 使用 `finite_dep
 ### 1.1 BayTrace 可用部分整合界線
 
 本專案只整合 BayTrace 可對應本地 CPU 執行的工程思路：CPU SoA／batch／chunk、每粒子可
-重現亂數、SCHISM triangle hint、可暫停 engine，以及 schema 3.0 checkpoint/restart。未採用
+重現亂數、SCHISM triangle hint、可暫停 engine，以及 schema 3.1 checkpoint/restart。未採用
 GPU/CUDA、BayTrace raw `schout`／`bp` I/O、oil/weathering、droptime、共享記憶體
 multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只保留為未來具備完整
 相容 fixture 時的 golden reference；目前不把它當成正式驗證結果。
@@ -116,7 +116,7 @@ flowchart LR
     subgraph C[批次與重啟]
         SCN[scenarios.py + runner.py<br/>情境與 RunUnit]
         PB[batch_state.py + production.py<br/>CPU/NumPy ProductionBatch]
-        CKP[checkpoint.py<br/>schema 3.0 restart]
+        CKP[checkpoint.py<br/>schema 3.1 restart]
     end
     subgraph D[執行控制]
         CLI[cli.py<br/>run-create／run-shard／run-reconcile]

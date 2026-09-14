@@ -1,11 +1,14 @@
 """安全保存與恢復 reference／production 粒子中途狀態。
 
 schema 1 只保存 ``ParticleState``，本模組保留其既有 ``write_checkpoint``／
-``load_checkpoint`` API。execution checkpoint 的新 writer 固定發布 schema ``3.0.0``，
+``load_checkpoint`` API。execution checkpoint 的新 writer 固定發布 schema ``3.1.0``，
 以不可變歷史 segment 與小型 current-state compact 分離寫入；每次 checkpoint 只追加
-本次新增的 observation／event rows，不重寫既有歷史。loader 會沿每一代
+本次新增的 observation／event rows，不重寫既有歷史。schema 3.1 對 payload 使用固定
+gzip level 1、mtime=0 與空 filename，manifest 綁定壓縮檔實際 bytes 及解壓後 JSON 大小。
+loader 會沿每一代
 ``checkpoint.json`` SHA-256 chain 還原完整 execution；該 manifest 同時綁定 compact、
-history segment、RNG 與 provenance。schema ``2.0.0``／``2.1.0``／``2.2.0`` 僅作舊檔工程相容讀取。
+history segment、RNG 與 provenance。schema ``3.0.0`` 仍可讀；schema ``2.0.0``／``2.1.0``／
+``2.2.0`` 僅作舊檔工程相容讀取。
 為了讓舊 run 可持續使用，
 ``load_execution_checkpoint`` 仍接受三個 2.x 版本，但不會把舊目錄原地升級。
 舊有 2.2 payload 的讀取契約如下：schema ``2.2.0`` 保存完整 ``ParticleExecutionState``、
@@ -26,6 +29,7 @@ trajectory artifact；本機 synthetic 測試也不是 OCM／NWW3 科學成果�
 
 from __future__ import annotations
 
+import gzip
 import json
 import math
 import os
@@ -54,7 +58,8 @@ from .models import (
 from .outputs import sha256_file
 
 _SCHEMA30_VERSION = "3.0.0"
-CHECKPOINT_SCHEMA_VERSION = _SCHEMA30_VERSION
+_SCHEMA31_VERSION = "3.1.0"
+CHECKPOINT_SCHEMA_VERSION = _SCHEMA31_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +90,7 @@ class CheckpointBinding:
 
 @dataclass(slots=True)
 class ExecutionCheckpoint:
-    """schema 2.x／3.0 execution checkpoint 的記憶體表示，供 loader 與 ``ProductionBatch`` 共用。
+    """schema 2.x／3.x execution checkpoint 的記憶體表示，供 loader 與 ``ProductionBatch`` 共用。
 
     ``executions``、``rng_states``、``triangle_hints`` 與 ``run_unit_identities`` 的順序
     都是固定 particle order；任何一項重新排序都會在讀取或 restore 時拒絕。``binding``
@@ -98,7 +103,7 @@ class ExecutionCheckpoint:
     executions: list[ParticleExecutionState]
     rng_states: list[dict[str, Any]]
     triangle_hints: list[int]
-    schema_version: str = _SCHEMA30_VERSION
+    schema_version: str = _SCHEMA31_VERSION
     observation_cursors: list[int] = field(default_factory=list)
     event_cursors: list[int] = field(default_factory=list)
 
@@ -112,12 +117,16 @@ class ExecutionCheckpoint:
 _SCHEMA20_VERSION = "2.0.0"
 _SCHEMA21_VERSION = "2.1.0"
 _SCHEMA22_VERSION = "2.2.0"
-_WRITER_SCHEMA_VERSION = _SCHEMA30_VERSION
+_WRITER_SCHEMA_VERSION = _SCHEMA31_VERSION
+_SCHEMA3_VERSIONS = frozenset({_SCHEMA30_VERSION, _SCHEMA31_VERSION})
 _SUPPORTED_EXECUTION_SCHEMA_VERSIONS = frozenset(
-    {_SCHEMA20_VERSION, _SCHEMA21_VERSION, _SCHEMA22_VERSION, _SCHEMA30_VERSION}
+    {_SCHEMA20_VERSION, _SCHEMA21_VERSION, _SCHEMA22_VERSION, *_SCHEMA3_VERSIONS}
 )
 _SCHEMA2_DATA_FILES = frozenset({"execution_state.json", "rng_states.json"})
-_SCHEMA3_DATA_FILES = frozenset({"compact_state.json", "history_segment.json"})
+_SCHEMA30_DATA_FILES = frozenset({"compact_state.json", "history_segment.json"})
+_SCHEMA31_DATA_FILES = frozenset({"compact_state.json.gz", "history_segment.json.gz"})
+# 保留舊私有名稱供同一模組的歷史 helper 使用；新程式碼依 schema 版本選擇拓撲。
+_SCHEMA3_DATA_FILES = _SCHEMA30_DATA_FILES
 _SCHEMA3_GENERATION_NAME_RE = re.compile(r"checkpoint-[0-9]{8}\Z")
 _BINDING_FIELDS = (
     "config_hash",
@@ -195,6 +204,41 @@ def _write_json(path: Path, payload: object, *, sort_keys: bool = False) -> None
         handle.write("\n")
 
 
+def _write_json_gzip(path: Path, payload: object, *, sort_keys: bool = False) -> int:
+    """以固定 gzip 參數串流寫入 JSON，回傳解壓後的 UTF-8 位元組數。
+
+    schema 3.1 的 compact 與 history segment 仍使用同一套 JSON 語意，但以標準函式庫
+    gzip level 1 保存。``mtime=0`` 與空 filename 移除時間戳和來源檔名差異，讓相同的
+    payload 產生可重現的壓縮 bytes。JSON encoder 的 ``iterencode`` 逐片交給 gzip writer，
+    不先建立完整 raw 或 compressed bytes；內層 gzip context 正常離開後才會寫入 trailer，
+    呼叫端因此可以安全計算 checksum 並發布 manifest。回傳值是 manifest 使用的 raw JSON
+    大小，不是壓縮檔大小；壓縮檔大小必須在 context 完整關閉後由 ``stat().st_size`` 取得。
+    """
+
+    safe_payload = _json_safe(payload)
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=sort_keys,
+        allow_nan=False,
+    )
+    uncompressed_size = 0
+    with path.open("wb") as raw_handle, gzip.GzipFile(
+        filename="",
+        mode="wb",
+        fileobj=raw_handle,
+        compresslevel=1,
+        mtime=0,
+    ) as gzip_handle:
+        for fragment in encoder.iterencode(safe_payload):
+            encoded = fragment.encode("utf-8")
+            gzip_handle.write(encoded)
+            uncompressed_size += len(encoded)
+        gzip_handle.write(b"\n")
+        uncompressed_size += 1
+    return uncompressed_size
+
+
 def _binding_payload(binding: CheckpointBinding) -> dict[str, Any]:
     """建立 checkpoint metadata 的 binding object，並保留舊六欄格式。
 
@@ -224,6 +268,33 @@ def _read_json(path: Path) -> Any:
 
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle, parse_constant=_reject_json_constant)
+    _assert_finite_json(payload)
+    return payload
+
+
+def _read_json_gzip(path: Path, *, expected_size: int, label: str) -> Any:
+    """解壓並讀取 schema 3.1 JSON payload，同時核對 manifest 的 raw byte 大小。
+
+    呼叫端必須先驗證壓縮檔 ``st_size`` 與 SHA-256；本 helper 只負責在 checksum 已通過後
+    檢查 gzip stream 是否有完整 trailer、UTF-8 JSON 是否可解析，以及解壓結果是否符合
+    ``uncompressed_size_bytes``。截斷、trailer 損壞、編碼錯誤、JSON 非有限值或 raw 大小
+    不符都會轉為 ``ValueError``，避免部分 payload 被當作可恢復 execution。
+    """
+
+    if type(expected_size) is not int or expected_size < 0:
+        raise ValueError(f"{label} uncompressed_size_bytes 無效")
+    try:
+        with gzip.open(path, "rb") as handle:
+            raw = handle.read()
+    except (OSError, EOFError, gzip.BadGzipFile) as error:
+        raise ValueError(f"{label} gzip payload 無法完整解壓") from error
+    if len(raw) != expected_size:
+        raise ValueError(f"{label} uncompressed_size_bytes 不符")
+    try:
+        text = raw.decode("utf-8")
+        payload = json.loads(text, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} gzip JSON 無法解析") from error
     _assert_finite_json(payload)
     return payload
 
@@ -457,14 +528,14 @@ def _serialize_observation(
 ) -> dict[str, Any]:
     """把 Observation 序列化成 v3 segment／compact 使用的固定 JSON object。
 
-    2.2 與 3.0 以明確固定的 23 欄保存舊有位置／狀態、環境 context 與速度紀錄；不使用目前
+    2.2、3.0 與 3.1 以明確固定的 23 欄保存舊有位置／狀態、環境 context 與速度紀錄；不使用目前
     ``Observation`` dataclass 的反射欄位集合，避免日後新增執行期欄位時改變檔案拓撲。
     列舉使用穩定的 ``value`` 而不是 Python 名稱；``None`` 是唯一的 JSON 缺值表示，
     絕不把 NaN／無限值當作缺值。函式刻意拒絕以 schema 2.0／2.1 寫檔，因為兩者僅是
     loader 的舊檔工程相容格式，不能讓新 writer 產生沒有新速度紀錄的 checkpoint。
     """
 
-    if schema_version not in {_SCHEMA22_VERSION, _SCHEMA30_VERSION}:
+    if schema_version not in {_SCHEMA22_VERSION, _SCHEMA30_VERSION, _SCHEMA31_VERSION}:
         raise ValueError("execution checkpoint writer 不提供 schema 2.0／2.1 downgrade")
     row = {name: getattr(observation, name) for name in _SCHEMA22_OBSERVATION_FIELDS}
     row["status"] = observation.status.value
@@ -493,7 +564,7 @@ def _deserialize_observation(
         expected_fields = _LEGACY_OBSERVATION_FIELDS
     elif schema_version == _SCHEMA21_VERSION:
         expected_fields = _SCHEMA21_OBSERVATION_FIELDS
-    elif schema_version in {_SCHEMA22_VERSION, _SCHEMA30_VERSION}:
+    elif schema_version in {_SCHEMA22_VERSION, _SCHEMA30_VERSION, _SCHEMA31_VERSION}:
         expected_fields = _SCHEMA22_OBSERVATION_FIELDS
     else:
         raise ValueError(f"checkpoint schema 不支援：{schema_version!r}")
@@ -509,7 +580,12 @@ def _deserialize_observation(
         "z_m": _finite_float(row["z_m"], label=f"{label}.z_m"),
         "status": _particle_status(row["status"], label=f"{label}.status"),
     }
-    if schema_version in {_SCHEMA21_VERSION, _SCHEMA22_VERSION, _SCHEMA30_VERSION}:
+    if schema_version in {
+        _SCHEMA21_VERSION,
+        _SCHEMA22_VERSION,
+        _SCHEMA30_VERSION,
+        _SCHEMA31_VERSION,
+    }:
         kwargs.update(
             environment_sample_status=_environment_sample_status(
                 row["environment_sample_status"],
@@ -524,7 +600,7 @@ def _deserialize_observation(
                 row["environment_qc_flags"], label=f"{label}.environment_qc_flags"
             ),
         )
-    if schema_version in {_SCHEMA22_VERSION, _SCHEMA30_VERSION}:
+    if schema_version in {_SCHEMA22_VERSION, _SCHEMA30_VERSION, _SCHEMA31_VERSION}:
         kwargs.update(
             velocity_sample_status=_velocity_sample_status(
                 row["velocity_sample_status"],
@@ -1217,7 +1293,7 @@ def build_execution_checkpoint(
     rngs: Sequence[np.random.Generator],
     triangle_hints: Sequence[int | None],
 ) -> ExecutionCheckpoint:
-    """建立 execution snapshot，供記憶體檢查及 schema 3.0 磁碟 writer 共用。
+    """建立 execution snapshot，供記憶體檢查及 schema 3.1 磁碟 writer 共用。
 
     ``run_units``、``executions``、``rngs`` 與 ``triangle_hints`` 必須逐項同序；state 的
     particle／scenario／member／站點／受體／到達時間會立即和 RunUnit 核對。這個函式只
@@ -1235,6 +1311,8 @@ def build_execution_checkpoint(
     identity_tuples = [_run_identity_tuple(identity) for identity in identities]
     if len(set(identity_tuples)) != len(identity_tuples):
         raise ValueError("execution checkpoint RunUnit identity 必須唯一")
+    if len({identity["particle_id"] for identity in identities}) != len(identities):
+        raise ValueError("execution checkpoint particle_id 必須唯一")
     normalized_hints: list[int] = []
     observation_cursors: list[int] = []
     event_cursors: list[int] = []
@@ -1293,7 +1371,7 @@ def _write_execution_checkpoint_schema22(
     製造。這個 fixture helper 固定寫出 2.2 的 11 個速度欄位，即使 observation 是 ``NOT_SAMPLED``
     也會保存其明示的狀態與 ``None`` 缺值，而不會將舊資料偽裝成速度證據。
     此函式只保留給需要建立舊版 fixture 的內部相容路徑；正式 ``ProductionBatch`` writer
-    使用下面的 ``write_execution_checkpoint``，固定發布 schema 3.0.0，避免每次 checkpoint
+    使用下面的 ``write_execution_checkpoint``，固定發布 schema 3.1.0，避免每次 checkpoint
     重寫完整 observation／event history。
     """
 
@@ -1330,7 +1408,7 @@ def _write_execution_checkpoint_schema22(
                 execution,
                 triangle_hint=triangle_hint,
                 # 這個私有 helper 只供建立舊版 fixture；正式 writer 由下方
-                # ``write_execution_checkpoint`` 固定發布 schema 3.0.0。
+                # ``write_execution_checkpoint`` 固定發布 schema 3.1.0。
                 schema_version=_SCHEMA22_VERSION,
             )
             execution_records.append({"identity": identity, "execution": execution_payload})
@@ -1852,17 +1930,31 @@ def _reset_checkpoint_history_tracking(execution: ParticleExecutionState) -> Non
         setattr(execution, attribute, _CheckpointHistoryList(current))
 
 
-def _verify_schema3_files(root: Path, metadata: dict[str, Any]) -> None:
-    """驗證 schema 3 generation 的固定檔案拓撲與兩份 payload checksum。
+def _schema3_data_files(schema_version: str) -> frozenset[str]:
+    """依 schema 版本回傳 payload 檔名，維持 3.0 原始檔與 3.1 gzip 拓撲分離。"""
 
-    schema 3 把 immutable history segment 與 compact current state 分成兩個普通檔案。
-    兩者都在同一個 partial directory 完成後才發布；loader 先確認目錄和 checksum，再
-    解析資料，避免將殘留 partial、symlink 或截斷檔當成可續跑狀態。
+    if schema_version == _SCHEMA30_VERSION:
+        return _SCHEMA30_DATA_FILES
+    if schema_version == _SCHEMA31_VERSION:
+        return _SCHEMA31_DATA_FILES
+    raise ValueError(f"schema 3 generation schema_version 不支援：{schema_version!r}")
+
+
+def _verify_schema3_files(root: Path, metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """驗證 schema 3 generation 固定檔案拓撲與 payload 壓縮／checksum 契約。
+
+    schema 3.0 的兩份 payload 維持原始 ``.json`` 檔案，schema 3.1 則使用固定 gzip
+    ``.json.gz`` 檔案；兩者共享相同 JSON 欄位，但 manifest 的 contract 不同。loader 先
+    以 ``stat().st_size`` 與 SHA-256 核對實際保存 bytes，3.1 再由呼叫端以
+    ``uncompressed_size_bytes`` 驗證解壓後 raw JSON。這個順序可在解析資料前拒絕截斷、
+    替換、symlink 或額外檔案。回傳已驗證的 manifest，供 header 讀取器選擇正確 payload。
     """
 
+    schema_version = metadata.get("schema_version")
+    data_files = _schema3_data_files(schema_version)
     if root.is_symlink() or not root.is_dir():
         raise ValueError(f"schema 3 checkpoint 根目錄必須是普通目錄：{root}")
-    expected_names = _SCHEMA3_DATA_FILES | {"checkpoint.json"}
+    expected_names = data_files | {"checkpoint.json"}
     entries = tuple(root.iterdir())
     if {entry.name for entry in entries} != expected_names:
         raise ValueError("schema 3 checkpoint 目錄含有遺失或未知檔案")
@@ -1870,11 +1962,16 @@ def _verify_schema3_files(root: Path, metadata: dict[str, Any]) -> None:
         if entry.is_symlink() or not entry.is_file():
             raise ValueError(f"schema 3 checkpoint 只允許固定普通檔案：{entry.name}")
     files = metadata.get("files")
-    if not isinstance(files, dict) or set(files) != _SCHEMA3_DATA_FILES:
+    if not isinstance(files, dict) or set(files) != data_files:
         raise ValueError("schema 3 checkpoint files manifest 不完整或含未知檔案")
-    for filename in sorted(_SCHEMA3_DATA_FILES):
+    expected_contract_keys = (
+        {"size_bytes", "sha256"}
+        if schema_version == _SCHEMA30_VERSION
+        else {"size_bytes", "sha256", "content_encoding", "uncompressed_size_bytes"}
+    )
+    for filename in sorted(data_files):
         contract = files[filename]
-        if not isinstance(contract, dict) or set(contract) != {"size_bytes", "sha256"}:
+        if not isinstance(contract, dict) or set(contract) != expected_contract_keys:
             raise ValueError(f"schema 3 {filename} checksum contract 不完整")
         size = contract["size_bytes"]
         digest = contract["sha256"]
@@ -1882,9 +1979,16 @@ def _verify_schema3_files(root: Path, metadata: dict[str, Any]) -> None:
             raise ValueError(f"schema 3 {filename}.size_bytes 無效")
         if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise ValueError(f"schema 3 {filename}.sha256 無效")
+        if schema_version == _SCHEMA31_VERSION:
+            if contract["content_encoding"] != "gzip":
+                raise ValueError(f"schema 3 {filename}.content_encoding 必須是 gzip")
+            uncompressed_size = contract["uncompressed_size_bytes"]
+            if type(uncompressed_size) is not int or uncompressed_size < 0:
+                raise ValueError(f"schema 3 {filename}.uncompressed_size_bytes 無效")
         path = root / filename
         if path.stat().st_size != size or sha256_file(path) != digest:
             raise ValueError(f"schema 3 {filename} checksum 或 size 不符")
+    return files
 
 
 def _read_schema3_generation_header(
@@ -1896,10 +2000,11 @@ def _read_schema3_generation_header(
     """讀取 schema 3 generation 的 compact 與 segment metadata，不建立歷史 dataclass。
 
     writer 在建立下一代 segment 時只需要上一代 compact cursor 與 checkpoint.json SHA；這個
-    helper 仍會讀取並 JSON parse 該代完整 history payload，檢查 checksum、固定欄位、cursor
-    與 row count，但不把每一列反序列化成 ``Observation``／``BoundaryEvent``。完整 hash
-    chain 與 rows 仍由 ``_load_schema3_execution_checkpoint`` 在 resume／validation 時逐代
-    還原與驗證，避免 checkpoint cadence 因重建 dataclass 引入平方級 CPU 成本。
+    helper 仍會讀取並 JSON parse 該代完整 history payload。schema 3.1 會先驗證 gzip 壓縮
+    bytes、SHA 與解壓後 raw 大小，再檢查固定欄位、cursor 與 row count；但不把每一列轉成
+    ``Observation``／``BoundaryEvent`` dataclass。完整 hash chain 與 rows 仍由
+    ``_load_schema3_execution_checkpoint`` 在 resume／validation 時逐代還原與驗證，避免
+    checkpoint cadence 因重建 dataclass 引入平方級 CPU 成本。
     """
 
     metadata = _read_json(root / "checkpoint.json")
@@ -1917,7 +2022,8 @@ def _read_schema3_generation_header(
         "legacy_source",
     )
     metadata = _require_exact_keys(metadata, expected_metadata_keys, label="schema 3 metadata")
-    if metadata["schema_version"] != _SCHEMA30_VERSION:
+    schema_version = metadata["schema_version"]
+    if schema_version not in _SCHEMA3_VERSIONS:
         raise ValueError("schema 3 generation schema_version 不符")
     sequence = _nonnegative_int(metadata["sequence"], label="schema 3 sequence")
     if sequence < 1:
@@ -2025,16 +2131,30 @@ def _read_schema3_generation_header(
     )
     if segment_record_count != particle_count:
         raise ValueError("schema 3 segment record_count 不一致")
-    _verify_schema3_files(root, metadata)
-
-    compact = _read_json(root / "compact_state.json")
+    files = _verify_schema3_files(root, metadata)
+    compact_filename = (
+        "compact_state.json.gz" if schema_version == _SCHEMA31_VERSION else "compact_state.json"
+    )
+    segment_filename = (
+        "history_segment.json.gz"
+        if schema_version == _SCHEMA31_VERSION
+        else "history_segment.json"
+    )
+    if schema_version == _SCHEMA31_VERSION:
+        compact = _read_json_gzip(
+            root / compact_filename,
+            expected_size=files[compact_filename]["uncompressed_size_bytes"],
+            label="schema 3 compact state",
+        )
+    else:
+        compact = _read_json(root / compact_filename)
     compact = _require_exact_keys(
         compact,
         ("schema_version", "sequence", "binding", "particle_order", "records"),
         label="schema 3 compact state",
     )
     compact_sequence = _nonnegative_int(compact["sequence"], label="schema 3 compact sequence")
-    if compact["schema_version"] != _SCHEMA30_VERSION or compact_sequence != sequence:
+    if compact["schema_version"] != schema_version or compact_sequence != sequence:
         raise ValueError("schema 3 compact schema/sequence 不一致")
     compact_binding = _binding_from_payload(compact["binding"], label="schema 3 compact binding")
     if compact_binding != expected_binding:
@@ -2094,7 +2214,7 @@ def _read_schema3_generation_header(
         pending_observation = _deserialize_observation(
             row["pending_observation"],
             label=f"compact.records[{index}].pending_observation",
-            schema_version=_SCHEMA30_VERSION,
+            schema_version=schema_version,
         )
         if pending_observation.particle_id != identity["particle_id"]:
             raise ValueError("schema 3 compact pending observation identity 不一致")
@@ -2134,7 +2254,14 @@ def _read_schema3_generation_header(
         if expected_identities != identities:
             raise ValueError("checkpoint RunUnit identity/order 與目前 shard 不一致")
 
-    segment = _read_json(root / "history_segment.json")
+    if schema_version == _SCHEMA31_VERSION:
+        segment = _read_json_gzip(
+            root / segment_filename,
+            expected_size=files[segment_filename]["uncompressed_size_bytes"],
+            label="schema 3 history segment",
+        )
+    else:
+        segment = _read_json(root / segment_filename)
     segment = _require_exact_keys(
         segment,
         (
@@ -2148,7 +2275,7 @@ def _read_schema3_generation_header(
         label="schema 3 history segment",
     )
     segment_sequence = _nonnegative_int(segment["sequence"], label="schema 3 history sequence")
-    if segment["schema_version"] != _SCHEMA30_VERSION or segment_sequence != sequence:
+    if segment["schema_version"] != schema_version or segment_sequence != sequence:
         raise ValueError("schema 3 history segment schema/sequence 不一致")
     segment_binding = _binding_from_payload(segment["binding"], label="schema 3 segment binding")
     if segment_binding != expected_binding:
@@ -2275,7 +2402,7 @@ def _load_schema3_execution_checkpoint(
             raise ValueError("schema 3 segment chain 缺少前一代 checkpoint")
         previous_metadata_path = previous_path / "checkpoint.json"
         previous_raw = _read_json(previous_metadata_path)
-        if previous_raw.get("schema_version") != _SCHEMA30_VERSION:
+        if previous_raw.get("schema_version") not in _SCHEMA3_VERSIONS:
             raise ValueError("schema 3 segment chain 不可跨越非 schema 3 generation")
         previous = _read_schema3_generation_header(
             previous_path,
@@ -2297,6 +2424,7 @@ def _load_schema3_execution_checkpoint(
     if chain_root_sequence != int(chain[0][1]["sequence"]):
         raise ValueError("schema 3 hash chain root sequence 不一致")
     previous_sequence = chain_root_sequence - 1
+    previous_schema_version: str | None = None
     for segment_path, segment_metadata, segment_compact, segment_payload in chain:
         del segment_path, segment_compact
         sequence = int(segment_metadata["sequence"])
@@ -2304,6 +2432,10 @@ def _load_schema3_execution_checkpoint(
             raise ValueError("schema 3 segment sequence 跳號或重排")
         if int(segment_metadata["chain_root_sequence"]) != chain_root_sequence:
             raise ValueError("schema 3 chain_root_sequence 在 generation 間改變")
+        schema_version = segment_metadata["schema_version"]
+        if previous_schema_version == _SCHEMA31_VERSION and schema_version == _SCHEMA30_VERSION:
+            raise ValueError("schema 3.1 generation 不可降回 schema 3.0")
+        previous_schema_version = schema_version
         previous_sequence = sequence
         if segment_payload["particle_order"] != particle_order:
             raise ValueError("schema 3 segment particle order 重排")
@@ -2360,7 +2492,7 @@ def _load_schema3_execution_checkpoint(
                 _deserialize_observation(
                     value,
                     label=f"segment[{sequence}].records[{index}].observations[{row_index}]",
-                    schema_version=_SCHEMA30_VERSION,
+                    schema_version=segment_payload["schema_version"],
                 )
                 for row_index, value in enumerate(observations)
             )
@@ -2399,7 +2531,7 @@ def _load_schema3_execution_checkpoint(
         pending_observation = _deserialize_observation(
             record["pending_observation"],
             label=f"compact.records[{index}].pending_observation",
-            schema_version=_SCHEMA30_VERSION,
+            schema_version=metadata["schema_version"],
         )
         if pending_observation.particle_id != state.particle_id:
             raise ValueError("schema 3 pending observation identity 與 state 不一致")
@@ -2465,7 +2597,7 @@ def _load_schema3_execution_checkpoint(
         executions=executions,
         rng_states=rng_states,
         triangle_hints=hints,
-        schema_version=_SCHEMA30_VERSION,
+        schema_version=metadata["schema_version"],
         observation_cursors=[len(item.observations) for item in executions],
         event_cursors=[len(item.events) for item in executions],
     )
@@ -2579,18 +2711,19 @@ def write_execution_checkpoint(
     sequence: int,
     previous_checkpoint: str | Path | None = None,
 ) -> Path:
-    """以 schema 3.0.0 原子追加 checkpoint generation。
+    """以 schema 3.1.0 原子追加 gzip checkpoint generation。
 
     ``previous_checkpoint`` 指向同一 shard 的上一個已發布 generation。新 generation 的
     compact file 只保存最新 ParticleState／step counter／輸出游標／RNG／triangle hint；
     history segment 只保存各粒子自上一代 cursor 之後新增的 observation 與 event。因而
     每代寫入量與新增 row 數近似成正比，不會隨累積歷史重寫完整 execution JSON。第一代
     沒有前代時 cursor 從零開始；若 caller 由舊 schema 2.x 起始，會把該 checkpoint 當作
-    一次性 chain root 讀入並追加完整歷史，舊目錄本身不會被修改。binding 的六個固定欄位
+    一次性 chain root 讀入並追加完整歷史，舊目錄本身不會被修改。compact 與 history
+    payload 以固定 gzip level 1 串流寫入，metadata／latest 仍是明文 JSON。binding 的六個固定欄位
     與 optional ``random_stream_id`` 會先經同一個 strict parser 正規化，確保寫入 JSON
     後仍能以原生型別被 loader 精確比對。
 
-    寫入順序是 partial directory → checksum manifest → atomic rename；目標已存在、前代
+    寫入順序是 partial directory → 關閉 gzip trailer → checksum manifest → atomic rename；目標已存在、前代
     binding／RunUnit 順序不符、history cursor 回退、相鄰 observation engine key 重複，或
     輸出資料在完整 sweep/macro boundary 外呼叫，均由 caller 或本函式拒絕。RunUnit identity
     會在建立 partial 前沿用 loader 的 strict 欄位驗證，並要求所有粒子的 ``particle_id``
@@ -2636,7 +2769,7 @@ def write_execution_checkpoint(
             )
         previous_metadata = _read_json(previous_root / "checkpoint.json")
         previous_schema = previous_metadata.get("schema_version")
-        if previous_schema == _SCHEMA30_VERSION:
+        if previous_schema in _SCHEMA3_VERSIONS:
             if had_untracked_history:
                 raise ValueError("schema 3 continuation 的 observations/events 必須保留追蹤器")
             previous_metadata, previous_compact, _ = _read_schema3_generation_header(
@@ -2742,7 +2875,7 @@ def write_execution_checkpoint(
             {"identity": identity, "observation_cursor": 0, "event_cursor": 0}
             for identity in identities
         ]
-    if previous_schema != _SCHEMA30_VERSION:
+    if previous_schema not in _SCHEMA3_VERSIONS:
         # root／legacy migration 沒有可沿用的 v3 cursor；若 execution 來自另一份 v3
         # snapshot，其 tracker prefix 只屬於來源 chain，不能拿來限制新 chain 的完整歷史。
         # legacy prefix 已在上方先完成逐欄核對，這裡只重建 owner 與從零開始的追蹤狀態。
@@ -2768,7 +2901,7 @@ def write_execution_checkpoint(
         )
         if observation_start > len(execution.observations) or event_start > len(execution.events):
             raise ValueError("schema 3 history cursor 回退")
-        if previous_schema == _SCHEMA30_VERSION:
+        if previous_schema in _SCHEMA3_VERSIONS:
             _validate_terminal_continuation(
                 execution,
                 previous_record,
@@ -2791,11 +2924,11 @@ def write_execution_checkpoint(
         stable_observation_end = len(execution.observations) - 1
         if observation_start > stable_observation_end:
             raise ValueError("schema 3 history cursor 超過穩定 observation 數")
-        if previous_schema == _SCHEMA30_VERSION:
+        if previous_schema in _SCHEMA3_VERSIONS:
             previous_pending = _deserialize_observation(
                 previous_record["pending_observation"],
                 label=f"previous compact.records[{index}].pending_observation",
-                schema_version=_SCHEMA30_VERSION,
+                schema_version=previous_schema,
             )
             _require_observation_core_match(
                 previous_pending,
@@ -2872,7 +3005,7 @@ def write_execution_checkpoint(
         observation_count += len(execution.observations)
         event_count += len(execution.events)
     segment_payload = {
-        "schema_version": _SCHEMA30_VERSION,
+        "schema_version": _SCHEMA31_VERSION,
         "sequence": sequence,
         "binding": _binding_payload(binding),
         "particle_order": [identity["particle_id"] for identity in identities],
@@ -2880,7 +3013,7 @@ def write_execution_checkpoint(
         "records": segment_records,
     }
     compact_payload = {
-        "schema_version": _SCHEMA30_VERSION,
+        "schema_version": _SCHEMA31_VERSION,
         "sequence": sequence,
         "binding": _binding_payload(binding),
         "particle_order": [identity["particle_id"] for identity in identities],
@@ -2890,22 +3023,28 @@ def write_execution_checkpoint(
     partial = target.parent / f".{target.name}.partial-{uuid4().hex}"
     try:
         partial.mkdir()
-        compact_path = partial / "compact_state.json"
-        segment_path = partial / "history_segment.json"
-        _write_json(compact_path, compact_payload)
-        _write_json(segment_path, segment_payload)
+        compact_path = partial / "compact_state.json.gz"
+        segment_path = partial / "history_segment.json.gz"
+        # _write_json_gzip 只有在 gzip context 正常關閉、trailer 已完整寫入後才返回；
+        # 因此下面的 stat／SHA 不會把尚未完成的壓縮串流登錄進 manifest。
+        compact_uncompressed_size = _write_json_gzip(compact_path, compact_payload)
+        segment_uncompressed_size = _write_json_gzip(segment_path, segment_payload)
         files = {
             compact_path.name: {
                 "size_bytes": int(compact_path.stat().st_size),
                 "sha256": sha256_file(compact_path),
+                "content_encoding": "gzip",
+                "uncompressed_size_bytes": compact_uncompressed_size,
             },
             segment_path.name: {
                 "size_bytes": int(segment_path.stat().st_size),
                 "sha256": sha256_file(segment_path),
+                "content_encoding": "gzip",
+                "uncompressed_size_bytes": segment_uncompressed_size,
             },
         }
         metadata = {
-            "schema_version": _SCHEMA30_VERSION,
+            "schema_version": _SCHEMA31_VERSION,
             "sequence": sequence,
             "particle_count": len(execution_rows),
             "observation_count": observation_count,
@@ -2980,7 +3119,7 @@ def load_execution_checkpoint(
     expected_binding: CheckpointBinding,
     expected_run_units: Sequence[Any] | None = None,
 ) -> ExecutionCheckpoint:
-    """嚴格讀取 schema 3.0 與舊 schema 2.0／2.1／2.2 checkpoint。
+    """嚴格讀取 schema 3.0／3.1 與舊 schema 2.0／2.1／2.2 checkpoint。
 
     schema 3 會先沿 checkpoint.json hash chain 還原完整歷史；2.0 只接受舊七
     欄並將環境與速度 context 設為 ``NOT_SAMPLED``／``None``；2.1 只接受舊環境欄位；
@@ -3002,7 +3141,8 @@ def load_execution_checkpoint(
     # 先讀版本欄位再分派，避免把 schema 3 的 compact／segment 拓撲誤判為 schema 2
     # 的 execution_state／rng_states。舊 schema 只走下方既有相容 parser，完全不改寫原檔。
     initial_metadata = _read_json(root / "checkpoint.json")
-    if initial_metadata.get("schema_version") == _SCHEMA30_VERSION:
+    initial_schema_version = initial_metadata.get("schema_version")
+    if type(initial_schema_version) is str and initial_schema_version in _SCHEMA3_VERSIONS:
         return _load_schema3_execution_checkpoint(
             root,
             expected_binding=expected_binding,
@@ -3138,7 +3278,8 @@ def inspect_execution_checkpoint(
     expected_binding = _canonical_binding(expected_binding, label="expected_binding")
     root = Path(path)
     initial_metadata = _read_json(root / "checkpoint.json")
-    if initial_metadata.get("schema_version") == _SCHEMA30_VERSION:
+    initial_schema_version = initial_metadata.get("schema_version")
+    if type(initial_schema_version) is str and initial_schema_version in _SCHEMA3_VERSIONS:
         metadata, compact, _ = _read_schema3_generation_header(
             root,
             expected_binding=expected_binding,

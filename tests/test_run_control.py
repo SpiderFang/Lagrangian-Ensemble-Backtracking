@@ -781,7 +781,7 @@ def test_reconcile_rejects_schema2_downgrade_after_v3_generation(tmp_path: Path)
     progress["run_lifecycle"] = "RUNNING"
     _write_progress(workspace, progress)
 
-    with pytest.raises(ValueError, match=r"不可由 3\.0\.0 降回 2\.x"):
+    with pytest.raises(ValueError, match=r"不可由 3\.x 降回 2\.x"):
         RunController(workspace, request_factory=_request, resume=True).reconcile()
 
 
@@ -925,8 +925,8 @@ def test_checkpoint_damage_is_fail_closed(tmp_path: Path, damage: str) -> None:
     elif damage == "symlink":
         (parent / "linked").symlink_to(generation, target_is_directory=True)
     elif damage == "corrupt":
-        payload = generation / "history_segment.json"
-        payload.write_text(payload.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        payload = generation / "history_segment.json.gz"
+        payload.write_bytes(payload.read_bytes() + b"\n")
     else:
         metadata_path = generation / "checkpoint.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))

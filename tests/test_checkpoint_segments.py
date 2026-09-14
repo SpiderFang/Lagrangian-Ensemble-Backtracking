@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import shutil
 from copy import deepcopy
@@ -17,6 +18,7 @@ import numpy as np
 import pytest
 from test_checkpoint_execution import _binding, _factory, _shard, _write_legacy_batch_checkpoint
 
+import lagrangian_backtracking.checkpoint as checkpoint_module
 from lagrangian_backtracking.checkpoint import (
     inspect_execution_checkpoint,
     load_execution_checkpoint,
@@ -48,20 +50,209 @@ def _write_chain(tmp_path: Path, *, generation_count: int = 5) -> tuple[Path, li
     return previous, paths
 
 
-def _refresh_manifest(root: Path, filename: str) -> None:
+def _refresh_manifest(
+    root: Path, filename: str, *, update_uncompressed_size: bool = True
+) -> None:
     """測試篡改後只重算指定 payload manifest，保留 semantic gate 的可觀測性。"""
 
     payload = root / filename
     metadata_path = root / "checkpoint.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["files"][filename] = {
-        "size_bytes": payload.stat().st_size,
-        "sha256": sha256_file(payload),
-    }
+    contract = metadata["files"][filename]
+    contract["size_bytes"] = payload.stat().st_size
+    contract["sha256"] = sha256_file(payload)
+    if filename.endswith(".gz") and update_uncompressed_size:
+        with gzip.open(payload, "rb") as handle:
+            contract["uncompressed_size_bytes"] = len(handle.read())
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _read_payload(root: Path, stem: str) -> dict[str, object]:
+    """讀取 schema 3.1 gzip payload，讓測試不依賴已淘汰的未壓縮檔名。"""
+
+    with gzip.open(root / f"{stem}.json.gz", "rt", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _write_payload(path: Path, payload: dict[str, object]) -> None:
+    """以與 production writer 相同的 deterministic gzip 參數改寫測試 payload。"""
+
+    encoder = json.JSONEncoder(ensure_ascii=False, indent=2, allow_nan=False)
+    with path.open("wb") as raw_handle, gzip.GzipFile(
+        filename="", mode="wb", fileobj=raw_handle, compresslevel=1, mtime=0
+    ) as gzip_handle:
+        for fragment in encoder.iterencode(payload):
+            gzip_handle.write(fragment.encode("utf-8"))
+        gzip_handle.write(b"\n")
+
+
+def _convert_v31_root_to_v30(root: Path) -> None:
+    """將測試 root 轉為已發布的 schema 3.0 拓撲，模擬既有舊 chain。"""
+
+    metadata_path = root / "checkpoint.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    files: dict[str, dict[str, object]] = {}
+    for stem in ("compact_state", "history_segment"):
+        payload = _read_payload(root, stem)
+        payload["schema_version"] = "3.0.0"
+        raw_path = root / f"{stem}.json"
+        raw_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        files[raw_path.name] = {
+            "size_bytes": raw_path.stat().st_size,
+            "sha256": sha256_file(raw_path),
+        }
+        (root / f"{stem}.json.gz").unlink()
+    metadata["schema_version"] = "3.0.0"
+    metadata["files"] = files
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_schema31_gzip_payload_is_deterministic_and_manifest_uses_compressed_size(
+    tmp_path: Path,
+) -> None:
+    """相同 payload 的 gzip bytes 必須固定，manifest size 則是壓縮檔實際長度。"""
+
+    first, _ = _write_chain(tmp_path / "first", generation_count=1)
+    second, _ = _write_chain(tmp_path / "second", generation_count=1)
+    first_metadata = json.loads((first / "checkpoint.json").read_text(encoding="utf-8"))
+    second_metadata = json.loads((second / "checkpoint.json").read_text(encoding="utf-8"))
+    assert first_metadata["schema_version"] == second_metadata["schema_version"] == "3.1.0"
+    for filename in ("compact_state.json.gz", "history_segment.json.gz"):
+        first_path = first / filename
+        second_path = second / filename
+        assert first_path.read_bytes() == second_path.read_bytes()
+        contract = first_metadata["files"][filename]
+        assert contract["content_encoding"] == "gzip"
+        assert contract["size_bytes"] == first_path.stat().st_size
+        with gzip.open(first_path, "rb") as handle:
+            assert contract["uncompressed_size_bytes"] == len(handle.read())
+
+
+def test_schema30_to_schema31_mixed_chain_preserves_history(tmp_path: Path) -> None:
+    """既有 3.0 root 接續 3.1 generation 時，loader 必須保留完整 history。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    first = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000001", binding=_binding(), sequence=1
+    )
+    _convert_v31_root_to_v30(first)
+    first_bytes_before = {
+        path.name: path.read_bytes() for path in first.iterdir() if path.is_file()
+    }
+    batch.advance()
+    second = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000002",
+        binding=_binding(),
+        sequence=2,
+        previous_checkpoint=first,
+    )
+    loaded = load_execution_checkpoint(second, expected_binding=_binding())
+    assert loaded.schema_version == "3.1.0"
+    assert loaded.executions == [runtime.execution for runtime in batch.runtimes]
+    assert (first / "compact_state.json").is_file()
+    assert (second / "compact_state.json.gz").is_file()
+    assert first_bytes_before == {
+        path.name: path.read_bytes() for path in first.iterdir() if path.is_file()
+    }
+
+
+def test_schema31_to_schema30_downgrade_is_rejected(tmp_path: Path) -> None:
+    """3.1 chain 不得以舊 3.0 generation 續接，避免回降切斷 gzip 契約。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    first = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000001", binding=_binding(), sequence=1
+    )
+    batch.advance()
+    second = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000002",
+        binding=_binding(),
+        sequence=2,
+        previous_checkpoint=first,
+    )
+    _convert_v31_root_to_v30(second)
+    with pytest.raises(ValueError, match=r"3\.1.*降回.*3\.0"):
+        load_execution_checkpoint(second, expected_binding=_binding())
+
+
+@pytest.mark.parametrize("damage", ["truncate", "bit"])
+def test_schema31_gzip_corruption_is_fail_closed(tmp_path: Path, damage: str) -> None:
+    """gzip trailer 截斷或壓縮 bytes 篡改即使重算 manifest 也不得被採認。"""
+
+    target, _ = _write_chain(tmp_path, generation_count=1)
+    payload = target / "history_segment.json.gz"
+    corrupted = bytearray(payload.read_bytes())
+    if damage == "truncate":
+        del corrupted[-8:]
+    else:
+        corrupted[len(corrupted) // 2] ^= 0x01
+    payload.write_bytes(corrupted)
+    _refresh_manifest(target, payload.name, update_uncompressed_size=False)
+    with pytest.raises(ValueError, match="checksum|gzip|JSON|uncompressed_size"):
+        load_execution_checkpoint(target, expected_binding=_binding())
+
+
+def test_schema31_gzip_writer_failures_leave_no_adoptable_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """gzip write、close 與 generation rename 失敗都不得留下 target 或 partial。"""
+
+    def write_failure(*args: object, **kwargs: object) -> int:
+        """模擬 payload 尚未完成時的寫入失敗。"""
+
+        del args, kwargs
+        raise OSError("simulated gzip write failure")
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    target = tmp_path / "write" / "checkpoint-00000001"
+    monkeypatch.setattr(checkpoint_module, "_write_json_gzip", write_failure)
+    with pytest.raises(OSError, match="gzip write"):
+        batch.write_checkpoint(target, binding=_binding(), sequence=1)
+    assert not target.exists()
+    assert not tuple(target.parent.glob(f".{target.name}.partial-*"))
+
+    monkeypatch.undo()
+    original_close = checkpoint_module.gzip.GzipFile.close
+
+    def close_failure(gzip_file: object) -> None:
+        """先完成 trailer 再回報 close 失敗，驗證 writer cleanup 邊界。"""
+
+        original_close(gzip_file)  # type: ignore[arg-type]
+        raise OSError("simulated gzip close failure")
+
+    monkeypatch.setattr(checkpoint_module.gzip.GzipFile, "close", close_failure)
+    target = tmp_path / "close" / "checkpoint-00000001"
+    with pytest.raises(OSError, match="gzip close"):
+        batch.write_checkpoint(target, binding=_binding(), sequence=1)
+    assert not target.exists()
+    assert not tuple(target.parent.glob(f".{target.name}.partial-*"))
+
+    monkeypatch.undo()
+
+    def rename_failure(*args: object, **kwargs: object) -> None:
+        """模擬 payload 完整後 atomic rename 失敗。"""
+
+        del args, kwargs
+        raise OSError("simulated generation rename failure")
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", rename_failure)
+    target = tmp_path / "rename" / "checkpoint-00000001"
+    with pytest.raises(OSError, match="generation rename"):
+        batch.write_checkpoint(target, binding=_binding(), sequence=1)
+    assert not target.exists()
+    assert not tuple(target.parent.glob(f".{target.name}.partial-*"))
 
 
 def test_v3_segment_chain_restores_exact_result_and_only_appends_rows(tmp_path: Path) -> None:
@@ -74,7 +265,7 @@ def test_v3_segment_chain_restores_exact_result_and_only_appends_rows(tmp_path: 
         expected_binding=_binding(),
         expected_run_units=ProductionBatch(_shard(), master_seed=123, request_factory=_factory).units,
     )
-    assert loaded.schema_version == "3.0.0"
+    assert loaded.schema_version == "3.1.0"
     assert loaded.sequence == len(paths)
 
     total_segment_observations = 0
@@ -82,9 +273,9 @@ def test_v3_segment_chain_restores_exact_result_and_only_appends_rows(tmp_path: 
     previous_compact: dict[str, object] | None = None
     for sequence, path in enumerate(paths, start=1):
         metadata = json.loads((path / "checkpoint.json").read_text(encoding="utf-8"))
-        compact = json.loads((path / "compact_state.json").read_text(encoding="utf-8"))
-        segment = json.loads((path / "history_segment.json").read_text(encoding="utf-8"))
-        assert metadata["schema_version"] == "3.0.0"
+        compact = _read_payload(path, "compact_state")
+        segment = _read_payload(path, "history_segment")
+        assert metadata["schema_version"] == "3.1.0"
         assert set(compact) == {"schema_version", "sequence", "binding", "particle_order", "records"}
         assert all("observations" not in record for record in compact["records"])
         for index, record in enumerate(segment["records"]):
@@ -119,7 +310,7 @@ def test_v3_inspection_uses_compact_counters(tmp_path: Path) -> None:
     del final_path
     for sequence, path in enumerate(paths, start=1):
         metadata = json.loads((path / "checkpoint.json").read_text(encoding="utf-8"))
-        compact = json.loads((path / "compact_state.json").read_text(encoding="utf-8"))
+        compact = _read_payload(path, "compact_state")
         step_counts = [record["step_count"] for record in compact["records"]]
         assert inspect_execution_checkpoint(path, expected_binding=_binding()) == (
             sequence,
@@ -160,16 +351,13 @@ def test_v3_cursor_tampering_is_rejected_after_checksum_refresh(tmp_path: Path) 
     """即使同步更新 checksum，篡改 segment cursor 仍必須被 chain continuity gate 拒絕。"""
 
     final_path, paths = _write_chain(tmp_path, generation_count=3)
-    segment_path = paths[1] / "history_segment.json"
-    segment = json.loads(segment_path.read_text(encoding="utf-8"))
+    segment_path = paths[1] / "history_segment.json.gz"
+    segment = _read_payload(paths[1], "history_segment")
     record = segment["records"][0]
     record["observation_start_cursor"] = 0
     record["observation_end_cursor"] = len(record["observations"])
-    segment_path.write_text(
-        json.dumps(segment, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    _refresh_manifest(paths[1], "history_segment.json")
+    _write_payload(segment_path, segment)
+    _refresh_manifest(paths[1], "history_segment.json.gz")
     with pytest.raises(ValueError, match="cursor"):
         load_execution_checkpoint(final_path, expected_binding=_binding())
 
@@ -180,26 +368,20 @@ def test_v3_identity_and_binding_tampering_are_rejected_after_checksum_refresh(
     """compact 的 particle order 或 binding 被修改時，必須在 restore 前 fail closed。"""
 
     _, paths = _write_chain(tmp_path / "order", generation_count=2)
-    compact_path = paths[1] / "compact_state.json"
-    compact = json.loads(compact_path.read_text(encoding="utf-8"))
+    compact_path = paths[1] / "compact_state.json.gz"
+    compact = _read_payload(paths[1], "compact_state")
     compact["records"] = list(reversed(compact["records"]))
-    compact_path.write_text(
-        json.dumps(compact, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    _refresh_manifest(paths[1], "compact_state.json")
+    _write_payload(compact_path, compact)
+    _refresh_manifest(paths[1], "compact_state.json.gz")
     with pytest.raises(ValueError, match="order"):
         load_execution_checkpoint(paths[1], expected_binding=_binding())
 
     _, binding_paths = _write_chain(tmp_path / "binding", generation_count=2)
-    binding_compact_path = binding_paths[1] / "compact_state.json"
-    binding_compact = json.loads(binding_compact_path.read_text(encoding="utf-8"))
+    binding_compact_path = binding_paths[1] / "compact_state.json.gz"
+    binding_compact = _read_payload(binding_paths[1], "compact_state")
     binding_compact["binding"]["config_hash"] = "tampered"
-    binding_compact_path.write_text(
-        json.dumps(binding_compact, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    _refresh_manifest(binding_paths[1], "compact_state.json")
+    _write_payload(binding_compact_path, binding_compact)
+    _refresh_manifest(binding_paths[1], "compact_state.json.gz")
     with pytest.raises(ValueError, match="binding"):
         load_execution_checkpoint(binding_paths[1], expected_binding=_binding())
 
@@ -210,14 +392,11 @@ def test_v3_child_links_previous_checkpoint_manifest_including_rng_and_compact(
     """子代必須鏈前代 checkpoint.json，前代 RNG/compact 被重寫後不可繼續通過。"""
 
     _, paths = _write_chain(tmp_path, generation_count=2)
-    previous_compact_path = paths[0] / "compact_state.json"
-    previous_compact = json.loads(previous_compact_path.read_text(encoding="utf-8"))
+    previous_compact_path = paths[0] / "compact_state.json.gz"
+    previous_compact = _read_payload(paths[0], "compact_state")
     previous_compact["records"][0]["step_count"] += 1
-    previous_compact_path.write_text(
-        json.dumps(previous_compact, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    _refresh_manifest(paths[0], "compact_state.json")
+    _write_payload(previous_compact_path, previous_compact)
+    _refresh_manifest(paths[0], "compact_state.json.gz")
     with pytest.raises(ValueError, match="previous checkpoint.json SHA"):
         load_execution_checkpoint(paths[1], expected_binding=_binding())
 
@@ -228,14 +407,12 @@ def test_schema3_rejects_higher_generation_forged_as_independent_root(tmp_path: 
     _, paths = _write_chain(tmp_path, generation_count=1)
     forged = tmp_path / "checkpoint-00000002"
     shutil.copytree(paths[0], forged)
-    for filename in ("compact_state.json", "history_segment.json"):
+    for stem in ("compact_state", "history_segment"):
+        filename = f"{stem}.json.gz"
         payload_path = forged / filename
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        payload = _read_payload(forged, stem)
         payload["sequence"] = 2
-        payload_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        _write_payload(payload_path, payload)
         _refresh_manifest(forged, filename)
     metadata_path = forged / "checkpoint.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -279,9 +456,7 @@ def test_v3_migration_root_preserves_legacy_events_without_rewriting_legacy_tree
     migrated_metadata = json.loads(
         (migrated_root / "checkpoint.json").read_text(encoding="utf-8")
     )
-    migrated_segment = json.loads(
-        (migrated_root / "history_segment.json").read_text(encoding="utf-8")
-    )
+    migrated_segment = _read_payload(migrated_root, "history_segment")
     assert migrated_metadata["chain_root_sequence"] == 2
     assert migrated_metadata["segment"]["previous_checkpoint_json_sha256"] is None
     assert all(record["event_start_cursor"] == 0 for record in migrated_segment["records"])

@@ -587,11 +587,13 @@ class ProductionBatch:
                 runtime.execution,
                 observation_prefix_length=(
                     max(0, len(execution.observations) - 1)
-                    if loaded.schema_version == "3.0.0"
+                    if loaded.schema_version in {"3.0.0", "3.1.0"}
                     else 0
                 ),
                 event_prefix_length=(
-                    len(execution.events) if loaded.schema_version == "3.0.0" else 0
+                    len(execution.events)
+                    if loaded.schema_version in {"3.0.0", "3.1.0"}
+                    else 0
                 ),
             )
             runtime.rng.bit_generator.state = rng_state

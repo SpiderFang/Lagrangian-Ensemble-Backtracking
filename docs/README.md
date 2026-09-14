@@ -54,7 +54,7 @@
 | Git 部署與資料同步手冊 | [operations/git_deployment_and_data_sync.md](operations/git_deployment_and_data_sync.md) | 定義本機 Git、SERVER source、資料與部署驗收的邊界。 | 現行 | `docs/git_deployment_and_data_sync.md` |
 | 單站沉降先導執行計畫 | [operations/pilot_run_plan.md](operations/pilot_run_plan.md) | 定義單站 pilot 的選取、限制、命令與[獨立海岸底圖重繪](operations/pilot_run_plan.md#獨立海岸底圖重繪)入口。 | 現行 | `docs/pilot_run_plan.md` |
 | 單站 30 天工程測速操作契約 | [operations/17_engineering_window_benchmark.md](operations/17_engineering_window_benchmark.md) | 規範工程時窗的輸入、分片、計時、續跑與結果解讀界線。 | 現行 | `docs/operations/17_engineering_window_benchmark.md` |
-| Execution checkpoint schema 3.0 操作契約 | [operations/18_checkpoint_segment_storage.md](operations/18_checkpoint_segment_storage.md) | 說明 immutable history segment、compact state、hash chain、容量語意與故障恢復。 | 現行 | `docs/operations/18_checkpoint_segment_storage.md` |
+| Execution checkpoint schema 3.1 gzip 操作契約 | [operations/18_checkpoint_segment_storage.md](operations/18_checkpoint_segment_storage.md) | 說明 gzip payload、immutable history segment、compact state、hash chain、容量語意與故障恢復。 | 工程候選 | `docs/operations/18_checkpoint_segment_storage.md` |
 
 ## 產生物與其他入口
 

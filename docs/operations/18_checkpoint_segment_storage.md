@@ -1,12 +1,14 @@
-# Execution checkpoint schema 3.0 工程候選操作契約
+# Execution checkpoint schema 3.1 gzip 工程候選操作契約
 
-本文件說明尚未正式發布的 execution checkpoint schema `3.0.0` 工程候選。它解決長時間回溯中
+本文件說明尚未正式發布的 execution checkpoint schema `3.1.0` gzip 工程候選。它延續
+schema `3.0.0` 的 immutable segment 契約，並解決長時間回溯中
 每代重寫完整 observation／event history 造成的寫入量平方增長；它只保存可恢復的工程
 狀態，不能取代 trajectory、輸入 manifest、科學驗證或正式成果報告。
 
 SERVER 目前仍使用 schema 2.x；本機先前產生的 schema 3 draft 不是已發布格式，沒有持久化
-相容承諾，也不得交給 final v3 loader／resume。只有以本文件契約建立新 chain root、完成
-SERVER fault／resume 與資源驗證後，才能另行決定正式部署。
+相容承諾，也不得交給 final schema 3.1 loader／resume。schema 3.0 draft 與本候選均未部署；
+只有以本文件契約建立新 3.1 chain root、完成 SERVER fault／resume 與資源驗證後，才能另行
+決定正式部署。writer 固定發布 3.1.0，loader 仍可讀 3.0.0 舊拓撲。
 
 ## 操作順序
 
@@ -14,8 +16,9 @@ SERVER fault／resume 與資源驗證後，才能另行決定正式部署。
    沒有變更；SERVER 的 checkpoint root 必須位於已通過儲存閘門的 `/data/LBT` 子目錄。
 2. 由 `run-shard` 在完整 sweep／macro boundary 呼叫 `ProductionBatch.write_checkpoint`。
    不要手動複製 JSON、刪除中間 generation，或把 partial directory 改名成正式 generation。
-3. 每代發布後檢查 `checkpoint.json`、`compact_state.json`、`history_segment.json` 的
-   size／SHA-256，以及 `latest.json` 與 progress 的 sequence／counter 交叉連結。
+3. 每代發布後檢查 `checkpoint.json`、`compact_state.json.gz`、`history_segment.json.gz` 的
+   壓縮檔 `st_size`／SHA-256／解壓後大小，以及 `latest.json` 與 progress 的 sequence／counter
+   交叉連結。
 4. 中斷時保留已發布 generations；以原 run plan、同一 input binding、seed、shard ID 與
    checkpoint root 執行 `run-shard --resume`。controller 會先掃描 generation，再由最高代
    完整驗證 segment chain，通過後才建立 request factory 與載入 forcing。
@@ -24,7 +27,8 @@ SERVER fault／resume 與資源驗證後，才能另行決定正式部署。
 
 目前尚未啟用 generation retention，因此同一 shard 的已發布 generation 序號必須完整
 連續（`1..highest`）。schema 可以全程維持 `2.0.0`／`2.1.0`／`2.2.0`，也可以由
-2.x 遷移一次後全程使用 `3.0.0`；一旦出現 3.0.0，後續插入 2.x 會被 scanner 拒絕。
+2.x 遷移一次後全程使用 `3.1.0`；既有 `3.0.0` 可接續升級到 3.1.0，但一旦出現任一
+schema 3.x，後續插入 2.x 會被 scanner 拒絕，也不允許 3.1.0 回降 3.0.0。
 若 `RUNNING` progress 尚停在較舊代，crash window 只允許採認恰好下一代的 orphan；
 高出一代以上表示中間 generation 遺失或 progress 被回退，必須保留現場並停止恢復。
 
@@ -36,8 +40,8 @@ SERVER fault／resume 與資源驗證後，才能另行決定正式部署。
 $LBT_CHECKPOINT_ROOT/<run_id>/<shard_id>/
 ├── checkpoint-00000001/
 │   ├── checkpoint.json
-│   ├── compact_state.json
-│   └── history_segment.json
+│   ├── compact_state.json.gz
+│   └── history_segment.json.gz
 ├── checkpoint-00000002/
 │   └── ...
 └── latest.json
@@ -45,12 +49,14 @@ $LBT_CHECKPOINT_ROOT/<run_id>/<shard_id>/
 
 `checkpoint.json` 是 generation manifest，保存 schema、sequence、粒子／觀測／事件總數、
 完整 binding、固定 particle order、兩個 payload 的檔案大小／SHA-256、固定的
-`chain_root_sequence` 與 optional `legacy_source`。`segment.previous_checkpoint_json_sha256`
-以及 `history_segment.json` 內的同名欄位會指向上一代完整 `checkpoint.json`；因此上一代
+`chain_root_sequence` 與 optional `legacy_source`。3.1 manifest 對每個 `.json.gz` payload
+另保存 `content_encoding="gzip"` 與 `uncompressed_size_bytes`；`size_bytes` 永遠是 gzip
+完成關閉後的壓縮檔 `st_size`。`segment.previous_checkpoint_json_sha256` 以及
+`history_segment.json.gz` 解壓內容內的同名欄位會指向上一代完整 `checkpoint.json`；因此上一代
 compact、RNG、identity、binding、history payload checksum 與遷移來源都被同一條 hash chain
 綁定，不能跳代、重排或改寫後再繼續。
 
-`compact_state.json` 每代只保存目前的粒子狀態與恢復控制資料。每個 particle record
+`compact_state.json.gz` 每代只保存目前的粒子狀態與恢復控制資料。每個 particle record
 包含 RunUnit identity、`ParticleState`、步數、最小步長夾制次數、下一個輸出 age cursor、
 observation／event cursor、PCG64DXSM RNG state、triangle hint 與最後一筆尚可能被 engine
 更新 context 的 pending observation。最後一筆觀測暫放 compact，是因為同一時間／位置的
@@ -62,7 +68,7 @@ current state、計數器、輸出與 history cursor、pending observation、RNG
 既有 history 長度；writer 會用前代 compact 做 O(P) 比對並拒絕任何終止後追加或修改，避免
 公開 API 產生看似可讀但生命週期已分歧的 checkpoint。
 
-`history_segment.json` 每粒子只保存上一代 cursor 之後新增的 immutable rows。每筆 record
+`history_segment.json.gz` 每粒子只保存上一代 cursor 之後新增的 immutable rows。每筆 record
 包含 identity、觀測與事件的起訖 cursor、row count、觀測 rows 與事件 rows。loader 會由
 chain root 依固定 particle order 逐段附加資料，再把 compact 的 pending observation 接在
 末端；任何缺失、重複、跳號、cursor 回退、identity／binding 改變或 checksum 不符都會
@@ -87,8 +93,9 @@ writer 在建立 partial 前也會把本代 compact state、觀測（含 pending
 list、bool 或空值經由 JSON 正規化後才造成 binding 比對失敗；schema 2.x 舊檔也沿用相同
 欄位驗證，保留缺少 optional stream 欄位的相容語意。
 
-controller 的 generation scan 仍會讀取並 JSON parse 每代 compact／history payload，以驗證
-檔案 checksum、欄位拓撲、cursor 與 row count，但只在最高代完整 restore 時建立全部
+controller 的 generation scan 仍會讀取並 JSON parse 每代 compact／history payload；3.1 會先
+驗證 gzip 壓縮檔 `st_size`／SHA-256，再解壓核對 raw 大小與 JSON 欄位拓撲、cursor、row count，
+但只在最高代完整 restore 時建立全部
 `Observation`／`BoundaryEvent` 物件。若保留很多代，冷快取或 NFS 連線下的 scan／resume
 可能多次線性讀取整條 chain；這部分必須以 SERVER fault／resume 實測評估，不能用本機 page
 cache 命中推論 NFS 實際讀取量或完成時間。現行 loader 會先保留完整 chain 的 JSON dict，
@@ -98,8 +105,9 @@ benchmark 量測 RSS 與時間後，才能評估正式部署。
 
 ## 寫入與容量語意
 
-writer 的發布順序是：在同一父目錄建立 `.partial-*` → 寫 compact 與 segment → 計算 payload
-checksum 與 generation manifest → `os.replace` 發布 generation。controller 隨後原子更新
+writer 的發布順序是：在同一父目錄建立 `.partial-*` → 以 gzip level 1、mtime=0、空 filename
+串流寫 compact 與 segment → 關閉 gzip trailer → 計算壓縮 payload checksum／大小與 generation
+manifest → `os.replace` 發布 generation。controller 隨後原子更新
 `latest.json`，最後更新 progress。partial 目錄沒有完整 manifest 時不具備可恢復資格；若
 Python 例外或 `KeyboardInterrupt` 發生在 writer 的清理範圍內，`BaseException` cleanup
 會嘗試移除該 partial；NFS 權限／I/O 錯誤仍可能讓暫存目錄殘留。這不涵蓋 `SIGKILL`、主機掉電或

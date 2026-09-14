@@ -11,7 +11,7 @@ orchestration、Unix lock topology 及 reconcile。
 正式 controller 不會讀取 raw NetCDF，也不會把 forcing、geometry 或 request factory
 序列化；caller 必須以相同的 manifest/config 建立 request。這個邊界可讓 SERVER 的大型
 陣列由 ``ForcingWindowManager`` 管理，而 run plan 只保存可稽核的 hash 與相對路徑 token。
-execution checkpoint 由 schema 3.0 的 immutable history segment 與 compact current state
+execution checkpoint 由 schema 3.0／3.1 的 immutable history segment 與 compact current state
 保存；controller 仍會在每次 checkpoint 以共享 ``progress.lock`` 原子發布 run-level 進度，
 因此 schema 3 只改善歷史 payload 的重複寫入，不代表 NFS progress lock 競爭自動消失。
 schema 2.x 只在 loader 中維持舊目錄的唯讀相容性。
@@ -81,11 +81,13 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _CHECKPOINT_RE = re.compile(r"^checkpoint-([0-9]{8})$")
 # execution checkpoint 的 scanner 必須知道 schema 的單向遷移邊界。2.x 是既有唯讀
-# 格式；3.0 是新 writer 的 immutable segment 格式。沒有 retention 時，這裡也要求
+# 格式；3.x 是新 writer 的 immutable segment 格式。沒有 retention 時，這裡也要求
 # generation 序號完整連續，避免 reconcile 從缺代或較高偽 root 靜默採認錯誤狀態。
 _CHECKPOINT_SCHEMA2_VERSIONS = frozenset({"2.0.0", "2.1.0", "2.2.0"})
-_CHECKPOINT_SCHEMA3_VERSION = "3.0.0"
-_CHECKPOINT_SCHEMA_VERSIONS = _CHECKPOINT_SCHEMA2_VERSIONS | {_CHECKPOINT_SCHEMA3_VERSION}
+_CHECKPOINT_SCHEMA3_VERSIONS = frozenset({"3.0.0", "3.1.0"})
+_CHECKPOINT_SCHEMA30_VERSION = "3.0.0"
+_CHECKPOINT_SCHEMA3_VERSION = "3.1.0"
+_CHECKPOINT_SCHEMA_VERSIONS = _CHECKPOINT_SCHEMA2_VERSIONS | _CHECKPOINT_SCHEMA3_VERSIONS
 # candidate 狀態需區分「確定沒有已發布代」、「暫時無法讀取」與「已通過採認」；NFS
 # 讀取錯誤不能和確定的 publish 前失敗共用同一個 False，否則合法 orphan 會被誤標 FAILED。
 _CheckpointAdoptionStatus = Literal["adopted", "indeterminate", "not_adopted"]
@@ -178,7 +180,7 @@ class RunExecutionSummary:
 
 @dataclass(frozen=True, slots=True)
 class _CheckpointSelection:
-    """通過 schema 3.0／舊 schema 2.x 與 run binding 驗證的最高 checkpoint generation。
+    """通過 schema 3.x／舊 schema 2.x 與 run binding 驗證的最高 checkpoint generation。
 
     ``particle_steps`` 是所有 execution ``step_count`` 的精確總和。若 generation 已寫完、
     但程序在更新 ``latest.json`` 前中斷，schema 2 沒有 run-level sweep counter；此時只能
@@ -2156,6 +2158,7 @@ class RunController:
         entries = tuple(parent.iterdir())
         generations: dict[int, tuple[Path, int, int]] = {}
         generation_schemas: dict[int, str] = {}
+        legacy_sequence_zero: Path | None = None
         latest_path = parent / "latest.json"
         for entry in entries:
             if entry.is_symlink():
@@ -2170,8 +2173,6 @@ class RunController:
             if match is None or not entry.is_dir():
                 raise ValueError(f"checkpoint unknown entry：{entry.name}")
             sequence = int(match.group(1))
-            if sequence < 1:
-                raise ValueError("checkpoint generation sequence 必須從 1 開始")
             loaded_sequence, sweeps_lower_bound, particle_steps = inspect_execution_checkpoint(
                 entry, expected_binding=binding, expected_run_units=expected_units
             )
@@ -2182,37 +2183,84 @@ class RunController:
                 label=f"{entry.name}/checkpoint.json",
             )
             schema_version = metadata.get("schema_version")
-            if schema_version not in _CHECKPOINT_SCHEMA_VERSIONS:
+            if type(schema_version) is not str or schema_version not in _CHECKPOINT_SCHEMA_VERSIONS:
                 raise ValueError(f"checkpoint schema_version 不支援：{entry.name}")
+            if sequence == 0:
+                # schema 2 fixture 歷來允許 sequence=0；它只能作為同 parent 的一次性
+                # migration source，不能被當作 v3 generation 或 progress 的目前狀態。
+                if schema_version not in _CHECKPOINT_SCHEMA2_VERSIONS:
+                    raise ValueError("checkpoint sequence 0 只能是 schema 2.x 遷移來源")
+                if legacy_sequence_zero is not None:
+                    raise ValueError("checkpoint sequence 0 不得重複")
+                legacy_sequence_zero = entry
+                continue
+            if sequence < 1:
+                raise ValueError("checkpoint generation sequence 必須從 1 開始")
             generations[sequence] = (entry, sweeps_lower_bound, particle_steps)
             generation_schemas[sequence] = schema_version
         if not generations:
+            if legacy_sequence_zero is not None:
+                raise ValueError("schema 2 sequence 0 必須由 schema 3 migration root 引用")
             if latest_path.exists() or latest_path.is_symlink():
                 raise ValueError("latest.json 存在但沒有完整 checkpoint generation")
             return None
 
-        highest_sequence = max(generations)
-        expected_sequences = set(range(1, highest_sequence + 1))
-        missing_sequences = sorted(expected_sequences - set(generations))
-        if missing_sequences:
-            # retention 尚未實作；所有已發布代都必須留在同一 parent，才能沿 hash chain
-            # 驗證完整歷史。若直接採認最高代，缺少的中間代會讓 scanner 跳過未知狀態。
-            missing = ", ".join(f"checkpoint-{value:08d}" for value in missing_sequences)
-            raise ValueError(f"checkpoint generation sequence 必須連續，缺少：{missing}")
+        if legacy_sequence_zero is not None:
+            # 掃描前已完整驗證 schema 2 source；只有 migration root 明示以相對目錄綁定它
+            # 時才允許其留在 generation parent，避免任意 sequence=0 目錄繞過連續性 gate。
+            referenced = False
+            for sequence in generation_schemas:
+                if generation_schemas[sequence] not in _CHECKPOINT_SCHEMA3_VERSIONS:
+                    continue
+                metadata = _read_json(
+                    generations[sequence][0] / "checkpoint.json",
+                    label=f"checkpoint-{sequence:08d}/checkpoint.json",
+                )
+                legacy_source = metadata.get("legacy_source")
+                if isinstance(legacy_source, dict) and legacy_source.get(
+                    "relative_directory"
+                ) == legacy_sequence_zero.name:
+                    referenced = True
+                    break
+            if not referenced:
+                raise ValueError("schema 2 sequence 0 必須由 schema 3 migration root 引用")
 
-        # schema 只能保持在 2.x，或由 2.x 一次遷移到 3.0 後繼續使用 3.0。禁止在
+        highest_sequence = max(generations)
+        # retention 尚未實作；只用排序後的實際 generation 相鄰比較，避免把極端高序號
+        # （例如 stray checkpoint-99999999）展開成巨大 set。這仍能逐一指出第一個缺代，
+        # 同時讓 scanner 的記憶體成本維持 O(G)，其中 G 是實際目錄數量。
+        ordered_sequences = sorted(generations)
+        expected_sequence = 1
+        for sequence in ordered_sequences:
+            if sequence != expected_sequence:
+                raise ValueError(
+                    "checkpoint generation sequence 必須連續，缺少："
+                    f"checkpoint-{expected_sequence:08d}"
+                )
+            expected_sequence += 1
+
+        # schema 只能保持在 2.x，或由 2.x 一次遷移到 3.x 後繼續使用 3.x。禁止在
         # schema 3 chain 中插入舊格式，否則下一次 writer 可能把它誤當 migration root，
         # 切斷前代 v3 hash chain。這個 gate 放在最高代選擇前，故 latest 落後時也不會
         # 先採認不合法的降級 generation。
         seen_schema3 = False
-        for sequence in range(1, highest_sequence + 1):
+        seen_schema31 = False
+        for sequence in ordered_sequences:
             schema_version = generation_schemas[sequence]
             if schema_version == _CHECKPOINT_SCHEMA3_VERSION:
                 seen_schema3 = True
-            elif schema_version in _CHECKPOINT_SCHEMA2_VERSIONS:
+                seen_schema31 = True
+            elif schema_version == _CHECKPOINT_SCHEMA30_VERSION:
+                if seen_schema31:
+                    raise ValueError(
+                        "checkpoint schema 不可由 3.1.0 降回 3.0.0："
+                        f"checkpoint-{sequence:08d}"
+                    )
+                seen_schema3 = True
+            elif type(schema_version) is str and schema_version in _CHECKPOINT_SCHEMA2_VERSIONS:
                 if seen_schema3:
                     raise ValueError(
-                        "checkpoint schema 不可由 3.0.0 降回 2.x："
+                        "checkpoint schema 不可由 3.x 降回 2.x："
                         f"checkpoint-{sequence:08d}"
                     )
             else:  # pragma: no cover - schema version 已由上方集合 gate 限制

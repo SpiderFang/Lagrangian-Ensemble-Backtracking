@@ -375,9 +375,10 @@ uv run lbt run-shard "$LBT_OUTPUT_ROOT/runs/$RUN_ID" \
 
 同一 shard 的 resume 必須沿用原 config、seed、input binding 與 checkpoint root。external
 checkpoint root 只在命令執行時傳入；run plan／progress 保存相對 token，不保存 SERVER 絕對
-路徑。execution checkpoint 目前由 schema `3.0.0` 以 compact state 與 immutable history
-segment 保存；loader 會沿每代 `checkpoint.json` SHA-256 chain 檢查 generation、cursor、
-binding、checksum、particle order、RNG 與前代 provenance。缺 generation、binding、checksum、
+路徑。execution checkpoint writer 目前固定發布 schema `3.1.0`，以 deterministic gzip 的
+compact state 與 immutable history segment 保存；loader 同時保留 schema `3.0.0` 未壓縮拓撲，
+並沿每代 `checkpoint.json` SHA-256 chain 檢查 generation、cursor、binding、checksum、particle
+order、RNG 與前代 provenance。缺 generation、binding、checksum、
 particle order、RNG 或前代 manifest 不符時，controller 在建立物理 request 前停止，不從 seed
 靜默重算。latest/progress 更新若在完整 generation 發布後失敗，resume/reconcile 會驗證並採認
 該固定序號 orphan，重新建立 pointer 與容量 metrics。

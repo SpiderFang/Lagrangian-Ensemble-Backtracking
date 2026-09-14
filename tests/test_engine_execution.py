@@ -1522,7 +1522,7 @@ def test_missing_or_nonfinite_context_omitted_from_event_and_roundtrips(
     restored = load_execution_checkpoint(checkpoint_path, expected_binding=binding, expected_run_units=[unit])
     assert restored.executions[0] == execution
     assert restored.rng_states[0] == rng.bit_generator.state
-    assert json.loads((checkpoint_path / "checkpoint.json").read_text())["schema_version"] == "3.0.0"
+    assert json.loads((checkpoint_path / "checkpoint.json").read_text())["schema_version"] == "3.1.0"
     result = finalize_particle_execution(restored.executions[0])
     for name, event_attributes in (
         ("diagnostic", attributes), ("legacy", {}), ("ordinary", {"label": "old"}),

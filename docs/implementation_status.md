@@ -12,7 +12,7 @@
 | forcing | OCM native 三維 current、OCM surface selector、NWW3 analysis、有限水深 Stokes、月份視窗與 cache | 只讀已驗收產品；缺值不補零、未知跨月／跨網格外插拒絕 |
 | engine | 正向物理速度的 signed-time RK4、獨立隨機擴散、沉降、巢狀邊界與事件；CPU／NumPy reference orchestration | synthetic 與 unit／integration tests 不構成真資料科學驗證 |
 | 情境與執行 | 五站點 scenario builder、固定排序、pilot／formal workspace、shard／chunk、progress／lock、reconcile／validate | formal 仍須 approved config、完整 inventory、gap-safe／full-product evidence |
-| checkpoint | execution checkpoint writer schema `3.0.0`；immutable history segment + compact current state、SHA-256 chain、cursor／identity／binding／RNG continuation 驗證；讀取 schema `2.0.0`、`2.1.0`、`2.2.0` 舊拓撲 | 舊 2.x 目錄唯讀且不原地升級；v3 synthetic round-trip／故障拒絕測試不構成真資料 30 天正式成果證據 |
+| checkpoint | execution checkpoint writer schema `3.1.0`；compact／history payload 使用 deterministic gzip、immutable history segment + compact current state、SHA-256 chain、cursor／identity／binding／RNG continuation 驗證；保留 schema `3.0.0` 舊拓撲與讀取 schema `2.0.0`、`2.1.0`、`2.2.0` | 舊 2.x 與 3.0 目錄唯讀且不原地升級；3.0→3.1 混合 chain 可讀，禁止降級；gzip／resume／故障測試仍屬 engineering candidate，不構成真資料 30 天正式成果證據 |
 | trajectory | 新 writer schema `3.0.0`，含環境與速度 payload；reader／validator 可讀 `1.0.0`、`2.0.0`、`3.0.0` 的固定拓撲 | v1 不得作正式垂向證據；v2 保留既有位置／環境報告用途；同一正式 run 不混用版本 |
 | 跨區 pilot 矩陣 | `pilot-matrix-validate` 只讀各 run 的 `run_plan.json` 與 `normalized_config.json`，比較 M／seed、experiment、積分／邊界／Stokes、材質、scalar snapshot 與 deployment provenance；明示區域 identity、輸入／幾何 binding 與 Kh／Kz／Smagorinsky cap 可不同 | 只證明工程設定是否可比較，不驗 trajectory／forcing 內容、不判定 run 完成，也不構成正式科學 evidence |
 | 聚合與報告基礎 | aggregate／report statistics、trajectory stream、source binding、release I/O、共同 staging／格式／checksum 基礎 | caller 必須提供已驗證 products；不能由 typed facade 或 synthetic release 推導科學完成 |
