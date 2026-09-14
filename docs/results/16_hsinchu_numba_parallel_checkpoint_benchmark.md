@@ -125,11 +125,271 @@ checkpoint tree 的 `du -sb` 空間如下；這裡的總量包含各代 checkpoi
 在固定設定中保存該選擇；不能只因本輪可行就把 `10000` 視為所有站點與所有回溯長度的
 普遍最終值。
 
-schema 3 的 immutable history segments 與 compact state 仍在審查，未納入本節兩次
-SERVER 實測數字。它預期把每代新增 history 以追加段保存，降低長回溯的重複寫入；在
-validator、resume、故障與容量測試完成前，不把它當作正式執行依據。
+schema 3 的 immutable history segments 與 compact state 已另有一組 SERVER engineering
+baseline，詳見下一節。它預期把每代新增 history 以追加段保存，降低長回溯的重複寫入；
+該 baseline 仍須完成正式 validator、cold resume、故障、同步與容量審查，不能直接作為
+正式 30 天執行依據。
 
-## 5. 輸出完整性與 NumPy 對照
+## 5. schema 3 `cbfe58e4` SERVER engineering baseline
+
+本節補記一組以 schema 3 checkpoint 執行的 B 區新竹 24 小時 engineering baseline。
+它與前兩節的 `a7bd697` schema 2 `cp10000` 數據分開保存；本節只測
+`no_stokes`（只有流），沒有把 schema 3 的結果延伸宣稱至 `finite_depth_stokes`、30
+天或五站正式矩陣。
+
+### 5.1 版本、輸入與執行範圍
+
+| 項目 | 實際值 |
+|---|---|
+| checkout | `/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking-cbfe58e` |
+| Git commit | `cbfe58e4144a6f6f3f5ba418f2c38a16d7bc5240` |
+| deployment tree | `e916c91dec056109b800ea02097b8d846bc0d597` |
+| deployment bundle | `/data/LBT/packages/lbt-cbfe58e.bundle` |
+| bundle SHA-256 | `48a732cf25be528aa603be712793e810dcf89d2a7bce466287a34328e57eebf0` |
+| engineering root | `/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914` |
+| input artifact | `/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/artifacts/B-hsinchu-24h-cbfe58e-v1` |
+| run ID | `b-hsinchu-no-stokes-cbfe58e-schema3-4w-v1` |
+| 物理案例 | `no_stokes`，只有流 |
+| workload | B 區新竹、24 小時回溯、20 scenarios、`M=1`、`4 shards × 5` |
+| random stream | `abcd-hsinchu-20240102t0100z-m1-v1` |
+| checkpoint | schema 3，immutable history segment + compact state |
+
+### 5.2 刻意 pause、resume 與完整性
+
+為驗證 schema 3 的可恢復路徑，先只執行 shard 0，刻意在 `20,000 sweeps` 停止；當時
+完成 `100,000 particle steps`、產生 2 代 schema 3 checkpoint。該階段 elapsed 為
+`153.91 s`，最大 RSS 為 `394,324 KiB`，pause 後 checkpoint tree 的 `du -sb` 為
+`5,329,302 bytes`。接著以相同 run plan、input binding、random stream、shard ID
+與 checkpoint root resume，最終 `4/4 shards COMPLETE`、20 scenarios、20 particles，
+`validate-run --require-complete` 的紀錄為 `valid=true`、`errors=[]`、exit `0`。
+
+pause 計時來自 `/usr/bin/time -v`；它證明中斷點確實寫出可恢復 generation，不代表
+正常完整 run 的批次 elapsed。
+
+### 5.3 完成後 controller 資源與 checkpoint 指標
+
+下表的 wall／CPU／RSS／`checkpoint_active_bytes` 是四個完成 shard 的 controller
+指標。`checkpoint_active_bytes` 是該 shard 目前保留的 schema 3 checkpoint tree
+容量；`checkpoint_bytes` 則是 benchmark report 的 logical checkpoint bytes-written
+指標，兩者語意不同，不應互相加總後再當成磁碟使用量。
+
+| 分片 | controller wall (s) | controller CPU (s) | 最大 RSS (bytes) | checkpoint active (bytes) |
+|---|---:|---:|---:|---:|
+| 0：`00000000-00000005_shd_1e1a145ae32e2c3be549` | 325.071858 | 323.661282 | 403,787,776 | 10,378,905 |
+| 1：`00000005-00000010_shd_66c456e2c16fba23e794` | 332.854940 | 331.566838 | 424,435,712 | 10,857,319 |
+| 2：`00000010-00000015_shd_1dfab9241a1d607d3c4b` | 339.991760 | 338.646759 | 411,013,120 | 11,356,576 |
+| 3：`00000015-00000020_shd_b340262a6d60d172354a` | 286.554583 | 285.533785 | 424,480,768 | 9,135,734 |
+
+`benchmark-report.json` 的四片彙總為：wall `1286.128858 s`、CPU `1280.444640 s`、
+最大 RSS `445,562,880 bytes`、`particle_steps=839288`、
+`checkpoint_active_bytes=41,728,534`、`checkpoint_bytes=41,726,398`、
+`output_bytes=3,709,340`，且 `completed_shard_count=4`、`scenario_count_completed=20`。
+
+完成後四 worker 外層腳本的計時欄位誤報 `0.0`，因此不引用該欄位作批次 elapsed。
+四個程序是近同時啟動；最慢 worker 的 `/usr/bin/time` elapsed 為 `342.73 s`，只能
+作正常四 worker 批次 elapsed 的近似上界。前一組沒有 pause 的 `a7bd697` schema 2
+`cp10000` `no_stokes` 批次為 `347.844 s`，可作鄰近 workload 參照；本次 pause 加
+resume 的端到端 `153.91 + 342.73 = 496.64 s` 不是正常完整 run 耗時。
+
+### 5.4 schema 3 空間效果與輸出對照
+
+完成後 schema 3 checkpoint tree 實際 `du -sb` 為 `41,731,694 bytes`。同一 workload
+的舊 schema 2 `cp10000` checkpoint tree 為 `140,707,819 bytes`，因此 schema 3 約減少
+`70.34%`，容量約為舊版的 `1/3.37`。新 run workspace（不含 checkpoint root）的
+`du -sb` 為 `3,782,098 bytes`；這是 run metadata／輸出工作區容量，不能與 checkpoint
+tree 混為同一指標。
+
+新舊 shard 以 `diff -qr --exclude=manifest.json` 比較，return code `0`；所有 NPY 與
+Parquet payload 逐位元一致。唯一差異是各自的 `manifest.json`，因為 commit、artifact
+hash、run ID 與 resource metrics 必然不同。這證明 schema 3 的 checkpoint 拓撲變更沒有
+改寫本次粒子輸出，不等於已完成正式科學驗收。
+
+### 5.5 chain load 與壓縮容量候選
+
+最大分片的 schema 3 chain warm load 讀取第 5 代、5 particles、1,442 observations
+與 11,339 events，elapsed `1.90 s`、最大 RSS `251,740 KiB`。這是 warm-cache 測量，
+不是 cold-cache resume；不能用來承諾 SERVER 重啟後的首次載入時間。
+
+以現有 38 個 `compact_state.json`／`history_segment.json` 做 gzip level 1 的 dry
+estimate（沒有寫出壓縮檔），原始 `41,701,362 bytes` 可降至 `3,937,076 bytes`，減少
+`90.56%`；此估算 elapsed `0.29 s`、user CPU `0.23 s`、最大 RSS `14,596 KiB`。
+這只是 schema 3.1 的容量候選證據，壓縮格式會引入另一個設定變因，不能回填成本次
+未壓縮 schema 3 正式數字。
+
+### 5.6 工程限制與正式採用條件
+
+本 baseline 建立了 schema 3 的 pause／resume、四分片完整收束、容量與 payload parity
+證據，但仍屬 engineering-only：
+
+- SERVER NFS 當時剩餘約 `9.8 TB`、使用率約 `89%`；未壓縮 schema 3 的容量數字不可直接
+  當成正式長期配置。
+- 本輪沒有 `fsync` 故障注入、generation retention、真正 cold resume 或完整 NFS
+  斷線恢復測試；`progress.lock` 仍存在，不能宣稱所有 NFS lock 競爭已消失。
+- gzip level 1 只做 dry estimate，尚未測試壓縮寫入、解壓 resume、故障原子性與正式
+  validator，不能與未壓縮 run 混用。
+- 這是 `no_stokes` 的 24 小時工程 baseline，不是 `finite_depth_stokes`、30 天回溯、
+  四區五站或正式成果的工期／科學驗收證據。正式採用前須完成 cold／failure recovery、
+  NFS I/O 與 retention 策略、版本化 schema／容差及正式 release gates。
+
+### 5.7 SERVER SIGINT fault／resume 小測
+
+另以同一 schema 3 artifact 建立 `b-hsinchu-no-stokes-cbfe58e-sigint-v1`，只驗證
+operator 以 `SIGINT` 中斷時，最近一個已發布 checkpoint 是否保留，以及後續 resume
+是否維持執行狀態。這是操作員中斷與安全邊界測試，不是掉電、NFS client crash 或
+`fsync` durability 測試。
+
+測試順序與觀察如下：
+
+1. 先以 `--sweep-budget 10000` 執行 shard 0，產生 schema 3 `checkpoint-00000001`
+   後進入 `PAUSED`；此階段完成 `10,000 sweeps`、`50,000 particle steps`，elapsed
+   `78.42 s`，最大 RSS `382,776 KiB`。
+2. 從該 checkpoint 以 GNU `timeout` 執行 30 秒，送出 `SIGINT`；程序 return code
+   `130`。中斷後 progress 仍為 `RUNNING`、`sequence=1`、`sweeps=10000`、
+   `particle_steps=50000`，目錄只保留 `checkpoint-00000001` 與 `latest.json`，沒有
+   `.partial` 目錄，也沒有殘留 process。這表示訊號落在下一個可安全恢復邊界前時，
+   不會把未發布的半代誤認為可恢復 checkpoint。
+3. 再以相同 binding resume、`--sweep-budget 10000`，產生
+   `checkpoint-00000002` 並進入 `PAUSED`；此階段完成 `sweeps=20000`、
+   `particle_steps=100000`，elapsed `78.62 s`。
+4. 將中斷／恢復 run 的 generation 2 與未中斷 control run 的 generation 2 交給正式
+   loader 比較：`identities_equal`、`executions_equal`、`rng_states_equal`、
+   `triangle_hints_equal`、`observation_cursors_equal` 與 `event_cursors_equal` 均為
+   `true`，兩邊 sequence 均為 `[2, 2]`。最後 `validate-run` 為 `valid=true`，
+   lifecycle 為 `PAUSED`。
+
+此測試支持「checkpoint 對 operator 中斷與續跑是必要的」：SIGINT 後能回到最後合法
+generation，並保留亂數、粒子提示與 history 游標的一致性。它仍不能推論掉電或 NFS
+寫入途中故障的耐久性；正式 release 必須另做 fsync、斷線、cold resume、partial
+generation 與 retention 測試。
+
+證據均位於同一 SERVER engineering root：
+
+```text
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/checkpoints/b-hsinchu-no-stokes-cbfe58e-sigint-v1
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/runs/b-hsinchu-no-stokes-cbfe58e-sigint-v1
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/sigint-initial-pause.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/sigint-mid-advance.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/sigint-resume-to-gen2.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/sigint-validate-paused.json
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/profiles/sigint-mid-advance-status.txt
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/profiles/sigint-control-checkpoint-comparison.json
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/scripts/compare_checkpoint_cbfe58e.py
+```
+
+### 5.8 schema 3.1 `c67ad89` 正式 SERVER 工程比較
+
+在 schema 3.0 baseline 與 SIGINT 小測後，另以 schema 3.1 進行同一 B 區新竹 24 小時、
+20 scenarios、`M=1`、`4 shards × 5` 的 SERVER 工程比較。這裡的「正式」只表示依
+固定版本、artifact、run ID 與完整驗證流程執行的正式工程測次；它仍不是正式 30 天
+研究成果或五站科學驗收。
+
+#### 5.8.1 版本與初始化流程
+
+| 項目 | 實際值 |
+|---|---|
+| checkout | `/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking-c67ad89` |
+| Git commit | `c67ad893e5d2527be5c00bf87f72b0a802069297` |
+| deployment tree | `1223b13bb6ef6f61b4575e455f7ec566fe84272a` |
+| deployment bundle | `/data/LBT/packages/lbt-c67ad89.bundle` |
+| bundle SHA-256 | `99cac85ff3241931aef2e0be2458e307b056aef5e5dd693a7c6a73781e0df752` |
+| engineering root | `/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914` |
+| input artifact | `/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/artifacts/B-hsinchu-24h-c67ad89-v1` |
+| run ID | `b-hsinchu-no-stokes-c67ad89-schema31-4w-v2` |
+| 亂數流 | `abcd-hsinchu-20240102t0100z-m1-v1` |
+| checkpoint payload | 所有 generation 使用 schema `3.1.0`，payload 為 `.json.gz` |
+
+第一個 v1 嘗試在四個 worker 同時建立 workspace；只有 shard 3 成功，耗時 `290.47 s`，
+其餘三片安全以 `FileExistsError` 拒絕，外層計時 `290.487542890 s`、return code `1`。
+這次不是效能成果，而是確認必須先由 controller 完成 `run-create`／workspace 初始化，
+再派發 resume worker。
+
+v2 先由 shard 0 以 budget 1 初始化 workspace，耗時 `5.37 s`，完成 5 particle steps
+並建立 generation 1 `PAUSED` checkpoint；之後才同時啟動四個 resume worker。四 worker
+外層 elapsed 為 `372.216224447 s`、return code `0`，最後 `4/4 COMPLETE`，20
+scenarios／particles，`validate-run --require-complete` 為 `valid=true`、`errors=[]`、
+exit `0`。
+
+#### 5.8.2 schema 3.1 controller 資源與容量
+
+下表為四片完成後的 controller 指標；shard 0 的時間與資源含前述初始化累積。
+
+| 分片 | controller wall (s) | controller CPU (s) | 最大 RSS (bytes) | checkpoint active (bytes) |
+|---|---:|---:|---:|---:|
+| 0：`00000000-00000005_shd_1e1a145ae32e2c3be549` | 307.313707 | 306.936861 | 425,422,848 | 994,645 |
+| 1：`00000005-00000010_shd_66c456e2c16fba23e794` | 349.786126 | 349.364385 | 422,600,704 | 1,029,341 |
+| 2：`00000010-00000015_shd_1dfab9241a1d607d3c4b` | 369.764398 | 369.384170 | 412,131,328 | 1,072,465 |
+| 3：`00000015-00000020_shd_b340262a6d60d172354a` | 294.425198 | 294.093251 | 420,847,616 | 876,057 |
+
+`v2-benchmark-report.json` 的彙總為：wall `1322.845371 s`、CPU `1320.775614 s`、
+最大 RSS `449,146,880 bytes`、`particle_steps=839288`、
+`checkpoint_active_bytes=3,972,508`、`checkpoint_bytes=3,970,364`、
+`output_bytes=3,709,329`，且 `completed_shard_count=4`、`scenario_count_completed=20`。
+實際 `du -sb` 為 checkpoint tree `3,976,052 bytes`、run workspace `3,782,083 bytes`。
+
+checkpoint tree 的跨版本比較如下：
+
+| checkpoint 版本 | 實際 tree bytes | 對 schema 3.1 容量倍率 | 相對 schema 3.1 減少 |
+|---|---:|---:|---:|
+| schema 2 `cp10000` | 140,707,819 | 35.39× | 97.17% |
+| schema 3.0 | 41,731,694 | 10.50× | 90.47% |
+| schema 3.1 | 3,976,052 | 1.00× | — |
+
+schema 3.1 的外層 elapsed `372.216224447 s` 比前一組無 pause 的 schema 2 `cp10000`
+批次 `347.843958 s` 慢 `7.01%`；相對 schema 3.0 只有最慢 worker 的 `342.73 s`
+近似上界，慢 `8.60%`，不能視為嚴格的 outer-to-outer 比較。schema 3.1 的四片 CPU
+總和相對 schema 3.0 的 `1280.444640 s` 增加 `3.15%`。以上只是一輪 SERVER 測量，
+會受當時共享主機負載與檔案快取影響。
+
+#### 5.8.3 payload parity 與 warm load
+
+所有 schema 3.1 generation 均使用 `.json.gz` payload。新 run 與 schema 2、schema 3.0
+對應 shard 以 `diff -qr --exclude=manifest.json` 比較均為 return code `0`；所有 NPY
+與 Parquet payload 逐位元一致。差異只存在於各 run 的 manifest，原因是 commit、artifact
+hash、run ID 與資源欄位不同。
+
+最大分片 schema 3.1 warm load 讀取 generation 5、5 particles、1,442 observations、
+11,339 events，elapsed `1.97 s`、最大 RSS `255,824 KiB`。schema 3.0 對應 warm load
+為 `1.90 s`、`251,740 KiB`；兩者都是 warm-cache 測量，不能當成 cold resume 數字。
+
+#### 5.8.4 正式限制
+
+- 本輪沒有 `fsync` 故障注入、generation retention 或 cold resume；舊祖先 payload 的
+  讀取依 immutable 假設，若更舊 payload 已被破壞，full loader 必須 fail-closed。
+- `progress.lock` 仍存在；schema 3.1 的壓縮與追加 payload 降低了容量，但沒有證明
+  所有 NFS 鎖競爭已消失。
+- 當時 `/data` NFS 約剩 `9.8 TB`、使用率約 `89%`。schema 3.1 雖已成功完成工程寫入，
+  正式 30 天仍需通過容量閘門、同步／故障驗證與安全回收（retention）設計。
+- 這是 `no_stokes` 24 小時的 schema 3.1 工程比較，不包含 `finite_depth_stokes`，
+  也不構成 30 天、四區五站、M 收斂或科學成果驗收。
+
+證據絕對路徑如下：
+
+```text
+/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking-c67ad89
+/data/LBT/packages/lbt-c67ad89.bundle
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/artifacts/B-hsinchu-24h-c67ad89-v1
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/runs/b-hsinchu-no-stokes-c67ad89-schema31-4w-v1
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/runs/b-hsinchu-no-stokes-c67ad89-schema31-4w-v2
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/checkpoints/b-hsinchu-no-stokes-c67ad89-schema31-4w-v1
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/checkpoints/b-hsinchu-no-stokes-c67ad89-schema31-4w-v2
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-shard-0.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-shard-1.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-shard-2.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-shard-3.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-v2-init-shard0.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-v2-shard-0.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-v2-shard-1.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-v2-shard-2.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/no-stokes-v2-shard-3.log
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/v2-reconcile.json
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/logs/v2-validate-run.json
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/profiles/no-stokes-4w-outer.txt
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/profiles/no-stokes-v2-4w-outer.txt
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/profiles/v2-benchmark-report.json
+/data/LBT/benchmarks/checkpoint-schema31-c67ad89-20260914/profiles/v2-largest-shard-warm-load.log
+```
+
+## 6. 輸出完整性與 NumPy 對照
 
 兩組新版 run 都以 `validate-run --require-complete --checkpoint-root ...` 完成只讀
 檢查，結果均為 `valid=true`、`errors=[]`、exit `0`，並確認 `4/4` shards、20
@@ -146,7 +406,7 @@ scenarios、20 particles 與 `run_lifecycle=COMPLETE`。
 分類、筆數與主要數值行為相符，不能直接宣告 Numba 已達正式數值等價。必須先把正式
 浮點與事件時間容差版本化、補上相應的科學／工程驗收規則，再決定是否納入正式 release。
 
-## 6. SERVER 證據索引
+## 7. SERVER 證據索引
 
 以下路徑均為本輪實測的絕對路徑：
 
@@ -192,9 +452,26 @@ scenarios、20 particles 與 `run_lifecycle=COMPLETE`。
 
 # NFS lock 競爭診斷（cp1000，刻意停止，非成果 run）
 /data/LBT/benchmarks/ocm-runtime-a7bd697-20260914/profiles/no-stokes-4w-v1-summary.json
+
+# schema 3 cbfe58e4 engineering baseline
+/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking-cbfe58e
+/data/LBT/packages/lbt-cbfe58e.bundle
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/artifacts/B-hsinchu-24h-cbfe58e-v1
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/runs/b-hsinchu-no-stokes-cbfe58e-schema3-4w-v1
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/checkpoints/b-hsinchu-no-stokes-cbfe58e-schema3-4w-v1
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/no-stokes-shard0-pause.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/no-stokes-shard-0-resume.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/no-stokes-shard-1-resume.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/no-stokes-shard-2-resume.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/no-stokes-shard-3-resume.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/reconcile.json
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/logs/validate-run.json
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/profiles/benchmark-report.json
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/profiles/largest-shard-warm-load.log
+/data/LBT/benchmarks/checkpoint-schema3-cbfe58e-20260914/profiles/schema3-gzip1-dry-estimate.log
 ```
 
-## 7. 研究解讀界線
+## 8. 研究解讀界線
 
 本輪證明的是：在一個 24 小時新竹工程 workload 上，既有四分片平行入口可以配合
 Numba OCM 後端與較低 checkpoint 頻率完成；相較刻意串行 NumPy baseline，實際外層
