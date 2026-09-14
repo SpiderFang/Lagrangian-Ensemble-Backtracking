@@ -1991,6 +1991,191 @@ def _verify_schema3_files(root: Path, metadata: dict[str, Any]) -> dict[str, dic
     return files
 
 
+def _validate_schema3_chain_schema_and_hash(
+    root: Path,
+    *,
+    expected_binding: CheckpointBinding,
+    expected_particle_order: Sequence[str],
+) -> None:
+    """在續寫前沿完整 schema 3 chain 驗證 metadata 與前代 SHA-256 鏈。
+
+    續寫 writer 原本只驗證 ``previous_checkpoint`` 指向的單一 generation；若有人把
+    中間代改成另一個可自洽的 schema 3.0 目錄，該代本身仍能通過 header 檢查，但新的
+    schema 3.1 generation 會在稍後由完整 loader 發現「3.1 後回降 3.0」。這會形成已
+    發布但不能立即 resume 的 generation。此 helper 只沿固定同父目錄讀取每代
+    ``checkpoint.json``，逐鏈核對前代 metadata SHA、sequence、chain root、binding、
+    particle order 與 3.0→3.1 單向版本規則；不重新解析每代 history payload，因此不把
+    完整歷史重建成本帶入每次 checkpoint。指定的最新 generation 其 payload 已由
+    ``_read_schema3_generation_header`` 驗證，完整 payload 語意仍由 loader 在 resume 時
+    再驗證。
+
+    schema 2 只允許出現在 migration root 的 ``legacy_source``，不會被當成 v3 hash
+    chain 的 predecessor。任何缺代、跳號、hash 不符、獨立高代 root、3.1→3.0 回降或
+    目錄／metadata 形狀不符都立即拒絕，讓 writer 在建立 partial 前 fail-closed。
+    """
+
+    expected_order = list(expected_particle_order)
+    if not expected_order or any(type(item) is not str or not item for item in expected_order):
+        raise ValueError("schema 3 expected particle order 無效")
+    expected_metadata_keys = (
+        "schema_version",
+        "sequence",
+        "particle_count",
+        "observation_count",
+        "event_count",
+        "binding",
+        "particle_order",
+        "files",
+        "segment",
+        "chain_root_sequence",
+        "legacy_source",
+    )
+    chain: list[tuple[Path, dict[str, Any]]] = []
+    current_root = root
+    while True:
+        if current_root.parent != root.parent:
+            raise ValueError("schema 3 chain 不得離開同一 parent")
+        if current_root.is_symlink() or not current_root.is_dir():
+            raise ValueError("schema 3 chain generation 必須是普通目錄")
+        metadata = _require_exact_keys(
+            _read_json(current_root / "checkpoint.json"),
+            expected_metadata_keys,
+            label=f"schema 3 chain {current_root.name} metadata",
+        )
+        schema_version = metadata["schema_version"]
+        if type(schema_version) is not str or schema_version not in _SCHEMA3_VERSIONS:
+            raise ValueError("schema 3 chain 含有不支援的 schema version")
+        sequence = _nonnegative_int(
+            metadata["sequence"], label=f"schema 3 chain {current_root.name} sequence"
+        )
+        if sequence < 1 or current_root.name != f"checkpoint-{sequence:08d}":
+            raise ValueError("schema 3 chain generation 名稱與 sequence 不一致")
+        chain_root_sequence = _positive_int(
+            metadata["chain_root_sequence"],
+            label=f"schema 3 chain {current_root.name} chain_root_sequence",
+        )
+        if chain_root_sequence > sequence:
+            raise ValueError("schema 3 chain_root_sequence 不可晚於 sequence")
+        particle_count = _positive_int(
+            metadata["particle_count"],
+            label=f"schema 3 chain {current_root.name} particle_count",
+        )
+        if particle_count != len(expected_order):
+            raise ValueError("schema 3 chain particle_count 與目前 shard 不一致")
+        actual_binding = _binding_from_payload(
+            metadata["binding"], label=f"schema 3 chain {current_root.name} binding"
+        )
+        if actual_binding != expected_binding:
+            raise ValueError("schema 3 chain binding 與目前 shard 不一致")
+        particle_order = metadata["particle_order"]
+        if particle_order != expected_order:
+            raise ValueError("schema 3 chain particle order 與目前 shard 不一致")
+        segment_meta = _require_exact_keys(
+            metadata["segment"],
+            ("sequence", "previous_checkpoint_json_sha256", "record_count"),
+            label=f"schema 3 chain {current_root.name} segment metadata",
+        )
+        segment_sequence = _nonnegative_int(
+            segment_meta["sequence"],
+            label=f"schema 3 chain {current_root.name} segment sequence",
+        )
+        if segment_sequence != sequence:
+            raise ValueError("schema 3 chain segment sequence 與 generation 不一致")
+        previous_hash = _sha256_or_none(
+            segment_meta["previous_checkpoint_json_sha256"],
+            label=f"schema 3 chain {current_root.name} previous checkpoint hash",
+        )
+        legacy_source = metadata["legacy_source"]
+        if previous_hash is not None and legacy_source is not None:
+            raise ValueError("schema 3 chain continuation 不得帶 legacy source")
+        chain.append((current_root, metadata))
+        if previous_hash is None:
+            if legacy_source is None:
+                if sequence != 1 or chain_root_sequence != sequence:
+                    raise ValueError("schema 3 chain 無 legacy source 的 root 必須是 sequence 1")
+            else:
+                legacy_source = _require_exact_keys(
+                    legacy_source,
+                    (
+                        "schema_version",
+                        "sequence",
+                        "relative_directory",
+                        "checkpoint_json_sha256",
+                    ),
+                    label=f"schema 3 chain {current_root.name} legacy source",
+                )
+                if legacy_source["schema_version"] not in {
+                    _SCHEMA20_VERSION,
+                    _SCHEMA21_VERSION,
+                    _SCHEMA22_VERSION,
+                }:
+                    raise ValueError("schema 3 chain legacy source schema 不支援")
+                legacy_sequence = _nonnegative_int(
+                    legacy_source["sequence"],
+                    label=f"schema 3 chain {current_root.name} legacy sequence",
+                )
+                relative_directory = legacy_source["relative_directory"]
+                if (
+                    type(relative_directory) is not str
+                    or _SCHEMA3_GENERATION_NAME_RE.fullmatch(relative_directory) is None
+                    or int(relative_directory.removeprefix("checkpoint-")) != legacy_sequence
+                ):
+                    raise ValueError("schema 3 chain legacy source path 與 sequence 不一致")
+                source_hash = _sha256_or_none(
+                    legacy_source["checkpoint_json_sha256"],
+                    label=f"schema 3 chain {current_root.name} legacy source hash",
+                )
+                if source_hash is None:
+                    raise ValueError("schema 3 chain legacy source hash 不可為 None")
+                if legacy_sequence != sequence - 1 or chain_root_sequence != sequence:
+                    raise ValueError("schema 3 chain legacy source 必須緊接 root generation")
+                source_root = root.parent / relative_directory
+                if source_root == current_root or source_root.is_symlink() or not source_root.is_dir():
+                    raise ValueError("schema 3 chain legacy source 必須位於同一 parent")
+                source_metadata_path = source_root / "checkpoint.json"
+                source_metadata = _read_json(source_metadata_path)
+                if (
+                    source_metadata.get("schema_version") != legacy_source["schema_version"]
+                    or _nonnegative_int(
+                        source_metadata.get("sequence"),
+                        label="schema 3 chain legacy source metadata sequence",
+                    )
+                    != legacy_sequence
+                    or sha256_file(source_metadata_path) != source_hash
+                ):
+                    raise ValueError("schema 3 chain legacy source metadata 不一致")
+                _verify_schema2_files(source_root, source_metadata)
+            break
+        if sequence <= 1:
+            raise ValueError("schema 3 chain 缺少前一代 generation")
+        previous_root = root.parent / f"checkpoint-{sequence - 1:08d}"
+        if previous_root.is_symlink() or not previous_root.is_dir():
+            raise ValueError("schema 3 chain 缺少前一代 generation")
+        previous_metadata_path = previous_root / "checkpoint.json"
+        if sha256_file(previous_metadata_path) != previous_hash:
+            raise ValueError("schema 3 chain previous checkpoint.json SHA-256 不一致")
+        current_root = previous_root
+
+    chain.reverse()
+    root_sequence = int(chain[0][1]["sequence"])
+    previous_schema: str | None = None
+    expected_sequence = root_sequence
+    for _, metadata in chain:
+        sequence = _nonnegative_int(metadata["sequence"], label="schema 3 chain sequence")
+        if sequence != expected_sequence:
+            raise ValueError("schema 3 chain sequence 跳號或重排")
+        if (
+            _positive_int(metadata["chain_root_sequence"], label="schema 3 chain root sequence")
+            != root_sequence
+        ):
+            raise ValueError("schema 3 chain_root_sequence 在 generation 間改變")
+        schema_version = metadata["schema_version"]
+        if previous_schema == _SCHEMA31_VERSION and schema_version == _SCHEMA30_VERSION:
+            raise ValueError("schema 3.1 generation 不可降回 schema 3.0")
+        previous_schema = schema_version
+        expected_sequence += 1
+
+
 def _read_schema3_generation_header(
     root: Path,
     *,
@@ -2023,7 +2208,7 @@ def _read_schema3_generation_header(
     )
     metadata = _require_exact_keys(metadata, expected_metadata_keys, label="schema 3 metadata")
     schema_version = metadata["schema_version"]
-    if schema_version not in _SCHEMA3_VERSIONS:
+    if type(schema_version) is not str or schema_version not in _SCHEMA3_VERSIONS:
         raise ValueError("schema 3 generation schema_version 不符")
     sequence = _nonnegative_int(metadata["sequence"], label="schema 3 sequence")
     if sequence < 1:
@@ -2769,9 +2954,17 @@ def write_execution_checkpoint(
             )
         previous_metadata = _read_json(previous_root / "checkpoint.json")
         previous_schema = previous_metadata.get("schema_version")
-        if previous_schema in _SCHEMA3_VERSIONS:
+        if type(previous_schema) is str and previous_schema in _SCHEMA3_VERSIONS:
             if had_untracked_history:
                 raise ValueError("schema 3 continuation 的 observations/events 必須保留追蹤器")
+            # header 只驗證指定的上一代；這裡再走完整 metadata/hash chain，避免有人把
+            # chain 中間代改成另一個自洽 schema 3.0 後，writer 仍發布 loader 無法讀回的
+            # 3.1 後代。此檢查位於 partial 建立前，失敗不會留下新 generation。
+            _validate_schema3_chain_schema_and_hash(
+                previous_root,
+                expected_binding=binding,
+                expected_particle_order=[identity["particle_id"] for identity in identities],
+            )
             previous_metadata, previous_compact, _ = _read_schema3_generation_header(
                 previous_root,
                 expected_binding=binding,
@@ -2792,7 +2985,7 @@ def write_execution_checkpoint(
                 previous_metadata["chain_root_sequence"],
                 label="previous chain_root_sequence",
             )
-        elif previous_schema in {
+        elif type(previous_schema) is str and previous_schema in {
             _SCHEMA20_VERSION,
             _SCHEMA21_VERSION,
             _SCHEMA22_VERSION,

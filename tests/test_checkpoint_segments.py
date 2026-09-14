@@ -186,6 +186,37 @@ def test_schema31_to_schema30_downgrade_is_rejected(tmp_path: Path) -> None:
         load_execution_checkpoint(second, expected_binding=_binding())
 
 
+def test_schema31_writer_rejects_downgraded_middle_generation_before_partial(
+    tmp_path: Path,
+) -> None:
+    """續寫前必須掃描完整鏈，拒絕自洽 3.0 中間代切斷既有 3.1 歷史。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    first = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000001", binding=_binding(), sequence=1
+    )
+    batch.advance()
+    second = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000002",
+        binding=_binding(),
+        sequence=2,
+        previous_checkpoint=first,
+    )
+    _convert_v31_root_to_v30(second)
+    batch.advance()
+    target = tmp_path / "checkpoint-00000003"
+    with pytest.raises(ValueError, match=r"3\.1.*降回.*3\.0"):
+        batch.write_checkpoint(
+            target,
+            binding=_binding(),
+            sequence=3,
+            previous_checkpoint=second,
+        )
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(f".{target.name}.partial-*"))
+
+
 @pytest.mark.parametrize("damage", ["truncate", "bit"])
 def test_schema31_gzip_corruption_is_fail_closed(tmp_path: Path, damage: str) -> None:
     """gzip trailer 截斷或壓縮 bytes 篡改即使重算 manifest 也不得被採認。"""
