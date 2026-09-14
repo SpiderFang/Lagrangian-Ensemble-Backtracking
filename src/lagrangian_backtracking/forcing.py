@@ -309,8 +309,24 @@ class OCMNativeMonth:
             raise ValueError("OCM time_utc_ns 必須是嚴格遞增 int64")
 
     @classmethod
-    def from_directory(cls, month_dir: str | Path, *, mesh: NativeMesh) -> OCMNativeMonth:
-        """從月份資料夾以唯讀方式開啟陣列，不允許載入任意序列化物件。"""
+    def from_directory(
+        cls,
+        month_dir: str | Path,
+        *,
+        mesh: NativeMesh,
+        use_numba_kernel: bool = False,
+    ) -> OCMNativeMonth:
+        """從月份資料夾以唯讀方式開啟陣列，不允許載入任意序列化物件。
+
+        ``use_numba_kernel`` 只切換既有 OCM 端點內插 primitive；月份選擇、時間缺口、
+        網格定位、濕乾遮罩、垂向支援與最終品質檢查仍由同一個 Python 控制層執行，
+        因此這個參數不會把純 NumPy 參考引擎誤稱為完整 Numba physics backend。預設
+        ``False`` 保留舊 caller 的 NumPy 行為；檔案仍以唯讀 memory-map 開啟，避免
+        建立一份與 SERVER 上游產品相同大小的複本。
+        """
+
+        if type(use_numba_kernel) is not bool:
+            raise TypeError("use_numba_kernel 必須是 bool")
 
         root = Path(month_dir)
 
@@ -332,6 +348,7 @@ class OCMNativeMonth:
             elev=load("elev.npy"),
             wetdry_elem=load("wetdry_elem.npy"),
             diffusivity=load("diffusivity.npy"),
+            use_numba_kernel=use_numba_kernel,
         )
 
     def _vertical_node_sample(

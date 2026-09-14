@@ -60,6 +60,16 @@ FormalDomainPolicy = Literal[
     "v3_local20km_20260909_v1",
 ]
 
+# OCM 內層插值的版本化選項。這兩個識別碼只描述 OCM 垂向、水平及時間插值所使用的
+# 實作，不會改寫 ``production_backend`` 的整體粒子引擎語意；完整 Python RK4、NWW3、
+# Stokes、邊界、品質檢查與 checkpoint 仍由既有 reference orchestration 負責。
+OCM_INTERPOLATION_BACKEND_NUMPY_V1 = "numpy_v1"
+OCM_INTERPOLATION_BACKEND_NUMBA_V1 = "numba_ocm_v1"
+OcmInterpolationBackend = Literal[
+    "numpy_v1",
+    "numba_ocm_v1",
+]
+
 NORTHEAST_V3_FLOW_DOMAIN_ID = "northeast_taiwan_common_cache_v3"
 NORTHEAST_V3_BBOX_LON_LAT = (121.306315, 122.793685, 24.600844, 25.499156)
 NORTHEAST_V3_COMMON_FORCING_PRODUCTS = frozenset(
@@ -318,12 +328,17 @@ class ExecutionConfig(StrictModel):
 
     ``checkpoint_interval_sweeps`` 的單位是完整批次 sweep，不是輸出觀測點；兩者在
     adaptive time-step 下不等價。``active_chunk_size`` 控制一次散射／回寫的粒子數，
-    ``max_resident_forcing_months`` 控制單一 process 的月份 cache 上限。這些欄位只描述
-    執行策略，不改變 Scenario、粒子 seed 或物理方程。
+    ``max_resident_forcing_months`` 控制單一 process 的月份 cache 上限。
+    ``ocm_interpolation_backend`` 只選擇 OCM 內層插值的 NumPy 參考實作或 Numba 等價
+    kernel；它不代表完整 Numba physics backend，也不改變 Scenario、粒子 seed、Python
+    RK4、NWW3、Stokes、邊界或 checkpoint 行為。未出現在既有 YAML 時，runtime 以
+    ``numpy_v1`` 執行；canonical payload 會省略這個由 Pydantic 補上的預設，維持舊
+    run 的 config hash。
     """
 
     reference_backend: str
     production_backend: str
+    ocm_interpolation_backend: OcmInterpolationBackend = OCM_INTERPOLATION_BACKEND_NUMPY_V1
     shard_scenario_count: int | None = None
     checkpoint_interval_sweeps: int | None = None
     active_chunk_size: int | None = None
@@ -717,6 +732,17 @@ class ProjectConfig(StrictModel):
             # 舊 YAML 保留既有 canonical hash；若 YAML 明示 null，欄位仍會留下來，
             # 讓「尚未具備支援證據」的意圖可被追溯。
             del inputs_payload["backtrack_support_days"]
+        execution_payload = payload.get("execution")
+        if (
+            isinstance(execution_payload, dict)
+            and "ocm_interpolation_backend" in execution_payload
+            and "ocm_interpolation_backend" not in self.execution.model_fields_set
+        ):
+            # 新欄位的實際 runtime 預設是 NumPy；但舊 YAML 沒有這個選項，不能因為
+            # Pydantic 補上 ``numpy_v1`` 就讓既有 run／checkpoint 的 canonical hash 漂移。
+            # 只有 YAML 明示 backend（包括明示 ``numpy_v1``）時，才把選擇寫入 normalized
+            # config，形成可追溯且可驗證的 execution binding。
+            del execution_payload["ocm_interpolation_backend"]
         domain_payloads = payload.get("domains")
         if isinstance(domain_payloads, list):
             for domain, domain_payload in zip(self.domains, domain_payloads, strict=False):

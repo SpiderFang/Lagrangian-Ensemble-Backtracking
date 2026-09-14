@@ -48,7 +48,12 @@ from typing import Any
 import pyarrow.parquet as pq
 from shapely.geometry import Point
 
-from .config import ProjectConfig, load_config, resolve_flow_domain_id
+from .config import (
+    OCM_INTERPOLATION_BACKEND_NUMBA_V1,
+    ProjectConfig,
+    load_config,
+    resolve_flow_domain_id,
+)
 from .diffusion import DiffusionCoefficients, SmagorinskySettings
 from .engine import EngineSettings
 from .forcing_window import ForcingWindowManager
@@ -2086,6 +2091,13 @@ class RuntimeRequestFactory:
             config.execution.max_resident_forcing_months,
             label="execution.max_resident_forcing_months",
         )
+        # 設定欄位以版本化字串保存，runtime 在唯一的 forcing manager 邊界轉成既有
+        # ``use_numba_kernel`` bool。這個切換只影響 OCM 垂向／水平／時間內插 primitive；
+        # Python RK4、NWW3/Stokes、RNG、邊界、品質檢查及 checkpoint 仍走原本的控制流程。
+        # 舊 YAML 由 ExecutionConfig 補入 ``numpy_v1``，所以不需要在 caller 端做 fallback。
+        self._ocm_use_numba_kernel = (
+            config.execution.ocm_interpolation_backend == OCM_INTERPOLATION_BACKEND_NUMBA_V1
+        )
         self._dt_min_seconds = _finite_scalar(
             config.integration.dt_min_seconds,
             label="integration.dt_min_seconds",
@@ -2269,6 +2281,7 @@ class RuntimeRequestFactory:
                 ocm_root=self._ocm_root,
                 nww_root=self._nww_root,
                 max_resident_months=self._max_resident_months,
+                use_numba_kernel=self._ocm_use_numba_kernel,
             )
             self._managers[flow_id] = manager
 

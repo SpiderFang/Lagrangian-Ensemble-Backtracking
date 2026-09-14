@@ -21,6 +21,7 @@
 - `lbt run-worker` 接受同 run 的明確分片清單，先驗證全部 ID，再以同一 controller 依序執行；遇暫停或例外停止。詳細參數見 [CLI 參考](cli_reference.md)。這是持續執行程序的入口，尚不是已完成實測調校的全案自動排程器。
 - `ManagedForcingProvider` 明示同點樣本可重用，粒子引擎只在首次正常 RK4 嘗試沿用步首樣本；步長折半與海面階段反射重試仍重新查詢 k1。一般有狀態取樣函式保持原呼叫語意。重用樣本不寫入 checkpoint，不新增跨粒子快取。
 - `_surface_series_for_location` 先擷取必要的多維座標，再轉為雙精度，保留原始時間／空間支援與數值語意；不縮小正式輸入的母體範圍。
+- `execution.ocm_interpolation_backend` 可明示 `numpy_v1` 或 `numba_ocm_v1`。後者只把已由 NumPy 參考測試固定的 OCM 垂向、水平及時間內插 primitive 交給 Numba；Python RK4、NWW3／Stokes、亂數、邊界、品質檢查及 checkpoint 不在此切片改寫。第一次使用 Numba 的 JIT 編譯／暖機必須另行計時，並與暖機後的 steady-state benchmark 分開報告；NumPy／Numba parity、跨月與 QC 測試通過後才可在 SERVER 比較吞吐。
 
 持續 worker 的快取計數以每次分片執行前的計數為基準，記錄本次增加的載入、命中、未命中及淘汰次數；同一分片續跑時才與該分片先前已保存的增量累計。多次 checkpoint 只是同一執行區間的進度快照，不可把這些快照再次相加。`manager_count` 與 `resident_bytes` 為狀態量，分片及報告採已觀測樣本的最大值，不是各 worker 同時使用量的總和，也不是連續量測的整機峰值。歷史未標示計數語意的紀錄不能反推精確增量，須保留可讀性並明示其限制，不能將累計快取次數當成已驗證的全案總量。
 

@@ -556,6 +556,7 @@ def test_valid_no_stokes_is_lazy_shared_and_uses_dynamic_pair(
     assert calls[0]["nww_root"] is None
     assert calls[0]["ocm_root"] == tmp_path / "ocm-native"
     assert calls[0]["max_resident_months"] == 2
+    assert calls[0]["use_numba_kernel"] is False
     manager = managers[0]
     assert manager.provider_calls == [(-0.2, False)]
     assert manager.sample_calls == []
@@ -590,6 +591,26 @@ def test_valid_no_stokes_is_lazy_shared_and_uses_dynamic_pair(
         data["scenario"].arrival_time_utc_ns - 7 * 86400 * 1_000_000_000
     )
     assert first.settings.maximum_minimum_clamps == 100
+
+
+def test_numba_ocm_backend_is_forwarded_only_to_ocm_kernel_switch(
+    runtime_fixture: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """execution backend 選擇應在 manager 邊界轉成 use_numba_kernel=True。"""
+
+    execution = runtime_fixture["config"].execution.model_copy(
+        update={"ocm_interpolation_backend": "numba_ocm_v1"}
+    )
+    data = {
+        **runtime_fixture,
+        "config": runtime_fixture["config"].model_copy(update={"execution": execution}),
+    }
+    calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
+    factory = _factory(data, tmp_path)
+    factory(_unit(data["scenario"]))
+    assert calls[0]["use_numba_kernel"] is True
+    # execution backend 不應改寫既有 experiment case 的 Stokes／diffusion registry。
+    assert calls[0]["nww_root"] is None
 
 
 @pytest.mark.parametrize(

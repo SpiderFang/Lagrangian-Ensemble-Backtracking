@@ -588,7 +588,10 @@ arrival_time_selection:
 
 execution:
   reference_backend: numpy
-  # 目前只有 CPU/NumPy reference orchestration；不可宣稱已接 Numba kernel。
+  # 目前仍是 CPU/NumPy reference orchestration；下列 OCM 選項只控制內層插值 kernel，
+  # 不可宣稱已接上完整 Numba physics backend。為維持既有範例設定的 hash，此行刻意
+  # 保持註解；新 run 若要明示選擇，可解除註解並填入 numpy_v1 或 numba_ocm_v1。
+  # ocm_interpolation_backend: numpy_v1
   production_backend: numpy_reference
   shard_scenario_count: null
   # cadence 以完整 sweep 計算，不以輸出觀測點代替。
