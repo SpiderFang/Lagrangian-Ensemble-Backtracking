@@ -1,533 +1,255 @@
 # SERVER 執行手冊
 
-> **閱讀提示**
-> - 文件類型：SERVER 資料盤點、執行、續跑與發布手冊。
-> - 它回答：正式流程如何在核准環境中逐關檢查並保留證據。
-> - 建議先讀：[CLI 參考](cli_reference.md)，再核對[實作狀態](../implementation_status.md)。
+這是一份給實際操作者使用的手冊。若目的是執行既有 **B 區工程試跑**，只需依序完成
+第 2～6 節；不必先理解程式架構或科學方法。
 
-## 1. 適用範圍
+> 本文件中的命令都在 SERVER 執行。`<...>` 代表必須由本次執行負責人提供的值，不能原樣貼上，
+> 也不能沿用過去紀錄猜測。每次執行都要重新通過 `PREPARE`；歷史成功不代表目前 SERVER 已通過。
 
-本文件定義 SERVER 部署、preflight、pilot、正式 batch、checkpoint、QC 與發布程序。
-程式歷史接入、canonical 根目錄衝突保留、Git bundle 與大型資料同步邊界，另見[Git 部署與資料同步手冊](git_deployment_and_data_sync.md)；本文件只保留科學 runtime 與發布流程。
-`config-check`、`preflight`、`behavior-manifest`、`synthetic-smoke` 與 `validate-shard` 已可
-執行；Phase 3B1/3B2a 另已提供 `code-provenance`、`validate-run` 與 `benchmark-report`，
-並以 schema 2 ordering、固定 lock topology 與跨程序 progress 契約約束 restart。
-Phase 3A2 已提供 `receptor_arrival_initial_condition_manifest` 的 strict loader：它驗證
-100 個 receptor templates、250 個 arrival-time 與 5,000 個 dynamic pair initial conditions，
-並保存 pair component hash；formal actual z 必須取自 pair record。runtime 已由
-`initialize_run`／`initialize_formal_run`、`RuntimeRequestFactory` 與
-`open_run_controller` 接通 pilot／formal CPU 管線；`lbt run-create`、`lbt run-shard` 與
-`lbt run-reconcile` 可依 immutable run plan 執行兩種模式。formal 仍會對正式 config、
-approved manifests、192 筆月份 inventory、8 筆時間軸及逐 arrival flow 的時間支援
-fail-closed。aggregate/release 仍是後續 gate，不得以 synthetic fixture 冒充正式批次。
+## 1. 先確認要執行哪一種工作
 
-本輪僅同步程式與 runbook，未登入或執行 SERVER，沒有正式研究結果。
+| 目的 | 現況 | 應使用的入口 |
+|---|---|---|
+| 既有 B 區 12 組工程試跑 | 可執行，但必須先通過本次檢查 | `scripts/run_b_hsinchu_expanded_matrix.sh` |
+| 新增其他 pilot（小型工程試跑） | 命令已存在，但目前沒有通用 SERVER 執行入口 | 由執行包維護者依第 7 節建立入口 |
+| 2024–2025 五站正式批次 | **目前不可執行** | 等待第 8 節列出的正式輸入與驗證完成 |
+| 完整報告建置 | **目前不可執行** | 專案目前尚無 `report-build` 命令 |
 
-2026-08-19 的舊版 preflight 曾把 NWW `trial_ready`、OCM partial month 與已知缺時合計成
-188 項正式 blocker；此解釋已被 2026-08-20 available-data 決策取代。現有 OCM/NWW 即本
-研究可取得的完整 2024–2025 母體，供應者補件不是前置條件；NWW native 實測為 17,544 個
-連續逐時 UTC，OCM canonical 軸為 17,124 個 UTC、總缺 420 時次。後續 preflight 把前兩項
-記為 accepted provenance，把 OCM 缺口送入 reconstruction/gap-safe gate，不能再輸出「等待
-上游補資料」的建議。細節見[全部可得資料決策](10_available_data_time_reconstruction_and_a_expansion.md)
-與[更正後稽核](../archive/09_implementation_audit_2026-08-19.md)。每次 release 仍須重跑並保存
-machine-readable evidence；不得把密碼、private key 或 token 寫入 repository、設定、命令
-紀錄或報告。
+既有 B 區入口會依序完成儲存檢查、輸入檢查、建立或恢復工作目錄、執行分片、整理狀態及
+完整驗證。一般操作者不需要手動串接這些內部命令。
 
-## 2. 預定路徑變數
+## 2. 執行前先取得四個核准值
 
-```bash
-export LBT_PROJECT_ROOT=/home/mustlab/Workspace/Lagrangian-Ensemble-Backtracking
-export OCM_NATIVE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_native
-export OCM_SURFACE_ROOT=/data/OCM-Preprocessed-Data/preprocessed/ocm_surface
-export NWW_ANALYSIS_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_analysis
-export NWW_NATIVE_ROOT=/data/NWW-Preprocessed-Data/preprocessed/nww3_native/ww3_grd3_253x237
+向本次執行負責人取得下列資料；缺少任一項就停止，不要自行選路徑或版本。
 
-# SERVER deployment 值：project/code/venv 可在 /home；所有 execution package、成果、
-# scratch、checkpoint、logs、aggregate/report 與程式快取均在同一 NFS result root 的
-# 對應子目錄。八個子目錄必須先由 operator 建立並通過 scripts/validate_server_storage.py。
-export LBT_RESULT_NFS_ROOT=/data/LBT
-export LBT_EXECUTION_PACKAGE_ROOT=/data/LBT/execution-packages/<execution-package>
-export LBT_OUTPUT_ROOT=/data/LBT/outputs
-export LBT_SCRATCH_ROOT=/data/LBT/scratch
-export LBT_CHECKPOINT_ROOT=/data/LBT/checkpoints
-export LBT_UV_CACHE_ROOT=/data/LBT/cache/uv
-export LBT_MPL_CACHE_ROOT=/data/LBT/cache/matplotlib
-export LBT_XDG_CACHE_ROOT=/data/LBT/cache/xdg
-export LBT_TMP_ROOT=/data/LBT/tmp
+| 名稱 | 代表什麼 |
+|---|---|
+| `LBT_PROJECT_ROOT` | 本次真正要執行的 SERVER 程式目錄絕對路徑 |
+| `LBT_EXPECTED_GIT_COMMIT` | 已核准的 40 碼 Git 版本編號（commit） |
+| `LBT_EXECUTION_PACKAGE_ROOT` | 已部署完成的 B 區執行包（execution package）絕對路徑 |
+| `LBT_MIN_FREE_GB` | 本次核准的最低剩餘空間，單位 GiB，必須是正整數 |
 
-# tracked runner 會把這些 runtime 變數固定到已驗證 NFS root；UV_PROJECT_ENVIRONMENT
-# 固定使用 project root 下既有 .venv，避免 uv 安裝環境與研究成果混在一起。
-export UV_CACHE_DIR="$LBT_UV_CACHE_ROOT"
-export MPLCONFIGDIR="$LBT_MPL_CACHE_ROOT"
-export XDG_CACHE_HOME="$LBT_XDG_CACHE_ROOT"
-export TMPDIR="$LBT_TMP_ROOT"
-export UV_PROJECT_ENVIRONMENT="$LBT_PROJECT_ROOT/.venv"
-export PYTHONDONTWRITEBYTECODE=1
-export LBT_MIN_FREE_GB=<operator-approved-positive-integer>
-```
+執行包內必須已包含 `run_server_matrix.sh`、固定設定、12 組清單、輸入成果與校準成果。
+本手冊不負責建立或修改執行包。
 
-正式設定與程式碼只引用這些 task-specific 變數，不以 `/Users/...`、`$HOME` 或 raw data 絕對路徑硬編碼。
+## 3. 設定環境並核對版本
 
-## 3. G0 唯讀資料盤點
-
-### 3.1 路徑與月份
-
-在已認證的 SERVER shell 執行：
+在 SERVER shell 貼上以下區塊。只替換有 `<...>` 的四個值；若資料管理者另有核准的 OCM／NWW
+路徑，則以其書面提供值取代下列資料根目錄。
 
 ```bash
-for root_path in "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT"; do
-  test -d "$root_path" || { echo "MISSING $root_path"; continue; }
-  find "$root_path" -mindepth 3 -maxdepth 3 -type d -name '20????' | sort
-done
+export LBT_PROJECT_ROOT="<本次核准的SERVER程式目錄絕對路徑>"
+export LBT_EXPECTED_GIT_COMMIT="<本次核准的40碼Git版本編號>"
+export LBT_EXECUTION_PACKAGE_ROOT="<本次核准的B區執行包絕對路徑>"
+export LBT_MIN_FREE_GB="<本次核准的最低剩餘GiB>"
+
+export LBT_RESULT_NFS_ROOT="/data/LBT"
+export LBT_OUTPUT_ROOT="/data/LBT/outputs"
+export LBT_SCRATCH_ROOT="/data/LBT/scratch"
+export LBT_CHECKPOINT_ROOT="/data/LBT/checkpoints"
+export LBT_UV_CACHE_ROOT="/data/LBT/cache/uv"
+export LBT_MPL_CACHE_ROOT="/data/LBT/cache/matplotlib"
+export LBT_XDG_CACHE_ROOT="/data/LBT/cache/xdg"
+export LBT_TMP_ROOT="/data/LBT/tmp"
+
+export OCM_NATIVE_ROOT="/data/OCM-Preprocessed-Data/preprocessed/ocm_native"
+export OCM_SURFACE_ROOT="/data/OCM-Preprocessed-Data/preprocessed/ocm_surface"
+export NWW_ANALYSIS_ROOT="/data/NWW-Preprocessed-Data/preprocessed/nww3_analysis"
 ```
 
-預期不是只看「共 24 個」；必須依每個 `flow_domain_id` 分別列 202401-202512，並辨識完全缺月、partial month 與重複版本。
-
-### 3.2 metadata 與狀態
+接著核對程式目錄、版本與執行包：
 
 ```bash
-find "$OCM_NATIVE_ROOT" "$OCM_SURFACE_ROOT" "$NWW_ANALYSIS_ROOT" \
-  -path '*/months/20????/metadata.json' -print0 \
-  | xargs -0 jq -c '{path: input_filename, status, cache_kind, schema: (.cache_schema_version // .schema_version), month, flow_domain_id: (.flow_domain_id // .domain.domain_id), source_day_coverage}'
+test "$(git -C "$LBT_PROJECT_ROOT" rev-parse --show-toplevel)" = "$LBT_PROJECT_ROOT" && \
+test "$(git -C "$LBT_PROJECT_ROOT" rev-parse HEAD)" = "$LBT_EXPECTED_GIT_COMMIT" && \
+test -z "$(git -C "$LBT_PROJECT_ROOT" status --porcelain --untracked-files=all)" && \
+test -f "$LBT_EXECUTION_PACKAGE_ROOT/run_server_matrix.sh" && \
+echo "部署版本與執行包：PASS"
 ```
 
-此輸出需保存為 G0 evidence，但它還不能取代 `time_utc_ns.npy` 的逐值檢查。正式 `lbt-preflight` 會另外驗證：
+**成功判定：** 最後只出現 `部署版本與執行包：PASS`。
 
-- 設定恰有 A-D 四個 `analysis_region_id`／`flow_domain_id` 與五個唯一 `study_site_id`；貢寮、龜山島均對應 A 區，但情境與輸出不可合併。
-- 貢寮／龜山島以本期 policy 產生 12.5 km receptor core、20 km local domain，與固定 OCM ocean polygon 相交；兩個 local domains 重疊時須完整保留，不作 Voronoi 切割。圓周外海 arc 與岸線必須分段，只有前者可計入 local-entry KDE；本期不建立 A 的 35 km sensitivity，也不自行加入 15 km／23 km case。
-- 貢寮／龜山島引用同一 A 區 forcing-domain ID 與 outer-boundary geometry；每條軌跡只以 own local domain 產生主要 first-exit。foreign-local crossing 必須是非終止診斷事件，不得改變 `study_site_id`、scenario、seed 或主要入口分母。
-- 現行 A v3 bbox 南界 `24.600844°N` 是本期不南擴的正式準備範圍；`formal_domain_policy`
-  為 `v3_local20km_20260909_v1`，貢寮／龜山島各使用 12.5 km receptor core 與 20 km
-  local domain。OCM native、OCM surface、NWW analysis 必須共同證明 20 km local boundary
-  至 outer boundary 至少兩個共同有效格點；目前僅有 receptor native 篩選不構成此證據。
-- 月份內原始 UTC 可含重複或亂序；先 stable sort/prefer-last，再驗證 canonical UTC 嚴格
-  遞增與唯一，並保存來源月份/local index。
-- 實際 start/end、正常間距、缺口長度與跨月銜接。已知 gap 是 reconstruction inventory，
-  不是要求原始供應者補件的 blocker。
-- array shape/dtype 與 metadata 相符。
-- OCM native/surface pair 的空間相容，以及 NWW full-hour analysis 對 OCM observed 與
-  reconstructed UTC 的 superset 支撐；不得再要求 NWW 時間軸與舊 gappy OCM 軸逐值相等。
-- OCM 必要欄位與 NWW Hs/fp/DP/mask/QC 的存在及有限率。
+**沒有出現 PASS：** 立即停止。不要切換分支、清除工作樹、改寫執行包或改用另一個同名程式目錄；
+請執行負責人重新提供正確值。
 
-### 3.3 正式時間產品產製
+## 4. 先執行 PREPARE
 
-正式 batch 前依固定順序產製兩個不可變 manifest：
-
-1. 從 NWW native 24 個月份重採樣到每個正式 OCM 靜態格網，產生 17,544 個完整逐時
-   analysis slices；DP 在空間與時間均先轉成單位向量作圓形內插，再轉回角度。
-2. 對 OCM canonical 軸建立缺口遮罩，執行實際缺口形狀的 blocked cross-validation；通過
-   才產生 `observed/reconstructed_short/reconstructed_state_space` patch 與 posterior members。
-3. validation 未通過的長缺口不硬補；arrival selector 只選擇不跨缺口、且能支援該
-   horizon 的分層時窗。此 fallback 必須仍覆蓋兩年、四季、大小潮與三潮位相位 strata。
-4. preflight 驗證 manifest、checksum、方法版本、時間 origin 與 forcing member 完整後，
-   才將已知缺口視為可積分支撐；任何 runtime 臨時補值均禁止。
-
-此外，正式 LBT config 必須指向不可變的
-`receptor_arrival_initial_condition_manifest`。它不是由本 run 臨時從 OCM 讀取產生的檔案；
-上游完成產製後，LBT loader 只驗證每個 arrival UTC 的 `eta`、`bed`、`zcor`、濕元素與
-來源索引，並核對五站 5,000 個完整 pair coverage。`Receptor.z_m_positive_up` 仍只是
-模板候選值，不能取代 pair actual z；若 manifest 尚不存在，formal gate 應停止而不是猜測
-深度或以模板值補齊。
-
-A 區本期 G0 只盤點並衍生 v3 policy 所需的 accepted-product inventory、UTC／mask／schema
-與共同 margin evidence；不執行南向擴張，也不把 raw NetCDF 直接交給正式 LBT runtime。
-`inputs-build`／`inputs-validate` 可在 strict、fail-closed 條件下準備新 20 km geometry、
-receptor 與 arrival manifest，但在 OCM native、OCM surface、NWW analysis 三產品的實際
-共同 margin validator／producer 證據完成前，不得寫入 `approved` formal release。歷史
-`northeast_taiwan_common_cache_v4_lbt_south_expanded` 只保留為舊規劃識別，不是本期產製入口。
-
-### 3.4 容量與檔案系統
-
-```bash
-df -hT "$OCM_NATIVE_ROOT" "$NWW_ANALYSIS_ROOT" "$LBT_OUTPUT_ROOT" "$LBT_SCRATCH_ROOT"
-findmnt -T "$LBT_OUTPUT_ROOT"
-findmnt -T "$LBT_SCRATCH_ROOT"
-python3 scripts/validate_server_storage.py \
-  --project-root "$LBT_PROJECT_ROOT" \
-  --project-venv "$LBT_PROJECT_ROOT/.venv" \
-  --result-nfs-root "$LBT_RESULT_NFS_ROOT" \
-  --execution-package-root "$LBT_EXECUTION_PACKAGE_ROOT" \
-  --output-root "$LBT_OUTPUT_ROOT" \
-  --scratch-root "$LBT_SCRATCH_ROOT" \
-  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
-  --uv-cache-root "$LBT_UV_CACHE_ROOT" \
-  --mpl-cache-root "$LBT_MPL_CACHE_ROOT" \
-  --xdg-cache-root "$LBT_XDG_CACHE_ROOT" \
-  --tmp-root "$LBT_TMP_ROOT" \
-  --minimum-free-gib "$LBT_MIN_FREE_GB" \
-  --snapshot-output "$LBT_SCRATCH_ROOT/server-storage-gate-manual.json"
-```
-
-所有 output、active shard、checkpoint、logs 與 publisher staging 都必須留在上述同一個
-NFS result root；不能以本機 scratch 作為執行結果或 checkpoint fallback。完成 checksum
-後仍由單一 publisher 寫入 NFS 上的 `.incoming/<run_id>/`，最後原子改名；不得讓下游看到半套正式 run。
-
-## 4. 環境建立
+`PREPARE` 會建立本次檢查紀錄，但不會建立、啟動或恢復粒子運算。
 
 ```bash
 cd "$LBT_PROJECT_ROOT"
-export UV_CACHE_DIR="$LBT_UV_CACHE_ROOT"
-export UV_PROJECT_ENVIRONMENT="$LBT_PROJECT_ROOT/.venv"
-export MPLCONFIGDIR="$LBT_MPL_CACHE_ROOT"
-export XDG_CACHE_HOME="$LBT_XDG_CACHE_ROOT"
-export TMPDIR="$LBT_TMP_ROOT"
-export PYTHONDONTWRITEBYTECODE=1
-
-uv sync --frozen
-uv run pytest -q -p no:cacheprovider
+bash scripts/run_b_hsinchu_expanded_matrix.sh PREPARE
 ```
 
-實作時鎖定具體 Python patch 版本並保存於 run manifest。Numba、NumPy 與 SciPy 版本變更可能改變浮點/JIT 行為；正式 release 只使用 `uv.lock`，不在 batch 中臨時更新套件。
+**成功判定：** 命令退出狀態為 0，且最後出現：
 
-## 5. CLI 流程
-
-下列 validator、provenance、pilot 與 formal runtime CLI 均已接通。formal 命令可建立及
-執行 workspace，但只有正式 release config、approved manifests／products 與
-`preflight --formal-release` inventory 完整通過時才會開始；example config 仍刻意被 gate
-阻擋，不能當成 SERVER release 設定。
-
-### 5.0 Code provenance 與 run workspace validator
-
-在 SERVER 乾淨 checkout 或沒有 `.git` 的部署目錄，先保存不含絕對專案路徑的程式指紋。
-沒有 `.git` 時 pilot 可省略宣告 commit，來源固定為 `no_git_pilot`；formal 若沒有 Git
-則必須由 release record 提供 40 位小寫 commit，來源固定為 `declared_deployment`，且
-`git_dirty=None` 必須保留為「無法判定」而不能誤當成 clean。若有 Git，來源必須是
-`git_repository`，formal 只接受 `git_dirty=false`：
-
-```bash
-uv run lbt-code-provenance --project-root "$LBT_PROJECT_ROOT"
-uv run lbt-validate-run "$LBT_OUTPUT_ROOT/runs/<run_id>" \
-  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
-uv run lbt-benchmark-report "$LBT_OUTPUT_ROOT/runs/<run_id>" \
-  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
+```text
+PREPARE 完成：未建立、啟動或恢復任何 run workspace。
 ```
 
-`validate-run` 是純讀檢查；它會驗證 run plan/progress、immutable input file checksum、
-schema 2 ordering policy/group metadata、scenario/seed row order、128-bit seed 導出、shard range、checkpoint generation/latest
-與 COMPLETE trajectory shard 的完整 particle/scenario/member/site/region/receptor identity。
-若 checkpoint 使用 workspace 外路徑，兩個命令都必須傳入執行時相同的
-`--checkpoint-root`；此絕對路徑不寫入 JSON。缺失或落後的合法 latest、RUNNING orphan 及
-published-before-progress 會回報 recoverable 但 `valid=false`，只有 controller reconcile
-可更新現場。`benchmark-report` 只彙總已驗證 progress 的 wall time、
-process CPU、max RSS、particle steps、output/checkpoint bytes 與 forcing cache stats，並
-固定標記 `engineering_measurement_not_scientific_result=true`；pilot 的完成比例不得
-改寫五站 50,000 基礎情境契約。
+檢查內容包括：所有結果與快取都在 `/data/LBT` 的網路檔案系統（NFS）、目錄不是符號連結、
+空間足夠、可寫入、可安全完成改名、跨程序鎖可用、Git 版本正確，以及執行包／輸入／設定彼此相符。
 
-每個 schema 2 workspace 必須有固定且恰好完整的 `locks/`：`run_gate.lock`、
-`progress.lock` 與每一個 `<shard_id>.lock`；它們是預建零長度普通檔案，不列入四個
-immutable input checksum。worker 依 run gate shared → shard exclusive → progress exclusive
-取得 Unix `fcntl.flock`；不同 shard 可同時執行，同 shard contention 在 request factory 前
-失敗，reconcile 則需 run gate exclusive 且遇到 active worker 立即停止。NFS/NAS 的 flock
-語意必須在 SERVER preflight 實測。舊 schema 1 synthetic/pilot workspace 不支援 resume，
-必須以目前 ordering policy 重建，不能猜測或偷偷兼容舊 shard 順序。
+**任何檢查失敗：** 不要執行 `RUN`。保留完整終端輸出；若畫面是 JSON，查看其中的
+`issues` 或 `errors`，否則查看第一個失敗命令的錯誤訊息，再交由執行負責人處理。
 
-### 5.1 Preflight
+## 5. 在 tmux 中執行 RUN
+
+先建立 tmux session，避免 SSH 中斷時連帶終止運算：
 
 ```bash
-uv run lbt-preflight \
-  --config configs/lagrangian_backtracking.example.yaml \
-  --ocm-native-root "$OCM_NATIVE_ROOT" \
-  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --output "$LBT_SCRATCH_ROOT/preflight/input_inventory.json"
+tmux new-session -s lbt-b-pilot
 ```
 
-Preflight 必須唯讀，不建立 forcing 副本。輸出至少包含 path token、schema、月份、raw 與
-canonical time inventory、duplicate source choice、gap shapes、reconstruction/NWW-full-hour
-manifest、array bytes、coverage、unit/direction decision、CRS/mesh QC、domain role、own/foreign
-local-domain topology、各必要 forcing 的共同 margin、預估 working set 與輸出空間。
-`trial_ready`/partial month 依 available-data contract 記錄為 accepted info，不得再當成等待外部
-補件的錯誤。A 區 v3 可進入本期 strict preparation，但輸出仍須明示
-`formal_domain_policy=v3_local20km_20260909_v1` 與 margin evidence 狀態；config validator
-不得只因 metadata `status=ready` 或 receptor native 篩選成功，就允許正式 20 km local domain。
-
-runtime experiment case 由 `EXPERIMENT_CASE_SPECS` 唯一登錄五個值：
-`finite_depth_stokes` 是 formal baseline 候選，`no_stokes` 是常數擴散敏感度，
-`smagorinsky_cs_010`、`smagorinsky_cs_015`、`smagorinsky_cs_020` 是已接通但尚未升格
-為正式結果的 Smagorinsky 敏感度。Smagorinsky diffusion facade 只載入 OCM native
-current／mesh；三個案例的 velocity 仍含有限水深 Stokes，故 run-shard 仍必須提供
-NWW analysis root。example config 的 Smagorinsky floor/cap 為 `null`，在填入經核定的
-有限非負值且通過 floor/cap、well-mixed、PDE、收斂與 pilot gates 前會 fail-closed。
-
-### 5.2 OCM 真資料擴散／步長校準 evidence
-
-在 release config 與 input artifact 已通過唯讀 gate 後，SERVER 可建立 OCM-only pilot
-calibration evidence。命令必須明示 accepted OCM native root、input directory、config、
-project root 與新的 destination；不使用 raw NetCDF、transfer archive、NWW3 或環境中
-未登錄的資料路徑：
+進入 tmux 後，**重新貼上第 3 節的環境變數區塊**，再執行：
 
 ```bash
-uv run lbt pilot-calibrate \
-  --config "$PILOT_CONFIG" \
-  --input-directory "$LBT_INPUT_RELEASE" \
-  --ocm-native-root "$OCM_NATIVE_ROOT" \
-  --project-root "$LBT_PROJECT_ROOT" \
-  --destination "$LBT_SCRATCH_ROOT/pilot-calibration-ocm"
-
-uv run lbt pilot-calibrate-validate \
-  "$LBT_SCRATCH_ROOT/pilot-calibration-ocm" \
-  --config "$PILOT_CONFIG" \
-  --input-directory "$LBT_INPUT_RELEASE"
+cd "$LBT_PROJECT_ROOT"
+bash scripts/run_b_hsinchu_expanded_matrix.sh RUN
 ```
 
-建置器先驗證 release config、actual-z dynamic pair 與公尺制 geometry，才建立 hidden
-partial directory；成功時以 atomic rename 發布，既有 destination 或任何 partial failure
-均不會覆寫既有 evidence。每筆 pair 使用自己的 arrival UTC／`z_m_positive_up`，並以同一
-OCM-only forcing manager 取樣 current 與 Cs=0.10、0.15、0.20 的 P1 nodal Smagorinsky。
-`pair_samples.parquet` 的 QC 欄位非空，失敗物理值為 null；`calibration_report.json`
-保存 stable-hash 抽樣政策、per-site／month／domain QC、候選 quantiles、time-limit
-候選、input／code provenance 與 OCM cache resource counters；`manifest.json` 保存固定
-三檔 closure、大小、SHA-256 與 schema fingerprint。
+`RUN` 會再次執行全部前置檢查，因此不會只依賴稍早的 `PREPARE` 結果。每組試跑含 4 個平行分片；
+任一分片失敗時，腳本會保留日誌、失敗紀錄及先前已成功發布的續跑檔（checkpoint），並停止
+啟動後續組別。若錯誤發生在第一份續跑檔建立前，該分片可能沒有可恢復的續跑檔。
 
-其中唯一常數水平擴散候選 `constant_kh_m2ps` 固定取 Cs=0.15 有效 particle Kh 的
-q50；`constant_kz_m2ps` 取有效 OCM sampled Kz 的 q50，floor 固定為 0，cap 取 Cs=0.20
-raw current-triangle Kh 的 q99.5。builder 輸出的 calibration report schema `1.1.0`
-將 diffusion time-limit 分軸保存：`horizontal_diffusion` 使用
-`(0.25*horizontal_scale_m)²/(2*constant_kh_m2ps)`，`vertical_diffusion` 使用
-`(0.25*vertical_scale_m)²/(2*constant_kz_m2ps)`；尺度或對應 K 無效時只在該軸記為
-unlimited，不製造有限步長，也不使另一軸一併失效。這是由三軸 Brownian 方差分軸得到
-的契約，禁止以 `min(horizontal_scale_m, vertical_scale_m)` 與
-`max(constant_kh_m2ps, constant_kz_m2ps)` 交叉配對。validator／reader 依明示 schema
-版本保留既有 `1.0.0` 的 combined formula 相容驗證；legacy 不會被靜默套用 1.1.0 雙軸
-公式。
-
-validator 通過只表示 artifact topology、checksum、schema、QC、provenance consistency
-與報告可由 pair table 重算；它不表示 diffusion candidate 已通過 well-mixed、PDE barrier、
-時步／網格／系集收斂或正式 trajectory。完整設計只有在 100 receptors、250 arrivals、
-5,000 unique pair records 且未用每站少於 1,000 筆的 explicit limit 時標為 `complete`；
-explicit `--pair-limit-per-site < 1000` 一律標為 `partial_engineering_sample`。本機不執行真資料命令，該步驟
-由具權限的 SERVER 完成。
-
-### 5.2.1 Calibration-bound pilot execution config
-
-calibration evidence 通過 `pilot-calibrate-validate` 後，SERVER operator 可用下列命令
-建立 candidate-bound 的 pilot runtime 設定。所有 engineering scalar 必須由 operator
-明示；`--active-chunk-size none` 是有意義的 explicit value，不可省略。候選 Kh/Kz 與
-Smagorinsky floor/cap 不在命令列重複輸入，而由完整 schema `1.1.0` report 綁定。
+離開 tmux 但保持運算：按 `Ctrl-b`，放開後按 `d`。重新查看：
 
 ```bash
-uv run lbt pilot-config-create \
-  --source-config "$PILOT_SOURCE_RELEASE_CONFIG" \
-  --input-directory "$LBT_INPUT_RELEASE" \
-  --calibration "$LBT_SCRATCH_ROOT/pilot-calibration-ocm" \
-  --output "$LBT_SCRATCH_ROOT/pilot-execution.yaml" \
-  --dt-min-seconds 60 \
-  --dt-max-seconds 300 \
-  --output-interval-seconds 900 \
-  --max-backtrack-days 7 \
-  --maximum-step-count 2016 \
-  --members-per-scenario 4 \
-  --master-seed 123 \
-  --shard-scenario-count 100 \
-  --checkpoint-interval-sweeps 10 \
-  --active-chunk-size none \
-  --max-resident-forcing-months 2
-
-uv run lbt pilot-config-validate \
-  "$LBT_SCRATCH_ROOT/pilot-execution.yaml" \
-  --input-directory "$LBT_INPUT_RELEASE" \
-  --calibration "$LBT_SCRATCH_ROOT/pilot-calibration-ocm"
+tmux attach-session -t lbt-b-pilot
 ```
 
-建立器先以 source config 的 release/input binding 與 gap-safe horizon gate 驗證，再從
-calibration report 取得四個 finite non-negative candidate。target 以同一 parent 的 hidden
-YAML、file fsync 與 atomic rename 發布；既有 destination 不覆寫。target 搬到另一個 parent
-時，`ARTIFACT_FILENAMES` 所登錄的 component binding 與 config runtime references 會同步
-重建為新的相對路徑；根層 `pilot_execution_binding` schema `1.0.0` 只保存 source semantic
-config hash（由 calibration report 的 `input_binding.config_hash` 驗證）、input/calibration
-hash、候選值、套用欄位與 scalar snapshot，禁止保存 path。
+不要以「tmux 還在」或單一分片退出 0 判定全部完成。
 
-兩個命令成功只代表 calibration candidate 已封裝為 `config_status=generated`，狀態仍固定
-為 `candidate_pending_dt_and_member_convergence`。這不是 `approved`、`passed` 或正式
-scientific baseline；`pilot-config-create` 不啟動 runtime，`pilot-config-validate` 只讀取
-target、accepted input 與 calibration，invalid 以 exit code `2` 回傳。完成後才可依本節
-5.4 的代表性 pilot runbook 另行執行 convergence 與 trajectory gate。
+## 6. 判定完成、失敗與續跑
 
-### 5.3 合成端到端 smoke test
+### 6.1 完成判定
+
+B 區 12 組工程試跑必須同時符合三項：
+
+1. `RUN` 的 shell 退出狀態是 0。
+2. 最後出現 `矩陣結果：12 組均已 COMPLETE 或安全跳過。`。
+3. 本次 `summary.tsv` 的 12 列皆為 `COMPLETE` 或 `SKIPPED_COMPLETE`，且 validation 欄皆為 `valid`。
+
+列出最近一次摘要：
 
 ```bash
-uv run lbt synthetic-smoke \
-  --output "$LBT_SCRATCH_ROOT/trials/synthetic-constant-flow"
-uv run lbt validate-shard \
-  "$LBT_SCRATCH_ROOT/trials/synthetic-constant-flow"
+SUMMARY_PATH="$(find "$LBT_SCRATCH_ROOT/b-hsinchu-expanded-m2-h1/logs" \
+  -mindepth 2 -maxdepth 2 -name summary.tsv -print | sort | tail -n 1)"
+test -n "$SUMMARY_PATH" && column -t -s $'\t' "$SUMMARY_PATH"
 ```
 
-此命令不讀 SERVER forcing，只驗證 CLI、signed-time RK4、巢狀事件、ragged arrays、
-Parquet、manifest 與 checksum。metadata 固定標示 `synthetic_smoke_not_scientific_result`，
-不得作為 2024–2025 科學成果。接通實值單月 reference pilot 是 G3 下一切片。
+上述完成只代表 **B 區固定工程 pilot 的程式與資料完整性通過**，不是五站正式研究結果、
+科學驗證、收斂證明或來源機率。
 
-### 5.4 代表性 pilot
+### 6.2 失敗或 SSH 中斷
+
+先確認舊程序是否仍在執行：
 
 ```bash
+pgrep -af 'run_server_matrix.sh|lbt run-shard'
+```
+
+- 若仍有程序：回到原 tmux 查看，不要啟動第二份 `RUN`。
+- 若已無程序：保留 outputs、checkpoint、scratch 與 logs，不要刪除或手動改狀態。若原
+  `lbt-b-pilot` tmux session 仍存在，就重新連入該 session，不要再建立同名 session。
+- 重新取得同一份核准值，重做第 3、4 節，再依第 5 節回到原 tmux 或建立新的 tmux。既有 B 區
+  runner 會跳過已完整通過的分片；從未開始的 `PLANNED` 分片直接執行，`RUNNING`、`PAUSED`、
+  `FAILED` 分片才會以原設定、原續跑檔根目錄與 `--resume` 恢復。
+- 若再次失敗：將畫面錯誤及最近一次 `summary.tsv`、`total.log` 的路徑交給執行負責人；不要換 seed、
+  改 config 或從頭覆寫原 run。
+
+## 7. 進階：建立新的 pilot 執行入口
+
+本節只供執行包維護者使用。一般操作者執行既有 B 區試跑時不需要閱讀。
+
+新的 SERVER 工作目前沒有通用 tracked runner；必須先建立會呼叫
+`scripts/validate_server_storage.py` 的受追蹤入口，不能直接用下列命令繞過第 4 節的儲存檢查。
+維護者必須先準備：
+
+- 已生成且已驗證的 pilot config；不可使用含未決值的 example config。
+- 同一 config 產生的 preflight JSON；它不是 input artifact 目錄。
+- 新的 `RUN_ID`、NFS 輸出上層目錄，以及整個 run 固定不變的續跑檔根目錄。
+
+完成上述條件後，建立工作目錄：
+
+```bash
+export CONFIG="<已生成且已驗證的pilot config絕對路徑>"
+export INVENTORY="<同一config產生的preflight JSON絕對路徑>"
+export RUN_ID="<新的run ID>"
+export RUN_PARENT="$LBT_OUTPUT_ROOT/runs"
+export WORKSPACE="$RUN_PARENT/$RUN_ID"
+
 uv run lbt run-create \
-  --config configs/lagrangian_backtracking.example.yaml \
-  --input-inventory "$LBT_PROJECT_ROOT/work/input-inventory.json" \
-  --destination "$LBT_SCRATCH_ROOT/pilots" \
-  --run-id pilot-representative \
+  --config "$CONFIG" \
+  --input-inventory "$INVENTORY" \
+  --destination "$RUN_PARENT" \
+  --run-id "$RUN_ID" \
   --run-kind pilot \
-  --experiment-case no_stokes \
-  --pilot-scenarios-per-stratum 1
+  --experiment-case finite_depth_stokes \
+  --pilot-scenarios-per-stratum 1 \
+  --project-root "$LBT_PROJECT_ROOT"
+```
 
-uv run lbt run-shard "$LBT_SCRATCH_ROOT/pilots/pilot-representative" \
-  --config configs/lagrangian_backtracking.example.yaml \
-  --shard-id <shard-id> \
+成功時 stdout JSON 會有 `"valid": true`，但此時只建立 `PLANNED` 工作目錄，尚未完成運算。
+從計畫檔列出真正的分片 ID，不可自行編號：
+
+```bash
+jq -r '.shards[].shard_id' "$WORKSPACE/run_plan.json"
+```
+
+將列出的每個 ID 各放入一個 `--shard-id`，再依同一順序執行：
+
+```bash
+uv run lbt run-worker "$WORKSPACE" \
+  --config "$CONFIG" \
+  --shard-id "<第一個shard ID>" \
+  --shard-id "<第二個shard ID；其餘照樣增加>" \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --resume \
-  --sweep-budget 10
-
-uv run lbt run-reconcile "$LBT_OUTPUT_ROOT/pilots/pilot-representative" \
-  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
-uv run lbt validate-run "$LBT_OUTPUT_ROOT/pilots/pilot-representative" \
-  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
-uv run lbt benchmark-report "$LBT_OUTPUT_ROOT/pilots/pilot-representative" \
   --checkpoint-root "$LBT_CHECKPOINT_ROOT"
 ```
 
-`--pilot-scenarios-per-stratum 1` 只供工程 sanity／benchmark；selector 會由完整且已驗證的
-scenario/receptor manifests 依 `(study_site_id, receptor.vertical_id)` 重算，每層取一筆，
-目前完整五站×四垂向資料預期為 `5×4=20` 筆。20 不代表正式研究結果，也不改變每站 10,000、
-全案 50,000 的正式 coverage。run plan 的 selection binding 保存 source/selected count、
-order-independent ID hash 與 strata，static loader 在 `run-shard` 前會重算並比對；formal
-command 禁止此參數且永遠使用完整 50,000 情境。
-
-Pilot 報告需以五站點各固定 10,000、A 區 20,000、全案 50,000 個基礎 scenarios，外推各候選 `M` 與 experiment case 數的 particle-step、wall time、CPU、RAM、read bytes、trajectory bytes、event bytes、checkpoint bytes 與 NFS publish time；並比較 7/14/30/60 日 horizon 及貢寮／龜山島本期 12.5 km receptor core／20 km local domain。A 區 paired-UTC shards 應共用同一 staged forcing time window，報告須證明沒有為兩站各自重複跨 NFS 載入同一 OCM/NWW 月窗。benchmark 用於衍生最小收斂 `M`、horizon、shard、並行度與儲存策略，不得據此把任一站完整交叉改回 1,000 或把五站合併為 10,000。
-
-### 5.4 正式 batch（runtime／CLI 已接，release 證據仍須備妥）
-
-正式 run 只能使用 `status=approved` 的 config、behavior、local-domain、每站 20／全案 100 receptor templates、每站 50／全案 250 arrival-time、每站 1,000／全案 5,000 dynamic pair initial-condition records、每站 10,000／全案 50,000 情境 coverage 與 member-convergence manifests。每個 material 共用 pair actual z，不得以模板 z 取代；A 區貢寮與龜山島必須引用同一個 `northeast_taiwan_common_cache_v3` 與 `formal_domain_policy=v3_local20km_20260909_v1`，並通過 OCM native／OCM surface／NWW analysis 的 20 km 共同 forcing margin 證據；證據未完成時不得建立 approved formal release。舊 `formal_domain_policy=expanded_domain_v1` 只作相容讀取，B-D 的 `expanded_domain` sensitivity 另依各自 evidence gate。
-
-正式鏈路固定為 formal preflight、建立 workspace、逐 shard 執行／暫停／恢復、reconcile，
-最後要求完整驗證。第一次 `run-shard` 可用 sweep budget 在 checkpoint 邊界產生 `PAUSED`；
-後續必須使用 `--resume` 與同一 checkpoint root：
+若既有分片是 `RUNNING`、`PAUSED` 或 `FAILED`，同一命令才加 `--resume`；初次 `PLANNED` 不加。
+`run-worker` 遇到安全暫停也可能退出 0，因此最後仍須執行完整驗證：
 
 ```bash
-FORMAL_CONFIG="$LBT_PROJECT_ROOT/configs/releases/lagrangian_backtracking_2024_2025_v1.yaml"
-FORMAL_RUN_ROOT="$LBT_OUTPUT_ROOT/runs"
-FORMAL_RUN_ID="lbt-2024-2025-v1"
-FORMAL_INVENTORY="$LBT_SCRATCH_ROOT/preflight/formal-input-inventory.json"
-
-uv run lbt preflight \
-  --config "$FORMAL_CONFIG" \
-  --ocm-native-root "$OCM_NATIVE_ROOT" \
-  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --output "$FORMAL_INVENTORY" \
-  --formal-release
-
-uv run lbt run-create \
-  --config "$FORMAL_CONFIG" \
-  --input-inventory "$FORMAL_INVENTORY" \
-  --destination "$FORMAL_RUN_ROOT" \
-  --run-id "$FORMAL_RUN_ID" \
-  --run-kind formal \
-  --experiment-case finite_depth_stokes \
-  --project-root "$LBT_PROJECT_ROOT"
-
-uv run lbt run-shard "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
-  --config "$FORMAL_CONFIG" \
-  --shard-id <shard-id> \
-  --ocm-native-root "$OCM_NATIVE_ROOT" \
-  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
-  --sweep-budget 10
-
-uv run lbt run-shard "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
-  --config "$FORMAL_CONFIG" \
-  --shard-id <shard-id> \
-  --ocm-native-root "$OCM_NATIVE_ROOT" \
-  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
-  --resume
-
-uv run lbt run-reconcile "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
+uv run lbt run-reconcile "$WORKSPACE" \
   --checkpoint-root "$LBT_CHECKPOINT_ROOT"
-uv run lbt validate-run "$FORMAL_RUN_ROOT/$FORMAL_RUN_ID" \
+
+uv run lbt validate-run "$WORKSPACE" \
   --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
   --require-complete
+
+uv run lbt benchmark-report "$WORKSPACE" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
 ```
 
-formal inventory 不是布林旗標通行證：它必須逐 flow 完整涵蓋 config 年月與產品契約，NWW
-必須全期無缺，OCM 則只能是 `missing=0` 的完整／已重建產品，或由已核准 gap-safe manifest
-逐站點所屬 flow 證明每個 inclusive 回溯窗不碰缺口。任一 topology、計數、boundary gap、
-manifest binding 或時間支援矛盾都會在 forcing I/O 前拒絕。
+唯一完成判定是 `validate-run` 退出 0、`valid=true`、`summary.run_lifecycle=COMPLETE`，且
+`summary.completed_shard_count` 等於 `summary.shard_count`。`benchmark-report` 只提供工程量測；
+分片時間加總與分片記憶體最大值不能當成整台 SERVER 的平行效能。
 
-目前 repository 的 example config，以及 SERVER 實際 approved manifests、正式產品與核准
-參數尚未作為 release artifacts 提供，因此上述命令在這些證據到位前應 fail-closed。本文件
-只說明程式已可正式執行；本輪未登入 SERVER，也未宣稱已完成任何正式科學批次。
+## 8. 為什麼目前不能執行五站正式批次
 
-每一 shard 完成後執行 schema/checksum/QC；失敗 shard 保留 failure manifest，不用不同 seed 手動重跑。相同 run 續跑只允許處理尚未完成且 checkpoint 相容的 shard。
+現行 A 區政策保留 v3 forcing 範圍、貢寮與龜山島各 20 km local domain、各 12.5 km receptor
+core，且不納入 35 km sensitivity。但目前程式仍明確阻擋 v3／20 km 共同 forcing 邊界驗證，
+repository 也沒有可直接使用的正式 release config。因此不要把 example config 改名後執行 formal，
+也不要把 B 區 pilot 結果當成正式替代品。
 
-## 6. tmux 作業方式
+正式執行至少要先具備：已核准且可重建的輸入成果、正式設定、實際共同 forcing-margin 證據、
+完整情境與 seed 綁定、checkpoint／隨機數延續驗證、效能證據與科學驗證。缺一項就停止。
+完整輸入條件見[輸入衍生與發布契約](14_input_derivation_and_release_contract.md)，目前完成狀態見
+[實作狀態](../implementation_status.md)。
 
-```bash
-tmux new-session -s lbt-2024-2025
-cd "$LBT_PROJECT_ROOT"
-```
+## 9. 操作時不可跨越的界線
 
-進入 session 後設定第 2、4 節的變數並執行命令。離開但保持執行使用 `Ctrl-b d`，重新連線後：
-
-```bash
-tmux attach-session -t lbt-2024-2025
-```
-
-每 5-15 分鐘更新 machine-readable progress：completed/failed/pending shards、particle steps、wall time、ETA、read/write bytes、RSS、checkpoint age。不要只輸出無法稽核的 progress bar。
-
-## 7. Checkpoint 與恢復
-
-Checkpoint 至少綁定：
-
-- normalized config SHA-256。
-- OCM/NWW input inventory hash。
-- Git commit、dirty flag、lock hash、Python/NumPy/Numba 版本。
-- scenario range、particle/member IDs 與 seed table hash。
-- 最後完整 output time、particle state、triangle ID、status 與 RNG state/counter。
-- shard output row count、partial checksum 與 schema version。
-
-恢復時必須傳入原執行使用的 checkpoint root。run plan 只保存 `checkpoints` token，不保存
-SERVER 絕對路徑；progress 宣告 sequence/path 而該 root 找不到合法 generation 時，controller
-會在 request factory 與 forcing I/O 前停止，不能退回 seed 從頭重算。`RUNNING`、`PAUSED`、
-`FAILED` 均須明示 resume；`COMPLETE` 只重驗輸出。PLANNED 卻已有 generation，或 checkpoint
-tree 含 unknown、partial、symlink、checksum、binding、粒子順序錯誤，一律 fail-closed 且不
-刪除現場。
-
-每次從上一個合法 checkpoint 恢復後，最多前進 plan 指定的 interval sweeps；若尚未 terminal
-便先發布新 generation/latest，再立即原子更新 RUNNING progress，budget pause 才轉 PAUSED。
-因此 off-boundary pause 不會漏掉後續 periodic checkpoint。KeyboardInterrupt 盡力建立
-checkpoint、累計 checkpoint bytes；只有 batch 已建構且可序列化、checkpoint generation
-成功發布時才標 PAUSED，不建立 failure artifact。若 request factory／ProductionBatch
-建構尚未完成，或 checkpoint 發布失敗，則保留 RUNNING，不建立虛假的可恢復 checkpoint；
-operator 必須以 resume=True 重試，並由合法 generation 恢復，或在沒有 generation 時重新
-建構。一般 Exception 才建立不含絕對路徑與 secret 的 immutable failure JSON。恢復前仍須重新執行相容性檢查；
-任一關鍵 hash 不符即拒絕舊 checkpoint，不得混用不同 input、method、geometry 或 seed policy。
-
-run plan schema `2.1.0` 的情境列順序固定為
-`analysis_region_arrival_utc_site_material_receptor_scenario_v1`，並先以
-`analysis_region_id`／到達 UTC 奈秒分 execution group；group 小於 shard 上限也不能與下
-一組合併。2.1 plan 另保存 full 或 pilot stratified selection binding；2.0 plan 沒有此欄位
-時按 full 唯讀相容。這是 I/O locality 與可恢復邊界，不是物理排序假設。one-process-per-shard 由
-`lbt run-shard` 依 immutable plan 的 pilot／formal 模式呼叫同一套 CPU/NumPy request
-factory；formal 會先重驗 config、manifest bindings 與 strict inventory，不能由 plan 標籤
-繞過 release gate，也不會以最近值、零值或其他 forcing fallback 繼續。
-
-## 8. 驗證與發布
-
-每個 run 依序完成：
-
-1. `lbt-validate-run`：schema、ID、time、status、event、row count、checksum、NaN/QC、scenario coverage。
-2. `lbt-aggregate`：raw counts、有效分母、KDE/HDR、sensitivity、foreign-local crossing 與 paired-UTC cross-site overlap，不修改 trajectory shards；跨站比例按原站有效 members 正規化。
-3. `lbt-validate-aggregate`：質量、邊界弧長、raster sum、bandwidth、bootstrap、failure density。
-4. 第二次 publish dry-run，確認 source/destination 清單一致。
-5. 傳至 `.incoming/<run_id>`，在遠端重驗 manifest/checksum後原子發布。
-6. 寫 `release_manifest.json` 與上游／下游 impact map。
-
-本機 scratch 不自動刪除。只有在正式發布、備份與 checksum 均由使用者確認後，才依明確 `run_id` 另行執行可復原的清理流程。
-
-## 9. 故障分類
-
-| 類型 | 處理 |
+| 發現 | 處理方式 |
 |---|---|
-| authentication/path | 不反覆猜密碼；由資料管理者提供已認證環境或 inventory |
-| input schema/time | manifest 外 schema/checksum/UTC 改變時停止受影響 domain/month；已知缺口則回到 reconstruction 或 gap-safe selector，不要求供應者補資料，也不在 runtime 臨時外插 |
-| disk quota | 停止啟動新 shard，保留完整 checkpoint；調整 output/scratch 後續跑 |
-| NFS I/O wait | active write 與 scratch 均留在 `/data/LBT` 嚴格子目錄，採單一 publisher、節流或降低並行；不得移至 `/home` 或其他未納入結果契約的 scratch |
-| numerical failure | 保存 particle/scenario/step/forcing/event 診斷，以相同 seed 最小化重現 |
-| code/config change | 新 run ID；舊 checkpoint 不相容，不在原 run 上覆寫 |
+| 任一結果、續跑檔、暫存、日誌或快取要寫到 `/home` | 停止；所有執行資料都必須在 `/data/LBT` |
+| 實際程式目錄、Git 版本或未提交變更狀態與核准值不同 | 停止；不得自動切換或清理 |
+| 儲存檢查、PREPARE 或完整驗證未通過 | 停止；不得跳過或把警告視為完成 |
+| 已有同一矩陣程序或鎖定檔 | 回到原程序，不啟動第二份 |
+| 執行中斷或失敗 | 保留續跑檔與日誌，以同一設定明示恢復 |
+| 想刪除舊資料 | 先另做程序、執行包、續跑檔與發布證據盤點；本手冊不授權刪除 |
+
+需要查個別命令參數時看 [CLI 參考](cli_reference.md)；需要部署新 Git 版本或同步資料時看
+[Git 部署與資料同步手冊](git_deployment_and_data_sync.md)。

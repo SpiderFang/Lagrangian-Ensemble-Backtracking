@@ -142,16 +142,13 @@ PILOT_EXPLICIT_MAX_BACKTRACK_DAYS = 1.0
 PILOT_EXPLICIT_TIDE_CLASS = "pilot_explicit_window"
 PILOT_EXPLICIT_PHASE_OR_EVENT = "explicit_24h_window"
 PILOT_ARRIVAL_SELECTION_METHOD_ID = (
-    "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_"
-    "explicit_pilot_window_v1"
+    "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_explicit_pilot_window_v1"
 )
 
 # C 區紅框候選是研究者明示的兩個近岸子區，不得再退回舊版 12.5 km 圓形核心。
 # policy 只描述選點契約；實際 EPSG:4326 座標由 pilot config 的
 # ``receptor_candidate_regions`` 保存，並在 input derivation 時重新投影及驗證。
-RED_FRAME_CANDIDATE_POLICY_ID = (
-    "houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1"
-)
+RED_FRAME_CANDIDATE_POLICY_ID = "houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1"
 RED_FRAME_CANDIDATE_CONFIG_KEY = "receptor_candidate_regions"
 RED_FRAME_SELECTION_CONFIG_KEY = "receptor_candidate_selection"
 
@@ -679,9 +676,7 @@ def _parse_explicit_pilot_arrivals(
             raise InputDerivationError("pilot_arrival_utc 必須落在 exact-hour UTC")
         canonical = parsed.isoformat().replace("+00:00", "Z")
         if canonical != raw:
-            raise InputDerivationError(
-                "pilot_arrival_utc 必須使用固定 ISO8601 格式 2024-01-02T01:00:00Z"
-            )
+            raise InputDerivationError("pilot_arrival_utc 必須使用固定 ISO8601 格式 2024-01-02T01:00:00Z")
         if raw != PILOT_EXPLICIT_ARRIVAL_UTC:
             raise InputDerivationError(
                 f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} 只登錄 {PILOT_EXPLICIT_ARRIVAL_UTC}"
@@ -1159,9 +1154,7 @@ def _build_face_vertical_support(
         below = valid_layers[valid_layers <= target.z_m_positive_up]
         above = valid_layers[valid_layers >= target.z_m_positive_up]
         if below.size == 0 or above.size == 0:
-            raise InputDerivationError(
-                f"OCM face vertical_id={target.vertical_id} 沒有代表性雙側 zcor 支撐"
-            )
+            raise InputDerivationError(f"OCM face vertical_id={target.vertical_id} 沒有代表性雙側 zcor 支撐")
         lower = float(below[-1])
         upper = float(above[0])
         if upper <= lower:
@@ -1624,8 +1617,7 @@ def _authoritative_flow_domain_bbox_lon_lat(
             or actual_flow_domain_id != NORTHEAST_V3_FLOW_DOMAIN_ID
         ):
             raise InputDerivationError(
-                "v3_local20km_20260909_v1 僅接受 A 區 exact northeast_taiwan_common_cache_v3 "
-                "及固定 v3 bbox"
+                "v3_local20km_20260909_v1 僅接受 A 區 exact northeast_taiwan_common_cache_v3 及固定 v3 bbox"
             )
         return tuple(float(value) for value in domain.bbox_lon_lat)
     if domain.formal_domain_policy != FORMAL_DOMAIN_POLICY_EXPANDED_V1:
@@ -2014,9 +2006,7 @@ def _load_nww_runtime_cache(product: _ProductData) -> _NWWRuntimeCache:
     ):
         raise InputDerivationError("NWW runtime lon/lat 軸必須是有限且嚴格遞增的一維座標")
 
-    static_mask_values = np.asarray(
-        _load_npy(product.grid_dir / "mask_static.npy"), dtype=np.float64
-    )
+    static_mask_values = np.asarray(_load_npy(product.grid_dir / "mask_static.npy"), dtype=np.float64)
     expected_grid_shape = (lat_axis.size, lon_axis.size)
     if static_mask_values.shape != expected_grid_shape:
         raise InputDerivationError("NWW mask_static shape 必須是 (lat,lon) 且與 runtime grid 相符")
@@ -2036,9 +2026,7 @@ def _load_nww_runtime_cache(product: _ProductData) -> _NWWRuntimeCache:
         if any(tuple(array.shape) != expected_array_shape for array in arrays):
             raise InputDerivationError(f"NWW3 {source_month.label} runtime array shape 不符")
         if np.any(np.mod(source_month.time_ns, _UTC_HOUR_NS) != 0):
-            raise InputDerivationError(
-                f"NWW3 {source_month.label} time_utc_ns 必須是 exact-hour UTC"
-            )
+            raise InputDerivationError(f"NWW3 {source_month.label} time_utc_ns 必須是 exact-hour UTC")
         months.append(
             _NWWRuntimeMonth(
                 source=source_month,
@@ -2304,16 +2292,12 @@ def _nww_exact_hour_sample_rows(
     hs_values = np.asarray(
         month.significant_wave_height[row_grid, corner_y_grid, corner_x_grid], dtype=np.float64
     )
-    fp_values = np.asarray(
-        month.peak_frequency[row_grid, corner_y_grid, corner_x_grid], dtype=np.float64
-    )
+    fp_values = np.asarray(month.peak_frequency[row_grid, corner_y_grid, corner_x_grid], dtype=np.float64)
     direction_values = np.asarray(
         month.peak_direction_raw_deg[row_grid, corner_y_grid, corner_x_grid], dtype=np.float64
     )
     dynamic_valid = np.all(
-        np.asarray(
-            month.valid_mask_wave[row_grid, corner_y_grid, corner_x_grid], dtype=bool
-        ),
+        np.asarray(month.valid_mask_wave[row_grid, corner_y_grid, corner_x_grid], dtype=bool),
         axis=1,
     )
     directions = np.deg2rad(direction_values)
@@ -2389,8 +2373,7 @@ def _nww_exact_hour_samples(
             requested_array = np.asarray(requested_values, dtype=np.int64)
             positions = np.searchsorted(month.source.time_ns, requested_array, side="left")
             exact = (positions < month.source.time_ns.size) & (
-                month.source.time_ns[np.minimum(positions, month.source.time_ns.size - 1)]
-                == requested_array
+                month.source.time_ns[np.minimum(positions, month.source.time_ns.size - 1)] == requested_array
             )
             output_indices = np.flatnonzero(exact)
             row_indices = positions[output_indices].astype(np.int64, copy=False)
@@ -2403,9 +2386,7 @@ def _nww_exact_hour_samples(
                 spatial_weights=spatial_weights,
                 static_valid=static_valid,
             )
-        for time_ns, value, available in zip(
-            sampled_times, sampled_values, sampled_valid, strict=True
-        ):
+        for time_ns, value, available in zip(sampled_times, sampled_values, sampled_valid, strict=True):
             time_key = int(time_ns)
             result[time_key] = float(value) if bool(available) else float("nan")
             valid_result[time_key] = bool(available)
@@ -2466,9 +2447,7 @@ def _surface_series_for_location(
     support_coordinates = np.unravel_index(
         np.asarray(spatial_indices, dtype=np.intp), spatial_shape, order="C"
     )
-    nearest_coordinates = np.unravel_index(
-        np.asarray(flat_index, dtype=np.intp), spatial_shape, order="C"
-    )
+    nearest_coordinates = np.unravel_index(np.asarray(flat_index, dtype=np.intp), spatial_shape, order="C")
     elevation: dict[int, float] = {}
     speed: dict[int, float] = {}
     for month in product.months:
@@ -2488,21 +2467,11 @@ def _surface_series_for_location(
             # 先以多維座標擷取（gather）必要格點，再轉成計算所需資料型別。這種以座標
             # 陣列取值的索引結果最多只有四個值，故不會把整個逐時網格轉成 float64；
             # 直接座標索引也能正確處理欄優先順序或非連續的逐時網格檢視。
-            u_support = np.asarray(
-                u_surface[local][support_coordinates], dtype=np.float64
-            )
-            v_support = np.asarray(
-                v_surface[local][support_coordinates], dtype=np.float64
-            )
-            surface_z_support = np.asarray(
-                surface_z[local][support_coordinates], dtype=np.float64
-            )
-            eta_support = np.asarray(
-                eta[local][support_coordinates], dtype=np.float64
-            )
-            valid_support = np.asarray(
-                valid_surface[local][support_coordinates], dtype=bool
-            )
+            u_support = np.asarray(u_surface[local][support_coordinates], dtype=np.float64)
+            v_support = np.asarray(v_surface[local][support_coordinates], dtype=np.float64)
+            surface_z_support = np.asarray(surface_z[local][support_coordinates], dtype=np.float64)
+            eta_support = np.asarray(eta[local][support_coordinates], dtype=np.float64)
+            valid_support = np.asarray(valid_surface[local][support_coordinates], dtype=bool)
             available = static_valid and bool(np.all(valid_support))
             if available:
                 support_values = np.concatenate(
@@ -2518,15 +2487,9 @@ def _surface_series_for_location(
                 # 最近格點單一值必須沿用既有 flat_index，而不是把四角值做雙線性
                 # 平均；只把這一個 scalar 轉成 float64，保持 arrival selector 的既有
                 # 最近點語意與速度模長數值。
-                u_nearest = np.asarray(
-                    u_surface[local][nearest_coordinates], dtype=np.float64
-                )
-                v_nearest = np.asarray(
-                    v_surface[local][nearest_coordinates], dtype=np.float64
-                )
-                eta_nearest = np.asarray(
-                    eta[local][nearest_coordinates], dtype=np.float64
-                )
+                u_nearest = np.asarray(u_surface[local][nearest_coordinates], dtype=np.float64)
+                v_nearest = np.asarray(v_surface[local][nearest_coordinates], dtype=np.float64)
+                eta_nearest = np.asarray(eta[local][nearest_coordinates], dtype=np.float64)
                 elevation[int(time_ns)] = float(eta_nearest)
                 speed[int(time_ns)] = float(np.hypot(u_nearest, v_nearest))
             else:
@@ -2839,9 +2802,7 @@ def _nww_metric_location_binding(
         lat=float(lat),
         anchor_distance_m=anchor_distance_m,
         representative_grid_scale_m=float(representative_grid_scale_m),
-        maximum_snap_distance_m=(
-            NWW_METRIC_LOCATION_MAX_GRID_SCALES * float(representative_grid_scale_m)
-        ),
+        maximum_snap_distance_m=(NWW_METRIC_LOCATION_MAX_GRID_SCALES * float(representative_grid_scale_m)),
         cell_x0=x0,
         cell_x1=x1,
         cell_y0=y0,
@@ -2932,8 +2893,7 @@ def _validate_explicit_pilot_arrival_support(
         speed = float(context.speed.get(time_key, float("nan")))
         if not np.isfinite(elevation) or not np.isfinite(speed):
             raise InputDerivationError(
-                f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} OCM surface exact UTC 支援失敗："
-                f"{_utc_string(time_key)}"
+                f"{PILOT_EXPLICIT_WINDOW_POLICY_ID} OCM surface exact UTC 支援失敗：{_utc_string(time_key)}"
             )
 
     # 重新以選定 metric location 的四角資料取樣 25 個 UTC；這個旗標同時包含
@@ -3119,10 +3079,7 @@ def _pilot_selection_summary(arrivals: Sequence[ArrivalTime]) -> dict[str, Any] 
             "explicit_pilot_window_start_utc",
             "explicit_pilot_window_end_utc",
         )
-        if any(
-            not isinstance(metadata.get(key), str) or not str(metadata[key]).strip()
-            for key in required
-        ):
+        if any(not isinstance(metadata.get(key), str) or not str(metadata[key]).strip() for key in required):
             raise InputDerivationError("pilot explicit arrival metadata 缺少原／替換 identity 或視窗")
         if _utc_string(item.time_utc_ns) != PILOT_EXPLICIT_ARRIVAL_UTC:
             raise InputDerivationError("pilot explicit arrival UTC 不符合 registry 固定時次")
@@ -3370,8 +3327,7 @@ def _clone_paired_a_arrivals(
         ]
         if unsupported_shared:
             raise InputDerivationError(
-                "A 區 paired UTC 的 guishan OCM/NWW/gap-safe 支援失敗："
-                f"utc={unsupported_shared[0]}"
+                f"A 區 paired UTC 的 guishan OCM/NWW/gap-safe 支援失敗：utc={unsupported_shared[0]}"
             )
 
     cloned: list[ArrivalTime] = []
@@ -3480,8 +3436,7 @@ def _receptor_candidate_polygon_metric(
         return candidate_metric
     if anchor_lonlat is None or radius_m is None:
         raise InputDerivationError(
-            f"{site.study_site_id} 的 receptor core 必須同時明示 anchor_lonlat 與 "
-            "receptor_core_radius_m"
+            f"{site.study_site_id} 的 receptor core 必須同時明示 anchor_lonlat 與 receptor_core_radius_m"
         )
     radius_value = float(radius_m)
     if not math.isfinite(radius_value) or radius_value <= 0.0:
@@ -3806,9 +3761,7 @@ def _receptor_payload(
                     raise InputDerivationError(
                         f"{site_id}/{spec.region_id} 紅框子區垂向支撐重選超過有限迭代次數"
                     )
-                anchor_lon, anchor_lat = projection.unproject(
-                    float(region_anchor.x), float(region_anchor.y)
-                )
+                anchor_lon, anchor_lat = projection.unproject(float(region_anchor.x), float(region_anchor.y))
                 for horizontal_item in selected_scope:
                     face_index = int(horizontal_item.source_face_local_index)
                     if face_index in used_faces:
@@ -3835,8 +3788,7 @@ def _receptor_payload(
                         int(item.source_face_global_index) for item in selected_scope
                     ],
                     "selected_positions_lonlat": [
-                        {"lon": float(item.lon), "lat": float(item.lat)}
-                        for item in selected_scope
+                        {"lon": float(item.lon), "lat": float(item.lat)} for item in selected_scope
                     ],
                     "anchor_lonlat": [float(anchor_lon), float(anchor_lat)],
                     "anchor_xy_m": [float(region_anchor.x), float(region_anchor.y)],
@@ -3943,11 +3895,9 @@ def _receptor_payload(
     if len(receptors) != EXPECTED_RECEPTOR_COUNT:
         raise InputDerivationError(f"receptor 應有 100 筆，實際 {len(receptors)}")
     receptor_method_id = (
-        "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
-        "red_frame_regions_v1"
+        "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_red_frame_regions_v1"
         if candidate_region_selection_by_site
-        else "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_"
-        "core_intersection_v3"
+        else "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_core_intersection_v3"
     )
     provenance = _provenance(
         method_id=receptor_method_id,
@@ -4187,9 +4137,7 @@ def _arrival_payload(
     """
 
     method_id = (
-        PILOT_ARRIVAL_SELECTION_METHOD_ID
-        if pilot_selection is not None
-        else ARRIVAL_SELECTION_METHOD_ID
+        PILOT_ARRIVAL_SELECTION_METHOD_ID if pilot_selection is not None else ARRIVAL_SELECTION_METHOD_ID
     )
     provenance_extra: dict[str, Any] = {
         "counts": {"study_sites": EXPECTED_STUDY_SITE_COUNT, "arrivals": len(arrivals)},
@@ -4553,8 +4501,7 @@ def _forcing_inventory_payload(
     }
     if has_v3_policy:
         provenance_extra["formal_domain_policy_by_region"] = {
-            region: domain_by_region[region].formal_domain_policy
-            for region in sorted(domain_by_region)
+            region: domain_by_region[region].formal_domain_policy for region in sorted(domain_by_region)
         }
     return {
         "manifest_kind": "forcing_inventory",
@@ -4846,11 +4793,15 @@ def build_input_derivatives(
     months = _months_for_config(config)
     if formal and [int(year) for year in config.inputs.years] != [2024, 2025]:
         raise InputDerivationError("formal input build 的 years 必須 exact 為 [2024, 2025]")
-    if formal and not horizon_settings.is_generic and not math.isclose(
-        float(config.boundaries.max_backtrack_days or 0.0),
-        float(DEFAULT_MAX_BACKTRACK_DAYS),
-        rel_tol=0.0,
-        abs_tol=1e-12,
+    if (
+        formal
+        and not horizon_settings.is_generic
+        and not math.isclose(
+            float(config.boundaries.max_backtrack_days or 0.0),
+            float(DEFAULT_MAX_BACKTRACK_DAYS),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     ):
         raise InputDerivationError("formal input build 的 gap-safe horizon 必須是 7 日")
     if (
@@ -4917,8 +4868,7 @@ def build_input_derivatives(
     # location selector 與 receptor face support gate 共用。同一 analysis region 只保留
     # 一份座標軸、static mask 與月份 memory-map，避免兩條流程各自重開 24 個月份檔案。
     nww_runtime_caches = {
-        region: _load_nww_runtime_cache(nww_by_region[region])
-        for region in sorted(nww_by_region)
+        region: _load_nww_runtime_cache(nww_by_region[region]) for region in sorted(nww_by_region)
     }
     # preflight 是既有低記憶體 schema/month gate；它的 finding 與本模組 fingerprint
     # 一起保存，避免只看 derived scalar 而忽略 source metadata。只呼叫一次，避免四個
@@ -5037,11 +4987,7 @@ def build_input_derivatives(
     if "gongliao" in arrivals_by_site and "guishan" in arrivals_by_site:
         guishan_context = arrival_contexts["guishan"]
         guishan_product = ocm_by_region[
-            next(
-                site.analysis_region_id
-                for site in config.study_sites
-                if site.study_site_id == "guishan"
-            )
+            next(site.analysis_region_id for site in config.study_sites if site.study_site_id == "guishan")
         ]
         arrivals_by_site["guishan"] = _clone_paired_a_arrivals(
             source_arrivals=arrivals_by_site["gongliao"],
@@ -5056,9 +5002,7 @@ def build_input_derivatives(
             # paired clone 完成後，兩站都以自己的 baseline arrival identity 建立固定
             # pilot replacement；OCM／NWW support 仍各自重新驗證，不能只複製另一站結果。
             for pilot_site_id in ("gongliao", "guishan"):
-                pilot_site = next(
-                    item for item in config.study_sites if item.study_site_id == pilot_site_id
-                )
+                pilot_site = next(item for item in config.study_sites if item.study_site_id == pilot_site_id)
                 pilot_region = pilot_site.analysis_region_id
                 pilot_surface = products_by_region[pilot_region][1]
                 arrivals_by_site[pilot_site_id] = _replace_with_explicit_pilot_arrival(
@@ -5084,8 +5028,7 @@ def build_input_derivatives(
         if not isinstance(pilot_arrival_ids, list):
             pilot_arrival_ids = [pilot_selection["arrival_time_id"]]
         pilot_horizon_overrides = {
-            str(arrival_id): PILOT_EXPLICIT_MAX_BACKTRACK_DAYS
-            for arrival_id in pilot_arrival_ids
+            str(arrival_id): PILOT_EXPLICIT_MAX_BACKTRACK_DAYS for arrival_id in pilot_arrival_ids
         }
     receptor_payload, receptor_index, receptor_objects, meshes, projections = _receptor_payload(
         config=config,
@@ -5152,9 +5095,7 @@ def build_input_derivatives(
             domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
             for domain in config.domains
         ):
-            raise InputDerivationError(
-                "formal input build 未通過：v3/20km共同forcing邊界支援尚待實際驗證"
-            )
+            raise InputDerivationError("formal input build 未通過：v3/20km共同forcing邊界支援尚待實際驗證")
         formal_blockers = [
             f"{kind}_not_approved"
             for kind, payload in (
@@ -5443,9 +5384,7 @@ def _validate_canonical_axis_bindings(
     if not isinstance(products, list) or not isinstance(expected_period, Mapping):
         return ["canonical_axis_rebuild_inventory_period_invalid"]
     try:
-        period_start = datetime.fromisoformat(
-            str(expected_period["start_utc"]).replace("Z", "+00:00")
-        )
+        period_start = datetime.fromisoformat(str(expected_period["start_utc"]).replace("Z", "+00:00"))
         period_end = datetime.fromisoformat(str(expected_period["end_utc"]).replace("Z", "+00:00"))
         if period_start.utcoffset() != timedelta(0) or period_end.utcoffset() != timedelta(0):
             raise ValueError("expected period 必須是 UTC")
@@ -5579,7 +5518,9 @@ def _validate_canonical_axis_bindings(
                     errors.append(f"canonical_axis_rebuild_month_summary_mismatch:{product_name}:{label}")
                 chunks.append(TimeChunk(label, np.asarray(values)))
             except Exception as exc:
-                errors.append(f"canonical_axis_rebuild_time_unreadable:{product_name}:{path}:{type(exc).__name__}")
+                errors.append(
+                    f"canonical_axis_rebuild_time_unreadable:{product_name}:{path}:{type(exc).__name__}"
+                )
                 invalid_product = True
         if invalid_product or not chunks:
             continue
@@ -5591,9 +5532,7 @@ def _validate_canonical_axis_bindings(
                 policy=policy,  # type: ignore[arg-type]
                 expected_timestep_hours=expected_timestep,
             )
-            actual_hash = sha256(
-                np.asarray(axis.time_utc_ns, dtype="<i8").tobytes()
-            ).hexdigest()
+            actual_hash = sha256(np.asarray(axis.time_utc_ns, dtype="<i8").tobytes()).hexdigest()
             actual_gaps = [
                 {
                     "before_utc": _utc_string(item.before_utc_ns),
@@ -5603,9 +5542,7 @@ def _validate_canonical_axis_bindings(
                 }
                 for item in axis.gaps
             ]
-            period_mask = (axis.time_utc_ns >= expected_start_ns) & (
-                axis.time_utc_ns <= expected_end_ns
-            )
+            period_mask = (axis.time_utc_ns >= expected_start_ns) & (axis.time_utc_ns <= expected_end_ns)
             available_period_count = int(np.count_nonzero(period_mask))
             expected_summary = {
                 "policy": axis.policy,
@@ -5728,8 +5665,10 @@ def validate_input_derivatives(
         )
     )
     if (
-        horizon_settings is not None and horizon_settings.is_generic
-    ) or gap.get("policy") == GENERIC_HORIZON_POLICY_ID or generic_gap_marked:
+        (horizon_settings is not None and horizon_settings.is_generic)
+        or gap.get("policy") == GENERIC_HORIZON_POLICY_ID
+        or generic_gap_marked
+    ):
         generic_result = validate_generic_gap_payload(
             gap,
             arrival,
@@ -5791,10 +5730,7 @@ def validate_input_derivatives(
             # 重新建立版本化契約，不可沿用 2024–2025 的 17,544 小時聲明。
             if [int(year) for year in config.inputs.years] != [2024, 2025]:
                 errors.append("formal_years_must_be_2024_2025")
-            if (
-                horizon_settings is None
-                or not horizon_settings.is_generic
-            ) and not math.isclose(
+            if (horizon_settings is None or not horizon_settings.is_generic) and not math.isclose(
                 float(config.boundaries.max_backtrack_days or 0.0),
                 float(DEFAULT_MAX_BACKTRACK_DAYS),
                 rel_tol=0.0,
@@ -5891,13 +5827,17 @@ def validate_input_derivatives(
     # 這裡在既有 formal loader 之外再保存一個可搜尋的明確錯誤。非正式 validator 則
     # 檢查 25-node、1 日 gap record 與 arrival metadata 是否彼此一致，避免只因 count
     # 正確就把缺少中間支援的 pilot artifact 當成可用。
-    pilot_rows = [
-        row
-        for row in arrival_rows
-        if isinstance(row, Mapping)
-        and isinstance(row.get("metadata"), Mapping)
-        and row["metadata"].get("pilot_replacement_policy_id") in _PILOT_EXPLICIT_POLICY_IDS
-    ] if isinstance(arrival_rows, list) else []
+    pilot_rows = (
+        [
+            row
+            for row in arrival_rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("metadata"), Mapping)
+            and row["metadata"].get("pilot_replacement_policy_id") in _PILOT_EXPLICIT_POLICY_IDS
+        ]
+        if isinstance(arrival_rows, list)
+        else []
+    )
     if pilot_rows:
         if formal:
             errors.append("formal_pilot_explicit_window_not_48_plus_2")
@@ -5949,8 +5889,7 @@ def validate_input_derivatives(
                     expected_time_valid = False
                     with suppress(TypeError, ValueError, OverflowError):
                         expected_time_valid = (
-                            _utc_string(int(pilot_row.get("time_utc_ns")))
-                            == PILOT_EXPLICIT_ARRIVAL_UTC
+                            _utc_string(int(pilot_row.get("time_utc_ns"))) == PILOT_EXPLICIT_ARRIVAL_UTC
                         )
                     if (
                         policy_id not in _PILOT_EXPLICIT_POLICY_IDS
@@ -5979,11 +5918,15 @@ def validate_input_derivatives(
             nww_analysis_root, config.inputs.nww_analysis_root_env, required=False
         )
     inventory_products = forcing.get("products")
-    source_tokens = {
-        str(item.get("root_token"))
-        for item in inventory_products
-        if isinstance(item, Mapping) and isinstance(item.get("root_token"), str)
-    } if isinstance(inventory_products, list) else set()
+    source_tokens = (
+        {
+            str(item.get("root_token"))
+            for item in inventory_products
+            if isinstance(item, Mapping) and isinstance(item.get("root_token"), str)
+        }
+        if isinstance(inventory_products, list)
+        else set()
+    )
     source_roots_complete = bool(source_tokens) and all(
         roots_by_token.get(token) is not None for token in source_tokens
     )
@@ -6221,10 +6164,7 @@ def _config_for_inventory_validation(
     # artifact 在 inventory flow-domain 對齊後錯誤觸發 generic 未定案 gate。只有原始
     # YAML 真正寫過欄位時才保留它，與 ProjectConfig.normalized_payload 的 hash 相容政策一致。
     inputs_payload = payload.get("inputs")
-    if (
-        isinstance(inputs_payload, dict)
-        and "backtrack_support_days" not in config.inputs.model_fields_set
-    ):
+    if isinstance(inputs_payload, dict) and "backtrack_support_days" not in config.inputs.model_fields_set:
         inputs_payload.pop("backtrack_support_days", None)
     _bind_inventory_flow_domains(payload, inventory_flow_ids=inventory_flow_ids)
     domains = payload["domains"]
@@ -6312,11 +6252,7 @@ def _release_support_evidence(
         if type(source_hash) is not str or _SHA256_RE.fullmatch(source_hash) is None:
             raise InputDerivationError("input artifact source_config_hash 格式不合法")
     else:
-        source_hash = (
-            source_bindings.get("config_hash")
-            if isinstance(source_bindings, Mapping)
-            else None
-        )
+        source_hash = source_bindings.get("config_hash") if isinstance(source_bindings, Mapping) else None
 
     gap, _ = read_canonical_json(input_root / ARTIFACT_FILENAMES["ocm_gap_safe_arrival_horizon"])
     raw_root_days = gap.get("max_backtrack_days")
@@ -6330,13 +6266,9 @@ def _release_support_evidence(
     if support_days is not None and not math.isclose(
         root_days, float(support_days), rel_tol=0.0, abs_tol=1e-12
     ):
-        raise InputDerivationError(
-            "gap-safe artifact 的母體支援日數與 source config 宣告不一致"
-        )
+        raise InputDerivationError("gap-safe artifact 的母體支援日數與 source config 宣告不一致")
     if support_declared and requested_days is not None and requested_days > root_days:
-        raise InputDerivationError(
-            "release config requested max_backtrack_days 超過 gap-safe 母體支援窗"
-        )
+        raise InputDerivationError("release config requested max_backtrack_days 超過 gap-safe 母體支援窗")
 
     records = gap.get("records")
     if not isinstance(records, list) or not records:
@@ -6395,13 +6327,10 @@ def create_release_config(
     if support_declared and normalized_max_days is not None:
         source_support_days = source_config.inputs.backtrack_support_days
         if source_support_days is None:
-            raise ValueError(
-                "已指定 release max_backtrack_days，但 inputs.backtrack_support_days 尚未定案"
-            )
+            raise ValueError("已指定 release max_backtrack_days，但 inputs.backtrack_support_days 尚未定案")
         if normalized_max_days > float(source_support_days):
             raise ValueError(
-                "release config requested max_backtrack_days 不得超過 "
-                "inputs.backtrack_support_days"
+                "release config requested max_backtrack_days 不得超過 inputs.backtrack_support_days"
             )
     config_payload = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     if not isinstance(config_payload, dict):
@@ -6620,9 +6549,11 @@ def validate_release_config(
                     if gap_payload is None:
                         raise ValueError("gap-safe component unreadable")
                     artifact_support = gap_payload.get("max_backtrack_days")
-                    if isinstance(artifact_support, bool) or not isinstance(
-                        artifact_support, (int, float)
-                    ) or not math.isfinite(float(artifact_support)):
+                    if (
+                        isinstance(artifact_support, bool)
+                        or not isinstance(artifact_support, (int, float))
+                        or not math.isfinite(float(artifact_support))
+                    ):
                         raise ValueError("artifact support 非有限數")
                     support_days = release_config.inputs.backtrack_support_days
                     requested_days = release_config.boundaries.max_backtrack_days
@@ -6662,11 +6593,7 @@ def validate_release_config(
                         errors.append("release_horizon_source_hash_mismatch")
                 elif bound_source_hash is not None:
                     errors.append("release_horizon_source_hash_mismatch")
-                expected_support = (
-                    release_config.inputs.backtrack_support_days
-                    if support_declared
-                    else None
-                )
+                expected_support = release_config.inputs.backtrack_support_days if support_declared else None
                 bound_support = horizon_binding.get("source_backtrack_support_days")
                 if bound_support != expected_support:
                     errors.append("release_support_binding_mismatch")
@@ -6680,9 +6607,7 @@ def validate_release_config(
                         if gap_payload is None:
                             raise ValueError("gap-safe component unreadable")
                         gap_support = gap_payload.get("max_backtrack_days")
-                        bound_artifact_support = horizon_binding.get(
-                            "artifact_backtrack_support_days"
-                        )
+                        bound_artifact_support = horizon_binding.get("artifact_backtrack_support_days")
                         if (
                             isinstance(bound_artifact_support, bool)
                             or not isinstance(bound_artifact_support, (int, float))
