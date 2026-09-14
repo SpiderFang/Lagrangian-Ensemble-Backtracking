@@ -82,6 +82,10 @@ writer 在建立 partial 前也會把本代 compact state、觀測（含 pending
 因此不同 member 或 seed 仍不能共用同一 `particle_id`，避免 loader 的 particle order 無法
 唯一還原。這些欄位驗證使用與 loader 相同的 canonical identity，成功發布即不會留下之後才
 被 loader 拒絕的 identity payload。
+同一個 preflight 也會驗證 checkpoint binding 的六個固定欄位都是非空原生字串；若有
+`random_stream_id`，則必須是非空白原生字串。writer 與 loader 共用此 parser，禁止 tuple、
+list、bool 或空值經由 JSON 正規化後才造成 binding 比對失敗；schema 2.x 舊檔也沿用相同
+欄位驗證，保留缺少 optional stream 欄位的相容語意。
 
 controller 的 generation scan 仍會讀取並 JSON parse 每代 compact／history payload，以驗證
 檔案 checksum、欄位拓撲、cursor 與 row count，但只在最高代完整 restore 時建立全部

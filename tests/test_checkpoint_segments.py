@@ -1052,3 +1052,71 @@ def test_schema3_writer_rejects_duplicate_run_unit_particle_id(
         )
     assert not target.exists()
     assert not tuple(tmp_path.glob(".checkpoint-00000001.partial-*"))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("config_hash", ("config",)),
+        ("input_inventory_hash", ["inventory"]),
+        ("experiment_case_id", True),
+        ("shard_id", ""),
+        ("seed_policy", None),
+        ("code_commit", 123),
+    ],
+)
+def test_schema3_writer_rejects_noncanonical_binding(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    """binding 的 tuple、list、bool、空值與數值不得在 partial 後才由 loader 發現。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    invalid_binding = replace(_binding(), **{field: replacement})
+    target = tmp_path / "checkpoint-00000001"
+    with pytest.raises(ValueError, match=rf"binding\.{field}"):
+        batch.write_checkpoint(target, binding=invalid_binding, sequence=1)
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(".checkpoint-00000001.partial-*"))
+
+    # 驗證 strict binding preflight 只拒絕不可持久化輸入；合法 binding 仍可立即被 loader
+    # 還原，且不需要改變同一批次的 execution、RNG 或 particle history。
+    valid = batch.write_checkpoint(target, binding=_binding(), sequence=1)
+    loaded = load_execution_checkpoint(valid, expected_binding=_binding())
+    assert loaded.binding == _binding()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("config_hash", ["config"]),
+        ("input_inventory_hash", True),
+        ("experiment_case_id", ""),
+        ("shard_id", None),
+        ("seed_policy", 123),
+        ("code_commit", {"commit": "value"}),
+        ("random_stream_id", "   "),
+        ("random_stream_id", False),
+    ],
+)
+def test_schema3_loader_rejects_noncanonical_binding_payload(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    """loader 必須以同一 binding parser 拒絕 JSON 正規化後仍不合法的欄位。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    target = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000001",
+        binding=_binding(),
+        sequence=1,
+    )
+    metadata_path = target / "checkpoint.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["binding"][field] = replacement
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=rf"schema 3 binding\.{field}"):
+        load_execution_checkpoint(target, expected_binding=_binding())

@@ -204,12 +204,12 @@ def _binding_payload(binding: CheckpointBinding) -> dict[str, Any]:
     binding 又能直接保存並驗證其亂數命名空間。
     """
 
-    payload = {
-        field_name: getattr(binding, field_name)
-        for field_name in _BINDING_FIELDS
-    }
-    if binding.random_stream_id is not None:
-        payload["random_stream_id"] = binding.random_stream_id
+    # 所有寫入入口都經由同一個 canonical parser；這會拒絕 tuple、list、bool 與空字串，
+    # 避免 ``_json_safe`` 將不可持久化的 Python 值轉成 JSON 後才由 loader 發現不相容。
+    canonical = _canonical_binding(binding, label="binding")
+    payload = {field_name: getattr(canonical, field_name) for field_name in _BINDING_FIELDS}
+    if canonical.random_stream_id is not None:
+        payload["random_stream_id"] = canonical.random_stream_id
     return payload
 
 
@@ -1299,6 +1299,9 @@ def _write_execution_checkpoint_schema22(
 
     if not isinstance(binding, CheckpointBinding):
         raise TypeError("binding 必須是 CheckpointBinding")
+    # 先完成 binding 的 primitive/canonical 驗證，再建立 snapshot 或 partial；這樣 legacy
+    # fixture writer 也不會先發布一份 JSON 正常、但 loader 無法用原生型別比對的檔案。
+    binding = _canonical_binding(binding, label="binding")
     snapshot = build_execution_checkpoint(
         binding=binding,
         sequence=sequence,
@@ -1369,8 +1372,16 @@ def _write_execution_checkpoint_schema22(
     return target
 
 
-def _binding_from_payload(value: Any, *, label: str = "binding") -> CheckpointBinding:
-    """嚴格解析 JSON binding，讓 2.x 與 3.0 loader 共用同一個 identity gate。"""
+def _validated_binding_row(value: Any, *, label: str) -> dict[str, Any]:
+    """驗證並建立可持久化的 binding primitive row。
+
+    binding 的六個固定欄位是設定雜湊、輸入清單雜湊、案例、分片、亂數策略與程式版本；
+    它們都必須是非空的原生 Python 字串。``random_stream_id`` 若存在，則同樣必須是
+    非空白原生字串。這個 parser 同時服務記憶體中的 writer 與 JSON loader，刻意不使用
+    ``_json_safe`` 做寬鬆轉型，避免 tuple／list／bool 在發布後才變成 loader 無法比對的值。
+    回傳新 dict 而非沿用呼叫端物件，讓後續 metadata、compact 與 segment 共用同一份
+    canonical binding；缺少 optional stream 欄位時維持舊六欄 schema 的語意。
+    """
 
     if not isinstance(value, dict):
         raise ValueError(f"{label} 必須是 object")
@@ -1379,14 +1390,44 @@ def _binding_from_payload(value: Any, *, label: str = "binding") -> CheckpointBi
         row = _require_exact_keys(value, _BINDING_FIELDS, label=label)
     elif keys == set(_BINDING_FIELDS_WITH_RANDOM):
         row = _require_exact_keys(value, _BINDING_FIELDS_WITH_RANDOM, label=label)
-        if type(row["random_stream_id"]) is not str or not row["random_stream_id"].strip():
-            raise ValueError(f"{label}.random_stream_id 必須是非空白字串")
     else:
         raise ValueError(f"{label} 欄位集合不符")
-    try:
-        return CheckpointBinding(**row)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{label} 欄位無效") from error
+
+    canonical = {
+        field_name: _nonempty_string(row[field_name], label=f"{label}.{field_name}")
+        for field_name in _BINDING_FIELDS
+    }
+    if "random_stream_id" in row:
+        random_stream_id = row["random_stream_id"]
+        if type(random_stream_id) is not str or not random_stream_id.strip():
+            raise ValueError(f"{label}.random_stream_id 必須是非空白字串")
+        canonical["random_stream_id"] = random_stream_id
+    return canonical
+
+
+def _canonical_binding(binding: CheckpointBinding, *, label: str) -> CheckpointBinding:
+    """以 writer／loader 共用 parser 建立 binding 的 canonical dataclass。
+
+    ``CheckpointBinding`` 的型別標註不會在執行期限制六個欄位；因此即使呼叫端建立了
+    tuple、list、bool 或空字串，仍須在任何 partial、tracker 或 payload 動作前重新驗證。
+    這裡只回傳通過 primitive gate 的新物件，不修改呼叫端提供的 binding。
+    """
+
+    if not isinstance(binding, CheckpointBinding):
+        raise TypeError(f"{label} 必須是 CheckpointBinding")
+    row = {
+        field_name: getattr(binding, field_name)
+        for field_name in _BINDING_FIELDS
+    }
+    if binding.random_stream_id is not None:
+        row["random_stream_id"] = binding.random_stream_id
+    return CheckpointBinding(**_validated_binding_row(row, label=label))
+
+
+def _binding_from_payload(value: Any, *, label: str = "binding") -> CheckpointBinding:
+    """嚴格解析 JSON binding，讓 2.x 與 3.0 loader 共用同一個 primitive gate。"""
+
+    return CheckpointBinding(**_validated_binding_row(value, label=label))
 
 
 def _sha256_or_none(value: Any, *, label: str) -> str | None:
@@ -2545,7 +2586,9 @@ def write_execution_checkpoint(
     history segment 只保存各粒子自上一代 cursor 之後新增的 observation 與 event。因而
     每代寫入量與新增 row 數近似成正比，不會隨累積歷史重寫完整 execution JSON。第一代
     沒有前代時 cursor 從零開始；若 caller 由舊 schema 2.x 起始，會把該 checkpoint 當作
-    一次性 chain root 讀入並追加完整歷史，舊目錄本身不會被修改。
+    一次性 chain root 讀入並追加完整歷史，舊目錄本身不會被修改。binding 的六個固定欄位
+    與 optional ``random_stream_id`` 會先經同一個 strict parser 正規化，確保寫入 JSON
+    後仍能以原生型別被 loader 精確比對。
 
     寫入順序是 partial directory → checksum manifest → atomic rename；目標已存在、前代
     binding／RunUnit 順序不符、history cursor 回退、相鄰 observation engine key 重複，或
@@ -2557,6 +2600,9 @@ def write_execution_checkpoint(
 
     if not isinstance(binding, CheckpointBinding):
         raise TypeError("binding 必須是 CheckpointBinding")
+    # binding 先完成 strict canonical 驗證，再檢查 tracker 或其餘 execution 輸入；失敗時
+    # 不能讓 writer 因任何後續流程留下 partial 或改變呼叫端的歷史追蹤狀態。
+    binding = _canonical_binding(binding, label="binding")
     # 在初始化 root tracker 前記住原始型別；v3 continuation 若整條替換成普通 list，
     # 後續必須拒絕，避免新 tracker 把未驗證的 stable prefix 偽裝成合法延續。
     had_untracked_history = any(
@@ -2947,6 +2993,9 @@ def load_execution_checkpoint(
 
     if not isinstance(expected_binding, CheckpointBinding):
         raise TypeError("expected_binding 必須是 CheckpointBinding")
+    # expected binding 也可能來自外部設定物件；先以 writer／payload 共用 parser 建立
+    # canonical 值，避免 tuple/list/bool 等值直到讀檔 equality 比對時才顯示為不相容。
+    expected_binding = _canonical_binding(expected_binding, label="expected_binding")
     root = Path(path)
     if not root.is_dir():
         raise FileNotFoundError(f"checkpoint 目錄不存在：{root}")
@@ -2980,29 +3029,9 @@ def load_execution_checkpoint(
     event_count = _nonnegative_int(metadata["event_count"], label="event_count")
     if particle_count < 1:
         raise ValueError("schema 2 checkpoint 不允許空 shard")
-    binding_value = metadata["binding"]
-    if not isinstance(binding_value, dict):
-        raise ValueError("binding 必須是 object")
-    binding_keys = set(binding_value)
-    if binding_keys == set(_BINDING_FIELDS):
-        # 舊 checkpoint 沒有 stream 欄位；dataclass default None 保留既有 binding 語意。
-        binding_row = _require_exact_keys(binding_value, _BINDING_FIELDS, label="binding")
-    elif binding_keys == set(_BINDING_FIELDS_WITH_RANDOM):
-        binding_row = _require_exact_keys(
-            binding_value,
-            _BINDING_FIELDS_WITH_RANDOM,
-            label="binding",
-        )
-        if type(binding_row["random_stream_id"]) is not str or not binding_row[
-            "random_stream_id"
-        ].strip():
-            raise ValueError("binding.random_stream_id 必須是非空白字串")
-    else:
-        raise ValueError("binding 欄位集合不符")
-    try:
-        actual_binding = CheckpointBinding(**binding_row)
-    except (TypeError, ValueError) as error:
-        raise ValueError("checkpoint binding 欄位無效") from error
+    # schema 2 與 schema 3 共用同一個 binding parser，確保舊檔的六欄與 paired run 的
+    # optional random_stream_id 都遵守相同 primitive/type 契約。
+    actual_binding = _binding_from_payload(metadata["binding"], label="binding")
     if actual_binding != expected_binding:
         raise ValueError(f"checkpoint binding 不相容：actual={actual_binding}, expected={expected_binding}")
     _verify_schema2_files(root, metadata)
@@ -3102,6 +3131,11 @@ def inspect_execution_checkpoint(
     generation 時對同一段歷史反覆建立 dataclass，不能保證冷 NFS cache 下完全不讀歷史。
     """
 
+    if not isinstance(expected_binding, CheckpointBinding):
+        raise TypeError("expected_binding 必須是 CheckpointBinding")
+    # inspect 也會驗證 schema 3 payload；先套用同一 canonical binding parser，避免掃描與
+    # 真正 resume 對外部 expected binding 採用不同的 primitive 語意。
+    expected_binding = _canonical_binding(expected_binding, label="expected_binding")
     root = Path(path)
     initial_metadata = _read_json(root / "checkpoint.json")
     if initial_metadata.get("schema_version") == _SCHEMA30_VERSION:
@@ -3136,6 +3170,11 @@ def write_checkpoint(
 ) -> Path:
     """以 schema 1 格式保存粒子狀態；此 API 保留給既有呼叫端。"""
 
+    if not isinstance(binding, CheckpointBinding):
+        raise TypeError("binding 必須是 CheckpointBinding")
+    # 舊 schema 1 writer 仍需在 partial 前拒絕不可 JSON round-trip 的 binding primitive；
+    # 這與 execution checkpoint 的 strict binding 契約一致，避免兩套 API 產生不同語意。
+    binding = _canonical_binding(binding, label="binding")
     if sequence < 0 or not states:
         raise ValueError("checkpoint sequence 必須非負且 states 不可空")
     if len({state.particle_id for state in states}) != len(states):
@@ -3183,9 +3222,14 @@ def load_checkpoint(
 ) -> tuple[list[ParticleState], int]:
     """以 schema 1 API 讀回粒子狀態，並保留原有 binding/checksum/count 檢查。"""
 
+    if not isinstance(expected_binding, CheckpointBinding):
+        raise TypeError("expected_binding 必須是 CheckpointBinding")
+    # schema 1 與 execution loader 共用 strict binding parser，讓 expected binding 的
+    # 記憶體 primitive 也和磁碟 JSON 的 canonical representation 一致。
+    expected_binding = _canonical_binding(expected_binding, label="expected_binding")
     root = Path(path)
     metadata = json.loads((root / "checkpoint.json").read_text(encoding="utf-8"))
-    actual_binding = CheckpointBinding(**metadata["binding"])
+    actual_binding = _binding_from_payload(metadata["binding"], label="binding")
     if actual_binding != expected_binding:
         raise ValueError(f"checkpoint binding 不相容：actual={actual_binding}, expected={expected_binding}")
     state_path = root / "particle_states.parquet"
