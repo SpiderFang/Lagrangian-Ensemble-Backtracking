@@ -827,6 +827,40 @@ def _require_observation_core_match(
         raise ValueError(f"{label} observation core 不一致")
 
 
+def _validate_adjacent_observation_engine_keys(
+    observations: Sequence[Observation],
+    *,
+    start: int,
+    label: str,
+) -> None:
+    """檢查本代新增觀測與 pending 邊界不得留下 engine 同點重複列。
+
+    引擎的 ``_append_or_replace_observation`` 對同一粒子只保留最後一筆相同 UTC／age
+    的觀測，age 使用絕對容差 ``1e-12`` 秒。若外部呼叫端以 ``append``、``extend``、
+    ``insert``、空 slice insertion、``+=`` 或 ``*=`` 繞過 history tracker，可能把原本
+    應被替換的 pending row 變成兩筆相鄰資料；writer 若只依 cursor 切片，這個假列會
+    在 restore 後形成零長度時間區段。因此這裡在發布前以同一 engine key 做 fail-closed
+    檢查。
+
+    ``start`` 是上一代已發布的 observation cursor。為維持分段 checkpoint 的線性寫入
+    成本，只檢查 ``start`` 位置與其後的新列，並保留前一列作為邊界比較；不重掃已發布
+    的更早 history。範圍包含最後一筆 pending observation，因為同點假列也可能只出現在
+    stable segment 與 pending 的交界。schema 2 migration 的 ``start=0`` 會一次檢查完整
+    舊 history，這是遷移 root 的一次性驗證成本。
+    """
+
+    first_pair = max(1, start)
+    for index in range(first_pair, len(observations)):
+        previous = observations[index - 1]
+        current = observations[index]
+        if _observation_core(previous) == _observation_core(current) and bool(
+            np.isclose(previous.age_seconds, current.age_seconds, rtol=0.0, atol=1.0e-12)
+        ):
+            raise ValueError(
+                f"{label}[{index - 1}:{index + 1}] 相鄰 observation engine key 重複"
+            )
+
+
 def _validate_legacy_execution_prefix(
     current: ParticleExecutionState,
     legacy: ParticleExecutionState,
@@ -1391,17 +1425,25 @@ class _CheckpointHistoryList(list[Any]):
         if isinstance(index, slice):
             start, stop, step = index.indices(len(self))
             touched = list(range(start, stop, step))
+            # list 的 slice assignment 接受任意 iterable；先 materialize，除了讓 tuple、
+            # generator 等呼叫形式可建立 event tracker，也能判斷這次是否真的插入了列。
+            value = list(value)
             # 空 slice assignment 是插入操作；只要插入點落在 immutable prefix 中，
-            # 即使原本沒有被替換的 index，也會改變後續 cursor，必須標記 dirty。
+            # 且該位置後仍有既有列，即使原本沒有被替換的 index，也會改變後續 cursor，
+            # 必須標記 dirty。插入點等於 len(self) 是合法的尾端追加，不應誤標記。
             insertion_point = start if step > 0 else stop
             if (
                 any(item < self._checkpoint_immutable_prefix_length for item in touched)
                 or insertion_point < self._checkpoint_immutable_prefix_length
+                or (
+                    value
+                    and index.step is None
+                    and start == stop
+                    and insertion_point == self._checkpoint_immutable_prefix_length
+                    and insertion_point < len(self)
+                )
             ):
                 self._checkpoint_history_dirty = True
-            # list 的 slice assignment 接受任意 iterable；先 materialize，才能讓 tuple、
-            # generator 等呼叫形式也取得與 append 相同的 BoundaryEvent attributes tracker。
-            value = list(value)
             if index.step is None:
                 value = [
                     self._wrap_event(
@@ -1482,8 +1524,12 @@ class _CheckpointHistoryList(list[Any]):
     def insert(self, index: int, value: Any) -> None:
         """追蹤插入；插入 stable prefix 會改變既有 row cursor，必須拒絕。"""
 
-        normalized = index if index >= 0 else max(0, len(self) + index)
-        if normalized < self._checkpoint_immutable_prefix_length:
+        # list.insert 會把超出範圍的 index 夾到 [0, len]；使用實際插入位置判定，
+        # 避免把「插入 prefix 尾端且 prefix == len」誤判成修改 immutable rows。
+        normalized = min(max(index if index >= 0 else len(self) + index, 0), len(self))
+        if normalized < self._checkpoint_immutable_prefix_length or (
+            normalized == self._checkpoint_immutable_prefix_length and normalized < len(self)
+        ):
             self._checkpoint_history_dirty = True
         super().insert(
             index,
@@ -2390,9 +2436,9 @@ def write_execution_checkpoint(
     一次性 chain root 讀入並追加完整歷史，舊目錄本身不會被修改。
 
     寫入順序是 partial directory → checksum manifest → atomic rename；目標已存在、前代
-    binding／RunUnit 順序不符、history cursor 回退或輸出資料在完整 sweep/macro boundary
-    外呼叫，均由 caller 或本函式拒絕。此 API 不刪除任何 generation，避免 retention 破壞
-    checkpoint.json hash chain。
+    binding／RunUnit 順序不符、history cursor 回退、相鄰 observation engine key 重複，或
+    輸出資料在完整 sweep/macro boundary 外呼叫，均由 caller 或本函式拒絕。此 API 不刪除
+    任何 generation，避免 retention 破壞 checkpoint.json hash chain。
     """
 
     if not isinstance(binding, CheckpointBinding):
@@ -2595,6 +2641,15 @@ def write_execution_checkpoint(
                 execution.observations[observation_start],
                 label=f"schema 3 execution[{index}] pending boundary",
             )
+        # engine 對同一 particle／UTC／age 只保留一筆最後 observation；這項增量 gate
+        # 封住 append、extend、空 slice insertion、insert、+= 與 *= 等一般 list API，避免
+        # 它們在 stable prefix gate 未觸發時製造相鄰假列。包含最後 pending row，才能抓到
+        # stable segment 與 pending 交界的重複；start 以前的歷史由上一代 loader 驗證。
+        _validate_adjacent_observation_engine_keys(
+            execution.observations,
+            start=observation_start,
+            label=f"execution[{index}].observations",
+        )
         observations = execution.observations[observation_start:stable_observation_end]
         events = execution.events[event_start:]
         _validate_observation_sequence(

@@ -821,3 +821,54 @@ def test_schema3_deepcopy_preserves_stable_event_tracking(tmp_path: Path) -> Non
             sequence=2,
             previous_checkpoint=first,
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["slice_at_prefix", "insert_at_prefix", "append", "extend", "iadd", "imul"],
+)
+def test_schema3_rejects_adjacent_observation_engine_key_duplicates(
+    tmp_path: Path, mutation: str
+) -> None:
+    """各種 list 變更都不得把同一 engine observation key 留成兩筆資料。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    first = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000001",
+        binding=_binding(),
+        sequence=1,
+    )
+    # member 1 在 synthetic sweep 後仍為 active 且只有一筆 pending；使用它可將測試
+    # 集中在 history writer 的 engine-key gate，不混入 member 0 的 terminal freeze。
+    observations = batch.runtimes[1].execution.observations
+    pending = observations[-1]
+    replacement = replace(pending, x_m=pending.x_m + 123.0)
+    if mutation == "slice_at_prefix":
+        observations[0:0] = [replacement]
+    elif mutation == "insert_at_prefix":
+        observations.insert(0, replacement)
+    elif mutation == "append":
+        observations.append(pending)
+    elif mutation == "extend":
+        observations.extend([pending])
+    elif mutation == "iadd":
+        observations += [pending]
+    else:
+        observations *= 2
+
+    # 空 slice insertion／insert 會先由 tracker 標記 prefix；其餘追加 API 由 writer
+    # 的增量相鄰 key gate 攔截。兩條閘門都必須存在，才能封住不同的 Python list 入口。
+    if mutation in {"slice_at_prefix", "insert_at_prefix"}:
+        assert observations.checkpoint_history_dirty is True
+    with pytest.raises(ValueError, match="stable observation/event prefix|相鄰 observation engine key"):
+        batch.write_checkpoint(
+            tmp_path / "checkpoint-00000002",
+            binding=_binding(),
+            sequence=2,
+            previous_checkpoint=first,
+        )
+    assert not (tmp_path / "checkpoint-00000002").exists()
+    restored = load_execution_checkpoint(first, expected_binding=_binding())
+    assert restored.sequence == 1
+    assert len(restored.executions[1].observations) == 1

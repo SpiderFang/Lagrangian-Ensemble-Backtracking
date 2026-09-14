@@ -1,8 +1,12 @@
-# Execution checkpoint schema 3.0 操作契約
+# Execution checkpoint schema 3.0 工程候選操作契約
 
-本文件說明正式執行所使用的 execution checkpoint schema `3.0.0`。它解決長時間回溯中
+本文件說明尚未正式發布的 execution checkpoint schema `3.0.0` 工程候選。它解決長時間回溯中
 每代重寫完整 observation／event history 造成的寫入量平方增長；它只保存可恢復的工程
 狀態，不能取代 trajectory、輸入 manifest、科學驗證或正式成果報告。
+
+SERVER 目前仍使用 schema 2.x；本機先前產生的 schema 3 draft 不是已發布格式，沒有持久化
+相容承諾，也不得交給 final v3 loader／resume。只有以本文件契約建立新 chain root、完成
+SERVER fault／resume 與資源驗證後，才能另行決定正式部署。
 
 ## 操作順序
 
@@ -63,6 +67,11 @@ current state、計數器、輸出與 history cursor、pending observation、RNG
 chain root 依固定 particle order 逐段附加資料，再把 compact 的 pending observation 接在
 末端；任何缺失、重複、跳號、cursor 回退、identity／binding 改變或 checksum 不符都會
 fail-closed。
+writer 另在本代新增範圍及其 pending 邊界檢查相鄰 observation 的 engine key：同一 particle
+若 UTC 相同且 age 差距不超過 `1e-12` 秒，只能保留一列。這會攔截以 `append`、`extend`、
+`insert`、空 slice insertion、`+=` 或 `*=` 造成的重複假列；合法的 pending context 更新
+仍是替換同一列，並依 particle／UTC／age 核心契約通過。檢查只掃本代增量與一個邊界列，
+不會因 generation 數增加而重掃完整已發布 history。
 
 controller 的 generation scan 仍會讀取並 JSON parse 每代 compact／history payload，以驗證
 檔案 checksum、欄位拓撲、cursor 與 row count，但只在最高代完整 restore 時建立全部
