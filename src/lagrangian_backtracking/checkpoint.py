@@ -861,6 +861,89 @@ def _validate_adjacent_observation_engine_keys(
             )
 
 
+def _serialize_and_validate_writer_state(
+    state: ParticleState,
+    *,
+    expected_identity: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    """以 loader 同一套 primitive／cross-field 規則預驗 compact current state。
+
+    ``ParticleState`` 是執行期 dataclass，並不會自動拒絕 bool 充當整數、浮點充當 UTC
+    奈秒或錯誤的 own-local-exit 型別；若 writer 只呼叫 ``asdict``，可能先發布一個
+    loader 必定拒絕的 generation。這裡把即將寫入的 JSON 先送回嚴格 decoder，並核對
+    反序列化後的固定 identity。回傳同一份已驗證的 payload，供 compact 重用，避免在
+    建立 partial 後才發現 semantic mismatch。
+    """
+
+    payload = _serialize_particle_state(state)
+    validated = _deserialize_particle_state(payload, label=label)
+    expected = (
+        expected_identity["particle_id"],
+        expected_identity["scenario_id"],
+        expected_identity["member_id"],
+        expected_identity["study_site_id"],
+        expected_identity["analysis_region_id"],
+        expected_identity["receptor_id"],
+    )
+    if _state_identity(validated) != expected:
+        raise ValueError(f"{label} identity 與 RunUnit identity 不一致")
+    return payload
+
+
+def _serialize_and_validate_writer_observation(
+    observation: Observation,
+    *,
+    expected_particle_id: str,
+    label: str,
+) -> dict[str, Any]:
+    """預驗即將寫入的 observation，確保 writer 與 loader 的欄位語意一致。
+
+    驗證範圍只包含本代新增 rows 與最後 pending row；已發布的更早 prefix 已在上一代
+    chain 驗證，避免每次 checkpoint 重新掃描完整 history。除了 Observation constructor
+    所涵蓋的環境／速度欄位，也明確核對 particle_id，防止新列被錯誤粒子使用而直到
+    restore 才失敗。回傳的 payload 供 segment 或 compact 直接寫入。
+    """
+
+    payload = _serialize_observation(observation, schema_version=_SCHEMA30_VERSION)
+    validated = _deserialize_observation(
+        payload,
+        label=label,
+        schema_version=_SCHEMA30_VERSION,
+    )
+    if validated.particle_id != expected_particle_id:
+        raise ValueError(f"{label} particle_id 與 RunUnit identity 不一致")
+    return payload
+
+
+def _serialize_and_validate_writer_event(
+    event: BoundaryEvent,
+    *,
+    expected_identity: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    """預驗本代新增 event 的 JSON primitive、fraction 與完整 particle identity。
+
+    事件欄位在執行期由 frozen dataclass 承載，但 constructor 不負責所有 JSON 邊界型別；
+    例如 fraction 超過 1 或 UTC 使用 bool 都可能在 writer 直接被序列化。先以 loader 的
+    strict decoder 還原一次，再比對六個固定 identity，才能保證 generation 一旦發布就
+    可立即由同一 loader 讀回。只處理 event cursor 之後的增量列，維持線性 checkpoint 成本。
+    """
+
+    payload = _serialize_event(event)
+    validated = _deserialize_event(payload, label=label)
+    if (
+        validated.particle_id != expected_identity["particle_id"]
+        or validated.scenario_id != expected_identity["scenario_id"]
+        or validated.member_id != expected_identity["member_id"]
+        or validated.study_site_id != expected_identity["study_site_id"]
+        or validated.analysis_region_id != expected_identity["analysis_region_id"]
+        or validated.receptor_id != expected_identity["receptor_id"]
+    ):
+        raise ValueError(f"{label} identity 與 RunUnit identity 不一致")
+    return payload
+
+
 def _validate_legacy_execution_prefix(
     current: ParticleExecutionState,
     legacy: ParticleExecutionState,
@@ -2437,8 +2520,9 @@ def write_execution_checkpoint(
 
     寫入順序是 partial directory → checksum manifest → atomic rename；目標已存在、前代
     binding／RunUnit 順序不符、history cursor 回退、相鄰 observation engine key 重複，或
-    輸出資料在完整 sweep/macro boundary 外呼叫，均由 caller 或本函式拒絕。此 API 不刪除
-    任何 generation，避免 retention 破壞 checkpoint.json hash chain。
+    輸出資料在完整 sweep/macro boundary 外呼叫，均由 caller 或本函式拒絕。state、觀測與
+    事件也會先用 loader 的 strict semantic decoder 預驗，確保成功發布的 generation 可
+    立即還原。此 API 不刪除任何 generation，避免 retention 破壞 checkpoint.json hash chain。
     """
 
     if not isinstance(binding, CheckpointBinding):
@@ -2592,6 +2676,7 @@ def write_execution_checkpoint(
         raise ValueError("schema 3 generation sequence 不連續")
 
     segment_records: list[dict[str, Any]] = []
+    compact_records: list[dict[str, Any]] = []
     observation_count = 0
     event_count = 0
     for index, (identity, execution, previous_record) in enumerate(
@@ -2657,18 +2742,30 @@ def write_execution_checkpoint(
             execution.state,
             label=f"execution[{index}].observations",
         )
-        for event_index, event in enumerate(events):
-            if (
-                event.particle_id != identity["particle_id"]
-                or event.scenario_id != identity["scenario_id"]
-                or event.member_id != identity["member_id"]
-                or event.study_site_id != identity["study_site_id"]
-                or event.analysis_region_id != identity["analysis_region_id"]
-                or event.receptor_id != identity["receptor_id"]
-            ):
-                raise ValueError(
-                    f"execution[{index}].events[{event_start + event_index}] identity 不一致"
-                )
+        serialized_state = _serialize_and_validate_writer_state(
+            execution.state,
+            expected_identity=identity,
+            label=f"schema 3 compact.records[{index}].state",
+        )
+        observation_tail = execution.observations[observation_start:]
+        serialized_observation_tail = [
+            _serialize_and_validate_writer_observation(
+                observation,
+                expected_particle_id=identity["particle_id"],
+                label=f"schema 3 execution[{index}].observations[{observation_start + row_index}]",
+            )
+            for row_index, observation in enumerate(observation_tail)
+        ]
+        serialized_observations = serialized_observation_tail[:-1]
+        serialized_pending_observation = serialized_observation_tail[-1]
+        serialized_events = [
+            _serialize_and_validate_writer_event(
+                event,
+                expected_identity=identity,
+                label=f"schema 3 execution[{index}].events[{event_start + event_index}]",
+            )
+            for event_index, event in enumerate(events)
+        ]
         segment_records.append(
             {
                 "identity": deepcopy(identity),
@@ -2678,11 +2775,22 @@ def write_execution_checkpoint(
                 "event_end_cursor": len(execution.events),
                 "observation_row_count": len(observations),
                 "event_row_count": len(events),
-                "observations": [
-                    _serialize_observation(item, schema_version=_SCHEMA30_VERSION)
-                    for item in observations
-                ],
-                "events": [_serialize_event(item) for item in events],
+                "observations": serialized_observations,
+                "events": serialized_events,
+            }
+        )
+        compact_records.append(
+            {
+                "identity": deepcopy(identity),
+                "state": serialized_state,
+                "step_count": execution.step_count,
+                "minimum_clamp_count": execution.minimum_clamp_count,
+                "next_output_age_seconds": execution.next_output_age_seconds,
+                "observation_cursor": len(execution.observations) - 1,
+                "event_cursor": len(execution.events),
+                "pending_observation": serialized_pending_observation,
+                "rng_state": rng_states[index],
+                "triangle_hint": normalized_hints[index],
             }
         )
         observation_count += len(execution.observations)
@@ -2700,29 +2808,7 @@ def write_execution_checkpoint(
         "sequence": sequence,
         "binding": _binding_payload(binding),
         "particle_order": [identity["particle_id"] for identity in identities],
-        "records": [
-            {
-                "identity": deepcopy(identity),
-                "state": _serialize_particle_state(execution.state),
-                "step_count": execution.step_count,
-                "minimum_clamp_count": execution.minimum_clamp_count,
-                "next_output_age_seconds": execution.next_output_age_seconds,
-                "observation_cursor": len(execution.observations) - 1,
-                "event_cursor": len(execution.events),
-                "pending_observation": _serialize_observation(
-                    execution.observations[-1], schema_version=_SCHEMA30_VERSION
-                ),
-                "rng_state": rng_state,
-                "triangle_hint": triangle_hint,
-            }
-            for identity, execution, rng_state, triangle_hint in zip(
-                identities,
-                execution_rows,
-                rng_states,
-                normalized_hints,
-                strict=True,
-            )
-        ],
+        "records": compact_records,
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.parent / f".{target.name}.partial-{uuid4().hex}"

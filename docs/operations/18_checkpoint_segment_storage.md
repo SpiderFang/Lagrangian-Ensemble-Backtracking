@@ -72,6 +72,11 @@ writer 另在本代新增範圍及其 pending 邊界檢查相鄰 observation 的
 `insert`、空 slice insertion、`+=` 或 `*=` 造成的重複假列；合法的 pending context 更新
 仍是替換同一列，並依 particle／UTC／age 核心契約通過。檢查只掃本代增量與一個邊界列，
 不會因 generation 數增加而重掃完整已發布 history。
+writer 在建立 partial 前也會把本代 compact state、觀測（含 pending）與新增事件以 loader
+同一套 strict semantic decoder 預驗，並核對 observation／event 與 RunUnit 的 identity；
+因此欄位 primitive、fraction、UTC 型別或粒子歸屬錯誤會在 atomic publish 前拒絕，不會留下
+只能發布卻無法立即 resume 的 generation。這項預驗只涵蓋本代 `Θ(P + ΔH)` 資料；已發布
+的更早 history 仍由既有 chain checksum／loader 驗證。
 
 controller 的 generation scan 仍會讀取並 JSON parse 每代 compact／history payload，以驗證
 檔案 checksum、欄位拓撲、cursor 與 row count，但只在最高代完整 restore 時建立全部

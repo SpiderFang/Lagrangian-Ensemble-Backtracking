@@ -872,3 +872,91 @@ def test_schema3_rejects_adjacent_observation_engine_key_duplicates(
     restored = load_execution_checkpoint(first, expected_binding=_binding())
     assert restored.sequence == 1
     assert len(restored.executions[1].observations) == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("state_own_local_exit_recorded_int", "own_local_exit_recorded.*boolean"),
+        ("state_time_utc_ns_float", "time_utc_ns.*整數"),
+        ("observation_particle_id", "particle_id.*RunUnit identity"),
+        ("observation_particle_id_stable", "particle_id.*RunUnit identity"),
+        ("observation_time_utc_ns_float", "time_utc_ns.*整數"),
+        ("event_particle_id", "identity.*RunUnit identity"),
+        ("event_fraction_out_of_range", "fraction.*介於 0 與 1"),
+        ("event_time_utc_ns_bool", "time_utc_ns.*整數"),
+    ],
+)
+def test_schema3_writer_rejects_payloads_loader_would_reject(
+    tmp_path: Path, mutation: str, expected_error: str
+) -> None:
+    """writer 必須在 atomic publish 前拒絕 loader 必定無法還原的 payload。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    first = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000001",
+        binding=_binding(),
+        sequence=1,
+    )
+    runtime = batch.runtimes[1]
+    if mutation == "state_own_local_exit_recorded_int":
+        runtime.execution.state = replace(
+            runtime.execution.state,
+            own_local_exit_recorded=0,
+        )
+    elif mutation == "state_time_utc_ns_float":
+        runtime.execution.state = replace(
+            runtime.execution.state,
+            time_utc_ns=float(runtime.execution.state.time_utc_ns),
+        )
+    elif mutation == "observation_particle_id":
+        pending = runtime.execution.observations[-1]
+        # 追加成新的 pending row，讓上一代 boundary 仍正確；這專門驗證 writer 對
+        # 本代新增列的 particle identity gate，而不是只依既有 pending 比對攔截。
+        runtime.execution.observations.append(
+            replace(pending, particle_id="wrong-particle")
+        )
+    elif mutation == "observation_particle_id_stable":
+        pending = runtime.execution.observations[-1]
+        # 再追加一筆合法 pending，讓錯誤列落在本代 stable segment 中；這確認 gate
+        # 不只驗最後一列，而是驗證 observation_start 之後的所有新增 rows。
+        runtime.execution.observations.extend(
+            [replace(pending, particle_id="wrong-particle"), pending]
+        )
+    elif mutation == "observation_time_utc_ns_float":
+        pending = runtime.execution.observations[-1]
+        runtime.execution.observations[-1] = replace(
+            pending,
+            time_utc_ns=float(pending.time_utc_ns),
+        )
+    else:
+        source_event = batch.runtimes[0].execution.events[0]
+        event = replace(
+            source_event,
+            particle_id=runtime.execution.state.particle_id,
+            scenario_id=runtime.execution.state.scenario_id,
+            member_id=runtime.execution.state.member_id,
+            study_site_id=runtime.execution.state.study_site_id,
+            analysis_region_id=runtime.execution.state.analysis_region_id,
+            receptor_id=runtime.execution.state.receptor_id,
+        )
+        if mutation == "event_particle_id":
+            event = replace(event, particle_id="wrong-event")
+        elif mutation == "event_fraction_out_of_range":
+            event = replace(event, fraction=1.5)
+        else:
+            event = replace(event, time_utc_ns=True)
+        runtime.execution.events.append(event)
+
+    target = tmp_path / "checkpoint-00000002"
+    with pytest.raises(ValueError, match=expected_error):
+        batch.write_checkpoint(
+            target,
+            binding=_binding(),
+            sequence=2,
+            previous_checkpoint=first,
+        )
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(".checkpoint-00000002.partial-*"))
+    assert load_execution_checkpoint(first, expected_binding=_binding()).sequence == 1
