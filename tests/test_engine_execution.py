@@ -1516,13 +1516,13 @@ def test_missing_or_nonfinite_context_omitted_from_event_and_roundtrips(
     unit = RunUnit(scenario, "baseline", 0, "p0", 12)
     binding = CheckpointBinding("config", "inventory", "baseline", "shard", "pcg64dxsm-v1", "commit")
     checkpoint_path = write_execution_checkpoint(
-        tmp_path / "checkpoint", binding=binding, run_units=[unit], executions=[execution],
-        rngs=[rng], triangle_hints=[None], sequence=0,
+        tmp_path / "checkpoint-00000001", binding=binding, run_units=[unit], executions=[execution],
+        rngs=[rng], triangle_hints=[None], sequence=1,
     )
     restored = load_execution_checkpoint(checkpoint_path, expected_binding=binding, expected_run_units=[unit])
     assert restored.executions[0] == execution
     assert restored.rng_states[0] == rng.bit_generator.state
-    assert json.loads((checkpoint_path / "checkpoint.json").read_text())["schema_version"] == "2.2.0"
+    assert json.loads((checkpoint_path / "checkpoint.json").read_text())["schema_version"] == "3.0.0"
     result = finalize_particle_execution(restored.executions[0])
     for name, event_attributes in (
         ("diagnostic", attributes), ("legacy", {}), ("ordinary", {"label": "old"}),
@@ -1649,7 +1649,7 @@ def test_checkpoint_resume_retains_exact_rk_failure_diagnostics(tmp_path: Path) 
     unit = RunUnit(scenario, "baseline", 0, "p0", 16)
     binding = CheckpointBinding("config", "inventory", "baseline", "shard", "pcg64dxsm-v1", "commit")
     path = write_execution_checkpoint(
-        tmp_path / "active", binding=binding, run_units=[unit], executions=[execution],
+        tmp_path / "checkpoint-00000001", binding=binding, run_units=[unit], executions=[execution],
         rngs=[rng], triangle_hints=[None], sequence=1,
     )
     checkpoint = load_execution_checkpoint(path, expected_binding=binding, expected_run_units=[unit])
@@ -1675,8 +1675,11 @@ def test_checkpoint_resume_retains_exact_rk_failure_diagnostics(tmp_path: Path) 
     assert attributes["sample_eta_available"] is attributes["sample_bed_available"] is True
     _assert_safe_diagnostic(attributes)
     terminal_path = write_execution_checkpoint(
-        tmp_path / "terminal", binding=binding, run_units=[unit], executions=[restored],
-        rngs=[restored_rng], triangle_hints=[None], sequence=2,
+        tmp_path / "terminal" / "checkpoint-00000001",
+        binding=binding,
+        run_units=[unit],
+        executions=[restored],
+        rngs=[restored_rng], triangle_hints=[None], sequence=1,
     )
     assert load_execution_checkpoint(terminal_path, expected_binding=binding).executions[0] == restored
     shard = write_trajectory_shard(tmp_path / "output", [result], run_metadata={"run_kind": "synthetic"})

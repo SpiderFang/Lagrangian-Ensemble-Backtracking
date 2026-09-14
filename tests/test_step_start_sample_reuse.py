@@ -440,7 +440,7 @@ def test_marked_reference_and_production_match_with_short_checkpoint_restart(tmp
     assert first.stepped and len(sampler.calls) == 4
     run_units = list(iter_run_units(shard, master_seed=19))
     checkpoint_path = write_execution_checkpoint(
-        tmp_path / "checkpoint",
+        tmp_path / "checkpoint-00000001",
         binding=checkpoint_binding,
         run_units=run_units,
         executions=[execution],

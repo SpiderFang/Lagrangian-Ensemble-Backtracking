@@ -373,9 +373,9 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
     "checkpoint": {
-        "role": "schema 2 中途狀態的安全寫入與續跑繫結",
+        "role": "schema 3.0 中途狀態的分段寫入與續跑繫結",
         "inputs": "粒子中途狀態、批次識別與設定繫結",
-        "outputs": "schema 2 CheckpointBinding、execution/RNG checkpoint 與 schema 1 相容資料",
+        "outputs": "schema 3.0 compact／history segment、CheckpointBinding、RNG checkpoint 與 schema 1 相容資料",
         "entrypoints": [
             "write_execution_checkpoint",
             "load_execution_checkpoint",
@@ -383,13 +383,15 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "load_checkpoint（schema 1 相容入口）",
         ],
         "read_first": (
-            "正式續跑先讀 schema 2 的 write_execution_checkpoint／load_execution_checkpoint；"
+            "正式續跑先讀 schema 3.0 的 write_execution_checkpoint／load_execution_checkpoint；"
             "列表中的 write_checkpoint／load_checkpoint 僅是既有 schema 1 相容入口，不能取代"
-            "schema 2 的完整 execution、觀測、事件、triangle hint 與每粒子 RNG state。"
+            "schema 3.0 的 compact、分段 observation／event history、triangle hint 與每粒子 RNG state；"
+            "loader 同時保留 schema 2.x 舊目錄唯讀相容。"
         ),
         "baytrace_integration": (
-            "這是為本專案可重啟系集補上的強化：schema 2 保存完整 execution、觀測、事件、"
-            "triangle hint 與每粒子 RNG state，並非 BayTrace checkpoint 的原樣搬入。"
+            "這是為本專案可重啟系集補上的強化：schema 3.0 以 immutable history segment、"
+            "compact state、cursor 與 SHA-256 chain 保存 execution、觀測、事件、triangle hint"
+            "與每粒子 RNG state，並非 BayTrace checkpoint 的原樣搬入。"
         ),
     },
     "runtime": {
@@ -559,7 +561,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
     },
     "run_control": {
         "role": "管理 immutable run plan、atomic progress、CPU shard 與 reconcile",
-        "inputs": "schema 2 workspace、RunUnit、ProductionBatch、checkpoint/output 與 lock topology",
+        "inputs": "schema 2.1 workspace、RunUnit、ProductionBatch、schema 3.0 checkpoint/output 與 lock topology",
         "outputs": "RunExecutionSummary、progress lifecycle、checkpoint pointer 與可恢復 run 狀態",
         "entrypoints": [
             "initialize_run_workspace",
@@ -609,7 +611,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": "鎖檔只表達 topology，實際互斥由 fcntl.flock 提供；NFS/NAS 語意仍須在目標環境另行 preflight。",
     },
     "run_validation": {
-        "role": "唯讀驗證 schema 2 workspace、checkpoint、shard 與工程摘要",
+        "role": "唯讀驗證 run workspace、schema 3.0／舊 checkpoint、shard 與工程摘要",
         "inputs": "run plan/progress、scenario／seed table、lock topology、checkpoint/output checksum",
         "outputs": "JSON-safe valid/errors/summary 與 benchmark report；不修復現場檔案",
         "entrypoints": ["validate_run", "benchmark_report"],

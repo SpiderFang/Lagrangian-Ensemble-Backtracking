@@ -256,6 +256,29 @@ def test_missing_cache_measurement_on_either_resume_side_is_legacy() -> None:
     assert _merge_metrics({**base}, previous)["forcing_cache_stats_semantics"] == "legacy_unknown"
 
 
+def test_checkpoint_and_output_byte_counters_never_round_trip_through_float() -> None:
+    """大於 float 精確整數上限的容量累加仍須逐 byte 保持原生 int。"""
+
+    current = {
+        "wall_seconds": 1.0,
+        "process_cpu_seconds": 1.0,
+        "max_rss_bytes": 1,
+        "output_bytes": 2**60 + 3,
+        "checkpoint_bytes": 2**60 + 5,
+        "particle_steps": 1,
+    }
+    previous = {
+        **current,
+        "output_bytes": 7,
+        "checkpoint_bytes": 11,
+    }
+    merged = _merge_metrics(current, previous)
+    assert merged["output_bytes"] == 2**60 + 10
+    assert merged["checkpoint_bytes"] == 2**60 + 16
+    assert type(merged["output_bytes"]) is int
+    assert type(merged["checkpoint_bytes"]) is int
+
+
 def test_invocation_counter_regression_is_rejected() -> None:
     """同 invocation 的較新 counter 不得回退覆蓋已觀測的事件數。"""
 

@@ -1,8 +1,15 @@
 """安全保存與恢復 reference／production 粒子中途狀態。
 
 schema 1 只保存 ``ParticleState``，本模組保留其既有 ``write_checkpoint``／
-``load_checkpoint`` API。execution checkpoint 的 writer 固定發布 schema ``2.2.0``，
-保存完整 ``ParticleExecutionState``、每條粒子的 PCG64DXSM generator state、triangle hint
+``load_checkpoint`` API。execution checkpoint 的新 writer 固定發布 schema ``3.0.0``，
+以不可變歷史 segment 與小型 current-state compact 分離寫入；每次 checkpoint 只追加
+本次新增的 observation／event rows，不重寫既有歷史。loader 會沿每一代
+``checkpoint.json`` SHA-256 chain 還原完整 execution；該 manifest 同時綁定 compact、
+history segment、RNG 與 provenance。schema ``2.0.0``／``2.1.0``／``2.2.0`` 僅作舊檔工程相容讀取。
+為了讓舊 run 可持續使用，
+``load_execution_checkpoint`` 仍接受三個 2.x 版本，但不會把舊目錄原地升級。
+舊有 2.2 payload 的讀取契約如下：schema ``2.2.0`` 保存完整 ``ParticleExecutionState``、
+每條粒子的 PCG64DXSM generator state、triangle hint
 與固定 RunUnit identity；schema ``2.0.0``／``2.1.0`` 僅作舊檔工程相容讀取。2.2 observation
 在既有環境樣本欄位之外，保存同一個輸出觀測點的總速度、OCM current、Stokes 水平速度、
 向上為正的沉降速度、速度樣本狀態與獨立速度品質旗標；這些欄位必須由 engine 的明示
@@ -24,9 +31,9 @@ import math
 import os
 import re
 import shutil
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -45,6 +52,9 @@ from .models import (
     VelocitySampleStatus,
 )
 from .outputs import sha256_file
+
+_SCHEMA30_VERSION = "3.0.0"
+CHECKPOINT_SCHEMA_VERSION = _SCHEMA30_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +85,7 @@ class CheckpointBinding:
 
 @dataclass(slots=True)
 class ExecutionCheckpoint:
-    """schema 2.0／2.1／2.2 execution checkpoint 的記憶體表示，供 loader 與 ``ProductionBatch`` 共用。
+    """schema 2.x／3.0 execution checkpoint 的記憶體表示，供 loader 與 ``ProductionBatch`` 共用。
 
     ``executions``、``rng_states``、``triangle_hints`` 與 ``run_unit_identities`` 的順序
     都是固定 particle order；任何一項重新排序都會在讀取或 restore 時拒絕。``binding``
@@ -88,6 +98,9 @@ class ExecutionCheckpoint:
     executions: list[ParticleExecutionState]
     rng_states: list[dict[str, Any]]
     triangle_hints: list[int]
+    schema_version: str = _SCHEMA30_VERSION
+    observation_cursors: list[int] = field(default_factory=list)
+    event_cursors: list[int] = field(default_factory=list)
 
     @property
     def particle_order(self) -> tuple[str, ...]:
@@ -99,11 +112,13 @@ class ExecutionCheckpoint:
 _SCHEMA20_VERSION = "2.0.0"
 _SCHEMA21_VERSION = "2.1.0"
 _SCHEMA22_VERSION = "2.2.0"
-_WRITER_SCHEMA_VERSION = _SCHEMA22_VERSION
+_WRITER_SCHEMA_VERSION = _SCHEMA30_VERSION
 _SUPPORTED_EXECUTION_SCHEMA_VERSIONS = frozenset(
-    {_SCHEMA20_VERSION, _SCHEMA21_VERSION, _SCHEMA22_VERSION}
+    {_SCHEMA20_VERSION, _SCHEMA21_VERSION, _SCHEMA22_VERSION, _SCHEMA30_VERSION}
 )
 _SCHEMA2_DATA_FILES = frozenset({"execution_state.json", "rng_states.json"})
+_SCHEMA3_DATA_FILES = frozenset({"compact_state.json", "history_segment.json"})
+_SCHEMA3_GENERATION_NAME_RE = re.compile(r"checkpoint-[0-9]{8}\Z")
 _BINDING_FIELDS = (
     "config_hash",
     "input_inventory_hash",
@@ -241,6 +256,15 @@ def _nonnegative_int(value: Any, *, label: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{label} 必須是非負整數")
     return value
+
+
+def _positive_int(value: Any, *, label: str) -> int:
+    """解析嚴格大於零的整數欄位，供 generation 與粒子計數使用。"""
+
+    normalized = _nonnegative_int(value, label=label)
+    if normalized < 1:
+        raise ValueError(f"{label} 必須是正整數")
+    return normalized
 
 
 def _integer(value: Any, *, label: str) -> int:
@@ -431,16 +455,16 @@ def _serialize_observation(
     *,
     schema_version: str = _WRITER_SCHEMA_VERSION,
 ) -> dict[str, Any]:
-    """把 Observation 序列化成 writer 固定發布的 2.2 JSON object。
+    """把 Observation 序列化成 v3 segment／compact 使用的固定 JSON object。
 
-    2.2 以明確固定的 23 欄保存舊有位置／狀態、環境 context 與速度紀錄；不使用目前
+    2.2 與 3.0 以明確固定的 23 欄保存舊有位置／狀態、環境 context 與速度紀錄；不使用目前
     ``Observation`` dataclass 的反射欄位集合，避免日後新增執行期欄位時改變檔案拓撲。
     列舉使用穩定的 ``value`` 而不是 Python 名稱；``None`` 是唯一的 JSON 缺值表示，
     絕不把 NaN／無限值當作缺值。函式刻意拒絕以 schema 2.0／2.1 寫檔，因為兩者僅是
     loader 的舊檔工程相容格式，不能讓新 writer 產生沒有新速度紀錄的 checkpoint。
     """
 
-    if schema_version != _WRITER_SCHEMA_VERSION:
+    if schema_version not in {_SCHEMA22_VERSION, _SCHEMA30_VERSION}:
         raise ValueError("execution checkpoint writer 不提供 schema 2.0／2.1 downgrade")
     row = {name: getattr(observation, name) for name in _SCHEMA22_OBSERVATION_FIELDS}
     row["status"] = observation.status.value
@@ -458,7 +482,7 @@ def _deserialize_observation(
     """依 execution schema 嚴格還原 Observation 並交由 constructor 驗證跨欄位契約。
 
     schema 2.0 的 observation 只允許原有七欄；schema 2.1 只允許七欄加五個環境欄位；
-    schema 2.2 才允許再加固定的 11 個速度欄位。舊版本讀取後新增欄位一律保持 engine
+    schema 2.2／3.0 才允許再加固定的 11 個速度欄位。舊版本讀取後新增欄位一律保持 engine
     預設的 ``NOT_SAMPLED`` 與 ``None``，不從時間、位置、月份、深度或總速度推測。2.1／
     2.2 的有限數值、合法 ``YYYYMM``、狀態列舉與原生整數品質旗標先經本模組的 JSON
     邊界檢查，再交給 engine constructor 做 status／垂向範圍／速度總和的 cross-field
@@ -469,7 +493,7 @@ def _deserialize_observation(
         expected_fields = _LEGACY_OBSERVATION_FIELDS
     elif schema_version == _SCHEMA21_VERSION:
         expected_fields = _SCHEMA21_OBSERVATION_FIELDS
-    elif schema_version == _SCHEMA22_VERSION:
+    elif schema_version in {_SCHEMA22_VERSION, _SCHEMA30_VERSION}:
         expected_fields = _SCHEMA22_OBSERVATION_FIELDS
     else:
         raise ValueError(f"checkpoint schema 不支援：{schema_version!r}")
@@ -485,7 +509,7 @@ def _deserialize_observation(
         "z_m": _finite_float(row["z_m"], label=f"{label}.z_m"),
         "status": _particle_status(row["status"], label=f"{label}.status"),
     }
-    if schema_version in {_SCHEMA21_VERSION, _SCHEMA22_VERSION}:
+    if schema_version in {_SCHEMA21_VERSION, _SCHEMA22_VERSION, _SCHEMA30_VERSION}:
         kwargs.update(
             environment_sample_status=_environment_sample_status(
                 row["environment_sample_status"],
@@ -500,7 +524,7 @@ def _deserialize_observation(
                 row["environment_qc_flags"], label=f"{label}.environment_qc_flags"
             ),
         )
-    if schema_version == _SCHEMA22_VERSION:
+    if schema_version in {_SCHEMA22_VERSION, _SCHEMA30_VERSION}:
         kwargs.update(
             velocity_sample_status=_velocity_sample_status(
                 row["velocity_sample_status"],
@@ -542,7 +566,9 @@ def _validate_attributes(value: Any, *, label: str) -> dict[str, bool | float | 
     ``isinstance``，可避免 bool 被當成 int，或自訂數值物件在序列化時產生不穩定結果。
     """
 
-    if type(value) is not dict:
+    # schema 3 的 BoundaryEvent.attributes 由輕量 tracker 包裝；它仍是受限 mapping，
+    # 序列化時轉回普通 dict 以維持既有 JSON 契約，不讓追蹤器類別名稱滲入檔案格式。
+    if not isinstance(value, Mapping):
         raise ValueError(f"{label} 必須是 object")
     result: dict[str, bool | float | int | str] = {}
     for key, item in value.items():
@@ -706,9 +732,9 @@ def _serialize_execution(
 ) -> dict[str, Any]:
     """完整序列化一條 execution，不遺漏觀測、事件、步數或輸出游標。
 
-    execution 的資料拓撲在 2.0／2.1／2.2 間保持不變，差異只在 observation 欄位；
-    writer 明示傳入 2.2，並由 observation serializer 保證永不產生沒有新速度欄位的舊
-    payload。讀取端則依 metadata 版本選擇對應的固定 observation 欄位集合。
+    execution 的資料拓撲在 2.0／2.1／2.2 間保持不變，差異只在 observation 欄位；v3
+    writer 不把整條 execution 放進 compact，而是另由呼叫端挑出 immutable history rows。
+    舊版 fixture helper 會明示傳入 2.2，讀取端則依 metadata 版本選擇固定欄位集合。
     """
 
     if not execution.observations:
@@ -763,6 +789,149 @@ def _validate_observation_sequence(
         raise ValueError(f"{label} 最後 age_seconds 超過目前 state")
     if state.time_utc_ns > last.time_utc_ns:
         raise ValueError(f"{label} time_utc_ns 晚於目前 state")
+
+
+def _observation_core(value: Observation) -> tuple[object, ...]:
+    """提取 engine 同點替換契約固定的 identity、UTC 時間與回溯年齡。
+
+    engine 的 ``_append_or_replace_observation`` 以 particle、time 與 age 判斷是否更新
+    最後一筆 observation；同點的 status、context 及經邊界修正後的 x/y/z 都可能合法變更。
+    checkpoint continuation 必須遵循這個既有契約，否則會把合法的 surface recovery 誤判
+    成歷史篡改。較早 stable row 仍由完整 dataclass equality 驗證。
+    """
+
+    return (
+        value.particle_id,
+        value.time_utc_ns,
+        value.age_seconds,
+    )
+
+
+def _require_observation_core_match(
+    expected: Observation,
+    actual: Observation,
+    *,
+    label: str,
+) -> None:
+    """核對跨 generation observation 核心；status/context 更新仍由 engine 契約允許。
+
+    同一輸出點的 engine 更新可改變生命週期 status、環境／速度 context，以及邊界修正後
+    的位置；particle identity、UTC time 與回溯年齡一旦不同，就代表呼叫端換成另一筆
+    observation。這種替換若只依 cursor 切片會在 restore 時靜默遺失，因此直接以 engine
+    的同點 key 比對拒絕。
+    """
+
+    if _observation_core(expected) != _observation_core(actual):
+        raise ValueError(f"{label} observation core 不一致")
+
+
+def _validate_legacy_execution_prefix(
+    current: ParticleExecutionState,
+    legacy: ParticleExecutionState,
+    *,
+    label: str,
+) -> None:
+    """確認 schema 2 migration 的 current history 仍以 legacy execution 為前綴。
+
+    legacy payload 會被完整載入一次，因此遷移 root 可以逐筆驗證，而不必把舊目錄改寫。
+    最後一筆 observation 允許 engine 既有的同點 status/context 更新；其核心欄位與所有
+    更早 observation、event row 則必須逐欄相同。current 只能追加資料，不能刪除或重排
+    legacy history。
+    """
+
+    if len(current.observations) < len(legacy.observations):
+        raise ValueError(f"{label} observations 不再以 legacy 為前綴")
+    if len(current.events) < len(legacy.events):
+        raise ValueError(f"{label} events 不再以 legacy 為前綴")
+    for index, (expected, actual) in enumerate(
+        zip(legacy.observations, current.observations, strict=False)
+    ):
+        if index == len(legacy.observations) - 1:
+            _require_observation_core_match(
+                expected,
+                actual,
+                label=f"{label}.observations[{index}]",
+            )
+        elif expected != actual:
+            raise ValueError(f"{label}.observations[{index}] stable row 不一致")
+    for index, (expected, actual) in enumerate(
+        zip(legacy.events, current.events, strict=False)
+    ):
+        if expected != actual:
+            raise ValueError(f"{label}.events[{index}] stable row 不一致")
+
+
+def _validate_terminal_continuation(
+    execution: ParticleExecutionState,
+    previous_record: Mapping[str, Any],
+    *,
+    rng_state: Mapping[str, Any],
+    triangle_hint: int,
+    label: str,
+) -> None:
+    """凍結上一代已終止粒子的 current compact 與 history 邊界。
+
+    粒子一旦進入非 ``ACTIVE`` 狀態，engine 不應再替它產生任何步進、事件或觀測；
+    公開 writer 也必須把這項生命週期契約當成資料完整性閘門。這裡只比較上一代 compact
+    保存的 O(P) 輕量欄位：完整 ``ParticleState``、步數與最小步長夾制計數、下一個輸出
+    年齡、history cursors、pending observation、RNG state 與三角形提示。既有 history
+    tracker 會另外拒絕已發布 prefix 的內容修改，因而不需要為每個 generation 重讀整條
+    歷史來建立平方級驗證成本。任何新增或替換 terminal particle 的資料都直接拒絕，避免
+    產生 loader 可讀但執行語意已分歧的後代 checkpoint。
+    """
+
+    previous_state = _deserialize_particle_state(
+        previous_record["state"], label=f"{label}.previous.state"
+    )
+    if previous_state.status is ParticleStatus.ACTIVE:
+        return
+
+    if _serialize_particle_state(execution.state) != previous_record["state"]:
+        raise ValueError(f"{label} terminal state 不可在後代 generation 改變")
+    previous_step_count = _nonnegative_int(
+        previous_record["step_count"], label=f"{label}.previous.step_count"
+    )
+    previous_minimum_clamp_count = _nonnegative_int(
+        previous_record["minimum_clamp_count"], label=f"{label}.previous.minimum_clamp_count"
+    )
+    previous_next_output_age_seconds = _finite_float(
+        previous_record["next_output_age_seconds"],
+        label=f"{label}.previous.next_output_age_seconds",
+    )
+    previous_observation_cursor = _nonnegative_int(
+        previous_record["observation_cursor"], label=f"{label}.previous.observation_cursor"
+    )
+    previous_event_cursor = _nonnegative_int(
+        previous_record["event_cursor"], label=f"{label}.previous.event_cursor"
+    )
+    if execution.step_count != previous_step_count:
+        raise ValueError(f"{label} terminal step_count 不可在後代 generation 改變")
+    if execution.minimum_clamp_count != previous_minimum_clamp_count:
+        raise ValueError(f"{label} terminal minimum_clamp_count 不可在後代 generation 改變")
+    if execution.next_output_age_seconds != previous_next_output_age_seconds:
+        raise ValueError(f"{label} terminal next_output_age_seconds 不可在後代 generation 改變")
+    if len(execution.observations) != previous_observation_cursor + 1:
+        raise ValueError(f"{label} terminal observation history 不可新增或刪除")
+    if len(execution.events) != previous_event_cursor:
+        raise ValueError(f"{label} terminal event history 不可新增或刪除")
+
+    # 即使 pending row 後續只用序列化結果比較，也先完整反序列化一次，確保上一代
+    # compact 的 observation 欄位仍符合 engine 的 schema 與有限值契約。
+    _deserialize_observation(
+        previous_record["pending_observation"],
+        label=f"{label}.previous.pending_observation",
+        schema_version=_SCHEMA30_VERSION,
+    )
+    if _serialize_observation(
+        execution.observations[-1], schema_version=_SCHEMA30_VERSION
+    ) != previous_record["pending_observation"]:
+        raise ValueError(f"{label} terminal pending observation 不可在後代 generation 改變")
+    if dict(rng_state) != previous_record["rng_state"]:
+        raise ValueError(f"{label} terminal RNG state 不可在後代 generation 改變")
+    if triangle_hint != _normalize_triangle_hint(
+        previous_record["triangle_hint"], label=f"{label}.previous.triangle_hint"
+    ):
+        raise ValueError(f"{label} terminal triangle hint 不可在後代 generation 改變")
 
 
 def _deserialize_execution(
@@ -874,7 +1043,7 @@ def build_execution_checkpoint(
     rngs: Sequence[np.random.Generator],
     triangle_hints: Sequence[int | None],
 ) -> ExecutionCheckpoint:
-    """建立 execution snapshot，供記憶體檢查及 schema 2.2 磁碟 writer 共用。
+    """建立 execution snapshot，供記憶體檢查及 schema 3.0 磁碟 writer 共用。
 
     ``run_units``、``executions``、``rngs`` 與 ``triangle_hints`` 必須逐項同序；state 的
     particle／scenario／member／站點／受體／到達時間會立即和 RunUnit 核對。這個函式只
@@ -893,6 +1062,8 @@ def build_execution_checkpoint(
     if len(set(identity_tuples)) != len(identity_tuples):
         raise ValueError("execution checkpoint RunUnit identity 必須唯一")
     normalized_hints: list[int] = []
+    observation_cursors: list[int] = []
+    event_cursors: list[int] = []
     copied_executions: list[ParticleExecutionState] = []
     copied_rng_states: list[dict[str, Any]] = []
     for index, (identity, execution, rng, triangle_hint) in enumerate(
@@ -912,6 +1083,8 @@ def build_execution_checkpoint(
         normalized_hint = _normalize_triangle_hint(triangle_hint, label=f"triangle_hints[{index}]")
         _serialize_execution(execution, triangle_hint=normalized_hint)
         normalized_hints.append(normalized_hint)
+        observation_cursors.append(len(execution.observations))
+        event_cursors.append(len(execution.events))
         copied_executions.append(deepcopy(execution))
         copied_rng_states.append(_copy_rng_state(rng))
     return ExecutionCheckpoint(
@@ -921,10 +1094,13 @@ def build_execution_checkpoint(
         executions=copied_executions,
         rng_states=copied_rng_states,
         triangle_hints=normalized_hints,
+        schema_version=_WRITER_SCHEMA_VERSION,
+        observation_cursors=observation_cursors,
+        event_cursors=event_cursors,
     )
 
 
-def write_execution_checkpoint(
+def _write_execution_checkpoint_schema22(
     destination: str | Path,
     *,
     binding: CheckpointBinding,
@@ -934,14 +1110,17 @@ def write_execution_checkpoint(
     triangle_hints: Sequence[int | None],
     sequence: int,
 ) -> Path:
-    """以 schema 2.2.0 原子寫入 execution checkpoint，保存完整軌跡與 RNG continuation。
+    """以相容用途原子寫入 schema 2.2.0 execution checkpoint。
 
     目標已存在時拒絕覆寫；寫入期間使用同父目錄的 ``.partial-*``，只有 execution JSON、
     RNG JSON、大小與 SHA-256 manifest 都成功建立後才以 ``os.replace`` 發布。空 shard、
     duplicate identity、非 PCG64DXSM、未知狀態或不一致欄位會在建立 partial 前拒絕。新
     writer 沒有 downgrade 參數；schema 2.0／2.1 僅由 loader 相容讀取，不能由新寫入流程
-    製造。新 writer 固定寫出 2.2 的 11 個速度欄位，即使 observation 是 ``NOT_SAMPLED``
+    製造。這個 fixture helper 固定寫出 2.2 的 11 個速度欄位，即使 observation 是 ``NOT_SAMPLED``
     也會保存其明示的狀態與 ``None`` 缺值，而不會將舊資料偽裝成速度證據。
+    此函式只保留給需要建立舊版 fixture 的內部相容路徑；正式 ``ProductionBatch`` writer
+    使用下面的 ``write_execution_checkpoint``，固定發布 schema 3.0.0，避免每次 checkpoint
+    重寫完整 observation／event history。
     """
 
     if not isinstance(binding, CheckpointBinding):
@@ -959,8 +1138,8 @@ def write_execution_checkpoint(
         raise FileExistsError(f"不可覆寫 checkpoint：{target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.parent / f".{target.name}.partial-{uuid4().hex}"
-    partial.mkdir()
     try:
+        partial.mkdir()
         execution_records = []
         observation_count = 0
         event_count = 0
@@ -973,7 +1152,9 @@ def write_execution_checkpoint(
             execution_payload = _serialize_execution(
                 execution,
                 triangle_hint=triangle_hint,
-                schema_version=_WRITER_SCHEMA_VERSION,
+                # 這個私有 helper 只供建立舊版 fixture；正式 writer 由下方
+                # ``write_execution_checkpoint`` 固定發布 schema 3.0.0。
+                schema_version=_SCHEMA22_VERSION,
             )
             execution_records.append({"identity": identity, "execution": execution_payload})
             observation_count += len(execution.observations)
@@ -997,7 +1178,7 @@ def write_execution_checkpoint(
             for path in (execution_path, rng_path)
         }
         metadata = {
-            "schema_version": _WRITER_SCHEMA_VERSION,
+            "schema_version": _SCHEMA22_VERSION,
             "sequence": snapshot.sequence,
             "particle_count": len(snapshot.executions),
             "observation_count": observation_count,
@@ -1008,7 +1189,1475 @@ def write_execution_checkpoint(
         }
         _write_json(partial / "checkpoint.json", metadata, sort_keys=True)
         os.replace(partial, target)
-    except Exception:
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    return target
+
+
+def _binding_from_payload(value: Any, *, label: str = "binding") -> CheckpointBinding:
+    """嚴格解析 JSON binding，讓 2.x 與 3.0 loader 共用同一個 identity gate。"""
+
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必須是 object")
+    keys = set(value)
+    if keys == set(_BINDING_FIELDS):
+        row = _require_exact_keys(value, _BINDING_FIELDS, label=label)
+    elif keys == set(_BINDING_FIELDS_WITH_RANDOM):
+        row = _require_exact_keys(value, _BINDING_FIELDS_WITH_RANDOM, label=label)
+        if type(row["random_stream_id"]) is not str or not row["random_stream_id"].strip():
+            raise ValueError(f"{label}.random_stream_id 必須是非空白字串")
+    else:
+        raise ValueError(f"{label} 欄位集合不符")
+    try:
+        return CheckpointBinding(**row)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} 欄位無效") from error
+
+
+def _sha256_or_none(value: Any, *, label: str) -> str | None:
+    """解析 segment chain 使用的可空 SHA-256，避免空字串偽裝 chain root。"""
+
+    if value is None:
+        return None
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} 必須是小寫 SHA-256 或 None")
+    return value
+
+
+class _CheckpointTrackedAttributes(dict[str, Any]):
+    """追蹤已發布 BoundaryEvent.attributes 的巢狀 dict 修改。"""
+
+    __slots__ = ("_checkpoint_owner", "_checkpoint_stable")
+
+    def __init__(
+        self,
+        value: Mapping[str, Any] | None = None,
+        *,
+        owner: _CheckpointHistoryList | None = None,
+        stable: bool = False,
+    ) -> None:
+        """建立 attributes 追蹤器；stable 只用於上一代已發布 event。"""
+
+        super().__init__({} if value is None else value)
+        self._checkpoint_owner = owner
+        self._checkpoint_stable = stable
+
+    def _mark_if_stable(self) -> None:
+        """巢狀欄位改動若屬已發布 event，標記 owner history dirty。"""
+
+        if self._checkpoint_stable and self._checkpoint_owner is not None:
+            self._checkpoint_owner._checkpoint_history_dirty = True
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """追蹤 attributes 單欄修改。"""
+
+        self._mark_if_stable()
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: str) -> None:
+        """追蹤 attributes 單欄刪除。"""
+
+        self._mark_if_stable()
+        super().__delitem__(key)
+
+    def clear(self) -> None:
+        """追蹤 attributes 清除。"""
+
+        self._mark_if_stable()
+        super().clear()
+
+    _MISSING = object()
+
+    def pop(self, key: str, default: Any = _MISSING) -> Any:
+        """追蹤 attributes pop。"""
+
+        if key in self:
+            self._mark_if_stable()
+        if default is self._MISSING:
+            return super().pop(key)
+        return super().pop(key, default)
+
+    def popitem(self) -> tuple[str, Any]:
+        """追蹤 attributes popitem。"""
+
+        self._mark_if_stable()
+        return super().popitem()
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        """追蹤 attributes setdefault。"""
+
+        if key not in self:
+            self._mark_if_stable()
+        return super().setdefault(key, default)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        """追蹤 attributes update。"""
+
+        if args or kwargs:
+            self._mark_if_stable()
+        super().update(*args, **kwargs)
+
+    def __ior__(self, value: Mapping[str, Any]) -> _CheckpointTrackedAttributes:
+        """追蹤 ``attributes |= mapping``；dict 內建實作不一定呼叫 update hook。"""
+
+        self._mark_if_stable()
+        super().__ior__(value)
+        return self
+
+    def mark_checkpoint_stable(self, stable: bool) -> None:
+        """設定此 attributes 是否屬於已發布 event。"""
+
+        self._checkpoint_stable = bool(stable)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        """deepcopy 時輸出無 owner 的普通 dict，避免複製追蹤器循環參照。"""
+
+        copied = {deepcopy(key, memo): deepcopy(value, memo) for key, value in self.items()}
+        memo[id(self)] = copied
+        return copied
+
+
+class _CheckpointHistoryList(list[Any]):
+    """追蹤已發布歷史前綴，拒絕把 immutable row 靜默換成另一筆資料。
+
+    ``ParticleExecutionState`` 的 observations/events 在 engine 內仍是可變 list：最新
+    observation 可能因同一時間／位置的 status 或 context 更新而被替換，事件則只會追加。
+    schema 3 writer 若只依 cursor 切片，呼叫端把較早的 stable row 改掉時會悄悄忽略該改動，
+    造成記憶體中的 execution 與 restore 後的 chain 不一致。這個 list subclass 記住上次
+    發布後的 immutable prefix 長度；對該前綴的替換、刪除、插入或排序會標記 dirty，writer
+    在下一次發布前 fail-closed。prefix 之後的 observation pending/context 更新與 event
+    append 仍符合 engine 契約。這項追蹤只保存一個整數與旗標，不複製歷史資料。
+    """
+
+    __slots__ = ("_checkpoint_immutable_prefix_length", "_checkpoint_history_dirty")
+
+    def __init__(self, iterable: Sequence[Any] = (), *, immutable_prefix_length: int = 0) -> None:
+        """建立可追蹤 list；prefix 長度代表最近一次成功發布的穩定 row 數。"""
+
+        super().__init__()
+        self._checkpoint_immutable_prefix_length = 0
+        self._checkpoint_history_dirty = False
+        self.extend(iterable)
+        self.mark_checkpoint_prefix(immutable_prefix_length)
+
+    def _mark_if_prefix_touched(self, index: int) -> None:
+        """若索引落在 immutable prefix 內，記錄不可接受的歷史修改。"""
+
+        normalized = index if index >= 0 else len(self) + index
+        if normalized < self._checkpoint_immutable_prefix_length:
+            self._checkpoint_history_dirty = True
+
+    def __setitem__(self, index: int | slice, value: Any) -> None:
+        """追蹤單項或區段替換；pending row 以後的修改仍可由 engine 使用。"""
+
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            touched = list(range(start, stop, step))
+            # 空 slice assignment 是插入操作；只要插入點落在 immutable prefix 中，
+            # 即使原本沒有被替換的 index，也會改變後續 cursor，必須標記 dirty。
+            insertion_point = start if step > 0 else stop
+            if (
+                any(item < self._checkpoint_immutable_prefix_length for item in touched)
+                or insertion_point < self._checkpoint_immutable_prefix_length
+            ):
+                self._checkpoint_history_dirty = True
+            # list 的 slice assignment 接受任意 iterable；先 materialize，才能讓 tuple、
+            # generator 等呼叫形式也取得與 append 相同的 BoundaryEvent attributes tracker。
+            value = list(value)
+            if index.step is None:
+                value = [
+                    self._wrap_event(
+                        item,
+                        stable=start < self._checkpoint_immutable_prefix_length,
+                    )
+                    for item in value
+                ]
+            else:
+                value = [
+                    self._wrap_event(
+                        item,
+                        stable=position < self._checkpoint_immutable_prefix_length,
+                    )
+                    for position, item in zip(touched, value, strict=True)
+                ]
+        else:
+            self._mark_if_prefix_touched(index)
+            value = self._wrap_event(
+                value,
+                stable=(index if index >= 0 else len(self) + index)
+                < self._checkpoint_immutable_prefix_length,
+            )
+        super().__setitem__(index, value)
+
+    def __delitem__(self, index: int | slice) -> None:
+        """追蹤刪除，避免 stable prefix 被縮短或重排。"""
+
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            if any(
+                item < self._checkpoint_immutable_prefix_length
+                for item in range(start, stop, step)
+            ):
+                self._checkpoint_history_dirty = True
+        else:
+            self._mark_if_prefix_touched(index)
+        super().__delitem__(index)
+
+    def _wrap_event(self, value: Any, *, stable: bool) -> Any:
+        """將 BoundaryEvent 的巢狀 attributes 綁回此 history tracker。"""
+
+        if not isinstance(value, BoundaryEvent):
+            return value
+        if (
+            isinstance(value.attributes, _CheckpointTrackedAttributes)
+            and value.attributes._checkpoint_owner is self
+        ):
+            # 同一 BoundaryEvent 可能被呼叫端 append／insert 到另一個位置；直接共用
+            # owner tracker 並把 stable 降成 False 會讓原本已發布 row 失去 dirty
+            # 追蹤。只有 stable 狀態相同才能安全重用，否則複製 event 與 attributes。
+            if value.attributes._checkpoint_stable == stable:
+                return value
+            return replace(
+                value,
+                attributes=_CheckpointTrackedAttributes(
+                    value.attributes,
+                    owner=self,
+                    stable=stable,
+                ),
+            )
+        return replace(
+            value,
+            attributes=_CheckpointTrackedAttributes(value.attributes, owner=self, stable=stable),
+        )
+
+    def append(self, value: Any) -> None:
+        """追加 event 時建立未發布 attributes tracker；observation 則原樣追加。"""
+
+        super().append(self._wrap_event(value, stable=False))
+
+    def extend(self, values: Sequence[Any]) -> None:
+        """逐項追加並追蹤新 event 的 attributes。"""
+
+        for value in values:
+            self.append(value)
+
+    def insert(self, index: int, value: Any) -> None:
+        """追蹤插入；插入 stable prefix 會改變既有 row cursor，必須拒絕。"""
+
+        normalized = index if index >= 0 else max(0, len(self) + index)
+        if normalized < self._checkpoint_immutable_prefix_length:
+            self._checkpoint_history_dirty = True
+        super().insert(
+            index,
+            self._wrap_event(value, stable=normalized < self._checkpoint_immutable_prefix_length),
+        )
+
+    def clear(self) -> None:
+        """清空 history 會觸碰任何既有 prefix，故先標記 dirty。"""
+
+        if self._checkpoint_immutable_prefix_length:
+            self._checkpoint_history_dirty = True
+        super().clear()
+
+    def pop(self, index: int = -1) -> Any:
+        """追蹤移除 history row。"""
+
+        # 只有實際成功移除 row 才標記 dirty；若 index 無效，list.pop 原本應拋出
+        # IndexError，不能把「沒有任何資料變更」誤記成永久不可續跑。
+        normalized = index if index >= 0 else len(self) + index
+        if 0 <= normalized < len(self):
+            self._mark_if_prefix_touched(index)
+        return super().pop(index)
+
+    def remove(self, value: Any) -> None:
+        """追蹤依值移除 history row；位置未知時以 dirty 保守處理。"""
+
+        try:
+            index = self.index(value)
+        except ValueError:
+            # 與普通 list.remove 相同，找不到資料時不應改變 tracker 狀態。
+            raise
+        if index < self._checkpoint_immutable_prefix_length:
+            self._checkpoint_history_dirty = True
+        super().remove(value)
+
+    def reverse(self) -> None:
+        """反轉 history 會改變 stable row 順序，直接標記 dirty。"""
+
+        if self:
+            self._checkpoint_history_dirty = True
+        super().reverse()
+
+    def sort(self, *args: Any, **kwargs: Any) -> None:
+        """排序 history 會改變 stable row 順序，直接標記 dirty。"""
+
+        if self:
+            self._checkpoint_history_dirty = True
+        super().sort(*args, **kwargs)
+
+    def __imul__(self, value: int) -> _CheckpointHistoryList:
+        """追蹤重複或清空 list 的 in-place 操作。"""
+
+        if self and self._checkpoint_immutable_prefix_length and value != 1:
+            self._checkpoint_history_dirty = True
+        if value == 1:
+            return self
+        return super().__imul__(value)
+
+    def __iadd__(self, values: Sequence[Any]) -> _CheckpointHistoryList:
+        """追蹤 in-place 追加。"""
+
+        self.extend(values)
+        return self
+
+    @property
+    def checkpoint_immutable_prefix_length(self) -> int:
+        """回傳最近一次發布時承諾不可變的 row 數。"""
+
+        return self._checkpoint_immutable_prefix_length
+
+    @property
+    def checkpoint_history_dirty(self) -> bool:
+        """回傳 stable prefix 是否曾被呼叫端修改。"""
+
+        return self._checkpoint_history_dirty
+
+    def mark_checkpoint_prefix(self, length: int) -> None:
+        """在成功發布後設定新的 stable prefix，清除本次已驗證的 dirty 標記。"""
+
+        if type(length) is not int or length < 0 or length > len(self):
+            raise ValueError("checkpoint immutable prefix 長度無效")
+        previous_length = self._checkpoint_immutable_prefix_length
+        if length < previous_length:
+            raise ValueError("checkpoint immutable prefix 不可回退")
+        self._checkpoint_immutable_prefix_length = length
+        self._checkpoint_history_dirty = False
+        # 觀測列是 immutable dataclass，不含可變 attributes；不必在每次 checkpoint 重掃
+        # 完整歷史。事件的 attributes 需要轉成 stable tracker，但只處理這次新發布的
+        # prefix 區間，讓 cadence 次數增加時 CPU 成本仍與新增 event row 數近似成正比。
+        for index in range(previous_length, length):
+            value = self[index]
+            if isinstance(value, BoundaryEvent) and isinstance(
+                value.attributes, _CheckpointTrackedAttributes
+            ):
+                value.attributes.mark_checkpoint_stable(index < length)
+            elif isinstance(value, BoundaryEvent):
+                # 這個分支只會在外部以底層 list API 躲過一般 hook 時出現；發布前仍把
+                # event attributes 補上 tracker，避免之後的巢狀修改被靜默忽略。
+                super().__setitem__(
+                    index,
+                    replace(
+                        value,
+                        attributes=_CheckpointTrackedAttributes(
+                            value.attributes,
+                            owner=self,
+                            stable=True,
+                        ),
+                    ),
+                )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _CheckpointHistoryList:
+        """建立獨立追蹤 list，避免 snapshot 複製回原 owner。"""
+
+        copied = _CheckpointHistoryList()
+        memo[id(self)] = copied
+        for value in self:
+            copied.append(deepcopy(value, memo))
+        # 先維持 copied 的 prefix=0，再逐步標記到原 prefix；若先把 prefix 設成目標值，
+        # ``mark_checkpoint_prefix`` 只會掃描新增區間的設計就不會走訪既有 BoundaryEvent，
+        # 造成 deep-copy 後的 stable attributes 仍被誤標為可變，巢狀修改便可能繞過 dirty
+        # gate。最後恢復原 dirty 旗標，保留 snapshot 建立前已觀測到的篡改證據。
+        original_prefix = self._checkpoint_immutable_prefix_length
+        original_dirty = self._checkpoint_history_dirty
+        copied.mark_checkpoint_prefix(original_prefix)
+        copied._checkpoint_history_dirty = original_dirty
+        return copied
+
+
+def _track_execution_history(
+    execution: ParticleExecutionState,
+    *,
+    observation_prefix_length: int = 0,
+    event_prefix_length: int = 0,
+) -> None:
+    """把 execution 的兩條歷史 list 置於 prefix 追蹤狀態，供 writer/resume 共用。
+
+    初次建立 root 時兩個 prefix 都是零；從已發布 schema 3 restore 時，呼叫端傳入上一代
+    compact cursor 對應的 stable／event prefix。若外部以整個 plain list 取代既有追蹤物件，
+    caller 可先以本函式建立新物件，但 schema 3 continuation 仍會由 writer 的型別 gate
+    拒絕，避免把未追蹤的替換歷史當成合法延續。
+    """
+
+    for attribute, prefix_length, label in (
+        ("observations", observation_prefix_length, "observations"),
+        ("events", event_prefix_length, "events"),
+    ):
+        current = getattr(execution, attribute)
+        if isinstance(current, _CheckpointHistoryList):
+            if current.checkpoint_immutable_prefix_length != prefix_length:
+                raise ValueError(f"execution {label} checkpoint prefix 長度不一致")
+            continue
+        setattr(
+            execution,
+            attribute,
+            _CheckpointHistoryList(current, immutable_prefix_length=prefix_length),
+        )
+
+
+def _reset_checkpoint_history_tracking(execution: ParticleExecutionState) -> None:
+    """把 execution 的歷史重新視為新 chain root，保留列內容但清除舊 owner 狀態。
+
+    獨立 root writer 可以合法接收從另一份已載入 checkpoint deep-copy 出來的 execution；
+    這時原 list 可能仍帶著前一條 chain 的 immutable prefix 或 dirty 旗標。root 沒有前代
+    可供核對，應將目前所有 rows 當成新 chain 的輸入，而不是誤套用舊 cursor。migration
+    root 也先以 legacy payload 驗證 prefix，再使用相同的重置，讓新 chain 自己管理 nested
+    event attributes。schema 3 continuation 不呼叫本函式，因為那條路徑必須保留原 tracker
+    並嚴格核對前代 cursor。
+    """
+
+    for attribute in ("observations", "events"):
+        current = getattr(execution, attribute)
+        if not isinstance(current, _CheckpointHistoryList):
+            continue
+        if current.checkpoint_immutable_prefix_length == 0 and not current.checkpoint_history_dirty:
+            continue
+        setattr(execution, attribute, _CheckpointHistoryList(current))
+
+
+def _verify_schema3_files(root: Path, metadata: dict[str, Any]) -> None:
+    """驗證 schema 3 generation 的固定檔案拓撲與兩份 payload checksum。
+
+    schema 3 把 immutable history segment 與 compact current state 分成兩個普通檔案。
+    兩者都在同一個 partial directory 完成後才發布；loader 先確認目錄和 checksum，再
+    解析資料，避免將殘留 partial、symlink 或截斷檔當成可續跑狀態。
+    """
+
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"schema 3 checkpoint 根目錄必須是普通目錄：{root}")
+    expected_names = _SCHEMA3_DATA_FILES | {"checkpoint.json"}
+    entries = tuple(root.iterdir())
+    if {entry.name for entry in entries} != expected_names:
+        raise ValueError("schema 3 checkpoint 目錄含有遺失或未知檔案")
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            raise ValueError(f"schema 3 checkpoint 只允許固定普通檔案：{entry.name}")
+    files = metadata.get("files")
+    if not isinstance(files, dict) or set(files) != _SCHEMA3_DATA_FILES:
+        raise ValueError("schema 3 checkpoint files manifest 不完整或含未知檔案")
+    for filename in sorted(_SCHEMA3_DATA_FILES):
+        contract = files[filename]
+        if not isinstance(contract, dict) or set(contract) != {"size_bytes", "sha256"}:
+            raise ValueError(f"schema 3 {filename} checksum contract 不完整")
+        size = contract["size_bytes"]
+        digest = contract["sha256"]
+        if type(size) is not int or size < 0:
+            raise ValueError(f"schema 3 {filename}.size_bytes 無效")
+        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(f"schema 3 {filename}.sha256 無效")
+        path = root / filename
+        if path.stat().st_size != size or sha256_file(path) != digest:
+            raise ValueError(f"schema 3 {filename} checksum 或 size 不符")
+
+
+def _read_schema3_generation_header(
+    root: Path,
+    *,
+    expected_binding: CheckpointBinding,
+    expected_run_units: Sequence[Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """讀取 schema 3 generation 的 compact 與 segment metadata，不建立歷史 dataclass。
+
+    writer 在建立下一代 segment 時只需要上一代 compact cursor 與 checkpoint.json SHA；這個
+    helper 仍會讀取並 JSON parse 該代完整 history payload，檢查 checksum、固定欄位、cursor
+    與 row count，但不把每一列反序列化成 ``Observation``／``BoundaryEvent``。完整 hash
+    chain 與 rows 仍由 ``_load_schema3_execution_checkpoint`` 在 resume／validation 時逐代
+    還原與驗證，避免 checkpoint cadence 因重建 dataclass 引入平方級 CPU 成本。
+    """
+
+    metadata = _read_json(root / "checkpoint.json")
+    expected_metadata_keys = (
+        "schema_version",
+        "sequence",
+        "particle_count",
+        "observation_count",
+        "event_count",
+        "binding",
+        "particle_order",
+        "files",
+        "segment",
+        "chain_root_sequence",
+        "legacy_source",
+    )
+    metadata = _require_exact_keys(metadata, expected_metadata_keys, label="schema 3 metadata")
+    if metadata["schema_version"] != _SCHEMA30_VERSION:
+        raise ValueError("schema 3 generation schema_version 不符")
+    sequence = _nonnegative_int(metadata["sequence"], label="schema 3 sequence")
+    if sequence < 1:
+        raise ValueError("schema 3 sequence 必須從 1 開始")
+    chain_root_sequence = _positive_int(
+        metadata["chain_root_sequence"], label="schema 3 chain_root_sequence"
+    )
+    if chain_root_sequence > sequence:
+        raise ValueError("schema 3 chain_root_sequence 不可晚於 sequence")
+    legacy_source = metadata["legacy_source"]
+    if legacy_source is not None:
+        legacy_source = _require_exact_keys(
+            legacy_source,
+            (
+                "schema_version",
+                "sequence",
+                "relative_directory",
+                "checkpoint_json_sha256",
+            ),
+            label="schema 3 legacy source",
+        )
+        if legacy_source["schema_version"] not in {
+            _SCHEMA20_VERSION,
+            _SCHEMA21_VERSION,
+            _SCHEMA22_VERSION,
+        }:
+            raise ValueError("schema 3 legacy source schema 不支援")
+        # 舊 schema execution checkpoint 的工程序號歷來允許 0；遷移時仍須保留其原值，
+        # 例如 checkpoint-00000000 → v3 checkpoint-00000001，不能因 v3 generation 從 1
+        # 開始而把 legacy source 誤判成非法。
+        legacy_sequence = _nonnegative_int(
+            legacy_source["sequence"], label="schema 3 legacy source sequence"
+        )
+        relative_directory = legacy_source["relative_directory"]
+        if (
+            type(relative_directory) is not str
+            or _SCHEMA3_GENERATION_NAME_RE.fullmatch(relative_directory) is None
+        ):
+            raise ValueError("schema 3 legacy source relative_directory 不安全")
+        if int(relative_directory.removeprefix("checkpoint-")) != legacy_sequence:
+            raise ValueError("schema 3 legacy source sequence 與 relative_directory 不一致")
+        source_sha = _sha256_or_none(
+            legacy_source["checkpoint_json_sha256"],
+            label="schema 3 legacy source checkpoint_json_sha256",
+        )
+        if source_sha is None:
+            raise ValueError("schema 3 legacy source checkpoint_json_sha256 不可為 None")
+        source_root = root.parent / relative_directory
+        if source_root == root or source_root.is_symlink() or not source_root.is_dir():
+            raise ValueError("schema 3 legacy source 必須位於同一 parent 的固定目錄")
+        source_metadata_path = source_root / "checkpoint.json"
+        source_metadata = _read_json(source_metadata_path)
+        if source_metadata.get("schema_version") != legacy_source["schema_version"]:
+            raise ValueError("schema 3 legacy source schema_version 已改變")
+        if (
+            _nonnegative_int(
+                source_metadata.get("sequence"),
+                label="schema 3 legacy source metadata sequence",
+            )
+            != legacy_sequence
+        ):
+            raise ValueError("schema 3 legacy source sequence 已改變")
+        if sha256_file(source_metadata_path) != source_sha:
+            raise ValueError("schema 3 legacy source checkpoint.json SHA-256 不一致")
+        _verify_schema2_files(source_root, source_metadata)
+        legacy_source["sequence"] = legacy_sequence
+    particle_count = _positive_int(metadata["particle_count"], label="schema 3 particle_count")
+    observation_count = _nonnegative_int(metadata["observation_count"], label="schema 3 observation_count")
+    event_count = _nonnegative_int(metadata["event_count"], label="schema 3 event_count")
+    actual_binding = _binding_from_payload(metadata["binding"], label="schema 3 binding")
+    if actual_binding != expected_binding:
+        raise ValueError(f"checkpoint binding 不相容：actual={actual_binding}, expected={expected_binding}")
+    particle_order = metadata["particle_order"]
+    if (
+        not isinstance(particle_order, list)
+        or len(particle_order) != particle_count
+        or any(type(item) is not str or not item for item in particle_order)
+        or len(set(particle_order)) != particle_count
+    ):
+        raise ValueError("schema 3 particle_order 無效或含 duplicate")
+    segment_meta = _require_exact_keys(
+        metadata["segment"],
+        ("sequence", "previous_checkpoint_json_sha256", "record_count"),
+        label="schema 3 segment metadata",
+    )
+    segment_sequence = _nonnegative_int(
+        segment_meta["sequence"], label="schema 3 segment sequence"
+    )
+    if segment_sequence != sequence:
+        raise ValueError("schema 3 segment sequence 與 generation 不一致")
+    previous_checkpoint_json_sha256 = _sha256_or_none(
+        segment_meta["previous_checkpoint_json_sha256"],
+        label="schema 3 previous_checkpoint_json_sha256",
+    )
+    if previous_checkpoint_json_sha256 is None:
+        if legacy_source is None:
+            if sequence != 1 or chain_root_sequence != sequence:
+                raise ValueError("schema 3 無 legacy source 的 root 必須是 sequence 1")
+        elif legacy_source["sequence"] != sequence - 1 or chain_root_sequence != sequence:
+            raise ValueError("schema 3 legacy source 必須緊接 root generation")
+    elif legacy_source is not None:
+        raise ValueError("schema 3 continuation 不得帶 legacy source")
+    segment_record_count = _positive_int(
+        segment_meta["record_count"], label="schema 3 segment record_count"
+    )
+    if segment_record_count != particle_count:
+        raise ValueError("schema 3 segment record_count 不一致")
+    _verify_schema3_files(root, metadata)
+
+    compact = _read_json(root / "compact_state.json")
+    compact = _require_exact_keys(
+        compact,
+        ("schema_version", "sequence", "binding", "particle_order", "records"),
+        label="schema 3 compact state",
+    )
+    compact_sequence = _nonnegative_int(compact["sequence"], label="schema 3 compact sequence")
+    if compact["schema_version"] != _SCHEMA30_VERSION or compact_sequence != sequence:
+        raise ValueError("schema 3 compact schema/sequence 不一致")
+    compact_binding = _binding_from_payload(compact["binding"], label="schema 3 compact binding")
+    if compact_binding != expected_binding:
+        raise ValueError("schema 3 compact binding 不一致")
+    if compact["particle_order"] != particle_order:
+        raise ValueError("schema 3 compact particle_order 不一致")
+    compact_records = compact["records"]
+    if not isinstance(compact_records, list) or len(compact_records) != particle_count:
+        raise ValueError("schema 3 compact records 數量不一致")
+    identities: list[dict[str, Any]] = []
+    for index, record in enumerate(compact_records):
+        row = _require_exact_keys(
+            record,
+            (
+                "identity",
+                "state",
+                "step_count",
+                "minimum_clamp_count",
+                "next_output_age_seconds",
+                "observation_cursor",
+                "event_cursor",
+                "rng_state",
+                "triangle_hint",
+                "pending_observation",
+            ),
+            label=f"schema 3 compact.records[{index}]",
+        )
+        identity = _validate_run_identity(row["identity"], label=f"compact.records[{index}].identity")
+        if identity["particle_id"] != particle_order[index]:
+            raise ValueError("schema 3 compact particle order 與 identity 不一致")
+        state = _deserialize_particle_state(row["state"], label=f"compact.records[{index}].state")
+        if _state_identity(state) != (
+            identity["particle_id"],
+            identity["scenario_id"],
+            identity["member_id"],
+            identity["study_site_id"],
+            identity["analysis_region_id"],
+            identity["receptor_id"],
+        ):
+            raise ValueError("schema 3 compact state identity 不一致")
+        _nonnegative_int(row["step_count"], label=f"compact.records[{index}].step_count")
+        _nonnegative_int(
+            row["minimum_clamp_count"], label=f"compact.records[{index}].minimum_clamp_count"
+        )
+        next_age = _finite_float(
+            row["next_output_age_seconds"], label=f"compact.records[{index}].next_output_age_seconds"
+        )
+        if next_age <= 0:
+            raise ValueError("schema 3 compact next_output_age_seconds 必須為正")
+        observation_cursor = _nonnegative_int(
+            row["observation_cursor"],
+            label=f"compact.records[{index}].observation_cursor",
+        )
+        event_cursor = _nonnegative_int(
+            row["event_cursor"], label=f"compact.records[{index}].event_cursor"
+        )
+        pending_observation = _deserialize_observation(
+            row["pending_observation"],
+            label=f"compact.records[{index}].pending_observation",
+            schema_version=_SCHEMA30_VERSION,
+        )
+        if pending_observation.particle_id != identity["particle_id"]:
+            raise ValueError("schema 3 compact pending observation identity 不一致")
+        # 粒子可以在兩個輸出觀測點之間多走數個數值步，因此最後一筆觀測不一定
+        # 與 compact 的 current state 落在同一時間。只要求它仍位於目前 state 之前，
+        # 並保留完整 loader 對歷史順序的進一步檢查。
+        if (
+            state.age_seconds + 1.0e-9 < pending_observation.age_seconds
+            or state.time_utc_ns > pending_observation.time_utc_ns
+        ):
+            raise ValueError("schema 3 compact pending observation 晚於 current state")
+        _validate_rng_state(row["rng_state"], label=f"compact.records[{index}].rng_state")
+        _normalize_triangle_hint(row["triangle_hint"], label=f"compact.records[{index}].triangle_hint")
+        # 後續 header cursor 比對使用已驗證的 Python int，避免 JSON bool 因為
+        # ``True == 1`` 被錯誤視為合法 cursor。
+        row["observation_cursor"] = observation_cursor
+        row["event_cursor"] = event_cursor
+        identities.append(identity)
+    if len({_run_identity_tuple(identity) for identity in identities}) != particle_count:
+        raise ValueError("schema 3 compact 含 duplicate RunUnit identity")
+    compact_observation_count = sum(
+        _nonnegative_int(
+            record["observation_cursor"],
+            label=f"compact.records[{index}].observation_cursor",
+        )
+        + 1
+        for index, record in enumerate(compact_records)
+    )
+    compact_event_count = sum(
+        _nonnegative_int(record["event_cursor"], label=f"compact.records[{index}].event_cursor")
+        for index, record in enumerate(compact_records)
+    )
+    if compact_observation_count != observation_count or compact_event_count != event_count:
+        raise ValueError("schema 3 metadata count 與 compact cursor 不一致")
+    if expected_run_units is not None:
+        expected_identities = [_run_unit_identity(unit) for unit in expected_run_units]
+        if expected_identities != identities:
+            raise ValueError("checkpoint RunUnit identity/order 與目前 shard 不一致")
+
+    segment = _read_json(root / "history_segment.json")
+    segment = _require_exact_keys(
+        segment,
+        (
+            "schema_version",
+            "sequence",
+            "binding",
+            "particle_order",
+            "previous_checkpoint_json_sha256",
+            "records",
+        ),
+        label="schema 3 history segment",
+    )
+    segment_sequence = _nonnegative_int(segment["sequence"], label="schema 3 history sequence")
+    if segment["schema_version"] != _SCHEMA30_VERSION or segment_sequence != sequence:
+        raise ValueError("schema 3 history segment schema/sequence 不一致")
+    segment_binding = _binding_from_payload(segment["binding"], label="schema 3 segment binding")
+    if segment_binding != expected_binding:
+        raise ValueError("schema 3 history segment binding 不一致")
+    if segment["particle_order"] != particle_order:
+        raise ValueError("schema 3 segment particle_order 不一致")
+    if _sha256_or_none(
+        segment["previous_checkpoint_json_sha256"],
+        label="schema 3 segment previous checkpoint hash",
+    ) != previous_checkpoint_json_sha256:
+        raise ValueError("schema 3 segment previous checkpoint hash 與 metadata 不一致")
+    segment_records = segment["records"]
+    if not isinstance(segment_records, list) or len(segment_records) != particle_count:
+        raise ValueError("schema 3 history segment records 數量不一致")
+    for index, record in enumerate(segment_records):
+        row = _require_exact_keys(
+            record,
+            (
+                "identity",
+                "observation_start_cursor",
+                "observation_end_cursor",
+                "event_start_cursor",
+                "event_end_cursor",
+                "observation_row_count",
+                "event_row_count",
+                "observations",
+                "events",
+            ),
+            label=f"schema 3 history segment.records[{index}]",
+        )
+        identity = _validate_run_identity(
+            row["identity"], label=f"schema 3 segment.records[{index}].identity"
+        )
+        if identity != identities[index]:
+            raise ValueError("schema 3 segment identity/order 不一致")
+        observation_start = _nonnegative_int(
+            row["observation_start_cursor"],
+            label=f"schema 3 segment.records[{index}].observation_start_cursor",
+        )
+        observation_end = _nonnegative_int(
+            row["observation_end_cursor"],
+            label=f"schema 3 segment.records[{index}].observation_end_cursor",
+        )
+        event_start = _nonnegative_int(
+            row["event_start_cursor"],
+            label=f"schema 3 segment.records[{index}].event_start_cursor",
+        )
+        event_end = _nonnegative_int(
+            row["event_end_cursor"],
+            label=f"schema 3 segment.records[{index}].event_end_cursor",
+        )
+        observations = row["observations"]
+        events = row["events"]
+        if not isinstance(observations, list) or not isinstance(events, list):
+            raise ValueError("schema 3 segment observations/events 必須是陣列")
+        observation_row_count = _nonnegative_int(
+            row["observation_row_count"],
+            label=f"schema 3 segment.records[{index}].observation_row_count",
+        )
+        event_row_count = _nonnegative_int(
+            row["event_row_count"],
+            label=f"schema 3 segment.records[{index}].event_row_count",
+        )
+        if (
+            observation_end - observation_start != len(observations)
+            or event_end - event_start != len(events)
+            or observation_row_count != len(observations)
+            or event_row_count != len(events)
+        ):
+            raise ValueError("schema 3 segment cursor/row count 不一致")
+        compact_record = compact_records[index]
+        if (
+            observation_end
+            != _nonnegative_int(
+                compact_record["observation_cursor"],
+                label=f"schema 3 compact.records[{index}].observation_cursor",
+            )
+            or event_end
+            != _nonnegative_int(
+                compact_record["event_cursor"],
+                label=f"schema 3 compact.records[{index}].event_cursor",
+            )
+        ):
+            raise ValueError("schema 3 segment end cursor 與 compact cursor 不一致")
+    return metadata, compact, segment
+
+
+def _load_schema3_execution_checkpoint(
+    root: Path,
+    *,
+    expected_binding: CheckpointBinding,
+    expected_run_units: Sequence[Any] | None = None,
+) -> ExecutionCheckpoint:
+    """沿 checkpoint.json SHA-256 chain 還原一份 schema 3 execution checkpoint。
+
+    每一代只保存新增 rows，故還原時必須從 chain root 依粒子固定順序逐段套用 cursor。
+    任一代缺失、跳號、hash 不相符、粒子重排、cursor 不連續或 identity/binding 改變都會
+    fail-closed；不以較舊 generation 掩蓋損壞歷史。compact state 則提供最後的 current
+    state、step counters、輸出游標、亂數 state 與 triangle hint。
+    """
+
+    metadata, compact, segment = _read_schema3_generation_header(
+        root,
+        expected_binding=expected_binding,
+        expected_run_units=expected_run_units,
+    )
+    target_sequence = int(metadata["sequence"])
+    chain: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]] = [
+        (root, metadata, compact, segment)
+    ]
+    current = (root, metadata, compact, segment)
+    while True:
+        previous_checkpoint_json_sha256 = _sha256_or_none(
+            current[3]["previous_checkpoint_json_sha256"],
+            label="schema 3 previous checkpoint.json hash",
+        )
+        if previous_checkpoint_json_sha256 is None:
+            if int(current[1]["chain_root_sequence"]) != int(current[1]["sequence"]):
+                raise ValueError("schema 3 hash chain root metadata 不一致")
+            break
+        sequence = int(current[1]["sequence"])
+        previous_path = root.parent / f"checkpoint-{sequence - 1:08d}"
+        if sequence <= 1 or not previous_path.is_dir() or previous_path.is_symlink():
+            raise ValueError("schema 3 segment chain 缺少前一代 checkpoint")
+        previous_metadata_path = previous_path / "checkpoint.json"
+        previous_raw = _read_json(previous_metadata_path)
+        if previous_raw.get("schema_version") != _SCHEMA30_VERSION:
+            raise ValueError("schema 3 segment chain 不可跨越非 schema 3 generation")
+        previous = _read_schema3_generation_header(
+            previous_path,
+            expected_binding=expected_binding,
+            expected_run_units=expected_run_units,
+        )
+        previous_checkpoint_json_sha256_actual = sha256_file(previous_metadata_path)
+        if previous_checkpoint_json_sha256_actual != previous_checkpoint_json_sha256:
+            raise ValueError("schema 3 previous checkpoint.json SHA-256 不一致")
+        chain.append((previous_path, *previous))
+        current = (previous_path, *previous)
+    chain.reverse()
+
+    identities = [record["identity"] for record in compact["records"]]
+    particle_order = list(metadata["particle_order"])
+    observation_rows: list[list[Observation]] = [[] for _ in identities]
+    event_rows: list[list[BoundaryEvent]] = [[] for _ in identities]
+    chain_root_sequence = int(chain[0][1]["chain_root_sequence"])
+    if chain_root_sequence != int(chain[0][1]["sequence"]):
+        raise ValueError("schema 3 hash chain root sequence 不一致")
+    previous_sequence = chain_root_sequence - 1
+    for segment_path, segment_metadata, segment_compact, segment_payload in chain:
+        del segment_path, segment_compact
+        sequence = int(segment_metadata["sequence"])
+        if sequence != previous_sequence + 1:
+            raise ValueError("schema 3 segment sequence 跳號或重排")
+        if int(segment_metadata["chain_root_sequence"]) != chain_root_sequence:
+            raise ValueError("schema 3 chain_root_sequence 在 generation 間改變")
+        previous_sequence = sequence
+        if segment_payload["particle_order"] != particle_order:
+            raise ValueError("schema 3 segment particle order 重排")
+        records = segment_payload["records"]
+        for index, record in enumerate(records):
+            row = _require_exact_keys(
+                record,
+                (
+                    "identity",
+                    "observation_start_cursor",
+                    "observation_end_cursor",
+                    "event_start_cursor",
+                    "event_end_cursor",
+                    "observation_row_count",
+                    "event_row_count",
+                    "observations",
+                    "events",
+                ),
+                label=f"schema 3 segment[{sequence}].records[{index}]",
+            )
+            identity = _validate_run_identity(
+                row["identity"], label=f"segment[{sequence}].records[{index}].identity"
+            )
+            if identity != identities[index] or identity["particle_id"] != particle_order[index]:
+                raise ValueError("schema 3 segment identity/order 不一致")
+            observation_start = _nonnegative_int(
+                row["observation_start_cursor"],
+                label=f"segment[{sequence}].records[{index}].observation_start_cursor",
+            )
+            observation_end = _nonnegative_int(
+                row["observation_end_cursor"],
+                label=f"segment[{sequence}].records[{index}].observation_end_cursor",
+            )
+            event_start = _nonnegative_int(
+                row["event_start_cursor"], label=f"segment[{sequence}].records[{index}].event_start_cursor"
+            )
+            event_end = _nonnegative_int(
+                row["event_end_cursor"], label=f"segment[{sequence}].records[{index}].event_end_cursor"
+            )
+            observations = row["observations"]
+            events = row["events"]
+            if not isinstance(observations, list) or not isinstance(events, list):
+                raise ValueError("schema 3 segment observations/events 必須是陣列")
+            if (
+                observation_end - observation_start != len(observations)
+                or event_end - event_start != len(events)
+                or row["observation_row_count"] != len(observations)
+                or row["event_row_count"] != len(events)
+            ):
+                raise ValueError("schema 3 segment cursor/row count 不一致")
+            if observation_start != len(observation_rows[index]) or event_start != len(event_rows[index]):
+                raise ValueError("schema 3 segment cursor 不連續、重複或缺失")
+            observation_rows[index].extend(
+                _deserialize_observation(
+                    value,
+                    label=f"segment[{sequence}].records[{index}].observations[{row_index}]",
+                    schema_version=_SCHEMA30_VERSION,
+                )
+                for row_index, value in enumerate(observations)
+            )
+            event_rows[index].extend(
+                _deserialize_event(
+                    value,
+                    label=f"segment[{sequence}].records[{index}].events[{row_index}]",
+                )
+                for row_index, value in enumerate(events)
+            )
+
+    executions: list[ParticleExecutionState] = []
+    rng_states: list[dict[str, Any]] = []
+    hints: list[int] = []
+    total_observations = 0
+    total_events = 0
+    for index, record in enumerate(compact["records"]):
+        state = _deserialize_particle_state(record["state"], label=f"compact.records[{index}].state")
+        if _state_identity(state) != (
+            identities[index]["particle_id"],
+            identities[index]["scenario_id"],
+            identities[index]["member_id"],
+            identities[index]["study_site_id"],
+            identities[index]["analysis_region_id"],
+            identities[index]["receptor_id"],
+        ):
+            raise ValueError("schema 3 compact state identity 不一致")
+        observation_cursor = _nonnegative_int(
+            record["observation_cursor"], label=f"compact.records[{index}].observation_cursor"
+        )
+        event_cursor = _nonnegative_int(
+            record["event_cursor"], label=f"compact.records[{index}].event_cursor"
+        )
+        if observation_cursor != len(observation_rows[index]) or event_cursor != len(event_rows[index]):
+            raise ValueError("schema 3 compact cursor 與 segment history 不一致")
+        pending_observation = _deserialize_observation(
+            record["pending_observation"],
+            label=f"compact.records[{index}].pending_observation",
+            schema_version=_SCHEMA30_VERSION,
+        )
+        if pending_observation.particle_id != state.particle_id:
+            raise ValueError("schema 3 pending observation identity 與 state 不一致")
+        if (
+            state.age_seconds + 1.0e-9 < pending_observation.age_seconds
+            or state.time_utc_ns > pending_observation.time_utc_ns
+        ):
+            raise ValueError("schema 3 pending observation 晚於 current state")
+        complete_observations = [*observation_rows[index], pending_observation]
+        execution = ParticleExecutionState(
+            state=state,
+            observations=complete_observations,
+            events=event_rows[index],
+            step_count=_nonnegative_int(record["step_count"], label=f"compact.records[{index}].step_count"),
+            minimum_clamp_count=_nonnegative_int(
+                record["minimum_clamp_count"], label=f"compact.records[{index}].minimum_clamp_count"
+            ),
+            next_output_age_seconds=_finite_float(
+                record["next_output_age_seconds"],
+                label=f"compact.records[{index}].next_output_age_seconds",
+            ),
+        )
+        if execution.next_output_age_seconds <= 0:
+            raise ValueError("schema 3 next_output_age_seconds 必須為正")
+        if any(item.particle_id != state.particle_id for item in execution.observations):
+            raise ValueError("schema 3 observation identity 與 state 不一致")
+        if any(
+            item.particle_id != state.particle_id
+            or item.scenario_id != state.scenario_id
+            or item.member_id != state.member_id
+            or item.study_site_id != state.study_site_id
+            or item.analysis_region_id != state.analysis_region_id
+            or item.receptor_id != state.receptor_id
+            for item in execution.events
+        ):
+            raise ValueError("schema 3 event identity 與 state 不一致")
+        _validate_observation_sequence(execution.observations, state, label=f"schema 3 observations[{index}]")
+        # 公開 loader 也直接回傳可續寫的 tracker；不能只依賴 ProductionBatch 私下補包裝，
+        # 否則呼叫端以 load_execution_checkpoint→advance→write continuation 時，stable
+        # prefix 會退化成普通 list，無法保證歷史列未被替換。
+        _track_execution_history(
+            execution,
+            observation_prefix_length=observation_cursor,
+            event_prefix_length=event_cursor,
+        )
+        executions.append(execution)
+        rng_states.append(
+            _validate_rng_state(record["rng_state"], label=f"compact.records[{index}].rng_state")
+        )
+        hints.append(
+            _normalize_triangle_hint(
+                record["triangle_hint"], label=f"compact.records[{index}].triangle_hint"
+            )
+        )
+        total_observations += observation_cursor + 1
+        total_events += event_cursor
+    if total_observations != metadata["observation_count"] or total_events != metadata["event_count"]:
+        raise ValueError("schema 3 observation/event count 不符")
+    return ExecutionCheckpoint(
+        binding=expected_binding,
+        sequence=target_sequence,
+        run_unit_identities=deepcopy(identities),
+        executions=executions,
+        rng_states=rng_states,
+        triangle_hints=hints,
+        schema_version=_SCHEMA30_VERSION,
+        observation_cursors=[len(item.observations) for item in executions],
+        event_cursors=[len(item.events) for item in executions],
+    )
+
+
+def _prepare_schema3_writer_inputs(
+    *,
+    run_units: Sequence[Any],
+    executions: Sequence[ParticleExecutionState],
+    rngs: Sequence[np.random.Generator],
+    triangle_hints: Sequence[int | None],
+) -> tuple[
+    list[dict[str, Any]],
+    list[ParticleExecutionState],
+    list[dict[str, Any]],
+    list[int],
+]:
+    """驗證 v3 writer 的固定 identity 並只保留目前 execution 的輕量參照。
+
+    舊的 ``build_execution_checkpoint`` 為了提供可獨立保存的記憶體 snapshot，會 deep-copy
+    每粒子的完整 observation／event history。正式 checkpoint 若在數萬步中每個 cadence
+    都重複複製這些歷史，雖然檔案 segment 已改成線性，writer 仍會在記憶體與 CPU 產生
+    隱性的 O(n²) 成本。因此磁碟 writer 不把完整 history 複製到另一份 snapshot；它只在
+    下面序列化本代新增 rows、最後一筆 pending observation、目前 state、RNG 與 triangle
+    hint。呼叫端在完整 sweep 邊界同步呼叫 writer，故這些參照在一次寫入期間不會被 engine
+    併發修改；公開 ``snapshot`` API 仍維持獨立 deep-copy 語意。
+
+    回傳的 execution list 只含原物件參照，供 writer 依上一代 cursor 切片；writer 會在
+    切片後以固定 serializer 驗證要發布的 rows，並由 loader 在 resume 時完整重建與再驗證。
+    """
+
+    lengths = (len(run_units), len(executions), len(rngs), len(triangle_hints))
+    if not lengths[0] or len(set(lengths)) != 1:
+        raise ValueError("execution checkpoint 不允許空資料且所有欄位長度必須一致")
+    identities = [_run_unit_identity(unit) for unit in run_units]
+    identity_tuples = [_run_identity_tuple(identity) for identity in identities]
+    if len(set(identity_tuples)) != len(identity_tuples):
+        raise ValueError("execution checkpoint RunUnit identity 必須唯一")
+
+    normalized_hints: list[int] = []
+    execution_rows: list[ParticleExecutionState] = []
+    rng_states: list[dict[str, Any]] = []
+    for index, (identity, execution, rng, triangle_hint) in enumerate(
+        zip(identities, executions, rngs, triangle_hints, strict=True)
+    ):
+        if not isinstance(execution, ParticleExecutionState):
+            raise TypeError(f"execution[{index}] 必須是 ParticleExecutionState")
+        # 初次 root writer 可能接到 engine 建立的普通 list；先把它轉成輕量追蹤器，讓
+        # 後續 publish 後能辨識 stable prefix 是否被替換。這裡只保存長度與 dirty 旗標，
+        # 不複製歷史 row，也不改變 observations/events 的資料內容或順序。
+        for attribute in ("observations", "events"):
+            current_history = getattr(execution, attribute)
+            if not isinstance(current_history, _CheckpointHistoryList):
+                setattr(execution, attribute, _CheckpointHistoryList(current_history))
+        if _state_identity(execution.state) != (
+            identity["particle_id"],
+            identity["scenario_id"],
+            identity["member_id"],
+            identity["study_site_id"],
+            identity["analysis_region_id"],
+            identity["receptor_id"],
+        ):
+            raise ValueError(f"execution[{index}] 與 RunUnit identity 不一致")
+        if not execution.observations:
+            raise ValueError(f"execution[{index}] observations 不可為空")
+        _nonnegative_int(execution.step_count, label=f"execution[{index}].step_count")
+        _nonnegative_int(
+            execution.minimum_clamp_count,
+            label=f"execution[{index}].minimum_clamp_count",
+        )
+        next_age = _finite_float(
+            execution.next_output_age_seconds,
+            label=f"execution[{index}].next_output_age_seconds",
+        )
+        if next_age <= 0:
+            raise ValueError(f"execution[{index}].next_output_age_seconds 必須為正")
+        normalized_hint = _normalize_triangle_hint(
+            triangle_hint,
+            label=f"triangle_hints[{index}]",
+        )
+        # 只檢查最後一筆與 current state 的不可逆方向關係；歷史前綴已由上一代
+        # published chain 驗證，新增區間會在 writer 的切片後再檢查完整順序。
+        _validate_observation_sequence(
+            execution.observations[-1:],
+            execution.state,
+            label=f"execution[{index}].observations",
+        )
+        normalized_hints.append(normalized_hint)
+        execution_rows.append(execution)
+        rng_states.append(_copy_rng_state(rng))
+    return identities, execution_rows, rng_states, normalized_hints
+
+
+def write_execution_checkpoint(
+    destination: str | Path,
+    *,
+    binding: CheckpointBinding,
+    run_units: Sequence[Any],
+    executions: Sequence[ParticleExecutionState],
+    rngs: Sequence[np.random.Generator],
+    triangle_hints: Sequence[int | None],
+    sequence: int,
+    previous_checkpoint: str | Path | None = None,
+) -> Path:
+    """以 schema 3.0.0 原子追加 checkpoint generation。
+
+    ``previous_checkpoint`` 指向同一 shard 的上一個已發布 generation。新 generation 的
+    compact file 只保存最新 ParticleState／step counter／輸出游標／RNG／triangle hint；
+    history segment 只保存各粒子自上一代 cursor 之後新增的 observation 與 event。因而
+    每代寫入量與新增 row 數近似成正比，不會隨累積歷史重寫完整 execution JSON。第一代
+    沒有前代時 cursor 從零開始；若 caller 由舊 schema 2.x 起始，會把該 checkpoint 當作
+    一次性 chain root 讀入並追加完整歷史，舊目錄本身不會被修改。
+
+    寫入順序是 partial directory → checksum manifest → atomic rename；目標已存在、前代
+    binding／RunUnit 順序不符、history cursor 回退或輸出資料在完整 sweep/macro boundary
+    外呼叫，均由 caller 或本函式拒絕。此 API 不刪除任何 generation，避免 retention 破壞
+    checkpoint.json hash chain。
+    """
+
+    if not isinstance(binding, CheckpointBinding):
+        raise TypeError("binding 必須是 CheckpointBinding")
+    # 在初始化 root tracker 前記住原始型別；v3 continuation 若整條替換成普通 list，
+    # 後續必須拒絕，避免新 tracker 把未驗證的 stable prefix 偽裝成合法延續。
+    had_untracked_history = any(
+        not isinstance(getattr(execution, attribute), _CheckpointHistoryList)
+        for execution in executions
+        for attribute in ("observations", "events")
+    )
+    identities, execution_rows, rng_states, normalized_hints = _prepare_schema3_writer_inputs(
+        run_units=run_units,
+        executions=executions,
+        rngs=rngs,
+        triangle_hints=triangle_hints,
+    )
+    if type(sequence) is not int or sequence < 1:
+        raise ValueError("schema 3 sequence 必須是從 1 開始的整數")
+    target = Path(destination)
+    expected_target_name = f"checkpoint-{sequence:08d}"
+    if target.name != expected_target_name:
+        raise ValueError("schema 3 target 名稱必須是 checkpoint-{sequence:08d}")
+    if target.exists():
+        raise FileExistsError(f"不可覆寫 checkpoint：{target}")
+    previous_schema: str | None = None
+    previous_checkpoint_json_sha256: str | None = None
+    legacy_source: dict[str, Any] | None = None
+    if previous_checkpoint is not None:
+        previous_root = Path(previous_checkpoint)
+        expected_previous_root = target.parent / f"checkpoint-{sequence - 1:08d}"
+        if previous_root.parent != target.parent or previous_root.name != expected_previous_root.name:
+            raise ValueError(
+                "schema 3 previous_checkpoint 必須位於 target 同一 parent，且名稱必須是上一代 checkpoint"
+            )
+        previous_metadata = _read_json(previous_root / "checkpoint.json")
+        previous_schema = previous_metadata.get("schema_version")
+        if previous_schema == _SCHEMA30_VERSION:
+            if had_untracked_history:
+                raise ValueError("schema 3 continuation 的 observations/events 必須保留追蹤器")
+            previous_metadata, previous_compact, _ = _read_schema3_generation_header(
+                previous_root,
+                expected_binding=binding,
+                expected_run_units=run_units,
+            )
+            previous_sequence = _nonnegative_int(
+                previous_metadata["sequence"], label="previous sequence"
+            )
+            if sequence != previous_sequence + 1:
+                raise ValueError("schema 3 sequence 必須緊接上一代 generation")
+            previous_checkpoint_json_sha256 = sha256_file(previous_root / "checkpoint.json")
+            previous_records = previous_compact["records"]
+            # 既有 v3 continuation 必須沿用同一條 chain 的 root sequence。這個欄位
+            # 代表 v3 歷史鏈真正開始的 generation；若前一代是從舊 schema 遷移而來，
+            # root 可能大於 1，不能因為目前 generation 已經往後推進就重新算成 1 或
+            # current sequence，否則 loader 會把合法的遷移鏈誤判為 root 改變。
+            chain_root_sequence = _positive_int(
+                previous_metadata["chain_root_sequence"],
+                label="previous chain_root_sequence",
+            )
+        elif previous_schema in {
+            _SCHEMA20_VERSION,
+            _SCHEMA21_VERSION,
+            _SCHEMA22_VERSION,
+        }:
+            # 舊 schema 沒有 segment cursor；完整舊 execution 只在這個 migration root 讀一次。
+            previous_loaded = load_execution_checkpoint(
+                previous_root,
+                expected_binding=binding,
+                expected_run_units=run_units,
+            )
+            for index, (current, legacy) in enumerate(
+                zip(execution_rows, previous_loaded.executions, strict=True)
+            ):
+                _validate_legacy_execution_prefix(
+                    current,
+                    legacy,
+                    label=f"schema 3 migration execution[{index}]",
+                )
+            previous_sequence = previous_loaded.sequence
+            if sequence != previous_sequence + 1:
+                raise ValueError("schema 3 migration sequence 必須緊接舊 checkpoint")
+            previous_checkpoint_json_sha256 = None
+            legacy_source = {
+                "schema_version": previous_schema,
+                "sequence": previous_sequence,
+                "relative_directory": previous_root.name,
+                "checkpoint_json_sha256": sha256_file(previous_root / "checkpoint.json"),
+            }
+            # 舊 schema 沒有 v3 segment，因此本次發布的 generation 是新 hash chain
+            # 的 root。root sequence 必須保留本代實際 sequence，讓遷移後的下一代／
+            # 再下一代都能繼承同一值並通過完整鏈驗證。
+            chain_root_sequence = sequence
+            previous_records = [
+                {
+                    "identity": identity,
+                    # 舊 schema 的完整 execution 已包含所有 rows；轉成 v3 時只需把
+                    # 穩定列寫入新 chain，最後一筆保留在 compact pending observation。
+                    "observation_cursor": 0,
+                    # 舊目錄不是 v3 hash chain 的前一代，因此舊事件沒有在任何已發布
+                    # segment 中出現；遷移 root 必須從 cursor 0 重新寫入全部事件，否則
+                    # loader 會得到少於舊 execution 的事件歷史，且 resume 後事件順序會
+                    # 靜默缺列。這不會改寫舊檔，只決定一次性 v3 migration segment。
+                    "event_cursor": 0,
+                }
+                for identity, execution in zip(
+                    previous_loaded.run_unit_identities,
+                    previous_loaded.executions,
+                    strict=True,
+                )
+            ]
+        else:
+            raise ValueError("previous_checkpoint schema 不支援")
+        previous_order = [record["identity"]["particle_id"] for record in previous_records]
+        if previous_order != [identity["particle_id"] for identity in identities]:
+            raise ValueError("previous checkpoint particle order 不一致")
+    else:
+        previous_sequence = 0
+        previous_checkpoint_json_sha256 = None
+        # 沒有前代時建立全新的 v3 chain，固定由 sequence 1 作為 root。正式 controller
+        # 會依序發布 generation；此欄位不能因為後續寫入而重新計算。
+        chain_root_sequence = 1
+        previous_records = [
+            {"identity": identity, "observation_cursor": 0, "event_cursor": 0}
+            for identity in identities
+        ]
+    if previous_schema != _SCHEMA30_VERSION:
+        # root／legacy migration 沒有可沿用的 v3 cursor；若 execution 來自另一份 v3
+        # snapshot，其 tracker prefix 只屬於來源 chain，不能拿來限制新 chain 的完整歷史。
+        # legacy prefix 已在上方先完成逐欄核對，這裡只重建 owner 與從零開始的追蹤狀態。
+        for execution in execution_rows:
+            _reset_checkpoint_history_tracking(execution)
+    if previous_sequence != sequence - 1:
+        raise ValueError("schema 3 generation sequence 不連續")
+
+    segment_records: list[dict[str, Any]] = []
+    observation_count = 0
+    event_count = 0
+    for index, (identity, execution, previous_record) in enumerate(
+        zip(identities, execution_rows, previous_records, strict=True)
+    ):
+        if identity != previous_record["identity"]:
+            raise ValueError(f"schema 3 previous/current identity 不一致：index={index}")
+        observation_start = _nonnegative_int(
+            previous_record["observation_cursor"], label=f"previous observation cursor[{index}]"
+        )
+        event_start = _nonnegative_int(
+            previous_record["event_cursor"], label=f"previous event cursor[{index}]"
+        )
+        if observation_start > len(execution.observations) or event_start > len(execution.events):
+            raise ValueError("schema 3 history cursor 回退")
+        if previous_schema == _SCHEMA30_VERSION:
+            _validate_terminal_continuation(
+                execution,
+                previous_record,
+                rng_state=rng_states[index],
+                triangle_hint=normalized_hints[index],
+                label=f"schema 3 execution[{index}]",
+            )
+        if execution.observations.checkpoint_history_dirty or execution.events.checkpoint_history_dirty:
+            raise ValueError("schema 3 stable observation/event prefix 已被修改")
+        if (
+            execution.observations.checkpoint_immutable_prefix_length != observation_start
+            or execution.events.checkpoint_immutable_prefix_length != event_start
+        ):
+            raise ValueError("schema 3 stable observation/event prefix tracking 不一致")
+        if not execution.observations:
+            raise ValueError("schema 3 execution observations 不可為空")
+        # engine 允許在下一個取樣前以同一時間／位置更新最後一筆 observation 的
+        # context/status；因此最後一筆先放在 compact，等下一筆出現後才成為 immutable
+        # segment row，避免 checkpoint 重新寫入同一歷史列。
+        stable_observation_end = len(execution.observations) - 1
+        if observation_start > stable_observation_end:
+            raise ValueError("schema 3 history cursor 超過穩定 observation 數")
+        if previous_schema == _SCHEMA30_VERSION:
+            previous_pending = _deserialize_observation(
+                previous_record["pending_observation"],
+                label=f"previous compact.records[{index}].pending_observation",
+                schema_version=_SCHEMA30_VERSION,
+            )
+            _require_observation_core_match(
+                previous_pending,
+                execution.observations[observation_start],
+                label=f"schema 3 execution[{index}] pending boundary",
+            )
+        observations = execution.observations[observation_start:stable_observation_end]
+        events = execution.events[event_start:]
+        _validate_observation_sequence(
+            execution.observations[observation_start:],
+            execution.state,
+            label=f"execution[{index}].observations",
+        )
+        for event_index, event in enumerate(events):
+            if (
+                event.particle_id != identity["particle_id"]
+                or event.scenario_id != identity["scenario_id"]
+                or event.member_id != identity["member_id"]
+                or event.study_site_id != identity["study_site_id"]
+                or event.analysis_region_id != identity["analysis_region_id"]
+                or event.receptor_id != identity["receptor_id"]
+            ):
+                raise ValueError(
+                    f"execution[{index}].events[{event_start + event_index}] identity 不一致"
+                )
+        segment_records.append(
+            {
+                "identity": deepcopy(identity),
+                "observation_start_cursor": observation_start,
+                "observation_end_cursor": stable_observation_end,
+                "event_start_cursor": event_start,
+                "event_end_cursor": len(execution.events),
+                "observation_row_count": len(observations),
+                "event_row_count": len(events),
+                "observations": [
+                    _serialize_observation(item, schema_version=_SCHEMA30_VERSION)
+                    for item in observations
+                ],
+                "events": [_serialize_event(item) for item in events],
+            }
+        )
+        observation_count += len(execution.observations)
+        event_count += len(execution.events)
+    segment_payload = {
+        "schema_version": _SCHEMA30_VERSION,
+        "sequence": sequence,
+        "binding": _binding_payload(binding),
+        "particle_order": [identity["particle_id"] for identity in identities],
+        "previous_checkpoint_json_sha256": previous_checkpoint_json_sha256,
+        "records": segment_records,
+    }
+    compact_payload = {
+        "schema_version": _SCHEMA30_VERSION,
+        "sequence": sequence,
+        "binding": _binding_payload(binding),
+        "particle_order": [identity["particle_id"] for identity in identities],
+        "records": [
+            {
+                "identity": deepcopy(identity),
+                "state": _serialize_particle_state(execution.state),
+                "step_count": execution.step_count,
+                "minimum_clamp_count": execution.minimum_clamp_count,
+                "next_output_age_seconds": execution.next_output_age_seconds,
+                "observation_cursor": len(execution.observations) - 1,
+                "event_cursor": len(execution.events),
+                "pending_observation": _serialize_observation(
+                    execution.observations[-1], schema_version=_SCHEMA30_VERSION
+                ),
+                "rng_state": rng_state,
+                "triangle_hint": triangle_hint,
+            }
+            for identity, execution, rng_state, triangle_hint in zip(
+                identities,
+                execution_rows,
+                rng_states,
+                normalized_hints,
+                strict=True,
+            )
+        ],
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.parent / f".{target.name}.partial-{uuid4().hex}"
+    try:
+        partial.mkdir()
+        compact_path = partial / "compact_state.json"
+        segment_path = partial / "history_segment.json"
+        _write_json(compact_path, compact_payload)
+        _write_json(segment_path, segment_payload)
+        files = {
+            compact_path.name: {
+                "size_bytes": int(compact_path.stat().st_size),
+                "sha256": sha256_file(compact_path),
+            },
+            segment_path.name: {
+                "size_bytes": int(segment_path.stat().st_size),
+                "sha256": sha256_file(segment_path),
+            },
+        }
+        metadata = {
+            "schema_version": _SCHEMA30_VERSION,
+            "sequence": sequence,
+            "particle_count": len(execution_rows),
+            "observation_count": observation_count,
+            "event_count": event_count,
+            "binding": _binding_payload(binding),
+            "particle_order": [identity["particle_id"] for identity in identities],
+            "files": files,
+            # 一般 v3 chain 從 sequence 1 開始；由舊 schema 2.x resume 的第一個 v3
+            # generation 以自身作 chain root，明示遷移邊界而不改寫舊目錄。
+            "chain_root_sequence": chain_root_sequence,
+            "legacy_source": legacy_source,
+            "segment": {
+                "sequence": sequence,
+                "previous_checkpoint_json_sha256": previous_checkpoint_json_sha256,
+                "record_count": len(segment_records),
+            },
+        }
+        _write_json(partial / "checkpoint.json", metadata, sort_keys=True)
+        os.replace(partial, target)
+        for execution in execution_rows:
+            execution.observations.mark_checkpoint_prefix(len(execution.observations) - 1)
+            execution.events.mark_checkpoint_prefix(len(execution.events))
+    except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
         raise
     return target
@@ -1060,9 +2709,9 @@ def load_execution_checkpoint(
     expected_binding: CheckpointBinding,
     expected_run_units: Sequence[Any] | None = None,
 ) -> ExecutionCheckpoint:
-    """嚴格讀取 schema 2.0／2.1／2.2 checkpoint，並可核對同一 shard 的固定 RunUnit 順序。
+    """嚴格讀取 schema 3.0 與舊 schema 2.0／2.1／2.2 checkpoint。
 
-    loader 先以 metadata 的精確 schema version 決定 observation 欄位契約：2.0 只接受舊七
+    schema 3 會先沿 checkpoint.json hash chain 還原完整歷史；2.0 只接受舊七
     欄並將環境與速度 context 設為 ``NOT_SAMPLED``／``None``；2.1 只接受舊環境欄位；
     2.2 才接受完整的速度 11 欄，三個版本都不容許 unknown／missing。之後仍會拒絕
     binding、checksum、檔案／觀測／事件／粒子數、duplicate identity、未知 status、未知
@@ -1076,6 +2725,15 @@ def load_execution_checkpoint(
     root = Path(path)
     if not root.is_dir():
         raise FileNotFoundError(f"checkpoint 目錄不存在：{root}")
+    # 先讀版本欄位再分派，避免把 schema 3 的 compact／segment 拓撲誤判為 schema 2
+    # 的 execution_state／rng_states。舊 schema 只走下方既有相容 parser，完全不改寫原檔。
+    initial_metadata = _read_json(root / "checkpoint.json")
+    if initial_metadata.get("schema_version") == _SCHEMA30_VERSION:
+        return _load_schema3_execution_checkpoint(
+            root,
+            expected_binding=expected_binding,
+            expected_run_units=expected_run_units,
+        )
     metadata = _read_json(root / "checkpoint.json")
     expected_metadata_keys = (
         "schema_version",
@@ -1196,7 +2854,52 @@ def load_execution_checkpoint(
         executions=executions,
         rng_states=rng_states,
         triangle_hints=hints,
+        schema_version=schema_version,
+        observation_cursors=[len(execution.observations) for execution in executions],
+        event_cursors=[len(execution.events) for execution in executions],
     )
+
+
+def inspect_execution_checkpoint(
+    path: str | Path,
+    *,
+    expected_binding: CheckpointBinding,
+    expected_run_units: Sequence[Any] | None = None,
+) -> tuple[int, int, int]:
+    """只讀取 generation counter，避免掃描 v3 時建立完整歷史 dataclass。
+
+    回傳 ``(sequence, sweeps_lower_bound, particle_steps)``。schema 3 仍會讀取並 JSON
+    parse metadata、compact 與當代 history segment，並驗證 payload checksum、欄位拓撲、
+    cursor 與 row count；它只不建立每條 observation／event 的 ``Observation``／
+    ``BoundaryEvent`` 物件。最高 generation 的完整 chain validation 或真正 resume 才會
+    反序列化並逐欄還原全部歷史。schema 2.x 沒有 compact state，因此沿用完整 loader，
+    保留舊檔的嚴格驗證語意。此函式不能取代 resume validation；它的用途是避免掃描數百個
+    generation 時對同一段歷史反覆建立 dataclass，不能保證冷 NFS cache 下完全不讀歷史。
+    """
+
+    root = Path(path)
+    initial_metadata = _read_json(root / "checkpoint.json")
+    if initial_metadata.get("schema_version") == _SCHEMA30_VERSION:
+        metadata, compact, _ = _read_schema3_generation_header(
+            root,
+            expected_binding=expected_binding,
+            expected_run_units=expected_run_units,
+        )
+        step_counts = [
+            _nonnegative_int(
+                record["step_count"], label=f"compact.records[{index}].step_count"
+            )
+            for index, record in enumerate(compact["records"])
+        ]
+        return int(metadata["sequence"]), max(step_counts, default=0), sum(step_counts)
+
+    loaded = load_execution_checkpoint(
+        root,
+        expected_binding=expected_binding,
+        expected_run_units=expected_run_units,
+    )
+    step_counts = [int(execution.step_count) for execution in loaded.executions]
+    return loaded.sequence, max(step_counts, default=0), sum(step_counts)
 
 
 def write_checkpoint(
@@ -1217,8 +2920,8 @@ def write_checkpoint(
         raise FileExistsError(f"不可覆寫 checkpoint：{target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.parent / f".{target.name}.partial-{uuid4().hex}"
-    partial.mkdir()
     try:
+        partial.mkdir()
         rows = []
         for state in states:
             row = asdict(state)
@@ -1242,7 +2945,7 @@ def write_checkpoint(
             json.dump(metadata, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
         os.replace(partial, target)
-    except Exception:
+    except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
         raise
     return target
@@ -1274,9 +2977,11 @@ def load_checkpoint(
 
 
 __all__ = [
+    "CHECKPOINT_SCHEMA_VERSION",
     "CheckpointBinding",
     "ExecutionCheckpoint",
     "build_execution_checkpoint",
+    "inspect_execution_checkpoint",
     "load_checkpoint",
     "load_execution_checkpoint",
     "write_checkpoint",

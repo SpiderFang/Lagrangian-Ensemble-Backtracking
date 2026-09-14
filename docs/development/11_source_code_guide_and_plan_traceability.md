@@ -37,7 +37,7 @@ engineering pilot；A 的兩站使用 `no_stokes`，B／C／D 使用 `finite_dep
 ### 1.1 BayTrace 可用部分整合界線
 
 本專案只整合 BayTrace 可對應本地 CPU 執行的工程思路：CPU SoA／batch／chunk、每粒子可
-重現亂數、SCHISM triangle hint、可暫停 engine，以及 schema 2 checkpoint/restart。未採用
+重現亂數、SCHISM triangle hint、可暫停 engine，以及 schema 3.0 checkpoint/restart。未採用
 GPU/CUDA、BayTrace raw `schout`／`bp` I/O、oil/weathering、droptime、共享記憶體
 multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只保留為未來具備完整
 相容 fixture 時的 golden reference；目前不把它當成正式驗證結果。
@@ -88,9 +88,9 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 | 物理與邊界 | `boundaries.py`、`engine.py` | 提議的新粒子位置、局部／外層範圍、海面與海床資料 | 解析海岸、局部範圍、共同流場外框、海面與海床事件，控制單粒子回溯至停止。 | `resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` |
 | 批次與重啟 | `scenarios.py`、`runner.py` | 行為、受體、到達時刻、主亂數種子 | 建立 10 × 20 × 50 唯一情境，展開 `RunUnit` 與每情境 `M` 個成員，固定順序切 shard。 | `build_scenarios`、`derive_member_seed`、`plan_scenario_shards`、`iter_run_units` |
 | 批次與重啟 | `batch_state.py`、`production.py` | `ParticleState`、`ScenarioShard`、request factory 與 reference engine 單步介面 | 以 SoA 保存狀態，執行 CPU/NumPy active compaction、chunking、scatter 與可暫停 batch。 | `ParticleBatch`、`ProductionBatch`、`run_production_shard` |
-| 批次與重啟 | `checkpoint.py` | 粒子 execution、觀測、事件、RNG state 與 binding | 以 schema 2 保存可重啟系集狀態；不覆寫既有 generation，並驗證輸入繫結。 | `write_execution_checkpoint`、`load_execution_checkpoint` |
+| 批次與重啟 | `checkpoint.py` | 粒子 execution、觀測、事件、RNG state 與 binding | 以 schema 3 immutable segment + compact 保存可重啟系集狀態；沿 SHA-256 chain 驗證 cursor、identity、binding 與輸入繫結，並保留 schema 2.x 唯讀 loader。 | `write_execution_checkpoint`、`load_execution_checkpoint` |
 | 執行控制 | `cli.py`、`runtime.py` | 命令列參數、run workspace、manifest、config 與 forcing roots | 提供 `run-create`、`run-shard`、`run-reconcile`；依 run kind 建立 `RuntimeRequestFactory` 與 controller，formal 先通過 strict inventory／manifest gate。 | `main`、`initialize_run`、`initialize_formal_run`、`RuntimeRequestFactory`、`open_run_controller` |
-| 執行控制 | `provenance.py`、`run_control.py` | 部署指紋、run plan/progress、ProductionBatch 與 checkpoint/output | 綁定程式來源、schema 2 immutable plan、atomic progress、lock topology、shard 執行與 reconcile。 | `collect_code_provenance`、`initialize_run_workspace`、`RunController` |
+| 執行控制 | `provenance.py`、`run_control.py` | 部署指紋、run plan/progress、ProductionBatch 與 checkpoint/output | 綁定程式來源、immutable plan、schema 3 segment checkpoint、atomic progress、lock topology、shard 執行與 reconcile。 | `collect_code_provenance`、`initialize_run_workspace`、`RunController` |
 | 執行控制 | `run_locking.py`、`run_validation.py` | lock file、validator 輸入與 checksum | 以 Unix `flock` 保護互斥；唯讀驗證 lifecycle、identity、order、checkpoint/output 與工程摘要。 | `acquire_run_lock`、`validate_run`、`benchmark_report` |
 | 執行控制 | `pilot_matrix_validation.py` | 兩個以上 pilot run root 的 `run_plan.json` 與 `normalized_config.json` | 唯讀比較跨區共同設定與 deployment provenance；允許明示的站點／domain／arrival／scenario、輸入／幾何 binding 與區域 Kh／Kz／Smagorinsky cap 差異。它不判定 run lifecycle、不讀 forcing／trajectory，也不是 formal gate。 | `validate_pilot_matrix`、`canonical_pilot_matrix_json` |
 | 輸出與聚合 | `outputs.py` | 完成的 `ParticleResult` 清單 | 原子寫出粒子摘要、事件、軌跡一維陣列與檢查資料；拒絕覆寫或不完整結果。 | `write_trajectory_shard`、`validate_trajectory_shard` |
@@ -116,7 +116,7 @@ flowchart LR
     subgraph C[批次與重啟]
         SCN[scenarios.py + runner.py<br/>情境與 RunUnit]
         PB[batch_state.py + production.py<br/>CPU/NumPy ProductionBatch]
-        CKP[checkpoint.py<br/>schema 2 restart]
+        CKP[checkpoint.py<br/>schema 3.0 restart]
     end
     subgraph D[執行控制]
         CLI[cli.py<br/>run-create／run-shard／run-reconcile]

@@ -1037,7 +1037,9 @@ def test_each_ocm_backend_checkpoint_resume_and_cross_backend_binding(
     checkpoint_path = interrupted.write_checkpoint(
         tmp_path / backend,
         binding=binding,
-        sequence=interrupted.sweep_count,
+        # checkpoint sequence 表示不可變 generation 的連續編號，不是已完成的
+        # sweep 數；首次寫入固定從 1 開始，才能驗證 schema 3 hash chain。
+        sequence=1,
     )
     resumed = ProductionBatch.from_checkpoint(
         checkpoint_path,
