@@ -80,6 +80,12 @@ _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _CHECKPOINT_RE = re.compile(r"^checkpoint-([0-9]{8})$")
+# execution checkpoint 的 scanner 必須知道 schema 的單向遷移邊界。2.x 是既有唯讀
+# 格式；3.0 是新 writer 的 immutable segment 格式。沒有 retention 時，這裡也要求
+# generation 序號完整連續，避免 reconcile 從缺代或較高偽 root 靜默採認錯誤狀態。
+_CHECKPOINT_SCHEMA2_VERSIONS = frozenset({"2.0.0", "2.1.0", "2.2.0"})
+_CHECKPOINT_SCHEMA3_VERSION = "3.0.0"
+_CHECKPOINT_SCHEMA_VERSIONS = _CHECKPOINT_SCHEMA2_VERSIONS | {_CHECKPOINT_SCHEMA3_VERSION}
 # candidate 狀態需區分「確定沒有已發布代」、「暫時無法讀取」與「已通過採認」；NFS
 # 讀取錯誤不能和確定的 publish 前失敗共用同一個 False，否則合法 orphan 會被誤標 FAILED。
 _CheckpointAdoptionStatus = Literal["adopted", "indeterminate", "not_adopted"]
@@ -2149,6 +2155,7 @@ class RunController:
         binding = self._binding(shard)
         entries = tuple(parent.iterdir())
         generations: dict[int, tuple[Path, int, int]] = {}
+        generation_schemas: dict[int, str] = {}
         latest_path = parent / "latest.json"
         for entry in entries:
             if entry.is_symlink():
@@ -2170,11 +2177,46 @@ class RunController:
             )
             if loaded_sequence != sequence:
                 raise ValueError(f"checkpoint dirname/metadata sequence 不一致：{entry.name}")
+            metadata = _read_json(
+                entry / "checkpoint.json",
+                label=f"{entry.name}/checkpoint.json",
+            )
+            schema_version = metadata.get("schema_version")
+            if schema_version not in _CHECKPOINT_SCHEMA_VERSIONS:
+                raise ValueError(f"checkpoint schema_version 不支援：{entry.name}")
             generations[sequence] = (entry, sweeps_lower_bound, particle_steps)
+            generation_schemas[sequence] = schema_version
         if not generations:
             if latest_path.exists() or latest_path.is_symlink():
                 raise ValueError("latest.json 存在但沒有完整 checkpoint generation")
             return None
+
+        highest_sequence = max(generations)
+        expected_sequences = set(range(1, highest_sequence + 1))
+        missing_sequences = sorted(expected_sequences - set(generations))
+        if missing_sequences:
+            # retention 尚未實作；所有已發布代都必須留在同一 parent，才能沿 hash chain
+            # 驗證完整歷史。若直接採認最高代，缺少的中間代會讓 scanner 跳過未知狀態。
+            missing = ", ".join(f"checkpoint-{value:08d}" for value in missing_sequences)
+            raise ValueError(f"checkpoint generation sequence 必須連續，缺少：{missing}")
+
+        # schema 只能保持在 2.x，或由 2.x 一次遷移到 3.0 後繼續使用 3.0。禁止在
+        # schema 3 chain 中插入舊格式，否則下一次 writer 可能把它誤當 migration root，
+        # 切斷前代 v3 hash chain。這個 gate 放在最高代選擇前，故 latest 落後時也不會
+        # 先採認不合法的降級 generation。
+        seen_schema3 = False
+        for sequence in range(1, highest_sequence + 1):
+            schema_version = generation_schemas[sequence]
+            if schema_version == _CHECKPOINT_SCHEMA3_VERSION:
+                seen_schema3 = True
+            elif schema_version in _CHECKPOINT_SCHEMA2_VERSIONS:
+                if seen_schema3:
+                    raise ValueError(
+                        "checkpoint schema 不可由 3.0.0 降回 2.x："
+                        f"checkpoint-{sequence:08d}"
+                    )
+            else:  # pragma: no cover - schema version 已由上方集合 gate 限制
+                raise ValueError(f"checkpoint schema_version 不支援：checkpoint-{sequence:08d}")
 
         selected: _CheckpointSelection | None = None
         if latest_path.exists():
@@ -2246,7 +2288,6 @@ class RunController:
         elif latest_path.is_symlink():
             raise ValueError("latest.json 不允許 symlink")
 
-        highest_sequence = max(generations)
         # generation 掃描階段逐代讀取 header 與 JSON payload，驗證 checksum、拓撲、cursor
         # 與 row count，但不建立完整 Observation/BoundaryEvent dataclass；最後對最高代完整
         # 還原一次，確保整條 immutable segment chain 的缺失、跳號、checksum、cursor 與歷史
@@ -2337,8 +2378,8 @@ class RunController:
         progress 已宣告 sequence/path 卻在目前 root 找不到 generation 時直接失敗；因此
         operator 若忘記傳入原 external root，不會呼叫 request factory 或從 seed 重新開始。
         PLANNED 看到任何 generation 亦視為外來狀態。只有 RUNNING 可採認高於 progress 的
-        orphan generation，因為合法中斷順序是「標 RUNNING→寫 generation/latest→更新
-        progress」。PAUSED/FAILED 不可能合法地多出未登錄 generation。
+        orphan generation，且只能是恰好下一代，因為合法中斷順序是「標 RUNNING→寫
+        generation/latest→更新 progress」。PAUSED/FAILED 不可能合法地多出未登錄 generation。
         """
 
         lifecycle = row["lifecycle"]
@@ -2391,6 +2432,14 @@ class RunController:
                     f"progress checkpoint counters 與 selected generation 不一致：{shard.shard_id}"
                 )
             return repair_pointer(selected)
+        if lifecycle == "RUNNING" and selected.sequence > sequence + 1:
+            # 合法 publish window 只會在同一個 checkpoint sequence 留下一個尚未登錄的
+            # generation；若高出一代以上，代表中間代遺失、外來資料混入或 progress 已被
+            # 回退。這裡不能直接採認最高代，避免 resume 跳過未驗證的粒子／RNG 狀態。
+            raise ValueError(
+                "RUNNING shard 的 orphan generation 只能是 progress 的下一代："
+                f"progress={sequence}, selected={selected.sequence}, shard={shard.shard_id}"
+            )
         if lifecycle != "RUNNING":
             raise ValueError(f"只有 RUNNING shard 可採認 crash-window orphan generation：{shard.shard_id}")
         selected = repair_pointer(selected)
@@ -2893,7 +2942,9 @@ class RunController:
         已 COMPLETE 且輸出通過 validator 的 shard 直接回傳，不會重跑。PAUSED/FAILED
         必須以 controller ``resume=True`` 恢復。每達到 checkpoint interval 就建立新的
         generation；只有整個 batch terminal 且 formal validator 通過後才發布 trajectory
-        shard。任何物理例外會先寫 failure artifact，再把原例外重新拋給上層。
+        shard。checkpoint 只在 ``ProductionBatch.advance`` 正常回傳完整 sweep 結果後發布；
+        若中途收到 Ctrl-C，會保留上一個 generation，下一次 resume 重新執行該 interval。
+        任何物理例外會先寫 failure artifact，再把原例外重新拋給上層。
         """
 
         if sweep_budget is not None and (
@@ -2973,6 +3024,11 @@ class RunController:
         # sequence，而不能因 pending path 尚未取得就再次遞增，否則會跳過一代並讓
         # scanner 對 progress 與 generation 的交叉引用失去連續性。
         checkpoint_attempt_started = False
+        # ``ProductionBatch.advance`` 可能在已修改部分 runtime 後才收到 Ctrl-C；在它
+        # 正常回傳 ``ProductionAdvanceResult`` 前，sweep／particle counter 都尚未由
+        # controller 確認。這個旗標讓 KeyboardInterrupt handler 保留上一個已發布
+        # generation，而不把半個 sweep 序列化成可恢復 checkpoint。
+        advance_in_progress = False
         try:
             try:
                 resource_baseline = self._resource_snapshot()
@@ -3008,15 +3064,19 @@ class RunController:
             interval = int(self.plan["checkpoint_interval_sweeps"])
             budget_left = sweep_budget
             while not batch.terminal:
-                # 每輪 advance 開始時尚未分配新的 generation；若 advance 期間中斷，
-                # recovery 需要為目前已完成的 sweep 狀態分配下一個 sequence。
+                # 每輪 advance 開始時尚未分配新的 generation。只有 advance 正常回傳後，
+                # controller 才知道完整 sweep 的 counters，才可把目前 batch 寫成 checkpoint。
                 checkpoint_attempt_started = False
                 step_count = interval if budget_left is None else min(interval, budget_left)
+                advance_in_progress = True
                 result = batch.advance(step_count)
                 sweeps_completed += result.sweeps_completed
                 particle_steps += result.stepped_particle_count
                 if budget_left is not None:
                     budget_left -= result.sweeps_completed
+                # 只有完整結果與 controller counters 都已接收後才離開 safe-boundary
+                # guard；此前任何 Ctrl-C 都必須捨棄目前 mutable batch，從上一代重算。
+                advance_in_progress = False
                 # 每次 advance 都是從上一個完整 checkpoint 起最多 interval sweeps；因此
                 # off-boundary budget pause 後重新啟動仍會在下一個 interval 內產生 generation，
                 # 不依無法可靠持久化的全域 sweep modulo。
@@ -3162,10 +3222,51 @@ class RunController:
                 f"{self.plan['run_id']}/{shard_id}/{checkpoint_path.name}" if checkpoint_path else None,
             )
         except KeyboardInterrupt:
-            # Ctrl-C 可能落在 generation rename、latest pointer 或 progress update 的窗口。
+            # Ctrl-C 可能落在 advance 或 generation rename、latest pointer、progress update
+            # 的窗口。advance 尚未正常回傳時不允許把半個 sweep 寫入 checkpoint；已進入
+            # publish window 才由下方 recovery 驗證並採認完整 generation。
             # 若預期 generation 已完整存在，先驗證並採認它，不能無條件 sequence += 1 再寫
             # 一份相同狀態；若尚未完成 rename，writer 的 BaseException cleanup 會清理 partial，
             # 再用同一序號做一次 best-effort checkpoint 即可。
+            if "batch" in locals() and advance_in_progress:
+                # advance 尚未正常回傳，當前 execution／RNG 可能只完成部分粒子或部分
+                # sweep；此時不能呼叫 writer，也不能用舊 counters 假裝已完成。_mark_running
+                # 已在進入 loop 前保留上一個已發布 generation，下一次 resume 會從該代重算
+                # 整個 interval，避免半步狀態造成重複／遺失且無法驗證的結果。
+                try:
+                    stats = self._resource_delta(resource_baseline)
+                    latest_forcing_stats = _merge_invocation_forcing_snapshot(
+                        latest_forcing_stats,
+                        stats,
+                    )
+                except Exception:
+                    resource_stats_unavailable = True
+                safe_metrics = _merge_metrics(
+                    self._metrics(
+                        started_wall,
+                        started_cpu,
+                        particle_steps=particle_steps,
+                        checkpoint_active_bytes=checkpoint_active_bytes,
+                        forcing_stats=latest_forcing_stats,
+                        forcing_stats_status=(
+                            _FORCING_CACHE_STATS_STATUS_UNAVAILABLE
+                            if resource_stats_unavailable
+                            else None
+                        ),
+                    ),
+                    previous_metrics,
+                )
+
+                def save_safe_boundary_metrics(progress: dict[str, Any]) -> None:
+                    """只更新可稽核量測，不把半個 sweep 宣告成 checkpoint。"""
+
+                    progress["shards"][shard_id]["metrics"] = deepcopy(safe_metrics)
+
+                with suppress(Exception):
+                    self._update_progress(save_safe_boundary_metrics)
+                    # progress lock／NFS 若在這個 best-effort metrics 更新中失敗，不能讓
+                    # 它取代 operator 的 Ctrl-C；下一次 resume 仍會以舊 progress 重算。
+                raise
             try:
                 if "batch" in locals() and not batch.terminal:
                     recovery_metrics = _merge_metrics(
@@ -3210,9 +3311,8 @@ class RunController:
                             )
                         if pending_checkpoint_path is None:
                             # 若中斷發生在本輪 checkpoint parent/path 建立途中，sequence
-                            # 已經先分配但 pending path 尚未寫入；沿用該 sequence。只有
-                            # 中斷發生於 advance 期間、尚未進入 publish 嘗試時，才需要
-                            # 分配下一代。
+                            # 已經先分配但 pending path 尚未寫入；沿用該 sequence。advance
+                            # 期間的中斷已在 handler 開頭直接保留上一代，不會走到這裡。
                             if not checkpoint_attempt_started:
                                 checkpoint_sequence += 1
                             pending_checkpoint_path = self._checkpoint_parent(

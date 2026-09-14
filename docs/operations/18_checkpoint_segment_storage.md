@@ -18,6 +18,12 @@
 5. 若 validator 回報 chain 缺失、checksum、cursor、identity 或 binding 錯誤，立即停止該
    shard，保存錯誤與目錄清單，不能退回較舊 generation 產生看似完整的結果。
 
+目前尚未啟用 generation retention，因此同一 shard 的已發布 generation 序號必須完整
+連續（`1..highest`）。schema 可以全程維持 `2.0.0`／`2.1.0`／`2.2.0`，也可以由
+2.x 遷移一次後全程使用 `3.0.0`；一旦出現 3.0.0，後續插入 2.x 會被 scanner 拒絕。
+若 `RUNNING` progress 尚停在較舊代，crash window 只允許採認恰好下一代的 orphan；
+高出一代以上表示中間 generation 遺失或 progress 被回退，必須保留現場並停止恢復。
+
 ## 目錄與欄位
 
 每個不可覆寫的 generation 位於固定路徑：
@@ -44,7 +50,9 @@ compact、RNG、identity、binding、history payload checksum 與遷移來源都
 包含 RunUnit identity、`ParticleState`、步數、最小步長夾制次數、下一個輸出 age cursor、
 observation／event cursor、PCG64DXSM RNG state、triangle hint 與最後一筆尚可能被 engine
 更新 context 的 pending observation。最後一筆觀測暫放 compact，是因為同一時間／位置的
-engine context 可能在下一次取樣前被替換；它不代表目前 state 必定與觀測落在同一時間。
+engine context 可能在下一次取樣前被替換；跨代判定沿用 engine 的同點契約：particle 與
+UTC time 必須相同，age 允許 `np.isclose(rtol=0, atol=1e-12)` 的浮點容差；它不代表目前
+state 必定與觀測落在同一時間。
 若某粒子的 `ParticleState.status` 已不是 `ACTIVE`，後續 generation 必須逐欄保留該粒子的
 current state、計數器、輸出與 history cursor、pending observation、RNG、triangle hint 及
 既有 history 長度；writer 會用前代 compact 做 O(P) 比對並拒絕任何終止後追加或修改，避免
@@ -110,6 +118,12 @@ schema 3 消除歷史列的重複寫入，但不會自動消除 controller 對�
 同步競爭；每次 checkpoint 仍需依既有 run-level progress 契約更新該鎖保護的 JSON。若多
 worker 在 NFS 上因鎖等待成為瓶頸，必須另行調整 checkpoint interval、worker 併發或
 progress 發布策略，不能把 schema 3 的線性 history 寫入誤稱為鎖競爭已解決。
+
+`ProductionBatch.advance` 必須先正常回傳完整 sweep 的結果，controller 才會發布下一代
+checkpoint。若 Ctrl-C／例外發生在 advance 內，當前 execution 可能只完成部分粒子，
+controller 會保留上一個已發布 generation 與原有 `RUNNING` progress；下一次 `--resume`
+會由該代重新執行整個 interval。這個安全邊界避免使用舊 sweep counter 為半個 sweep 建立
+看似可恢復的檔案，也避免在沒有 phase cursor 時重複或遺失粒子步進。
 
 ## 舊 checkpoint 與遷移界線
 

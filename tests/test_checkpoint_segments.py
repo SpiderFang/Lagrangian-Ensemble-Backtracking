@@ -319,6 +319,74 @@ def test_v3_migration_root_preserves_legacy_events_without_rewriting_legacy_tree
     assert restored.complete() == uninterrupted
 
 
+def test_v3_migration_pending_age_uses_engine_tolerance(tmp_path: Path) -> None:
+    """schema 2 migration 也應接受 engine 同點 pending age 的微小浮點誤差。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    legacy_root = _write_legacy_batch_checkpoint(
+        batch,
+        tmp_path / "checkpoint-00000001",
+        sequence=1,
+    )
+    pending = batch.runtimes[1].execution.observations[-1]
+    batch.runtimes[1].execution.observations[-1] = replace(
+        pending,
+        age_seconds=pending.age_seconds + 5.0e-13,
+    )
+    migrated_root = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000002",
+        binding=_binding(),
+        sequence=2,
+        previous_checkpoint=legacy_root,
+    )
+    loaded = load_execution_checkpoint(migrated_root, expected_binding=_binding())
+    assert loaded.executions[1].observations[-1].age_seconds == pytest.approx(
+        pending.age_seconds + 5.0e-13
+    )
+
+
+@pytest.mark.parametrize("mutation", ["state", "rng"])
+def test_v3_migration_freezes_legacy_terminal_particle(
+    tmp_path: Path, mutation: str
+) -> None:
+    """schema 2→v3 遷移時，legacy 已終止粒子不可改變 state 或 RNG。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    runtime = batch.runtimes[0]
+    runtime.execution.state = replace(
+        runtime.execution.state,
+        status=ParticleStatus.MAX_AGE,
+    )
+    legacy_root = _write_legacy_batch_checkpoint(
+        batch,
+        tmp_path / "checkpoint-00000001",
+        sequence=1,
+    )
+    if mutation == "state":
+        runtime.execution.state = replace(
+            runtime.execution.state,
+            x_m=runtime.execution.state.x_m + 1.0,
+        )
+        expected_error = "terminal state"
+    else:
+        runtime.rng.random()
+        expected_error = "terminal RNG"
+
+    with pytest.raises(ValueError, match=expected_error):
+        write_execution_checkpoint(
+            tmp_path / "checkpoint-00000002",
+            binding=_binding(),
+            run_units=batch.units,
+            executions=[item.execution for item in batch.runtimes],
+            rngs=[item.rng for item in batch.runtimes],
+            triangle_hints=[item.triangle_hint for item in batch.runtimes],
+            sequence=2,
+            previous_checkpoint=legacy_root,
+        )
+
+
 def test_v3_migration_chain_missing_generation_is_rejected(tmp_path: Path) -> None:
     """遷移 root 後的 v3 chain 缺少中間 generation 時不得退回舊狀態。"""
 
@@ -530,6 +598,9 @@ def test_schema3_pending_context_update_is_allowed(tmp_path: Path) -> None:
         pending,
         environment_sample_status=EnvironmentSampleStatus.INVALID,
         environment_qc_flags=7,
+        # engine 以 age 的 1e-12 秒絕對容差判定同一 pending row；checkpoint 必須
+        # 使用相同契約，不能因浮點累積的 5e-13 秒差異誤拒合法 context 更新。
+        age_seconds=pending.age_seconds + 5.0e-13,
         x_m=pending.x_m + 0.25,
         y_m=pending.y_m - 0.5,
         z_m=pending.z_m + 0.75,
@@ -549,6 +620,7 @@ def test_schema3_pending_context_update_is_allowed(tmp_path: Path) -> None:
         pending.y_m - 0.5,
         pending.z_m + 0.75,
     )
+    assert loaded_pending.age_seconds == pytest.approx(pending.age_seconds + 5.0e-13)
 
 
 def test_schema3_pending_time_replacement_is_rejected(tmp_path: Path) -> None:
@@ -566,6 +638,31 @@ def test_schema3_pending_time_replacement_is_rejected(tmp_path: Path) -> None:
     runtime.execution.observations[-1] = replace(
         pending,
         time_utc_ns=pending.time_utc_ns + 1,
+    )
+    with pytest.raises(ValueError, match="pending boundary.*core"):
+        batch.write_checkpoint(
+            tmp_path / "checkpoint-00000002",
+            binding=_binding(),
+            sequence=2,
+            previous_checkpoint=first,
+        )
+
+
+def test_schema3_pending_age_beyond_engine_tolerance_is_rejected(tmp_path: Path) -> None:
+    """pending age 超過 engine 的 1e-12 秒容差時，必須拒絕替換造成的歷史缺列。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    first = batch.write_checkpoint(
+        tmp_path / "checkpoint-00000001",
+        binding=_binding(),
+        sequence=1,
+    )
+    runtime = batch.runtimes[1]
+    pending = runtime.execution.observations[-1]
+    runtime.execution.observations[-1] = replace(
+        pending,
+        age_seconds=pending.age_seconds + 2.0e-12,
     )
     with pytest.raises(ValueError, match="pending boundary.*core"):
         batch.write_checkpoint(

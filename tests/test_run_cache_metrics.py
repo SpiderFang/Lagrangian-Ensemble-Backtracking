@@ -355,7 +355,7 @@ def test_keyboard_interrupt_during_factory_preserves_cache_snapshot(tmp_path: Pa
 def test_keyboard_interrupt_after_batch_keeps_checkpoint_cache_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """batch 已建立時 Ctrl-C 產生 checkpoint，且 checkpoint metrics 不遺失 cache loads。"""
+    """advance 未回傳時 Ctrl-C 保留 RUNNING，且 metrics 仍記錄既有 cache loads。"""
 
     workspace = _workspace(tmp_path, "keyboard-checkpoint-cache", run_kind="pilot", interval=1)
     counters = _cache_stats()
@@ -382,6 +382,9 @@ def test_keyboard_interrupt_after_batch_keeps_checkpoint_cache_metrics(
             resource_reporter=lambda: dict(counters),
         ).run_shard(_first_shard(workspace))
     row = load_run_progress(workspace)["shards"][_first_shard(workspace)]
-    assert row["lifecycle"] == "PAUSED"
+    # advance 尚未正常回傳，不能把可能只完成部分粒子的 batch 寫成 checkpoint；但
+    # request factory 已完成的 cache load 仍可作為 RUNNING 的 best-effort invocation metric。
+    assert row["lifecycle"] == "RUNNING"
+    assert row["checkpoint_sequence"] == 0
     assert row["metrics"]["forcing_cache_stats"]["loads"] == 2
     assert row["metrics"]["forcing_cache_stats_semantics"] == "invocation_delta_v1"

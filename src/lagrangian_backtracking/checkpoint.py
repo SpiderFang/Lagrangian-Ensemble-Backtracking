@@ -792,18 +792,18 @@ def _validate_observation_sequence(
 
 
 def _observation_core(value: Observation) -> tuple[object, ...]:
-    """提取 engine 同點替換契約固定的 identity、UTC 時間與回溯年齡。
+    """提取 engine 同點替換契約固定的 particle identity 與 UTC 時間。
 
-    engine 的 ``_append_or_replace_observation`` 以 particle、time 與 age 判斷是否更新
-    最後一筆 observation；同點的 status、context 及經邊界修正後的 x/y/z 都可能合法變更。
-    checkpoint continuation 必須遵循這個既有契約，否則會把合法的 surface recovery 誤判
-    成歷史篡改。較早 stable row 仍由完整 dataclass equality 驗證。
+    engine 的 ``_append_or_replace_observation`` 以 particle、time 與「絕對誤差不超過
+    1e-12 秒」的 age 判斷是否更新最後一筆 observation；同點的 status、context 及邊界
+    修正後的 x/y/z 都可能合法變更。checkpoint continuation 必須遵循這個既有契約，否則
+    會把合法的 surface recovery 誤判成歷史篡改。較早 stable row 仍由完整 dataclass
+    equality 驗證。
     """
 
     return (
         value.particle_id,
         value.time_utc_ns,
-        value.age_seconds,
     )
 
 
@@ -816,12 +816,14 @@ def _require_observation_core_match(
     """核對跨 generation observation 核心；status/context 更新仍由 engine 契約允許。
 
     同一輸出點的 engine 更新可改變生命週期 status、環境／速度 context，以及邊界修正後
-    的位置；particle identity、UTC time 與回溯年齡一旦不同，就代表呼叫端換成另一筆
-    observation。這種替換若只依 cursor 切片會在 restore 時靜默遺失，因此直接以 engine
-    的同點 key 比對拒絕。
+    的位置；particle identity、UTC time 必須相同，age 則遵循 engine 使用的絕對容差
+    ``1e-12`` 秒。超過此範圍代表呼叫端換成另一筆 observation；這種替換若只依 cursor
+    切片會在 restore 時靜默遺失，因此直接以 engine 的同點 key 比對拒絕。
     """
 
-    if _observation_core(expected) != _observation_core(actual):
+    if _observation_core(expected) != _observation_core(actual) or not bool(
+        np.isclose(expected.age_seconds, actual.age_seconds, rtol=0.0, atol=1.0e-12)
+    ):
         raise ValueError(f"{label} observation core 不一致")
 
 
@@ -834,9 +836,9 @@ def _validate_legacy_execution_prefix(
     """確認 schema 2 migration 的 current history 仍以 legacy execution 為前綴。
 
     legacy payload 會被完整載入一次，因此遷移 root 可以逐筆驗證，而不必把舊目錄改寫。
-    最後一筆 observation 允許 engine 既有的同點 status/context 更新；其核心欄位與所有
-    更早 observation、event row 則必須逐欄相同。current 只能追加資料，不能刪除或重排
-    legacy history。
+    最後一筆 observation 允許 engine 既有的同點 status/context 更新；其 particle、UTC
+    與 age（絕對容差 1e-12 秒）核心欄位，以及所有更早 observation、event row，則必須
+    逐欄相同。current 只能追加資料，不能刪除或重排 legacy history。
     """
 
     if len(current.observations) < len(legacy.observations):
@@ -932,6 +934,41 @@ def _validate_terminal_continuation(
         previous_record["triangle_hint"], label=f"{label}.previous.triangle_hint"
     ):
         raise ValueError(f"{label} terminal triangle hint 不可在後代 generation 改變")
+
+
+def _legacy_terminal_compact_record(
+    execution: ParticleExecutionState,
+    *,
+    rng_state: Mapping[str, Any],
+    triangle_hint: int,
+    label: str,
+) -> dict[str, Any] | None:
+    """把舊 schema 的 terminal execution 轉成 terminal 凍結檢查所需的輕量 record。
+
+    schema 2 沒有 v3 compact 檔，卻仍保存完整的 current state、history、RNG 與三角形
+    提示。遷移 root 若只驗證 history 前綴，呼叫端仍可能在寫入 v3 前偷偷改掉已終止粒子
+    的位置、計數器或亂數狀態，造成可讀但不可重現的續跑結果。因此這裡只把舊 execution
+    已有的 terminal 欄位映射成與 v3 compact 相同的檢查介面；active 粒子回傳 ``None``，
+    讓遷移流程維持既有的可前進行為。這個 record 只在記憶體內使用，不會改寫舊檔。
+    """
+
+    if execution.state.status is ParticleStatus.ACTIVE:
+        return None
+    if not execution.observations:
+        raise ValueError(f"{label} terminal execution observations 不可為空")
+    return {
+        "state": _serialize_particle_state(execution.state),
+        "step_count": execution.step_count,
+        "minimum_clamp_count": execution.minimum_clamp_count,
+        "next_output_age_seconds": execution.next_output_age_seconds,
+        "observation_cursor": len(execution.observations) - 1,
+        "event_cursor": len(execution.events),
+        "pending_observation": _serialize_observation(
+            execution.observations[-1], schema_version=_SCHEMA30_VERSION
+        ),
+        "rng_state": deepcopy(dict(rng_state)),
+        "triangle_hint": triangle_hint,
+    }
 
 
 def _deserialize_execution(
@@ -2435,6 +2472,23 @@ def write_execution_checkpoint(
                     legacy,
                     label=f"schema 3 migration execution[{index}]",
                 )
+                # schema 2 沒有 compact record，但舊 execution 已保存 terminal 粒子的
+                # 完整 current／cursor／pending／RNG／hint。遷移時沿用同一個 O(P) 凍結
+                # 閘門，避免只驗 history 前綴而讓已終止粒子在 v3 root 靜默分歧。
+                legacy_record = _legacy_terminal_compact_record(
+                    legacy,
+                    rng_state=previous_loaded.rng_states[index],
+                    triangle_hint=previous_loaded.triangle_hints[index],
+                    label=f"schema 3 migration execution[{index}]",
+                )
+                if legacy_record is not None:
+                    _validate_terminal_continuation(
+                        current,
+                        legacy_record,
+                        rng_state=rng_states[index],
+                        triangle_hint=normalized_hints[index],
+                        label=f"schema 3 migration execution[{index}]",
+                    )
             previous_sequence = previous_loaded.sequence
             if sequence != previous_sequence + 1:
                 raise ValueError("schema 3 migration sequence 必須緊接舊 checkpoint")
