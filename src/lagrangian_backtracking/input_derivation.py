@@ -30,7 +30,7 @@ import shutil
 import stat
 import tempfile
 from calendar import monthrange
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -874,6 +874,91 @@ class _ProductData:
         chunk_index = int(self.canonical.source_chunk_index[index])
         local_index = int(self.canonical.source_local_index[index])
         return self.months[chunk_index], local_index
+
+
+@dataclass(frozen=True, slots=True)
+class _OCMMonthPairArrays:
+    """單一月份供 OCM receptor／dynamic pair 共用的唯讀陣列檢視。
+
+    ``zcor`` 的座標軸是 ``(time, node, layer)``、``elev`` 是
+    ``(time, node)`` 海面高程、``wetdry`` 是 ``(time, face)`` 的元素濕乾旗標；三者
+    都由已驗收的 OCM native schema 3 NPY 以唯讀 memory-map 開啟。這個小型容器把三個
+    陣列綁在同一月份，避免 receptor 與 dynamic 兩條路徑以裸 tuple 傳遞時把不同月份
+    或不同產品的資料錯接。``__iter__`` 只為既有工程 adapter 的私有 tuple 解構保留
+    相容性，新的跨階段程式應使用具名欄位。
+    """
+
+    zcor: np.ndarray
+    elev: np.ndarray
+    wetdry: np.ndarray
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        """依舊有順序提供 tuple 解構；不改變三個陣列的來源或內容。"""
+
+        yield self.zcor
+        yield self.elev
+        yield self.wetdry
+
+
+@dataclass(frozen=True, slots=True)
+class _OCMPairCache:
+    """同一 flow domain 的 OCM pair 取樣共同 cache。
+
+    ``utc_prefer_last_index`` 將 exact UTC 綁到月份與 local row；遇到跨月 halo 的重複
+    UTC 時，最後一個依既有月份排序寫入的來源會勝出，與 canonical time-axis 契約一致。
+    ``depth`` 是 source node 的正值向下水深，``monthly_arrays`` 則保存每月 zcor、elev
+    與 wetdry 的唯讀 memory-map。``flow_domain_id`` 是所有取樣資料的 binding；任何
+    caller 將 cache 套到不同產品前都必須重新核對，錯綁時直接 fail closed。
+
+    這個型別的生命週期通常是一個 ``build_input_derivatives`` 呼叫，讓 receptor 選點
+    和 5,000 筆 dynamic pair 共用同一組檔案檢視；它不複製大型陣列，也不把資料缺口
+    轉成零值或最近值。``__iter__`` 僅支援既有 ``prepare_engineering_window`` 的
+    私有 tuple 解構，實際共享一律使用具名欄位或整個 cache 物件。
+    """
+
+    flow_domain_id: str
+    utc_prefer_last_index: Mapping[int, tuple[_MonthData, int]]
+    depth: np.ndarray
+    monthly_arrays: Mapping[str, _OCMMonthPairArrays]
+
+    @property
+    def by_time(self) -> Mapping[int, tuple[_MonthData, int]]:
+        """舊有 helper 使用的 UTC index 別名；內容仍是 prefer-last mapping。"""
+
+        return self.utc_prefer_last_index
+
+    @property
+    def month_arrays(self) -> Mapping[str, _OCMMonthPairArrays]:
+        """舊有 helper 使用的月份陣列別名；每項仍可 tuple 解構。"""
+
+        return self.monthly_arrays
+
+    def __iter__(self) -> Iterator[object]:
+        """依既有順序回傳 UTC index、depth、月份 arrays，維持私有 caller 相容。"""
+
+        yield self.utc_prefer_last_index
+        yield self.depth
+        yield self.monthly_arrays
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeMeshBinding:
+    """把已建立的 NativeMesh 與其 flow domain 綁定，供 dynamic 安全重用。
+
+    ``NativeMesh`` 本身只保存幾何陣列，沒有 flow-domain 識別碼；若只把裸 mesh 由
+    receptor 傳給 dynamic，誤把另一區網格套入目前產品時無法從物件本身察覺。此 binding
+    保存產品 ID 與 immutable mesh，dynamic 會先驗證 ID 再取用，獨立 caller 未提供
+    binding 時仍會自行載入 mesh。
+    """
+
+    flow_domain_id: str
+    mesh: NativeMesh
+
+
+# 垂向支撐 cache 的 key 依序是 analysis region、study site、arrival UTC ns 與 source
+# face local index。相同 horizontal face 的四個 vertical receptor 因而只需建立一次
+# 全部 target/bracket；不同站點即使共享 flow domain 也不會誤用另一站 arrival 的結果。
+_VerticalSupportCacheKey = tuple[str, str, int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2500,24 +2585,20 @@ def _surface_series_for_location(
 
 def _load_ocm_pair_cache(
     product: _ProductData,
-) -> tuple[
-    dict[int, tuple[_MonthData, int]],
-    np.ndarray,
-    dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
-]:
+) -> _OCMPairCache:
     """一次載入 OCM pair 所需月份陣列，並建立 prefer-last UTC lookup。
 
-    回傳的 tuple 依序是 UTC 到 ``(month, local index)`` 的索引、靜態正值向下水深，
-    以及每月 ``(zcor, elev, wetdry_elem)`` 的 memory-map。receptor 的水平重選需要
-    對少量候選 face 檢查全部 arrival；dynamic manifest 也需要同一批切片。兩條路徑
-    採用同一個 cache 建立契約，並各自在單次 builder 呼叫內只建立一次，避免每次重選
-    或每個 pair 重複開啟同一個月份檔案，同時保留月份重複 UTC 的既有 prefer-last
-    precedence。這裡只驗證時間第一軸；face/node 的局部維度仍在實際取樣時按 mesh 與
-    face 檢查，避免為了 cache 掃描完整 zcor。
+    回傳物件明確綁定 ``flow_domain_id``、UTC 到 ``(month, local index)`` 的
+    prefer-last 索引、靜態正值向下水深，以及每月 zcor/elev/wetdry memory-map。receptor
+    的水平重選需要對少量候選 face 檢查全部 arrival；dynamic manifest 也需要同一批
+    切片。兩條路徑共用同一個 cache 建立契約，避免每次重選或每個 pair 重複開啟同一個
+    月份檔案，同時保留月份重複 UTC 的既有 prefer-last precedence。這裡只驗證時間第一
+    軸；face/node 的局部維度仍在實際取樣時按 mesh 與 face 檢查，避免為了 cache 掃描
+    完整 zcor。
     """
 
     by_time: dict[int, tuple[_MonthData, int]] = {}
-    month_arrays: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    month_arrays: dict[str, _OCMMonthPairArrays] = {}
     for month in product.months:
         zcor = _load_npy(month.directory / "zcor.npy")
         elev = _load_npy(month.directory / "elev.npy")
@@ -2531,7 +2612,7 @@ def _load_ocm_pair_cache(
             or wetdry.shape[0] != month.time_ns.size
         ):
             raise InputDerivationError(f"OCM {month.label} dynamic array time shape 不符")
-        month_arrays[month.label] = (zcor, elev, wetdry)
+        month_arrays[month.label] = _OCMMonthPairArrays(zcor=zcor, elev=elev, wetdry=wetdry)
         for local, value in enumerate(month.time_ns):
             # 月份依既有排序寫入；後來的重複 UTC 覆蓋前者，與 canonical source precedence
             # 一致，不能以 dict 建立順序以外的鄰近時間替代缺少的 exact UTC。
@@ -2539,7 +2620,31 @@ def _load_ocm_pair_cache(
     depth = _load_npy(product.grid_dir / "source_depth_m.npy")
     if depth.ndim != 1:
         raise InputDerivationError("OCM source_depth_m 必須是一維 node 陣列")
-    return by_time, depth, month_arrays
+    return _OCMPairCache(
+        flow_domain_id=product.flow_domain_id,
+        utc_prefer_last_index=by_time,
+        depth=depth,
+        monthly_arrays=month_arrays,
+    )
+
+
+def _assert_ocm_pair_cache(product: _ProductData, cache: _OCMPairCache) -> _OCMPairCache:
+    """核對 OCM pair cache 與產品的 flow-domain binding，錯綁時 fail closed。
+
+    cache 雖然只保存唯讀 memory-map，但其內容仍代表特定 OCM native flow domain。若
+    caller 以 analysis region 或字典位置誤把另一域的 cache 套用到目前產品，所有 face
+    index 與垂向資料都可能在數值上看似可讀卻失去物理來源。這裡在任何取樣前比對
+    ``flow_domain_id``，維持獨立 helper 的明確錯誤，而不是靜默退回重新載入或補值。
+    """
+
+    if not isinstance(cache, _OCMPairCache):
+        raise InputDerivationError("OCM pair cache 必須是具 flow-domain binding 的 _OCMPairCache")
+    if cache.flow_domain_id != product.flow_domain_id:
+        raise InputDerivationError(
+            "OCM pair cache flow_domain_id 錯綁："
+            f"cache={cache.flow_domain_id}，product={product.flow_domain_id}"
+        )
+    return cache
 
 
 def _face_times(
@@ -2547,20 +2652,29 @@ def _face_times(
     arrivals: Sequence[ArrivalTime],
     face_count: int,
     *,
+    pair_cache: _OCMPairCache | None = None,
     by_time: Mapping[int, tuple[_MonthData, int]] | None = None,
-    month_arrays: Mapping[str, tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
+    month_arrays: Mapping[str, _OCMMonthPairArrays] | None = None,
 ) -> np.ndarray:
     """依 arrival UTC 取出 OCM wetdry face matrix，維持 0=wet 的原值語意。
 
-    若 caller 已建立 OCM pair cache，這裡只切取其 memory-map，不再重複開啟月份檔案；
-    沒有提供 cache 時則保留原本的獨立使用行為，方便純測試或其他小型 caller 使用。
+    若 caller 已建立帶 flow-domain binding 的 OCM pair cache，這裡只切取其 memory-map，
+    不再重複開啟月份檔案；沒有提供 cache 時則保留原本的獨立使用行為，方便純測試或
+    其他小型 caller 使用。``by_time``／``month_arrays`` 參數只保留既有私有 helper
+    的相容路徑；新的跨階段 caller 應傳入完整 ``pair_cache``，避免拆散 binding。
     """
 
     rows: list[np.ndarray] = []
-    if by_time is None or month_arrays is None:
-        cached_by_time, _depth, cached_month_arrays = _load_ocm_pair_cache(product)
-        by_time = cached_by_time
-        month_arrays = cached_month_arrays
+    if pair_cache is not None:
+        if by_time is not None or month_arrays is not None:
+            raise InputDerivationError("OCM pair cache 不得與拆散的 by_time/month_arrays 同時提供")
+        checked_cache = _assert_ocm_pair_cache(product, pair_cache)
+        by_time = checked_cache.utc_prefer_last_index
+        month_arrays = checked_cache.monthly_arrays
+    elif by_time is None or month_arrays is None:
+        checked_cache = _load_ocm_pair_cache(product)
+        by_time = checked_cache.utc_prefer_last_index
+        month_arrays = checked_cache.monthly_arrays
     for arrival in arrivals:
         source = by_time.get(int(arrival.time_utc_ns))
         if source is None:
@@ -2569,7 +2683,7 @@ def _face_times(
         month_values = month_arrays.get(month.label)
         if month_values is None:
             raise InputDerivationError(f"OCM cache 缺少月份 wetdry：{month.label}")
-        _zcor, _elev, wetdry = month_values
+        wetdry = month_values.wetdry
         frame = np.asarray(wetdry[local], dtype=np.float64)
         if frame.shape != (face_count,):
             raise InputDerivationError("OCM wetdry_elem face 維度與網格不符")
@@ -3464,6 +3578,8 @@ def _receptor_payload(
     local_polygons: Mapping[str, Polygon],
     arrivals_by_site: Mapping[str, Sequence[ArrivalTime]],
     nww_runtime_caches: Mapping[str, _NWWRuntimeCache] | None = None,
+    ocm_pair_caches: Mapping[str, _OCMPairCache] | None = None,
+    vertical_support_cache: MutableMapping[_VerticalSupportCacheKey, _FaceVerticalSupport] | None = None,
     source_hashes: Mapping[str, str],
     strict: bool,
 ) -> tuple[
@@ -3506,17 +3622,15 @@ def _receptor_payload(
     # build_input_derivatives 會把每個 analysis region 的 cache 傳進來；直接使用此
     # internal helper 的小型 caller 若未提供 mapping，才保留 lazy 建立的相容行為。
     shared_nww_runtime_caches = dict(nww_runtime_caches or {})
-    # 同一 flow domain 可能服務兩個站點；vertical cache 以實際 source ID 共用，讓 A
-    # 區兩站的 wetdry 與 zcor/elev 只開檔一次。站點本身仍各自使用自己的 arrival、
-    # candidate geometry 與 deterministic maximin，不能因 cache 共用而合併受體選擇。
-    pair_caches: dict[
-        str,
-        tuple[
-            dict[int, tuple[_MonthData, int]],
-            np.ndarray,
-            dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
-        ],
-    ] = {}
+    # 同一 flow domain 可能服務兩個站點；pair cache 以 analysis region 作外層 key，
+    # 內部再核對實際 source ID。A 區兩站的 wetdry 與 zcor/elev 因而只開檔一次；站點
+    # 本身仍各自使用自己的 arrival、candidate geometry 與 deterministic maximin，不能
+    # 因 cache 共用而合併受體選擇。
+    pair_caches: dict[str, _OCMPairCache] = dict(ocm_pair_caches or {})
+    # 這份 cache 由 build handler 傳入時會延伸到 dynamic 階段；獨立 helper 未傳入時
+    # 建立本次呼叫專用字典，仍維持原本 lazy、無全域狀態的行為。key 同時含 region、
+    # site、arrival UTC 與 face，避免兩站共用 flow domain 時錯拿另一站的垂向結果。
+    shared_vertical_support_cache = vertical_support_cache if vertical_support_cache is not None else {}
     for site_id in sorted(site_by_id):
         site = site_by_id[site_id]
         product = products_by_region[site.analysis_region_id]
@@ -3563,11 +3677,15 @@ def _receptor_payload(
         arrival_records = list(arrivals_by_site[site_id])
         if not arrival_records:
             raise InputDerivationError(f"site 沒有 arrival，無法建立 receptor：{site_id}")
-        pair_cache = pair_caches.get(product.flow_domain_id)
+        analysis_region_id = site.analysis_region_id
+        pair_cache = pair_caches.get(analysis_region_id)
         if pair_cache is None:
             pair_cache = _load_ocm_pair_cache(product)
-            pair_caches[product.flow_domain_id] = pair_cache
-        by_time, depth_array, month_arrays = pair_cache
+            pair_caches[analysis_region_id] = pair_cache
+        pair_cache = _assert_ocm_pair_cache(product, pair_cache)
+        by_time = pair_cache.utc_prefer_last_index
+        depth_array = pair_cache.depth
+        month_arrays = pair_cache.monthly_arrays
         arrival_sources: list[tuple[_MonthData, int]] = []
         for arrival in arrival_records:
             source = by_time.get(int(arrival.time_utc_ns))
@@ -3578,8 +3696,7 @@ def _receptor_payload(
             product,
             arrival_records,
             mesh.face_nodes_local.shape[0],
-            by_time=by_time,
-            month_arrays=month_arrays,
+            pair_cache=pair_cache,
         )
         # arrival selector 已先完成逐 UTC 的 NWW exact-hour 四角 gate；此處對每個
         # horizontal face 再以其實際 lon/lat 重做同一套空間支撐，確保 receptor 與
@@ -3613,10 +3730,11 @@ def _receptor_payload(
             *,
             mesh: NativeMesh = mesh,
             depth_array: np.ndarray = depth_array,
+            analysis_region_id: str = analysis_region_id,
             site_id: str = site_id,
             arrival_records: Sequence[ArrivalTime] = arrival_records,
             arrival_sources: Sequence[tuple[_MonthData, int]] = arrival_sources,
-            month_arrays: Mapping[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = month_arrays,
+            month_arrays: Mapping[str, _OCMMonthPairArrays] = month_arrays,
             nww_cache: _NWWRuntimeCache = nww_cache,
             face_support_cache: dict[int, _FaceVerticalSupport | None] = face_support_cache,
             face_support_errors: dict[int, str] = face_support_errors,
@@ -3669,20 +3787,38 @@ def _receptor_payload(
                 arrival_sources,
                 strict=True,
             ):
-                zcor, elev, _wetdry = month_arrays[source_month.label]
-                try:
-                    zcor_slice = np.asarray(zcor[source_local, nodes], dtype=np.float64)
-                    eta_values = np.asarray(elev[source_local, nodes], dtype=np.float64)
-                except (IndexError, TypeError, ValueError) as exc:
+                month_values = month_arrays.get(source_month.label)
+                if month_values is None:
                     raise InputDerivationError(
-                        f"{site_id} receptor face 無法切取 OCM zcor／eta：{arrival.time_utc_ns}"
-                    ) from exc
-                support = _build_face_vertical_support(
-                    zcor_node_layer=zcor_slice,
-                    node_elev_m=eta_values,
-                    node_depth_m=node_depth,
-                    vertical_ids=_VERTICAL_TARGET_IDS,
+                        f"{site_id} receptor cache 缺少 OCM 月份：{source_month.label}"
+                    )
+                zcor = month_values.zcor
+                elev = month_values.elev
+                support_key: _VerticalSupportCacheKey = (
+                    analysis_region_id,
+                    site_id,
+                    int(arrival.time_utc_ns),
+                    face_index,
                 )
+                support = shared_vertical_support_cache.get(support_key)
+                if support is None:
+                    try:
+                        # 同一個 horizontal face×arrival 一次建立完整四個 vertical
+                        # target/bracket；後面四個 receptor 只取對應 target，不再各自掃描
+                        # node/layer。所有逐 node 雙側支撐、wet/dry 與缺值 gate 均維持原規則。
+                        zcor_slice = np.asarray(zcor[source_local, nodes], dtype=np.float64)
+                        eta_values = np.asarray(elev[source_local, nodes], dtype=np.float64)
+                    except (IndexError, TypeError, ValueError) as exc:
+                        raise InputDerivationError(
+                            f"{site_id} receptor face 無法切取 OCM zcor／eta：{arrival.time_utc_ns}"
+                        ) from exc
+                    support = _build_face_vertical_support(
+                        zcor_node_layer=zcor_slice,
+                        node_elev_m=eta_values,
+                        node_depth_m=node_depth,
+                        vertical_ids=_VERTICAL_TARGET_IDS,
+                    )
+                    shared_vertical_support_cache[support_key] = support
                 if first_support is None:
                     first_support = support
             if first_support is None:
@@ -3936,16 +4072,21 @@ def _dynamic_initial_payload(
     expected_pair_count: int | None = None,
     generation_method_id: str = "server_v3_ocm_dynamic_receptor_arrival_initial_condition_v1",
     provenance_extra: Mapping[str, Any] | None = None,
+    ocm_pair_caches: Mapping[str, _OCMPairCache] | None = None,
+    native_mesh_bindings: Mapping[str, _NativeMeshBinding] | None = None,
+    vertical_support_cache: MutableMapping[_VerticalSupportCacheKey, _FaceVerticalSupport] | None = None,
 ) -> dict[str, Any]:
     """建立每個 receptor×arrival 一筆的 OCM-derived dynamic manifest。
 
-    建立前先按 flow domain 建立唯讀 cache，將網格拓撲、月份時間索引與 OCM 的 zcor、
-    elev、wetdry 陣列各載入一次。這不只改善 5,000 pair 的執行時間，也避免同一個
-    ``receptor×arrival`` 因重複開檔而讀到不同的跨月 halo；時間索引沿用月份排序後的
-    prefer-last 語意。每列仍保存實際月份、source time index、面索引與 observed origin，
-    因而不會把模板 receptor 的 z 值誤當成所有 arrival 共用的固定深度。每個 pair
-    會再以同一個 `_build_face_vertical_support` 檢查目前 UTC 的各 face node 與指定
-    vertical class；若 receptor gate 與實際 zcor／eta 不一致，直接 fail closed。
+    建立前先按 analysis region 建立／接收帶 flow-domain binding 的唯讀 cache，將網格
+    拓撲、月份時間索引與 OCM 的 zcor、elev、wetdry 陣列各載入一次。正式 builder 會
+    把 receptor 階段已建立的 cache 與 NativeMesh 直接傳入，因此不會在 dynamic 階段
+    再次開啟同一組月份檔案或重建網格；沒有傳入時則保留獨立 helper 的 lazy 行為。
+    時間索引沿用月份排序後的 prefer-last 語意。每列仍保存實際月份、source time index、
+    面索引與 observed origin，因而不會把模板 receptor 的 z 值誤當成所有 arrival 共用的
+    固定深度。每個 unique ``(analysis region, site, arrival UTC, face)`` 只以
+    ``_VERTICAL_TARGET_IDS`` 建立一次完整垂向支撐；四個 vertical receptor 後續只取
+    對應 target/bracket。若 receptor gate 與實際 zcor／eta 不一致，仍直接 fail closed。
     ``expected_pair_count`` 預設為既有正式流程的 5,000 筆；只有明確傳入時才允許
     工程性小範圍 adapter 使用另一個已驗收的 receptor×arrival 數量，因此不會改變正式
     wrapper 的固定計數。``generation_method_id`` 與 ``provenance_extra`` 讓工程 artifact
@@ -3970,33 +4111,71 @@ def _dynamic_initial_payload(
     for arrival in arrivals:
         arrival_by_site.setdefault(arrival.study_site_id, []).append(arrival)
 
-    # 每個 region 的 tuple 內容依序為：NativeMesh、UTC→(month,local) 索引、靜態水深與
-    # 月份陣列 cache。陣列仍是 mmap view，不會因建立 5,000 rows 把完整四維 forcing
-    # 複製進記憶體；cache 的生命週期只涵蓋本次 builder 呼叫。
+    # 每個 region 的 tuple 內容依序為 NativeMesh 與帶 flow-domain binding 的 OCM cache。
+    # 陣列仍是 mmap view，不會因建立 5,000 rows 把完整四維 forcing 複製進記憶體；
+    # cache 的生命週期通常涵蓋同一個 builder call 的 receptor 與 dynamic 階段。
+    shared_pair_caches: dict[str, _OCMPairCache] = dict(ocm_pair_caches or {})
+    shared_mesh_bindings: dict[str, _NativeMeshBinding] = dict(native_mesh_bindings or {})
+    shared_vertical_support_cache = vertical_support_cache if vertical_support_cache is not None else {}
+    # 先按唯一 pair key 收集實際 caller 要求的 vertical 類別。正式 builder 的每個
+    # horizontal face 會有四類，因此仍按固定 ``_VERTICAL_TARGET_IDS`` 順序一次建立
+    # 全部支撐；engineering adapter 可能只保留 near-bed，不能因未要求的類別缺少
+    # 支撐而改變原本的單站相容行為。
+    requested_vertical_ids_by_key: dict[tuple[str, str, int, int], set[str]] = {}
+    for receptor in receptors:
+        site_arrivals = arrival_by_site.get(receptor.study_site_id, ())
+        node_face = receptor.metadata.get("source_face_local_index")
+        if not isinstance(node_face, int) or isinstance(node_face, bool):
+            # 保留後面依 receptor 的既有明確錯誤；此處不先猜測 face key。
+            continue
+        for arrival in site_arrivals:
+            key = (
+                receptor.analysis_region_id,
+                receptor.study_site_id,
+                int(arrival.time_utc_ns),
+                int(node_face),
+            )
+            requested_vertical_ids_by_key.setdefault(key, set()).add(receptor.vertical_id)
     runtime_cache: dict[
         str,
-        tuple[
-            NativeMesh,
-            dict[int, tuple[_MonthData, int]],
-            np.ndarray,
-            dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
-        ],
+        tuple[NativeMesh, _OCMPairCache],
     ] = {}
     for region, product in sorted(products_by_region.items()):
         domain = domain_by_region[region]
         projection = DomainProjection(*domain.center_lonlat)
-        mesh = _load_native_mesh(product, projection)
-        # 使用與 receptor 水平重選相同的月份／UTC／memory-map cache 契約；本次
-        # dynamic builder 只載入一次各月份陣列，pair 只讀取實際 receptor face 的小切片，
-        # 不把完整 OCM 四維資料複製到記憶體。
-        by_time, depth, month_arrays = _load_ocm_pair_cache(product)
-        runtime_cache[region] = (mesh, by_time, depth, month_arrays)
+        pair_cache = shared_pair_caches.get(region)
+        if pair_cache is None:
+            # 獨立 engineering／測試 caller 未提供共同 cache 時，仍在此處 lazy 建立，
+            # 但建立後以 analysis region 保存，避免同一 helper 內後續 receptor 取樣重開。
+            pair_cache = _load_ocm_pair_cache(product)
+            shared_pair_caches[region] = pair_cache
+        pair_cache = _assert_ocm_pair_cache(product, pair_cache)
+        mesh_binding = shared_mesh_bindings.get(region)
+        if mesh_binding is None:
+            mesh_binding = _NativeMeshBinding(
+                flow_domain_id=product.flow_domain_id,
+                mesh=_load_native_mesh(product, projection),
+            )
+            shared_mesh_bindings[region] = mesh_binding
+        if not isinstance(mesh_binding, _NativeMeshBinding):
+            raise InputDerivationError(
+                f"dynamic NativeMesh binding 必須是具 flow-domain binding 的 _NativeMeshBinding：{region}"
+            )
+        if mesh_binding.flow_domain_id != product.flow_domain_id:
+            raise InputDerivationError(
+                "dynamic NativeMesh flow_domain_id 錯綁："
+                f"cache={mesh_binding.flow_domain_id}，product={product.flow_domain_id}"
+            )
+        runtime_cache[region] = (mesh_binding.mesh, pair_cache)
 
     records: list[dict[str, Any]] = []
     for receptor in sorted(receptors, key=lambda item: item.receptor_id):
         site = site_by_id[receptor.study_site_id]
         product = products_by_region[site.analysis_region_id]
-        mesh, by_time, depth, month_arrays = runtime_cache[site.analysis_region_id]
+        mesh, pair_cache = runtime_cache[site.analysis_region_id]
+        by_time = pair_cache.utc_prefer_last_index
+        depth = pair_cache.depth
+        month_arrays = pair_cache.monthly_arrays
         node_face = receptor.metadata.get("source_face_local_index")
         if not isinstance(node_face, int) or isinstance(node_face, bool):
             raise InputDerivationError(f"receptor 缺少 source_face_local_index：{receptor.receptor_id}")
@@ -4012,21 +4191,49 @@ def _dynamic_initial_payload(
             if source is None:
                 raise InputDerivationError(f"dynamic pair UTC 不在 OCM：{arrival.time_utc_ns}")
             month, local = source
-            zcor, elev, wetdry = month_arrays[month.label]
-            wetdry_value = int(round(float(np.asarray(wetdry[local], dtype=np.float64)[node_face])))
+            month_values = month_arrays.get(month.label)
+            if month_values is None:
+                raise InputDerivationError(f"dynamic pair cache 缺少 OCM 月份：{month.label}")
+            zcor = month_values.zcor
+            elev = month_values.elev
+            wetdry = month_values.wetdry
+            # dynamic 只需要目前 receptor 所在 face 的濕乾狀態；直接以二維索引取一個
+            # scalar，避免先把整個 time row materialize 成 float64。receptor 階段仍需
+            # 整列 wetdry 建立 horizontal candidate pool，兩者資料需求不同，不能以此
+            # 優化放寬逐 face 的 wet/dry gate。
+            wetdry_value = int(round(float(np.asarray(wetdry[local, node_face], dtype=np.float64))))
             if wetdry_value != 0:
                 raise InputDerivationError(
                     f"dynamic pair 遇到 dry face：{receptor.receptor_id}/{arrival.arrival_time_id}"
                 )
-            # 不能沿用 receptor template 的 z 或只對 face node 先取 median；actual pair
-            # 必須依此 UTC 的每個 node/layer zcor 重新證明同一 vertical target 有雙側
-            # 支撐。若與 receptor 建立時的 gate 不一致，這裡直接拒絕，不做補值或外插。
-            pair_support = _build_face_vertical_support(
-                zcor_node_layer=np.asarray(zcor[local, nodes], dtype=np.float64),
-                node_elev_m=np.asarray(elev[local, nodes], dtype=np.float64),
-                node_depth_m=depth_values,
-                vertical_ids=(receptor.vertical_id,),
+            support_key: _VerticalSupportCacheKey = (
+                receptor.analysis_region_id,
+                receptor.study_site_id,
+                int(arrival.time_utc_ns),
+                int(node_face),
             )
+            pair_support = shared_vertical_support_cache.get(support_key)
+            if pair_support is None:
+                # 不能沿用 receptor template 的 z 或只對 face node 先取 median；actual
+                # pair 必須依此 UTC 的每個 node/layer zcor 重新證明 caller 要求的
+                # vertical target 雙側支撐。正式四類支撐一旦建立，四個 receptor 只取
+                # 自己的 target/bracket，不會為每個 vertical class 重複掃描相同資料。
+                requested_vertical_ids = tuple(
+                    vertical_id
+                    for vertical_id in _VERTICAL_TARGET_IDS
+                    if vertical_id in requested_vertical_ids_by_key.get(support_key, set())
+                )
+                if not requested_vertical_ids:
+                    raise InputDerivationError(
+                        f"dynamic pair 找不到目前 face／arrival 的 vertical 要求：{support_key}"
+                    )
+                pair_support = _build_face_vertical_support(
+                    zcor_node_layer=np.asarray(zcor[local, nodes], dtype=np.float64),
+                    node_elev_m=np.asarray(elev[local, nodes], dtype=np.float64),
+                    node_depth_m=depth_values,
+                    vertical_ids=requested_vertical_ids,
+                )
+                shared_vertical_support_cache[support_key] = pair_support
             target = pair_support.target_for(receptor.vertical_id)
             lower, upper = pair_support.bracket_for(receptor.vertical_id)
             alpha = float((target.z_m_positive_up - lower) / (upper - lower))
@@ -5030,6 +5237,14 @@ def build_input_derivatives(
         pilot_horizon_overrides = {
             str(arrival_id): PILOT_EXPLICIT_MAX_BACKTRACK_DAYS for arrival_id in pilot_arrival_ids
         }
+    # OCM native 的 zcor/elev/wetdry 與 source depth 只建立一次帶 flow-domain binding 的
+    # pair cache；receptor 需要整列 wetdry 來選水平 face，dynamic 只取 selected face scalar，
+    # 但兩階段共用同一批 memory-map 與 prefer-last UTC index。外層 key 統一使用
+    # analysis_region_id，避免把不同 region 的產品因 flow-domain 字串碰巧相同而錯接。
+    ocm_pair_caches = {
+        region: _load_ocm_pair_cache(product) for region, product in sorted(ocm_by_region.items())
+    }
+    vertical_support_cache: dict[_VerticalSupportCacheKey, _FaceVerticalSupport] = {}
     receptor_payload, receptor_index, receptor_objects, meshes, projections = _receptor_payload(
         config=config,
         products_by_region=ocm_by_region,
@@ -5038,9 +5253,23 @@ def build_input_derivatives(
         local_polygons=local_polygons,
         arrivals_by_site=arrivals_by_site,
         nww_runtime_caches=nww_runtime_caches,
+        ocm_pair_caches=ocm_pair_caches,
+        vertical_support_cache=vertical_support_cache,
         source_hashes=source_hashes,
         strict=strict_mode,
     )
+    # receptor helper 以 flow-domain 共用 mesh，先把相同 immutable object 包成每 region
+    # 的 binding 供 dynamic 使用。A 區兩站仍指向同一個 NativeMesh；binding 會在 dynamic
+    # 取用前核對產品 flow_domain_id，避免裸 mesh 無法辨識錯綁。
+    native_mesh_bindings: dict[str, _NativeMeshBinding] = {}
+    for region, product in sorted(ocm_by_region.items()):
+        mesh = meshes.get(product.flow_domain_id)
+        if mesh is None:
+            raise InputDerivationError(f"receptor 未回傳 OCM NativeMesh：{region}")
+        native_mesh_bindings[region] = _NativeMeshBinding(
+            flow_domain_id=product.flow_domain_id,
+            mesh=mesh,
+        )
     del receptor_index, meshes, projections
     arrival_payload = _arrival_payload(
         config,
@@ -5058,6 +5287,9 @@ def build_input_derivatives(
         source_hashes=source_hashes,
         strict=strict_mode,
         pilot_selection=pilot_selection,
+        ocm_pair_caches=ocm_pair_caches,
+        native_mesh_bindings=native_mesh_bindings,
+        vertical_support_cache=vertical_support_cache,
     )
     max_days = horizon_settings.selection_days
     gap_payload = _gap_safe_payload(

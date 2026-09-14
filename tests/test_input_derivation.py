@@ -12,6 +12,7 @@ import json
 import shutil
 from calendar import monthrange
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,7 +45,7 @@ from lagrangian_backtracking.receptors import (
     prepare_horizontal_receptor_candidates,
     select_horizontal_receptors_from_pool,
 )
-from lagrangian_backtracking.scenarios import ArrivalTime, stable_identifier
+from lagrangian_backtracking.scenarios import ArrivalTime, Receptor, stable_identifier
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
@@ -1178,8 +1179,12 @@ def test_receptor_nww_reselection_prepares_one_pool_per_site_and_caches_support(
     original_select = input_derivation_module.select_horizontal_receptors_from_pool
     original_exact_hour = input_derivation_module._nww_exact_hour_samples
     original_load_nww_cache = input_derivation_module._load_nww_runtime_cache
+    original_load_ocm_pair_cache = input_derivation_module._load_ocm_pair_cache
+    original_load_native_mesh = input_derivation_module._load_native_mesh
     prepare_calls: list[str] = []
     nww_cache_loads: list[str] = []
+    ocm_pair_cache_loads: list[str] = []
+    native_mesh_loads: list[str] = []
     pools: dict[str, object] = {}
     selector_calls: dict[str, list[tuple[int, ...]]] = {}
     face_positions: dict[tuple[float, float], tuple[str, int]] = {}
@@ -1247,10 +1252,24 @@ def test_receptor_nww_reselection_prepares_one_pool_per_site_and_caches_support(
         nww_cache_loads.append(str(product.flow_domain_id))  # type: ignore[attr-defined]
         return original_load_nww_cache(product)  # type: ignore[arg-type]
 
+    def load_ocm_pair_cache_spy(product: object) -> object:
+        """記錄 OCM pair cache 建立，確認 receptor／dynamic 共用同一份每區 cache。"""
+
+        ocm_pair_cache_loads.append(str(product.flow_domain_id))  # type: ignore[attr-defined]
+        return original_load_ocm_pair_cache(product)  # type: ignore[arg-type]
+
+    def load_native_mesh_spy(product: object, projection: object) -> object:
+        """記錄 NativeMesh 建立，確認 dynamic 直接重用 receptor 的 immutable mesh。"""
+
+        native_mesh_loads.append(str(product.flow_domain_id))  # type: ignore[attr-defined]
+        return original_load_native_mesh(product, projection)  # type: ignore[arg-type]
+
     monkeypatch.setattr(input_derivation_module, "prepare_horizontal_receptor_candidates", prepare_spy)
     monkeypatch.setattr(input_derivation_module, "select_horizontal_receptors_from_pool", select_spy)
     monkeypatch.setattr(input_derivation_module, "_nww_exact_hour_samples", exact_hour_spy)
     monkeypatch.setattr(input_derivation_module, "_load_nww_runtime_cache", load_nww_cache_spy)
+    monkeypatch.setattr(input_derivation_module, "_load_ocm_pair_cache", load_ocm_pair_cache_spy)
+    monkeypatch.setattr(input_derivation_module, "_load_native_mesh", load_native_mesh_spy)
     input_derivation_module.build_input_derivatives(
         config_path=config_path,
         destination=root / "derived-inputs-nww-reselect",
@@ -1265,6 +1284,24 @@ def test_receptor_nww_reselection_prepares_one_pool_per_site_and_caches_support(
         "houwan_nmmba_cache_v3",
         "hsinchu_cache_v3",
         "lienchiang_common_cache_v3",
+        "northeast_taiwan_common_cache_v3",
+    ]
+    # 四個 analysis region 各自只建立一次；dynamic 不應在 receptor 完成後重新開啟
+    # 同一批 zcor/elev/wetdry memory-map。
+    assert sorted(ocm_pair_cache_loads) == [
+        "houwan_nmmba_cache_v3",
+        "hsinchu_cache_v3",
+        "lienchiang_common_cache_v3",
+        "northeast_taiwan_common_cache_v3",
+    ]
+    # A 區 geometry helper 目前會為兩個 local 圓各自讀一次 mesh，之後 receptor 只再
+    # 建立一份共享 mesh；dynamic 沿用 receptor binding，不能再為四個 region 重建。
+    assert sorted(native_mesh_loads) == [
+        "houwan_nmmba_cache_v3",
+        "hsinchu_cache_v3",
+        "lienchiang_common_cache_v3",
+        "northeast_taiwan_common_cache_v3",
+        "northeast_taiwan_common_cache_v3",
         "northeast_taiwan_common_cache_v3",
     ]
     assert set(prepare_calls) == expected_sites
@@ -1325,6 +1362,133 @@ def test_receptor_nww_common_candidates_below_five_fail_closed(
             nww_analysis_root=nww_root,
             formal=False,
         )
+
+
+def test_ocm_pair_cache_rejects_wrong_flow_domain_binding(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> None:
+    """OCM pair cache 若被套到不同 flow domain，取樣前必須直接拒絕。"""
+
+    config_path, ocm_root, _surface_root, _nww_root, _root = synthetic_input_fixture
+    config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert isinstance(config_payload, dict)
+    config = ProjectConfig.model_validate(config_payload)
+    product = input_derivation_module._load_product(
+        product="ocm_native",
+        root=ocm_root,
+        root_token=config.inputs.ocm_native_root_env,
+        flow_domain_id="hsinchu_cache_v3",
+        months=input_derivation_module._months_for_config(config),
+        config=config,
+    )
+    cache = input_derivation_module._load_ocm_pair_cache(product)
+    wrong_cache = replace(cache, flow_domain_id="houwan_nmmba_cache_v3")
+    with pytest.raises(InputDerivationError, match="flow_domain_id 錯綁"):
+        input_derivation_module._face_times(
+            product,
+            arrivals=(),
+            face_count=1,
+            pair_cache=wrong_cache,
+        )
+
+
+def test_dynamic_pair_cache_reads_scalar_wetdry_and_reuses_four_vertical_supports(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 face×arrival 的四類 receptor 應共用一次垂向計算並只索引 wetdry scalar。"""
+
+    config_path, ocm_root, _surface_root, _nww_root, _root = synthetic_input_fixture
+    config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert isinstance(config_payload, dict)
+    config = ProjectConfig.model_validate(config_payload)
+    domain = next(item for item in config.domains if item.analysis_region_id == "B")
+    product = input_derivation_module._load_product(
+        product="ocm_native",
+        root=ocm_root,
+        root_token=config.inputs.ocm_native_root_env,
+        flow_domain_id="hsinchu_cache_v3",
+        months=input_derivation_module._months_for_config(config),
+        config=config,
+    )
+    projection = DomainProjection(*domain.center_lonlat)
+    mesh = input_derivation_module._load_native_mesh(product, projection)
+    face_index = 0
+    arrival_ns = int(product.canonical.time_utc_ns[0])
+    arrival = ArrivalTime(
+        arrival_time_id="dynamic-cache-test-arrival",
+        study_site_id="hsinchu",
+        time_utc_ns=arrival_ns,
+        year=2024,
+        season="DJF",
+        tide_class="test",
+        phase_or_event="test",
+        metadata={},
+    )
+    receptors = tuple(
+        Receptor(
+            receptor_id=f"dynamic-cache-test-{vertical_id}",
+            study_site_id="hsinchu",
+            analysis_region_id="B",
+            lon=float(mesh.node_lon[mesh.face_nodes_local[face_index, 0]]),
+            lat=float(mesh.node_lat[mesh.face_nodes_local[face_index, 0]]),
+            z_m_positive_up=-1.0,
+            vertical_id=vertical_id,
+            metadata={
+                "source_face_local_index": face_index,
+                "source_face_global_index": int(mesh.source_face_global_index[face_index]),
+            },
+        )
+        for vertical_id in input_derivation_module._VERTICAL_TARGET_IDS
+    )
+    pair_cache = input_derivation_module._load_ocm_pair_cache(product)
+
+    class ScalarOnlyWetdry:
+        """只允許 dynamic 所需的 ``(time, face)`` scalar 索引。"""
+
+        def __init__(self, values: np.ndarray) -> None:
+            self.values = values
+
+        def __getitem__(self, key: object) -> np.ndarray:
+            """拒絕先以單一 time index 取整列，避免測試悄悄失去 I/O 保證。"""
+
+            if not isinstance(key, tuple) or len(key) != 2:
+                raise AssertionError("dynamic wetdry 必須使用 (time, face) scalar 索引")
+            return self.values[key]
+
+    wrapped_months = {
+        label: replace(month_values, wetdry=ScalarOnlyWetdry(month_values.wetdry))
+        for label, month_values in pair_cache.monthly_arrays.items()
+    }
+    wrapped_cache = replace(pair_cache, monthly_arrays=wrapped_months)
+    original_support = input_derivation_module._build_face_vertical_support
+    support_calls: list[tuple[str, ...]] = []
+
+    def support_spy(**kwargs: object) -> object:
+        """記錄每個 unique pair 的 vertical_ids，再執行正式 fail-closed helper。"""
+
+        support_calls.append(tuple(kwargs["vertical_ids"]))  # type: ignore[arg-type]
+        return original_support(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(input_derivation_module, "_build_face_vertical_support", support_spy)
+    payload = input_derivation_module._dynamic_initial_payload(
+        config=config,
+        products_by_region={"B": product},
+        receptors=receptors,
+        arrivals=(arrival,),
+        source_hashes={"ocm_native:hsinchu_cache_v3": "0" * 64},
+        strict=False,
+        expected_pair_count=len(receptors),
+        ocm_pair_caches={"B": wrapped_cache},
+        native_mesh_bindings={
+            "B": input_derivation_module._NativeMeshBinding(
+                flow_domain_id=product.flow_domain_id,
+                mesh=mesh,
+            )
+        },
+    )
+    assert len(payload["records"]) == len(receptors)
+    assert support_calls == [input_derivation_module._VERTICAL_TARGET_IDS]
 
 
 def test_face_vertical_support_rejects_steep_node_without_target_bracket() -> None:
@@ -1533,6 +1697,11 @@ def test_inputs_build_validate_and_release_config(
     assert validation["summary"]["receptor_count"] == 100
     assert validation["summary"]["arrival_count"] == 250
     assert validation["summary"]["dynamic_initial_condition_count"] == 5_000
+    initial_payload, _ = read_canonical_json(artifact_directory / ARTIFACT_FILENAMES["initial_condition"])
+    assert len(initial_payload["records"]) == 5_000
+    assert initial_payload["records"] == sorted(
+        initial_payload["records"], key=lambda row: (row["receptor_id"], row["time_utc_ns"])
+    )
     # 以同一份已建立的 artifact 驗證相對目錄入口；config 與三個 accepted root 仍明示
     # 為絕對路徑，故這裡專門測試 artifact component path 的 lexical 絕對化，而不新增
     # 第二套 expensive fixture 或重建任何 synthetic product。
