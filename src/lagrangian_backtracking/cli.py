@@ -51,6 +51,7 @@ from .boundaries import BoundaryGeometry
 from .config import load_config
 from .diffusion import DiffusionCoefficients
 from .engine import EngineSettings, run_particle
+from .horizon_suite import build_horizon_suite, validate_horizon_suite
 from .input_derivation import (
     build_input_derivatives,
     create_release_config,
@@ -209,6 +210,66 @@ def _release_config_validate_parser() -> argparse.ArgumentParser:
     parser.add_argument("--formal-release", "--formal", dest="formal", action="store_true")
     parser.set_defaults(formal=True)
     parser.add_argument("--pilot", dest="formal", action="store_false")
+    return parser
+
+
+def _horizon_suite_create_parser() -> argparse.ArgumentParser:
+    """建立共同回溯母體 suite 的建置 parser。
+
+    ``--backtrack-days`` 接受任意數量的整數日數；handler 會再拒絕重複值並排序，
+    因此 CLI 不會把 30、60、90 寫成固定選單。建置會把最大日數送入一次
+    ``inputs-build``，其餘日數只建立 release config；三個 accepted forcing root 均需
+    由 caller 明示，避免在 SERVER 上猜測資料位置。
+    """
+
+    parser = argparse.ArgumentParser(description="建立共用輸入母體與多個回溯長度 release suite")
+    parser.add_argument("--config-template", required=True, type=Path)
+    parser.add_argument("--backtrack-days", required=True, nargs="+", type=_positive_cli_int)
+    parser.add_argument("--destination", required=True, type=Path)
+    parser.add_argument("--ocm-native-root", required=True, type=Path)
+    parser.add_argument("--ocm-surface-root", required=True, type=Path)
+    parser.add_argument("--nww-analysis-root", required=True, type=Path)
+    parser.set_defaults(formal=True)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--formal-release",
+        "--formal",
+        dest="formal",
+        action="store_true",
+        help="啟用正式 approved gate（預設模式）",
+    )
+    mode_group.add_argument(
+        "--pilot",
+        dest="formal",
+        action="store_false",
+        help="保留 generated/pilot gate；仍執行完整結構與 hash 驗證",
+    )
+    return parser
+
+
+def _horizon_suite_validate_parser() -> argparse.ArgumentParser:
+    """建立共同回溯母體 suite 的唯讀 validator parser。"""
+
+    parser = argparse.ArgumentParser(description="驗證共用輸入母體與多個回溯 release suite")
+    parser.add_argument("path", type=Path)
+    parser.add_argument("--ocm-native-root", type=Path)
+    parser.add_argument("--ocm-surface-root", type=Path)
+    parser.add_argument("--nww-analysis-root", type=Path)
+    parser.set_defaults(formal=True)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--formal-release",
+        "--formal",
+        dest="formal",
+        action="store_true",
+        help="啟用正式 approved gate（預設模式）",
+    )
+    mode_group.add_argument(
+        "--pilot",
+        dest="formal",
+        action="store_false",
+        help="以 generated/pilot 狀態驗證 suite",
+    )
     return parser
 
 
@@ -997,6 +1058,50 @@ def run_release_config_validate(argv: Sequence[str] | None = None) -> int:
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result.get("valid") is True else 2
+
+
+def run_horizon_suite_create(argv: Sequence[str] | None = None) -> int:
+    """建立共用最長回溯輸入與多份 horizon release config，並輸出 JSON 摘要。
+
+    CLI 只負責解析 caller 明示的 template、日數、目的地及三個 accepted forcing
+    root；日數保持 argparse 收到的原始順序傳給核心，由核心統一做唯一性與排序檢查。
+    ``formal`` 只表達正式／pilot gate 模式，不在 handler 內複製任何輸入衍生或
+    release 設定邏輯。核心例外維持既有 CLI 錯誤機制，避免把 partial suite 誤報成成功。
+    """
+
+    args = _horizon_suite_create_parser().parse_args(argv)
+    result = build_horizon_suite(
+        config_template_path=args.config_template,
+        backtrack_days=args.backtrack_days,
+        destination=args.destination,
+        ocm_native_root=args.ocm_native_root,
+        ocm_surface_root=args.ocm_surface_root,
+        nww_analysis_root=args.nww_analysis_root,
+        formal=args.formal,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def run_horizon_suite_validate(argv: Sequence[str] | None = None) -> int:
+    """唯讀驗證 horizon suite，並以 validator 的 ``valid`` 映射 shell 狀態。
+
+    suite path 是唯一的輸入母體識別；common input 必須由核心固定解析為 suite 內的
+    ``common-input``，因此 handler 不接受或轉送外部 input directory。三個 forcing
+    root 可由 caller 明示以重做來源與 checksum 檢查；驗證報告原樣輸出為 JSON，合法
+    回傳 0，任何 ``valid`` 非嚴格 ``True`` 的報告回傳 2。
+    """
+
+    args = _horizon_suite_validate_parser().parse_args(argv)
+    result = validate_horizon_suite(
+        args.path,
+        formal=args.formal,
+        ocm_native_root=args.ocm_native_root,
+        ocm_surface_root=args.ocm_surface_root,
+        nww_analysis_root=args.nww_analysis_root,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if isinstance(result, Mapping) and result.get("valid") is True else 2
 
 
 def run_pilot_calibrate(argv: Sequence[str] | None = None) -> int:
@@ -1908,6 +2013,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         add_help=False,
     )
     subparsers.add_parser(
+        "horizon-suite-create",
+        parents=[_horizon_suite_create_parser()],
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "horizon-suite-validate",
+        parents=[_horizon_suite_validate_parser()],
+        add_help=False,
+    )
+    subparsers.add_parser(
         "pilot-calibrate",
         parents=[_pilot_calibrate_parser()],
         add_help=False,
@@ -2003,6 +2118,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_release_config_create(command_argv)
     if parsed.command == "release-config-validate":
         return run_release_config_validate(command_argv)
+    if parsed.command == "horizon-suite-create":
+        return run_horizon_suite_create(command_argv)
+    if parsed.command == "horizon-suite-validate":
+        return run_horizon_suite_validate(command_argv)
     if parsed.command in {"pilot-calibrate", "pilot-calibration-build"}:
         return run_pilot_calibrate(command_argv)
     if parsed.command in {"pilot-calibrate-validate", "pilot-calibration-validate"}:

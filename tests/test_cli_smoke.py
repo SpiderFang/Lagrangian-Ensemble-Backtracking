@@ -242,6 +242,179 @@ def test_inputs_build_cli_rejects_formal_pilot_before_builder_or_destination_wri
     assert not destination.exists()
 
 
+def test_horizon_suite_create_cli_forwards_all_arguments_and_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """horizon-suite-create 應保留日數順序、轉送三個 roots，並輸出核心 JSON。"""
+
+    calls: list[dict[str, object]] = []
+
+    def fake_build_horizon_suite(**kwargs: object) -> dict[str, object]:
+        """記錄 suite builder 的完整參數，隔離測試與實際 accepted-product I/O。"""
+
+        calls.append(kwargs)
+        return {
+            "destination": str(kwargs["destination"]),
+            "formal": kwargs["formal"],
+            "horizons_days": list(kwargs["backtrack_days"]),
+            "valid": True,
+        }
+
+    monkeypatch.setattr(cli, "build_horizon_suite", fake_build_horizon_suite)
+    template = tmp_path / "template.yaml"
+    destination = tmp_path / "suite-formal"
+    ocm_native_root = tmp_path / "ocm-native"
+    ocm_surface_root = tmp_path / "ocm-surface"
+    nww_analysis_root = tmp_path / "nww-analysis"
+    common = [
+        "horizon-suite-create",
+        "--config-template",
+        str(template),
+        "--backtrack-days",
+        "90",
+        "30",
+        "60",
+        "--destination",
+        str(destination),
+        "--ocm-native-root",
+        str(ocm_native_root),
+        "--ocm-surface-root",
+        str(ocm_surface_root),
+        "--nww-analysis-root",
+        str(nww_analysis_root),
+    ]
+
+    assert main([*common, "--formal"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "destination": str(destination),
+        "formal": True,
+        "horizons_days": [90, 30, 60],
+        "valid": True,
+    }
+    assert calls == [
+        {
+            "config_template_path": template,
+            "backtrack_days": [90, 30, 60],
+            "destination": destination,
+            "ocm_native_root": ocm_native_root,
+            "ocm_surface_root": ocm_surface_root,
+            "nww_analysis_root": nww_analysis_root,
+            "formal": True,
+        }
+    ]
+
+    pilot_destination = tmp_path / "suite-pilot"
+    assert (
+        main(
+            [
+                *common[:7],
+                "--destination",
+                str(pilot_destination),
+                *common[9:],
+                "--pilot",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "destination": str(pilot_destination),
+        "formal": False,
+        "horizons_days": [90, 30, 60],
+        "valid": True,
+    }
+    assert calls[1]["destination"] == pilot_destination
+    assert calls[1]["formal"] is False
+
+
+def test_horizon_suite_validate_cli_forwards_suite_and_optional_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """horizon-suite-validate 應固定只傳 suite path，並以 valid 映射 0／2。"""
+
+    calls: list[tuple[Path, dict[str, object]]] = []
+    reports = iter(
+        (
+            {"valid": True, "errors": [], "warnings": []},
+            {"valid": False, "errors": ["tampered"], "warnings": []},
+        )
+    )
+
+    def fake_validate_horizon_suite(path: Path, **kwargs: object) -> dict[str, object]:
+        """記錄 validator 呼叫，確保沒有外部 common-input override 被轉送。"""
+
+        calls.append((path, kwargs))
+        return next(reports)
+
+    monkeypatch.setattr(cli, "validate_horizon_suite", fake_validate_horizon_suite)
+    suite = tmp_path / "suite"
+    ocm_native_root = tmp_path / "ocm-native"
+    ocm_surface_root = tmp_path / "ocm-surface"
+    nww_analysis_root = tmp_path / "nww-analysis"
+    roots = [
+        "--ocm-native-root",
+        str(ocm_native_root),
+        "--ocm-surface-root",
+        str(ocm_surface_root),
+        "--nww-analysis-root",
+        str(nww_analysis_root),
+    ]
+
+    assert main(["horizon-suite-validate", str(suite), *roots, "--formal-release"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"errors": [], "valid": True, "warnings": []}
+    assert calls[0] == (
+        suite,
+        {
+            "formal": True,
+            "ocm_native_root": ocm_native_root,
+            "ocm_surface_root": ocm_surface_root,
+            "nww_analysis_root": nww_analysis_root,
+        },
+    )
+
+    assert main(["horizon-suite-validate", str(suite), "--pilot"]) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "errors": ["tampered"],
+        "valid": False,
+        "warnings": [],
+    }
+    assert calls[1] == (
+        suite,
+        {
+            "formal": False,
+            "ocm_native_root": None,
+            "ocm_surface_root": None,
+            "nww_analysis_root": None,
+        },
+    )
+
+
+def test_horizon_suite_cli_registers_commands_and_rejects_conflicting_modes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """整合 help 應列出兩個新命令，formal 與 pilot 也必須互斥。"""
+
+    with pytest.raises(SystemExit) as help_exit:
+        main(["--help"])
+    assert help_exit.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "horizon-suite-create" in help_text
+    assert "horizon-suite-validate" in help_text
+
+    create_parser = cli._horizon_suite_create_parser()
+    with pytest.raises(SystemExit) as conflict_exit:
+        create_parser.parse_args(["--formal", "--pilot"])
+    assert conflict_exit.value.code == 2
+
+    validate_parser = cli._horizon_suite_validate_parser()
+    with pytest.raises(SystemExit) as input_override_exit:
+        validate_parser.parse_args(["suite", "--input-directory", "outside-common-input"])
+    assert input_override_exit.value.code == 2
+
+
 def test_run_validation_cli_exit_codes_and_external_checkpoint_root(tmp_path: Path) -> None:
     """整合 CLI 必須把 external root 傳入 validator/report，並以 0/2 回報結果。"""
 

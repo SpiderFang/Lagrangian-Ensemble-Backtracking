@@ -27,6 +27,7 @@ import lagrangian_backtracking.input_derivation as input_derivation_module
 from lagrangian_backtracking.cli import main
 from lagrangian_backtracking.config import ProjectConfig, StudySiteConfig, resolve_flow_domain_id
 from lagrangian_backtracking.geometry import DomainProjection
+from lagrangian_backtracking.horizon_suite import build_horizon_suite, validate_horizon_suite
 from lagrangian_backtracking.input_derivation import (
     ARTIFACT_FILENAMES,
     InputDerivationError,
@@ -37,6 +38,7 @@ from lagrangian_backtracking.input_derivation import (
     validate_release_config,
     write_canonical_json,
 )
+from lagrangian_backtracking.manifests import load_scenario_inputs
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.receptors import (
     prepare_horizontal_receptor_candidates,
@@ -1770,6 +1772,72 @@ def test_shared_30_day_mother_creates_7_and_30_day_release_configs(
             maximum_step_count=8_639,
         )
     assert not short_steps_path.exists()
+
+
+def test_horizon_suite_real_builder_keeps_90_day_common_scenario_identity(
+    synthetic_support_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> None:
+    """真正 builder 應只建一次 90 日母體，並讓 30／60／90 日共用完整 scenario identity。
+
+    這裡重用的資料是 pytest 產生的規則 synthetic forcing，目的是驗證 CLI／manifest／
+    ScenarioInputs 的工程連接，不是 OCM／NWW3 科學成果。正式研究仍須在 SERVER 以
+    已驗收產品重新建置並保留來源 fingerprint、QC 與資源紀錄。
+    """
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_support_input_fixture
+    suite_root = root / "horizon-suite-90-day"
+    result = build_horizon_suite(
+        config_path,
+        [90, 30, 60],
+        suite_root,
+        ocm_root,
+        surface_root,
+        nww_root,
+        formal=False,
+    )
+    assert result["horizons_days"] == [30, 60, 90]
+    assert result["selection_support_days"] == 90
+    assert result["common_input_build_count"] == 1
+
+    common_input = suite_root / "common-input"
+    material, _ = read_canonical_json(common_input / ARTIFACT_FILENAMES["material"])
+    receptor, _ = read_canonical_json(common_input / ARTIFACT_FILENAMES["receptor"])
+    arrival, _ = read_canonical_json(common_input / ARTIFACT_FILENAMES["arrival"])
+    initial, _ = read_canonical_json(common_input / ARTIFACT_FILENAMES["initial_condition"])
+    assert len(material["records"]) == 10
+    assert len(receptor["records"]) == 100
+    assert len(arrival["records"]) == 250
+    assert len(initial["records"]) == 5_000
+
+    scenario_ids_by_horizon: dict[int, tuple[str, ...]] = {}
+    config_hashes: dict[int, str] = {}
+    expected_steps = {30: 86_401, 60: 172_801, 90: 259_201}
+    for days in (30, 60, 90):
+        release_path = suite_root / "release-configs" / f"release-{days}d.yaml"
+        release_config = input_derivation_module.load_config(release_path, formal_release=False)
+        scenario_inputs = load_scenario_inputs(
+            release_config,
+            config_path=release_path,
+            require_dynamic_initial_conditions=True,
+            formal=False,
+        )
+        assert len(scenario_inputs.scenarios) == 50_000
+        assert len(scenario_inputs.initial_conditions) == 5_000
+        scenario_ids_by_horizon[days] = tuple(item.scenario_id for item in scenario_inputs.scenarios)
+        config_hashes[days] = release_config.config_hash()
+        assert release_config.boundaries.max_backtrack_days == float(days)
+        assert release_config.boundaries.maximum_step_count == expected_steps[days]
+
+    assert scenario_ids_by_horizon[30] == scenario_ids_by_horizon[60] == scenario_ids_by_horizon[90]
+    assert len(set(config_hashes.values())) == 3
+    validation = validate_horizon_suite(
+        suite_root,
+        formal=False,
+        ocm_native_root=ocm_root,
+        ocm_surface_root=surface_root,
+        nww_analysis_root=nww_root,
+    )
+    assert validation["valid"] is True, validation
 
 
 def test_hsinchu_explicit_pilot_window_is_deterministic_and_keeps_full_counts(

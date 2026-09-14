@@ -17,7 +17,7 @@
 
 | 類別 | 實際命令 |
 |---|---|
-| 設定／輸入 | `config-check`、`preflight`、`inputs-build`、`inputs-validate`、`release-config-create`、`release-config-validate` |
+| 設定／輸入 | `config-check`、`preflight`、`inputs-build`、`inputs-validate`、`release-config-create`、`release-config-validate`、`horizon-suite-create`、`horizon-suite-validate` |
 | pilot | `pilot-calibrate`、`pilot-calibrate-validate`、`pilot-calibration-build`、`pilot-calibration-validate`、`pilot-config-create`、`pilot-config-validate` |
 | 工程驗證 | `behavior-manifest`、`synthetic-smoke`、`validate-shard`、`code-provenance`、`validate-run`、`benchmark-report`、`pilot-matrix-validate` |
 | run lifecycle | `run-create`、`run-shard`、`run-worker`、`run-reconcile` |
@@ -108,7 +108,84 @@ uv run lbt release-config-validate "$LBT_SCRATCH_ROOT/release-2024-2025.yaml" \
 constant-field fallback。`release-config-create`、`release-config-validate` 只處理
 immutable input binding；它們不啟動粒子運算。
 
-### 同一套輸入產生不同回溯長度
+### horizon suite：一次建立共用母體與多個回溯長度
+
+`horizon-suite-create` 將「最長支援窗的共同輸入」與「各回溯長度的執行設定」綁在同一個
+不可覆寫的目的地。`--backtrack-days` 接受一個以上的正整日數，不是固定選單；suite
+先取最大值，再把它精確寫入 effective `common-config` 的
+`inputs.backtrack_support_days`。例如 30、60、90 的 suite 只執行一次 strict
+`inputs-build`，而且只納入 `[arrival - 90 日, arrival]` inclusive UTC 窗口逐時完整且
+gap-safe 的到達時刻。90 日檢查不通過的 arrival 不得進入共同母體，不能先用較短支援窗
+選入後再把設定標成 90 日。OCM 缺時不得以零值或最近值補齊。
+
+建立後，suite 由完全相同的 `common-input` 產生 30／60／90 三份 release config。各份
+設定的 `boundaries.max_backtrack_days` 是該次執行長度，
+`boundaries.maximum_step_count` 固定依
+`ceil(days * 86400 / integration.dt_min_seconds) + 1` 設定；`dt_min_seconds` 必須是
+common config 中已核定的有限正值。三份 release 的執行設定 hash 可以不同，但
+site／receptor／arrival／material／initial-condition／scenario 母體與 input artifact
+hash 必須相同，才能支援公平的 horizon 比較。
+
+```bash
+uv run lbt horizon-suite-create \
+  --config-template "$FORMAL_CONFIG_TEMPLATE" \
+  --backtrack-days 30 60 90 \
+  --destination "$LBT_SCRATCH_ROOT/horizon-suite-2024-2025-h30-h60-h90-v1" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+```
+
+`--formal-release` 可改寫為 `--formal`；若只建立 pilot 供工程稽核，改用 `--pilot`。
+formal 仍須通過既有 A 區 v3/local20 formal gate，suite 不得繞過；兩種模式都仍要求
+accepted roots、strict input derivation、完整結構與 hash 驗證；pilot
+可以保留 `generated` 狀態，不能當作 `approved` 或正式科學成果。suite 對 template 的
+改寫只允許原範例文件化的
+`scenarios.receptor_arrival_initial_condition_manifest` placeholder（值為
+`manifests/receptor_arrival_initial_condition.json`），再寫入
+`inputs.backtrack_support_days` 與本次共同來源；若 template 已綁定 release／pilot，或
+其他欄位指向非預期 derived path，建置會拒絕，不會沿用或覆寫既有綁定。
+
+目的地必須是不存在的新目錄。成功的 suite 目錄具有固定語意的下列內容：
+
+```text
+<suite>/
+├── source-template.yaml       # 原始 template 保存
+├── common-config.yaml         # 最大支援窗的 effective config
+├── common-input/              # 唯一一次 inputs-build 的 immutable artifacts
+├── release-configs/           # 每個 requested horizon 一份 release YAML
+├── validations/               # common input 與各 release validator JSON
+├── horizon-suite-manifest.json        # suite 拓撲、模式、日數與所有來源／artifact hash
+└── horizon-suite-manifest.json.sha256 # manifest bytes 的 SHA-256 binding
+```
+
+`horizon-suite-validate` 是唯讀入口；它固定讀取 suite 內的 `common-input/`，重新核對
+suite 拓撲、source-template 與 common-config 的來源關係、common-input 的 accepted product
+provenance、90 日 gap-safe 根證據、各 release 的精確步數／日數與共同 artifact hash。省略
+三個 accepted roots 時只驗 suite 內的 artifact closure，不代表重新核對 accepted source
+bytes 或 canonical UTC axis；正式或移機驗收必須明示三個 roots。不提供外部輸入目錄 override，
+以免破壞 release YAML 的 `../common-input/*` exact path binding。可明示三個 accepted roots：
+
+```bash
+uv run lbt horizon-suite-validate \
+  "$LBT_SCRATCH_ROOT/horizon-suite-2024-2025-h30-h60-h90-v1" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+```
+
+`--pilot` 只切換驗證的正式狀態閘門；它不放寬 schema、來源、gap-safe、路徑或 hash 檢查。
+驗證失敗時回傳非零狀態，且 create 任一步失敗都不發布成功的 final suite；失敗時保留
+`.partial-*` 現場供人工稽核，不自動遞迴刪除。共享同帳號 SERVER 上，操作員清理前必須先
+確認 process、partial 的目錄擁有者、inode 與 final 狀態，不可採用先 `stat` 再 `unlink` 的
+競態方式；`.partial-*` 不能當作成功。即使三份 config 與 manifest 均有效，也只保證共同設計
+母體與執行設定可比較，不保證每粒子走滿 90 日；粒子仍可能因海岸、域外、資料缺口或數值
+狀態停止。正式輸入限 OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3 schema
+1 `nww3_analysis`，禁止 raw NetCDF、transfer archive、零值與最近值補齊。
+
+### 同一套輸入產生不同回溯長度（手動模式）
 
 在建置用完整 YAML 明示 `inputs.backtrack_support_days`，例如 30，先以此支援窗
 完成上面的 `inputs-build` 與 `inputs-validate`。接著可重用同一目錄產生不同回溯長度；

@@ -18,6 +18,9 @@ CLI 參數優先使用明示的 root；未明示時，只讀 config 指定的環
 inventory 使用 `$OCM_NATIVE_ROOT/<flow_domain_id>/...`、`$OCM_SURFACE_ROOT/<flow_domain_id>/...`
 與 `$NWW_ANALYSIS_ROOT/<flow_domain_id>/...` 等 lexical token。
 
+下列命令中的 `$FORMAL_CONFIG_TEMPLATE` 必須指向實際存在且未綁定 release／pilot 的 YAML
+template；不可改用已產生的 release config、`common-config.yaml` 或其他已有 derived path 的設定。
+
 accepted-product fingerprint 對小型且直接影響資料契約的 `grid/metadata.json`、
 `months/*/metadata.json` 與 `months/*/time_utc_ns.npy` 保存實際 SHA-256；大型 required
 NPY 預設只保存檔案大小與 NPY header 的 shape/dtype structural fingerprint。validator
@@ -97,6 +100,88 @@ boundaries:
 母體驗證後，`release-config-create --max-backtrack-days` 可分別產生 7 日、30 日設定，直接綁定同一批不可覆寫的輸入。兩者保留相同 `design_version`、到達／受體／初始條件／情境 ID 及輸入雜湊；回溯長度不同則執行設定雜湊不同，各自使用 run、checkpoint、輸出目錄與 runtime preflight inventory。原始建置設定雜湊仍作為來源證據，不改寫成後製執行設定的雜湊。
 
 若日後要跑 60 日，原 30 日母體不足，需以參數另建 60 日輸入版本；程式不需改碼。新母體可能因缺時排除更多日期。若要嚴格比較 7／30／60 日，應重新從共同通過 60 日檢查的母體建立三份執行設定，不能把兩批不同日期當成只有回溯長度不同的比較。
+
+#### 3.1.1 `horizon-suite` 一鍵建立契約
+
+需要比較多個回溯長度時，`lbt horizon-suite-create` 將上述「先建立最長支援窗母體、再
+衍生較短執行設定」固定成單一可稽核流程。命令的 `--backtrack-days` 接受任意數量的
+正整日；例如 30、60、90 時，suite 先取最大值 90，從 caller 指定且符合上述條件的
+`$FORMAL_CONFIG_TEMPLATE`（由 `--config-template` 傳入）產生 effective `common-config`，精確設定
+`inputs.backtrack_support_days: 90`，並以同一組 accepted roots 僅執行一次
+`inputs-build`。每個 arrival 必須通過 inclusive
+`[arrival - 90 日, arrival]` 的逐時完整 gap-safe 支援，未通過者不能進共同母體；不能先
+用 30 日或 60 日檢查選入，再將其標記為 90 日。真正缺時不得使用零值、最近值、跨缺口
+內插或其他未登錄外插。
+
+common-input 完成後，suite 只由這一份共同母體產生 30／60／90 的 release config，不再
+重跑 inputs-build。每份 release config 的 `boundaries.max_backtrack_days` 等於該份
+requested horizon，`boundaries.maximum_step_count` 則依 common config 的有限正值
+`integration.dt_min_seconds` 設為
+`ceil(days * 86400 / dt_min_seconds) + 1`；多出的 1 是包含起始節點的步數保留。這個
+計算是 suite 的固定下限契約，不得因較短 horizon 省略步數，也不得以 `dt_max_seconds`
+取代 `dt_min_seconds`。
+
+suite 目的地必須是全新的不存在目錄，create 不覆寫 template、common-input 或既有
+release。輸出拓撲固定包含：
+
+```text
+<suite>/
+├── source-template.yaml       # 原始 template 的保存副本
+├── common-config.yaml         # backtrack_support_days 等於最大 requested horizon
+├── common-input/              # 唯一一次 inputs-build 的 immutable input artifacts
+├── release-configs/           # 每個 requested horizon 的 release config
+├── validations/               # common input 與各 release validator JSON
+├── horizon-suite-manifest.json        # suite 模式、日數、拓撲、來源與 artifact hash
+└── horizon-suite-manifest.json.sha256 # manifest 位元組的 SHA-256 binding
+```
+
+`source-template.yaml` 仍保存 caller 原始檔案；suite 只允許原範例所文件化的
+`scenarios.receptor_arrival_initial_condition_manifest` placeholder（值為
+`manifests/receptor_arrival_initial_condition.json`）進行精確改寫，再
+補入共同支援窗與 suite 產物的相對路徑。template 若已綁定 release／pilot config，或
+任何其他欄位已指向非預期 derived path，必須拒絕建置；suite 不猜測、遞迴替換或重用既有
+binding。`--formal-release`／`--formal` 啟用正式 approved gate，且仍須通過既有 A 區
+v3/local20 formal gate，suite 不得繞過；`--pilot` 只保留 generated／pilot 狀態，兩種
+模式都必須完成 strict accepted-product、結構、gap-safe 與 SHA-256 檢查。任一步驟失敗時
+不發布成功的 final suite；失敗時保留 `.partial-*` 現場供人工稽核，不自動遞迴刪除。共享
+同帳號 SERVER 上，操作員清理前必須先確認相關 process、partial 的目錄擁有者、inode 與
+final 狀態，不可採用先 `stat` 再 `unlink` 的競態方式；`.partial-*` 不得當作成功發布。
+
+`lbt horizon-suite-validate` 以 suite root 為 positional path，固定讀取 suite 內的
+`common-input/`，並可明示 OCM native、OCM surface、NWW3 analysis 三個 accepted roots。省略
+三個 roots 時只驗 suite 內的 artifact closure，不代表重新核對 accepted source bytes 或
+canonical UTC axis；正式或移機驗收必須明示三個 roots。不提供外部輸入目錄 override，以免
+外部目錄破壞 release YAML 的 `../common-input/*` exact path binding。唯讀 validator 會核對 source-template／common-config 關係、90 日
+gap-safe 根證據、一次 common-input 的完整性、所有 release 的日數與步數、共同
+site／receptor／arrival／material／initial-condition／scenario 母體，以及各 artifact hash。
+三個 release 的 config hash 可以不同，因為回溯長度與步數不同；共同母體與 artifact hash
+必須完全一致。
+
+這個流程保證的是可公平比較的設計母體與設定綁定，不是每粒子的固定存活時間。粒子仍可
+因海岸、域外、資料缺口或數值狀態停止，不能把三份設定都通過解讀為每粒子實際走滿 90 日。
+正式 accepted inputs 限 OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3
+schema 1 `nww3_analysis`；raw NetCDF 與 transfer archive 不得進入 suite。
+
+```bash
+uv run lbt horizon-suite-create \
+  --config-template "$FORMAL_CONFIG_TEMPLATE" \
+  --backtrack-days 30 60 90 \
+  --destination work/horizon-suite-2024-2025-h30-h60-h90-v1 \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+
+uv run lbt horizon-suite-validate \
+  work/horizon-suite-2024-2025-h30-h60-h90-v1 \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+```
+
+將兩個命令的最後 `--formal-release` 改成 `--pilot` 可建立／驗證 pilot suite；這不會
+放寬 accepted product、gap-safe 或 hash binding，只改變正式 `approved` 狀態閘門。
 
 ## 4. 幾何、受體與 arrival
 
@@ -190,8 +275,11 @@ raw/canonical hash 與 exact path policy。
 
 builder 在 `os.replace` 前會把完整 hidden partial directory 交給既有
 `validate_input_derivatives`，並顯式傳入當次 config、formal flag 及 OCM native／OCM
-surface／NWW analysis 三個 accepted roots。validator 失敗時 partial 會被清除，final
-目錄不會建立；不會在 final 路徑驗證、降低 validator gate 或形成遞迴發布。只有下列
+surface／NWW analysis 三個 accepted roots。任一步 validator 或發布步驟失敗時，不自動遞迴
+刪除 `.partial-*`，保留現場供人工稽核，且不建立成功的 final 目錄；不會在 final 路徑驗證、
+降低 validator gate 或形成遞迴發布。共享同帳號 SERVER 上，人工清理前必須先確認 process、
+partial 的 inode／owner marker 與 final 狀態，不可採用先 `stat` 再 `unlink` 的競態方式；
+`.partial-*` 不能當作成功。只有下列
 條件全部成立才可寫入 `config_status: approved`：component immutable binding
 可讀且 hash 一致、四域／五站及 10／100／250／5,000 計數正確、NWW 四域均為 17,544
 小時、每個 gap-safe horizon 不跨缺口、strict manifest loader 通過、A 當期 domain policy
@@ -207,7 +295,7 @@ gap-safe horizon 等正式發布閘門。
 
 ```bash
 uv run lbt inputs-build \
-  --config configs/formal_release.yaml \
+  --config "$FORMAL_CONFIG_TEMPLATE" \
   --destination work/input-release-2024-2025 \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --ocm-surface-root "$OCM_SURFACE_ROOT" \
@@ -215,14 +303,14 @@ uv run lbt inputs-build \
   --formal-release
 
 uv run lbt inputs-validate work/input-release-2024-2025 \
-  --config configs/formal_release.yaml \
+  --config "$FORMAL_CONFIG_TEMPLATE" \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --ocm-surface-root "$OCM_SURFACE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
   --formal-release
 
 uv run lbt release-config-create \
-  --config-template configs/formal_release.yaml \
+  --config-template "$FORMAL_CONFIG_TEMPLATE" \
   --input-directory work/input-release-2024-2025 \
   --output configs/release-2024-2025.yaml \
   --formal-release

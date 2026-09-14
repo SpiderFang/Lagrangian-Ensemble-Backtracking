@@ -78,6 +78,7 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 | 資料與幾何 | `config.py` | YAML 設定 | 鎖定 4 個流場範圍、5 個站點、每站 10,000／全案 50,000 個基礎情境；正式發布時拒絕未補齊的證據。 | `ProjectConfig`、`load_config` |
 | 資料與幾何 | `preflight.py`、`time_axis.py` | OCM／NWW3 月份 metadata 與 UTC 軸 | 唯讀盤點上游檔案、建立跨月唯一 UTC 軸、列出缺時與資料契約問題。 | `run_preflight`、`canonicalize_time_chunks` |
 | 資料與幾何 | `input_derivation.py`、`input_horizon.py` | 已驗收產品、共同支援日數與逐筆到達時刻 | 建立不可覆寫的共同輸入；重新核對完整回溯窗與來源缺口，同一母體可綁定不同執行日數，保留共同情境身分。 | `build_input_derivatives`、`validate_generic_gap_payload`、`create_release_config` |
+| 資料與幾何 | `horizon_suite.py` | 未綁定設定 template、horizons 回溯日數，以及已接受的 OCM schema 3 `ocm_native`／`ocm_surface` 與 NWW3 schema 1 `nww3_analysis` 產品根目錄 | 先以最大 horizon 篩選完整 gap-safe 到達母體，`inputs-build` 僅執行一次，再由同一份 `common-input` 產生多份 release config、validation 與 manifest／SHA-256；缺時不得補零或用最近值替代，formal 仍受既有 gate 約束。 | `build_horizon_suite`、`validate_horizon_suite` |
 | 資料與幾何 | `geometry.py`、`mesh.py` | 經緯度、原始 OCM 節點與網格面 | 轉為公尺座標、建立局部分析區，並以原始三角形定位粒子。 | `DomainProjection`、`build_anchor_local_domain`、`NativeMesh.locate` |
 | 資料與幾何 | `receptors.py`、`arrival_times.py` | 可長期濕潤的網格面、各時段資料品質指標 | 選取每站 5 個水平位置 × 4 個垂向層位，以及 48 個分層時刻加 2 個事件時刻。 | `select_horizontal_receptors`、`build_vertical_targets`、`select_arrival_times` |
 | 資料與幾何 | `manifests.py` | 已產製的 component／geometry JSON 與 config resolver | 嚴格驗證 material、receptor、arrival、dynamic pair 與巢狀邊界；formal A 依 resolver 綁定當期 `formal_domain_policy` 與 v3 flow-domain ID，舊 `formal_domain_policy=expanded_domain_v1` 僅作相容讀取。 | `load_scenario_inputs`、`load_boundary_geometries` |

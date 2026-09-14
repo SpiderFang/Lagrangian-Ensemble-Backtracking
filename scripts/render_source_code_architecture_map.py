@@ -50,6 +50,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "manifests",
             "input_derivation",
             "input_horizon",
+            "horizon_suite",
         ),
     },
     {
@@ -526,6 +527,24 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "不能以最近值、零值或 synthetic fallback 補齊。共同輸入以 backtrack_support_days "
             "要求支援窗，release config 的 max_backtrack_days 則決定各次執行長度；"
             "重用母體仍須核對每個到達時刻的完整時間證據。"
+        ),
+    },
+    "horizon_suite": {
+        "role": "以最大 horizon 一次建立共同輸入並產生多份 release config 的共同母體流程",
+        "inputs": (
+            "未綁定設定 template（unbound config）、horizons 回溯日數，以及已接受的 OCM schema 3 "
+            "ocm_native／ocm_surface 與 NWW3 schema 1 nww3_analysis 產品根目錄"
+        ),
+        "outputs": (
+            "一份 common-input、多份 release configs、horizon-suite-manifest.json／.sha256，"
+            "以及 common／release validations"
+        ),
+        "entrypoints": ["build_horizon_suite", "validate_horizon_suite"],
+        "read_first": (
+            "先以最大 horizon 對每個到達時刻做完整 gap-safe 支援篩選，inputs-build 僅執行一次，"
+            "再由完全相同的 common-input 產生各 horizon 的 release config；真正缺時禁止以零值或最近值補齊。"
+            "formal 仍必須通過既有 A v3/local20 formal gate，pilot 僅是工程 E2E，不能升格為正式結果；"
+            "共同母體一致不代表每粒子必然走滿要求日數。"
         ),
     },
     "provenance": {
@@ -1149,6 +1168,11 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "mesh", "target": "input_derivation", "label": "native face support"},
     {"source": "receptors", "target": "input_derivation", "label": "receptor candidates"},
     {"source": "arrival_times", "target": "input_derivation", "label": "arrival selector"},
+    {"source": "config", "target": "horizon_suite", "label": "未綁定 template／suite 設定"},
+    {"source": "input_horizon", "target": "horizon_suite", "label": "最大 horizon／gap-safe 支援"},
+    {"source": "input_derivation", "target": "horizon_suite", "label": "單次 common-input build"},
+    {"source": "horizon_suite", "target": "manifests", "label": "common-input component manifests"},
+    {"source": "horizon_suite", "target": "runtime", "label": "common input／release config"},
     {"source": "input_derivation", "target": "manifests", "label": "component JSON"},
     {"source": "scenarios", "target": "pilot_selection", "label": "完整情境清單"},
     {"source": "pilot_selection", "target": "runtime", "label": "pilot selection binding"},

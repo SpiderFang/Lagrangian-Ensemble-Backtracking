@@ -161,6 +161,46 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 回溯日數採通用參數：`inputs.backtrack_support_days` 指定共同輸入要篩選與驗證的正整日上限，`boundaries.max_backtrack_days` 指定本次實際回溯長度。先建置並驗證支援 30 日的共同輸入，即可由 `release-config-create --max-backtrack-days` 產生 7 日、30 日等獨立執行設定，保留同一批到達時刻與情境，不必重跑整套 `inputs-build`。天數不是限定選單；超出既有輸入上限時須另建並驗證較長版本。設定範例、步數預算與來源綁定限制見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)與[CLI 參考](docs/operations/cli_reference.md)。
 
+### 5.1 多個回溯日數的一鍵共同母體
+
+若要公平比較 30、60、90 日，使用 `horizon-suite-create` 一次建立共同母體與三份
+release config。suite 先取 `--backtrack-days` 的最大值（此例為 90），由原始 template
+產生 effective `common-config`，精確填入 `inputs.backtrack_support_days: 90`，再以三個
+明示的 accepted product roots 嚴格執行一次 `inputs-build`。只有到達時刻的
+`[arrival - 90 日, arrival]` inclusive UTC 窗口完整 gap-safe 時，該到達時刻才會進入共同
+母體；OCM 缺時不得以零值或最近值補齊。接著 suite 從完全相同的 `common-input` 產生
+30／60／90 日三份 release config，分別設定 `boundaries.max_backtrack_days`，並依
+`ceil(days * 86400 / integration.dt_min_seconds) + 1` 設定
+`boundaries.maximum_step_count`。
+
+```bash
+uv run lbt horizon-suite-create \
+  --config-template "$FORMAL_CONFIG_TEMPLATE" \
+  --backtrack-days 30 60 90 \
+  --destination "$LBT_SCRATCH_ROOT/horizon-suite-2024-2025-h30-h60-h90-v1" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+```
+
+`--formal-release` 也可寫成 `--formal`；工程 pilot 請改用 `--pilot`。formal 仍須通過既有
+A 區 v3/local20 正式閘門，suite 不得繞過；兩種模式都執行完整結構、來源與 SHA-256 檢查，pilot 保留 `generated`／pilot 狀態，不得解讀為正式
+科學結果。建立後以同一批 accepted roots 執行唯讀的 `horizon-suite-validate`；省略三個 roots 時只驗
+artifact closure，不代表重新核對 accepted source bytes／canonical UTC axis；正式／移機驗收必須明示三個 roots（完整命令見 [CLI 參考](docs/operations/cli_reference.md)）。
+suite 目的地必須是不存在的新目錄，既有目的地不會覆寫；任一步驟失敗都不發布成功的 final，並保留失敗的 `.partial-*` 現場，不自動遞迴刪除。
+共享同帳號 SERVER 上，人工清理前先確認 process、目錄擁有者、inode 與 final 狀態，不採用先 `stat` 再 `unlink` 的競態方式，且不得把 `.partial-*` 當成成功。
+輸出包含 `source-template`、effective `common-config`、唯一的 `common-input`、`release-configs`、`validations`（common input 與各 release validator JSON），以及記錄各檔案
+與 artifact hash 的 `horizon-suite-manifest.json` 和相鄰 `.sha256` 綁定檔。suite 只接受原範例文件化的
+`scenarios.receptor_arrival_initial_condition_manifest` placeholder（值為 `manifests/receptor_arrival_initial_condition.json`）；若 template 已綁定
+release／pilot，或其他欄位含非預期 derived path，應拒絕，不會猜測或改寫既有來源。
+三個 horizon 共用 site、receptor、arrival、material、initial-condition、scenario 母體與
+artifact hash，因此差異可歸因於回溯長度設定；這不保證每粒子實際走滿最長日數，粒子仍可
+因海岸、域外、資料缺口或數值狀態停止。正式輸入只接受 OCM schema 3 `ocm_native`、OCM
+schema 3 `ocm_surface` 與 NWW3 schema 1 `nww3_analysis`；raw NetCDF、transfer archive、
+零值填補與最近值補齊都不在 suite 輸入範圍內。完整拓撲、驗證與限制見
+[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及
+[CLI 參考](docs/operations/cli_reference.md)。
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
 
 ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。
