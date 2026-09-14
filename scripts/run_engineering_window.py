@@ -134,6 +134,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="實驗案例識別碼；預設為 finite_depth_stokes",
     )
     run_parser.add_argument(
+        "--random-stream-id",
+        help=(
+            "可選共同亂數流識別碼；明示後會寫入 paired run plan／seed table，"
+            "讓不同 experiment case 在相同 scenario 與 member 使用相同 seed"
+        ),
+    )
+    run_parser.add_argument(
         "--sweep-budget",
         type=int,
         help="正整數 sweep 預算；到達預算由 controller 決定 checkpoint／pause 行為",
@@ -200,6 +207,7 @@ def _run_run(args: argparse.Namespace) -> int:
         nww_analysis_root=args.nww_analysis_root,
         project_root=args.project_root,
         experiment_case_id=args.experiment_case_id,
+        random_stream_id=args.random_stream_id,
         sweep_budget=args.sweep_budget,
         shard_ids=args.shard_ids,
         resume=args.resume,

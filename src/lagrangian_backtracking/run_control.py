@@ -55,13 +55,16 @@ from .runner import (
     plan_scenario_shards,
     scenario_execution_sort_key,
 )
-from .scenarios import Scenario, stable_identifier
+from .scenarios import Scenario, stable_identifier, validate_random_stream_id
 
 # schema 1 的 scenario_id lexical ordering 沒有明確的流場 locality 契約；schema 2.1 因此
 # 只接受含 ordering policy、execution group、固定 lock topology 與 scenario selection 的新
 # workspace。schema 2.0 仍可唯讀相容，但沒有 selection 時只能解讀為完整 full coverage，
-# 不猜測舊 workspace 的 pilot 子集或排序後 resume。
+# 不猜測舊 workspace 的 pilot 子集或排序後 resume。schema 2.2 僅供明示共同亂數流的
+# 新 workspace 使用；未指定 stream 時仍發布 2.1，讓舊 plan 與 seed table 的 bytes／欄位
+# 契約保持不變。
 RUN_PLAN_SCHEMA_VERSION = "2.1.0"
+RUN_PLAN_PAIRED_SCHEMA_VERSION = "2.2.0"
 RUN_PLAN_LEGACY_SCHEMA_VERSION = "2.0.0"
 RUN_PROGRESS_SCHEMA_VERSION = "1.0.0"
 _LIFECYCLES = frozenset({"PLANNED", "RUNNING", "PAUSED", "COMPLETE", "FAILED"})
@@ -116,6 +119,7 @@ _SEED_COLUMNS = (
     "particle_id",
     "seed_128_hex",
 )
+_SEED_COLUMNS_PAIRED = _SEED_COLUMNS + ("random_stream_id",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,13 +450,17 @@ def checkpoint_input_binding_hash(
     component_canonical_hashes: Mapping[str, str],
     geometry_canonical_hashes: Mapping[str, str],
     provenance: CodeProvenance | Mapping[str, Any],
+    random_stream_id: str | None = None,
 ) -> str:
     """計算 checkpoint binding 的 composite input hash。
 
     composite 內同時放 raw input inventory、三份情境 component／三份 geometry canonical
     hash、deployment tree 與 ``uv.lock`` hash；因此只改 manifest 語意、部署 Python、或
     依賴 lock 都會使舊 checkpoint 無法被新 run restore。raw inventory SHA 仍另存在
-    run plan，方便追溯原始檔案，不以 composite 取代它。
+    run plan，方便追溯原始檔案，不以 composite 取代它。明示 ``random_stream_id`` 時，
+    也把共同亂數流識別碼納入 hash；因此即使有人只修改 immutable plan 的 seed 命名空間，
+    舊 checkpoint 仍不能被錯誤地 restore。``None`` 刻意不寫入 payload，保留舊 run 的
+    composite hash 與 checkpoint binding 完全相容。
     """
 
     if (
@@ -471,6 +479,9 @@ def checkpoint_input_binding_hash(
         "deployment_tree_sha256": provenance_dict["deployment_tree_sha256"],
         "uv_lock_sha256": provenance_dict["uv_lock_sha256"],
     }
+    stream_id = validate_random_stream_id(random_stream_id)
+    if stream_id is not None:
+        payload["random_stream_id"] = stream_id
     return _canonical_hash(payload)
 
 
@@ -681,33 +692,53 @@ def _write_parquet_rows(
     return count
 
 
-def _write_seed_table_with_seed(path: Path, shards: Sequence[ScenarioShard], *, master_seed: int) -> int:
-    """依固定 shard／scenario／member 順序串流寫入 seed table。"""
+def _write_seed_table_with_seed(
+    path: Path,
+    shards: Sequence[ScenarioShard],
+    *,
+    master_seed: int,
+    random_stream_id: str | None = None,
+) -> int:
+    """依固定 shard／scenario／member 順序串流寫入 seed table。
 
-    schema = pa.schema(
-        [
-            pa.field("scenario_id", pa.string()),
-            pa.field("experiment_case_id", pa.string()),
-            pa.field("member_id", pa.int64()),
-            pa.field("particle_id", pa.string()),
-            pa.field("seed_128_hex", pa.string()),
-        ]
-    )
+    未啟用共同亂數流時，欄位集合維持既有五欄，避免舊 workspace 的 schema 與 checksum
+    被無意改寫。明示 stream 時，新增每列的 ``random_stream_id``，讓 seed table 自身
+    就能追溯「案例身分被哪個配對命名空間取代」，而不是只依賴執行命令列或外部說明。
+    兩種模式都由同一個 ``iter_run_units`` 產生 seed，確保 seed table 與實際
+    ``ProductionBatch`` 使用完全相同的導出路徑。
+    """
+
+    stream_id = validate_random_stream_id(random_stream_id)
+    fields = [
+        pa.field("scenario_id", pa.string()),
+        pa.field("experiment_case_id", pa.string()),
+        pa.field("member_id", pa.int64()),
+        pa.field("particle_id", pa.string()),
+        pa.field("seed_128_hex", pa.string()),
+    ]
+    if stream_id is not None:
+        fields.append(pa.field("random_stream_id", pa.string()))
+    schema = pa.schema(fields)
     writer = pq.ParquetWriter(path, schema)
     pending: list[dict[str, Any]] = []
     count = 0
     try:
         for shard in shards:
-            for unit in iter_run_units(shard, master_seed=master_seed):
-                pending.append(
-                    {
-                        "scenario_id": unit.scenario.scenario_id,
-                        "experiment_case_id": unit.experiment_case_id,
-                        "member_id": unit.member_id,
-                        "particle_id": unit.particle_id,
-                        "seed_128_hex": f"{unit.seed:032x}",
-                    }
-                )
+            for unit in iter_run_units(
+                shard,
+                master_seed=master_seed,
+                random_stream_id=stream_id,
+            ):
+                row = {
+                    "scenario_id": unit.scenario.scenario_id,
+                    "experiment_case_id": unit.experiment_case_id,
+                    "member_id": unit.member_id,
+                    "particle_id": unit.particle_id,
+                    "seed_128_hex": f"{unit.seed:032x}",
+                }
+                if stream_id is not None:
+                    row["random_stream_id"] = stream_id
+                pending.append(row)
                 if len(pending) >= 8192:
                     writer.write_table(pa.Table.from_pylist(pending, schema=schema))
                     count += len(pending)
@@ -773,10 +804,11 @@ def _validate_plan_shape(plan: Mapping[str, Any]) -> None:
     """嚴格檢查 immutable run plan 的型別、hash、count、range 與固定拓撲。
 
     schema 2.0 以舊 exact key set 唯讀相容；schema 2.1 另要求
-    ``scenario_selection``，並以 selected scenario count 對齊 plan。此檢查不讀大型
-    Parquet payload；它先確保 JSON 自身不可能以 ``bool`` 冒充 count、以 traversal 冒充
-    root，或以缺口／重疊 shard range 改變工作分配。run file checksum 與 scenario 內容的
-    實際比對由只讀 ``validate_run`` 接續完成。
+    ``scenario_selection``，schema 2.2 再要求明示且非空的 ``random_stream_id``，並以
+    selected scenario count 對齊 plan。此檢查不讀大型 Parquet payload；它先確保 JSON
+    自身不可能以 ``bool`` 冒充 count、以 traversal 冒充 root，或以缺口／重疊 shard range
+    改變工作分配。run file checksum 與 scenario 內容的實際比對由只讀 ``validate_run``
+    接續完成。
     """
 
     legacy_required = {
@@ -815,6 +847,10 @@ def _validate_plan_shape(plan: Mapping[str, Any]) -> None:
         required = legacy_required
     elif schema_version == RUN_PLAN_SCHEMA_VERSION:
         required = legacy_required | {"scenario_selection"}
+    elif schema_version == RUN_PLAN_PAIRED_SCHEMA_VERSION:
+        # 共同亂數流是明示的新 plan 版本；舊 2.1 plan 仍維持原 exact key set，避免
+        # validator 為了補預設值而改寫既有 schema 或 seed table。
+        required = legacy_required | {"scenario_selection", "random_stream_id"}
     else:
         raise ValueError("run plan schema_version 不支援")
     missing = sorted(required - set(plan))
@@ -844,6 +880,8 @@ def _validate_plan_shape(plan: Mapping[str, Any]) -> None:
         )
     _nonnegative_int(plan["master_seed"], label="run_plan.master_seed")
     _safe_slug(plan["seed_policy"], label="run_plan.seed_policy")
+    if schema_version == RUN_PLAN_PAIRED_SCHEMA_VERSION:
+        validate_random_stream_id(plan["random_stream_id"], allow_none=False)
     members = _positive_int(plan["members_per_scenario"], label="run_plan.members_per_scenario")
     _positive_int(plan["shard_scenario_count"], label="run_plan.shard_scenario_count")
     _positive_int(plan["checkpoint_interval_sweeps"], label="run_plan.checkpoint_interval_sweeps")
@@ -854,7 +892,7 @@ def _validate_plan_shape(plan: Mapping[str, Any]) -> None:
     shard_count = _positive_int(plan["shard_count"], label="run_plan.shard_count")
     if particle_count != scenario_count * members:
         raise ValueError("run plan particle_count 必須等於 scenario_count×members_per_scenario")
-    if schema_version == RUN_PLAN_SCHEMA_VERSION:
+    if schema_version in {RUN_PLAN_SCHEMA_VERSION, RUN_PLAN_PAIRED_SCHEMA_VERSION}:
         validate_scenario_selection_binding_shape(
             plan["scenario_selection"],
             plan["run_kind"],
@@ -1272,6 +1310,7 @@ def initialize_run_workspace(
     experiment_case_id: str,
     master_seed: int,
     seed_policy: str,
+    random_stream_id: str | None = None,
     members_per_scenario: int,
     shard_scenario_count: int,
     checkpoint_interval_sweeps: int,
@@ -1283,10 +1322,13 @@ def initialize_run_workspace(
 
     ``scenarios`` 代表本次 plan 要執行的 selected scenario tuple，先依 runner 的版本化
     execution ordering policy 排序，再按 region+arrival 群組切割；scenario table 與 seed
-    table 都保存這個順序。``scenario_selection`` 若省略，writer 會建立 source/selected
-    相等的 full binding；若提供 pilot stratified binding，則只驗證其 shape、selected
-    count 與 selected ID hash 是否吻合傳入 tuple，完整 source 的 re-selection 必須已在
-    runtime initializer 或 static loader 完成。seed table 由 ParquetWriter 以 8192 rows
+    table 都保存這個順序。``random_stream_id`` 若明示，會以 schema 2.2 將配對命名空間
+    同時寫入 immutable plan 與 seed table，並加入 checkpoint input binding；若省略，則
+    發布原 schema 2.1、五欄 seed table 與舊 seed 導出規則。``scenario_selection`` 若
+    省略，writer 會建立 source/selected 相等的 full binding；若提供 pilot stratified
+    binding，則只驗證其 shape、selected count 與 selected ID hash 是否吻合傳入 tuple，
+    完整 source 的 re-selection 必須已在 runtime initializer 或 static loader 完成。seed
+    table 由 ParquetWriter 以 8192 rows
     分批寫入，
     每個由主種子、scenario、experiment、member 導出的 128-bit seed 以 32 位小寫 hex
     保存。``input_inventory_file`` 若是 Path 會保留原始 bytes 的 SHA-256；若是 mapping
@@ -1297,6 +1339,7 @@ def initialize_run_workspace(
     root_parent = Path(destination)
     _safe_slug(run_id, label="run_id")
     _safe_slug(experiment_case_id, label="experiment_case_id")
+    stream_id = validate_random_stream_id(random_stream_id)
     if not isinstance(normalized_config, Mapping) or not normalized_config:
         raise ValueError("normalized_config 必須是非空 mapping")
     if type(config_hash) is not str or _SHA256_RE.fullmatch(config_hash) is None:
@@ -1360,6 +1403,7 @@ def initialize_run_workspace(
         component_canonical_hashes=component_hashes,
         geometry_canonical_hashes=geometry_hashes,
         provenance=provenance_value,
+        random_stream_id=stream_id,
     )
     target = root_parent / run_id
     if target.exists() or target.is_symlink():
@@ -1390,7 +1434,12 @@ def initialize_run_workspace(
         ordered_scenarios = tuple(item for shard in shards for item in shard.scenarios)
         scenario_rows = [_scenario_row(item) for item in ordered_scenarios]
         _write_parquet_rows(scenario_path, scenario_schema, scenario_rows)
-        seed_count = _write_seed_table_with_seed(seed_path, shards, master_seed=master_seed)
+        seed_count = _write_seed_table_with_seed(
+            seed_path,
+            shards,
+            master_seed=master_seed,
+            random_stream_id=stream_id,
+        )
         files = {
             "normalized_config.json": _file_record(normalized_config_path),
             "input_inventory.json": _file_record(inventory_path),
@@ -1414,7 +1463,11 @@ def initialize_run_workspace(
             for shard in shards
         ]
         plan = {
-            "schema_version": RUN_PLAN_SCHEMA_VERSION,
+            "schema_version": (
+                RUN_PLAN_SCHEMA_VERSION
+                if stream_id is None
+                else RUN_PLAN_PAIRED_SCHEMA_VERSION
+            ),
             "run_id": run_id,
             "run_kind": run_kind,
             "created_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -1443,6 +1496,10 @@ def initialize_run_workspace(
             "checkpoint_root": "checkpoints",
             "failure_root": "failures",
         }
+        if stream_id is not None:
+            # 只在明示配對時加入欄位；舊模式不寫入 null，才能讓既有 plan 的 exact
+            # schema／checksum 及 reader 行為維持原樣。
+            plan["random_stream_id"] = stream_id
         _validate_plan_shape(plan)
         _write_json(partial / "run_plan.json", plan)
         _write_json(partial / "run_progress.json", _initial_progress(run_id, shards))
@@ -1908,13 +1965,14 @@ class RunController:
             shard_id=shard.shard_id,
             seed_policy=self.plan["seed_policy"],
             code_commit=checkpoint_commit,
+            random_stream_id=self.plan.get("random_stream_id"),
         )
 
     def _expected_metadata(self, shard: ScenarioShard) -> dict[str, Any]:
         """建立 output validator 用的不可變 metadata 子集合。"""
 
         provenance = self.plan["code_provenance"]
-        return {
+        metadata = {
             "run_id": self.plan["run_id"],
             "run_kind": self.plan["run_kind"],
             "config_hash": self.plan["config_hash"],
@@ -1930,6 +1988,11 @@ class RunController:
             "shard_id": shard.shard_id,
             "experiment_case_id": shard.experiment_case_id,
         }
+        if self.plan.get("random_stream_id") is not None:
+            # paired plan 的輸出 manifest 也要留下 stream identity，讓 output validator
+            # 與 seed table／checkpoint 使用同一份不可變 seed 命名空間證據。
+            metadata["random_stream_id"] = self.plan["random_stream_id"]
+        return metadata
 
     def _validate_checkpoint_run_topology(self) -> None:
         """拒絕 external checkpoint root 內本 run 的未知 shard、symlink 或特殊檔案。
@@ -2007,7 +2070,13 @@ class RunController:
         parent = self._checkpoint_parent(shard)
         if not parent.exists():
             return None
-        expected_units = tuple(iter_run_units(shard, master_seed=int(self.plan["master_seed"])))
+        expected_units = tuple(
+            iter_run_units(
+                shard,
+                master_seed=int(self.plan["master_seed"]),
+                random_stream_id=self.plan.get("random_stream_id"),
+            )
+        )
         binding = self._binding(shard)
         entries = tuple(parent.iterdir())
         generations: dict[int, tuple[Path, int, int]] = {}
@@ -2642,6 +2711,7 @@ class RunController:
                     selected.path,
                     shard=shard,
                     master_seed=int(self.plan["master_seed"]),
+                    random_stream_id=self.plan.get("random_stream_id"),
                     request_factory=self.request_factory,
                     expected_binding=self._binding(shard),
                     active_chunk_size=self.plan["active_chunk_size"],
@@ -2653,6 +2723,7 @@ class RunController:
                 batch = ProductionBatch(
                     shard,
                     master_seed=int(self.plan["master_seed"]),
+                    random_stream_id=self.plan.get("random_stream_id"),
                     request_factory=self.request_factory,
                     active_chunk_size=self.plan["active_chunk_size"],
                 )
@@ -3023,6 +3094,7 @@ class RunController:
 
 __all__ = [
     "RUN_PLAN_LEGACY_SCHEMA_VERSION",
+    "RUN_PLAN_PAIRED_SCHEMA_VERSION",
     "RUN_PLAN_SCHEMA_VERSION",
     "RUN_PROGRESS_SCHEMA_VERSION",
     "RunController",

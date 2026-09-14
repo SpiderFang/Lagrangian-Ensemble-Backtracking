@@ -154,11 +154,18 @@ NWW3 analysis root 與 external checkpoint root；這些值由上述 CLI 傳入�
 final workspace，避免破壞 initializer 的 exclusive 建立檢查。若現場已有其他使用者工作，
 先記錄干擾快照，但不停止他們的程序；第一輪以單程序量測，不能宣稱整機 capacity benchmark。
 
+若本輪另需比較 `no_stokes` 與 `finite_depth_stokes` 的共同亂數效果，兩個獨立 run 都要
+在各自的命令列明示相同、非空的 `--random-stream-id <ID>`，並保留不同的 `--run-id` 與
+`--experiment-case-id`。此設定只替換 seed 導出的案例命名空間；run plan schema 2.2、
+seed table、checkpoint binding 與 output metadata 會保存該 ID。省略時仍使用 schema 2.1
+及原本以物理案例導出的 seed；paired 不是把兩個物理案例或輸出合併，也不能當作正式
+獨立驗證證據。
+
 ### 3. 同片 resume 與後續分片
 
 若唯一分片在 sweep budget 形成合法 checkpoint，必須以完全相同的 config、input binding、
-seed、shard ID 與 checkpoint root resume。resume 另用唯一 phase／timings 檔，避免無鎖
-追加造成 lost update：
+seed（若為 paired 則同一 `random-stream-id`）、shard ID 與 checkpoint root resume。resume
+另用唯一 phase／timings 檔，避免無鎖追加造成 lost update：
 
 ```bash
 export SHARD_ID="$(LBT_RUN_DESTINATION="$LBT_RUN_DESTINATION" "$LBT_SOURCE_PYTHON" -c 'import json, os; from pathlib import Path; p=Path(os.environ["LBT_RUN_DESTINATION"]) / "guishan-h30-r1" / "run_plan.json"; rows=json.loads(p.read_text())["shards"]; assert len(rows) == 1; print(rows[0]["shard_id"])')"

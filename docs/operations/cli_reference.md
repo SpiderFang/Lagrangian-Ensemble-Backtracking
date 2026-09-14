@@ -259,6 +259,31 @@ arrival metadata、gap manifest、provenance 與 artifact index 會記錄 pilot 
 identity 及 1 日 horizon。這個選項不可與 `--formal-release` 同時使用；formal validator
 也會以非正式 `pilot_explicit_window` label 拒絕升格為 48+2 正式 arrival。
 
+### 工程案例的共同亂數配對
+
+`scripts/run_engineering_window.py run` 可透過 `--random-stream-id` 將
+`no_stokes` 與 `finite_depth_stokes` 的 seed 導出案例命名空間固定為同一個明示 ID；兩個
+run 仍須分別使用自己的 `--experiment-case-id`，因此物理案例、`particle_id` 與輸出目錄不
+會合併。此選項不可為空白，建立後會把 ID 寫入 run plan schema `2.2.0`、seed table、
+checkpoint binding 與 trajectory metadata：
+
+```bash
+uv run python scripts/run_engineering_window.py run \
+  --artifact "$ENGINEERING_ARTIFACT" \
+  --destination "$LBT_OUTPUT_ROOT/runs" \
+  --run-id "$RUN_ID_NO_STOKES" \
+  --experiment-case-id no_stokes \
+  --random-stream-id abcd-common-rng-v1 \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --shard-id 0
+```
+
+另一個物理案例沿用相同 `--random-stream-id`，但必須使用不同的 `--run-id` 與
+`--experiment-case-id finite_depth_stokes`。resume 時省略 stream ID 會沿用 immutable
+plan；若明示的 ID 與 plan 不同，或 checkpoint binding 的 stream 不同，流程會在建立
+request／恢復粒子前 fail-closed。省略此選項的 run 維持 schema `2.1.0`、五欄 seed table
+與原本以 `experiment_case_id` 導出的 seed，不需遷移既有 workspace。
+
 ## Pilot 與 synthetic
 
 `pilot-calibrate`／`pilot-config-create` 的完整參數與 candidate gate 見

@@ -238,10 +238,19 @@ class ProductionBatch:
         shard: ScenarioShard,
         *,
         master_seed: int,
+        random_stream_id: str | None = None,
         request_factory: Callable[[RunUnit], ReferenceParticleRequest],
         active_chunk_size: int | None = None,
     ) -> None:
-        """建立非空批次並一次完成所有 request 建立與初始觀測。"""
+        """建立非空批次並一次完成所有 request 建立與初始觀測。
+
+        ``random_stream_id`` 是可選的 common-random-number 命名空間。它只替換 seed
+        導出所使用的案例身分，仍以 ``shard.experiment_case_id`` 驗證 request 的物理
+        identity；因此配對的物理案例不會因共用 RNG 而互相覆寫 ``particle_id``。省略此
+        參數時，``iter_run_units`` 會維持既有以 experiment case 導出的 seed。建構後將
+        stream ID 留在批次物件上，讓呼叫端在 checkpoint／資源稽核時可追溯實際使用的
+        seed 命名空間。
+        """
 
         if isinstance(master_seed, bool) or not isinstance(master_seed, int):
             raise TypeError("master_seed 必須是非負整數")
@@ -258,8 +267,17 @@ class ProductionBatch:
             raise ValueError("active_chunk_size 必須為正整數或 None")
         self.shard = shard
         self.master_seed = master_seed
+        # iterator 會在產生第一個 RunUnit 前驗證 stream ID；此處保留原字串，因為它是
+        # immutable run plan 的稽核欄位，不應被自動正規化成另一個 operator 未提供的值。
+        self.random_stream_id = random_stream_id
         self.active_chunk_size = active_chunk_size
-        self.units = tuple(iter_run_units(shard, master_seed=master_seed))
+        self.units = tuple(
+            iter_run_units(
+                shard,
+                master_seed=master_seed,
+                random_stream_id=random_stream_id,
+            )
+        )
         if len(self.units) != shard.particle_count:
             raise RuntimeError("RunUnit 數量與 scenario×M 契約不符")
         self.runtimes: list[ProductionParticleRuntime] = []
@@ -509,17 +527,32 @@ class ProductionBatch:
         *,
         shard: ScenarioShard,
         master_seed: int,
+        random_stream_id: str | None = None,
         request_factory: Callable[[RunUnit], ReferenceParticleRequest],
         expected_binding: CheckpointBinding,
         active_chunk_size: int | None = None,
     ) -> ProductionBatch:
-        """以同一 shard、master seed 與 request factory 重建外部資源並恢復 checkpoint。"""
+        """以同一 shard、seed 命名空間與 request factory 恢復 checkpoint。
+
+        checkpoint loader 會先核對 ``expected_binding``；本方法再以同一個
+        ``random_stream_id`` 重建 RunUnit。即使 checkpoint 的粒子 identity 本身不包含
+        stream ID，controller 仍會在 binding 中保存該值，任何 resume 變更都會在建立
+        外部 request 前 fail-closed，而不以錯誤 seed 靜默續跑。
+        """
 
         from .checkpoint import load_execution_checkpoint
+
+        # execution checkpoint 的 particle identity 不包含 seed 命名空間；若只依 identity
+        # 來 restore，呼叫端可能把另一個 stream 的 RNG state 套回同一組物理粒子。因此在
+        # loader 前先把 batch 參數與 binding 的 stream 逐字核對，舊六欄 binding 的 None
+        # 也必須和未啟用配對的 batch 相符。
+        if random_stream_id != expected_binding.random_stream_id:
+            raise ValueError("checkpoint random_stream_id 與 ProductionBatch 不一致")
 
         batch = cls(
             shard,
             master_seed=master_seed,
+            random_stream_id=random_stream_id,
             request_factory=request_factory,
             active_chunk_size=active_chunk_size,
         )
@@ -561,15 +594,22 @@ def run_production_shard(
     shard: ScenarioShard,
     *,
     master_seed: int,
+    random_stream_id: str | None = None,
     request_factory: Callable[[RunUnit], ReferenceParticleRequest],
     active_chunk_size: int | None = None,
     on_result: Callable[[RunUnit, ParticleResult], None] | None = None,
 ) -> list[ParticleResult]:
-    """以 CPU/NumPy active-compacted orchestration 完成一個 scenario shard。"""
+    """以 CPU/NumPy active-compacted orchestration 完成一個 scenario shard。
+
+    ``random_stream_id`` 的語意與 ``ProductionBatch`` 相同：明示時可讓不同物理案例
+    對同一 scenario／member 使用相同 seed；未明示時保留舊 experiment-case seed。這裡
+    只轉交 seed 命名空間，不改變結果 callback 所收到的 RunUnit identity。
+    """
 
     batch = ProductionBatch(
         shard,
         master_seed=master_seed,
+        random_stream_id=random_stream_id,
         request_factory=request_factory,
         active_chunk_size=active_chunk_size,
     )

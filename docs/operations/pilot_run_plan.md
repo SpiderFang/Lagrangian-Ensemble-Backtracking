@@ -31,10 +31,17 @@
 - 執行建立器：`runtime.initialize_run`／`initialize_pilot_run` 新增三個可選參數
   `pilot_study_site_id`、`pilot_arrival_id`、`pilot_material_id`。全省略保留舊行為；
   部分指定、重複命令列選項或與 `pilot_scenarios_per_stratum` 混用均拒絕。
-- 識別碼只持久化於 `run_plan.json` 的 `scenario_selection`；不新增 config 欄位，
-  不改 `pilot_execution_binding` 或 calibration artifact，不改來源清單。
-- 根計畫維持 `2.1.0`；舊完整／分層選擇繫結仍為 `1.0.0`，舊 `2.0.0` 根計畫仍按
-  原完整模式讀取。精確選擇使用獨立繫結版本 `2.0.0`、`mode=pilot_exact`，僅 pilot 可用。
+- pilot 的站點／到達／材質三個識別碼只持久化於 `run_plan.json` 的
+  `scenario_selection`；不新增 config 欄位，不改 `pilot_execution_binding` 或 calibration
+  artifact，不改來源清單。paired 工程流的 `random_stream_id` 是獨立的 seed 命名空間欄位，
+  僅在明示配對時寫入 schema 2.2 plan 及其 seed／checkpoint／output 證據。
+- 一般（未配對）根計畫維持 `2.1.0`；舊完整／分層選擇繫結仍為 `1.0.0`，舊 `2.0.0`
+  根計畫仍按原完整模式讀取。精確選擇使用獨立繫結版本 `2.0.0`、`mode=pilot_exact`，
+  僅 pilot 可用。若工程上要讓不同物理 `experiment_case_id` 共用同一組可重現擴散亂數，
+  可由 `scripts/run_engineering_window.py run --random-stream-id <ID>` 建立 paired
+  根計畫 `2.2.0`；該 ID 必須為明示且非空白字串，會另外保存於 seed table、checkpoint
+  binding 與 trajectory metadata。省略此選項時不新增欄位，仍完全使用 `2.1.0` 與舊 seed
+  導出規則。
 
 精確繫結固定保存：版本與政策、站點／到達／材質 ID、完整來源與選中情境數及 ID 集合
 SHA-256、完整來源情境／受體記錄 SHA-256、本站來源受體數及 ID 集合 SHA-256。
@@ -44,9 +51,11 @@ SHA-256、完整來源情境／受體記錄 SHA-256、本站來源受體數及 I
 
 `load_validated_run_static_inputs` 在 run-shard／重開／resume 前重新驗證完整來源並套用
 `apply_scenario_selection`；識別碼、內容指紋、數量、受體垂向對應或欄位遭改動即拒絕。
-情境原物件與 ID 不變；粒子 seed 仍只取決於 master seed、scenario ID、experiment case
-與 member ID，因此較小 M 的成員 seed 是較大 M 的前綴集合。此性質不保證不同 M 的
-統計已收斂，也不表示任何後續執行軌跡必然逐點相同。
+情境原物件與 ID 不變；未指定 paired stream 時，粒子 seed 仍只取決於 master seed、
+scenario ID、experiment case 與 member ID，因此較小 M 的成員 seed 是較大 M 的前綴集合。
+指定 `random_stream_id` 時，只有 seed 導出的案例命名空間改用該 ID，物理案例與
+`particle_id` 仍保留原值；相同 stream 並不保證不同物理案例的後續軌跡逐點相同。此性質
+不保證不同 M 的統計已收斂，也不表示任何後續執行軌跡必然逐點相同。
 
 ## 回溯天數的表示精度
 
@@ -64,7 +73,9 @@ runtime 的 formal gap-safe 檢查與 `RuntimeRequestFactory` 共用同一個轉
 3600 秒及 3,600,000,000,000 ns，`1/48` 天為1800秒；由 10 ns 換算的可還原天數
 亦接受。`1e-12` 天＝86.4 ns、10.5 ns 及可分辨但不能精確往返的鄰近輸入仍拒絕。
 浮點數本來無法區分的更細時間不能靠本函式恢復，不宣稱任意設定都有奈秒準確度。
-這不改 builder YAML、run-plan schema、來源選擇、arrival、沉降、步長、seed 或 RNG；
+這個回溯表示精度功能不改 builder YAML、來源選擇、arrival、沉降、步長、seed 或 RNG；
+另行明示 `random_stream_id` 的 paired 工程控制才會採用 schema 2.2 的共同亂數命名空間，
+不應與本節的時間轉換混同。
 不合法時間在建立 forcing manager 前停止，也不代表已修復任何積分或海洋取樣失敗。
 
 ## 重建命令

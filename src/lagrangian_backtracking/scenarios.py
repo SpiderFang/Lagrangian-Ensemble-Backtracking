@@ -361,16 +361,63 @@ def validate_baseline_coverage(scenarios: Sequence[Scenario]) -> dict[str, int]:
     return counts
 
 
-def derive_member_seed(*, master_seed: int, scenario_id: str, experiment_case_id: str, member_id: int) -> int:
+def validate_random_stream_id(value: object, *, allow_none: bool = True) -> str | None:
+    """驗證可選的共同亂數流識別碼，並保留呼叫端提供的原文字串。
+
+    ``random_stream_id`` 是工程配對的亂數命名空間，不是物理實驗案例；例如
+    ``no_stokes`` 與 ``finite_depth_stokes`` 仍保留各自的 ``experiment_case_id``，但可
+    明示同一個 stream 讓兩組案例對相同的 scenario／member 使用同一個初始亂數狀態。這個
+    欄位只接受非空白原生字串；不做自動 trim 或替換，避免在 plan、seed table 與
+    checkpoint binding 中留下與 operator 看到的識別碼不同的值。省略時回傳 ``None``，
+    讓既有 seed 導出規則完全維持以 experiment case 為命名空間的行為。
+
+    Args:
+        value: 呼叫端提供的 stream ID，或代表未啟用配對的 ``None``。
+        allow_none: 是否允許 ``None``；公開 seed API 使用預設值，schema 驗證可要求
+            欄位必須存在時關閉此選項。
+
+    Returns:
+        原樣保留的非空字串，或在允許省略且輸入為 ``None`` 時回傳 ``None``。
+
+    Raises:
+        TypeError: 輸入不是原生字串或 ``None``。
+        ValueError: 字串去除前後空白後沒有內容，或不允許省略卻傳入 ``None``。
+    """
+
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError("random_stream_id 不可省略")
+    if type(value) is not str:
+        raise TypeError("random_stream_id 必須是字串或 None")
+    if not value.strip():
+        raise ValueError("random_stream_id 不可為空白")
+    return value
+
+
+def derive_member_seed(
+    *,
+    master_seed: int,
+    scenario_id: str,
+    experiment_case_id: str,
+    member_id: int,
+    random_stream_id: str | None = None,
+) -> int:
     """產生不受工作程序、批次切分與中途續跑影響的 NumPy 128 位元亂數種子。
 
-    不使用 Python 內建雜湊，因它在不同程序可能加入隨機值。主種子、情境、實驗案例與
-    成員編號都輸入 SHA-256，取前 16 位元組轉為非負整數，可直接交給 NumPy 亂數產生器。
+    不使用 Python 內建雜湊，因它在不同程序可能加入隨機值。未啟用共同亂數流時，主種子、
+    情境、物理實驗案例與成員編號都輸入 SHA-256，完整保留舊版 seed 規則；若明示
+    ``random_stream_id``，則只把這個配對識別碼替換「案例身分」輸入，讓不同物理案例在
+    相同主種子、scenario 與 member 下得到同一 seed，而不改變 ``particle_id`` 或任何
+    物理案例欄位。兩種模式都取 SHA-256 前 16 位元組作為非負整數，交給 NumPy
+    PCG64DXSM 亂數產生器。
     """
 
     if master_seed < 0 or member_id < 0 or not scenario_id or not experiment_case_id:
         raise ValueError("seed 欄位必須非負且識別碼不可空白")
-    fields = [str(master_seed), scenario_id, experiment_case_id, str(member_id)]
+    stream_id = validate_random_stream_id(random_stream_id)
+    case_identity = experiment_case_id if stream_id is None else stream_id
+    fields = [str(master_seed), scenario_id, case_identity, str(member_id)]
     encoded = json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return int.from_bytes(sha256(encoded).digest()[:16], "big", signed=False)
 

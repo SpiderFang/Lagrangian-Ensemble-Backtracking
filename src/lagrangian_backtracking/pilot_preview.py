@@ -815,6 +815,10 @@ def _collect(
                         scenario_id=scenario.scenario_id,
                         experiment_case_id=plan["experiment_case_id"],
                         member_id=member_id,
+                        # paired plan 的 seed 命名空間由 immutable plan 指定；預覽只讀
+                        # 結果但仍須輸出與 ProductionBatch／seed table 相同的 seed，不能
+                        # 因為 particle identity 保留物理案例而回退到 experiment case。
+                        random_stream_id=plan.get("random_stream_id"),
                     ),
                     "status": state.status.value,
                     "time_utc_ns": state.time_utc_ns,

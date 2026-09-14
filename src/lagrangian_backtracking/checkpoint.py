@@ -49,7 +49,12 @@ from .outputs import sha256_file
 
 @dataclass(frozen=True, slots=True)
 class CheckpointBinding:
-    """判定中途計算狀態是否可安全續跑的固定識別欄位。"""
+    """判定中途計算狀態是否可安全續跑的固定識別欄位。
+
+    ``random_stream_id`` 是可選的共同亂數流命名空間。舊 checkpoint 不含此欄位時，
+    loader 會以 ``None`` 還原並維持原有六欄 binding；paired run 的 writer 則保存非空
+    stream ID，讓物理案例身分不同但 RNG 命名空間相同的 run 不能誤用彼此的 checkpoint。
+    """
 
     config_hash: str
     input_inventory_hash: str
@@ -57,6 +62,15 @@ class CheckpointBinding:
     shard_id: str
     seed_policy: str
     code_commit: str
+    random_stream_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """拒絕空白 stream ID，避免 checkpoint binding 以空值代表不同語意。"""
+
+        if self.random_stream_id is not None and (
+            type(self.random_stream_id) is not str or not self.random_stream_id.strip()
+        ):
+            raise ValueError("random_stream_id 必須是非空白字串或 None")
 
 
 @dataclass(slots=True)
@@ -90,7 +104,15 @@ _SUPPORTED_EXECUTION_SCHEMA_VERSIONS = frozenset(
     {_SCHEMA20_VERSION, _SCHEMA21_VERSION, _SCHEMA22_VERSION}
 )
 _SCHEMA2_DATA_FILES = frozenset({"execution_state.json", "rng_states.json"})
-_BINDING_FIELDS = tuple(field.name for field in fields(CheckpointBinding))
+_BINDING_FIELDS = (
+    "config_hash",
+    "input_inventory_hash",
+    "experiment_case_id",
+    "shard_id",
+    "seed_policy",
+    "code_commit",
+)
+_BINDING_FIELDS_WITH_RANDOM = _BINDING_FIELDS + ("random_stream_id",)
 _PARTICLE_FIELDS = tuple(field.name for field in fields(ParticleState))
 _LEGACY_OBSERVATION_FIELDS = (
     "particle_id",
@@ -156,6 +178,24 @@ def _write_json(path: Path, payload: object, *, sort_keys: bool = False) -> None
             allow_nan=False,
         )
         handle.write("\n")
+
+
+def _binding_payload(binding: CheckpointBinding) -> dict[str, Any]:
+    """建立 checkpoint metadata 的 binding object，並保留舊六欄格式。
+
+    ``dataclasses.asdict`` 會把新增的 optional 欄位寫成 ``null``，造成未啟用配對的舊
+    run 也改變 metadata bytes 與欄位集合。這個 helper 只有在 stream ID 明示時才加入
+    第七欄，讓既有 schema 2 checkpoint 可由新版 loader 讀取，且 paired checkpoint 的
+    binding 又能直接保存並驗證其亂數命名空間。
+    """
+
+    payload = {
+        field_name: getattr(binding, field_name)
+        for field_name in _BINDING_FIELDS
+    }
+    if binding.random_stream_id is not None:
+        payload["random_stream_id"] = binding.random_stream_id
+    return payload
 
 
 def _reject_json_constant(value: str) -> None:
@@ -962,7 +1002,7 @@ def write_execution_checkpoint(
             "particle_count": len(snapshot.executions),
             "observation_count": observation_count,
             "event_count": event_count,
-            "binding": asdict(binding),
+            "binding": _binding_payload(binding),
             "particle_order": [identity["particle_id"] for identity in snapshot.run_unit_identities],
             "files": files,
         }
@@ -1057,7 +1097,25 @@ def load_execution_checkpoint(
     event_count = _nonnegative_int(metadata["event_count"], label="event_count")
     if particle_count < 1:
         raise ValueError("schema 2 checkpoint 不允許空 shard")
-    binding_row = _require_exact_keys(metadata["binding"], _BINDING_FIELDS, label="binding")
+    binding_value = metadata["binding"]
+    if not isinstance(binding_value, dict):
+        raise ValueError("binding 必須是 object")
+    binding_keys = set(binding_value)
+    if binding_keys == set(_BINDING_FIELDS):
+        # 舊 checkpoint 沒有 stream 欄位；dataclass default None 保留既有 binding 語意。
+        binding_row = _require_exact_keys(binding_value, _BINDING_FIELDS, label="binding")
+    elif binding_keys == set(_BINDING_FIELDS_WITH_RANDOM):
+        binding_row = _require_exact_keys(
+            binding_value,
+            _BINDING_FIELDS_WITH_RANDOM,
+            label="binding",
+        )
+        if type(binding_row["random_stream_id"]) is not str or not binding_row[
+            "random_stream_id"
+        ].strip():
+            raise ValueError("binding.random_stream_id 必須是非空白字串")
+    else:
+        raise ValueError("binding 欄位集合不符")
     try:
         actual_binding = CheckpointBinding(**binding_row)
     except (TypeError, ValueError) as error:
@@ -1172,7 +1230,7 @@ def write_checkpoint(
             "schema_version": "1.0.0",
             "sequence": sequence,
             "particle_count": len(states),
-            "binding": asdict(binding),
+            "binding": _binding_payload(binding),
             "files": {
                 state_path.name: {
                     "size_bytes": state_path.stat().st_size,

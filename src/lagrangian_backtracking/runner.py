@@ -19,7 +19,7 @@ from .diffusion import DiffusionModel
 from .engine import EngineSettings, ParticleResult, run_particle
 from .integrators import VelocityProvider
 from .models import ParticleState
-from .scenarios import Scenario, derive_member_seed, stable_identifier
+from .scenarios import Scenario, derive_member_seed, stable_identifier, validate_random_stream_id
 
 # 此政策只規範 I/O 與批次的固定遍歷順序，不改變 Scenario 的內容、scenario_id、粒子
 # 識別碼或種子。將排序鍵公開並版本化，是為了讓不同程序重建同一 run plan 時，能辨識
@@ -262,11 +262,24 @@ def plan_scenario_shards(
     return shards
 
 
-def iter_run_units(shard: ScenarioShard, *, master_seed: int) -> Iterator[RunUnit]:
-    """依固定情境與成員順序逐一產生執行單位，避免一次建立龐大清單。"""
+def iter_run_units(
+    shard: ScenarioShard,
+    *,
+    master_seed: int,
+    random_stream_id: str | None = None,
+) -> Iterator[RunUnit]:
+    """依固定情境與成員順序逐一產生執行單位，避免一次建立龐大清單。
+
+    ``random_stream_id`` 只控制 seed 導出的案例命名空間，不會改變 shard 的物理
+    ``experiment_case_id``、情境內容或 ``particle_id``。因此 no-Stokes 與 finite-depth
+    Stokes 兩個 run 可以各自保留物理身分，並在明示同一 stream 時採用 common random
+    numbers；省略時完全沿用以 ``experiment_case_id`` 導出的舊 seed。驗證在建立 iterator
+    前完成，避免同一批 iterator 在第一次取值後才因非法識別碼中止。
+    """
 
     if type(master_seed) is not int or master_seed < 0:
         raise ValueError("master_seed 必須是非負整數，且不可為 bool")
+    validate_random_stream_id(random_stream_id)
     for scenario in shard.scenarios:
         for member_id in range(shard.members_per_scenario):
             particle_id = stable_identifier(
@@ -283,6 +296,7 @@ def iter_run_units(shard: ScenarioShard, *, master_seed: int) -> Iterator[RunUni
                     scenario_id=scenario.scenario_id,
                     experiment_case_id=shard.experiment_case_id,
                     member_id=member_id,
+                    random_stream_id=random_stream_id,
                 ),
             )
 
@@ -291,18 +305,24 @@ def run_reference_shard(
     shard: ScenarioShard,
     *,
     master_seed: int,
+    random_stream_id: str | None = None,
     request_factory: Callable[[RunUnit], ReferenceParticleRequest],
     on_result: Callable[[RunUnit, ParticleResult], None] | None = None,
 ) -> list[ParticleResult]:
     """以 NumPy 逐粒子引擎執行一批工作，供驗證與小型試算。
 
     建立函式回傳的初始粒子狀態必須和執行單位逐欄一致，避免錯誤受體、實驗案例或成員的
-    初始資料被寫成看似正確的結果。亂數產生器使用由主種子、情境、案例與成員共同導出的
-    128 位元種子，因此單獨重跑某一成員與整批計算會得到相同的隨機擴散序列。
+    初始資料被寫成看似正確的結果。亂數產生器使用由主種子、情境、案例（或明示的共同
+    ``random_stream_id``）與成員共同導出的 128 位元種子，因此單獨重跑某一成員與整批
+    計算會得到相同的隨機擴散序列；配對案例只有在 operator 明示相同 stream 時才共用。
     """
 
     results: list[ParticleResult] = []
-    for unit in iter_run_units(shard, master_seed=master_seed):
+    for unit in iter_run_units(
+        shard,
+        master_seed=master_seed,
+        random_stream_id=random_stream_id,
+    ):
         request = request_factory(unit)
         state = request.initial_state
         identity = (

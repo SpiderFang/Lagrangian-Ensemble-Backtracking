@@ -68,7 +68,7 @@ from .run_control import (
 )
 from .run_validation import validate_run
 from .runtime import RuntimeRequestFactory, _read_strict_json_object
-from .scenarios import ArrivalTime, Receptor, stable_identifier
+from .scenarios import ArrivalTime, Receptor, stable_identifier, validate_random_stream_id
 
 ENGINEERING_ARTIFACT_SCHEMA_VERSION = "1.0.0"
 """工程性 artifact 的版本；變更來源／狀態欄位時必須升版。"""
@@ -1480,6 +1480,7 @@ def run_engineering_window(
     nww_analysis_root: str | Path | None = None,
     project_root: str | Path | None = None,
     experiment_case_id: str = ENGINEERING_DEFAULT_EXPERIMENT_CASE_ID,
+    random_stream_id: str | None = None,
     sweep_budget: int | None = None,
     shard_ids: Sequence[str] | None = None,
     resume: bool = False,
@@ -1487,13 +1488,20 @@ def run_engineering_window(
     """從 engineering artifact 建立／恢復 pilot workspace 並執行指定 shard。
 
     ``shard_ids`` 可使用 immutable plan 的 hash ID；為方便現場 shell，也接受非負整數
-    index 並在讀取 plan 後轉成 exact ID。``resume=True`` 只恢復相同 run binding，不會在
-    artifact 或 checkpoint 改變後自動接續；``sweep_budget`` 讓首測可先取得真 checkpoint
+    index 並在讀取 plan 後轉成 exact ID。``random_stream_id`` 若明示，會在兩個不同
+    ``experiment_case_id`` 的 pilot run 中使用相同 seed 命名空間，並持久化於 schema 2.2
+    run plan、seed table、checkpoint binding 與 output metadata；省略時完全維持 schema
+    2.1 與舊 seed 行為。``resume=True`` 只恢復相同 run binding，不會在 artifact、seed
+    stream 或 checkpoint 改變後自動接續；``sweep_budget`` 讓首測可先取得真 checkpoint
     與 step cost。函式不接受 formal 模式，也不會把工程 artifact 交給 formal initializer。
     """
 
     if type(resume) is not bool:
         raise EngineeringWindowError("resume 必須是 bool")
+    try:
+        requested_stream_id = validate_random_stream_id(random_stream_id)
+    except (TypeError, ValueError) as error:
+        raise EngineeringWindowError(str(error)) from error
     if sweep_budget is not None and (
         isinstance(sweep_budget, bool) or not isinstance(sweep_budget, int) or sweep_budget < 1
     ):
@@ -1574,6 +1582,7 @@ def run_engineering_window(
             experiment_case_id=experiment_case_id,
             master_seed=int(config.scenarios.master_seed),
             seed_policy=str(config.scenarios.seed_policy),
+            random_stream_id=requested_stream_id,
             members_per_scenario=int(config.scenarios.members_per_scenario),
             shard_scenario_count=int(config.execution.shard_scenario_count),
             checkpoint_interval_sweeps=int(config.execution.checkpoint_interval_sweeps),
@@ -1594,6 +1603,11 @@ def run_engineering_window(
         errors = run_validation.get("errors", []) if isinstance(run_validation, Mapping) else []
         raise EngineeringWindowError(f"engineering run workspace 驗證失敗：{errors}")
     load_run_progress(workspace_path)
+    plan_stream_id = plan.get("random_stream_id")
+    if requested_stream_id is not None and plan_stream_id != requested_stream_id:
+        raise EngineeringWindowError(
+            "resume 或既有 run 的 random_stream_id 與命令列不一致"
+        )
     if plan.get("run_kind") != "pilot" or plan.get("experiment_case_id") != experiment_case_id:
         raise EngineeringWindowError("run plan 只允許相同 pilot experiment_case_id")
     if plan.get("config_hash") != config.config_hash():

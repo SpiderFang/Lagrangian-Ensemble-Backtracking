@@ -38,6 +38,7 @@ from .run_control import (
     _FORCING_CACHE_STATS_STATUS_UNAVAILABLE,
     _SCENARIO_COLUMNS,
     _SEED_COLUMNS,
+    _SEED_COLUMNS_PAIRED,
     _SHA256_RE,
     RunController,
     _cross_check_plan_progress,
@@ -297,7 +298,13 @@ def _load_scenarios(root: Path, plan: Mapping[str, Any], errors: list[str]) -> t
 def _validate_seed_table(
     root: Path, plan: Mapping[str, Any], shards: Sequence[ScenarioShard], errors: list[str]
 ) -> None:
-    """逐列核對 seed table 的粒子順序與 128-bit deterministic seed。"""
+    """逐列核對 seed table 的粒子順序與 128-bit deterministic seed。
+
+    舊 schema 2.0／2.1 plan 使用五欄 seed table；明示共同亂數流的 schema 2.2 另外要求
+    每列保存同一個 ``random_stream_id``。驗證器不以 seed table 自己的字串推導案例身分，
+    而是以 immutable run plan 決定導出命名空間，再同時核對欄位與 seed，避免竄改 plan 或
+    seed table 後仍被當成可恢復 run。
+    """
 
     path = root / "seed_table.parquet"
     if path.is_symlink() or not path.is_file():
@@ -305,7 +312,9 @@ def _validate_seed_table(
         return
     try:
         parquet = pq.ParquetFile(path)
-        if tuple(parquet.schema_arrow.names) != _SEED_COLUMNS:
+        stream_id = plan.get("random_stream_id")
+        expected_columns = _SEED_COLUMNS if stream_id is None else _SEED_COLUMNS_PAIRED
+        if tuple(parquet.schema_arrow.names) != expected_columns:
             errors.append("seed_table.parquet: columns")
             return
         expected_count = sum(shard.particle_count for shard in shards)
@@ -313,11 +322,16 @@ def _validate_seed_table(
             errors.append("seed_table.parquet: row_count")
         expected_units = iter(
             chain.from_iterable(
-                iter_run_units(shard, master_seed=int(plan["master_seed"])) for shard in shards
+                iter_run_units(
+                    shard,
+                    master_seed=int(plan["master_seed"]),
+                    random_stream_id=stream_id,
+                )
+                for shard in shards
             )
         )
         index = 0
-        for batch in parquet.iter_batches(batch_size=8192, columns=list(_SEED_COLUMNS)):
+        for batch in parquet.iter_batches(batch_size=8192, columns=list(expected_columns)):
             # 每批最多 8192 rows；正式 50,000×M seed table 不會被一次轉成 Python list。
             for row in batch.to_pylist():
                 unit = next(expected_units, None)
@@ -331,6 +345,8 @@ def _validate_seed_table(
                     "particle_id": unit.particle_id,
                     "seed_128_hex": f"{unit.seed:032x}",
                 }
+                if stream_id is not None:
+                    expected["random_stream_id"] = stream_id
                 if row != expected:
                     errors.append(f"seed_table.parquet: row_{index}_mismatch")
                     # 繼續掃描可顯示多個錯誤，但每欄錯誤只保留第一筆以免壞表灌滿 stdout。
@@ -401,7 +417,7 @@ def _expected_output_metadata(plan: Mapping[str, Any], shard: ScenarioShard) -> 
     """建立 output manifest 必須與 run plan 一致的 immutable metadata 子集合。"""
 
     provenance = cast(Mapping[str, Any], plan["code_provenance"])
-    return {
+    metadata = {
         "run_id": plan["run_id"],
         "run_kind": plan["run_kind"],
         "config_hash": plan["config_hash"],
@@ -417,6 +433,11 @@ def _expected_output_metadata(plan: Mapping[str, Any], shard: ScenarioShard) -> 
         "shard_id": shard.shard_id,
         "experiment_case_id": shard.experiment_case_id,
     }
+    if plan.get("random_stream_id") is not None:
+        # paired run 的 trajectory manifest 與 seed table、checkpoint binding 使用同一
+        # stream 識別碼；舊 plan 不加入 null 欄位，維持既有輸出 metadata 相容性。
+        metadata["random_stream_id"] = plan["random_stream_id"]
+    return metadata
 
 
 def _validate_output_tree(
@@ -488,7 +509,11 @@ def _validate_output_tree(
                     "analysis_region_id": unit.scenario.analysis_region_id,
                     "receptor_id": unit.scenario.receptor_id,
                 }
-                for unit in iter_run_units(shard, master_seed=int(plan["master_seed"]))
+                for unit in iter_run_units(
+                    shard,
+                    master_seed=int(plan["master_seed"]),
+                    random_stream_id=plan.get("random_stream_id"),
+                )
             ]
             identity_keys = tuple(expected_identities[0]) if expected_identities else ()
             actual_identities = [{key: row.get(key) for key in identity_keys} for row in rows]
@@ -777,7 +802,11 @@ def iter_complete_run_trajectory_shards(
             for index, (result, unit) in enumerate(
                 zip(
                     results,
-                    iter_run_units(shard, master_seed=int(plan["master_seed"])),
+                    iter_run_units(
+                        shard,
+                        master_seed=int(plan["master_seed"]),
+                        random_stream_id=plan.get("random_stream_id"),
+                    ),
                     strict=True,
                 )
             ):
