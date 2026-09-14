@@ -712,6 +712,26 @@ def _validate_run_identity(value: Any, *, label: str) -> dict[str, Any]:
     return identity
 
 
+def _strict_writer_run_unit_identity(unit: Any, *, label: str) -> dict[str, Any]:
+    """建立並嚴格驗證 writer 使用的 canonical RunUnit identity。
+
+    ``_run_unit_identity`` 會把 member、到達 UTC 與 seed 轉成 Python ``int``，原本的
+    便利轉換可能把 ``True``、``1.0`` 或數字文字誤藏成合法 identity。正式 v3 writer
+    必須在建立 compact／metadata 前沿用 loader 的欄位契約，因此先對 RunUnit 原始欄位
+    做不接受 bool 的整數檢查，再把提取結果交給 ``_validate_run_identity``。回傳值是
+    後續 state、observation、event 與 metadata 共用的 canonical dict；這裡只驗證固定
+    identity，不改變 RunUnit 或 execution 物件。
+    """
+
+    scenario = unit.scenario
+    # 先驗原始來源，避免 _run_unit_identity 的 int(...) 將錯誤 primitive 靜默轉型；
+    # arrival UTC 可為負值（代表 Unix epoch 之前），所以只要求原生整數而不限制符號。
+    _nonnegative_int(unit.member_id, label=f"{label}.member_id")
+    _integer(scenario.arrival_time_utc_ns, label=f"{label}.arrival_time_utc_ns")
+    _nonnegative_int(unit.seed, label=f"{label}.seed")
+    return _validate_run_identity(_run_unit_identity(unit), label=label)
+
+
 def _normalize_triangle_hint(value: Any, *, label: str) -> int:
     """將 checkpoint 的三角形提示固定為 ``-1`` 或非負 int64 可表示的整數。"""
 
@@ -2439,10 +2459,19 @@ def _prepare_schema3_writer_inputs(
     lengths = (len(run_units), len(executions), len(rngs), len(triangle_hints))
     if not lengths[0] or len(set(lengths)) != 1:
         raise ValueError("execution checkpoint 不允許空資料且所有欄位長度必須一致")
-    identities = [_run_unit_identity(unit) for unit in run_units]
+    # writer 必須先依 loader 同一 strict schema 驗證 RunUnit 原始 identity，才能保證
+    # metadata／compact 一旦發布就可立即被 resume loader 還原；validator 回傳的 canonical
+    # dict 會在本函式後續所有 state、history 與 particle order 檢查中共用。
+    identities = [
+        _strict_writer_run_unit_identity(unit, label=f"run_units[{index}].identity")
+        for index, unit in enumerate(run_units)
+    ]
     identity_tuples = [_run_identity_tuple(identity) for identity in identities]
     if len(set(identity_tuples)) != len(identity_tuples):
         raise ValueError("execution checkpoint RunUnit identity 必須唯一")
+    particle_ids = [identity["particle_id"] for identity in identities]
+    if len(set(particle_ids)) != len(particle_ids):
+        raise ValueError("execution checkpoint particle_id 必須唯一")
 
     normalized_hints: list[int] = []
     execution_rows: list[ParticleExecutionState] = []
@@ -2520,9 +2549,10 @@ def write_execution_checkpoint(
 
     寫入順序是 partial directory → checksum manifest → atomic rename；目標已存在、前代
     binding／RunUnit 順序不符、history cursor 回退、相鄰 observation engine key 重複，或
-    輸出資料在完整 sweep/macro boundary 外呼叫，均由 caller 或本函式拒絕。state、觀測與
-    事件也會先用 loader 的 strict semantic decoder 預驗，確保成功發布的 generation 可
-    立即還原。此 API 不刪除任何 generation，避免 retention 破壞 checkpoint.json hash chain。
+    輸出資料在完整 sweep/macro boundary 外呼叫，均由 caller 或本函式拒絕。RunUnit identity
+    會在建立 partial 前沿用 loader 的 strict 欄位驗證，並要求所有粒子的 ``particle_id``
+    全域唯一；state、觀測與事件也會預驗同一套 semantic decoder，確保成功發布的 generation
+    可立即還原。此 API 不刪除任何 generation，避免 retention 破壞 checkpoint.json hash chain。
     """
 
     if not isinstance(binding, CheckpointBinding):

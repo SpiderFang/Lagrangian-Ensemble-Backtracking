@@ -960,3 +960,95 @@ def test_schema3_writer_rejects_payloads_loader_would_reject(
     assert not target.exists()
     assert not tuple(tmp_path.glob(".checkpoint-00000002.partial-*"))
     assert load_execution_checkpoint(first, expected_binding=_binding()).sequence == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("particle_id", ""),
+        ("particle_id", True),
+        ("scenario_id", ""),
+        ("study_site_id", ""),
+        ("analysis_region_id", ""),
+        ("receptor_id", ""),
+        ("experiment_case_id", ""),
+        ("experiment_case_id", True),
+        ("member_id", True),
+        ("member_id", -1),
+        ("member_id", 1.5),
+        ("arrival_time_utc_ns", True),
+        ("arrival_time_utc_ns", 1.5),
+        ("seed", True),
+        ("seed", -1),
+        ("seed", 1.5),
+    ],
+)
+def test_schema3_writer_rejects_invalid_run_unit_identity(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    """RunUnit identity 的空值、bool、負值與錯誤數值型別必須在 partial 前拒絕。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    units = list(batch.units)
+    unit = units[0]
+    if field in {
+        "scenario_id",
+        "study_site_id",
+        "analysis_region_id",
+        "receptor_id",
+        "arrival_time_utc_ns",
+    }:
+        units[0] = replace(
+            unit,
+            scenario=replace(unit.scenario, **{field: replacement}),
+        )
+    else:
+        units[0] = replace(unit, **{field: replacement})
+
+    target = tmp_path / "checkpoint-00000001"
+    with pytest.raises(ValueError, match=r"run_units\[0\]\.identity"):
+        write_execution_checkpoint(
+            target,
+            binding=_binding(),
+            run_units=units,
+            executions=[runtime.execution for runtime in batch.runtimes],
+            rngs=[runtime.rng for runtime in batch.runtimes],
+            triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+            sequence=1,
+        )
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(".checkpoint-00000001.partial-*"))
+
+    # 所有失敗案例共用同一個正常 root 回歸，確保 strict identity gate 不改變合法
+    # RunUnit 的 canonical payload 與 loader round-trip。
+    valid = batch.write_checkpoint(
+        target,
+        binding=_binding(),
+        sequence=1,
+    )
+    assert load_execution_checkpoint(valid, expected_binding=_binding()).sequence == 1
+
+
+def test_schema3_writer_rejects_duplicate_run_unit_particle_id(
+    tmp_path: Path,
+) -> None:
+    """不同 member／seed 不得共用同一 particle_id，避免 loader particle order 重複。"""
+
+    batch = ProductionBatch(_shard(), master_seed=123, request_factory=_factory)
+    batch.advance()
+    units = list(batch.units)
+    units[1] = replace(units[1], particle_id=units[0].particle_id)
+    target = tmp_path / "checkpoint-00000001"
+    with pytest.raises(ValueError, match="particle_id 必須唯一"):
+        write_execution_checkpoint(
+            target,
+            binding=_binding(),
+            run_units=units,
+            executions=[runtime.execution for runtime in batch.runtimes],
+            rngs=[runtime.rng for runtime in batch.runtimes],
+            triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+            sequence=1,
+        )
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(".checkpoint-00000001.partial-*"))

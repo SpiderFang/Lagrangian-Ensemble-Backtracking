@@ -77,6 +77,11 @@ writer 在建立 partial 前也會把本代 compact state、觀測（含 pending
 因此欄位 primitive、fraction、UTC 型別或粒子歸屬錯誤會在 atomic publish 前拒絕，不會留下
 只能發布卻無法立即 resume 的 generation。這項預驗只涵蓋本代 `Θ(P + ΔH)` 資料；已發布
 的更早 history 仍由既有 chain checksum／loader 驗證。
+同一個 partial 建立前也會嚴格驗證每個 RunUnit identity 的非空文字欄位、member／seed 的
+非負原生整數與 arrival UTC 的原生整數型別；所有 RunUnit 的 `particle_id` 必須全域唯一。
+因此不同 member 或 seed 仍不能共用同一 `particle_id`，避免 loader 的 particle order 無法
+唯一還原。這些欄位驗證使用與 loader 相同的 canonical identity，成功發布即不會留下之後才
+被 loader 拒絕的 identity payload。
 
 controller 的 generation scan 仍會讀取並 JSON parse 每代 compact／history payload，以驗證
 檔案 checksum、欄位拓撲、cursor 與 row count，但只在最高代完整 restore 時建立全部
