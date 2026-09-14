@@ -1034,8 +1034,10 @@ def test_each_ocm_backend_checkpoint_resume_and_cross_backend_binding(
     interrupted = _ocm_backend_batch(shard, use_numba_kernel=use_numba_kernel)
     interrupted.advance(sweeps=2)
     assert interrupted.active_count > 0
+    # 每個 backend 使用自己的父目錄，避免兩組測試共用 generation；父目錄內的首次
+    # checkpoint 必須採用 schema 3 固定要求的 canonical 名稱 checkpoint-00000001。
     checkpoint_path = interrupted.write_checkpoint(
-        tmp_path / backend,
+        tmp_path / backend / "checkpoint-00000001",
         binding=binding,
         # checkpoint sequence 表示不可變 generation 的連續編號，不是已完成的
         # sweep 數；首次寫入固定從 1 開始，才能驗證 schema 3 hash chain。
