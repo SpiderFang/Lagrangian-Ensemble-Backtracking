@@ -2594,7 +2594,8 @@ def _baytrace_readme(
         "",
         "manifest.json 保存 style、style_version、四張 PNG 與 README SHA、原始七檔 before／after SHA、"
         "script SHA、實際命令、重建命令、幾何綁定及停止標籤核對結果。"
-        "endpoint_status_labels 與 terminal_status_labels 使用相同名稱；numerical_failure 固定標為「數值失敗停止」。",
+        "endpoint_status_labels 與 terminal_status_labels 使用相同名稱；"
+        "numerical_failure 固定標為「數值失敗停止」。",
         "失敗保留新輸出目錄供診斷，既有輸出、輸入檔、原無底圖 preview 與 legacy 成果均不覆寫。",
     ]
     return "\n".join(lines) + "\n"
