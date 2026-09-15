@@ -72,13 +72,22 @@ def _verified_server_cache_prefix() -> str:
     )
 
 
-def _validate_coastline_coverage(domain_geometry: Polygon, land_geometries: Sequence[Any]) -> None:
-    """驗證海岸資料的整體 bounds 涵蓋 domain，且至少有一個 land feature 相交。
+def _validate_coastline_coverage(
+    domain_geometry: Polygon,
+    land_geometries: Sequence[Any],
+    *,
+    require_bounds: bool = True,
+) -> None:
+    """驗證海岸資料與 domain 的空間關係，並依發布狀態選擇 bounds 閘門。
 
     海岸 GeoJSON 只作經緯度底圖參照，不能被當成 forcing mask；這個 gate 的目的只是
-    防止誤傳另一區或截短的海岸檔，讓圖面外框與底圖空間範圍可被解讀。先以所有有效
-    feature 的 bounds 組成涵蓋範圍，再要求至少一個 feature 與 domain 相交；不以
-    feature 數量或單一 polygon 的大小代替五站各自的 domain 綁定。
+    防止誤傳另一區或截短的海岸檔，讓圖面外框與底圖空間關係可被解讀。approved
+    幾何維持原契約：所有有效 land feature 的 bounds 必須完整涵蓋 domain，再要求至少
+    一個 feature 與 domain 相交。generated 的單站 pilot domain 可能包含較大的外海
+    矩形，canonical coastline 不一定延伸到矩形最外緣；此時由 caller 明示
+    ``require_bounds=False``，但仍強制有效 land feature 與 domain polygon 真實相交，
+    不接受只有 bbox 相交或完全不相交的底圖。這裡只驗證地理參照，不將 land feature
+    當作 forcing mask，也不改變粒子、流場或終止狀態。
     """
 
     if not land_geometries:
@@ -88,7 +97,7 @@ def _validate_coastline_coverage(domain_geometry: Polygon, land_geometries: Sequ
     coastline_max_x = max(float(geometry.bounds[2]) for geometry in land_geometries)
     coastline_max_y = max(float(geometry.bounds[3]) for geometry in land_geometries)
     domain_min_x, domain_min_y, domain_max_x, domain_max_y = domain_geometry.bounds
-    if not (
+    if require_bounds and not (
         coastline_min_x <= domain_min_x
         and coastline_min_y <= domain_min_y
         and coastline_max_x >= domain_max_x
@@ -97,6 +106,49 @@ def _validate_coastline_coverage(domain_geometry: Polygon, land_geometries: Sequ
         raise ValueError("海岸資料 bounds 未涵蓋站點 domain")
     if not any(geometry.intersects(domain_geometry) for geometry in land_geometries):
         raise ValueError("海岸資料沒有 land feature 與站點 domain 相交")
+
+
+def _geometry_release_status(
+    summary: dict[str, Any],
+    domain: dict[str, Any],
+    open_boundary: dict[str, Any],
+    *,
+    preview_marker: dict[str, Any] | None,
+) -> str:
+    """核對幾何發布狀態，回傳 ``approved`` 或受限的 ``generated``。
+
+    既有正式圖面以 ``status=approved`` 發布；兩份 geometry 只要同時是 approved，
+    就維持原有 reader 相容性，不要求舊 preview 額外增加 ``run_kind`` 或選擇欄位。
+    新增的 ``status=generated`` 只服務工程先導：preview 必須先由完整 validator 發布
+    ``.complete`` marker，summary 須明示 ``run_kind=pilot``、``selection_mode`` 為
+    ``pilot_exact`` 或受限 ``full``，且 source provenance 的 scenario selection mode
+    必須與 summary 一致。這裡只在既有 domain／open canonical hash、站點、flow owner、
+    幾何外框與海岸 coverage 檢查均通過後被呼叫，避免 generated 輸入冒充 approved 正式
+    geometry；mixed status、formal/full、缺欄或沒有完成 marker 一律 fail closed。
+    """
+
+    domain_status = domain.get("status")
+    open_status = open_boundary.get("status")
+    statuses = (domain_status, open_status)
+    if statuses == ("approved", "approved"):
+        return "approved"
+    if statuses != ("generated", "generated"):
+        raise ValueError("domain/open geometry release status 必須同時是 approved 或 generated")
+
+    # generated geometry 只能由已完成的 pilot preview 使用；marker 由共用 validator
+    # 檢查 manifest SHA、程式 provenance 與 storage gate，這裡拒絕沒有 marker 的舊目錄。
+    if preview_marker is None:
+        raise ValueError("generated geometry 需要已完成的 preview .complete marker")
+    if summary.get("run_kind") != "pilot":
+        raise ValueError("generated geometry 只接受 run_kind=pilot")
+    selection_mode = summary.get("selection_mode")
+    if selection_mode not in {"pilot_exact", "full"}:
+        raise ValueError("generated geometry 只接受 pilot_exact 或受限 full 的 pilot summary")
+    source = summary.get("source")
+    source_selection = source.get("scenario_selection") if isinstance(source, dict) else None
+    if not isinstance(source_selection, dict) or source_selection.get("mode") != selection_mode:
+        raise ValueError("generated geometry 的 summary source scenario selection 不一致")
+    return "generated"
 
 
 def load_plot_inputs(
@@ -113,9 +165,10 @@ def load_plot_inputs(
     particles 與 observations bytes 會在讀 CSV 前逐一核對。CSV 不做排序、插值或
     欄位刪減，列中的文字值也原樣保留，讓後續繪圖仍可追溯到原 preview。
 
-    ``domain_path`` 與 ``open_path`` 必須是 schema 1.0.0、approved 的 JSON。只選取
-    summary 指定 analysis region 的 domain record 及其 ``flow_domain`` open record，並以
-    summary 的 canonical geometry hash 綁定；open line 還必須與 domain polygon
+    ``domain_path`` 與 ``open_path`` 必須是 schema 1.0.0 的 geometry JSON；既有 approved
+    產品維持原行為，受限 generated 只可用於已完成 pilot preview。載入器只選取 summary
+    指定 analysis region 的 domain record 及其 ``flow_domain`` open record，並以 summary
+    的 canonical geometry hash 綁定；open line 還必須與 domain polygon
     exterior 相等，避免把其他區或 local record 誤畫成目前站點外框。海岸 GeoJSON 必須
     明示 OGC CRS84（座標順序為 longitude、latitude），每個 land feature 轉為
     Shapely Polygon/MultiPolygon。載入器不繪圖；繪圖函式可填灰色背景，但不以陸地
@@ -130,7 +183,10 @@ def load_plot_inputs(
     """
 
     preview = Path(preview_dir)
-    validate_published_preview(preview, storage_gate_evidence=storage_gate_evidence)
+    # 先驗證 preview 的發布協定；generated 幾何只准與已完成的 NFS marker 一起使用。
+    # 未帶 marker 的舊 exclusive-directory-rename 產品仍可供既有 approved geometry
+    # 相容讀取，但不能把它誤當成這次工程先導的完整發布證據。
+    preview_marker = validate_published_preview(preview, storage_gate_evidence=storage_gate_evidence)
     manifest, manifest_sha, manifest_canonical, _ = _read_json(preview / "manifest.json")
     if manifest.get("artifact_kind") != "pilot-preview-v1":
         raise ValueError("preview artifact_kind 不符")
@@ -185,16 +241,14 @@ def load_plot_inputs(
         domain.get("manifest_kind") != "domain_geometry_manifest"
         or domain.get("schema_version") != "1.0.0"
         or domain.get("coordinate_reference") != "EPSG:4326"
-        or domain.get("status") != "approved"
     ):
-        raise ValueError("domain manifest 不是 approved geometry")
+        raise ValueError("domain manifest schema 或座標參照不符")
     if (
         open_boundary.get("manifest_kind") != "open_boundary_manifest"
         or open_boundary.get("schema_version") != "1.0.0"
         or open_boundary.get("coordinate_reference") != "EPSG:4326"
-        or open_boundary.get("status") != "approved"
     ):
-        raise ValueError("open manifest 不是 approved geometry")
+        raise ValueError("open manifest schema 或座標參照不符")
 
     region = projection_info.get("analysis_region_id")
     center = projection_info.get("center_lonlat")
@@ -228,7 +282,6 @@ def load_plot_inputs(
         raise ValueError("站點 flow open geometry 不是有效 LineString")
     if not open_geometry.equals(domain_geometry.exterior):
         raise ValueError("站點 flow open line 未與 domain exterior 相等")
-
     coastline, coastline_sha, coastline_canonical, _ = _read_json(coastline_path)
     # 本入口專用於使用者已確認的海岸檔，不以相同 feature 數量接受另一份地圖。
     if coastline_sha != "9e2e0ac9bc527aca87d89332cd428fdcb776eefbf94a85dd70f887f729b95fdd":
@@ -243,7 +296,23 @@ def load_plot_inputs(
         or not all(geometry.is_valid and not geometry.is_empty for geometry in land_geometries)
     ):
         raise ValueError("海岸 GeoJSON features 不符合既有 1905 筆有效 land polygons")
-    _validate_coastline_coverage(domain_geometry, land_geometries)
+    # approved 完整保留原 bounds gate；generated 只放寬「外海矩形外緣」限制，仍要求
+    # 真實 land polygon 與 domain 相交，最後再由 geometry release helper 檢查 pilot
+    # summary／marker。這不會讓 formal/full 或 mixed status 取得 generated 路徑。
+    _validate_coastline_coverage(
+        domain_geometry,
+        land_geometries,
+        require_bounds=domain.get("status") == "approved"
+        and open_boundary.get("status") == "approved",
+    )
+    # 幾何發布狀態最後判定，確保 generated 也先通過既有站點、外框與海岸 coverage
+    # gate；此順序不改變 approved 路徑，只把工程先導的額外限制集中在一個 helper。
+    geometry_release_status = _geometry_release_status(
+        summary,
+        domain,
+        open_boundary,
+        preview_marker=preview_marker,
+    )
 
     return {
         "preview_manifest": manifest,
@@ -254,6 +323,7 @@ def load_plot_inputs(
         "open_boundary_manifest": open_boundary,
         "domain_record": domain_record,
         "open_boundary_record": open_record,
+        "geometry_release_status": geometry_release_status,
         "domain_geometry": domain_geometry,
         "open_geometry": open_geometry,
         "land_geometries": land_geometries,
@@ -301,8 +371,8 @@ _VERTICAL_LABELS = {
 }
 """初始水層的中文圖例，與 CSV 層別及固定顏色一一對應。"""
 
-_BAYTRACE_STYLE_VERSION = "1.2.0"
-"""新版圖面呈現契約版本；1.2.0 分開設定回溯上限與資料窗端點文字。"""
+_BAYTRACE_STYLE_VERSION = "1.3.0"
+"""新版圖面呈現契約版本；1.3.0 統一四張圖的 numerical_failure 中文名稱。"""
 
 _BAYTRACE_VERTICAL_COLORS = {
     "near_bed": "#377eb8",
@@ -416,9 +486,9 @@ _BAYTRACE_STATUS_LABELS = {
     "forcing_start": "到達驅動資料起點",
     "data_gap": "資料缺口",
     "max_age": "完成回溯",
-    "numerical_failure": "數值停止",
+    "numerical_failure": "數值失敗停止",
 }
-"""新版停止中文名稱；數值失敗只有在 CSV／summary 雙重核對後才改成取樣失敗停止。"""
+"""新版四張圖共用的停止中文名稱；狀態鍵與圖面文字不推斷更細的失敗根因。"""
 
 _BAYTRACE_STATUS_COLORS = {
     "flow_domain_open_exit": "#4c78a8",
@@ -635,7 +705,12 @@ def _depth_axis_limits_and_ticks(summary: dict[str, Any]) -> tuple[float, list[f
 
 
 def _legend_handles(summary: dict[str, Any], levels: list[str], *, include_land: bool = False) -> list:
-    """總覽與局部圖共用中文水層、起點、停止形狀及同一登錄外框圖例。"""
+    """建立 legacy 總覽與局部圖共用圖例，並保留停止狀態的既有符號語意。
+
+    水層顏色、回溯起點、終點 marker 與登錄開放邊界都只描述輸入資料中的圖例類別；
+    ``numerical_failure`` 的中文名稱固定為「數值失敗停止」，不改寫底層 status、
+    計數或 marker。
+    """
 
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -652,7 +727,7 @@ def _legend_handles(summary: dict[str, Any], levels: list[str], *, include_land:
     for status, label in (
         ("max_age", _max_age_label(summary)),
         ("flow_domain_open_exit", "開放邊界離域"),
-        ("numerical_failure", "數值停止"),
+        ("numerical_failure", "數值失敗停止"),
     ):
         handles.append(
             Line2D(
@@ -1104,13 +1179,14 @@ def _integer_value(value: Any) -> int | None:
 
 
 def _sampling_failure_is_verified(data: dict[str, Any]) -> bool:
-    """只有 CSV 與 summary 的同一批失敗事件一致時，才使用「取樣失敗停止」標籤。
+    """核對 CSV 與 summary 是否足以在診斷說明中記錄本批的特定取樣原因。
 
     每筆 ``numerical_failure`` 必須同時在 ``particles.csv`` 與
     ``summary.json`` 的 ``failure_details``／彙總診斷中標為
     ``invalid_velocity_sample`` 且 ``qc_flags=16``。若任何欄位缺少、數量不符、
-    粒子身分不一致或原因不同，呼叫端就退回較保守的「數值停止」，避免把一個
-    特定 pilot 的診斷原因泛化到所有數值失敗。
+    粒子身分不一致或原因不同，呼叫端就不記錄這項特定原因，避免把單一試跑的診斷
+    泛化到所有數值失敗。此核對只控制補充診斷文字與 manifest 旗標；新版四張圖的
+    ``numerical_failure`` 圖例一律使用「數值失敗停止」。
     """
 
     summary = data["summary"]
@@ -1168,18 +1244,17 @@ def _sampling_failure_is_verified(data: dict[str, Any]) -> bool:
 
 
 def _baytrace_status_labels(data: dict[str, Any]) -> dict[str, str]:
-    """依資料核對結果建立新版顯示名稱，底層 status 值與計數永遠不被改寫。
+    """建立新版四張圖共用的中文名稱，底層 status 值與計數永遠不被改寫。
 
     ``forcing_start`` 的文字由每顆粒子的 age 與本次回溯設定動態產生，讓圖例同時
     交代資料窗端點與本案例的回溯時長；它只反映輸入事件的顯示語意，不會把 status
-    轉成 ``max_age``。
+    轉成 ``max_age``。``numerical_failure`` 一律顯示為「數值失敗停止」；即使來源檔
+    已核對出特定 ``failure_reason``，也只在補充診斷中說明，不改變四圖的共同標籤。
     """
 
     labels = dict(_BAYTRACE_STATUS_LABELS)
     labels["max_age"] = _baytrace_max_age_label(data["summary"])
     labels["forcing_start"] = _forcing_start_label(data)
-    if _sampling_failure_is_verified(data):
-        labels["numerical_failure"] = "取樣失敗停止"
     return labels
 
 
@@ -2040,8 +2115,9 @@ def render_baytrace_terminal(data: dict[str, Any], output_path: str | Path) -> P
 
     圖面回答「各粒子到達哪一種終止狀態？」；``forcing_start`` 是否可寫成完成設定
     時長，另依每顆 particles CSV 的 ``age_seconds`` 與 summary horizon 以保守容差
-    核對。開放邊界離域與已核對的取樣失敗則分別顯示。底層 status、分母及各狀態計數
-    均直接取自輸入；這是 preview 的補充診斷，不是新的來源分析。
+    核對。開放邊界離域與數值失敗依各自的底層狀態分開顯示。底層 status、分母及各
+    狀態計數均直接取自輸入；此圖與水平總覽、局部及垂向圖共用「數值失敗停止」標籤。
+    這是 preview 的補充診斷，不是新的來源分析。
     """
 
     import matplotlib
@@ -2162,6 +2238,25 @@ def _source_snapshot(paths: dict[str, Path]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _geometry_release_note(data: dict[str, Any]) -> list[str]:
+    """建立 generated 幾何的顯式工程限制文字；approved 舊成果維持原 README 形狀。
+
+    ``load_plot_inputs`` 已完成 preview marker、站點拓撲、canonical hash、外框及海岸
+    coverage 驗證；這個 helper 只把發布狀態傳達給閱讀成果的 PI。generated 不等同
+    approved，且只能是單站 pilot 的圖面輸入，因此 README 必須明示工程限定，避免
+    下游把圖面誤解為正式幾何或來源歸因證據。
+    """
+
+    if data.get("geometry_release_status") != "generated":
+        return []
+    return [
+        "幾何發布狀態：`generated`；domain/open 仍是通過結構與綁定檢查的工程輸入，"
+        "尚非 `approved` 正式 geometry。",
+        "本目錄僅供單站 pilot 工程試跑診斷（`engineering_only=true`）；"
+        "不得據此宣稱正式海域代表性、來源機率或因果歸因。",
+    ]
+
+
 def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) -> str:
     """產生 legacy 兩圖成果的繁中圖說、來源事實與重建命令。
 
@@ -2184,6 +2279,7 @@ def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) ->
         "",
         f"Run：`{summary['run_id']}`；站點：{region}／{site_label}／{data['domain_record']['flow_domain_id']}。",
         _subtitle(summary) + "。",
+        *_geometry_release_note(data),
         "",
         "- [區域總覽](horizontal_overview.png)：經緯度、陸地及本次試跑登錄外框。",
         f"- [{panel_count} 個局部面板](horizontal_local.png)：沿用原圖水平面板，"
@@ -2196,9 +2292,9 @@ def _output_readme(data: dict[str, Any], sources: dict, rebuild_command: str) ->
         "線條依回溯時間連接保存位置，未重新取樣。圓點為回溯起點；終點取自 particles CSV。",
         "初始水層固定為近海床（藍）、中下水層（橙）、中上水層（綠）、上水層（紅）。",
         f"停止計數：{horizon_label} {counts['max_age']}、開放邊界離域 {counts['flow_domain_open_exit']}、"
-        f"數值停止 {counts['numerical_failure']}；資料缺口 {counts['data_gap']}、"
+        f"數值失敗停止 {counts['numerical_failure']}；資料缺口 {counts['data_gap']}、"
         f"沉積 {counts['deposited']}。",
-        f"數值停止共 {counts['numerical_failure']} 顆；未刪除或以其他狀態替代。",
+        f"數值失敗停止共 {counts['numerical_failure']} 顆；未刪除或以其他狀態替代。",
         "",
         f"材質代理：`{summary['material_id']}`；正向沉降速度 "
         f"{summary['settling_velocity_mps']} m/s（向下 2 毫米／秒）。",
@@ -2264,7 +2360,8 @@ def _baytrace_readme(
     README 只使用可移植的檔名與 shell 變數，不把個人絕對路徑寫入可追蹤文件。
     圖面意義先於程式細節：先說明三類問題，再列出本次粒子、水層與八狀態、
     缺值與取樣失敗的資料事實。新版深度／停止圖被明確標為專案補充診斷，與 default
-    legacy 的兩張水平圖分開，避免把呈現參照誤寫成數值或資料契約。
+    legacy 的兩張水平圖分開，避免把呈現參照誤寫成數值或資料契約。四張新版圖與
+    停止原因表格共用同一份狀態顯示名稱，讓數值失敗標籤在端點圖例和停止統計圖中一致。
     """
 
     summary = data["summary"]
@@ -2319,6 +2416,7 @@ def _baytrace_readme(
         "也不改變原始 CSV、summary 或舊成果。輸出只包含兩張水平圖、一張垂向診斷圖及一張停止原因圖，"
         "沒有新增直方圖或其他分析。",
         f"圖上共通情境：{_baytrace_metadata(summary)}。",
+        *_geometry_release_note(data),
         *candidate_note_lines,
         "",
         "## 給 PI 的閱讀方式",
@@ -2369,9 +2467,10 @@ def _baytrace_readme(
         "新版端點圖例依資料核對結果區分八種狀態；forcing_start 依每顆 particles.csv 的"
         f" age_seconds 與 horizon_seconds 判定，本批標籤為「{status_labels['forcing_start']}」。"
         f"固定容差為 {_FORCING_START_AGE_TOLERANCE_SECONDS:g} 秒，不能以 300 秒 output interval 取代；"
-        "圖例仍分開列出「最終位置｜"
+        "水平／垂向端點圖例仍分開列出「最終位置｜"
         f"{status_labels['max_age']}」、「最終位置｜{status_labels['flow_domain_open_exit']}」與"
         f"「最終位置｜{status_labels['numerical_failure']}」；只有 numerical_failure 使用紅色 X，"
+        f"四張新版圖與停止統計表共用「{status_labels['numerical_failure']}」名稱；"
         "所有終點均不是已知污染來源。",
         f"forcing_start age 分類計數：{dict(forcing_start_states)}；資料層 status 仍完整"
         "保留為 forcing_start。",
@@ -2442,14 +2541,18 @@ def _baytrace_readme(
     if sampling_verified:
         lines.append(
             f"本次 {len(numerical_rows)} 顆數值失敗只有在 particles.csv 與 summary.json 雙重"
-            "核對後才標為「取樣失敗停止」："
-            f"每筆 failure_reason=invalid_velocity_sample、qc_flags=16，停止 age 為 {numerical_age_text} 秒。"
+            "核對後才確認其保存的 failure_reason 與 qc_flags："
+            f"每筆 failure_reason=invalid_velocity_sample、qc_flags=16，停止 age 為 {numerical_age_text} 秒；"
+            f"四張新版圖仍統一標示「{status_labels['numerical_failure']}」。"
         )
-        lines.append("這只描述本次保存的停步原因，不暗示取樣問題已修復，也不能泛化到其他 numerical_failure。")
+        lines.append(
+            "根因欄位只描述本次保存的停步診斷，不暗示取樣問題已修復，"
+            "也不能泛化到其他 numerical_failure。"
+        )
     else:
         lines.append(
             f"本次 {len(numerical_rows)} 顆數值失敗未通過特定取樣原因的 CSV／summary 雙重"
-            "核對，因此圖面只標「數值停止」，"
+            f"核對，因此四張新版圖統一標示「{status_labels['numerical_failure']}」，"
             "不把 numerical_failure 泛化為取樣失敗。"
         )
     lines += [
@@ -2490,7 +2593,8 @@ def _baytrace_readme(
         "```",
         "",
         "manifest.json 保存 style、style_version、四張 PNG 與 README SHA、原始七檔 before／after SHA、"
-        "script SHA、實際命令、重建命令、幾何綁定及停止標籤核對結果；manifest 本身不做循環雜湊。",
+        "script SHA、實際命令、重建命令、幾何綁定及停止標籤核對結果。"
+        "endpoint_status_labels 與 terminal_status_labels 使用相同名稱；numerical_failure 固定標為「數值失敗停止」。",
         "失敗保留新輸出目錄供診斷，既有輸出、輸入檔、原無底圖 preview 與 legacy 成果均不覆寫。",
     ]
     return "\n".join(lines) + "\n"
@@ -2512,9 +2616,10 @@ def build_coastline_preview(
     manifest 契約；``baytrace`` 只在全新目錄寫入水平區域／局部、垂向高度、停止原因四張 PNG，並
     保存新版 style/version 與來源前後 SHA。兩個分支都先拒絕既有目錄或失效連結，
     再讀取並核對既有輸入；核對失敗均保留新目錄供診斷，不清理、不覆寫輸入或舊成果。
-    新版僅使用 preview 的 CSV／summary，不讀 forcing、run 或重新積分。讀取 preview 前
-    先驗證 completion marker；若 caller 明示 storage gate evidence，缺 marker 或 gate
-    binding 不符即拒絕，避免將逐檔發布中的 final 誤當完整圖面來源。
+    新版僅使用 preview 的 CSV／summary，不讀 forcing、run 或重新積分；manifest 會
+    同時保存端點與停止統計標籤，兩者共用同一對照表。讀取 preview 前先驗證 completion
+    marker；若 caller 明示 storage gate evidence，缺 marker 或 gate binding 不符即拒絕，
+    避免將逐檔發布中的 final 誤當完整圖面來源。
     """
 
     if style not in {"legacy", "baytrace"}:
@@ -2657,6 +2762,10 @@ def build_coastline_preview(
                 for name in ("horizontal_overview.png", "horizontal_local.png", "README.md")
             },
         }
+        if data["geometry_release_status"] == "generated":
+            # generated geometry 只能支援工程先導圖面；以明示欄位阻止下游誤當 approved。
+            manifest["geometry_release_status"] = "generated"
+            manifest["engineering_only"] = True
         if marker_publish:
             manifest["publish_protocol"] = "nfs_completion_marker_v1"
             manifest["completion_marker"] = ".complete"
@@ -2740,7 +2849,9 @@ def build_coastline_preview(
         "observation_count": len(data["observations"]),
         "terminal_counts": summary["terminal_counts"],
         "terminal_counts_by_vertical": terminal_table,
-        "terminal_status_labels": status_labels,
+        # 端點與停止統計都保留可機器讀取的標籤契約，並共用同一張中文對照表。
+        "endpoint_status_labels": dict(status_labels),
+        "terminal_status_labels": dict(status_labels),
         "forcing_start_age_tolerance_seconds": _FORCING_START_AGE_TOLERANCE_SECONDS,
         "forcing_start_age_state_counts": dict(Counter(_forcing_start_age_states(data))),
         "sampling_failure_verified": _sampling_failure_is_verified(data),
@@ -2780,6 +2891,10 @@ def build_coastline_preview(
             for name in output_names
         },
     }
+    if data["geometry_release_status"] == "generated":
+        # BayTrace 圖面沿用同一套視覺樣式；這兩個欄位只記錄 geometry release 邊界。
+        manifest["geometry_release_status"] = "generated"
+        manifest["engineering_only"] = True
     if candidate_regions:
         for key in (
             "receptor_candidate_selection",

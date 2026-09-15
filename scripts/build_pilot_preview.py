@@ -20,7 +20,7 @@ from lagrangian_backtracking.pilot_preview import PilotPreviewError, build_pilot
 def main(argv: Sequence[str] | None = None) -> int:
     """解析明示路徑與容量上限，回傳 0 或 2，不自行建立快取或放寬來源驗證。"""
 
-    parser = argparse.ArgumentParser(description="建立完整 pilot_exact 的獨立工程預覽")
+    parser = argparse.ArgumentParser(description="建立 pilot_exact 或受限 full 單站的獨立工程預覽")
     parser.add_argument("--run", required=True, type=Path)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)

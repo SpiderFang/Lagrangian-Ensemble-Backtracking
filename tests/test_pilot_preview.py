@@ -32,6 +32,7 @@ from lagrangian_backtracking.boundaries import BoundaryGeometry
 from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.models import SampleQC, VelocitySample
 from lagrangian_backtracking.outputs import sha256_file
+from lagrangian_backtracking.pilot_selection import build_full_scenario_selection
 from lagrangian_backtracking.run_control import RunController, load_run_plan, load_run_progress
 from lagrangian_backtracking.run_validation import iter_complete_run_trajectory_shards
 
@@ -130,6 +131,113 @@ def _build(case, **kwargs):
     """將測試專用位置傳入公開入口；不改寫預覽或正式報告的預設科學分母。"""
     root, config, output = case
     return preview.build_pilot_preview(root, config_path=config, output=output, **kwargs)
+
+
+def _single_site_full_records(data, *, identity=None):
+    """從完整 synthetic source 固定取一組單站／單到達／單材質的全受體情境。
+
+    這些記錄只用於驗證 preview selection gate；scenario 的來源欄位、受體座標與動態
+    初始條件仍由既有 fixture 提供，不手造一個看似合法但脫離來源 manifest 的集合。
+    """
+
+    source = tuple(data["inputs"].scenarios)
+    if identity is None:
+        identity = sorted(
+            {(item.study_site_id, item.arrival_time_id, item.material_id) for item in source}
+        )[0]
+    selected = tuple(
+        item
+        for item in source
+        if (item.study_site_id, item.arrival_time_id, item.material_id) == identity
+    )
+    receptors = tuple(
+        item for item in data["inputs"].receptors if item.study_site_id == identity[0]
+    )
+    return selected, receptors, identity
+
+
+def test_full_single_site_preview_records_actual_selection_mode(
+    preview_case, preview_template, monkeypatch
+):
+    """單站 full 全選可建立預覽，summary 與 source provenance 均保留實際 ``full``。"""
+
+    root, _config_path, _output = preview_case
+    data = preview_template["data"]
+    plan = load_run_plan(root)
+    exact_selection = plan["scenario_selection"]
+    identity = (
+        exact_selection["study_site_id"],
+        exact_selection["arrival_time_id"],
+        exact_selection["material_id"],
+    )
+    selected, receptors, _identity = _single_site_full_records(data, identity=identity)
+    plan["scenario_selection"] = build_full_scenario_selection(selected)
+    (root / "run_plan.json").write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    scenario_config = data["config"].scenarios.model_copy(update={"scenario_count": len(selected)})
+    config = data["config"].model_copy(update={"scenarios": scenario_config})
+    selected_inputs = replace(data["inputs"], scenarios=selected, receptors=receptors)
+
+    def fake_static_loader(workspace, **_kwargs):
+        """以已驗證 fixture snapshot 模擬 static loader，不放寬 preview 的後續軌跡 gate。"""
+
+        return preview.runtime.ValidatedRunStaticInputs(
+            plan=load_run_plan(workspace),
+            config=config,
+            scenario_inputs=selected_inputs,
+            geometries=data["geometries"],
+        )
+
+    monkeypatch.setattr(preview.runtime, "load_validated_run_static_inputs", fake_static_loader)
+    manifest = _build(preview_case, max_curves_per_vertical=5)
+    summary = json.loads((_output / "summary.json").read_bytes())
+    assert summary["selection_mode"] == "full"
+    assert summary["source"]["scenario_selection"]["mode"] == "full"
+    assert summary["scenario_count"] == summary["receptor_count"] == len(selected)
+    assert manifest["run_id"] == plan["run_id"]
+
+
+@pytest.mark.parametrize("tamper", ("selected_count", "hash_mismatch", "strata"))
+def test_full_selection_binding_tamper_is_rejected(exact_runtime_data, tamper):
+    """full binding 的數量、ID hash 或抽樣 strata 任一遭竄改都必須 fail closed。"""
+
+    selected, receptors, _identity = _single_site_full_records(exact_runtime_data)
+    binding = build_full_scenario_selection(selected)
+    if tamper == "selected_count":
+        binding["selected_scenario_count"] -= 1
+    elif tamper == "hash_mismatch":
+        binding["source_scenario_ids_sha256"] = "0" * 64
+    else:
+        binding["strata"] = [{"study_site_id": "site", "vertical_id": "near_bed"}]
+    with pytest.raises(preview.PilotPreviewError):
+        preview._validate_full_pilot_selection(binding, selected, receptors)
+
+
+@pytest.mark.parametrize("identity_index", (0, 1, 2))
+def test_full_selection_rejects_multi_site_arrival_or_material(exact_runtime_data, identity_index):
+    """full pilot 不得把多站、多到達或多材質情境混成一個 preview 分母。"""
+
+    selected, receptors, identity = _single_site_full_records(exact_runtime_data)
+    source = tuple(exact_runtime_data["inputs"].scenarios)
+    alternate = next(
+        item
+        for item in source
+        if item.study_site_id != identity[0]
+        or item.arrival_time_id != identity[1]
+        or item.material_id != identity[2]
+    )
+    if identity_index == 0:
+        alternate = replace(alternate, study_site_id=f"{identity[0]}-other")
+    elif identity_index == 1:
+        alternate = replace(alternate, arrival_time_id=f"{identity[1]}-other")
+    else:
+        alternate = replace(alternate, material_id=f"{identity[2]}-other")
+    mixed = selected + (alternate,)
+    binding = build_full_scenario_selection(mixed)
+    with pytest.raises(preview.PilotPreviewError, match="單站|單一到達|單一材質"):
+        preview._validate_full_pilot_selection(binding, mixed, receptors)
 
 
 def _nfs_marker_kwargs(tmp_path):

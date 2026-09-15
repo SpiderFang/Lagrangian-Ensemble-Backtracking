@@ -423,6 +423,221 @@ def _load_inputs(fixture: dict[str, Path]) -> dict[str, Any]:
     )
 
 
+def _configure_generated_geometry_fixture(
+    fixture: dict[str, Path],
+    *,
+    domain_status: str = "generated",
+    open_status: str = "generated",
+    run_kind: str | None = "pilot",
+    selection_mode: str | None = "full",
+    source_selection_mode: str | None = "full",
+    with_marker: bool = True,
+) -> None:
+    """把合成 preview 改成 generated geometry 案例，並同步所有 canonical bindings。
+
+    測試故意重新計算 domain/open canonical hash，避免以未更新的 summary 綁定掩蓋
+    geometry release gate。``with_marker`` 只建立 marker 節點；marker 內容由各測試的
+    stub validator 代表「已通過完整 preview 檢查」的回傳值，真正 marker schema 仍由
+    ``pilot_preview`` 的專責測試覆蓋。此 fixture 不連線 SERVER，也不把合成資料當作
+    approved 科學輸入。
+    """
+
+    domain_path = fixture["domain_path"]
+    domain = json.loads(domain_path.read_text(encoding="utf-8"))
+    domain["status"] = domain_status
+    _write_json(domain_path, domain)
+    open_path = fixture["open_path"]
+    open_boundary = json.loads(open_path.read_text(encoding="utf-8"))
+    open_boundary["status"] = open_status
+    _write_json(open_path, open_boundary)
+
+    summary_path = fixture["preview_dir"] / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if run_kind is None:
+        summary.pop("run_kind", None)
+    else:
+        summary["run_kind"] = run_kind
+    if selection_mode is None:
+        summary.pop("selection_mode", None)
+    else:
+        summary["selection_mode"] = selection_mode
+    if source_selection_mode is None:
+        summary.pop("source", None)
+    else:
+        summary["source"] = {"scenario_selection": {"mode": source_selection_mode}}
+    summary["projection"]["geometry_canonical_hashes"] = {
+        "domain": _canonical_hash(domain),
+        "open_boundary": _canonical_hash(open_boundary),
+    }
+    _refresh_summary_contract(fixture["preview_dir"], summary)
+    marker = fixture["preview_dir"] / ".complete"
+    if with_marker:
+        marker.write_text("synthetic-complete-marker", encoding="utf-8")
+    elif marker.exists():
+        marker.unlink()
+
+
+def _stub_validated_preview_marker(
+    preview_path: str | Path,
+    *,
+    storage_gate_evidence: str | Path | None = None,
+) -> dict[str, Any]:
+    """在 generated geometry 單元測試中模擬已通過完整 marker validator 的結果。"""
+
+    assert (Path(preview_path) / ".complete").is_file()
+    return {"publish_protocol": "nfs_completion_marker_v1"}
+
+
+def test_generated_geometry_is_allowed_only_for_completed_pilot_and_is_marked_engineering(
+    synthetic_inputs: dict[str, Path],
+    tmp_path: Path,
+    writable_mpl_config: None,
+    allow_synthetic_coastline_sha: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """確認 generated geometry 可供已完成 pilot 圖面，且 manifest／README 明示工程限定。"""
+
+    _configure_generated_geometry_fixture(synthetic_inputs)
+    monkeypatch.setattr(_TARGET, "validate_published_preview", _stub_validated_preview_marker)
+
+    data = _load_inputs(synthetic_inputs)
+    assert data["geometry_release_status"] == "generated"
+
+    output = tmp_path / "generated-baytrace"
+    manifest = _TARGET.build_coastline_preview(
+        synthetic_inputs["preview_dir"],
+        synthetic_inputs["domain_path"],
+        synthetic_inputs["open_path"],
+        synthetic_inputs["coastline_path"],
+        output,
+        style="baytrace",
+    )
+    assert manifest["geometry_release_status"] == "generated"
+    assert manifest["engineering_only"] is True
+    readme = (output / "README.md").read_text(encoding="utf-8")
+    assert "幾何發布狀態：`generated`" in readme
+    assert "engineering_only=true" in readme
+    assert "尚非 `approved` 正式 geometry" in readme
+
+
+def test_generated_geometry_allows_intersecting_ocean_margin_outside_coastline_bounds(
+    synthetic_inputs: dict[str, Path],
+    allow_synthetic_coastline_sha: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generated pilot 可含較大外海矩形，但仍須有 land polygon 真實相交。"""
+
+    _configure_generated_geometry_fixture(synthetic_inputs)
+    monkeypatch.setattr(_TARGET, "validate_published_preview", _stub_validated_preview_marker)
+    # 將合成 domain 向外海擴大，使 coastline bounds 不再包住整個矩形；左側仍保留
+    # 合成 land polygon，測試 generated 專用的「實際相交」而非 bbox gate。
+    expanded = Polygon(
+        [(119.8, 24.5), (120.4, 24.5), (120.4, 25.2), (119.8, 25.2), (119.8, 24.5)]
+    )
+    domain_path = synthetic_inputs["domain_path"]
+    domain = json.loads(domain_path.read_text(encoding="utf-8"))
+    domain["records"][0]["geometry"] = mapping(expanded)
+    _write_json(domain_path, domain)
+    open_path = synthetic_inputs["open_path"]
+    open_boundary = json.loads(open_path.read_text(encoding="utf-8"))
+    open_boundary["records"][0]["geometry"] = mapping(LineString(expanded.exterior.coords))
+    _write_json(open_path, open_boundary)
+    summary_path = synthetic_inputs["preview_dir"] / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["projection"]["geometry_canonical_hashes"] = {
+        "domain": _canonical_hash(domain),
+        "open_boundary": _canonical_hash(open_boundary),
+    }
+    _refresh_summary_contract(synthetic_inputs["preview_dir"], summary)
+
+    data = _load_inputs(synthetic_inputs)
+    assert data["geometry_release_status"] == "generated"
+
+
+def test_generated_geometry_rejects_completely_disjoint_coastline(
+    synthetic_inputs: dict[str, Path],
+    allow_synthetic_coastline_sha: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generated pilot 即使跳過外海 bounds，也拒絕與 coastline 完全不相交的 domain。"""
+
+    _configure_generated_geometry_fixture(synthetic_inputs)
+    monkeypatch.setattr(_TARGET, "validate_published_preview", _stub_validated_preview_marker)
+    disjoint = Polygon(
+        [(130.0, 30.0), (130.2, 30.0), (130.2, 30.2), (130.0, 30.2), (130.0, 30.0)]
+    )
+    domain_path = synthetic_inputs["domain_path"]
+    domain = json.loads(domain_path.read_text(encoding="utf-8"))
+    domain["records"][0]["geometry"] = mapping(disjoint)
+    _write_json(domain_path, domain)
+    open_path = synthetic_inputs["open_path"]
+    open_boundary = json.loads(open_path.read_text(encoding="utf-8"))
+    open_boundary["records"][0]["geometry"] = mapping(LineString(disjoint.exterior.coords))
+    _write_json(open_path, open_boundary)
+    summary_path = synthetic_inputs["preview_dir"] / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["projection"]["geometry_canonical_hashes"] = {
+        "domain": _canonical_hash(domain),
+        "open_boundary": _canonical_hash(open_boundary),
+    }
+    _refresh_summary_contract(synthetic_inputs["preview_dir"], summary)
+
+    with pytest.raises(ValueError, match="land feature 與站點 domain 相交"):
+        _load_inputs(synthetic_inputs)
+
+
+@pytest.mark.parametrize(
+    ("domain_status", "open_status", "run_kind", "selection_mode", "source_selection_mode"),
+    (
+        ("approved", "generated", "pilot", "full", "full"),
+        ("generated", "generated", "formal", "full", "full"),
+        ("generated", "generated", "pilot", "unsupported", "unsupported"),
+        ("generated", "generated", "pilot", "full", "pilot_exact"),
+    ),
+)
+def test_generated_geometry_gate_rejects_mixed_or_nonpilot_summary(
+    synthetic_inputs: dict[str, Path],
+    allow_synthetic_coastline_sha: None,
+    monkeypatch: pytest.MonkeyPatch,
+    domain_status: str,
+    open_status: str,
+    run_kind: str,
+    selection_mode: str,
+    source_selection_mode: str,
+) -> None:
+    """確認 mixed status、formal/full、未知 mode 及 source mode 不一致均 fail closed。"""
+
+    _configure_generated_geometry_fixture(
+        synthetic_inputs,
+        domain_status=domain_status,
+        open_status=open_status,
+        run_kind=run_kind,
+        selection_mode=selection_mode,
+        source_selection_mode=source_selection_mode,
+    )
+    monkeypatch.setattr(_TARGET, "validate_published_preview", _stub_validated_preview_marker)
+
+    with pytest.raises(ValueError, match="geometry release status|generated geometry|scenario selection"):
+        _load_inputs(synthetic_inputs)
+
+
+def test_generated_geometry_requires_summary_fields_and_complete_marker(
+    synthetic_inputs: dict[str, Path],
+    allow_synthetic_coastline_sha: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """確認 generated 缺少 pilot summary 欄位或 preview marker 時不會放行。"""
+
+    _configure_generated_geometry_fixture(synthetic_inputs, run_kind=None, with_marker=False)
+    with pytest.raises(ValueError, match="marker"):
+        _load_inputs(synthetic_inputs)
+
+    _configure_generated_geometry_fixture(synthetic_inputs, run_kind=None, with_marker=True)
+    monkeypatch.setattr(_TARGET, "validate_published_preview", _stub_validated_preview_marker)
+    with pytest.raises(ValueError, match="run_kind=pilot"):
+        _load_inputs(synthetic_inputs)
+
+
 def _rewrite_particle_statuses(
     preview_dir: Path,
     statuses: list[str],
@@ -501,6 +716,7 @@ def test_load_plot_inputs_happy_path_preserves_counts_ids_and_denominators(
     """確認 happy path 保留 20 顆粒子、203 筆觀測及五面板四層分母語意。"""
 
     data = _load_inputs(synthetic_inputs)
+    assert data["geometry_release_status"] == "approved"
     expected_ids = {
         f"B-H{panel_number}-{vertical_id}" for panel_number in range(1, 6) for vertical_id in _VERTICAL_LEVELS
     }
@@ -839,7 +1055,17 @@ def test_baytrace_build_emits_four_pngs_readme_and_rebuild_contract(
     }
     assert {path.name for path in output.iterdir()} == expected_files
     assert manifest["style"] == "baytrace"
+    assert manifest["style_version"] == "1.3.0"
     assert manifest["style_version"] == _TARGET._BAYTRACE_STYLE_VERSION
+    assert manifest["endpoint_status_labels"] == manifest["terminal_status_labels"]
+    assert manifest["endpoint_status_labels"]["numerical_failure"] == "數值失敗停止"
+    assert manifest["terminal_status_labels"]["numerical_failure"] == "數值失敗停止"
+    assert all(
+        old_label not in label
+        for labels in (manifest["endpoint_status_labels"], manifest["terminal_status_labels"])
+        for label in labels.values()
+        for old_label in ("數值停止", "取樣失敗停止")
+    )
     assert manifest["particle_count"] == 20
     assert manifest["observation_count"] == 203
     assert manifest["terminal_counts"]["max_age"] == 9
@@ -1033,7 +1259,14 @@ def test_legacy_build_keeps_two_png_contract_and_no_baytrace_style(
     writable_mpl_config: None,
     allow_synthetic_coastline_sha: None,
 ) -> None:
-    """確認 default legacy 仍只有原兩張水平圖與舊 manifest，不混入新版診斷圖。"""
+    """確認 default legacy 維持兩張圖契約，且數值失敗圖例名稱與新版一致。"""
+
+    data = _load_inputs(synthetic_inputs)
+    handles = _TARGET._legend_handles(data["summary"], list(data["summary"]["vertical_order"]))
+    labels = [handle.get_label() for handle in handles]
+    assert labels.count("數值失敗停止") == 1
+    assert all("數值停止" not in label for label in labels)
+    assert all("取樣失敗停止" not in label for label in labels)
 
     output = tmp_path / "legacy-style"
     manifest = _TARGET.build_coastline_preview(
@@ -1079,8 +1312,10 @@ def test_baytrace_artist_markers_and_labels_keep_initial_final_semantics(
         "初始位置（回溯起點）",
         "最終位置｜離開計算範圍",
         "最終位置｜到達設定回溯時間上限（1小時）",
-        "最終位置｜取樣失敗停止",
+        "最終位置｜數值失敗停止",
     ]
+    assert all("數值停止" not in handle.get_label() for handle in handles)
+    assert all("取樣失敗停止" not in handle.get_label() for handle in handles)
     assert all(handle.get_color() == _TARGET._BAYTRACE_FINAL_COLOR for handle in handles[1:])
 
     original_plot = Axes.plot
@@ -1148,7 +1383,7 @@ def test_forcing_start_near_horizon_uses_data_window_label_and_full_time_summary
     )
     forcing_handle = next(handle for handle in handles if "資料時間窗起點" in handle.get_label())
     max_age_handle = next(handle for handle in handles if "設定回溯時間上限" in handle.get_label())
-    numerical_handle = next(handle for handle in handles if "數值停止" in handle.get_label())
+    numerical_handle = next(handle for handle in handles if "數值失敗停止" in handle.get_label())
     assert forcing_handle.get_marker() == "D"
     assert forcing_handle.get_color() == _TARGET._BAYTRACE_FORCING_START_COLOR
     assert max_age_handle.get_marker() == "^"
@@ -1229,6 +1464,62 @@ def test_baytrace_terminal_markers_keep_all_registered_states_distinct(
         "D",
         _TARGET._BAYTRACE_FORCING_START_COLOR,
     )
+
+
+def test_baytrace_endpoint_and_terminal_legends_share_canonical_numerical_failure_label(
+    synthetic_inputs: dict[str, Path],
+    tmp_path: Path,
+    writable_mpl_config: None,
+    allow_synthetic_coastline_sha: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """確認端點圖例與停止統計圖共用 canonical 名稱，底層 numerical_failure 不被改寫。
+
+    合成資料刻意保留三顆已通過 CSV／summary 雙重核對的 numerical_failure，讓測試能
+    確認具體取樣診斷核對通過時，端點 helper 與 ``terminal_counts.png`` 的實際
+    Matplotlib legend 仍一致顯示「數值失敗停止」。測試只收集標籤 handles，不改動
+    資料、狀態計數、顏色或繪圖版面。
+    """
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt  # noqa: F401  # 先完成 pyplot 的 Axes API 綁定，再攔截 legend
+    from matplotlib.axes import Axes
+
+    data = _load_inputs(synthetic_inputs)
+    endpoint_labels = _TARGET._baytrace_status_labels(data)
+    assert _TARGET._sampling_failure_is_verified(data)
+    assert endpoint_labels["numerical_failure"] == "數值失敗停止"
+    endpoint_handles = _TARGET._baytrace_endpoint_handles(
+        endpoint_labels,
+        include_boundary=False,
+        statuses={"max_age", "flow_domain_open_exit", "numerical_failure"},
+    )
+    endpoint_legend_labels = [handle.get_label() for handle in endpoint_handles]
+    assert "最終位置｜數值失敗停止" in endpoint_legend_labels
+    assert all("數值停止" not in label for label in endpoint_legend_labels)
+    assert all("取樣失敗停止" not in label for label in endpoint_legend_labels)
+
+    original_legend = Axes.legend
+    legend_labels: list[str] = []
+
+    def traced_legend(self, *args: Any, **kwargs: Any):
+        """收集停止圖實際傳給 Matplotlib 的 handles，再交回原 legend renderer。"""
+
+        handles = kwargs.get("handles")
+        if handles is None and args:
+            handles = args[0]
+        if handles:
+            legend_labels.extend(handle.get_label() for handle in handles)
+        return original_legend(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "legend", traced_legend)
+    output = tmp_path / "terminal-label.png"
+    assert _TARGET.render_baytrace_terminal(data, output) == output
+    assert "數值失敗停止" in legend_labels
+    assert "數值停止" not in legend_labels
+    assert "取樣失敗停止" not in legend_labels
 
 
 def test_baytrace_depth_keeps_missing_eta_and_bed_blank(

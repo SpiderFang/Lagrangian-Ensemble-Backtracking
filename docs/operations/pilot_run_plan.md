@@ -124,7 +124,10 @@ uv run python scripts/build_pilot_preview.py \
 粒子／觀測預設上限為 2,000／250,000；操作端至多提高至 10,000／2,000,000。
 完整靜態來源仍由 `runtime.load_validated_run_static_inputs(expected_run_kind='pilot',
 require_complete=True)` 驗證，再由 `iter_complete_run_trajectory_shards` 逐片讀取及
-重新核對身分／計數。僅接受單站、同到達、同材質、`pilot_exact` 及軌跡 schema `2.0.0`；
+重新核對身分／計數。預覽接受既有單站、同到達、同材質的 `pilot_exact`；另接受
+`run_kind=pilot` 的 `full`，但僅限 source／selected 情境數與 ID hash 完全相等、沒有
+sampling strata、所有情境只屬一個站點×到達×材質，且本站每個受體恰有一筆。兩種模式都
+受粒子／觀測容量上限與 M 分母核對；generic multi-site/full formal run 不在此預覽範圍。
 legacy 因環境欄位不可用而拒絕此預覽，不改一般讀取器的舊版相容性。
 
 輸出固定為三張 PNG、`particles.csv`、`observations.csv`、`summary.json`、繁中
@@ -173,7 +176,13 @@ forcing 內容。通過只表示矩陣可比較；四區第一次實測目前仍
 `scripts/build_pilot_coastline_preview.py` 是已驗收 B 區 r2（20 顆粒子、203 筆模型
 保存紀錄）的專用離線補圖入口。它只讀原 preview 清單、summary、兩份 CSV，以及
 明示的 domain/open-boundary 清單與使用者已確認的海岸 GeoJSON；不讀驅動陣列或重跑模擬。
-原無底圖版及 `pilot_preview` 契約保持不變。
+原無底圖版及 `pilot_preview` 契約保持不變。既有 `status=approved` geometry 行為不變；
+若兩份 geometry 都是 `status=generated`，只准搭配已完整驗證且有 `.complete` 的
+`run_kind=pilot` summary，且 `selection_mode` 必須是 `pilot_exact` 或受限 `full`，
+canonical hash、站點／region／flow owner 與 open 外框仍須全部相符。此 generated 路徑
+只產生明示 `geometry_release_status=generated`、`engineering_only=true` 的工程圖面，
+不可冒充 approved 正式 geometry 或來源歸因證據；mixed status、formal/full、缺欄及 hash
+不符均 fail closed。
 
 預設 `legacy` 保留原兩張水平 PNG 與舊 manifest 契約；指定 `--style baytrace` 才建立
 新版四張 PNG：`horizontal_overview.png`、`horizontal_local.png`、`depth_age.png`、

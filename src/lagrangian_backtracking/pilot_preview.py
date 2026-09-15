@@ -1,9 +1,11 @@
-"""由已完成且來源綁定的精確先導產生獨立工程預覽，不建立正式 report-v1。
+"""由已完成且來源綁定的精確或受限全選先導產生獨立工程預覽，不建立正式 report-v1。
 
 只讀既有 trajectory schema 2／3 的軌跡、環境、速度與事件，不開啟海流／波浪陣列、不重新積分。全部成員
 皆進入停止統計及 CSV；曲線太多時依明示的穩定成員順序限量並揭露分母。公尺制位置、
 UTC 奈秒及回溯秒數原樣保留，缺環境或診斷不補零。來源與產品的 SHA-256 可供重建核對。
-合成測試只驗工程，預覽不是收斂、觀測驗證、絕對來源機率或來源歸因證據。
+``pilot_exact`` 保留既有單站精確繫結；``full`` 僅接受 pilot run 的單站／單到達／單材質
+全情境全選且容量受限，不能放行 generic multi-site/full formal run。合成測試只驗工程，
+預覽不是收斂、觀測驗證、絕對來源機率或來源歸因證據。
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import numpy as np
 from . import runtime
 from .models import ParticleStatus
 from .outputs import TRAJECTORY_SHARD_SCHEMA_VERSION, sha256_file
+from .pilot_selection import scenario_ids_sha256
 from .report_release import (
     _atomic_exclusive_directory_rename,
     _fsync_directory,
@@ -621,12 +624,22 @@ def _trajectory_metadata(root: Path, plan: Mapping) -> dict:
 
 
 def _early_reject(root: Path, *, max_particles: int, max_observations: int) -> tuple[dict, dict]:
-    """在通用驗證器讀軌跡前拒絕非精確先導或超量輸入，不產生驗收成功結論。"""
+    """在昂貴軌跡驗證前拒絕不合格模式或超量輸入。
+
+    預覽只允許既有 ``pilot_exact``，以及「單站、全情境全選」的 ``full`` pilot。
+    這個早期 gate 只讀 immutable 計畫與各分片的小型 manifest；它不能證明情境內容或
+    受體拓撲正確，後續仍由 static loader 與 ``_collect`` 重新驗證。計畫格式若已損壞，
+    也在此轉成不含來源路徑的預覽拒絕，避免 CLI 把底層例外當成成功前的可繞過訊號。
+    """
 
     _small_json(root / "run_plan.json")
-    plan = load_run_plan(root)
-    if plan["run_kind"] != "pilot" or plan.get("scenario_selection", {}).get("mode") != "pilot_exact":
-        raise PilotPreviewError("preview 只接受 pilot_exact 的 pilot run")
+    try:
+        plan = load_run_plan(root)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise PilotPreviewError("preview run plan 無法通過 immutable selection 驗證") from None
+    selection = plan.get("scenario_selection", {})
+    if plan["run_kind"] != "pilot" or selection.get("mode") not in {"pilot_exact", "full"}:
+        raise PilotPreviewError("preview 只接受 pilot_exact 或受限 full 的 pilot run")
     if plan["particle_count"] > max_particles:
         raise PilotPreviewError("preview 粒子數超過上限")
     shards = _trajectory_metadata(root, plan)
@@ -635,6 +648,81 @@ def _early_reject(root: Path, *, max_particles: int, max_observations: int) -> t
     if sum(row["observation_count"] for row in shards.values()) > max_observations:
         raise PilotPreviewError("preview 觀測數超過上限")
     return plan, shards
+
+
+def _validate_full_pilot_selection(
+    selection: Mapping[str, Any], scenarios: tuple, receptors: tuple,
+) -> tuple[str, str, str]:
+    """驗證 ``run_kind=pilot`` 的全情境單站選擇，回傳站點、到達及材質識別碼。
+
+    ``full`` 在一般 runtime 中也可代表多站正式情境；預覽因此不能只依 selection mode
+    放行。這裡要求 immutable binding 的 source／selected 數量與 order-independent scenario
+    ID 雜湊完全相等、沒有任何分層抽樣欄位，並且 loader 已驗證的情境只屬於一個
+    ``study_site_id × arrival_time_id × material_id``。最後逐一比對該站受體 ID，確保每個
+    受體恰有一筆情境；這個限制將輸出分母鎖在單站工程試跑，不能把 generic full run
+    擴張成預覽，也不把回溯停止位置解讀為污染源。容量上限已在 ``_early_reject`` 及
+    ``_collect`` 的宣告／實際觀測兩階段檢查，這裡不以縮減資料繞過容量 gate。
+    """
+
+    required_keys = {
+        "schema_version",
+        "mode",
+        "ranking_policy",
+        "stratum_fields",
+        "samples_per_stratum",
+        "source_scenario_count",
+        "selected_scenario_count",
+        "source_scenario_ids_sha256",
+        "selected_scenario_ids_sha256",
+        "strata",
+    }
+    if set(selection) != required_keys or selection.get("mode") != "full":
+        raise PilotPreviewError("full pilot scenario_selection 欄位或 mode 不符")
+    if (
+        selection.get("stratum_fields") not in ([], ())
+        or selection.get("samples_per_stratum") is not None
+        or selection.get("strata") not in ([], ())
+    ):
+        raise PilotPreviewError("full pilot 不得帶 sampling strata")
+    source_count = selection.get("source_scenario_count")
+    selected_count = selection.get("selected_scenario_count")
+    if (
+        type(source_count) is not int
+        or type(selected_count) is not int
+        or source_count < 1
+        or selected_count < 1
+        or not (source_count == selected_count == len(scenarios))
+    ):
+        raise PilotPreviewError("full pilot source／selected 情境數量不一致")
+    source_hash = selection.get("source_scenario_ids_sha256")
+    selected_hash = selection.get("selected_scenario_ids_sha256")
+    if (
+        not isinstance(source_hash, str)
+        or not isinstance(selected_hash, str)
+        or source_hash != selected_hash
+        or scenario_ids_sha256(scenarios) != selected_hash
+    ):
+        raise PilotPreviewError("full pilot source／selected scenario ID hash 不一致")
+
+    identities = {
+        (item.study_site_id, item.arrival_time_id, item.material_id)
+        for item in scenarios
+    }
+    if len(identities) != 1:
+        raise PilotPreviewError("full pilot 必須是單站、單一到達時間及單一材質")
+    site, arrival_id, material = next(iter(identities))
+    site_receptors = [item for item in receptors if item.study_site_id == site]
+    receptor_ids = [item.receptor_id for item in site_receptors]
+    scenario_receptor_ids = [item.receptor_id for item in scenarios]
+    if (
+        not site_receptors
+        or len(set(receptor_ids)) != len(receptor_ids)
+        or len(set(scenario_receptor_ids)) != len(scenario_receptor_ids)
+        or set(scenario_receptor_ids) != set(receptor_ids)
+        or len(scenario_receptor_ids) != len(receptor_ids)
+    ):
+        raise PilotPreviewError("full pilot 必須完整且恰有一次涵蓋本站受體")
+    return site, arrival_id, material
 
 
 def _source_snapshot(root: Path, config: Path, plan: Mapping) -> tuple[dict, dict]:
@@ -709,16 +797,28 @@ def _collect(
     plan = static.plan
     scenarios = static.scenario_inputs.scenarios
     selection = plan["scenario_selection"]
-    if plan["run_kind"] != "pilot" or selection["mode"] != "pilot_exact":
-        raise PilotPreviewError("preview 只接受 pilot_exact 的 pilot run")
-    identities = {(item.study_site_id, item.arrival_time_id, item.material_id) for item in scenarios}
-    if len(identities) != 1 or next(iter(identities)) != (
-        selection["study_site_id"],
-        selection["arrival_time_id"],
-        selection["material_id"],
-    ):
-        raise PilotPreviewError("preview 必須是單站／同到達／同材質並吻合選擇繫結")
-    site, arrival_id, material = next(iter(identities))
+    selection_mode = selection.get("mode")
+    if plan["run_kind"] != "pilot" or selection_mode not in {"pilot_exact", "full"}:
+        raise PilotPreviewError("preview 只接受 pilot_exact 或受限 full 的 pilot run")
+    if selection_mode == "full":
+        # full 不保存單站識別碼，必須以目前已通過 runtime 的情境／受體重新建立站點
+        # 拓撲；helper 也重新比對 count/hash，避免只信任 run plan 的宣告欄位。
+        site, arrival_id, material = _validate_full_pilot_selection(
+            selection,
+            tuple(scenarios),
+            tuple(static.scenario_inputs.receptors),
+        )
+    else:
+        # pilot_exact 延續既有 2.0.0 binding；這個分支刻意保留原有三重識別碼與受體
+        # 集合核對，確保擴充 full 不改變既有精確先導的驗證範圍。
+        identities = {(item.study_site_id, item.arrival_time_id, item.material_id) for item in scenarios}
+        if len(identities) != 1 or next(iter(identities)) != (
+            selection["study_site_id"],
+            selection["arrival_time_id"],
+            selection["material_id"],
+        ):
+            raise PilotPreviewError("preview 必須是單站／同到達／同材質並吻合選擇繫結")
+        site, arrival_id, material = next(iter(identities))
     receptors = {
         item.receptor_id: item for item in static.scenario_inputs.receptors if item.study_site_id == site
     }
@@ -886,7 +986,7 @@ def _collect(
         "schema_version": PILOT_PREVIEW_SCHEMA_VERSION,
         "run_id": plan["run_id"],
         "run_kind": "pilot",
-        "selection_mode": "pilot_exact",
+        "selection_mode": selection_mode,
         "study_site_id": site,
         "arrival_time_id": arrival_id,
         "arrival_time_utc_ns": scenarios[0].arrival_time_utc_ns,
@@ -1263,8 +1363,9 @@ def build_pilot_preview(
     """以已驗證完整先導建立新目錄，回傳無私有路徑的來源／輸出校驗清單。
 
     先只讀小型計畫／分片清單做容量與模式的早期拒絕；通過不代表來源已驗收。隨後必須
-    完整驗證靜態來源（pilot、require_complete=True），再串流 schema 2／3 結果，三 ID 與
-    全部受體／M 必須一致。容量上限在通用驗證器讀觀測前以清單宣告數量檢查，
+    完整驗證靜態來源（pilot、require_complete=True），再串流 schema 2／3 結果；
+    ``pilot_exact`` 的三 ID 或受限 ``full`` 的單站／單到達／單材質拓撲，均須與全部
+    受體／M 一致。容量上限在通用驗證器讀觀測前以清單宣告數量檢查，
     讀回後再驗實數；單次最多一個分片加有界表格，不載入 forcing。MPLCONFIGDIR 必須
     由 caller 明示且已存在；字型可指定，無合格中文字碼時圖用英文，繁中說明仍保留。
 
@@ -1306,8 +1407,9 @@ def build_pilot_preview(
             expected_run_kind="pilot",
             require_complete=True,
         )
-        if static.plan["run_kind"] != "pilot" or static.plan["scenario_selection"]["mode"] != "pilot_exact":
-            raise PilotPreviewError("preview 只接受 pilot_exact 的 pilot run")
+        selection_mode = static.plan["scenario_selection"].get("mode")
+        if static.plan["run_kind"] != "pilot" or selection_mode not in {"pilot_exact", "full"}:
+            raise PilotPreviewError("preview 只接受 pilot_exact 或受限 full 的 pilot run")
         if destination.exists() or destination.is_symlink():
             raise FileExistsError("preview 目的已存在")
         if destination.is_relative_to(root) or root.is_relative_to(destination):
