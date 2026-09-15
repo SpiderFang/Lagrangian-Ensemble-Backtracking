@@ -17,7 +17,7 @@
 | 跨區 pilot 矩陣 | `pilot-matrix-validate` 只讀各 run 的 `run_plan.json` 與 `normalized_config.json`，比較 M／seed、experiment、積分／邊界／Stokes、材質、scalar snapshot 與 deployment provenance；明示區域 identity、輸入／幾何 binding 與 Kh／Kz／Smagorinsky cap 可不同 | 只證明工程設定是否可比較，不驗 trajectory／forcing 內容、不判定 run 完成，也不構成正式科學 evidence |
 | 聚合與報告基礎 | aggregate／report statistics、trajectory stream、source binding、release I/O、共同 staging／格式／checksum 基礎 | caller 必須提供已驗證 products；不能由 typed facade 或 synthetic release 推導科學完成 |
 
-## A 區本期政策與尚缺的實測門檻
+## A 區本期政策與正式空間支援契約
 
 本期 A 區不南向擴域，現行 `northeast_taiwan_common_cache_v3` bbox 為
 `[121.306315, 122.793685, 24.600844, 25.499156]`。本期 geometry／design 身分採
@@ -28,11 +28,15 @@ core、20 km local domain，共用原 outer stop。原 material v2 non-rising �
 產製目標；不新增 15／23 km。B–D 原 `expanded_domain` 敏感度仍保留，與 A 政策分開
 驗證；legacy `formal_domain_policy=expanded_domain_v1` 僅供舊設定相容讀取。
 
-新政策可供 strict preparation，但尚未解除 formal gate。仍缺現行 v3 實際 OCM native、OCM
-surface 與 NWW analysis 的共同 forcing 邊界餘裕證據（至少兩個共同有效格點），以及完整
-field、mask、UTC、arrivals 與正式輸入 manifest 驗收；目前 existing gate 只做 receptor
-native 篩選，不是 20 km 邊界的三 forcing／兩共同格點驗證。正式 gate 未通過前不稱 20 km
-已被科學證實足夠，也不以準備工作節省承諾端到端加速或日期提升。
+正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`
+與 `formal_release_domain_status=no_expansion_runtime_stage_fail_closed`，沿用既有 A 區工程
+試跑的核心做法，但不沿用其資料證據：固定使用 v3 outer domain，不擴張；受體先通過 OCM
+native 篩選，軌跡執行時則在每個 RK4 stage 對實際
+位置、深度與世界協調時間（UTC）嚴格檢查 OCM／NWW3 forcing。任何無效支援均立即停止並
+保留 `data_gap` 或既有對應狀態，禁止零值、最近值或未登錄外插。既有 24 小時、20 情境
+產物只是 DEMO，不是 30 天正式證據。正式輸入仍須重新通過完整 field、mask、UTC、五站各
+50 個 arrivals、100 個 receptors、5,000 個初始配對、來源雜湊與 30 天 gap-safe 驗收；
+這項 runtime 空間政策不能替代時間涵蓋或正式母體驗證。
 
 ## ABCD 第一次工程試跑稽核
 

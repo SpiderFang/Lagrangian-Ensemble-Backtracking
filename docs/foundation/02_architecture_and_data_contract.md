@@ -126,15 +126,24 @@ receptor core 與 20 km local domain，共用原 outer stop，並與
 `design_baseline_v3_non_rising_a_v3_local20_20260909` 的 geometry/design identity 綁定。此裁決不新增 15／23 km，
 本期也不執行 A 區 25／35 km 敏感度；B–D 原登錄的 `expanded_domain` 敏感度仍保留。
 
-A 區目前可供 strict input preparation，但在下列證據完成前仍不能標成 formal ready：
+A 區正式空間支援採
+`runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`：不要求把三套
+forcing 預先裁成共同兩格邊界，也不以此理由擴大 v3。OCM surface 仍須在建置階段支援完整
+arrival 母體；OCM native 與 NWW analysis 則在每個四階 Runge-Kutta 法（RK4）階段依實際
+位置、深度、世界協調時間（UTC）、有限值與遮罩逐次驗證。任一必要 forcing 無支援時，粒子
+立即以 `data_gap`／對應品質狀態停止，不得補零、取最近值、跨月外插或退回 current-only。
 
-- OCM native、OCM surface 與 NWW analysis 必須對現行 20 km local boundary 提供實際
-  共同 forcing 邊界餘裕，至少有兩個共同有效格點；現行 receptor-native gate 只做受體
-  篩選，不等同三產品共同邊界驗證。
+A 區只有在下列契約全部成立時，才可標成 formal ready：
+
+- domain 的 `formal_release_domain_status` 必須是
+  `no_expansion_runtime_stage_fail_closed`，並同時要求 `boundaries.stop_at_data_gap=true`
+  與 `flow_domain_open_boundary=stop_at_first_crossing`。site 層的
+  `minimum_flow_domain_margin_local_grid_scales=2` 只用於受體候選的局部幾何安全篩選，
+  不是 OCM native／surface／NWW analysis 的共同邊界證據。
 - `flow_domain_id` 保留現行 `northeast_taiwan_common_cache_v3`；geometry identity、
   config／design identity、manifest、shard 與 input hash 必須依本期政策重新建立。舊
   25 km geometry 與舊 expanded 產物不能直接沿用。現有三類 v3 產品目錄或 metadata
-  齊全也不等於已完成 schema、UTC、field、mask、共同邊界與 arrivals 驗收。
+  齊全也不等於已完成 schema、UTC、field、mask、逐階段支援與 arrivals 驗收。
 - 歷史候選 `northeast_taiwan_common_cache_v4_lbt_south_expanded` 及其南界
   `24.480000°N` 只保留為延期／歷史依據，不是本期 A 產製目標；legacy
   `formal_domain_policy=expanded_domain_v1` 僅作舊設定相容讀取，不可替代本期 A 政策的

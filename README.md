@@ -28,7 +28,7 @@
 
 | 研究站點 | 流場區域 | 說明 |
 |---|---|---|
-| 貢寮 | A | 使用 `northeast_taiwan_common_cache_v3` 與 `formal_domain_policy=v3_local20km_20260909_v1`；12.5 km 受體核心、20 km 局部區域，與龜山島共用最外層停止邊界，正式驗收尚待共同邊界餘裕證據 |
+| 貢寮 | A | 使用 `northeast_taiwan_common_cache_v3` 與 `formal_domain_policy=v3_local20km_20260909_v1`；12.5 km 受體核心、20 km 局部區域，與龜山島共用最外層停止邊界；正式運算沿用不擴張的逐階段資料支援嚴格檢查 |
 | 龜山島西側 | A | 使用同一 v3 A 區海流資料與範圍規範；12.5 km 受體核心、20 km 局部區域，局部區域、受體與統計維持獨立 |
 | 新竹外海 | B | 使用 `hsinchu_cache_v3` 流場區域；local domain 仍等於 flow domain，水平受體候選限於 `[120.45, 24.75]` 半徑 12.5 km 核心；24 小時展示 pilot 入口與參數見[紀錄](docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md) |
 | 後灣海生館 | C | 使用 C 流場區域 |
@@ -38,7 +38,7 @@
 
 所有本專案沉降速度均為負值、物理方向以向上為正；不允許上升物性，也不對完全沉沒物體加入風壓效應。缺少密度、阻力、再懸浮參數時，不宣稱已完成沉積—再懸浮動力。
 
-貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。本期 A 區不南擴，沿用 `northeast_taiwan_common_cache_v3` 的 bbox `[121.306315,122.793685,24.600844,25.499156]`，以 anchor 半徑 12.5 km 的受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`，最外層停止邊界維持原 A 區設定。原先 25 km 基準、35 km 敏感度與南向擴張屬歷史規劃，移出本期；不自行加入 15 km 或 23 km case。舊 25 km 幾何、manifest、shard 與 hash 不沿用，必須依新規範重建。現有 v3 三類產品即使有 24 個月份目錄，也仍須由 `OCM native`、`OCM surface` 與 `NWW3` 的共同邊界餘裕證據完成實測驗收；目前程序只涵蓋受體的原生篩選，不能代替 20 km 邊界的三產品、兩共同格點證明，因此可先進行嚴格輸入準備，但正式驗收尚未通過、正式運算尚未開放。舊 `formal_domain_policy=expanded_domain_v1` 只保留舊設定相容讀取，不是本期 A 範圍。
+貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。本期 A 區不南擴，沿用 `northeast_taiwan_common_cache_v3` 的 bbox `[121.306315,122.793685,24.600844,25.499156]`，以 anchor 半徑 12.5 km 的受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`，最外層停止邊界維持原 A 區設定。原先 25 km 基準、35 km 敏感度與南向擴張屬歷史規劃，移出本期；不自行加入 15 km 或 23 km case。舊 25 km 幾何、manifest、shard 與 hash 不沿用，必須依新規範重建。A 區正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`，沿用工程試跑已採用的逐四階 Runge-Kutta 法（RK4）階段資料支援嚴格檢查：OCM 或 NWW3 在實際查詢位置／時間無有效支援時立即停止，保留 `data_gap` 等原始狀態，不以零值、最近值或擴張資料域補齊。既有 24 小時、20 情境產物只屬 DEMO；正式 30 天仍須由完整四區五站 `inputs-build` 重新建立 100 個受體、250 個到達時刻、5,000 個初始配對及其逐筆 gap-safe 時間證據。舊 `formal_domain_policy=expanded_domain_v1` 只保留舊設定相容讀取，不是本期 A 範圍。
 
 每個受體×到達配對的實際初始深度來自到達 UTC 的已驗證動態紀錄；不以模板深度代替所有到達時間。投影座標、公尺距離、步長限制、統計網格與軌跡計算使用公尺制座標，圖面可將公尺座標轉為經緯度顯示，但經緯度不進入粒子物理運算。
 

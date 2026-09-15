@@ -237,11 +237,13 @@ uv run lbt benchmark-report "$WORKSPACE" \
 ## 8. 為什麼目前不能執行五站正式批次
 
 現行 A 區政策保留 v3 forcing 範圍、貢寮與龜山島各 20 km local domain、各 12.5 km receptor
-core，且不納入 35 km sensitivity。但目前程式仍明確阻擋 v3／20 km 共同 forcing 邊界驗證，
-repository 也沒有可直接使用的正式 release config。因此不要把 example config 改名後執行 formal，
-也不要把 B 區 pilot 結果當成正式替代品。
+core，且不納入 35 km sensitivity。A 區不再等待共同兩格 forcing margin；正式設定改以
+`runtime_stage_fail_closed_no_expansion_v1` 在每個 RK4 階段驗證實際 OCM native／NWW
+analysis 支援，無支援就保存 `data_gap`／對應品質狀態並停止，不補值或切成 current-only。
+但 repository 仍沒有可直接使用的四區五站正式 release config，因此不要把 example config
+改名後執行 formal，也不要把 A 區 1 天／20 情境或 B 區 pilot 當成正式替代品。
 
-正式執行至少要先具備：已核准且可重建的輸入成果、正式設定、實際共同 forcing-margin 證據、
+正式執行至少要先具備：已核准且可重建的完整輸入成果、正式設定、逐階段 forcing 支援契約、
 完整情境與 seed 綁定、checkpoint／隨機數延續驗證、效能證據與科學驗證。缺一項就停止。
 完整輸入條件見[輸入衍生與發布契約](14_input_derivation_and_release_contract.md)，目前完成狀態見
 [實作狀態](../implementation_status.md)。
@@ -282,7 +284,7 @@ uv run lbt validate-run "$WORKSPACE" \
 
 建立後應先確認 `run-create` 及唯讀 `validate-run` 均為 `valid=true`，且 summary 的 `run_kind`
 是 `formal`、shard 數等於 run plan，不要手工編輯 plan／progress。formal initializer 還須成功
-通過該版本的輸入 manifest、完整 inventory、共同 forcing margin、正式 provenance 與設定 gate；
+通過該版本的輸入 manifest、完整 inventory、A 區逐階段封閉失敗空間契約、正式 provenance 與設定 gate；
 僅有 JSON 存在或 `run-create` 退出 0 不等於資料已被科學驗收。
 
 #### 8.2 重新執行 SERVER 儲存 gate

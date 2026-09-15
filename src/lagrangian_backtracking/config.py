@@ -4,9 +4,10 @@ example config 同時保存已定案設計與尚待 SERVER／pilot 衍生的 ``n
 允許這些欄位存在，以便合成測試與 pilot 前進；``formal_release=True`` 接受研究團隊核定的
 全部可得 2024–2025 資料契約，並依明示的 ``formal_domain_policy`` 套用來源範圍 gate。
 舊 ``expanded_domain_v1`` 維持 A 區 expanded source 的既有檢查；新的
-``v3_local20km_20260909_v1`` 在三套 forcing 共同有效格網與 20 km 邊界證據尚未由
-validator／producer 實際驗證前，必定 fail closed。這個分層避免把上游 ``trial_ready``
-名稱誤作外部補件阻擋，也不會讓尚未驗證的缺口重建被直接送入正式兩年批次。
+``v3_local20km_20260909_v1`` 固定使用 A 區既有 v3 forcing 與兩站 20 km local domain；
+空間支援不宣稱預先量測共同網格 margin，而由版本化的 runtime policy 要求每個速度
+取樣階段遇到無效 forcing 時 fail closed。這個政策同時要求資料缺口及外層開放邊界
+採停止語意；正式輸入仍須獨立通過 accepted products、時間窗、manifest 與 hash 閘門。
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 
 from .accelerated import PHYSICS_KERNEL_BACKEND_NUMPY_V1
 
@@ -52,14 +53,23 @@ LEGACY_DESIGN_VERSION = LEGACY_DESIGN_VERSION_V2
 
 # 這些識別碼是設定資料契約的一部分。``expanded_domain_v1`` 是未明示新政策的
 # 舊設定所採用的相容語意；它保留既有 A 區南擴 candidate／formal source 流程。
-# ``v3_local20km_20260909_v1`` 則只描述本期已決定的 A 區研究範圍：兩個站點共用
-# ``northeast_taiwan_common_cache_v3``，local 半徑為 20 km。後者尚未代表三套 forcing
-# 已完成共同有效網格與邊界驗證，因此正式發布 gate 仍會無條件阻擋。
+# ``v3_local20km_20260909_v1`` 描述本期已決定的 A 區研究範圍：兩站共用
+# ``northeast_taiwan_common_cache_v3``，local 半徑為 20 km；空間有效性由逐 stage
+# runtime gate 處理，不宣稱已量測三套 forcing 的共同網格 margin。
 FORMAL_DOMAIN_POLICY_EXPANDED_V1 = "expanded_domain_v1"
 FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1 = "v3_local20km_20260909_v1"
+RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1 = (
+    "runtime_stage_fail_closed_no_expansion_v1"
+)
+FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION = (
+    "no_expansion_runtime_stage_fail_closed"
+)
 FormalDomainPolicy = Literal[
     "expanded_domain_v1",
     "v3_local20km_20260909_v1",
+]
+RuntimeSpatialSupportPolicy = Literal[
+    "runtime_stage_fail_closed_no_expansion_v1",
 ]
 
 # OCM 內層插值的版本化選項。這兩個識別碼只描述 OCM 垂向、水平及時間插值所使用的
@@ -78,9 +88,6 @@ PhysicsKernelBackend = Literal["numpy_v1", "numba_cpu_v1"]
 
 NORTHEAST_V3_FLOW_DOMAIN_ID = "northeast_taiwan_common_cache_v3"
 NORTHEAST_V3_BBOX_LON_LAT = (121.306315, 122.793685, 24.600844, 25.499156)
-NORTHEAST_V3_COMMON_FORCING_PRODUCTS = frozenset(
-    {"ocm_native", "ocm_surface", "nww3_analysis"}
-)
 NORTHEAST_V3_LOCAL_SITE_IDS = frozenset({"gongliao", "guishan"})
 
 # 舊正式輸入採七日缺口安全基線；此值只供相容性查詢，不把所有舊 runtime 或
@@ -198,7 +205,9 @@ class DomainConfig(StrictModel):
     ``formal_domain_policy`` 是 versioned research scope，而不是檔案系統中產品是否
     已驗收的旗標。缺少此欄位時固定回到 ``expanded_domain_v1``，讓既有設定維持原本
     的 normalized payload／hash 語意；新設定必須明示 ``v3_local20km_20260909_v1``，
-    才會套用 A 區 v3 與 20 km local 的跨欄位契約。
+    才會套用 A 區 v3 與 20 km local 的跨欄位契約。A 區另以
+    ``runtime_spatial_support_policy`` 明示逐 stage 空間支援檢查版本；其值不代表任何
+    產品 margin 已量測或通過，只指定粒子 runtime 遇到無效 forcing 時採停止語意。
     """
 
     analysis_region_id: str
@@ -211,6 +220,7 @@ class DomainConfig(StrictModel):
     current_domain_role: str | None = None
     formal_release_flow_domain_id: str | None = None
     formal_release_domain_status: str | None = None
+    runtime_spatial_support_policy: RuntimeSpatialSupportPolicy | None = None
 
     def resolved_flow_domain_id(self, *, formal: bool = False) -> str:
         """回傳目前執行模式應使用的 flow-domain 識別碼。
@@ -374,13 +384,20 @@ class ExecutionConfig(StrictModel):
 
 
 class BoundaryConfig(StrictModel):
-    """local、foreign-local 與 outer boundary 的事件政策。"""
+    """保存局部／外層邊界及資料缺口的停止政策。
+
+    ``stop_at_forcing_start`` 與 ``stop_at_data_gap`` 原先由 YAML 額外欄位保存；將它們
+    明列為嚴格布林欄位，讓 A 區 v3 設定能驗證確實採用停止語意。欄位保持 optional，
+    以免改變未使用 v3 政策的舊設定載入與 canonical hash。
+    """
 
     local_domain_first_exit: str
     other_site_local_domain_enter: str
     other_site_local_domain_exit: str
     other_site_local_domain_changes_study_site: bool
     flow_domain_open_boundary: str
+    stop_at_forcing_start: StrictBool | None = None
+    stop_at_data_gap: StrictBool | None = None
     max_backtrack_days: float | None = None
     maximum_step_count: int | None = None
 
@@ -557,13 +574,16 @@ class ProjectConfig(StrictModel):
         ``expanded_domain_v1`` 維持既有行為：formal A 區可使用設定明示的 expanded
         source，並由 ``assert_formal_release_ready`` 繼續執行原本的 formal gate。
         ``v3_local20km_20260909_v1`` 只允許 A 區精確使用 ``northeast_taiwan_common_cache_v3``
-        與原始 bbox，且貢寮、龜山島必須各自保留 20,000 m local、12,500 m receptor core、
-        空的本期 local sensitivity 與三套 forcing 的 2 格 margin 宣告。這裡只檢查設定
-        內可判定的研究設計與來源綁定；三套產品的實際共同有效格網／20 km 邊界證據仍由
-        後續 validator／producer 產出，不能用 ``approved``、任意 boolean 或非空路徑繞過。
+        與固定 bbox，且貢寮、龜山島各自保留 20,000 m local、12,500 m receptor core、
+        空的本期 local sensitivity，以及版本化的逐 stage 空間支援政策。設定不得保留
+        未量測的共同 forcing margin 宣告；既有受體候選邊界幾何篩選仍由各站的
+        ``minimum_flow_domain_margin_local_grid_scales`` 控制，兩者用途不同。runtime
+        policy 要求無效 forcing 在每個速度取樣階段 fail closed，並要求資料缺口、forcing
+        起點與 flow-domain 開放邊界均採停止語意；其他正式產品／時間／hash 閘門仍由
+        input derivation 與 release validator 驗證。
 
         此方法會在 ``ProjectConfig`` schema 驗證及 input derivation 開始時呼叫，讓未知
-        policy、A 區錯誤 ID、半徑、核心或 margin 在任何 source I/O 前被拒絕。缺少
+        policy、A 區錯誤 ID、半徑、核心或 runtime controls 在任何 source I/O 前被拒絕。缺少
         ``formal_domain_policy`` 的舊模型已由欄位預設為 ``expanded_domain_v1``，因此
         不會把舊設定誤套用本期 v3 設計。
         """
@@ -617,6 +637,11 @@ class ProjectConfig(StrictModel):
             if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
         ]
         if not v3_domains:
+            if any(domain.runtime_spatial_support_policy is not None for domain in self.domains):
+                raise ValueError(
+                    "runtime_spatial_support_policy 只能搭配 A 區 "
+                    "v3_local20km_20260909_v1"
+                )
             return
         if len(v3_domains) != 1 or v3_domains[0].analysis_region_id != "A":
             raise ValueError("v3_local20km_20260909_v1 只能且必須套用 A 區")
@@ -628,10 +653,32 @@ class ProjectConfig(StrictModel):
             raise ValueError("v3_local20km_20260909_v1 的 A 區 formal flow-domain 必須 exact v3")
         if tuple(float(value) for value in region_a.bbox_lon_lat) != NORTHEAST_V3_BBOX_LON_LAT:
             raise ValueError("v3_local20km_20260909_v1 的 A 區 bbox 必須維持 northeast v3 bbox")
-        if region_a.formal_release_domain_status != "pending_common_support":
+        if (
+            region_a.formal_release_domain_status
+            != FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION
+        ):
             raise ValueError(
                 "v3_local20km_20260909_v1 的 A 區 formal_release_domain_status 必須是 "
-                "pending_common_support"
+                f"{FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION}"
+            )
+        if (
+            region_a.runtime_spatial_support_policy
+            != RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1
+        ):
+            raise ValueError(
+                "v3_local20km_20260909_v1 必須明示 "
+                "runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1"
+            )
+        if self.boundaries.stop_at_data_gap is not True:
+            raise ValueError("A 區 v3 runtime-stage policy 必須設定 boundaries.stop_at_data_gap=true")
+        if self.boundaries.stop_at_forcing_start is not True:
+            raise ValueError(
+                "A 區 v3 runtime-stage policy 必須設定 boundaries.stop_at_forcing_start=true"
+            )
+        if self.boundaries.flow_domain_open_boundary != "stop_at_first_crossing":
+            raise ValueError(
+                "A 區 v3 runtime-stage policy 必須設定 "
+                "boundaries.flow_domain_open_boundary=stop_at_first_crossing"
             )
 
         # 新 policy 不接受任何 expanded candidate 欄位；即使同一根目錄仍有 v4，也不
@@ -653,27 +700,16 @@ class ProjectConfig(StrictModel):
             )
 
         domain_extra = region_a.model_extra or {}
-        domain_margin = domain_extra.get("minimum_common_forcing_margin_grid_cells")
-        if (
-            isinstance(domain_margin, bool)
-            or not isinstance(domain_margin, (int, float))
-            or not math.isfinite(float(domain_margin))
-            or not math.isclose(float(domain_margin), 2.0, rel_tol=0.0, abs_tol=1e-12)
-        ):
+        unmeasured_margin_fields = {
+            "minimum_common_forcing_margin_grid_cells",
+            "margin_required_for_forcings",
+            "common_forcing_support_status",
+        }
+        stale_margin_fields = sorted(unmeasured_margin_fields & set(domain_extra))
+        if stale_margin_fields:
             raise ValueError(
-                "v3_local20km_20260909_v1 的 A 區 minimum_common_forcing_margin_grid_cells "
-                "必須明示為 2"
-            )
-        forcing_names = domain_extra.get("margin_required_for_forcings")
-        if (
-            not isinstance(forcing_names, (list, tuple))
-            or not all(isinstance(name, str) for name in forcing_names)
-            or set(forcing_names) != NORTHEAST_V3_COMMON_FORCING_PRODUCTS
-            or len(forcing_names) != len(NORTHEAST_V3_COMMON_FORCING_PRODUCTS)
-        ):
-            raise ValueError(
-                "v3_local20km_20260909_v1 必須明示 ocm_native、ocm_surface、nww3_analysis "
-                "三套 forcing margin"
+                "v3_local20km_20260909_v1 不得宣告未量測的共同 forcing margin："
+                + ", ".join(stale_margin_fields)
             )
 
         sites_a = [site for site in self.study_sites if site.analysis_region_id == "A"]
@@ -763,12 +799,13 @@ class ProjectConfig(StrictModel):
         domain_payloads = payload.get("domains")
         if isinstance(domain_payloads, list):
             for domain, domain_payload in zip(self.domains, domain_payloads, strict=False):
-                if (
-                    isinstance(domain_payload, dict)
-                    and "formal_domain_policy" in domain_payload
-                    and "formal_domain_policy" not in domain.model_fields_set
-                ):
-                    del domain_payload["formal_domain_policy"]
+                if not isinstance(domain_payload, dict):
+                    continue
+                for field_name in ("formal_domain_policy", "runtime_spatial_support_policy"):
+                    if field_name in domain_payload and field_name not in domain.model_fields_set:
+                        # 新的空間支援欄位只在 YAML 明示時入 hash；舊 v2／expanded 設定
+                        # 不因 Pydantic 補出的 null 發生無科學差異的 checkpoint identity 漂移。
+                        del domain_payload[field_name]
         # C 區候選設定是本期新增的 optional schema。舊 v2 YAML 沒有這三個 key 時，
         # Pydantic 仍會以 default 建立欄位；若直接將 default 寫入 canonical payload，
         # 會讓既有 run/checkpoint hash 無科學變更地漂移。因此只有 YAML 曾明示欄位時才
@@ -786,6 +823,13 @@ class ProjectConfig(StrictModel):
                 for field_name in candidate_fields:
                     if field_name in site_payload and field_name not in site.model_fields_set:
                         del site_payload[field_name]
+        boundaries_payload = payload.get("boundaries")
+        if isinstance(boundaries_payload, dict):
+            for field_name in ("stop_at_forcing_start", "stop_at_data_gap"):
+                if field_name in boundaries_payload and field_name not in self.boundaries.model_fields_set:
+                    # 這兩個 key 在新版 schema 成為嚴格布林欄位；未曾出現於舊 YAML 時
+                    # 仍從 canonical payload 移除，以維持舊設定 hash。
+                    del boundaries_payload[field_name]
         return payload
 
     def config_hash(self) -> str:
@@ -801,10 +845,10 @@ class ProjectConfig(StrictModel):
 
         這裡只驗證設定本身；上游月份的 schema、可用 coverage、canonical UTC 與物理
         reconstruction skill 仍由 preflight／reconstruction manifests 驗證。兩層 gate 都
-        通過前，CLI 不得啟動正式 run。對 ``v3_local20km_20260909_v1``，即使其他
-        formal 欄位全部填滿，也必須保留 ``v3/20km共同forcing邊界支援尚待實際驗證``
-        blocker；本輪沒有 validator／producer 可提供三套 forcing 的共同有效格網證據，
-        因此不可用 approved status、boolean 或非空 manifest path 偽造通過。舊的
+        通過前，CLI 不得啟動正式 run。對 ``v3_local20km_20260909_v1``，設定層只接受
+        已鎖定的 no-expansion runtime-stage fail-closed policy 與停止型邊界；這不表示
+        三套 forcing 的共同網格 margin 已量測，實際每站時間支援、accepted schema、產品
+        fingerprint、manifest 與正式輸入 status 仍必須由 input validator 通過。舊的
         ``expanded_domain_v1`` 則維持原本 expanded A formal ID gate。
         """
 
@@ -874,11 +918,11 @@ class ProjectConfig(StrictModel):
         if self.execution.checkpoint_interval_sweeps is None or self.execution.checkpoint_interval_sweeps < 1:
             blockers.append("正式 checkpoint_interval_sweeps 尚未核定")
         region_a = next(item for item in self.domains if item.analysis_region_id == "A")
-        if region_a.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
-            # 此 blocker 刻意不讀取任何「已批准」欄位；實際共同有效格網與 20 km
-            # 邊界證據尚未由 validator／producer 建立前，任何完整設定都不能啟動 formal。
-            blockers.append("v3/20km共同forcing邊界支援尚待實際驗證")
-        else:
+        if region_a.formal_domain_policy != FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+            # v3 的逐 stage 空間檢查已由 assert_research_domain_policy 鎖定；這裡只保留
+            # legacy expanded policy 原本的正式來源檢查。accepted products、完整研究時間
+            # 支援與 artifact/hash gate 仍由 input validator 重放，不因移除舊 margin blocker
+            # 而放寬。
             if not region_a.formal_release_flow_domain_id:
                 blockers.append("A 區 expanded formal_release_flow_domain_id 尚未產出")
             if region_a.formal_release_flow_domain_id == region_a.flow_domain_id:

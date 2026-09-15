@@ -136,7 +136,7 @@
 
 ### F11 物理敏感度與不確定性
 
-- no-Stokes、deep-water、finite-depth、Kh/Kz、dt、A 區 20 km local domain、B-D 原有 `expanded_domain` sensitivity、A v3 policy 與 boundary policy 以 baseline map、difference map 及來源排名變化並列；A 區比較只使用 OCM native、OCM surface 與 NWW analysis 的共同有效 forcing mask，且不把尚未完成的 margin evidence 畫成已通過。
+- no-Stokes、deep-water、finite-depth、Kh/Kz、dt、A 區 20 km local domain、B-D 原有 `expanded_domain` sensitivity、A v3 policy 與 boundary policy 以 baseline map、difference map 及來源排名變化並列；A 區圖面須分開呈現 OCM surface 的 arrival 母體支援，以及 OCM native／NWW analysis 在實際 RK4 階段造成的空間 `data_gap` 停止位置與分母，不得用共同遮罩裁切或補值隱藏逐階段失敗。
 - OCM 時間處理至少並列 observed-only gap-safe baseline、approved reconstruction mean 與
   reconstruction posterior members；報告來源排名、HDR、旅行／停留時間、主要 exit 機率
   與 reconstructed-exposure 分層差異。若長缺口未過 blocked validation，不得把重建案例
@@ -209,7 +209,7 @@ figures/
 
 - [ ] 每站 10,000、A 區 20,000、全案 50,000 是基礎情境數；`M`、experiment case、每站、region 與全案總軌跡數分欄呈現。
 - [ ] 貢寮／龜山島 12.5 km receptor core、20 km local domain 與重疊區均正確標示，且 local entry 與 flow-domain exit 分母分開；本期不含 35 km sensitivity。
-- [ ] A 區圖面明確標示現行 v3 bbox、`formal_domain_policy=v3_local20km_20260909_v1` 與 formal blocked 狀態，並揭露 OCM native／surface／NWW 共同有效遮罩及 20 km local-to-outer 最小距離；歷史 v4 只列 deferred provenance。
+- [ ] A 區圖面明確標示現行 v3 bbox、`formal_domain_policy=v3_local20km_20260909_v1`、`runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1` 與實際 release 狀態；揭露 OCM surface arrival 支援、OCM native／NWW analysis 的逐階段空間失敗位置、raw count 與有效分母，歷史 v4 只列 deferred provenance。
 - [ ] 自站 local first exit 與他站 local-domain enter/exit 使用不同事件與圖層；他站穿越不終止軌跡，也不混入自站主要來源分母。
 - [ ] 貢寮→龜山島與龜山島→貢寮的方向性連通分開呈現，分母是原始站點有效 members，且未被解讀為絕對交換機率。
 - [ ] 沒有以全軌跡疊圖取代密度、連通、時間與不確定性分析。

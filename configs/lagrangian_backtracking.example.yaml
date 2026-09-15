@@ -125,14 +125,14 @@ domains:
     center_lonlat: [122.05, 25.05]
     bbox_lon_lat: [121.306315, 122.793685, 24.600844, 25.499156]
     metric_crs_policy: local_azimuthal_equidistant
-    # 本期 A 區研究範圍保留 OCM-Data-Preprocessing flow-domain v3；20 km local
-    # boundary 的三套 OCM native／surface／NWW analysis 共同有效格網尚待實際驗證。
+    # 本期 A 區固定使用 OCM-Data-Preprocessing flow-domain v3 與兩站 20 km local。
+    # 三套 forcing 的空間支援不宣稱有預先量測的共同 margin；正式 runtime 必須在每個
+    # 速度取樣階段確認 forcing 有效，無效即 fail closed 並依停止型邊界政策終止該粒子。
     formal_domain_policy: v3_local20km_20260909_v1
     current_domain_role: development_and_pilot
     formal_release_flow_domain_id: northeast_taiwan_common_cache_v3
-    formal_release_domain_status: pending_common_support
-    minimum_common_forcing_margin_grid_cells: 2
-    margin_required_for_forcings: [ocm_native, ocm_surface, nww3_analysis]
+    formal_release_domain_status: no_expansion_runtime_stage_fail_closed
+    runtime_spatial_support_policy: runtime_stage_fail_closed_no_expansion_v1
   - analysis_region_id: B
     analysis_region_name_zh: 新竹外海
     flow_domain_id: hsinchu_cache_v3
@@ -156,7 +156,9 @@ study_sites:
   # 貢寮與龜山島不沿用過小的 surface-SVD candidate bbox。兩站均以 anchor 為中心，
   # 在 Azimuthal Equidistant CRS 產生半徑 12.5 km 受體核心與 20 km local domain，
   # 再與 A 區固定 OCM ocean polygon 相交。動態 wet/dry 只篩受體與 forcing stage，
-  # 不得使 boundary 隨 arrival time 改變；本期 A 區不登錄 35 km sensitivity。
+  # 不得使 boundary 隨 arrival time 改變；本期 A 區不登錄 35 km sensitivity。各站的
+  # minimum_flow_domain_margin_local_grid_scales 是受體候選與外層幾何邊界的安全距離，
+  # 不代表 OCM/NWW 三套 forcing 的共同網格 margin 已量測。
   - study_site_id: gongliao
     study_site_name_zh: 貢寮
     analysis_region_id: A
@@ -501,8 +503,10 @@ boundaries:
   bed_suspended: reflect_and_record_contact
   bed_sinking_or_near_bed: deposit_on_first_contact_and_stop
   stop_at_forcing_start: true
-  # 已知 OCM 缺時必須在啟動前由 approved reconstruction 或 gap-safe arrival/horizon
-  # 消化；此開關只保留給 manifest 外缺檔、checksum/I/O 損毀、空間支撐或重建失敗。
+  # 每個 RK4 速度取樣階段都須使用當下位置／時間的有效 forcing；若缺值、域外或品質檢查
+  # 失敗而無法由既有邊界定位規則合法處理，粒子即 fail closed。已知 OCM 缺時仍須在啟動
+  # 前由 approved reconstruction 或 gap-safe arrival/horizon 消化；此開關涵蓋執行期缺檔、
+  # checksum/I/O 損毀、空間支援或重建失敗，不允許補零或以最近值代替。
   stop_at_data_gap: true
   # 最大回溯期不是任意人工選值；比較 7/14/30/60 日後，取主要統計最小穩定尺度。
   max_backtrack_days: null

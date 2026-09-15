@@ -19,6 +19,12 @@
 > **2026-08-28 本輪執行界線。** 本輪只在本機同步程式架構地圖、測試與文件，未登入或
 > 執行 SERVER，沒有正式研究結果；下文的歷史 SERVER 證據不等同於本輪正式 run。
 
+> **2026-09-15 A 區契約更新。** 本文件保留 8 月稽核當時的 expanded-domain／共同兩格
+> margin 規劃，供追溯但不再是本期執行要求。現行 A 區固定沿用 v3、不南擴、兩站 20 km
+> local domain 與 12.5 km receptor core；正式空間支援改由每個 RK4 階段對 OCM native／
+> NWW analysis 封閉失敗，OCM surface 則須支援完整 arrival 母體。24 小時、20 情境產物
+> 只屬工程 DEMO，不能替代 30 天四區五站正式母體。
+
 ## 1. 結論
 
 本專案已由純規劃狀態進入「可執行 reference core、可重啟 CPU/NumPy batch、可進資料重建與

@@ -223,17 +223,18 @@ identity；正式流程仍只能讀取已驗收的 OCM／NWW3 products，不直�
 | outer stop | 沿用 A 區共用 outer boundary；不因 local radius 改變 |
 | 本期排除 | A 南向擴張、35 km sensitivity、另行新增 15 km／23 km case |
 
-現有 v3 三類產品即使可見 24 個月份目錄，仍須逐項驗證 schema、UTC、欄位、mask、共同
-boundary 與 20 km local-to-outer margin；三產品至少兩個共同有效格點的 validator／producer
-證據尚未完成。既有 receptor native 篩選只支援 strict preparation，不能視為 20 km 邊界
-的 forcing margin 驗收；因此 formal scope 維持 blocked。舊
+現有 v3 三類產品即使可見 24 個月份目錄，仍須逐項驗證 schema、UTC、欄位、mask 與 arrival
+母體。A 區空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`：
+OCM surface 在建置階段支援完整 arrival 選取，OCM native／NWW analysis 則在每個實際 RK4
+階段驗證位置、深度、UTC、有限值與遮罩；無支援立即停止且不補值。既有 receptor native
+篩選及其兩格尺度只服務受體候選的局部幾何安全，不是三產品共同邊界證據。舊
 `formal_domain_policy=expanded_domain_v1` 只作 legacy configuration 的預設相容身分，
 B-D 原有 `expanded_domain` 敏感度依其自身驗證保留。
 
 原先 `northeast_taiwan_common_cache_v4_lbt_south_expanded` 與 bbox
 `[121.306315,122.793685,24.480000,25.499156]` 是歷史南向擴張候選，現已延後，不是本期
 正式輸入。舊 25 km geometry、manifest、shard 與 hash 不沿用；若日後恢復南擴，必須另立
-domain policy、重新產製三類 products、共同 margin evidence 與 release identity，不能把
+domain policy、重新產製三類 products、對應空間支援契約與 release identity，不能把
 歷史 partial 或舊指紋轉成 current formal。
 
 ## 9. 尚待衍生而非待使用者確認的項目
@@ -242,7 +243,7 @@ domain policy、重新產製三類 products、共同 margin evidence 與 release
 
 - OCM blocked reconstruction validation 與 immutable patch manifest；
 - NWW 17,544 小時新 analysis manifest；
-- A v3 policy 的三產品共同 margin manifest／validator evidence；
+- A v3 policy 的 no-expansion runtime-stage 契約與逐階段停止狀態驗證；
 - 五站 receptors、50 arrival UTC、dt/horizon/Kh/Kz/M/shard convergence；
 - production batch、聚合、圖表及學術成果報告。
 

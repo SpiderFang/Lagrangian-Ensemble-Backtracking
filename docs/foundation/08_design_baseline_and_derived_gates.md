@@ -57,11 +57,15 @@ logical `local_domain_id` 可延續既有站點標籤，但其 geometry binding 
 若後續要恢復其他半徑，必須建立新的範圍決策與完整 manifest，不得沿用舊 geometry 或 hash。
 
 現行 A 區 `northeast_taiwan_common_cache_v3` 的 bbox 固定為
-`[121.306315,122.793685,24.600844,25.499156]`，本期不南擴。現有三類產品的月份目錄與
-metadata／UTC 訊息可供 strict preparation 盤點，但不等於 OCM native、OCM surface 與 NWW
-analysis 的欄位、mask、時間及共同 boundary margin 已驗收；目前受體 native 篩選 gate
-也不等於 20 km 邊界的三產品、兩共同有效格點證明。formal scope 在實際共同 forcing
-margin evidence validator／producer 完成前維持 blocked。
+`[121.306315,122.793685,24.600844,25.499156]`，本期不南擴。2026-09-15 裁決正式流程
+沿用 A 區工程試跑的空間支援核心方案
+`runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`，並以
+`formal_release_domain_status=no_expansion_runtime_stage_fail_closed` 鎖定狀態，但不沿用
+24 小時 DEMO 的資料證據：OCM surface
+負責完整母體的 arrival 篩選，OCM native／NWW analysis 則由 runtime 在每個 RK4 stage
+依實際位置、深度、UTC 與 mask 嚴格判定。任一必要 forcing 無效時立即停止並保存原始
+狀態，不使用零值、最近值、未登錄外插或擴張資料域。30 天正式輸入仍必須重新通過完整
+四區五站母體、field、mask、時間軸、逐 arrival gap-safe 與來源雜湊驗收。
 
 原先的 `northeast_taiwan_common_cache_v4_lbt_south_expanded` 與 bbox
 `[121.306315,122.793685,24.480000,25.499156]` 只作南向擴張的歷史候選，不是本期正式
@@ -255,8 +259,8 @@ intra-tidal phases:
 | 五站點各 50 個確切 UTC | 到達時間 selector 與 forcing coverage gate | 未產出前不可啟動正式 batch |
 | 常數 `Kh/Kz` baseline | Brownian／well-mixed 驗證與文獻合理範圍 pilot | 未通過時只跑無擴散解析或標記 trial |
 | `M` | exit ranking、HDR、travel time、path density 的 member-convergence | 決定正式總軌跡數 |
-| A 區版本化 domain policy | 依 `formal_domain_policy=v3_local20km_20260909_v1` 使用 v3 bbox、12.5 km receptor core 與 20 km local domain；共同驗證 OCM native、OCM surface 與 NWW analysis 的空間、時間、mask、schema 及 input fingerprint | strict preparation 可進行；共同 forcing margin evidence validator／producer 未完成前 formal 維持 blocked |
-| local/outer boundary margin | 以實際投影格網驗證 20 km local boundary 至 A 區 outer boundary 對 OCM native、OCM surface、NWW analysis 均至少保留兩個共同有效格點 | margin 不足或證據未完成時阻擋本期 A policy；不沿用舊 geometry、manifest、shard 或 hash，也不以 native source margin 代替三產品證據 |
+| A 區版本化 domain policy | 依 `formal_domain_policy=v3_local20km_20260909_v1` 使用 v3 bbox、12.5 km receptor core 與 20 km local domain；禁止 v4、南擴及未登錄半徑 | domain／site ID、bbox、半徑、geometry identity 或 no-expansion policy 任一漂移即阻擋 formal |
+| A 區沿途 forcing 空間支援 | OCM surface 先驗證完整 arrival 母體；OCM native／NWW analysis 在每個 RK4 stage 依實際位置、深度、UTC、mask 與物理值 fail closed | 無效支援立即停止並保留 `data_gap`／既有狀態；禁止補零、最近值、未登錄外插或改用 expanded domain。24 小時、20 情境 DEMO 不替代 30 天正式母體與時間證據 |
 | `max_backtrack_days` | 比較 7、14、30、60 日的 exit/censor、HDR 與排名穩定性，取最小穩定值 | 決定正式 horizon，不改變 50,000 個基礎情境 |
 | `dt`、output interval、shard、checkpoint 與並行度 | dt 收斂、particle-step benchmark、RAM/I/O/容量 | 決定數值與工程配置 |
 

@@ -26,7 +26,11 @@
 
 持續 worker 的快取計數以每次分片執行前的計數為基準，記錄本次增加的載入、命中、未命中及淘汰次數；同一分片續跑時才與該分片先前已保存的增量累計。多次 checkpoint 只是同一執行區間的進度快照，不可把這些快照再次相加。`manager_count` 與 `resident_bytes` 為狀態量，分片及報告採已觀測樣本的最大值，不是各 worker 同時使用量的總和，也不是連續量測的整機峰值。歷史未標示計數語意的紀錄不能反推精確增量，須保留可讀性並明示其限制，不能將累計快取次數當成已驗證的全案總量。
 
-以上是可供正式母體採用的本地工程候選；尚未因此解除共同輸入、forcing margin、恢復連續性與科學驗證等正式發布閘門，也尚未在 SERVER 啟動任何正式母體。未來建立新 formal config 時必須明示兩個 Numba backend，並由實際 run plan 決定母體與分片，不回頭補做歷史單站倍率比較。
+以上是可供正式母體採用的本地工程候選；尚未因此解除完整共同輸入、逐 RK4 階段 forcing
+支援、恢復連續性與科學驗證等正式發布閘門，也尚未在 SERVER 啟動任何正式母體。未來建立
+新 formal config 時必須明示兩個 Numba backend，並由實際 run plan 決定母體與分片，不回頭
+補做歷史單站倍率比較。A 區既有 1 天、20 情境產物只屬 `engineering_only` DEMO，不能作為
+30 天或完整母體的效能、資料支援及科學成果證據。
 
 ## 第二工作線：單站小試跑
 
@@ -55,9 +59,10 @@
 SERVER 正式啟動前依下列順序驗收；不以新舊版本倍率比較作為目的：
 
 1. 保存候選程式指紋、正式設定／來源／情境／種子，固定成員數、步長與自適應閾值、輸出間隔及終止規則。NumPy 參考與 Numba 的解析、QC、事件及亂數連續性驗證仍是科學正確性閘門；這不是效能倍率測試，也不能事後放寬誤差界線。
-2. 確認正式設定明示 `numba_ocm_v1` 與 `numba_cpu_v1`，run plan 涵蓋核准的完整母體，並通過版本化輸入、forcing margin、乾淨 deployment provenance、NFS storage 與 checkpoint／RNG 恢復驗證。
+2. 確認正式設定明示 `numba_ocm_v1` 與 `numba_cpu_v1`，run plan 涵蓋核准的完整母體，並通過版本化輸入、A 區 `runtime_stage_fail_closed_no_expansion_v1` 空間支援契約、乾淨 deployment provenance、NFS storage 與 checkpoint／RNG 恢復驗證。
 3. 依 SERVER 實際 cpuset 與排程核准值設定固定 worker 數；`run-formal-parallel` 記錄整機經過時間、CPU affinity、各子程序狀態、log 與最終完整性，這些是資源與操作證據，不是舊版／新版倍率比較。
 4. 執行期間分開保存達到 horizon、資料缺口、數值失敗與邊界終止狀態；任何 child 失敗或訊號中斷先保存 checkpoint 並停止，經 reconcile 與唯讀 validator 後才能明示 `--resume`。
 5. 全部 shard、輸出 checksum、QC、資源摘要與 `validate-run --require-complete` 通過後，才能進入聚合、圖表與研究報告；不得以工作執行中或局部區域完成冒充正式成果。
 
-效能工程、任意回溯長度的資料契約、共同 forcing 邊界支援、科學驗證及報告完成是不同驗收項目。本文件不解除既有正式發布阻擋，也不代表已部署 SERVER 或已完成任一區正式母體。
+效能工程、任意回溯長度的資料契約、逐階段 forcing 空間支援、科學驗證及報告完成是不同
+驗收項目。本文件不解除其他既有正式發布阻擋，也不代表已部署 SERVER 或已完成任一區正式母體。

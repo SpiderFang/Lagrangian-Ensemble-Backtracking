@@ -12,6 +12,11 @@
 它們不是五站正式研究成果，也沒有通過 `M`、時間步長、回溯期收斂、accepted input、
 正式 release 或獨立觀測驗證，因此不能推導絕對來源機率、因果來源或沉積質量。
 
+> **2026-09-15 後續裁決。** A 區這批 24 小時、每站 20 情境、`M=1` 產物的用途固定為
+> 工程 DEMO，不再補跑相同規模的 finite-depth Stokes 對齊案例。正式 A 區沿用 v3、兩站
+> 20 km local domain、12.5 km receptor core 與逐 RK4 階段 forcing 封閉失敗的核心方案，
+> 但必須以四區五站完整母體重新建置 30 天輸入與執行；本文件以下的歷史試跑數字不得升格。
+
 ## 第一次試跑實測摘要
 
 | 區域／站點 | 執行規模 | 已核對的終止／品質診斷 | 成果發布狀態 |
@@ -66,15 +71,15 @@ A 的舊圖面未發布是成果發布協定的限制，不是 A run、reconcile
 
 ## 重新判讀前必須完成的修正與 gate
 
-1. A 區貢寮與龜山島只需各補跑 20 粒子的 `finite_depth_stokes` 工程基準（兩站合計 40
-   粒子），並與其餘區域使用同一份乾淨 deployment snapshot；這是設定對齊的 pilot 基準，
-   不是每站完整 `10,000×M` 正式矩陣。既有 `no_stokes` run 應保留為 A 區 Stokes 敏感度
-   結果，不因補跑而覆寫或刪除；四區的程式 tree、Python／NumPy／Numba／PyArrow 環境與
-   lock provenance 必須一致。
+1. 不再補跑 A 區相同 24 小時／20 情境的工程基準。既有 `no_stokes` run 原樣保留為歷史
+   DEMO，不作正式 Stokes 敏感度或跨區可比證據；正式 30 天執行須使用同一份乾淨 deployment
+   snapshot，並保存 Python／NumPy／Numba／PyArrow 環境與 lock provenance。
 2. C、D 要先補足 NWW 波浪的空間支援，或改用經核准且留下 gap-safe 證據的 arrival window；
    不能把 `QC=32` 的缺口當成有效波浪速度，也不能以最近格點或零值補齊。
-3. A 區正式 release 仍缺 OCM native、OCM surface 與 NWW3 三產品在指定 20 km 邊界至少
-   兩個共同有效格點的實測餘裕證據；受體原生篩選通過不能代替這項 gate。
+3. A 區正式 release 採 `runtime_stage_fail_closed_no_expansion_v1`，不再要求指定 20 km
+   邊界的三產品共同兩格餘裕。OCM surface 必須支援完整 arrival 母體；OCM native 與 NWW3
+   在每個實際 RK4 階段依位置、深度、UTC 與 mask 驗證，任一必要 forcing 無支援即停止並
+   保存 `data_gap`／對應品質狀態，不得補值或降級為 current-only。
 4. 四區都還缺 `M`、時間步長與回溯期的收斂證據，以及 accepted input manifest、正式 run
    provenance、aggregate／report release 與逐圖表科學 QC；`M=1` 只能驗證鏈路，不能支持
    系集穩定性或來源路徑的研究結論。

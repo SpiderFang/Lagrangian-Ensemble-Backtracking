@@ -262,8 +262,10 @@ record、geometry、inventory、dynamic initial condition 與 provenance 都保�
 `flow_domain_id`、本期 `formal_domain_policy=v3_local20km_20260909_v1`、v3 bbox、schema
 major、root token、source files、metadata/time SHA-256、NPY structural fingerprint 與
 config hash。A v3 policy 建立 release config 時須將 12.5 km receptor core、20 km local
-domain 與共用 outer boundary 同步綁定；不得以公開標籤、舊 25 km geometry 或歷史 expanded
-bbox 代替實際來源空間。
+domain、共用 outer boundary、
+`runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1` 與
+`formal_release_domain_status=no_expansion_runtime_stage_fail_closed` 同步綁定；不得以公開
+標籤、舊 25 km geometry 或歷史 expanded bbox 代替實際來源空間。
 因此不能把歷史 expanded source 重新命名成不存在的資料夾，也不能用公開標籤取代來源識別。
 
 ## 7. Release config 閘門
@@ -283,7 +285,7 @@ partial 的 inode／owner marker 與 final 狀態，不可採用先 `stat` 再 `
 條件全部成立才可寫入 `config_status: approved`：component immutable binding
 可讀且 hash 一致、四域／五站及 10／100／250／5,000 計數正確、NWW 四域均為 17,544
 小時、每個 gap-safe horizon 不跨缺口、strict manifest loader 通過、A 當期 domain policy
-與三產品共同 margin evidence gate 通過、config formal gate 通過，以及所有 config reference
+與逐 RK4 階段封閉失敗空間契約通過、config formal gate 通過，以及所有 config reference
 exact 指向同一批 artifact。其他情況仍可產生
 `config_status: generated` 與 blocker，供人工稽核；`release-config-validate` 會再以唯讀
 方式驗證，不會自動修復 binding。
@@ -322,8 +324,10 @@ uv run lbt release-config-validate configs/release-2024-2025.yaml \
 
 正式 SERVER validation 仍須由具權限的執行環境提供實際四域 root、A v3 policy domain ID、
 OCM native／surface 與 NWW source metadata、磁碟／權限檢查、完整 NWW analysis 建置結果、
-A 20 km local-to-outer 三產品共同 margin evidence，以及必要的 OCM reconstruction 或逐
-arrival gap-safe 證據。本 slice 已提供重建與驗證入口，
+A 區 no-expansion runtime-stage 契約，以及必要的 OCM reconstruction 或逐 arrival gap-safe
+證據。OCM surface 必須先支援完整母體的 arrival 選取；OCM native／NWW analysis 則由
+runtime 依粒子的實際位置、深度、UTC 與 mask 逐階段判定，任一必要支援失敗立即停止且不補值。
+本 slice 已提供重建與驗證入口，
 但未登入 SERVER、未修改上游產品、未啟動正式軌跡或宣稱任何科學成果。
 
 ## 9. Slice 3A pilot calibration evidence

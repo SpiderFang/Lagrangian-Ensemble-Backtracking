@@ -546,7 +546,8 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": (
             "先以最大 horizon 對每個到達時刻做完整 gap-safe 支援篩選，inputs-build 僅執行一次，"
             "再由完全相同的 common-input 產生各 horizon 的 release config；真正缺時禁止以零值或最近值補齊。"
-            "formal 仍必須通過既有 A v3/local20 formal gate，pilot 僅是工程 E2E，不能升格為正式結果；"
+            "A v3/local20 formal 以不擴張的逐 RK4 階段封閉失敗契約驗證空間支援；"
+            "pilot 僅是工程 E2E，不能升格為正式結果；"
             "共同母體一致不代表每粒子必然走滿要求日數。"
         ),
     },

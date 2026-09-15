@@ -15,7 +15,8 @@ dynamic receptor×arrival 初始條件均以既有模組的演算法為基礎，
 本模組保存「條件式來源足跡」所需的資料來源識別與 fingerprint；它不把 A 區的實際
 flow-domain 改名成公開標籤。legacy ``expanded_domain_v1`` 若使用南擴產品，manifest
 仍會保存真實 domain ID、bbox、schema 與檔案 hash；新的 ``v3_local20km_20260909_v1``
-則只綁定 ``northeast_taiwan_common_cache_v3``，並記錄尚待共同 forcing 驗證的狀態。
+則只綁定 ``northeast_taiwan_common_cache_v3``，並記錄 no-expansion、逐 stage
+fail-closed 空間支援 policy/status；manifest 不宣稱三套 forcing 的共同格網 margin 已量測。
 圖面可使用 ``A 區分析域`` 作為公開顯示文字。Smagorinsky、正式軌跡執行、報告
 renderer 與互動式架構地圖不在本 Slice 範圍。
 """
@@ -47,8 +48,10 @@ from .arrival_times import select_arrival_times
 from .config import (
     FORMAL_DOMAIN_POLICY_EXPANDED_V1,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
+    FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION,
     NORTHEAST_V3_BBOX_LON_LAT,
     NORTHEAST_V3_FLOW_DOMAIN_ID,
+    RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1,
     DomainConfig,
     ProjectConfig,
     StudySiteConfig,
@@ -4573,6 +4576,143 @@ def _gap_safe_payload(
     }
 
 
+def _runtime_spatial_support_contracts_by_region(config: ProjectConfig) -> dict[str, dict[str, Any]]:
+    """建立 A 區 v3 runtime spatial-support policy 的可追溯設定快照。
+
+    這份快照只記錄研究範圍、no-expansion 狀態與既有停止型 runtime controls；它不計算
+    也不聲稱三套產品有任何共同格網 margin。config schema 已先驗證 domain ID、固定
+    bbox、兩站幾何半徑、每 stage fail-closed policy、資料缺口與外層邊界設定，這裡將
+    同一組值複製到 forcing inventory、artifact source bindings 與 release trace。
+    未採用 A 區 v3 policy 的舊設定回傳空 mapping，避免改變 legacy artifact 語意。
+    """
+
+    domains = [
+        domain
+        for domain in config.domains
+        if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
+    ]
+    if not domains:
+        return {}
+    if len(domains) != 1 or domains[0].analysis_region_id != "A":
+        raise InputDerivationError("A 區 runtime spatial-support policy 的 domain 綁定不唯一")
+    domain = domains[0]
+    return {
+        "A": {
+            "analysis_region_id": "A",
+            "formal_domain_policy": domain.formal_domain_policy,
+            "flow_domain_id": domain.formal_release_flow_domain_id,
+            "bbox_lon_lat": list(domain.bbox_lon_lat),
+            "runtime_spatial_support_policy": domain.runtime_spatial_support_policy,
+            "formal_release_domain_status": domain.formal_release_domain_status,
+            "stop_at_data_gap": config.boundaries.stop_at_data_gap,
+            "stop_at_forcing_start": config.boundaries.stop_at_forcing_start,
+            "flow_domain_open_boundary": config.boundaries.flow_domain_open_boundary,
+        }
+    }
+
+
+def _runtime_spatial_support_contract_errors(
+    config: ProjectConfig,
+    *,
+    forcing_inventory: Mapping[str, Any],
+    source_bindings: Mapping[str, Any] | None,
+) -> list[str]:
+    """確認 v3 inventory、產品記錄與 artifact source binding 共用同一停止政策。
+
+    比對只檢查設定宣告與不可變 provenance；它不等價於預先建立共同空間 margin 證據。
+    A 區三項產品都必須記錄同一 policy/status，舊的兩格共同 margin key 一律拒絕；
+    runtime 仍需在每個粒子速度 stage 依實際位置與時刻驗證 forcing。
+    """
+
+    expected = _runtime_spatial_support_contracts_by_region(config)
+    if not expected:
+        return []
+    errors: list[str] = []
+    if forcing_inventory.get("runtime_spatial_support_contracts_by_region") != expected:
+        errors.append("forcing_inventory_runtime_spatial_support_contract_mismatch")
+    if source_bindings is None:
+        errors.append("artifact_runtime_spatial_support_source_binding_missing")
+    elif source_bindings.get("runtime_spatial_support_contracts_by_region") != expected:
+        errors.append("artifact_runtime_spatial_support_source_binding_mismatch")
+
+    products = forcing_inventory.get("products")
+    a_products = [
+        item
+        for item in products
+        if isinstance(item, Mapping) and item.get("analysis_region_id") == "A"
+    ] if isinstance(products, list) else []
+    if len(a_products) != 3:
+        errors.append("forcing_inventory_runtime_spatial_support_product_count_invalid")
+        return errors
+    a_contract = expected["A"]
+    old_margin_fields = {
+        "minimum_common_forcing_margin_grid_cells",
+        "margin_required_for_forcings",
+        "common_forcing_support_status",
+    }
+    for item in a_products:
+        grid_metadata = item.get("grid_metadata")
+        if not isinstance(grid_metadata, Mapping):
+            errors.append("forcing_inventory_runtime_spatial_support_grid_metadata_missing")
+            continue
+        if (
+            grid_metadata.get("formal_domain_policy") != a_contract["formal_domain_policy"]
+            or grid_metadata.get("runtime_spatial_support_policy")
+            != a_contract["runtime_spatial_support_policy"]
+            or grid_metadata.get("formal_release_domain_status")
+            != a_contract["formal_release_domain_status"]
+        ):
+            errors.append("forcing_inventory_runtime_spatial_support_product_binding_mismatch")
+        if old_margin_fields & set(grid_metadata):
+            errors.append("forcing_inventory_unmeasured_common_margin_claim_present")
+    return errors
+
+
+def _artifact_source_bindings(
+    config: ProjectConfig,
+    *,
+    pilot_selection: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """建立 artifact index 的來源設定、A 區空間政策與 pilot 範圍綁定。
+
+    ``config_hash`` 是來源 YAML 的正規化語意摘要；A 區 v3 則額外保存固定 flow-domain、
+    bbox、站點來源 ID、no-expansion 狀態與逐 stage 停止控制。正式 release 的既有
+    ``source_config_hash`` 與 artifact-index SHA-256 會鎖定這筆 source binding，不再另建
+    一份可能與來源設定分歧的 release-binding map。pilot 選取範圍只作 provenance，不能
+    把 generated artifact 轉成 formal approved，也不會升格 24 小時 DEMO 到正式母體。
+    """
+
+    source_bindings: dict[str, Any] = {
+        "config_hash": config.config_hash(),
+        "ocm_native_root_token": config.inputs.ocm_native_root_env,
+        "ocm_surface_root_token": config.inputs.ocm_surface_root_env,
+        "nww_analysis_root_token": config.inputs.nww_analysis_root_env,
+    }
+    runtime_support_contracts = _runtime_spatial_support_contracts_by_region(config)
+    if runtime_support_contracts:
+        # 將設定中的版本化契約原樣放入 artifact index；它說明 runtime 必須怎麼停止，
+        # 不聲稱 accepted products 的共同 forcing margin 曾經被預先量測或核准。
+        region_a = next(domain for domain in config.domains if domain.analysis_region_id == "A")
+        source_bindings.update(
+            {
+                "formal_domain_policy": region_a.formal_domain_policy,
+                "formal_domain_id": region_a.formal_release_flow_domain_id,
+                "formal_domain_bbox_lon_lat": list(region_a.bbox_lon_lat),
+                "formal_domain_status": region_a.formal_release_domain_status,
+                "runtime_spatial_support_policy": region_a.runtime_spatial_support_policy,
+                "runtime_spatial_support_contracts_by_region": runtime_support_contracts,
+                "formal_site_ids": {
+                    site.study_site_id: site.formal_release_flow_domain_id
+                    for site in config.study_sites
+                    if site.analysis_region_id == "A"
+                },
+            }
+        )
+    if pilot_selection is not None:
+        source_bindings["pilot_selection_scope"] = dict(pilot_selection)
+    return source_bindings
+
+
 def _forcing_inventory_payload(
     *,
     config: ProjectConfig,
@@ -4589,6 +4729,7 @@ def _forcing_inventory_payload(
         domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
         for domain in config.domains
     )
+    runtime_support_contracts = _runtime_spatial_support_contracts_by_region(config)
     for region in sorted(products_by_region):
         # products_by_region 的 tuple 固定包含 ``ocm_native``、``ocm_surface`` 與
         # ``nww3_analysis``；逐一展開可保留三套產品各自的時間軸、grid schema、來源
@@ -4606,9 +4747,6 @@ def _forcing_inventory_payload(
         actual_flow_domain_id = next(iter(actual_ids))
         resolved_bbox = _authoritative_flow_domain_bbox_lon_lat(domain, actual_flow_domain_id)
         bbox_registration = _flow_domain_bbox_registration(domain, actual_flow_domain_id)
-        domain_extra = domain.model_extra or {}
-        common_margin = domain_extra.get("minimum_common_forcing_margin_grid_cells")
-        required_forcings = domain_extra.get("margin_required_for_forcings")
         for product in region_products:
             axis = product.canonical
             expected = np.asarray(expected_axis, dtype=np.int64)
@@ -4620,16 +4758,14 @@ def _forcing_inventory_payload(
                 "bbox_registration": bbox_registration,
             }
             if domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
-                # 這些欄位把本期三套 forcing 的共同邊界需求與尚待驗證狀態帶入
-                # inventory；它們不代表實際格網 margin 已被量測或核准。
+                # 每項 accepted product 都攜帶同一個 no-expansion/runtime-stage policy
+                # 與設定狀態，方便逐產品追溯。這些欄位不是空間支援量測結果，也不提升
+                # generated/approved inventory 自身的 status。
                 grid_metadata.update(
                     {
                         "formal_domain_policy": domain.formal_domain_policy,
-                        "minimum_common_forcing_margin_grid_cells": common_margin,
-                        "margin_required_for_forcings": list(required_forcings)
-                        if isinstance(required_forcings, (list, tuple))
-                        else required_forcings,
-                        "common_forcing_support_status": "pending_common_support",
+                        "runtime_spatial_support_policy": domain.runtime_spatial_support_policy,
+                        "formal_release_domain_status": domain.formal_release_domain_status,
                     }
                 )
             products.append(
@@ -4710,6 +4846,7 @@ def _forcing_inventory_payload(
         provenance_extra["formal_domain_policy_by_region"] = {
             region: domain_by_region[region].formal_domain_policy for region in sorted(domain_by_region)
         }
+        provenance_extra["runtime_spatial_support_contracts_by_region"] = runtime_support_contracts
     return {
         "manifest_kind": "forcing_inventory",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -4728,6 +4865,11 @@ def _forcing_inventory_payload(
             "end_utc": _utc_string(int(expected_axis[-1])),
             "hourly_step_count": int(expected_axis.size),
         },
+        **(
+            {"runtime_spatial_support_contracts_by_region": runtime_support_contracts}
+            if runtime_support_contracts
+            else {}
+        ),
         "products": products,
         "preflight_reports": [report.to_dict() for report in preflight_reports],
         "provenance": _provenance(
@@ -5323,11 +5465,8 @@ def build_input_derivatives(
         # formal build 必須在發布前 fail closed。這裡不以「目錄已寫出」代替核准；若
         # OCM gap-safe window、NWW 完整逐時或 forcing inventory 尚未達到正式閘門，連
         # partial directory 都不發布，避免 operator 誤把 generated artifact 當 release。
-        if formal and any(
-            domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
-            for domain in config.domains
-        ):
-            raise InputDerivationError("formal input build 未通過：v3/20km共同forcing邊界支援尚待實際驗證")
+        # A 區 v3 的空間政策由 config schema exact 綁定；空間位置有效性仍在 runtime 每個
+        # 速度取樣階段 fail closed，因此不再以未量測的共同網格 margin 當成建置 blocker。
         formal_blockers = [
             f"{kind}_not_approved"
             for kind, payload in (
@@ -5351,30 +5490,7 @@ def build_input_derivatives(
         "arrival": arrival_payload,
         "initial_condition": dynamic_payload,
     }
-    source_bindings: dict[str, Any] = {
-        "config_hash": config.config_hash(),
-        "ocm_native_root_token": config.inputs.ocm_native_root_env,
-        "ocm_surface_root_token": config.inputs.ocm_surface_root_env,
-        "nww_analysis_root_token": config.inputs.nww_analysis_root_env,
-    }
-    if any(
-        domain.formal_domain_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1
-        for domain in config.domains
-    ):
-        # A 區新 policy 的 source binding 明確保留 domain/site formal ID、bbox 與尚待
-        # 驗證狀態；這是 provenance，不是把 input artifact 標成 approved source。
-        region_a = next(domain for domain in config.domains if domain.analysis_region_id == "A")
-        source_bindings["formal_domain_policy"] = region_a.formal_domain_policy
-        source_bindings["formal_domain_id"] = region_a.formal_release_flow_domain_id
-        source_bindings["formal_domain_bbox_lon_lat"] = list(region_a.bbox_lon_lat)
-        source_bindings["formal_domain_status"] = region_a.formal_release_domain_status
-        source_bindings["formal_site_ids"] = {
-            site.study_site_id: site.formal_release_flow_domain_id
-            for site in config.study_sites
-            if site.analysis_region_id == "A"
-        }
-    if pilot_selection is not None:
-        source_bindings["pilot_selection_scope"] = dict(pilot_selection)
+    source_bindings = _artifact_source_bindings(config, pilot_selection=pilot_selection)
     return _write_artifact_directory(
         Path(destination),
         payloads,
@@ -5870,6 +5986,20 @@ def validate_input_derivatives(
             )
         except Exception as exc:
             errors.append(f"inventory_flow_domain_binding_invalid:{type(exc).__name__}")
+    if config is not None:
+        try:
+            artifact_index, _ = read_canonical_json(root / "artifact_index.json")
+            raw_source_bindings = artifact_index.get("source_bindings")
+            source_bindings = raw_source_bindings if isinstance(raw_source_bindings, Mapping) else None
+            errors.extend(
+                _runtime_spatial_support_contract_errors(
+                    config,
+                    forcing_inventory=forcing,
+                    source_bindings=source_bindings,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"runtime_spatial_support_binding_invalid:{type(exc).__name__}")
     horizon_settings: HorizonSettings | None = None
     if config is not None:
         try:
@@ -6261,6 +6391,7 @@ def _bind_inventory_flow_domains(
     config_payload: dict[str, Any],
     *,
     inventory_flow_ids: Mapping[str, str],
+    runtime_spatial_support_contracts_by_region: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把 inventory 的真實 source ID 綁定到 release config 的 formal 欄位。
 
@@ -6268,8 +6399,10 @@ def _bind_inventory_flow_domains(
     candidate 欄位中；因此舊 expanded A 只能來自 config 已登錄的
     ``expanded_domain_candidate_id``／formal ID，不能從任意目錄名稱推導。對
     ``v3_local20km_20260909_v1``，inventory 必須 exact 綁定 v3；domain/site 的 formal
-    ID 與 bbox 會維持 v3／原值，狀態維持 ``pending_common_support``，不會被此函式 mint
-    成 ``approved_source_bound_by_inventory``。公開分析標籤不在此函式中變更。
+    ID、bbox、no-expansion runtime policy/status 會維持設定原值，不會被此函式升格為
+    空間支援已量測或正式輸入已核准。若呼叫端提供 forcing inventory 的 contract map，
+    函式會核對其與 config 相同；正式 release builder 另以 source-config hash 及
+    artifact-index hash 不可變地綁定這份來源設定與 inventory。公開分析標籤不在此函式中變更。
     """
 
     domains = config_payload.get("domains")
@@ -6281,6 +6414,12 @@ def _bind_inventory_flow_domains(
         validated_config.assert_research_domain_policy()
     except Exception as exc:
         raise InputDerivationError("config 的 formal_domain_policy／研究範圍契約不合法") from exc
+    expected_runtime_contracts = _runtime_spatial_support_contracts_by_region(validated_config)
+    if (
+        runtime_spatial_support_contracts_by_region is not None
+        and dict(runtime_spatial_support_contracts_by_region) != expected_runtime_contracts
+    ):
+        raise InputDerivationError("inventory runtime spatial-support contract 與 config 不一致")
     domain_by_region: dict[str, dict[str, Any]] = {}
     for domain in domains:
         if not isinstance(domain, dict) or not isinstance(domain.get("analysis_region_id"), str):
@@ -6319,11 +6458,14 @@ def _bind_inventory_flow_domains(
                 or actual_id != NORTHEAST_V3_FLOW_DOMAIN_ID
                 or base_id != NORTHEAST_V3_FLOW_DOMAIN_ID
                 or formal_id != NORTHEAST_V3_FLOW_DOMAIN_ID
-                or domain.get("formal_release_domain_status") != "pending_common_support"
+                or domain.get("formal_release_domain_status")
+                != FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION
+                or domain.get("runtime_spatial_support_policy")
+                != RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1
             ):
                 raise InputDerivationError(
                     "v3_local20km_20260909_v1 inventory binding 必須 exact 使用 v3，"
-                    "且 domain formal status 維持 pending_common_support"
+                    "並保留 no-expansion runtime-stage policy/status"
                 )
             resolved_bbox = _authoritative_flow_domain_bbox_lon_lat(domain_model, actual_id)
             if list(domain.get("bbox_lon_lat", ())) != list(resolved_bbox):
@@ -6577,11 +6719,27 @@ def create_release_config(
             boundaries["maximum_step_count"] = normalized_max_steps
     # forcing inventory 是 builder 對三套 accepted product 的共同來源紀錄。先從它
     # 解析每個 region 的實際 ID，再把 release config 的 formal 欄位與 site-level
-    # runtime binding 一次綁定；不能只從 template 的 base ID 或任意資料夾名稱猜測。
+    # runtime binding 一次綁定；A 區 v3 另要求 contract map 與 source config 完全一致，
+    # 不能只從 template 的 base ID 或任意資料夾名稱猜測。
     forcing_payload, _ = read_canonical_json(input_root / ARTIFACT_FILENAMES["forcing_inventory"])
     inventory_flow_ids = _flow_domain_ids_from_inventory(forcing_payload)
+    expected_runtime_contracts = _runtime_spatial_support_contracts_by_region(source_config)
     rewritten = _replace_manifest_references(config_payload, config_output=output, input_directory=input_root)
-    _bind_inventory_flow_domains(rewritten, inventory_flow_ids=inventory_flow_ids)
+    inventory_runtime_contracts = forcing_payload.get("runtime_spatial_support_contracts_by_region")
+    if expected_runtime_contracts and (
+        not isinstance(inventory_runtime_contracts, Mapping)
+        or dict(inventory_runtime_contracts) != expected_runtime_contracts
+    ):
+        raise InputDerivationError(
+            "forcing inventory 缺少或錯綁 A 區 runtime spatial-support contract"
+        )
+    _bind_inventory_flow_domains(
+        rewritten,
+        inventory_flow_ids=inventory_flow_ids,
+        runtime_spatial_support_contracts_by_region=(
+            inventory_runtime_contracts if isinstance(inventory_runtime_contracts, Mapping) else None
+        ),
+    )
     rewritten["config_status"] = "generated"
     candidate_config = ProjectConfig.model_validate(rewritten)
     requested_days = candidate_config.boundaries.max_backtrack_days

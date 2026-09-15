@@ -488,8 +488,9 @@ checkpoint root、帳密及其他絕對部署路徑不得寫入 release manifest
 - 正式 forcing 必須重新驗證 OCM `hvel`、`vertical_velocity`、`zcor`、`elev`、
   `wetdry_elem`、`diffusivity`，以及 NWW3 連續 17,544 小時 analysis。A 區本期依
   `formal_domain_policy=v3_local20km_20260909_v1` 採 12.5 km receptor core／20 km
-  local domain，formal gate 仍須由 OCM native、OCM surface、NWW analysis 對實際共同
-  邊界提供至少兩個共同有效格點的 margin evidence；南向擴域與 25／35 km A 敏感度延期，
+  local domain，正式空間支援採 `runtime_stage_fail_closed_no_expansion_v1`：OCM surface
+  支援完整 arrival 母體，OCM native／NWW analysis 在每個實際 RK4 階段依位置、深度、UTC
+  與 mask 嚴格驗證，無支援立即停止且不補值；南向擴域與 25／35 km A 敏感度延期，
   B–D 原 `expanded_domain` 敏感度保留並分開驗證；legacy
   `formal_domain_policy=expanded_domain_v1` 僅作舊設定相容讀取。
 - 已知 OCM 時間缺口只能用通過 blocked Eulerian/Lagrangian validation 的 immutable

@@ -221,7 +221,7 @@ uv run --with reportlab python3 scripts/render_source_code_flow_diagrams.py \
 | 20 個三維 receptors／每站 | `geometry.py`、`mesh.py`、`receptors.py` | [test_receptors.py](../../tests/test_receptors.py) 驗證長期濕潤水平選取與 4 個有效垂向層。 | **資料產製待完成。** 演算法已具備；五站正式 local/open-boundary/receptor manifests 尚未由實際網格產生。 |
 | 50 個到達時間／每站 | `arrival_times.select_arrival_times`、`scenarios.ArrivalTime` | [test_checkpoint_arrivals.py](../../tests/test_checkpoint_arrivals.py) 驗證 48 個分層時刻加 2 個事件時刻。 | **資料產製待完成。** 尚未以完整資料時間軸產生五站正式 50 個 UTC 與回溯可用範圍證據。 |
 | 每站 `10 × 20 × 50 = 10,000`，全案 50,000 | `config.ProjectConfig`、`scenarios.build_scenarios`、`validate_baseline_coverage` | [test_config.py](../../tests/test_config.py)、[test_scenarios.py](../../tests/test_scenarios.py) 拒絕縮減計數並驗證 50,000 個唯一情境。 | **程式契約已驗證。** 尚待把正式受體、到達時間和行為表交叉成不可變的 scenario manifest。 |
-| 離開關注區域的邊界停止 | `BoundaryGeometry`、`resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` | [test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證自站、他站、外層、海岸、海面／海床與時間步內交點。 | **邏輯已驗證；正式幾何待完成。** A 區本期依 `formal_domain_policy=v3_local20km_20260909_v1` 重建 20 km local／12.5 km receptor core；實際三產品共同 margin、五站開放水域邊界與新 geometry identity 尚未完成驗收。 |
+| 離開關注區域的邊界停止 | `BoundaryGeometry`、`resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` | [test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證自站、他站、外層、海岸、海面／海床與時間步內交點。 | **邏輯已驗證；正式幾何待完成。** A 區本期依 `formal_domain_policy=v3_local20km_20260909_v1` 重建 20 km local／12.5 km receptor core，並以 `runtime_stage_fail_closed_no_expansion_v1` 逐 RK4 階段驗證 forcing；五站開放水域邊界與新 geometry identity 仍須由完整母體建置驗收。 |
 | 公式（6）：海流 + Stokes + 向下沉降的總平流速度；完全沉沒不加 windage | `forcing.CombinedMonthForcing`、`stokes.py` | [test_mesh_forcing.py](../../tests/test_mesh_forcing.py)、[test_stokes.py](../../tests/test_stokes.py) 驗證 OCM／NWW 取樣、波向與深淺水極限。 | **程式核心已驗證。** 尚未以 SERVER 全期正式 forcing 實跑與檢查單位、濕乾語意及共同有效遮罩。 |
 | 公式（7）：由波高、週期、波向與波長計算 Stokes 漂流 | `solve_wave_number`、`finite_depth_stokes`、`deep_water_stokes` | [test_stokes.py](../../tests/test_stokes.py) 驗證色散關係殘差、深水極限與波向轉換。 | **程式核心已驗證。** baseline 的波浪資料版本、no-Stokes／深水／有限水深敏感度尚未以實值資料產出。 |
 | 公式（8）：逆向四階 Runge-Kutta 時間積分 | `integrators.rk4_step`、`engine.run_particle` | [test_integrators_diffusion.py](../../tests/test_integrators_diffusion.py)、[test_boundaries_engine.py](../../tests/test_boundaries_engine.py) 驗證負時間步長只取反一次、四個中間點與離域處理。 | **程式核心已驗證。** 正式的最小／最大時間步長和時間步收斂試驗尚待 pilot 決定。 |
@@ -286,7 +286,7 @@ flowchart LR
 
 1. OCM 缺時重建或 gap-safe 到達／回溯窗 manifest；
 2. NWW3 完整逐時 analysis manifest；
-3. 本期 A v3 flow-domain policy（12.5 km receptor core、20 km local domain）與五站 domain、開放邊界、受體 manifests；三產品共同 margin evidence validator／producer 尚未完成前，formal 維持 blocked；
+3. 本期 A v3 flow-domain policy（12.5 km receptor core、20 km local domain）與五站 domain、開放邊界、受體 manifests；A 區 formal config 須明示 no-expansion runtime-stage 封閉失敗契約，且完整母體的 OCM surface arrival 支援與 runtime forcing root 必須通過驗證；
 4. 五站各 50 個到達時刻、10 種非上浮材質／形狀代理及 50,000 個 scenario manifest；
 5. 由 pilot 決定的 `M`、擴散係數、時間步長、最大回溯期、批次大小與 checkpoint 間隔；
 6. 實值 pilot、全期 SERVER batch、aggregate release 與 F01–F12 圖表。
@@ -297,7 +297,7 @@ flowchart LR
 
 下一個正確的里程碑不是直接跑 50,000 × `M` 條軌跡，而是建立一組可審查的「實值 pilot 證據包」：
 
-1. A 區 v3 policy 的 forcing／幾何／受體／到達時刻 manifests，以及 OCM native、OCM surface、NWW analysis 的實際共同 margin evidence；B-D 原有 expanded-domain 敏感度另依各自 manifest 驗證；
+1. A 區 v3 policy 的 forcing／幾何／受體／到達時刻 manifests、OCM surface 完整 arrival 母體支援，以及 OCM native／NWW analysis 的逐 RK4 階段封閉失敗契約；B-D 原有 expanded-domain 敏感度另依各自 manifest 驗證；
 2. 代表性站點與行為的 reference pilot shards；
 3. 時間步長、回溯期、擴散係數與成員數的收斂結果；
 4. local entry、outer exit、海岸與資料停止原因的摘要；

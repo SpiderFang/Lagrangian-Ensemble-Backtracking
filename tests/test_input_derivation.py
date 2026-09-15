@@ -380,20 +380,21 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
-    # 這組 coarse 8×10/2×2 mesh 只驗證既有 schema 連接，不能冒充新 policy 所要求的
-    # 三套 forcing 共同 margin 證據；明示 legacy policy 以保留 margin=0 的 synthetic
-    # fixture 語意與舊 geometry／scenario identity。
+    # 這組 coarse 8×10/2×2 mesh 只驗證既有 schema 連接，不能冒充 A 區逐 stage runtime
+    # 空間支援的科學驗收；測試明示 legacy policy，並以零受體邊界 inset 保留 synthetic
+    # fixture 語意與舊 geometry／scenario identity。正式 A v3 仍鎖定原本的幾何篩選值。
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
+    payload["domains"][0].pop("runtime_spatial_support_policy", None)
     payload["domains"][0]["expanded_domain_candidate_id"] = (
         "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     )
     payload["domains"][0]["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
     payload["domains"][0]["formal_release_flow_domain_id"] = None
     payload["domains"][0]["formal_release_domain_status"] = "expanded_domain_generation_required"
-    # 將 synthetic mesh 的 face scale 設為零 margin；正式資料仍由 config 登錄的兩格
-    # margin gate 決定。這個測試只隔離 receptor／dynamic 的 schema 連接，不放寬 production
-    # 預設值本身。
+    # 將 synthetic mesh 的受體候選邊界 inset 設為零；這是 selector 幾何參數，與 A v3
+    # 不再宣告的三套 forcing 共同格網 margin 不同。本 fixture 只隔離 receptor/dynamic
+    # 的 schema 連接，不變更 production v3 設定。
     for site in payload["study_sites"]:
         if site["analysis_region_id"] == "A":
             site["formal_release_flow_domain_id"] = None
@@ -1890,6 +1891,17 @@ def test_shared_30_day_mother_creates_7_and_30_day_release_configs(
         assert release_payload["boundaries"]["max_backtrack_days"] == float(days)
         assert release_payload["boundaries"]["maximum_step_count"] == steps
         release_binding = release_payload["release_binding"]
+        artifact_index, artifact_index_fingerprint = read_canonical_json(
+            artifact_directory / "artifact_index.json"
+        )
+        source_config_hash = ProjectConfig.model_validate(
+            yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        ).config_hash()
+        assert artifact_index["source_bindings"]["config_hash"] == source_config_hash
+        assert release_binding["source_config_hash"] == source_config_hash
+        assert release_binding["input_directory_artifact_index_sha256"] == (
+            artifact_index_fingerprint["sha256"]
+        )
         assert release_binding["backtrack_horizon_binding"]["artifact_backtrack_support_days"] == 30.0
         current_fingerprints = {
             item["kind"]: (item["sha256"], item["canonical_sha256"], item["size_bytes"])
@@ -2662,6 +2674,7 @@ def test_expanded_candidate_without_registered_bbox_fails_closed() -> None:
     # 因此 fixture 先明示舊 policy 與候選，再移除 bbox 觸發原本的 fail-closed gate。
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     a_domain["formal_domain_policy"] = "expanded_domain_v1"
+    a_domain.pop("runtime_spatial_support_policy", None)
     candidate_id = "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     a_domain["expanded_domain_candidate_id"] = candidate_id
     a_domain["formal_release_flow_domain_id"] = candidate_id
@@ -2684,8 +2697,8 @@ def test_expanded_candidate_without_registered_bbox_fails_closed() -> None:
         )
 
 
-def test_v3_policy_binds_exact_source_and_preserves_pending_status() -> None:
-    """新 policy 的三套 inventory source 必須 exact v3，binding 不得 mint approved status。"""
+def test_v3_policy_binds_exact_source_and_preserves_runtime_stage_status() -> None:
+    """新 policy exact 綁定 v3 並保留 no-expansion 狀態，inventory binding 不會升格支援證據。"""
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
@@ -2697,17 +2710,134 @@ def test_v3_policy_binds_exact_source_and_preserves_pending_status() -> None:
             "C": "houwan_nmmba_cache_v3",
             "D": "lienchiang_common_cache_v3",
         },
+        runtime_spatial_support_contracts_by_region=(
+            input_derivation_module._runtime_spatial_support_contracts_by_region(
+                input_derivation_module.load_config(EXAMPLE_CONFIG)
+            )
+        ),
     )
     a_domain = next(domain for domain in result["domains"] if domain["analysis_region_id"] == "A")
     assert a_domain["formal_release_flow_domain_id"] == "northeast_taiwan_common_cache_v3"
     assert a_domain["bbox_lon_lat"] == [121.306315, 122.793685, 24.600844, 25.499156]
-    assert a_domain["formal_release_domain_status"] == "pending_common_support"
-    assert a_domain["formal_release_domain_status"] != "approved_source_bound_by_inventory"
+    assert a_domain["formal_release_domain_status"] == "no_expansion_runtime_stage_fail_closed"
+    assert a_domain["runtime_spatial_support_policy"] == "runtime_stage_fail_closed_no_expansion_v1"
+    # Flow-domain 綁定只解析正式來源與空間政策，不得把仍含其他待衍生欄位的
+    # 範例設定擅自升格；正式 builder 會在全部輸入閘門通過後另行決定狀態。
+    assert result["config_status"] == "design_pending"
     assert {
         site["formal_release_flow_domain_id"]
         for site in result["study_sites"]
         if site["analysis_region_id"] == "A"
     } == {"northeast_taiwan_common_cache_v3"}
+
+    # artifact index 的來源設定摘要與 policy map 沿用同一個 config；正式 release 的既有
+    # source_config_hash 與 artifact-index SHA-256 會不可變地封存此索引，不另加 release map。
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG, formal_release=False)
+    source_bindings = input_derivation_module._artifact_source_bindings(
+        config,
+        pilot_selection=None,
+    )
+    expected_contracts = input_derivation_module._runtime_spatial_support_contracts_by_region(config)
+    assert source_bindings["config_hash"] == config.config_hash()
+    assert source_bindings["runtime_spatial_support_contracts_by_region"] == expected_contracts
+    assert source_bindings["formal_domain_status"] == "no_expansion_runtime_stage_fail_closed"
+    assert source_bindings["runtime_spatial_support_policy"] == (
+        "runtime_stage_fail_closed_no_expansion_v1"
+    )
+
+
+def test_v3_runtime_support_inventory_and_binding_reject_tamper(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+) -> None:
+    """forcing inventory 與 artifact source binding 保存相同 v3 policy，竄改或舊 margin 均拒絕。"""
+
+    _config_path, ocm_root, surface_root, nww_root, _root = synthetic_input_fixture
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG, formal_release=False)
+    flow_domain_id = "northeast_taiwan_common_cache_v3"
+    months = input_derivation_module._months_for_config(config)
+    products = (
+        input_derivation_module._load_product(
+            product="ocm_native",
+            root=ocm_root,
+            root_token=config.inputs.ocm_native_root_env,
+            flow_domain_id=flow_domain_id,
+            months=months,
+            config=config,
+        ),
+        input_derivation_module._load_product(
+            product="ocm_surface",
+            root=surface_root,
+            root_token=config.inputs.ocm_surface_root_env,
+            flow_domain_id=flow_domain_id,
+            months=months,
+            config=config,
+        ),
+        input_derivation_module._load_product(
+            product="nww3_analysis",
+            root=nww_root,
+            root_token=config.inputs.nww_analysis_root_env,
+            flow_domain_id=flow_domain_id,
+            months=months,
+            config=config,
+        ),
+    )
+    # 這份小型 fixture 僅測試 manifest 欄位的寫入／比對；generated 狀態不得因此升格，
+    # 也不構成三套正式 forcing 的共同空間支援或正式 30 日證據。
+    preflight_report = SimpleNamespace(to_dict=lambda: {"mode": "test", "findings": []})
+    expected_axis = input_derivation_module._expected_hourly_axis(months)
+    inventory = input_derivation_module._forcing_inventory_payload(
+        config=config,
+        products_by_region={"A": products},
+        preflight_reports=[preflight_report],
+        expected_axis=expected_axis,
+        strict=False,
+    )
+    source_bindings = input_derivation_module._artifact_source_bindings(
+        config,
+        pilot_selection=None,
+    )
+    assert inventory["status"] == "generated"
+    assert inventory["runtime_spatial_support_contracts_by_region"] == (
+        source_bindings["runtime_spatial_support_contracts_by_region"]
+    )
+    assert len(inventory["products"]) == 3
+    for product in inventory["products"]:
+        metadata = product["grid_metadata"]
+        assert metadata["formal_domain_policy"] == "v3_local20km_20260909_v1"
+        assert metadata["runtime_spatial_support_policy"] == (
+            "runtime_stage_fail_closed_no_expansion_v1"
+        )
+        assert metadata["formal_release_domain_status"] == (
+            "no_expansion_runtime_stage_fail_closed"
+        )
+        assert "minimum_common_forcing_margin_grid_cells" not in metadata
+    assert input_derivation_module._runtime_spatial_support_contract_errors(
+        config,
+        forcing_inventory=inventory,
+        source_bindings=source_bindings,
+    ) == []
+
+    changed_binding = deepcopy(source_bindings)
+    changed_binding["runtime_spatial_support_contracts_by_region"]["A"][
+        "stop_at_data_gap"
+    ] = False
+    binding_errors = input_derivation_module._runtime_spatial_support_contract_errors(
+        config,
+        forcing_inventory=inventory,
+        source_bindings=changed_binding,
+    )
+    assert "artifact_runtime_spatial_support_source_binding_mismatch" in binding_errors
+
+    changed_inventory = deepcopy(inventory)
+    changed_inventory["products"][0]["grid_metadata"][
+        "minimum_common_forcing_margin_grid_cells"
+    ] = 2
+    margin_errors = input_derivation_module._runtime_spatial_support_contract_errors(
+        config,
+        forcing_inventory=changed_inventory,
+        source_bindings=source_bindings,
+    )
+    assert "forcing_inventory_unmeasured_common_margin_claim_present" in margin_errors
 
 
 def test_v3_policy_resolver_does_not_fallback_to_v4(tmp_path: Path) -> None:

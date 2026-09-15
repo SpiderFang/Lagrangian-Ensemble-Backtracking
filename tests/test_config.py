@@ -39,8 +39,13 @@ def _legacy_hash_payload() -> dict:
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     a_domain = payload["domains"][0]
     a_domain.pop("formal_domain_policy", None)
+    a_domain.pop("runtime_spatial_support_policy", None)
     a_domain["formal_release_flow_domain_id"] = None
     a_domain["formal_release_domain_status"] = "expanded_domain_generation_required"
+    # 這兩個 extra 是舊 v3 YAML 曾宣告、但沒有經驗證的共同 forcing margin；legacy hash
+    # snapshot 必須保留歷史位元組語意，與新 policy 明確移除此宣告分開測試。
+    a_domain["minimum_common_forcing_margin_grid_cells"] = 2
+    a_domain["margin_required_for_forcings"] = ["ocm_native", "ocm_surface", "nww3_analysis"]
     a_domain["expanded_domain_candidate_id"] = "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     a_domain["expanded_bbox_lon_lat"] = [121.306315, 122.793685, 24.480000, 25.499156]
     a_domain["expanded_south_boundary_at_or_south_of_deg"] = 24.48
@@ -145,10 +150,10 @@ def test_config_hash_is_independent_of_mapping_order() -> None:
 
 
 def test_omitted_backtrack_support_keeps_current_example_hash() -> None:
-    """未宣告新支援欄位時，現行範例 hash 必須維持主專案已凍結值。"""
+    """舊的回溯支援 optional 欄位不入 hash；明示 v3 runtime policy 另形成新 hash。"""
 
     config = ProjectConfig.model_validate(_payload())
-    assert config.config_hash() == "163ee4f9f113a567206a28354e69e783db2da4eedc6ea618276893d4c1554214"
+    assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
     assert "backtrack_support_days" not in config.normalized_payload()["inputs"]
 
 
@@ -158,7 +163,7 @@ def test_omitted_ocm_interpolation_backend_keeps_numpy_and_current_hash() -> Non
     config = ProjectConfig.model_validate(_payload())
     assert config.execution.ocm_interpolation_backend == "numpy_v1"
     assert "ocm_interpolation_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "163ee4f9f113a567206a28354e69e783db2da4eedc6ea618276893d4c1554214"
+    assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
 
 
 def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
@@ -167,7 +172,7 @@ def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
     config = ProjectConfig.model_validate(_payload())
     assert config.execution.physics_kernel_backend == "numpy_v1"
     assert "physics_kernel_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "163ee4f9f113a567206a28354e69e783db2da4eedc6ea618276893d4c1554214"
+    assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
 
 
 @pytest.mark.parametrize("backend", ["numpy_v1", "numba_cpu_v1"])
@@ -264,6 +269,18 @@ def test_legacy_config_hash_preserves_omitted_policy_semantics() -> None:
     assert "formal_domain_policy" not in config.normalized_payload()["domains"][0]
 
 
+def test_omitted_optional_boundary_controls_preserve_legacy_payload_shape() -> None:
+    """舊 YAML 未明示的新 BoundaryConfig 欄位不得以 null 寫入 normalized hash。"""
+
+    payload = _legacy_hash_payload()
+    payload["boundaries"].pop("stop_at_forcing_start", None)
+    payload["boundaries"].pop("stop_at_data_gap", None)
+    config = ProjectConfig.model_validate(payload)
+    normalized_boundaries = config.normalized_payload()["boundaries"]
+    assert "stop_at_forcing_start" not in normalized_boundaries
+    assert "stop_at_data_gap" not in normalized_boundaries
+
+
 def test_rejects_region_a_site_merging() -> None:
     """A 區必須同時保留貢寮與龜山島兩個獨立 study_site_id。"""
 
@@ -327,6 +344,7 @@ def test_flow_domain_resolver_selects_formal_release_id_only_in_formal_mode() ->
     # 不可藉改 policy 將現行 v3 config 降回舊來源。
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
+    payload["domains"][0].pop("runtime_spatial_support_policy", None)
     payload["domains"][0]["formal_release_flow_domain_id"] = (
         "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     )
@@ -349,18 +367,29 @@ def test_flow_domain_resolver_selects_formal_release_id_only_in_formal_mode() ->
     assert resolve_flow_domain_id(config, "B", formal=True) == "hsinchu_cache_v3"
 
 
-def test_v3_local20_policy_loads_but_formal_release_stays_blocked() -> None:
-    """A 區核准的 v3/20 km scope 可載入，但共同 forcing 邊界未驗證時必須阻擋 formal。"""
+def test_v3_local20_policy_records_no_expansion_runtime_stage_contract() -> None:
+    """A 區固定 v3/20 km 與逐 stage policy，且不宣稱已量測共同 forcing margin。"""
 
     config = load_config(EXAMPLE_CONFIG)
     assert config.domains[0].formal_domain_policy == "v3_local20km_20260909_v1"
+    assert config.domains[0].runtime_spatial_support_policy == (
+        "runtime_stage_fail_closed_no_expansion_v1"
+    )
+    assert config.domains[0].formal_release_domain_status == "no_expansion_runtime_stage_fail_closed"
     assert resolve_flow_domain_id(config, "A", formal=True) == "northeast_taiwan_common_cache_v3"
-    with pytest.raises(ValueError, match="v3/20km共同forcing邊界支援尚待實際驗證"):
-        config.assert_formal_release_ready()
+    assert config.boundaries.stop_at_data_gap is True
+    assert config.boundaries.stop_at_forcing_start is True
+    assert config.boundaries.flow_domain_open_boundary == "stop_at_first_crossing"
+    assert "minimum_common_forcing_margin_grid_cells" not in (config.domains[0].model_extra or {})
+    assert all(
+        site.model_extra["minimum_flow_domain_margin_local_grid_scales"] == 2
+        for site in config.study_sites
+        if site.analysis_region_id == "A"
+    )
 
 
-def test_v3_formal_gate_ignores_fake_approved_evidence() -> None:
-    """新 policy 即使填滿 approved／path 欄位，也不得偽造共同 forcing 邊界證據。"""
+def test_v3_formal_config_gate_no_longer_has_unconditional_margin_blocker() -> None:
+    """完整設定可通過 config-only gate；這不替代 accepted-product 與 manifest 驗證。"""
 
     payload = _payload()
     payload["config_status"] = "approved"
@@ -403,8 +432,7 @@ def test_v3_formal_gate_ignores_fake_approved_evidence() -> None:
     payload["execution"].update({"shard_scenario_count": 1_000, "checkpoint_interval_sweeps": 10})
 
     config = ProjectConfig.model_validate(payload)
-    with pytest.raises(ValueError, match="v3/20km共同forcing邊界支援尚待實際驗證"):
-        config.assert_formal_release_ready()
+    config.assert_formal_release_ready()
 
 
 @pytest.mark.parametrize(
@@ -415,11 +443,18 @@ def test_v3_formal_gate_ignores_fake_approved_evidence() -> None:
             "northeast_taiwan_common_cache_v4",
             "formal flow domain",
         ),
+        (("domains", 0, "flow_domain_id"), "northeast_taiwan_common_cache_v4", "exact v3"),
+        (("domains", 0, "bbox_lon_lat"), [121.30, 122.79, 24.60, 25.50], "bbox"),
         (("study_sites", 0, "local_domain_baseline_radius_m"), 35_000, "local radius"),
         (("study_sites", 1, "receptor_core_radius_m"), 20_000, "receptor core"),
         (("study_sites", 0, "local_domain_sensitivity_radii_m"), [35_000], "sensitivity"),
         (("study_sites", 0, "radius_35000_requires_expanded_flow_domain"), True, "expanded radius mandatory"),
-        (("domains", 0, "minimum_common_forcing_margin_grid_cells"), 0, "margin"),
+        (("domains", 0, "minimum_common_forcing_margin_grid_cells"), 2, "未量測的共同 forcing margin"),
+        (
+            ("domains", 0, "expanded_domain_candidate_id"),
+            "northeast_taiwan_common_cache_v4",
+            "expanded candidate",
+        ),
     ],
 )
 def test_v3_local20_policy_rejects_scope_drift(
@@ -430,6 +465,12 @@ def test_v3_local20_policy_rejects_scope_drift(
     payload = _payload()
     section, index, field = path
     payload[section][index][field] = value
+    if section == "domains" and field == "flow_domain_id":
+        # 先同步兩站的 region/base ID，讓測試到達 v3 的 exact ID policy，而非被更早的
+        # 通用 region-to-domain 一致性檢查攔截；這不是放寬規則，只隔離目標 gate。
+        for site in payload["study_sites"]:
+            if site["analysis_region_id"] == "A":
+                site["flow_domain_id"] = value
     with pytest.raises(ValueError, match=message):
         ProjectConfig.model_validate(payload)
 
@@ -440,6 +481,34 @@ def test_v3_local20_policy_rejects_unknown_policy() -> None:
     payload = _payload()
     payload["domains"][0]["formal_domain_policy"] = "v3_local20km_unregistered"
     with pytest.raises(ValueError, match="formal_domain_policy"):
+        ProjectConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("domains", "runtime_spatial_support_policy", None, "runtime_spatial_support_policy"),
+        ("boundaries", "stop_at_data_gap", False, "stop_at_data_gap=true"),
+        ("boundaries", "stop_at_forcing_start", False, "stop_at_forcing_start=true"),
+        (
+            "boundaries",
+            "flow_domain_open_boundary",
+            "record_and_continue",
+            "flow_domain_open_boundary=stop_at_first_crossing",
+        ),
+    ],
+)
+def test_v3_runtime_spatial_support_policy_rejects_missing_or_relaxed_controls(
+    section: str, field: str, value: object, message: str
+) -> None:
+    """逐 stage 契約缺漏或任一既有停止控制被放寬時，必須在 config 層拒絕。"""
+
+    payload = _payload()
+    if section == "domains":
+        payload["domains"][0][field] = value
+    else:
+        payload["boundaries"][field] = value
+    with pytest.raises(ValueError, match=message):
         ProjectConfig.model_validate(payload)
 
 
