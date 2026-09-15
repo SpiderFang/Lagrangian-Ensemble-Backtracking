@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -10,7 +11,10 @@ import numpy as np
 import pytest
 from shapely.geometry import box
 
+import lagrangian_backtracking.forcing_window as forcing_window_module
 from lagrangian_backtracking.boundaries import BoundaryGeometry
+from lagrangian_backtracking.checkpoint import CheckpointBinding
+from lagrangian_backtracking.config import load_config
 from lagrangian_backtracking.diffusion import DiffusionCoefficients, SmagorinskySettings
 from lagrangian_backtracking.engine import (
     EngineSettings,
@@ -30,7 +34,9 @@ from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.integrators import supports_step_start_sample_reuse
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.models import ParticleState, SampleQC
-from lagrangian_backtracking.production import HintTrackingVelocityProvider
+from lagrangian_backtracking.production import HintTrackingVelocityProvider, ProductionBatch
+from lagrangian_backtracking.runner import ReferenceParticleRequest, plan_scenario_shards
+from lagrangian_backtracking.scenarios import Scenario
 
 
 def _mesh() -> NativeMesh:
@@ -834,6 +840,232 @@ def _sample_time(month_id: str, *, offset_seconds: int = 1_800) -> int:
     return _month_start_ns(month_id) + offset_seconds * 1_000_000_000
 
 
+def _ocm_backend_parity_shard():
+    """建立兩個 backend 共用的固定 scenario／seed 工作單位。"""
+
+    scenario = Scenario(
+        scenario_id="ocm-backend-parity",
+        study_site_id="synthetic-site",
+        analysis_region_id="synthetic-region",
+        material_id="synthetic-material",
+        receptor_id="synthetic-receptor",
+        arrival_time_id="synthetic-arrival",
+        settling_velocity_mps=-0.002,
+        arrival_time_utc_ns=_utc_ns("2024-08-01T00:00:30Z"),
+        design_version="ocm-backend-parity-v1",
+    )
+    return plan_scenario_shards(
+        [scenario],
+        members_per_scenario=2,
+        shard_scenario_count=1,
+        experiment_case_id="no_stokes",
+    )[0]
+
+
+def _ocm_backend_request_factory(use_numba_kernel: bool):
+    """以相同跨月 OCM fixture 建立 production request factory。
+
+    July 的最後一個時間列與 August 的第一個時間列分別提供月界前後端點；兩種
+    backend 只改變 OCM 內層垂向／水平／時間插值的實作。固定一秒步長、四秒回溯、
+    非零水平擴散與窄 local domain 讓測試同時產生多步觀測、亂數與 local 邊界事件，
+    但粒子始終留在 synthetic native triangle 內，不把域外資料當成可用速度。
+    """
+
+    july_end = [_utc_ns("2024-07-31T23:00:00Z"), _utc_ns("2024-08-01T00:00:00Z")]
+    august_start = [_utc_ns("2024-08-01T01:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    manager, _, _ = _manager(
+        {
+            "202407": _ocm_cross_month(
+                "202407", july_end, use_numba_kernel=use_numba_kernel
+            ),
+            "202408": _ocm_cross_month(
+                "202408", august_start, use_numba_kernel=use_numba_kernel
+            ),
+        }
+    )
+    provider = manager.provider(-0.002, include_stokes=False)
+    boundaries = BoundaryGeometry(
+        own_local_domain=box(1.95, 0.5, 8.5, 8.5),
+        flow_domain=box(0.5, 0.5, 9.5, 9.5),
+        foreign_local_domains={},
+    )
+    settings = EngineSettings(
+        dt_min_seconds=1.0,
+        dt_max_seconds=1.0,
+        output_interval_seconds=1.0,
+        max_backtrack_seconds=4.0,
+        maximum_step_count=32,
+        earliest_forcing_time_utc_ns=0,
+    )
+
+    def factory(unit):
+        """對兩個 member 使用同一 forcing，但由 unit 保留獨立 seed 與 identity。"""
+
+        state = ParticleState(
+            particle_id=unit.particle_id,
+            scenario_id=unit.scenario.scenario_id,
+            member_id=unit.member_id,
+            study_site_id=unit.scenario.study_site_id,
+            analysis_region_id=unit.scenario.analysis_region_id,
+            receptor_id=unit.scenario.receptor_id,
+            x_m=2.0,
+            y_m=2.0,
+            z_m=-5.0,
+            time_utc_ns=unit.scenario.arrival_time_utc_ns,
+        )
+        return ReferenceParticleRequest(
+            initial_state=state,
+            velocity=provider,
+            boundaries=boundaries,
+            behavior_class="sinking",
+            diffusion=DiffusionCoefficients(1.0e-4, 1.0e-4, 0.0),
+            settings=settings,
+        )
+
+    return factory
+
+
+def _ocm_backend_batch(shard, *, use_numba_kernel: bool) -> ProductionBatch:
+    """以固定 scenario／master seed 建立指定 OCM backend 的 production batch。"""
+
+    return ProductionBatch(
+        shard,
+        master_seed=20260914,
+        request_factory=_ocm_backend_request_factory(use_numba_kernel),
+        active_chunk_size=2,
+    )
+
+
+def _ocm_backend_config_hash(backend: str) -> str:
+    """從範例設定衍生明示 backend hash，供 checkpoint binding 使用。"""
+
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "lagrangian_backtracking.example.yaml"
+    config = load_config(config_path)
+    execution = config.execution.model_copy(update={"ocm_interpolation_backend": backend})
+    return config.model_copy(update={"execution": execution}).config_hash()
+
+
+def _ocm_backend_binding(shard, backend: str) -> CheckpointBinding:
+    """建立只差 OCM backend config hash 的 checkpoint binding。"""
+
+    return CheckpointBinding(
+        config_hash=_ocm_backend_config_hash(backend),
+        input_inventory_hash="synthetic-ocm-inventory",
+        experiment_case_id=shard.experiment_case_id,
+        shard_id=shard.shard_id,
+        seed_policy="pcg64dxsm-v1",
+        code_commit="synthetic-ocm-commit",
+    )
+
+
+def _assert_backend_values_equivalent(actual, expected) -> None:
+    """遞迴比較完整結果；缺值／狀態 exact，有限浮點採固定嚴格容差。"""
+
+    if actual is None or expected is None:
+        assert actual == expected
+    elif isinstance(actual, float) or isinstance(expected, float):
+        np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    elif isinstance(actual, dict) and isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_backend_values_equivalent(actual[key], expected[key])
+    elif isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected, strict=True):
+            _assert_backend_values_equivalent(actual_item, expected_item)
+    else:
+        assert actual == expected
+
+
+def _assert_particle_results_backend_equivalent(actual, expected) -> None:
+    """比較兩 backend 的完整狀態、觀測、事件、QC 與步數。"""
+
+    assert len(actual) == len(expected)
+    for actual_result, expected_result in zip(actual, expected, strict=True):
+        _assert_backend_values_equivalent(asdict(actual_result), asdict(expected_result))
+
+
+def _assert_batch_rng_states_equal(actual: ProductionBatch, expected: ProductionBatch) -> None:
+    """確認每個固定 particle seed 的 PCG64DXSM continuation state 完全一致。"""
+
+    assert [runtime.rng.bit_generator.state for runtime in actual.runtimes] == [
+        runtime.rng.bit_generator.state for runtime in expected.runtimes
+    ]
+
+
+def test_ocm_backends_match_full_multistep_trajectory_and_rng_state() -> None:
+    """同一跨月 forcing、scenario 與 seed 的 NumPy／Numba 完整軌跡應保持一致。"""
+
+    shard = _ocm_backend_parity_shard()
+    numpy_batch = _ocm_backend_batch(shard, use_numba_kernel=False)
+    numba_batch = _ocm_backend_batch(shard, use_numba_kernel=True)
+    numpy_results = numpy_batch.complete()
+    numba_results = numba_batch.complete()
+
+    _assert_particle_results_backend_equivalent(numba_results, numpy_results)
+    _assert_batch_rng_states_equal(numba_batch, numpy_batch)
+    assert any(result.events for result in numpy_results)
+    assert all(result.observations for result in numpy_results)
+    assert all(
+        observation.velocity_qc_flags == 0
+        for result in numpy_results
+        for observation in result.observations
+        if observation.velocity_sample_status.value == "complete"
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "use_numba_kernel"),
+    [("numpy_v1", False), ("numba_ocm_v1", True)],
+)
+def test_each_ocm_backend_checkpoint_resume_and_cross_backend_binding(
+    tmp_path: Path, backend: str, use_numba_kernel: bool
+) -> None:
+    """各 backend 的 checkpoint resume 應等於不中斷結果，跨 backend binding 必須拒絕。"""
+
+    shard = _ocm_backend_parity_shard()
+    binding = _ocm_backend_binding(shard, backend)
+    other_backend = "numba_ocm_v1" if backend == "numpy_v1" else "numpy_v1"
+    other_binding = _ocm_backend_binding(shard, other_backend)
+    assert binding.config_hash != other_binding.config_hash
+
+    uninterrupted = _ocm_backend_batch(shard, use_numba_kernel=use_numba_kernel)
+    uninterrupted_results = uninterrupted.complete()
+    interrupted = _ocm_backend_batch(shard, use_numba_kernel=use_numba_kernel)
+    interrupted.advance(sweeps=2)
+    assert interrupted.active_count > 0
+    # 每個 backend 使用自己的父目錄，避免兩組測試共用 generation；父目錄內的首次
+    # checkpoint 必須採用 schema 3 固定要求的 canonical 名稱 checkpoint-00000001。
+    checkpoint_path = interrupted.write_checkpoint(
+        tmp_path / backend / "checkpoint-00000001",
+        binding=binding,
+        # checkpoint sequence 表示不可變 generation 的連續編號，不是已完成的
+        # sweep 數；首次寫入固定從 1 開始，才能驗證 schema 3 hash chain。
+        sequence=1,
+    )
+    resumed = ProductionBatch.from_checkpoint(
+        checkpoint_path,
+        shard=shard,
+        master_seed=20260914,
+        request_factory=_ocm_backend_request_factory(use_numba_kernel),
+        expected_binding=binding,
+        active_chunk_size=2,
+    )
+    resumed_results = resumed.complete()
+    _assert_particle_results_backend_equivalent(resumed_results, uninterrupted_results)
+    _assert_batch_rng_states_equal(resumed, uninterrupted)
+
+    with pytest.raises(ValueError, match="config_hash"):
+        ProductionBatch.from_checkpoint(
+            checkpoint_path,
+            shard=shard,
+            master_seed=20260914,
+            request_factory=_ocm_backend_request_factory(not use_numba_kernel),
+            expected_binding=other_binding,
+            active_chunk_size=2,
+        )
+
+
 def test_same_month_material_facades_share_ocm_and_no_stokes_never_loads_nww() -> None:
     """不同沉降速度只建立輕量合併 facade，同月 OCM 及 no-Stokes NWW 都只讀一次／零次。"""
 
@@ -881,6 +1113,74 @@ def test_same_month_hot_path_counts_one_hit_per_product_after_warmup() -> None:
     after_stokes = manager.cache_stats
     assert after_stokes.ocm_cache_hit_count - before_stokes.ocm_cache_hit_count == 1
     assert after_stokes.nww_cache_hit_count - before_stokes.nww_cache_hit_count == 1
+
+
+def test_month_metadata_cache_reuses_hot_path_parse_and_next_month_start() -> None:
+    """同一月份反覆判斷熱路徑時，解析與下一月月初計算只在首次建立快取項目時發生。
+
+    直接觀察 production helper 的 ``cache_info``，而不是在測試中重做月份計算；首次
+    呼叫會建立查詢月份與下一月份兩個 metadata，第二次呼叫只增加命中數。這保留月界
+    halo 判斷依賴實際時間軸的原則，同時避免每個 OCM/NWW 速度樣本再次呼叫
+    ``datetime.strptime``。
+    """
+
+    forcing_window_module._cached_month_metadata.cache_clear()
+    month = "202412"
+    forcing = _ocm(month, _mesh())
+    target_ns = _month_start_ns(month) + 1_800 * 1_000_000_000
+
+    assert forcing_window_module.ForcingWindowManager._is_same_month_hot_path_safe(
+        month, target_ns, forcing
+    )
+    first = forcing_window_module._cached_month_metadata.cache_info()
+    assert first.misses == 2
+    assert first.currsize == 2
+
+    assert forcing_window_module.ForcingWindowManager._is_same_month_hot_path_safe(
+        month, target_ns, forcing
+    )
+    second = forcing_window_module._cached_month_metadata.cache_info()
+    assert second.misses == first.misses
+    assert second.hits == first.hits + 2
+
+    forcing_window_module._cached_month_metadata.cache_clear()
+
+
+@pytest.mark.parametrize("month_id", ["202400", "202413", "20A401", "20241"])
+def test_month_metadata_cache_rejects_invalid_month_without_caching(month_id: str) -> None:
+    """非法月份維持既有 ValueError，且不因錯誤輸入占用有限月份快取。"""
+
+    forcing_window_module._cached_month_metadata.cache_clear()
+    with pytest.raises(ValueError, match="month_id"):
+        forcing_window_module._validate_month_id(month_id)
+    assert forcing_window_module._cached_month_metadata.cache_info().currsize == 0
+
+
+def test_month_metadata_cache_rejects_non_string_month_id_without_lru_type_error() -> None:
+    """非字串 month_id 仍由驗證層回報 ValueError，不暴露 lru_cache 的雜湊錯誤。"""
+
+    forcing_window_module._cached_month_metadata.cache_clear()
+    with pytest.raises(ValueError, match="month_id 必須是 YYYYMM"):
+        forcing_window_module._validate_month_id(202412)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="month_id 必須是 YYYYMM"):
+        forcing_window_module._validate_month_id(["202412"])  # type: ignore[arg-type]
+    assert forcing_window_module._cached_month_metadata.cache_info().currsize == 0
+
+
+def test_adjacent_month_metadata_cache_preserves_cross_year_and_datetime_bounds() -> None:
+    """跨年相鄰月份與 datetime 首尾界線維持原本的曆法結果與錯誤契約。"""
+
+    forcing_window_module._cached_month_metadata.cache_clear()
+    assert forcing_window_module._adjacent_month_id("202412", 1) == "202501"
+    assert forcing_window_module._adjacent_month_id("202501", -1) == "202412"
+    assert forcing_window_module._month_start_ns("202501") == _month_start_ns("202501")
+    assert forcing_window_module._month_start_ns("000101") == _month_start_ns("000101")
+    assert forcing_window_module._month_start_ns("999912") == _month_start_ns("999912")
+    with pytest.raises(ValueError, match="超出 datetime 支援範圍"):
+        forcing_window_module._adjacent_month_id("000101", -1)
+    with pytest.raises(ValueError, match="超出 datetime 支援範圍"):
+        forcing_window_module._adjacent_month_id("999912", 1)
+    forcing_window_module._cached_month_metadata.cache_clear()
 
 
 def test_stokes_loads_nww_lazily_once_after_no_stokes() -> None:
@@ -1135,8 +1435,11 @@ def _write_production_fixture(root: Path, month_id: str) -> None:
     _save_npy(nww_grid, "lat.npy", nww_data.lat)
 
 
-def test_from_roots_loads_mesh_once_and_production_missing_month_is_qc(tmp_path: Path) -> None:
-    """from_roots 使用固定 root layout；已存在月份可取樣，缺月份回時間範圍 QC。"""
+@pytest.mark.parametrize("use_numba_kernel", [False, True])
+def test_from_roots_loads_mesh_once_and_production_missing_month_is_qc(
+    tmp_path: Path, use_numba_kernel: bool
+) -> None:
+    """from_roots 使用固定 root layout，並把 OCM kernel 選擇傳到月份 reader。"""
 
     month = "197001"
     _write_production_fixture(tmp_path, month)
@@ -1145,11 +1448,27 @@ def test_from_roots_loads_mesh_once_and_production_missing_month_is_qc(tmp_path:
         projection=DomainProjection(121.0, 25.0),
         ocm_root=tmp_path / "ocm",
         nww_root=tmp_path / "nww",
+        use_numba_kernel=use_numba_kernel,
     )
     assert manager.provider(-0.1, True).sample(1.0, 1.0, -5.0, _sample_time(month)).valid
+    assert manager._months[month].ocm is not None
+    assert manager._months[month].ocm.use_numba_kernel is use_numba_kernel
     missing = manager.provider(-0.1, False).sample(1.0, 1.0, -5.0, _sample_time("197002"))
     assert missing.qc == SampleQC.OUTSIDE_TIME_RANGE
     assert manager.cache_stats.ocm_load_count == 1
+
+
+def test_from_roots_rejects_non_boolean_ocm_kernel_switch(tmp_path: Path) -> None:
+    """OCM kernel 開關若不是真正 bool，應在讀取任何 root 前拒絕。"""
+
+    with pytest.raises(TypeError, match="use_numba_kernel 必須是 bool"):
+        ForcingWindowManager.from_roots(
+            flow_domain_id="synthetic_domain",
+            projection=DomainProjection(121.0, 25.0),
+            ocm_root=tmp_path / "ocm",
+            nww_root=None,
+            use_numba_kernel=1,  # type: ignore[arg-type]
+        )
 
 
 def test_missing_month_exception_is_supported_by_injected_loader() -> None:

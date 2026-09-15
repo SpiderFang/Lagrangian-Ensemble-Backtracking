@@ -368,8 +368,9 @@ def _validate_checkpoint_tree(
 ) -> None:
     """唯讀核對 default/external checkpoint tree、latest 與 progress cross-link。
 
-    controller 的 scanner 與 restore 共用相同 schema 2 binding/order 檢查，但此處傳入
-    ``repair_latest=False``，所以 missing/stale latest 只回報 machine-readable recoverable
+    controller 的 scanner 與 restore 共用相同 schema 3 segment／schema 2 legacy
+    binding/order 檢查，但此處傳入 ``repair_latest=False``，所以 missing/stale latest 只回報
+    machine-readable recoverable
     error，不修改 SERVER 現場。operator 必須明確執行 ``RunController.reconcile`` 才會修復。
     """
 
@@ -887,13 +888,28 @@ def benchmark_report(
         for shard_id, row in rows
         if isinstance(row.get("metrics"), dict)
     ]
-    sum_keys = ("wall_seconds", "process_cpu_seconds", "output_bytes", "checkpoint_bytes", "particle_steps")
+    # wall／CPU 以浮點秒呈現；位元組與粒子步數維持原生 int 累加。後者可能達到
+    # GB／TB 或數十億步，不能先轉成 float 再轉回 int，否則會遺失可稽核的低位元。
     metrics = {
-        key: sum(float(item.get(key, 0)) for _, item in metrics_rows) for key in sum_keys
+        key: sum(float(item.get(key, 0)) for _, item in metrics_rows)
+        for key in ("wall_seconds", "process_cpu_seconds")
     }
+    metrics.update(
+        {
+            key: sum(int(item.get(key, 0)) for _, item in metrics_rows)
+            for key in ("output_bytes", "checkpoint_bytes", "particle_steps")
+        }
+    )
     metrics["max_rss_bytes"] = max(
         (int(item.get("max_rss_bytes", 0)) for _, item in metrics_rows),
         default=0,
+    )
+    # checkpoint_bytes 是每次發布的 lifetime logical bytes-written 總和；active logical
+    # file bytes 是各 shard 目前已發布普通檔案的 st_size gauge。各 shard tree 彼此獨立，
+    # 所以此處各計一次可得到 run 當下的檔案長度總和，但不能把同一 shard 的歷代 gauge
+    # 再次累加，也不能把它當成 NFS 實際配置空間。
+    metrics["checkpoint_active_bytes"] = sum(
+        int(item.get("checkpoint_active_bytes", 0)) for _, item in metrics_rows
     )
 
     # 新語意 row 的 counter 已是每一個 shard invocation 增量，所以四個 counter 可以
@@ -974,6 +990,7 @@ def benchmark_report(
         "max_rss_bytes": metrics["max_rss_bytes"],
         "output_bytes": int(metrics["output_bytes"]),
         "checkpoint_bytes": int(metrics["checkpoint_bytes"]),
+        "checkpoint_active_bytes": int(metrics["checkpoint_active_bytes"]),
         "forcing_cache_stats": forcing_stats,
         "forcing_cache_stats_semantics": forcing_stats_semantics,
         "forcing_cache_stats_precise": cache_is_precise,

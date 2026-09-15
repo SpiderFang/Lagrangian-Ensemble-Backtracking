@@ -256,6 +256,29 @@ def test_missing_cache_measurement_on_either_resume_side_is_legacy() -> None:
     assert _merge_metrics({**base}, previous)["forcing_cache_stats_semantics"] == "legacy_unknown"
 
 
+def test_checkpoint_and_output_byte_counters_never_round_trip_through_float() -> None:
+    """大於 float 精確整數上限的容量累加仍須逐 byte 保持原生 int。"""
+
+    current = {
+        "wall_seconds": 1.0,
+        "process_cpu_seconds": 1.0,
+        "max_rss_bytes": 1,
+        "output_bytes": 2**60 + 3,
+        "checkpoint_bytes": 2**60 + 5,
+        "particle_steps": 1,
+    }
+    previous = {
+        **current,
+        "output_bytes": 7,
+        "checkpoint_bytes": 11,
+    }
+    merged = _merge_metrics(current, previous)
+    assert merged["output_bytes"] == 2**60 + 10
+    assert merged["checkpoint_bytes"] == 2**60 + 16
+    assert type(merged["output_bytes"]) is int
+    assert type(merged["checkpoint_bytes"]) is int
+
+
 def test_invocation_counter_regression_is_rejected() -> None:
     """同 invocation 的較新 counter 不得回退覆蓋已觀測的事件數。"""
 
@@ -332,7 +355,7 @@ def test_keyboard_interrupt_during_factory_preserves_cache_snapshot(tmp_path: Pa
 def test_keyboard_interrupt_after_batch_keeps_checkpoint_cache_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """batch 已建立時 Ctrl-C 產生 checkpoint，且 checkpoint metrics 不遺失 cache loads。"""
+    """advance 未回傳時 Ctrl-C 保留 RUNNING，且 metrics 仍記錄既有 cache loads。"""
 
     workspace = _workspace(tmp_path, "keyboard-checkpoint-cache", run_kind="pilot", interval=1)
     counters = _cache_stats()
@@ -359,6 +382,9 @@ def test_keyboard_interrupt_after_batch_keeps_checkpoint_cache_metrics(
             resource_reporter=lambda: dict(counters),
         ).run_shard(_first_shard(workspace))
     row = load_run_progress(workspace)["shards"][_first_shard(workspace)]
-    assert row["lifecycle"] == "PAUSED"
+    # advance 尚未正常回傳，不能把可能只完成部分粒子的 batch 寫成 checkpoint；但
+    # request factory 已完成的 cache load 仍可作為 RUNNING 的 best-effort invocation metric。
+    assert row["lifecycle"] == "RUNNING"
+    assert row["checkpoint_sequence"] == 0
     assert row["metrics"]["forcing_cache_stats"]["loads"] == 2
     assert row["metrics"]["forcing_cache_stats_semantics"] == "invocation_delta_v1"

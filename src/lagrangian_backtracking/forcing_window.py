@@ -23,10 +23,12 @@ from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 
+from .accelerated import validate_physics_kernel_backend
 from .diffusion import DiffusionCoefficients, DiffusionSample, SmagorinskySettings
 from .forcing import (
     CombinedMonthForcing,
@@ -39,6 +41,47 @@ from .integrators import StepStartSampleReuseProvider
 from .mesh import NativeMesh
 from .models import SURFACE_BOUNDARY_TOLERANCE_M, SampleQC, VelocitySample
 
+_MONTH_METADATA_CACHE_SIZE = 512
+
+
+@dataclass(frozen=True, slots=True)
+class _MonthMetadata:
+    """保存一個已驗證 ``YYYYMM`` 的小型曆法資訊。
+
+    月份解析只影響目錄選擇與月界 halo 判斷，並不代表該月份資料一定存在；因此這裡
+    只快取 UTC 曆法值，不快取 OCM/NWW 陣列，也不把缺月份轉成任何數值。metadata
+    快取由 ``lru_cache`` 限制為固定 512 個月份鍵，屬於單一 Python process 的狀態；
+    不同 multiprocessing worker 各自擁有一份小型快取，且 manager 本身仍維持原本
+    的非 thread-safe 契約。``month_start_utc`` 只保存解析後的 aware datetime；奈秒
+    轉換仍在原本的 ``_month_start_ns`` 呼叫點進行，以保留 datetime 上下界與奈秒邊界
+    的既有語意。
+    """
+
+    month_id: str
+    year: int
+    month: int
+    month_start_utc: datetime
+
+
+@lru_cache(maxsize=_MONTH_METADATA_CACHE_SIZE)
+def _cached_month_metadata(month_id: str) -> _MonthMetadata:
+    """以有限容量快取有效月份的 ``strptime`` 結果與 UTC 月初 datetime。
+
+    呼叫端必須先完成 ``_validate_month_id`` 的型別、長度與數字檢查；因此不可雜湊的
+    非字串輸入仍會由既有驗證路徑回傳 ``ValueError``，不會變成 ``lru_cache`` 的
+    ``TypeError``。``lru_cache`` 不保存例外，非法月份也不會佔用快取；每個不同有效
+    ``YYYYMM`` 最多解析一次，重複的 RK stage 查詢直接重用同一份 immutable metadata。
+    """
+
+    parsed = datetime.strptime(month_id, "%Y%m")
+    month_start = parsed.replace(tzinfo=UTC)
+    return _MonthMetadata(
+        month_id=month_id,
+        year=parsed.year,
+        month=parsed.month,
+        month_start_utc=month_start,
+    )
+
 
 class MissingForcingMonth(Exception):
     """表示整個 ``YYYYMM`` 月份目錄不存在，可轉成明確的時間範圍 QC。
@@ -49,15 +92,29 @@ class MissingForcingMonth(Exception):
     """
 
 
-def _validate_month_id(month_id: str) -> str:
-    """驗證可由 UTC stage 選出的六位數 YYYYMM 月份識別碼。"""
+def _validated_month_metadata(month_id: str) -> _MonthMetadata:
+    """驗證月份並只取一次其快取 metadata，避免 caller 先驗證再重複查快取。
+
+    ``month_id`` 的外部契約仍是六位數字字串；型別與格式錯誤在進入
+    ``lru_cache`` 前處理，維持原本的 ``ValueError`` 訊息。有效月份由
+    ``_cached_month_metadata`` 解析並保存，讓同一熱路徑同時需要「相鄰月份識別碼」與
+    「下一月月初」時共用同一個小型 immutable 物件，而不必在單次呼叫中重複驗證或解析。
+    """
 
     if not isinstance(month_id, str) or len(month_id) != 6 or not month_id.isdigit():
         raise ValueError(f"month_id 必須是 YYYYMM：{month_id!r}")
     try:
-        datetime.strptime(month_id, "%Y%m")
+        # 先保留既有的外部錯誤訊息與型別行為，再把有效月份交給有限容量快取；
+        # ``lru_cache`` 不會快取例外，所以 202413 等非法月份不會污染快取內容。
+        return _cached_month_metadata(month_id)
     except ValueError as exc:
         raise ValueError(f"month_id 不是有效月份：{month_id!r}") from exc
+
+
+def _validate_month_id(month_id: str) -> str:
+    """驗證可由 UTC stage 選出的六位數 YYYYMM 月份識別碼。"""
+
+    _validated_month_metadata(month_id)
     return month_id
 
 
@@ -77,8 +134,8 @@ def _month_from_utc_ns(time_utc_ns: int) -> str:
 def _adjacent_month_id(month_id: str, offset: int) -> str:
     """以 UTC 曆月計算相鄰月份，避免跨年時用整數加減產生非法 ``YYYY00``。"""
 
-    parsed = datetime.strptime(_validate_month_id(month_id), "%Y%m")
-    serial = parsed.year * 12 + parsed.month - 1 + int(offset)
+    metadata = _validated_month_metadata(month_id)
+    serial = metadata.year * 12 + metadata.month - 1 + int(offset)
     year, month_zero_based = divmod(serial, 12)
     if year < 1 or year > 9999:
         raise ValueError(f"相鄰月份超出 datetime 支援範圍：{month_id!r} offset={offset}")
@@ -88,8 +145,10 @@ def _adjacent_month_id(month_id: str, offset: int) -> str:
 def _month_start_ns(month_id: str) -> int:
     """回傳 UTC 月初奈秒，供判斷月份末列與相鄰 leading halo 的距離。"""
 
-    parsed = datetime.strptime(_validate_month_id(month_id), "%Y%m").replace(tzinfo=UTC)
-    return int(parsed.timestamp()) * 1_000_000_000
+    metadata = _validated_month_metadata(month_id)
+    # timestamp 仍在此處計算，讓月初奈秒的例外與原本 ``_month_start_ns`` 完全相同；
+    # 快取只重用解析後的 aware datetime，不會改變 datetime 上下界的錯誤契約。
+    return int(metadata.month_start_utc.timestamp()) * 1_000_000_000
 
 
 def _cross_month_support_z(
@@ -331,8 +390,14 @@ class ForcingWindowManager:
         ocm_loader: Callable[[str], OCMNativeMonth | None],
         nww_loader: Callable[[str], NWWAnalysisMonth | None] | None = None,
         max_resident_months: int = 2,
+        physics_kernel_backend: str = "numpy_v1",
     ) -> None:
-        """建立注入式 manager，測試可用小型 loader，production 則由 ``from_roots`` 建立。"""
+        """建立注入式 manager，測試可用小型 loader，production 則由 ``from_roots`` 建立。
+
+        ``physics_kernel_backend`` 固定此 manager 所有材質 provider 共用的數值 primitive
+        版本；這樣同月 combined cache 不必在每次 RK stage 依 request 改寫，也不會讓同一
+        run 中有些粒子走不同 Stokes 方程實作。舊 caller 省略時使用 NumPy reference。
+        """
 
         if not isinstance(flow_domain_id, str) or not flow_domain_id.strip():
             raise ValueError("flow_domain_id 不可為空白")
@@ -354,6 +419,7 @@ class ForcingWindowManager:
         self._ocm_loader = ocm_loader
         self._nww_loader = nww_loader
         self.max_resident_months = max_resident_months
+        self.physics_kernel_backend = validate_physics_kernel_backend(physics_kernel_backend)
         self._months: OrderedDict[str, _MonthEntry] = OrderedDict()
         self._ocm_load_count = 0
         self._nww_load_count = 0
@@ -382,14 +448,24 @@ class ForcingWindowManager:
         ocm_root: str | Path,
         nww_root: str | Path | None,
         max_resident_months: int = 2,
+        use_numba_kernel: bool = False,
+        physics_kernel_backend: str = "numpy_v1",
     ) -> ForcingWindowManager:
         """從正式 root layout 建立 manager，且 OCM mesh 只在此處載入一次。
 
         OCM 讀取位置為 ``<ocm_root>/<flow_domain_id>/grid`` 與
         ``months/YYYYMM``；NWW 讀取位置為 ``<nww_root>/<flow_domain_id>/grid`` 與
         ``months/YYYYMM``。缺少整個月份目錄回傳 ``MissingForcingMonth``，但已存在目錄
-        的必要檔案或 schema 錯誤由既有 reader 原樣上拋。
+        的必要檔案或 schema 錯誤由既有 reader 原樣上拋。``use_numba_kernel`` 只傳給
+        ``OCMNativeMonth.from_directory`` 的 OCM 內層插值 kernel；
+        ``physics_kernel_backend`` 另決定 Stokes、步長、RK4 最後純量更新及 Brownian 位移
+        的數值 primitive。月份選擇、NWW 載入、缺值／遮罩、QC 與邊界判定仍由 Python 控制層
+        負責。兩個參數都使用舊 caller 相容預設，不會因省略而切換到 Numba。
         """
+
+        if type(use_numba_kernel) is not bool:
+            raise TypeError("use_numba_kernel 必須是 bool")
+        backend = validate_physics_kernel_backend(physics_kernel_backend)
 
         ocm_domain_root = Path(ocm_root) / flow_domain_id
         nww_domain_root = Path(nww_root) / flow_domain_id if nww_root is not None else None
@@ -405,7 +481,11 @@ class ForcingWindowManager:
             month_dir = ocm_domain_root / "months" / _validate_month_id(month_id)
             if not month_dir.is_dir():
                 raise MissingForcingMonth(str(month_dir))
-            return OCMNativeMonth.from_directory(month_dir, mesh=mesh)
+            return OCMNativeMonth.from_directory(
+                month_dir,
+                mesh=mesh,
+                use_numba_kernel=use_numba_kernel,
+            )
 
         def load_nww(month_id: str) -> NWWAnalysisMonth | None:
             """僅在 Stokes facade 需要時開啟 NWW 月份；整個月不存在回傳 None。"""
@@ -426,6 +506,7 @@ class ForcingWindowManager:
             ocm_loader=load_ocm,
             nww_loader=load_nww,
             max_resident_months=max_resident_months,
+            physics_kernel_backend=backend,
         )
 
     def _evict_if_needed(self) -> None:
@@ -873,6 +954,7 @@ class ForcingWindowManager:
             projection=self.projection,
             settling_velocity_mps=settling_velocity_mps,
             include_stokes=include_stokes,
+            physics_kernel_backend=self.physics_kernel_backend,
         )
         entry.combined[key] = value
         return value
@@ -1071,6 +1153,7 @@ class ForcingWindowManager:
                 projection=self.projection,
                 settling_velocity_mps=settling_velocity_mps,
                 include_stokes=include_stokes,
+                physics_kernel_backend=self.physics_kernel_backend,
             )
             return combined.sample_from_endpoints(
                 x_m=x_m,
@@ -1095,6 +1178,7 @@ class ForcingWindowManager:
             projection=self.projection,
             settling_velocity_mps=settling_velocity_mps,
             include_stokes=False,
+            physics_kernel_backend=self.physics_kernel_backend,
         )
         current = combined.sample_from_endpoints(
             x_m=x_m,

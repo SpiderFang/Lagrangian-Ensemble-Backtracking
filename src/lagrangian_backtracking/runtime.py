@@ -48,7 +48,12 @@ from typing import Any
 import pyarrow.parquet as pq
 from shapely.geometry import Point
 
-from .config import ProjectConfig, load_config, resolve_flow_domain_id
+from .config import (
+    OCM_INTERPOLATION_BACKEND_NUMBA_V1,
+    ProjectConfig,
+    load_config,
+    resolve_flow_domain_id,
+)
 from .diffusion import DiffusionCoefficients, SmagorinskySettings
 from .engine import EngineSettings
 from .forcing_window import ForcingWindowManager
@@ -2086,6 +2091,14 @@ class RuntimeRequestFactory:
             config.execution.max_resident_forcing_months,
             label="execution.max_resident_forcing_months",
         )
+        # OCM 插值和物理 scalar kernels 是兩個獨立、各自版本化的選項。manager 的布林值
+        # 僅控制既有 OCM 垂向／水平／時間內插；physics token 則同時進入 EngineSettings
+        # 與 finite-depth Stokes provider，讓 Python 控制層固定處理 stage、RNG、QC、事件
+        # 與邊界。舊 YAML 的 default 由 ExecutionConfig 補入，不在此猜測或靜默 fallback。
+        self._ocm_use_numba_kernel = (
+            config.execution.ocm_interpolation_backend == OCM_INTERPOLATION_BACKEND_NUMBA_V1
+        )
+        self._physics_kernel_backend = config.execution.physics_kernel_backend
         self._dt_min_seconds = _finite_scalar(
             config.integration.dt_min_seconds,
             label="integration.dt_min_seconds",
@@ -2269,6 +2282,8 @@ class RuntimeRequestFactory:
                 ocm_root=self._ocm_root,
                 nww_root=self._nww_root,
                 max_resident_months=self._max_resident_months,
+                use_numba_kernel=self._ocm_use_numba_kernel,
+                physics_kernel_backend=self._physics_kernel_backend,
             )
             self._managers[flow_id] = manager
 
@@ -2354,6 +2369,7 @@ class RuntimeRequestFactory:
             maximum_step_count=self._maximum_step_count,
             earliest_forcing_time_utc_ns=earliest_ns,
             maximum_minimum_clamps=self._maximum_minimum_clamps,
+            physics_kernel_backend=self._physics_kernel_backend,
         )
 
     def resource_stats(self) -> dict[str, int]:

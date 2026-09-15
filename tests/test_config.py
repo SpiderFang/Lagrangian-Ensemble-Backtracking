@@ -152,6 +152,71 @@ def test_omitted_backtrack_support_keeps_current_example_hash() -> None:
     assert "backtrack_support_days" not in config.normalized_payload()["inputs"]
 
 
+def test_omitted_ocm_interpolation_backend_keeps_numpy_and_current_hash() -> None:
+    """舊 YAML 省略 OCM backend 時走 NumPy，且不得因預設欄位改變 canonical hash。"""
+
+    config = ProjectConfig.model_validate(_payload())
+    assert config.execution.ocm_interpolation_backend == "numpy_v1"
+    assert "ocm_interpolation_backend" not in config.normalized_payload()["execution"]
+    assert config.config_hash() == "163ee4f9f113a567206a28354e69e783db2da4eedc6ea618276893d4c1554214"
+
+
+def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
+    """舊 YAML 未帶 CPU 核心選項時仍用 NumPy，且 config hash 維持凍結值。"""
+
+    config = ProjectConfig.model_validate(_payload())
+    assert config.execution.physics_kernel_backend == "numpy_v1"
+    assert "physics_kernel_backend" not in config.normalized_payload()["execution"]
+    assert config.config_hash() == "163ee4f9f113a567206a28354e69e783db2da4eedc6ea618276893d4c1554214"
+
+
+@pytest.mark.parametrize("backend", ["numpy_v1", "numba_cpu_v1"])
+def test_explicit_physics_kernel_backend_is_versioned_and_hashed(backend: str) -> None:
+    """明示 CPU 數值後端時必須在 canonical 設定與 hash 中留下版本 token。"""
+
+    payload = _payload()
+    payload["execution"]["physics_kernel_backend"] = backend
+    config = ProjectConfig.model_validate(payload)
+    assert config.execution.physics_kernel_backend == backend
+    assert config.normalized_payload()["execution"]["physics_kernel_backend"] == backend
+    assert config.config_hash() != ProjectConfig.model_validate(_payload()).config_hash()
+
+
+@pytest.mark.parametrize("backend", [None, "numpy", "numba", "numba_cpu_v2", True, 1])
+def test_invalid_physics_kernel_backend_is_rejected(backend: object) -> None:
+    """未知或非字串 CPU 核心後端不得靜默退回 NumPy。"""
+
+    payload = _payload()
+    payload["execution"]["physics_kernel_backend"] = backend
+    with pytest.raises((TypeError, ValueError)):
+        ProjectConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("backend", ["numpy_v1", "numba_ocm_v1"])
+def test_explicit_ocm_interpolation_backend_is_versioned_and_hashed(backend: str) -> None:
+    """明示的 OCM backend 應保留在 normalized config，讓 run binding 可追溯。"""
+
+    payload = _payload()
+    payload["execution"]["ocm_interpolation_backend"] = backend
+    config = ProjectConfig.model_validate(payload)
+    assert config.execution.ocm_interpolation_backend == backend
+    assert config.normalized_payload()["execution"]["ocm_interpolation_backend"] == backend
+    assert config.config_hash() != ProjectConfig.model_validate(_payload()).config_hash()
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [None, "numpy", "numba", "numba_ocm_v2", True, 1],
+)
+def test_invalid_ocm_interpolation_backend_is_rejected(backend: object) -> None:
+    """未知、空值與非字串 backend 不得由 extra 或型別轉換靜默接受。"""
+
+    payload = _payload()
+    payload["execution"]["ocm_interpolation_backend"] = backend
+    with pytest.raises((TypeError, ValueError)):
+        ProjectConfig.model_validate(payload)
+
+
 def test_explicit_backtrack_support_is_strict_and_bounds_requested_horizon() -> None:
     """明示母體支援窗只接受正整日，且 requested 不得超出母體。"""
 

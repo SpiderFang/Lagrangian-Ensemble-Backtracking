@@ -100,6 +100,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "run_locking",
             "run_validation",
             "pilot_matrix_validation",
+            "parallel_execution",
         ),
     },
     {
@@ -373,9 +374,9 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
     "checkpoint": {
-        "role": "schema 2 中途狀態的安全寫入與續跑繫結",
+        "role": "schema 3.0 中途狀態的分段寫入與續跑繫結",
         "inputs": "粒子中途狀態、批次識別與設定繫結",
-        "outputs": "schema 2 CheckpointBinding、execution/RNG checkpoint 與 schema 1 相容資料",
+        "outputs": "schema 3.0 compact／history segment、CheckpointBinding、RNG checkpoint 與 schema 1 相容資料",
         "entrypoints": [
             "write_execution_checkpoint",
             "load_execution_checkpoint",
@@ -383,13 +384,15 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "load_checkpoint（schema 1 相容入口）",
         ],
         "read_first": (
-            "正式續跑先讀 schema 2 的 write_execution_checkpoint／load_execution_checkpoint；"
+            "正式續跑先讀 schema 3.0 的 write_execution_checkpoint／load_execution_checkpoint；"
             "列表中的 write_checkpoint／load_checkpoint 僅是既有 schema 1 相容入口，不能取代"
-            "schema 2 的完整 execution、觀測、事件、triangle hint 與每粒子 RNG state。"
+            "schema 3.0 的 compact、分段 observation／event history、triangle hint 與每粒子 RNG state；"
+            "loader 同時保留 schema 2.x 舊目錄唯讀相容。"
         ),
         "baytrace_integration": (
-            "這是為本專案可重啟系集補上的強化：schema 2 保存完整 execution、觀測、事件、"
-            "triangle hint 與每粒子 RNG state，並非 BayTrace checkpoint 的原樣搬入。"
+            "這是為本專案可重啟系集補上的強化：schema 3.0 以 immutable history segment、"
+            "compact state、cursor 與 SHA-256 chain 保存 execution、觀測、事件、triangle hint"
+            "與每粒子 RNG state，並非 BayTrace checkpoint 的原樣搬入。"
         ),
     },
     "runtime": {
@@ -559,7 +562,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
     },
     "run_control": {
         "role": "管理 immutable run plan、atomic progress、CPU shard 與 reconcile",
-        "inputs": "schema 2 workspace、RunUnit、ProductionBatch、checkpoint/output 與 lock topology",
+        "inputs": "schema 2.1 workspace、RunUnit、ProductionBatch、schema 3.0 checkpoint/output 與 lock topology",
         "outputs": "RunExecutionSummary、progress lifecycle、checkpoint pointer 與可恢復 run 狀態",
         "entrypoints": [
             "initialize_run_workspace",
@@ -609,7 +612,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": "鎖檔只表達 topology，實際互斥由 fcntl.flock 提供；NFS/NAS 語意仍須在目標環境另行 preflight。",
     },
     "run_validation": {
-        "role": "唯讀驗證 schema 2 workspace、checkpoint、shard 與工程摘要",
+        "role": "唯讀驗證 run workspace、schema 3.0／舊 checkpoint、shard 與工程摘要",
         "inputs": "run plan/progress、scenario／seed table、lock topology、checkpoint/output checksum",
         "outputs": "JSON-safe valid/errors/summary 與 benchmark report；不修復現場檔案",
         "entrypoints": ["validate_run", "benchmark_report"],
@@ -629,7 +632,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
     "cli": {
-        "role": "正式 preflight、run workspace、分片執行、reconcile、aggregate 與 report 唯讀驗證入口",
+        "role": "正式 preflight、run workspace、分片與平行執行、reconcile、aggregate 與 report 驗證入口",
         "inputs": "命令列參數、設定檔與資料根目錄",
         "outputs": "formal/pilot preflight、run lifecycle、shard 結果、aggregate 與 report 驗證報告",
         "entrypoints": [
@@ -638,6 +641,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "run_create",
             "run_shard",
             "run_worker",
+            "run_formal_parallel",
             "run_reconcile",
             "run_validate_run",
             "run_pilot_matrix_validate",
@@ -646,11 +650,36 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ],
         "read_first": (
             "正式鏈路依序閱讀 main → run_preflight_command（--formal-release）→ run_create → "
-            "run_shard／run_worker／run_reconcile → run_validate_run；run_worker 先驗證同一 run 的 "
+            "run_shard／run_worker／run_formal_parallel／run_reconcile → run_validate_run；run_worker 先驗證同一 run 的 "
             "全部 shard ID，再在單一 controller 內依指定順序連續執行；synthetic 與設定檢查是輔助入口，"
             "不能取代 formal inventory gate。report-spec-create 只建立 renderer 規格；"
             "run_report_validate／report-validate 只讀取 caller 明示的既有 report-v1 release，"
             "不猜測路徑、不建立產品，也不把 engineering validator 通過稱為科學成果。"
+        ),
+    },
+    "parallel_execution": {
+        "role": "正式 immutable run plan 的持久 CPU worker 分組、NFS gate 與整機執行協調",
+        "inputs": (
+            "已驗證 formal workspace／全部 shard、乾淨部署 provenance、固定 worker 數、"
+            "SERVER storage gate、明示 log／Numba cache 與 CPU affinity 選項"
+        ),
+        "outputs": (
+            "scenario 連續且位元組可重現的 worker assignment、每 worker run-worker log、"
+            "whole-machine exit／elapsed summary 與最終 COMPLETE validator 結果"
+        ),
+        "entrypoints": [
+            "build_worker_groups",
+            "worker_assignment_document",
+            "execute_worker_groups",
+            "execute_formal_parallel",
+            "warmup_numba_cache",
+        ],
+        "read_first": (
+            "所有 preflight 都在 child 啟動前完成；每個長壽命程序只呼叫一次 run-worker，"
+            "由同一 controller 連續處理其固定 shard 群。worker assignment 不參與 run identity，"
+            "scenario index 範圍連續、站點／流域欄位只讀表格既有值，缺少時明示沿用 plan 順序。"
+            "Linux affinity 不可用時安全退回並記錄；NFS scratch gate 不通過、cache 未明示或"
+            "worker 失敗時停止派發且保留 logs／checkpoint。部分完成不會標為 COMPLETE。"
         ),
     },
     "outputs": {
@@ -1146,6 +1175,10 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "cli", "target": "config", "label": "run-create／設定"},
     {"source": "cli", "target": "runtime", "label": "run-create／pilot+formal"},
     {"source": "cli", "target": "run_control", "label": "run-shard／run-reconcile"},
+    {"source": "cli", "target": "parallel_execution", "label": "run-formal-parallel／JIT warm-up"},
+    {"source": "parallel_execution", "target": "provenance", "label": "clean formal deployment gate"},
+    {"source": "parallel_execution", "target": "run_control", "label": "固定分組 run-worker／schema 3.1 resume"},
+    {"source": "parallel_execution", "target": "run_validation", "label": "整批 COMPLETE validator"},
     {"source": "cli", "target": "pilot_matrix_validation", "label": "pilot-matrix-validate／跨區共同設定"},
     {"source": "engineering_window", "target": "input_derivation", "label": "source component／hash validation"},
     {"source": "engineering_window", "target": "runtime", "label": "engineering artifact／pilot request"},

@@ -1,4 +1,4 @@
-"""execution checkpoint 2.2.0、RNG continuation 與版本相容性拒絕測試。
+"""execution checkpoint 舊版相容、RNG continuation 與版本相容性拒絕測試。
 
 本檔所有 request、位置與環境欄位都是本機建立的 synthetic 工程資料，只驗證序列化、
 恢復、checksum 與 fail-closed 邊界，不代表真實 OCM／NWW3 forcing 或任何科學成果。
@@ -18,6 +18,7 @@ from shapely.geometry import box
 from lagrangian_backtracking.boundaries import BoundaryGeometry
 from lagrangian_backtracking.checkpoint import (
     CheckpointBinding,
+    _write_execution_checkpoint_schema22,
     load_execution_checkpoint,
 )
 from lagrangian_backtracking.diffusion import DiffusionCoefficients
@@ -116,7 +117,34 @@ def _write_partial_checkpoint(destination: Path, *, master_seed: int = 5) -> Pat
 
     batch = ProductionBatch(_shard(), master_seed=master_seed, request_factory=_factory)
     batch.advance()
-    return batch.write_checkpoint(destination, binding=_binding(), sequence=1)
+    return _write_execution_checkpoint_schema22(
+        destination,
+        binding=_binding(),
+        run_units=batch.units,
+        executions=[runtime.execution for runtime in batch.runtimes],
+        rngs=[runtime.rng for runtime in batch.runtimes],
+        triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+        sequence=1,
+    )
+
+
+def _write_legacy_batch_checkpoint(
+    batch: ProductionBatch,
+    destination: Path,
+    *,
+    sequence: int,
+) -> Path:
+    """將已建立的 synthetic batch 寫成 2.2 fixture；正式 batch writer 固定使用 v3。"""
+
+    return _write_execution_checkpoint_schema22(
+        destination,
+        binding=_binding(),
+        run_units=batch.units,
+        executions=[runtime.execution for runtime in batch.runtimes],
+        rngs=[runtime.rng for runtime in batch.runtimes],
+        triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+        sequence=sequence,
+    )
 
 
 def _write_context_checkpoint(destination: Path) -> Path:
@@ -147,7 +175,15 @@ def _write_context_checkpoint(destination: Path) -> Path:
         environment_sample_status=EnvironmentSampleStatus.INVALID,
         environment_qc_flags=1,
     )
-    return batch.write_checkpoint(destination, binding=_binding(), sequence=1)
+    return _write_execution_checkpoint_schema22(
+        destination,
+        binding=_binding(),
+        run_units=batch.units,
+        executions=[runtime.execution for runtime in batch.runtimes],
+        rngs=[runtime.rng for runtime in batch.runtimes],
+        triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+        sequence=1,
+    )
 
 
 def _refresh_payload_checksum(root: Path, filename: str) -> None:
@@ -267,16 +303,23 @@ def _downgrade_fixture_to_21(root: Path) -> None:
 
 
 def test_partial_execution_checkpoint_restores_exact_results_and_rng(tmp_path: Path) -> None:
-    """數個 sweep 後 schema 2.2 restore 必須與不中斷完成結果逐欄完全相同。"""
+    """數個 sweep 後 schema 3 restore 必須與不中斷完成結果逐欄完全相同。"""
 
     shard = _shard()
     uninterrupted = ProductionBatch(shard, master_seed=123, request_factory=_factory).complete()
 
     interrupted = ProductionBatch(shard, master_seed=123, request_factory=_factory)
-    interrupted.advance(sweeps=2)
+    interrupted.advance(sweeps=1)
+    first_checkpoint = interrupted.write_checkpoint(
+        tmp_path / "checkpoint-00000001", binding=_binding(), sequence=1
+    )
+    interrupted.advance(sweeps=1)
     assert interrupted.active_count == 1
     checkpoint_path = interrupted.write_checkpoint(
-        tmp_path / "execution-0002", binding=_binding(), sequence=2
+        tmp_path / "checkpoint-00000002",
+        binding=_binding(),
+        sequence=2,
+        previous_checkpoint=first_checkpoint,
     )
 
     loaded = load_execution_checkpoint(
@@ -316,7 +359,7 @@ def test_partial_execution_checkpoint_restores_exact_results_and_rng(tmp_path: P
 
 
 def test_writer_publishes_schema22_with_exact_observation_fields(tmp_path: Path) -> None:
-    """新 writer 固定發布 2.2.0，且 11 個速度欄位以狀態與 None 明示保存。"""
+    """舊版 fixture writer 發布 2.2.0，且 11 個速度欄位以狀態與 None 明示保存。"""
 
     root = _write_partial_checkpoint(tmp_path / "schema22-writer")
     metadata = json.loads((root / "checkpoint.json").read_text(encoding="utf-8"))
@@ -669,7 +712,7 @@ def test_schema2_rejects_corrupted_rng_observation_checksum_and_binding(tmp_path
 
     batch = ProductionBatch(_shard(), master_seed=5, request_factory=_factory)
     batch.advance()
-    root = batch.write_checkpoint(tmp_path / "execution", binding=_binding(), sequence=1)
+    root = _write_legacy_batch_checkpoint(batch, tmp_path / "execution", sequence=1)
 
     rng_path = root / "rng_states.json"
     rng_payload = json.loads(rng_path.read_text(encoding="utf-8"))
@@ -680,7 +723,7 @@ def test_schema2_rejects_corrupted_rng_observation_checksum_and_binding(tmp_path
 
     clean = ProductionBatch(_shard(), master_seed=5, request_factory=_factory)
     clean.advance()
-    clean_root = clean.write_checkpoint(tmp_path / "execution-clean", binding=_binding(), sequence=1)
+    clean_root = _write_legacy_batch_checkpoint(clean, tmp_path / "execution-clean", sequence=1)
     execution_path = clean_root / "execution_state.json"
     execution_payload = json.loads(execution_path.read_text(encoding="utf-8"))
     execution_payload["records"][0]["execution"]["observations"][0]["age_seconds"] = 99.0
@@ -690,8 +733,10 @@ def test_schema2_rejects_corrupted_rng_observation_checksum_and_binding(tmp_path
 
     clean_again = ProductionBatch(_shard(), master_seed=5, request_factory=_factory)
     clean_again.advance()
-    binding_root = clean_again.write_checkpoint(
-        tmp_path / "execution-binding", binding=_binding(), sequence=1
+    binding_root = _write_legacy_batch_checkpoint(
+        clean_again,
+        tmp_path / "execution-binding",
+        sequence=1,
     )
     incompatible = CheckpointBinding("other", "inventory", "baseline", "shard", "pcg64dxsm-v1", "commit")
     with pytest.raises(ValueError, match="binding 不相容"):
@@ -846,7 +891,11 @@ def test_schema2_rejects_observation_sequence_direction_tampering(
 
     batch = ProductionBatch(_shard(), master_seed=5, request_factory=_factory)
     batch.advance(sweeps=4)
-    root = batch.write_checkpoint(tmp_path / f"semantic-sequence-{field}", binding=_binding(), sequence=4)
+    root = _write_legacy_batch_checkpoint(
+        batch,
+        tmp_path / f"semantic-sequence-{field}",
+        sequence=4,
+    )
     execution_path = root / "execution_state.json"
     execution_payload = json.loads(execution_path.read_text(encoding="utf-8"))
     observations = execution_payload["records"][1]["execution"]["observations"]
@@ -882,6 +931,28 @@ def test_schema2_rejects_duplicate_particle_order_after_checksum_refresh(tmp_pat
         load_execution_checkpoint(root, expected_binding=_binding())
 
 
+def test_schema22_fixture_writer_rejects_duplicate_particle_id(tmp_path: Path) -> None:
+    """schema 2.2 fixture 建立前即拒絕重複粒子識別，避免產生不可載入的舊檔。"""
+
+    batch = ProductionBatch(_shard(), master_seed=5, request_factory=_factory)
+    batch.advance()
+    units = list(batch.units)
+    units[1] = replace(units[1], particle_id=units[0].particle_id)
+    target = tmp_path / "duplicate-particle-id"
+    with pytest.raises(ValueError, match="particle_id 必須唯一"):
+        _write_execution_checkpoint_schema22(
+            target,
+            binding=_binding(),
+            run_units=units,
+            executions=[runtime.execution for runtime in batch.runtimes],
+            rngs=[runtime.rng for runtime in batch.runtimes],
+            triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+            sequence=1,
+        )
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(f".{target.name}.partial-*"))
+
+
 def test_schema2_rejects_unknown_subdirectory_and_symlink(tmp_path: Path) -> None:
     """schema 2.x 目錄只能含三個實體檔案，不接受未知子目錄或 symlink。"""
 
@@ -905,8 +976,10 @@ def test_schema2_all_complete_batch_round_trip_preserves_results(tmp_path: Path)
     batch = ProductionBatch(_shard(), master_seed=17, request_factory=_factory)
     expected = batch.complete()
     assert batch.terminal
-    root = batch.write_checkpoint(
-        tmp_path / "all-complete", binding=_binding(), sequence=batch.sweep_count
+    root = _write_legacy_batch_checkpoint(
+        batch,
+        tmp_path / "all-complete",
+        sequence=batch.sweep_count,
     )
 
     restored = ProductionBatch.from_checkpoint(
@@ -925,7 +998,7 @@ def test_schema2_rejects_run_unit_mismatch_and_empty_checkpoint(tmp_path: Path) 
     """不同 scenario identity 與空 execution 都不能冒充可恢復 checkpoint。"""
 
     batch = ProductionBatch(_shard(), master_seed=8, request_factory=_factory)
-    root = batch.write_checkpoint(tmp_path / "execution", binding=_binding(), sequence=0)
+    root = _write_legacy_batch_checkpoint(batch, tmp_path / "execution", sequence=0)
     with pytest.raises(ValueError, match="RunUnit identity/order"):
         load_execution_checkpoint(root, expected_binding=_binding(), expected_run_units=ProductionBatch(
             _shard("other"), master_seed=8, request_factory=_factory

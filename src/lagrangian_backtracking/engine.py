@@ -22,6 +22,7 @@ from enum import StrEnum
 
 import numpy as np
 
+from .accelerated import validate_physics_kernel_backend
 from .boundaries import (
     BoundaryGeometry,
     recover_surface_boundary_at_step_start,
@@ -54,7 +55,13 @@ from .models import (
 
 @dataclass(frozen=True, slots=True)
 class EngineSettings:
-    """單一分析情境的時間步長、輸出頻率與停止上限。"""
+    """單一情境的時間步長、輸出頻率、停止上限與版本化純量 kernel 選擇。
+
+    ``physics_kernel_backend`` 隨 request 的不可變設定一起傳入單步核心；既有
+    手動建構與舊檢查點還原呼叫端若省略欄位，仍使用 ``numpy_v1``。選擇
+    ``numba_cpu_v1`` 只替換可獨立計算的純量數值核心，不改事件、品質檢查旗標（QC）、
+    RK4 階段查詢或每粒子的亂數來源。
+    """
 
     dt_min_seconds: float
     dt_max_seconds: float
@@ -63,6 +70,7 @@ class EngineSettings:
     maximum_step_count: int
     earliest_forcing_time_utc_ns: int
     maximum_minimum_clamps: int = 100
+    physics_kernel_backend: str = "numpy_v1"
 
 
 class EnvironmentSampleStatus(StrEnum):
@@ -997,6 +1005,7 @@ def _validate_engine_settings(settings: EngineSettings) -> None:
         raise ValueError("engine dt 範圍無效")
     if settings.output_interval_seconds <= 0 or settings.max_backtrack_seconds <= 0:
         raise ValueError("output interval 與 max backtrack 必須為正")
+    validate_physics_kernel_backend(settings.physics_kernel_backend)
 
 
 def initialize_particle_execution(
@@ -1367,6 +1376,7 @@ def advance_particle_once(
         coefficients=diffusion_sample.coefficients,
         dt_min_seconds=settings.dt_min_seconds,
         dt_max_seconds=min(settings.dt_max_seconds, remaining_age, seconds_to_start),
+        physics_kernel_backend=settings.physics_kernel_backend,
     )
     if decision.limiting_reason == "minimum_clamp":
         execution.minimum_clamp_count += 1
@@ -1394,6 +1404,7 @@ def advance_particle_once(
                 coefficients=diffusion_sample,
                 rng=rng,
                 step_start_sample=step_start_sample,
+                physics_kernel_backend=settings.physics_kernel_backend,
             )
             break
         except SamplingError as error:
@@ -1436,6 +1447,7 @@ def advance_particle_once(
                         # 反射包裝器的階段計數器必須從 k1 開始，且其 k1 可能
                         # 需要重新取得原始邊界樣本；因此不能沿用原速度取樣器的步首樣本。
                         step_start_sample=None,
+                        physics_kernel_backend=settings.physics_kernel_backend,
                     )
                 except SamplingError as adjusted_error:
                     stage_error = adjusted_error

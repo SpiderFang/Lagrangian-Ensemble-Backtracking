@@ -243,10 +243,16 @@ def test_paired_checkpoint_restore_binds_stream_and_rejects_change(tmp_path: Pat
         request_factory=_request,
     )
     interrupted.advance()
-    checkpoint = interrupted.write_checkpoint(tmp_path / "paired-checkpoint", binding=binding, sequence=1)
+    checkpoint = interrupted.write_checkpoint(
+        tmp_path / "checkpoint-00000001", binding=binding, sequence=1
+    )
     metadata = json.loads((checkpoint / "checkpoint.json").read_text(encoding="utf-8"))
     assert metadata["binding"]["random_stream_id"] == "pair-v1"
-    loaded = load_execution_checkpoint(checkpoint, expected_binding=binding, expected_run_units=interrupted.units)
+    loaded = load_execution_checkpoint(
+        checkpoint,
+        expected_binding=binding,
+        expected_run_units=interrupted.units,
+    )
     assert loaded.binding == binding
 
     restored = ProductionBatch.from_checkpoint(

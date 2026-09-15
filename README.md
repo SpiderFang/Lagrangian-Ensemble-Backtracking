@@ -92,7 +92,7 @@ OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾�
 | 產品 | 新 writer | 舊格式相容性 |
 |---|---|---|
 | trajectory shard | `3.0.0`：固定位置、狀態、事件、環境與速度資料檔；實際產品含 `.npy`、`.parquet`、`.json`，並有 dtype／count／checksum 驗證器 | `1.0.0`、`2.0.0` 可唯讀；舊欄位沒有速度資料，不自動補速度。正式報告可使用 v2 或 v3，v1 不得作正式垂向驗證證據；同一執行混用 v2／v3 保守拒絕 |
-| execution checkpoint | `2.2.0`：保存 Observation 11 個速度欄位、環境、事件、triangle hint 與 PCG64DXSM RNG | `2.0.0`／`2.1.0` 以固定舊欄位集合唯讀；缺少速度時回傳 `NOT_SAMPLED`／`None`，不受最新資料類別污染 |
+| execution checkpoint | 新 writer 固定 `3.1.0`：以 `immutable history segments` 追加觀測／事件列，`compact_state.json.gz` 與 `history_segment.json.gz` 使用 deterministic gzip 保存 current／history；manifest 綁定壓縮檔 `st_size`、SHA-256 與解壓後 JSON 大小，完整 `checkpoint.json` SHA-256 chain 綁定 generation、provenance 與資料內容；已終止粒子的 current 與 history 在後代逐欄凍結 | loader 保留 `3.0.0` 未壓縮拓撲，允許 3.0→3.1 混合 chain；`2.0.0`／`2.1.0`／`2.2.0` 以固定舊欄位集合唯讀遷移；禁止 3.1 降回 3.0／2.x；舊目錄不原地升級；schema 3 仍逐次更新共享 `progress.lock` |
 
 缺值與版本界線是驗證證據的一部分：舊成果不會自動升格為含速度的新成果，synthetic／pilot 也不會升格為正式科學證據；事件與狀態保留 `DATA_GAP`、`NUMERICAL_FAILURE`、邊界事件、可用性與失敗原因，無效取樣必須有非零 QC，不能用靜水或終止位置掩蓋失敗查詢。trajectory shard 與 checkpoint 都是不可覆寫、以檔案大小／SHA-256 驗證的工程產品；checkpoint 只保存可恢復的粒子狀態、觀測、事件、triangle hint 與 RNG，大型流場資料、網格與幾何由相同來源綁定的 request factory 重建。
 
@@ -145,7 +145,7 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 檢查；測試建立的 PNG 可直接以 `view_image` 檢查版面，但 synthetic fixture 不代表正式
 五站研究成果。
 
-若只要檢查速度契約，可閱讀 `tests/test_velocity_recording.py`；若要檢查舊 checkpoint 的讀取與亂數延續，閱讀 `tests/test_checkpoint_execution.py`。這些測試刻意不執行真實模型、不下載資料，也不修改既有 pilot 結果。
+若只要檢查速度契約，可閱讀 `tests/test_velocity_recording.py`；若要檢查 v3 segment chain、舊 checkpoint 的唯讀讀取與亂數延續，閱讀 `tests/test_checkpoint_segments.py` 與 `tests/test_checkpoint_execution.py`。這些測試刻意不執行真實模型、不下載資料，也不修改既有 pilot 結果。
 
 ## 5. 實際資料與 SERVER 使用入口
 
@@ -153,11 +153,11 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
-效能改善以[四區五站正式運算與單站試跑兩條工作線](docs/operations/16_performance_improvement_tracks.md)推進，優先降低正式全矩陣的總耗時，再縮短單站小試跑的準備成本。首批提供 `run-worker` 接續執行同 run 的指定分片並重用流場管理器、正常步首速度樣本重用，以及 OCM 表面資料的少量格點取值；使用方法見[CLI 參考](docs/operations/cli_reference.md)。30 天回溯仍須完整資料支援、版本化輸入驗收與現有 SERVER 實測；局部取樣加速或短試跑完成不能代替全案工期證據。
+效能改善以[正式完整母體效能工作線](docs/operations/16_performance_improvement_tracks.md)推進。首批提供 `run-worker` 接續執行同 run 的指定分片並重用流場管理器、正常步首速度樣本重用，以及 OCM 表面資料的少量格點取值；使用方法見[CLI 參考](docs/operations/cli_reference.md)。未來各區正式完整母體使用 `run-formal-parallel`：固定數量的長壽命 worker 依固定 run plan 確定分組，每個程序以單一 `run-worker` 連續執行自己的 shard 群，重用同程序流場管理器與已編譯 dispatcher。完整完成仍須全 shard lifecycle、child exit 與 `validate-run --require-complete` 同時通過；不做舊／新版倍率 A/B 比較，也不把局部試跑當完整成果。實際正式執行仍須先通過版本化輸入、乾淨 deployment provenance、SERVER NFS 儲存檢查與科學驗證；runner 還會即時核對本次 `scratch_root` 的 NFS source，避免誤用其他掛載點的 PASS 快照。設定可明示 `execution.physics_kernel_backend: numpy_v1` 或 `numba_cpu_v1`，OCM 內層插值另可明示 `execution.ocm_interpolation_backend: numpy_v1` 或 `numba_ocm_v1`。後端版本會進入設定與 run 身分；省略欄位的舊設定仍沿用 NumPy。Numba dispatcher 目前使用 `cache=False`，每個正式 worker 會在自己程序內呼叫 `warmup_numba_backend()` 一次，編譯結果只留在該程序記憶體，不能宣稱跨程序磁碟 cache 重用。若設定了 Numba backend，`NUMBA_CACHE_DIR` 仍必須明示為通過儲存檢查的 scratch 子目錄，並在匯入加速模組前設定；這是安全路徑契約，不代表目前核心會寫入 `.nbc`／`.nbi`。
 
-龜山島單站 30 天工程測速的分片順序、外部監測、checkpoint／resume 與耗時解讀見[單站 H30 工程測速操作契約](docs/operations/17_engineering_window_benchmark.md)。該測速僅量測實際步進成本、資料讀寫與準備時間，不能升格為正式研究成果或改寫五站完整情境契約。工程配對若需讓 `no_stokes` 與 `finite_depth_stokes` 在相同 scenario、master seed、member 下共用可重現的擴散亂數，請在 `scripts/run_engineering_window.py run` 明示非空 `--random-stream-id <ID>`；ID 只替換 seed 導出案例命名空間，兩個 run 仍保留各自 `experiment_case_id`、`particle_id`、物理 request 與輸出，並發布 schema `2.2.0`、含 ID 的 seed table／checkpoint 繫結／trajectory metadata。省略時維持 schema `2.1.0`、舊五欄 seed table 與原案例 seed；resume stream 變更、空白或非字串均 fail-closed。這只是 common-random-number 工程控制，不代表物理案例具有相同軌跡或可合併其條件式來源足跡。
+龜山島單站 30 天工程測速的分片順序、外部監測、checkpoint／resume 與耗時解讀見[單站 H30 工程測速操作契約](docs/operations/17_engineering_window_benchmark.md)。該測速僅量測實際步進成本、資料讀寫與準備時間，不能升格為正式研究成果或改寫五站完整情境契約。checkpoint 的 segment 操作、故障恢復與容量指標見[checkpoint segment 操作契約](docs/operations/18_checkpoint_segment_storage.md)。工程配對若需讓 `no_stokes` 與 `finite_depth_stokes` 在相同 scenario、master seed、member 下共用可重現的擴散亂數，請在 `scripts/run_engineering_window.py run` 明示非空 `--random-stream-id <ID>`；ID 只替換 seed 導出案例命名空間，兩個 run 仍保留各自 `experiment_case_id`、`particle_id`、物理 request 與輸出，並由 execution checkpoint schema `3.1.0` 保存含 ID 的 `binding`／segment chain。省略時維持原案例 seed；resume stream 變更、空白或非字串均 fail-closed。這只是 common-random-number 工程控制，不代表物理案例具有相同軌跡或可合併其條件式來源足跡。
 
-持續 worker 的快取計數按分片執行增量保存，續跑合併已保存增量，避免共用管理器的累計次數被報告重複相加；常駐位元組等狀態量以樣本最大值呈現。歷史缺少計數語意或量測不完整的紀錄須保留限制說明，不能作為精確總量。
+持續 worker 的快取計數按分片執行增量保存，續跑合併已保存增量，避免共用管理器的累計次數被報告重複相加；常駐位元組等狀態量以樣本最大值呈現。checkpoint 的 `checkpoint_bytes` 表示每次新 generation 的 lifetime logical bytes-written，`checkpoint_active_bytes` 表示目前所有保留 generation、`latest.json` 與 checkpoint 資料檔的已發布普通檔案 `st_size` 邏輯長度加總；它不包含目錄與 NFS 配置空間，不能取代 `du`／`df` 儲存閘門。兩者不可混為同一種容量。歷史缺少計數語意或量測不完整的紀錄須保留限制說明，不能作為精確總量。
 
 回溯日數採通用參數：`inputs.backtrack_support_days` 指定共同輸入要篩選與驗證的正整日上限，`boundaries.max_backtrack_days` 指定本次實際回溯長度。先建置並驗證支援 30 日的共同輸入，即可由 `release-config-create --max-backtrack-days` 產生 7 日、30 日等獨立執行設定，保留同一批到達時刻與情境，不必重跑整套 `inputs-build`。天數不是限定選單；超出既有輸入上限時須另建並驗證較長版本。設定範例、步數預算與來源綁定限制見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)與[CLI 參考](docs/operations/cli_reference.md)。
 

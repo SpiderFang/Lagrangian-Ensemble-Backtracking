@@ -13,6 +13,12 @@ from dataclasses import dataclass
 
 from scipy.optimize import brentq
 
+from .accelerated import (
+    PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1,
+    finite_depth_stokes_numba_kernel,
+    solve_wave_number_numba_kernel,
+    validate_physics_kernel_backend,
+)
 from .models import SURFACE_BOUNDARY_TOLERANCE_M
 
 GRAVITY_MPS2 = 9.80665
@@ -32,14 +38,34 @@ class StokesResult:
 
 
 def solve_wave_number(
-    *, angular_frequency_radps: float, water_depth_m: float, gravity_mps2: float = GRAVITY_MPS2
+    *,
+    angular_frequency_radps: float,
+    water_depth_m: float,
+    gravity_mps2: float = GRAVITY_MPS2,
+    physics_kernel_backend: str = "numpy_v1",
 ) -> float:
     """求解有限水深波浪色散關係 ``omega²=g k tanh(kh)`` 的唯一正波數。
 
     搜尋範圍從深水近似開始逐步放大，直到方程式兩側差值跨過零；接著使用有收斂保證的
-    數值方法求根。極淺水或非有限輸入會立即拒絕，避免不可靠結果污染整條粒子軌跡。
+    數值方法求根。預設 ``numpy_v1`` 保留 SciPy Brent 參考實作；``numba_cpu_v1`` 使用
+    最多 100 次的有界二分，括界策略、絕對／相對停止容差 ``1e-13`` 與最後殘差門檻
+    完全對齊。極淺水或非有限輸入會立即拒絕，避免不可靠結果污染整條粒子軌跡。
+
+    Args:
+        angular_frequency_radps: 波浪角頻率，單位 rad/s，必須有限且大於零。
+        water_depth_m: 海面至海床的正水深，單位 m。
+        gravity_mps2: 重力加速度，單位 m/s²。
+        physics_kernel_backend: 版本化 NumPy 參考或 Numba CPU 數值核心識別碼。
+
+    Returns:
+        色散關係的正波數，單位 m⁻¹。
+
+    Raises:
+        ValueError: 輸入非有限或非正。
+        RuntimeError: 無法建立括界、未收斂或最終殘差超出固定容差。
     """
 
+    backend = validate_physics_kernel_backend(physics_kernel_backend)
     if not (
         math.isfinite(angular_frequency_radps)
         and angular_frequency_radps > 0
@@ -50,6 +76,24 @@ def solve_wave_number(
     ):
         raise ValueError("omega、water depth 與 gravity 必須為有限正值")
     omega2 = angular_frequency_radps**2
+
+    if backend == PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1:
+        root, status = solve_wave_number_numba_kernel(
+            angular_frequency_radps,
+            water_depth_m,
+            gravity_mps2,
+        )
+        if status == 1:
+            raise RuntimeError("無法建立 dispersion root bracket")
+        if status == 2:
+            raise RuntimeError("dispersion root bisection did not converge")
+        if status == 3:
+            raise RuntimeError("dispersion root residual 超出容許值")
+        if status != 0:
+            # 外層已執行與 NumPy 參考同一組有限正值檢查；4 表示 kernel 的防禦性輸入
+            # 閘門也看見無效值，通常代表非標準 scalar 在編譯邊界轉型時失去原始語意。
+            raise ValueError("omega、water depth 與 gravity 必須為有限正值")
+        return float(root)
 
     def residual(wave_number: float) -> float:
         """回傳有限水深色散關係兩側的差值，供求根步驟判定方向。"""
@@ -86,15 +130,36 @@ def finite_depth_stokes(
     surface_z_m: float,
     bed_z_m: float,
     gravity_mps2: float = GRAVITY_MPS2,
+    physics_kernel_backend: str = "numpy_v1",
 ) -> StokesResult:
     """計算文件公式（7）對應的有限水深波浪表面漂移水平速度。
 
     ``particle_z_m``、``surface_z_m`` 與 ``bed_z_m`` 都以海面向上為正。粒子必須位於
     海床與海面之間；有效波高為零時可合法回傳零速度，但峰值頻率、波向與水深仍必須有效，
     才能區分「確實無波」和「缺少波浪資料」。水很深時為避免雙曲函數數值溢位，會改用
-    已驗證的深水極限公式；這只是穩定計算方式，不是改變物理情境。
+    已驗證的深水極限公式；這只是穩定計算方式，不是改變物理情境。可選
+    ``physics_kernel_backend`` 只替換求根與標量公式的執行實作，Python caller 仍先檢查
+    有效波高、頻率、角度、粒子垂向位置及表面容差；預設 NumPy 保留既有數值路徑。
+
+    Args:
+        significant_wave_height_m: 有效波高，單位 m，不可為負。
+        peak_frequency_hz: 峰值頻率，單位 Hz，必須為正。
+        direction_raw_deg: NWW3 來波方向，正北起順時針，單位度。
+        particle_z_m: 粒子高度，海面向上為正，單位 m。
+        surface_z_m: 當下海面高度，單位 m。
+        bed_z_m: 當下海床高度，單位 m。
+        gravity_mps2: 重力加速度，單位 m/s²。
+        physics_kernel_backend: 版本化 NumPy 參考或 Numba CPU 數值核心識別碼。
+
+    Returns:
+        StokesResult，含東／北速度（m/s）、波數與波長、無因次 ``kh``／陡峭度及相對深度。
+
+    Raises:
+        ValueError: 物理輸入無效、粒子在容差帶外越過海面／海床，或 solver 看見非有限頻率。
+        RuntimeError: Numba 有界求根未能滿足參考容差。
     """
 
+    backend = validate_physics_kernel_backend(physics_kernel_backend)
     values = [
         significant_wave_height_m,
         peak_frequency_hz,
@@ -120,8 +185,46 @@ def finite_depth_stokes(
     if relative_z > 0.0:
         relative_z = 0.0
     omega = 2.0 * math.pi * peak_frequency_hz
+    if backend == PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1:
+        (
+            u_mps,
+            v_mps,
+            wave_number,
+            wavelength_m,
+            kh,
+            steepness_ka,
+            relative_depth,
+            status,
+        ) = finite_depth_stokes_numba_kernel(
+            significant_wave_height_m,
+            peak_frequency_hz,
+            direction_raw_deg,
+            relative_z,
+            water_depth,
+            gravity_mps2,
+        )
+        if status == 1:
+            raise RuntimeError("無法建立 dispersion root bracket")
+        if status == 2:
+            raise RuntimeError("dispersion root bisection did not converge")
+        if status == 3:
+            raise RuntimeError("dispersion root residual 超出容許值")
+        if status != 0:
+            raise ValueError("omega、water depth 與 gravity 必須為有限正值")
+        return StokesResult(
+            u_mps=float(u_mps),
+            v_mps=float(v_mps),
+            wave_number_per_m=float(wave_number),
+            wavelength_m=float(wavelength_m),
+            kh=float(kh),
+            steepness_ka=float(steepness_ka),
+            relative_depth=float(relative_depth),
+        )
     wave_number = solve_wave_number(
-        angular_frequency_radps=omega, water_depth_m=water_depth, gravity_mps2=gravity_mps2
+        angular_frequency_radps=omega,
+        water_depth_m=water_depth,
+        gravity_mps2=gravity_mps2,
+        physics_kernel_backend=backend,
     )
     amplitude = significant_wave_height_m / 2.0
     kh = wave_number * water_depth

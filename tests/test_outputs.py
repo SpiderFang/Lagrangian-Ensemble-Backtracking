@@ -143,6 +143,22 @@ def test_strict_formal_and_pilot_metadata_rules(tmp_path: Path) -> None:
     )["valid"]
 
 
+def test_checkpoint_active_bytes_is_optional_but_strict_when_present(tmp_path: Path) -> None:
+    """v3 新增的 active logical file bytes 可供成果保存，舊 metadata 缺欄仍維持可讀。"""
+
+    current = _metadata("pilot", commit=None, dirty=None)
+    current["resource_usage"]["checkpoint_active_bytes"] = 4096
+    root = tmp_path / "active-bytes"
+    write_trajectory_shard(root, [_result()], run_metadata=current)
+    assert validate_trajectory_shard(root, strict_run_metadata=True)["valid"]
+
+    malformed = _metadata("pilot", commit=None, dirty=None)
+    malformed["resource_usage"]["checkpoint_active_bytes"] = "4096"
+    malformed_root = tmp_path / "malformed-active-bytes"
+    write_trajectory_shard(malformed_root, [_result()], run_metadata=malformed)
+    assert not validate_trajectory_shard(malformed_root, strict_run_metadata=True)["valid"]
+
+
 @pytest.mark.parametrize(
     "damage", ["bad_json", "nonfinite_json", "traversal", "npy", "unknown", "symlink"]
 )

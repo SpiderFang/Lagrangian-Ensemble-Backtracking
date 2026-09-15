@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .accelerated import interpolate_ocm_support_numba
+from .accelerated import interpolate_ocm_support_numba, validate_physics_kernel_backend
 from .diffusion import (
     DiffusionCoefficients,
     DiffusionSample,
@@ -309,8 +309,24 @@ class OCMNativeMonth:
             raise ValueError("OCM time_utc_ns 必須是嚴格遞增 int64")
 
     @classmethod
-    def from_directory(cls, month_dir: str | Path, *, mesh: NativeMesh) -> OCMNativeMonth:
-        """從月份資料夾以唯讀方式開啟陣列，不允許載入任意序列化物件。"""
+    def from_directory(
+        cls,
+        month_dir: str | Path,
+        *,
+        mesh: NativeMesh,
+        use_numba_kernel: bool = False,
+    ) -> OCMNativeMonth:
+        """從月份資料夾以唯讀方式開啟陣列，不允許載入任意序列化物件。
+
+        ``use_numba_kernel`` 只切換既有 OCM 端點內插 primitive；月份選擇、時間缺口、
+        網格定位、濕乾遮罩、垂向支援與最終品質檢查仍由同一個 Python 控制層執行，
+        因此這個參數不會把純 NumPy 參考引擎誤稱為完整 Numba physics backend。預設
+        ``False`` 保留舊 caller 的 NumPy 行為；檔案仍以唯讀 memory-map 開啟，避免
+        建立一份與 SERVER 上游產品相同大小的複本。
+        """
+
+        if type(use_numba_kernel) is not bool:
+            raise TypeError("use_numba_kernel 必須是 bool")
 
         root = Path(month_dir)
 
@@ -332,6 +348,7 @@ class OCMNativeMonth:
             elev=load("elev.npy"),
             wetdry_elem=load("wetdry_elem.npy"),
             diffusivity=load("diffusivity.npy"),
+            use_numba_kernel=use_numba_kernel,
         )
 
     def _vertical_node_sample(
@@ -1518,8 +1535,14 @@ class CombinedMonthForcing:
         projection: DomainProjection,
         settling_velocity_mps: float,
         include_stokes: bool,
+        physics_kernel_backend: str = "numpy_v1",
     ) -> None:
-        """不納入波浪表面漂移的案例可不讀波浪資料；納入時則必須提供 NWW 資料。"""
+        """不納入波浪表面漂移的案例可不讀波浪資料；納入時則必須提供 NWW 資料。
+
+        ``physics_kernel_backend`` 只選擇有限水深 Stokes 數值 primitive 的參考或 Numba
+        實作；不改變 OCM／NWW 空間與時間取樣、品質檢查、缺值分類或速度合成順序。預設
+        ``numpy_v1`` 保留舊 caller 直接建立此 provider 時的原有數值路徑。
+        """
 
         if include_stokes and nww is None:
             raise ValueError("include_stokes=True 時必須提供 NWW month")
@@ -1528,6 +1551,7 @@ class CombinedMonthForcing:
         self.projection = projection
         self.settling_velocity_mps = float(settling_velocity_mps)
         self.include_stokes = include_stokes
+        self.physics_kernel_backend = validate_physics_kernel_backend(physics_kernel_backend)
 
     def sample(
         self,
@@ -1579,6 +1603,7 @@ class CombinedMonthForcing:
                     particle_z_m=z_m,
                     surface_z_m=current.eta_m,
                     bed_z_m=current.bed_z_m,
+                    physics_kernel_backend=self.physics_kernel_backend,
                 )
             except ValueError:
                 return VelocitySample(
@@ -1866,6 +1891,7 @@ class CombinedMonthForcing:
                     particle_z_m=z_m,
                     surface_z_m=eta,
                     bed_z_m=bed,
+                    physics_kernel_backend=self.physics_kernel_backend,
                 )
             except ValueError:
                 return VelocitySample(

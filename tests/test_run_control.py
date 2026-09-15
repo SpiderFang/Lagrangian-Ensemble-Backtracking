@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 from shapely.geometry import box
 
+import lagrangian_backtracking.run_control as run_control_module
 from lagrangian_backtracking.boundaries import BoundaryGeometry
 from lagrangian_backtracking.diffusion import DiffusionCoefficients
 from lagrangian_backtracking.engine import EngineSettings
@@ -222,6 +223,42 @@ def _write_progress(workspace: Path, progress: dict) -> None:
     (workspace / "run_progress.json").write_text(
         json.dumps(progress, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
+    )
+
+
+def _write_schema22_generation(
+    controller: RunController,
+    shard_id: str,
+    destination: Path,
+    *,
+    sequence: int,
+) -> Path:
+    """在 controller 的同一 binding 下建立舊 schema 2.2 generation 測試資料。
+
+    scanner/reconcile 回歸需要一個「格式合法、binding 相同但版本／序號刻意不合規」的
+    generation。這個 helper 直接用 controller 重建的 ScenarioShard、master seed 與
+    checkpoint binding 寫入 synthetic schema 2.2；它不模擬真實 forcing，也不修改正式
+    writer 的 schema 3 行為，只讓測試能精確隔離拓撲閘門。
+    """
+
+    from lagrangian_backtracking.checkpoint import _write_execution_checkpoint_schema22
+
+    shard = controller._shard(shard_id)
+    batch = ProductionBatch(
+        shard,
+        master_seed=int(controller.plan["master_seed"]),
+        random_stream_id=controller.plan.get("random_stream_id"),
+        request_factory=_request,
+    )
+    batch.advance()
+    return _write_execution_checkpoint_schema22(
+        destination,
+        binding=controller._binding(shard),
+        run_units=batch.units,
+        executions=[runtime.execution for runtime in batch.runtimes],
+        rngs=[runtime.rng for runtime in batch.runtimes],
+        triangle_hints=[runtime.triangle_hint for runtime in batch.runtimes],
+        sequence=sequence,
     )
 
 
@@ -612,6 +649,12 @@ def test_off_boundary_pause_resume_keeps_periodic_checkpoint_cadence(tmp_path: P
     progress = load_run_progress(workspace)["shards"][shard_id]
     assert progress["checkpoint_sequence"] == 2
     assert progress["sweeps_completed"] == interval + 1
+    actual_active_bytes = sum(
+        path.stat().st_size
+        for path in parent.rglob("*")
+        if path.is_file()
+    )
+    assert progress["metrics"]["checkpoint_active_bytes"] == actual_active_bytes
 
 
 def test_periodic_checkpoint_updates_progress_before_next_step_failure(
@@ -696,6 +739,176 @@ def test_orphan_generation_repairs_latest_and_running_progress(
     assert row["metrics"]["sweeps_recovered_lower_bound"] is True
 
 
+def test_reconcile_rejects_gap_in_retained_checkpoint_generations(tmp_path: Path) -> None:
+    """保留 generation 缺少中間序號時，不得從較高代靜默採認。"""
+
+    workspace = _workspace(tmp_path, "checkpoint-generation-gap", interval=2)
+    shard_id = _first_shard(workspace)
+    controller = RunController(workspace, request_factory=_request)
+    controller.run_shard(shard_id, sweep_budget=1)
+    parent = workspace / "checkpoints" / workspace.name / shard_id
+    _write_schema22_generation(
+        controller,
+        shard_id,
+        parent / "checkpoint-00000003",
+        sequence=3,
+    )
+    progress = load_run_progress(workspace)
+    progress["shards"][shard_id]["lifecycle"] = "RUNNING"
+    progress["run_lifecycle"] = "RUNNING"
+    _write_progress(workspace, progress)
+
+    with pytest.raises(ValueError, match="generation sequence 必須連續"):
+        RunController(workspace, request_factory=_request, resume=True).reconcile()
+
+
+def test_reconcile_rejects_schema2_downgrade_after_v3_generation(tmp_path: Path) -> None:
+    """v3 generation 後插入 schema 2.x 時，不得切斷既有 hash chain。"""
+
+    workspace = _workspace(tmp_path, "checkpoint-schema-downgrade", interval=2)
+    shard_id = _first_shard(workspace)
+    controller = RunController(workspace, request_factory=_request)
+    controller.run_shard(shard_id, sweep_budget=1)
+    parent = workspace / "checkpoints" / workspace.name / shard_id
+    _write_schema22_generation(
+        controller,
+        shard_id,
+        parent / "checkpoint-00000002",
+        sequence=2,
+    )
+    progress = load_run_progress(workspace)
+    progress["shards"][shard_id]["lifecycle"] = "RUNNING"
+    progress["run_lifecycle"] = "RUNNING"
+    _write_progress(workspace, progress)
+
+    with pytest.raises(ValueError, match=r"不可由 3\.x 降回 2\.x"):
+        RunController(workspace, request_factory=_request, resume=True).reconcile()
+
+
+def test_reconcile_rejects_running_orphan_more_than_one_generation_ahead(
+    tmp_path: Path,
+) -> None:
+    """RUNNING progress 只能採認下一代 orphan，不得跳過已發布的中間代。"""
+
+    workspace = _workspace(tmp_path, "checkpoint-orphan-too-high", interval=1)
+    shard_id = _first_shard(workspace)
+    controller = RunController(workspace, request_factory=_request)
+    controller.run_shard(shard_id, sweep_budget=1)
+    first_progress = deepcopy(load_run_progress(workspace))
+    controller = RunController(workspace, request_factory=_request, resume=True)
+    controller.run_shard(shard_id, sweep_budget=1)
+    controller.run_shard(shard_id, sweep_budget=1)
+    progress = load_run_progress(workspace)
+    row = progress["shards"][shard_id]
+    first_row = first_progress["shards"][shard_id]
+    row.update(
+        {
+            "lifecycle": "RUNNING",
+            "checkpoint_sequence": first_row["checkpoint_sequence"],
+            "checkpoint_relative_path": first_row["checkpoint_relative_path"],
+            "sweeps_completed": first_row["sweeps_completed"],
+            "particle_steps": first_row["particle_steps"],
+            "metrics": deepcopy(first_row["metrics"]),
+        }
+    )
+    progress["run_lifecycle"] = "RUNNING"
+    _write_progress(workspace, progress)
+
+    with pytest.raises(ValueError, match="只能是 progress 的下一代"):
+        RunController(workspace, request_factory=_request, resume=True).reconcile()
+
+
+def test_latest_pointer_oserror_keeps_complete_generation_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """latest 更新失敗時不得把已發布 generation 標成 FAILED，且容量 metrics 由實體樹重建。"""
+
+    workspace = _workspace(tmp_path / "fault", "latest-oserror", interval=2)
+    shard_id = _first_shard(workspace)
+    RunController(workspace, request_factory=_request).run_shard(shard_id, sweep_budget=1)
+    controller = RunController(workspace, request_factory=_request, resume=True)
+
+    def fail_latest(*args, **kwargs):
+        """模擬 NFS latest pointer 原子替換失敗。"""
+
+        del args, kwargs
+        raise OSError("simulated latest rename failure")
+
+    monkeypatch.setattr(controller, "_write_latest", fail_latest)
+    with pytest.raises(OSError, match="latest rename"):
+        controller.run_shard(shard_id, sweep_budget=2)
+
+    row = load_run_progress(workspace)["shards"][shard_id]
+    parent = workspace / "checkpoints" / workspace.name / shard_id
+    assert row["lifecycle"] == "RUNNING"
+    assert row["checkpoint_sequence"] == 2
+    assert not (workspace / "failures" / shard_id).exists()
+    logical_bytes = sum(
+        path.stat().st_size
+        for generation in parent.glob("checkpoint-*")
+        for path in generation.iterdir()
+        if path.is_file()
+    )
+    active_bytes = sum(path.stat().st_size for path in parent.rglob("*") if path.is_file())
+    assert row["metrics"]["checkpoint_bytes"] == logical_bytes
+    assert row["metrics"]["checkpoint_active_bytes"] == active_bytes
+
+    # latest pointer 仍落在第一代，下一次 reconcile 應由 RUNNING row 採認第二代 orphan，
+    # 並在不改變 checkpoint state／RNG 的前提下允許完整 resume。
+    reconciled = RunController(workspace, request_factory=_request, resume=True).reconcile()
+    assert reconciled["shards"][shard_id]["checkpoint_sequence"] == 2
+    summary = RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id)
+    assert summary.lifecycle == "COMPLETE"
+
+    baseline = _workspace(tmp_path / "baseline", "latest-baseline", interval=2)
+    baseline_shard_id = _first_shard(baseline)
+    RunController(baseline, request_factory=_request).run_shard(baseline_shard_id)
+    assert _payload_snapshot(workspace, shard_id) == _payload_snapshot(baseline, baseline_shard_id)
+
+
+def test_latest_and_adoption_read_oserror_keep_running_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """latest 發布後的暫時讀取錯誤不得寫 FAILED，NFS 恢復後仍可續跑 orphan。"""
+
+    workspace = _workspace(tmp_path, "latest-adoption-oserror", interval=2)
+    shard_id = _first_shard(workspace)
+    RunController(workspace, request_factory=_request).run_shard(shard_id, sweep_budget=1)
+    controller = RunController(workspace, request_factory=_request, resume=True)
+
+    def fail_latest(*args, **kwargs):
+        """模擬 generation rename 後 latest pointer 原子替換失敗。"""
+
+        del args, kwargs
+        raise OSError("simulated latest rename failure")
+
+    original_load = run_control_module.load_execution_checkpoint
+
+    def fail_candidate_load(path, *args, **kwargs):
+        """模擬 orphan 已存在但 NFS 暫時無法讀取其 payload。"""
+
+        if Path(path).name == "checkpoint-00000002":
+            raise OSError("simulated transient checkpoint read failure")
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(controller, "_write_latest", fail_latest)
+    monkeypatch.setattr(run_control_module, "load_execution_checkpoint", fail_candidate_load)
+    with pytest.raises(OSError, match="latest rename"):
+        controller.run_shard(shard_id, sweep_budget=2)
+
+    row = load_run_progress(workspace)["shards"][shard_id]
+    assert row["lifecycle"] == "RUNNING"
+    # progress 仍停在上一個已知 generation；candidate 必須留在現場，不能覆寫或變成 FAILED。
+    assert row["checkpoint_sequence"] == 1
+    assert not (workspace / "failures" / shard_id).exists()
+
+    # NFS 恢復後恢復原 loader；新的 controller 會由最高完整 generation 修復 latest，
+    # 載入同一 RNG／history，完成剩餘執行。
+    monkeypatch.setattr(run_control_module, "load_execution_checkpoint", original_load)
+    summary = RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id)
+    assert summary.lifecycle == "COMPLETE"
+
+
 @pytest.mark.parametrize("damage", ["unknown", "partial", "symlink", "corrupt", "binding"])
 def test_checkpoint_damage_is_fail_closed(tmp_path: Path, damage: str) -> None:
     """未知、partial、symlink、checksum 或 binding 損壞都不可退回較舊狀態。"""
@@ -712,8 +925,8 @@ def test_checkpoint_damage_is_fail_closed(tmp_path: Path, damage: str) -> None:
     elif damage == "symlink":
         (parent / "linked").symlink_to(generation, target_is_directory=True)
     elif damage == "corrupt":
-        payload = generation / "execution_state.json"
-        payload.write_text(payload.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        payload = generation / "history_segment.json.gz"
+        payload.write_bytes(payload.read_bytes() + b"\n")
     else:
         metadata_path = generation / "checkpoint.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -733,29 +946,85 @@ def test_checkpoint_damage_is_fail_closed(tmp_path: Path, damage: str) -> None:
         RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id)
 
 
-def test_keyboard_interrupt_pauses_with_checkpoint_bytes_and_no_failure(
+def test_keyboard_interrupt_during_advance_preserves_previous_checkpoint_and_no_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KeyboardInterrupt 要 best-effort checkpoint、PAUSED，且不得寫 failure artifact。"""
+    """advance 未正常回傳時不得保存半個 sweep，應保留上一個已發布 generation。"""
 
     workspace = _workspace(tmp_path, "keyboard-run", interval=3)
     shard_id = _first_shard(workspace)
+    controller = RunController(workspace, request_factory=_request)
+    controller.run_shard(shard_id, sweep_budget=1)
+    before = deepcopy(load_run_progress(workspace))
+    original_advance = ProductionBatch.advance
 
-    def interrupt(self: ProductionBatch, sweeps: int = 1):
-        """模擬 operator 在 batch 已建構後中斷。"""
+    def interrupt_after_sweep(self: ProductionBatch, sweeps: int = 1):
+        """模擬完整 interval 已改變 runtime，但 advance 尚未回傳結果時收到 Ctrl-C。"""
 
-        del self, sweeps
+        original_advance(self, sweeps=sweeps)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(ProductionBatch, "advance", interrupt)
+    monkeypatch.setattr(ProductionBatch, "advance", interrupt_after_sweep)
     with pytest.raises(KeyboardInterrupt):
-        RunController(workspace, request_factory=_request).run_shard(shard_id)
+        RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id)
     row = load_run_progress(workspace)["shards"][shard_id]
-    assert row["lifecycle"] == "PAUSED"
-    assert row["checkpoint_sequence"] == 1
-    assert row["metrics"]["checkpoint_bytes"] > 0
+    before_row = before["shards"][shard_id]
+    assert row["lifecycle"] == "RUNNING"
+    assert row["checkpoint_sequence"] == before_row["checkpoint_sequence"] == 1
+    assert row["checkpoint_relative_path"] == before_row["checkpoint_relative_path"]
+    assert row["sweeps_completed"] == before_row["sweeps_completed"]
+    assert row["particle_steps"] == before_row["particle_steps"]
+    parent = workspace / "checkpoints" / workspace.name / shard_id
+    assert [path.name for path in parent.glob("checkpoint-*")] == ["checkpoint-00000001"]
     assert not (workspace / "failures" / shard_id).exists()
-    assert not any(path.name.startswith(".") for path in (workspace / "shards").iterdir())
+    assert not any(path.name.startswith(".") for path in parent.iterdir())
+
+    # 恢復時使用原始 advance；它會從 gen1 重算完整 interval，而不是接續未發布的半個
+    # sweep，並應與同樣先完成 gen1 的不中斷 baseline 逐欄一致。
+    monkeypatch.setattr(ProductionBatch, "advance", original_advance)
+    summary = RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id)
+    assert summary.lifecycle == "COMPLETE"
+
+    baseline = _workspace(tmp_path / "baseline", "keyboard-baseline", interval=3)
+    baseline_shard_id = _first_shard(baseline)
+    RunController(baseline, request_factory=_request).run_shard(baseline_shard_id, sweep_budget=1)
+    RunController(baseline, request_factory=_request, resume=True).run_shard(baseline_shard_id)
+    assert _payload_snapshot(workspace, shard_id) == _payload_snapshot(baseline, baseline_shard_id)
+
+
+def test_keyboard_interrupt_after_first_particle_preserves_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """單步中途已有粒子改動時，Ctrl-C 仍不得把半個 sweep 寫成 checkpoint。"""
+
+    workspace = _workspace(tmp_path, "keyboard-mid-sweep", interval=2)
+    shard_id = _first_shard(workspace)
+    controller = RunController(workspace, request_factory=_request)
+    controller.run_shard(shard_id, sweep_budget=1)
+    before = deepcopy(load_run_progress(workspace))
+
+    def interrupt_mid_sweep(self: ProductionBatch, sweeps: int = 1):
+        """只改第一個 runtime 後中斷，模擬 particle loop 尚未完成整個 sweep。"""
+
+        del sweeps
+        runtime = self.runtimes[0]
+        runtime.execution.state = replace(
+            runtime.execution.state,
+            x_m=runtime.execution.state.x_m + 123.0,
+        )
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ProductionBatch, "advance", interrupt_mid_sweep)
+    with pytest.raises(KeyboardInterrupt):
+        RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id)
+    row = load_run_progress(workspace)["shards"][shard_id]
+    before_row = before["shards"][shard_id]
+    assert row["lifecycle"] == "RUNNING"
+    assert row["checkpoint_sequence"] == before_row["checkpoint_sequence"] == 1
+    assert row["particle_steps"] == before_row["particle_steps"]
+    parent = workspace / "checkpoints" / workspace.name / shard_id
+    assert [path.name for path in parent.glob("checkpoint-*")] == ["checkpoint-00000001"]
+    assert not (workspace / "failures" / shard_id).exists()
 
 
 def test_keyboard_interrupt_during_request_factory_stays_running(tmp_path: Path) -> None:
@@ -781,6 +1050,151 @@ def test_keyboard_interrupt_during_request_factory_stays_running(tmp_path: Path)
     validation = validate_run(workspace)
     assert validation["valid"] is True
     assert validation["summary"]["run_lifecycle"] == "RUNNING"
+
+
+def test_atomic_json_cleanup_failure_preserves_original_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """暫存檔清理遇到 NFS OSError 時仍保留原始 Ctrl-C 與現場證據。"""
+
+    target = tmp_path / "state.json"
+    original_unlink = Path.unlink
+
+    def write_then_interrupt(path: Path, value: object) -> None:
+        """留下部分內容後模擬 operator 中斷，建立可觀測 cleanup fault window。"""
+
+        del value
+        path.write_text("partial\n", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    def fail_temporary_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        """只讓本次 atomic temporary 的清理模擬 NFS 權限／I/O 錯誤。"""
+
+        if path.name.startswith(".state.json.partial-"):
+            raise OSError("simulated temporary cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(run_control_module, "_write_json", write_then_interrupt)
+    monkeypatch.setattr(Path, "unlink", fail_temporary_unlink)
+    with pytest.raises(KeyboardInterrupt):
+        run_control_module._atomic_json(target, {})
+    partials = list(tmp_path.glob(".state.json.partial-*"))
+    assert len(partials) == 1
+    assert not target.exists()
+
+
+def test_keyboard_interrupt_during_checkpoint_parent_reuses_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """建立 checkpoint parent 時中斷，recovery 不得跳過已分配的 generation 序號。"""
+
+    workspace = _workspace(tmp_path, "keyboard-parent", interval=2)
+    shard_id = _first_shard(workspace)
+    controller = RunController(workspace, request_factory=_request)
+    original_parent = controller._checkpoint_parent
+    create_calls = 0
+
+    def interrupt_parent(shard, *, create: bool = False):
+        """只在本輪第一次真正建立 checkpoint parent 時模擬 Ctrl-C。"""
+
+        nonlocal create_calls
+        if create:
+            create_calls += 1
+            if create_calls == 1:
+                raise KeyboardInterrupt
+        return original_parent(shard, create=create)
+
+    monkeypatch.setattr(controller, "_checkpoint_parent", interrupt_parent)
+    with pytest.raises(KeyboardInterrupt):
+        controller.run_shard(shard_id, sweep_budget=1)
+
+    parent = workspace / "checkpoints" / workspace.name / shard_id
+    row = load_run_progress(workspace)["shards"][shard_id]
+    assert row["lifecycle"] == "PAUSED"
+    assert row["checkpoint_sequence"] == 1
+    assert [path.name for path in parent.glob("checkpoint-*")] == ["checkpoint-00000001"]
+    assert not any(path.name.startswith(".") for path in parent.iterdir())
+    assert not (workspace / "failures" / shard_id).exists()
+
+    assert RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id).lifecycle == (
+        "COMPLETE"
+    )
+
+
+@pytest.mark.parametrize("fault", ["payload", "rename", "latest", "progress"])
+def test_keyboard_interrupt_publish_windows_leave_one_resumable_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    """Ctrl-C 落在各 checkpoint 發布窗口時，不留 partial、不重複序號且可精確續跑。"""
+
+    workspace = _workspace(tmp_path, f"keyboard-{fault}", interval=2)
+    shard_id = _first_shard(workspace)
+    controller = RunController(workspace, request_factory=_request)
+
+    if fault == "payload":
+        original_write_checkpoint = ProductionBatch.write_checkpoint
+        calls = 0
+
+        def interrupt_once(self: ProductionBatch, *args, **kwargs):
+            """在 generation payload 尚未建立前中斷一次，第二次允許 handler 重試。"""
+
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise KeyboardInterrupt
+            return original_write_checkpoint(self, *args, **kwargs)
+
+        monkeypatch.setattr(ProductionBatch, "write_checkpoint", interrupt_once)
+    elif fault == "rename":
+        original_write_checkpoint = controller._write_checkpoint
+
+        def interrupt_after_generation(*args, **kwargs):
+            """generation/latest 已發布後，在 controller 收到 return 前中斷。"""
+
+            original_write_checkpoint(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(controller, "_write_checkpoint", interrupt_after_generation)
+    elif fault == "latest":
+
+        def interrupt_latest(*args, **kwargs):
+            """模擬 latest temporary／rename 窗口的 operator interrupt。"""
+
+            del args, kwargs
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(controller, "_write_latest", interrupt_latest)
+    else:
+        original_mark_running = controller._mark_checkpoint_running
+        calls = 0
+
+        def interrupt_after_progress(*args, **kwargs):
+            """progress 已原子發布後只中斷第一次，讓 handler 可再次採認。"""
+
+            nonlocal calls
+            result = original_mark_running(*args, **kwargs)
+            calls += 1
+            if calls == 1:
+                raise KeyboardInterrupt
+            return result
+
+        monkeypatch.setattr(controller, "_mark_checkpoint_running", interrupt_after_progress)
+
+    with pytest.raises(KeyboardInterrupt):
+        controller.run_shard(shard_id, sweep_budget=1)
+
+    parent = workspace / "checkpoints" / workspace.name / shard_id
+    row = load_run_progress(workspace)["shards"][shard_id]
+    assert row["lifecycle"] == "PAUSED"
+    assert row["checkpoint_sequence"] == 1
+    assert [path.name for path in parent.glob("checkpoint-*")] == ["checkpoint-00000001"]
+    assert not any(path.name.startswith(".") for path in parent.iterdir())
+    assert not (workspace / "failures" / shard_id).exists()
+
+    summary = RunController(workspace, request_factory=_request, resume=True).run_shard(shard_id)
+    assert summary.lifecycle == "COMPLETE"
 
 
 def test_ordinary_error_writes_safe_failure_and_no_partial_output(tmp_path: Path) -> None:

@@ -250,6 +250,13 @@ def _validate_tracked_run_metadata(metadata: Mapping[str, Any], *, require_forma
         value = resource_usage.get(key)
         if type(value) is not int or value < 0:
             add(f"run_metadata.resource_usage.{key}: invalid_nonnegative_integer")
+    # v3 execution checkpoint 額外保存目前已發布普通檔案 st_size 的邏輯長度 gauge；舊
+    # trajectory metadata 沒有此欄位仍可讀取，因此它是 optional，但一旦出現就必須維持
+    # 整數與非負語意。這個欄位不代表 NFS 目錄／區塊配置空間。
+    if "checkpoint_active_bytes" in resource_usage:
+        value = resource_usage["checkpoint_active_bytes"]
+        if type(value) is not int or value < 0:
+            add("run_metadata.resource_usage.checkpoint_active_bytes: invalid_nonnegative_integer")
 
 
 def sha256_file(path: str | Path, *, chunk_bytes: int = 8 * 1024 * 1024) -> str:

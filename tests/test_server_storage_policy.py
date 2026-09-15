@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -194,14 +195,39 @@ def test_free_space_failure_is_reported(tmp_path: Path) -> None:
 
 
 def test_write_probe_failure_is_reported(tmp_path: Path) -> None:
-    """寫入探針失敗時不能只依賴 os.access 放行。"""
+    """實際寫入探針失敗時仍以固定 issue 停止 gate。"""
+
+    layout = _layout(tmp_path)
+    failed_root = layout["output_root"]
+
+    snapshot = _validate(layout, write_probe=lambda path: path != failed_root)
+
+    assert snapshot["gate_status"] == "FAIL"
+    assert {"label": "output_root", "code": "write_probe_failed"} in snapshot["issues"]
+
+
+def test_nfs_advisory_write_access_denial_does_not_override_successful_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NFS 的 W_OK 預檢回報失敗時，成功的實際寫入探針仍可通過。"""
 
     layout = _layout(tmp_path)
 
-    snapshot = _validate(layout, write_probe=lambda _path: False)
+    def advisory_access(_path: Path, mode: int) -> bool:
+        # 模擬 NFS 上 access(2) 的 W_OK 預檢與後續檔案操作不一致；目錄搜尋權限仍
+        # 成功，實際寫入結果則由注入的寫入探針獨立提供。
+        if mode & os.W_OK:
+            return False
+        return bool(mode & os.X_OK)
 
-    assert snapshot["gate_status"] == "FAIL"
-    assert {issue["code"] for issue in snapshot["issues"]} >= {"write_probe_failed"}
+    monkeypatch.setattr(storage.os, "access", advisory_access)
+
+    assert not storage.os.access(layout["output_root"], os.W_OK)
+    assert storage.os.access(layout["output_root"], os.X_OK)
+    snapshot = _validate(layout, write_probe=lambda _path: True)
+
+    assert snapshot["gate_status"] == "PASS"
+    assert snapshot["issues"] == []
 
 
 def test_flock_probe_failure_is_reported(tmp_path: Path) -> None:

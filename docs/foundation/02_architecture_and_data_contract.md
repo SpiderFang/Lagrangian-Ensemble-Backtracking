@@ -12,7 +12,7 @@
 ### 1.1 BayTrace 可用部分整合界線
 
 本專案已採用 BayTrace 可對應本地 CPU 執行的工程思路：CPU SoA／batch／chunk、每粒子可
-重現亂數、SCHISM triangle hint、可暫停 engine，以及 checkpoint schema 2.2/restart。未採用
+重現亂數、SCHISM triangle hint、可暫停 engine，以及 checkpoint schema 3.1/restart。未採用
 GPU/CUDA、BayTrace raw `schout`／`bp` I/O、oil/weathering、droptime、共享記憶體
 multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 僅保留為未來具備完整
 相容 fixture 時的 golden reference，不是目前的正式驗證結果。
@@ -202,7 +202,7 @@ OCM 與 NWW3 缺值政策分開：
 | `forcing.nww3` | NWW3 analysis-grid time/space sampler 與 QC |
 | `forcing_window` | 單一 flow domain 的 UTC 月份 lazy loader、LRU resident window、material facade 與 cache/resource stats |
 | `provenance` | 不含絕對路徑的 Git/deployment tree、uv.lock、Python 與套件版本指紋；formal 只接受 Git clean 或 declared deployment commit |
-| `run_control` | immutable run plan、atomic progress、schema 2.2 checkpoint generation、trajectory publish 與 reconcile |
+| `run_control` | immutable run plan、atomic progress、schema 3.1 gzip segment checkpoint generation、trajectory publish 與 reconcile |
 | `run_validation` | run plan/progress、scenario/seed table、shard range、checkpoint/output checksum 與工程 benchmark 唯讀驗證 |
 | `physics.stokes` | dispersion solver、bulk finite-depth profile、方向轉換 |
 | `physics.diffusion` | Smagorinsky Kh、Kz、gradient drift 與 stochastic increment |
@@ -459,7 +459,10 @@ shard lifecycle 只接受 `PLANNED`、`RUNNING`、`PAUSED`、`COMPLETE`、`FAILE
 `particle_steps`、`sweeps_completed` 與 counter 來源。generation 已完成但 pointer 尚未更新的
 crash window，可由 execution 的每粒子 `step_count` 精確重建 particle steps；schema 2 未保存
 run-level sweep 時只能保守記錄 sweep 下界，並以
-`sweeps_recovered_lower_bound=true` 提供 machine-readable 標記。後續 checkpoint cadence 永遠
+`sweeps_recovered_lower_bound=true` 提供 machine-readable 標記。execution checkpoint schema
+3 將歷史切成 immutable segment，compact state 保存目前粒子狀態、觀測／事件 cursor、RNG
+與 triangle hint；每代以 segment manifest SHA-256 串接，loader 會拒絕缺失、重複、跳號、
+重排與 cursor 不連續。後續 checkpoint cadence 永遠
 從上一個合法 generation 起最多再前進 plan interval，不以此下界取模，因此不改變物理狀態、
 亂數狀態或下一次 checkpoint 時機。checkpoint
 schema 2 的 `CheckpointBinding.input_inventory_hash` 使用 composite hash（raw inventory、

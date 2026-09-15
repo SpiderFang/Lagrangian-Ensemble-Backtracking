@@ -588,7 +588,12 @@ arrival_time_selection:
 
 execution:
   reference_backend: numpy
-  # 目前只有 CPU/NumPy reference orchestration；不可宣稱已接 Numba kernel。
+  # production_backend 仍固定代表可稽核的 Python reference orchestration；下列兩個
+  # 版本化選項只替換已具 NumPy 參考測試的 CPU 內層數值 primitive，不改情境、粒子身分、
+  # 亂數順序、品質檢查旗標（QC）、邊界、缺值或 checkpoint 語意。舊設定為維持 hash 可
+  # 省略；未來新正式 run 應明示啟用兩個 Numba 選項，並使其進入 config/run 身分。
+  # ocm_interpolation_backend: numba_ocm_v1
+  # physics_kernel_backend: numba_cpu_v1
   production_backend: numpy_reference
   shard_scenario_count: null
   # cadence 以完整 sweep 計算，不以輸出觀測點代替。

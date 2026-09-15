@@ -481,7 +481,8 @@ class ProductionBatch:
         """建立記憶體中的 execution checkpoint snapshot，不序列化 forcing 或 geometry。
 
         ``binding`` 可省略以便測試或檢查中途狀態；真正寫入磁碟時必須提供
-        ``CheckpointBinding``，由 ``write_checkpoint`` 送入 schema 2 manifest。
+        ``CheckpointBinding``，由 ``write_checkpoint`` 送入 schema 3 compact／segment
+        manifest。
         """
 
         from .checkpoint import build_execution_checkpoint
@@ -502,8 +503,14 @@ class ProductionBatch:
         *,
         binding: CheckpointBinding,
         sequence: int,
+        previous_checkpoint: str | Path | None = None,
     ) -> Path:
-        """寫出不可覆寫、原子完成且含 RNG continuation 的 schema 2 checkpoint。"""
+        """寫出不可覆寫、原子完成且含 RNG continuation 的 schema 3 checkpoint。
+
+        ``previous_checkpoint`` 應是同一 shard 的上一個已發布 generation；傳入後 writer
+        會依 compact cursor 只追加新增觀測／事件列。省略時從零 cursor 建立 chain root。
+        這個參數只影響 checkpoint 儲存拓撲，不改變粒子步進、亂數或結果順序。
+        """
 
         from .checkpoint import write_execution_checkpoint
 
@@ -516,6 +523,7 @@ class ProductionBatch:
             executions=[runtime.execution for runtime in self.runtimes],
             rngs=[runtime.rng for runtime in self.runtimes],
             triangle_hints=[runtime.triangle_hint for runtime in self.runtimes],
+            previous_checkpoint=previous_checkpoint,
         )
         self.checkpoint_sequence = sequence
         return path
@@ -540,7 +548,7 @@ class ProductionBatch:
         外部 request 前 fail-closed，而不以錯誤 seed 靜默續跑。
         """
 
-        from .checkpoint import load_execution_checkpoint
+        from .checkpoint import _track_execution_history, load_execution_checkpoint
 
         # execution checkpoint 的 particle identity 不包含 seed 命名空間；若只依 identity
         # 來 restore，呼叫端可能把另一個 stream 的 RNG state 套回同一組物理粒子。因此在
@@ -575,6 +583,19 @@ class ProductionBatch:
             if _state_identity(execution.state) != _unit_identity(runtime.unit):
                 raise ValueError(f"checkpoint execution identity 不一致：index={index}")
             runtime.execution = execution
+            _track_execution_history(
+                runtime.execution,
+                observation_prefix_length=(
+                    max(0, len(execution.observations) - 1)
+                    if loaded.schema_version in {"3.0.0", "3.1.0"}
+                    else 0
+                ),
+                event_prefix_length=(
+                    len(execution.events)
+                    if loaded.schema_version in {"3.0.0", "3.1.0"}
+                    else 0
+                ),
+            )
             runtime.rng.bit_generator.state = rng_state
             runtime.triangle_hint = triangle_hint
             runtime.velocity.set_triangle_hint(triangle_hint)

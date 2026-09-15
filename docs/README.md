@@ -8,7 +8,7 @@
 |---|---|
 | 給 PI 快速看 | 先看[實作狀態](implementation_status.md)，再看[設計基線](foundation/08_design_baseline_and_derived_gates.md)與[成果呈現規格](results/07_results_visualization_plan.md)。 |
 | 第一次接手 | 先看[原始碼導覽](development/11_source_code_guide_and_plan_traceability.md)，再回看[架構與資料契約](foundation/02_architecture_and_data_contract.md)、[科學方法](foundation/03_scientific_method_and_validation.md)與[CLI 參考](operations/cli_reference.md)。 |
-| SERVER 執行 | 依序看[CLI 參考](operations/cli_reference.md)、[SERVER 執行手冊](operations/06_server_runbook_plan.md)、[輸入衍生契約](operations/14_input_derivation_and_release_contract.md)，最後核對[實作狀態](implementation_status.md)。 |
+| SERVER 執行 | 依序看[CLI 參考](operations/cli_reference.md)中的 `run-formal-parallel` 契約、[SERVER 執行手冊](operations/06_server_runbook_plan.md)的固定 worker 複製流程與完成／失敗處置、[輸入衍生契約](operations/14_input_derivation_and_release_contract.md)、[checkpoint 操作契約](operations/18_checkpoint_segment_storage.md)，最後核對[實作狀態](implementation_status.md)。 |
 | 成果報告 | 先看[成果呈現規格](results/07_results_visualization_plan.md)，再看[四區試跑稽核](results/15_four_region_first_pilot_audit.md)、[成果 release 管線](results/13_report_release_and_scientific_outputs_plan.md)、[聚合發布計畫](results/12_aggregate_release_and_server_execution_plan.md)與[實作狀態](implementation_status.md)。 |
 | 查科學方法 | 依序看[科學方法與驗證](foundation/03_scientific_method_and_validation.md)、[設計基線](foundation/08_design_baseline_and_derived_gates.md)、[資料與時間缺口決策](operations/10_available_data_time_reconstruction_and_a_expansion.md)及[需求追溯](foundation/01_requirements_traceability.md)。 |
 
@@ -38,7 +38,7 @@
 | 科學方法與驗證規格 | [foundation/03_scientific_method_and_validation.md](foundation/03_scientific_method_and_validation.md) | 說明座標、公式、時間積分、擴散與科學驗收方法。 | 現行 | `docs/03_scientific_method_and_validation.md` |
 | 快速實作計畫 | [archive/04_implementation_plan.md](archive/04_implementation_plan.md) | 保存早期工作拆分、依賴關係與加速原則。 | 歷史 | `docs/04_implementation_plan.md` |
 | 決策與風險登錄 | [development/05_decisions_and_risks.md](development/05_decisions_and_risks.md) | 記錄決策狀態、依據、風險與未決限制。 | 現行 | `docs/05_decisions_and_risks.md` |
-| SERVER 執行手冊 | [operations/06_server_runbook_plan.md](operations/06_server_runbook_plan.md) | 定義資料盤點、執行、續跑、驗證與發布的操作程序。 | 現行 | `docs/06_server_runbook_plan.md` |
+| SERVER 執行手冊 | [operations/06_server_runbook_plan.md](operations/06_server_runbook_plan.md) | 定義資料盤點、正式母體固定 worker 平行執行、完成判定、失敗保留與續跑、驗證及發布程序。 | 現行 | `docs/06_server_runbook_plan.md` |
 | 成果呈現與學術視覺化規格 | [results/07_results_visualization_plan.md](results/07_results_visualization_plan.md) | 定義成果圖表、分母、限制與報告呈現方式。 | 現行 | `docs/07_results_visualization_plan.md` |
 | 五站點情境與巢狀邊界設計基線 | [foundation/08_design_baseline_and_derived_gates.md](foundation/08_design_baseline_and_derived_gates.md) | 固定五站情境、沉降代理、幾何與衍生閘門的設計基線。 | 現行 | `docs/08_design_baseline_and_derived_gates.md` |
 | 實作與 SERVER 驗證稽核 | [archive/09_implementation_audit_2026-08-19.md](archive/09_implementation_audit_2026-08-19.md) | 保存 2026-08-19 稽核及其後續更正的歷史證據。 | 歷史 | `docs/09_implementation_audit_2026-08-19.md` |
@@ -48,10 +48,13 @@
 | 正式成果 release 與科學圖表生產管線規劃 | [results/13_report_release_and_scientific_outputs_plan.md](results/13_report_release_and_scientific_outputs_plan.md) | 將成果圖組與驗證證據轉成可重建的發布流程。 | 現行 | `docs/13_report_release_and_scientific_outputs_plan.md` |
 | 涵蓋 2024-01-01 的新竹外海 24 小時工程試跑紀錄 | [results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md](results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md) | SERVER r5 執行、完整性驗證、後處理與參數／hash 證據；供 pilot 工程追溯，不代表正式研究成果。 | 現行 | `docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md` |
 | ABCD 第一次 24 小時試跑稽核 | [results/15_four_region_first_pilot_audit.md](results/15_four_region_first_pilot_audit.md) | 彙整 A／B／C／D 實測狀態、設定一致性差異、NFS 成果標記語意與正式 gate 缺口；供工程稽核，不代表正式研究成果。 | 現行 | `docs/results/15_four_region_first_pilot_audit.md` |
+| 新竹 Numba／平行／checkpoint 測速紀錄 | [results/16_hsinchu_numba_parallel_checkpoint_benchmark.md](results/16_hsinchu_numba_parallel_checkpoint_benchmark.md) | 記錄純流與流加波浪的同站工程測速、NFS checkpoint 容量、輸出差異及正式採用限制。 | 現行 | `docs/results/16_hsinchu_numba_parallel_checkpoint_benchmark.md` |
 | Slice 1：SERVER v3 輸入衍生與 release contract | [operations/14_input_derivation_and_release_contract.md](operations/14_input_derivation_and_release_contract.md) | 定義已驗收 OCM／NWW3 產品如何衍生並綁定 runtime 輸入。 | 現行 | `docs/14_input_derivation_and_release_contract.md` |
-| CLI 與執行介面參考 | [operations/cli_reference.md](operations/cli_reference.md) | 對照目前可執行命令、參數、輸入輸出與安全限制。 | 現行 | `docs/cli_reference.md` |
+| CLI 與執行介面參考 | [operations/cli_reference.md](operations/cli_reference.md) | 對照目前可執行命令、正式母體 `run-formal-parallel` 參數契約、輸入輸出與安全限制。 | 現行 | `docs/cli_reference.md` |
 | Git 部署與資料同步手冊 | [operations/git_deployment_and_data_sync.md](operations/git_deployment_and_data_sync.md) | 定義本機 Git、SERVER source、資料與部署驗收的邊界。 | 現行 | `docs/git_deployment_and_data_sync.md` |
 | 單站沉降先導執行計畫 | [operations/pilot_run_plan.md](operations/pilot_run_plan.md) | 定義單站 pilot 的選取、限制、命令與[獨立海岸底圖重繪](operations/pilot_run_plan.md#獨立海岸底圖重繪)入口。 | 現行 | `docs/pilot_run_plan.md` |
+| 單站 30 天工程測速操作契約 | [operations/17_engineering_window_benchmark.md](operations/17_engineering_window_benchmark.md) | 規範工程時窗的輸入、分片、計時、續跑與結果解讀界線。 | 現行 | `docs/operations/17_engineering_window_benchmark.md` |
+| Execution checkpoint schema 3.1 gzip 操作契約 | [operations/18_checkpoint_segment_storage.md](operations/18_checkpoint_segment_storage.md) | 說明 gzip payload、immutable history segment、compact state、hash chain、容量語意與故障恢復。 | 工程候選 | `docs/operations/18_checkpoint_segment_storage.md` |
 
 ## 產生物與其他入口
 
