@@ -613,6 +613,28 @@ def test_numba_ocm_backend_is_forwarded_only_to_ocm_kernel_switch(
     assert calls[0]["nww_root"] is None
 
 
+def test_physics_kernel_backend_reaches_manager_and_particle_settings_without_nww_probe(
+    runtime_fixture: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """數值後端由 config 同時抵達 Stokes manager 與 immutable engine request，no-Stokes 不碰 NWW。"""
+
+    execution = runtime_fixture["config"].execution.model_copy(
+        update={"physics_kernel_backend": "numba_cpu_v1"}
+    )
+    data = {
+        **runtime_fixture,
+        "config": runtime_fixture["config"].model_copy(update={"execution": execution}),
+    }
+    calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
+    factory = _factory(data, tmp_path, case_id="no_stokes", nww_root=_UninspectablePath())
+
+    request = factory(_unit(data["scenario"], case_id="no_stokes"))
+
+    assert calls[0]["physics_kernel_backend"] == "numba_cpu_v1"
+    assert calls[0]["nww_root"] is None
+    assert request.settings.physics_kernel_backend == "numba_cpu_v1"
+
+
 @pytest.mark.parametrize(
     ("case_id", "expected_cs"),
     [

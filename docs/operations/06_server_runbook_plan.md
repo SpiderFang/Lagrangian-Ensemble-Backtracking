@@ -246,6 +246,184 @@ repository 也沒有可直接使用的正式 release config。因此不要把 ex
 完整輸入條件見[輸入衍生與發布契約](14_input_derivation_and_release_contract.md)，目前完成狀態見
 [實作狀態](../implementation_status.md)。
 
+### 正式 gate 開放後的完整母體平行執行流程
+
+`run-formal-parallel` 是正式母體的通用執行介面，不代表目前五站正式 gate 已通過。只有第 8 節
+列出的資料、設定、邊界與科學驗證條件全部解鎖，且已由核准部署建立 immutable formal workspace，
+才使用本流程。worker 數由本次執行負責人明示；run plan 原有的情境、seed、M、回溯期與
+checkpoint cadence 一律不由此命令改寫。
+
+#### 8.1 核對正式 workspace 與部署
+
+先使用已通過 formal release 驗證的 config、input inventory、study matrix 與 experiment case。
+部署 checkout 必須與 run plan 綁定的 commit 完全一致且 clean；不得在工作樹有未提交變更時啟動。
+以下建置命令只在核准 workspace 尚不存在時執行一次；`RUN_ID` 必須是本次新 ID，不可覆蓋舊 run：
+
+```bash
+export FORMAL_CONFIG="<已驗收正式 config 絕對路徑>"
+export FORMAL_INPUT_INVENTORY="<同一 config 對應且已驗證的 inventory JSON 絕對路徑>"
+export FORMAL_EXPERIMENT_CASE="<核准的 experiment case registry 值>"
+export RUN_ID="<本次唯一 formal run ID>"
+export WORKSPACE="$LBT_OUTPUT_ROOT/runs/$RUN_ID"
+
+test ! -e "$WORKSPACE" || { echo "workspace 已存在；停止，不覆寫"; exit 2; }
+uv run lbt run-create \
+  --config "$FORMAL_CONFIG" \
+  --input-inventory "$FORMAL_INPUT_INVENTORY" \
+  --destination "$LBT_OUTPUT_ROOT/runs" \
+  --run-id "$RUN_ID" \
+  --run-kind formal \
+  --experiment-case "$FORMAL_EXPERIMENT_CASE" \
+  --project-root "$LBT_PROJECT_ROOT"
+
+uv run lbt validate-run "$WORKSPACE" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT"
+```
+
+建立後應先確認 `run-create` 及唯讀 `validate-run` 均為 `valid=true`，且 summary 的 `run_kind`
+是 `formal`、shard 數等於 run plan，不要手工編輯 plan／progress。formal initializer 還須成功
+通過該版本的輸入 manifest、完整 inventory、共同 forcing margin、正式 provenance 與設定 gate；
+僅有 JSON 存在或 `run-create` 退出 0 不等於資料已被科學驗收。
+
+#### 8.2 重新執行 SERVER 儲存 gate
+
+結果、checkpoint、scratch、UV／Matplotlib／XDG cache 與 temporary 都應在 `/data/LBT` 同一 NFS
+mount。先把執行環境的套件與暫存路徑導到已核准根目錄，並產生本次儲存快照；不要把
+`NUMBA_CACHE_DIR`、Python bytecode、工作 log 或 temporary 放進 `/home`：
+
+```bash
+export UV_CACHE_DIR="$LBT_UV_CACHE_ROOT"
+export MPLCONFIGDIR="$LBT_MPL_CACHE_ROOT"
+export XDG_CACHE_HOME="$LBT_XDG_CACHE_ROOT"
+export TMPDIR="$LBT_TMP_ROOT"
+export LBT_STORAGE_GATE_JSON="$LBT_SCRATCH_ROOT/formal-parallel-storage-gate-$RUN_ID.json"
+export LBT_PARALLEL_LOG_ROOT="$LBT_SCRATCH_ROOT/formal-parallel/logs"
+export LBT_PARALLEL_CONSOLE_LOG="$LBT_SCRATCH_ROOT/formal-parallel/console-$RUN_ID.log"
+
+uv run python scripts/validate_server_storage.py \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --project-venv "$LBT_PROJECT_ROOT/.venv" \
+  --result-nfs-root "$LBT_RESULT_NFS_ROOT" \
+  --execution-package-root "$LBT_EXECUTION_PACKAGE_ROOT" \
+  --output-root "$LBT_OUTPUT_ROOT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --uv-cache-root "$LBT_UV_CACHE_ROOT" \
+  --mpl-cache-root "$LBT_MPL_CACHE_ROOT" \
+  --xdg-cache-root "$LBT_XDG_CACHE_ROOT" \
+  --tmp-root "$LBT_TMP_ROOT" \
+  --minimum-free-gib "$LBT_MIN_FREE_GB" \
+  --snapshot-output "$LBT_STORAGE_GATE_JSON"
+```
+
+只有命令退出 0 且 JSON `gate_status=PASS` 時才繼續。接著在已通過 gate 的 scratch 下建立
+既有 log 根目錄；執行器每次都會在此目錄建新 session，絕不覆寫舊 session：
+
+```bash
+mkdir -p "$LBT_PARALLEL_LOG_ROOT"
+```
+
+#### 8.3 （僅使用 Numba backend 時）確認 JIT 可編譯
+
+目前 Numba dispatcher 全部使用 `cache=False`，因此不會建立 `.nbc`／`.nbi` 磁碟快取，也不能宣稱
+下一個 Python process 能沿用這次編譯。正式執行時，每個長壽命 worker 會在自身程序內呼叫一次
+`accelerated.warmup_numba_backend()`，編譯結果留在該 worker 記憶體並供後續 `run-worker` 重用。
+本節 `--warmup-only` 是可選的部署檢查：用獨立小程序確認 kernel 可編譯，但不啟動粒子、也不
+替正式 worker 預熱。若要執行，必須再次通過相同 run／provenance／storage gate，並明示
+`NUMBA_CACHE_DIR` 為 scratch 下路徑；目前雖不寫磁碟，仍不允許使用 `/home` 或未驗證 temporary。
+
+```bash
+export LBT_NUMBA_CACHE_DIR="$LBT_SCRATCH_ROOT/formal-parallel/numba/$RUN_ID"
+export FORMAL_WORKER_COUNT="<本次核准的固定 worker 數，正整數且不大於 shard 數>"
+
+uv run python scripts/run_formal_parallel.py \
+  "$WORKSPACE" \
+  --config "$FORMAL_CONFIG" \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --worker-count "$FORMAL_WORKER_COUNT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --log-root "$LBT_PARALLEL_LOG_ROOT" \
+  --storage-gate-evidence "$LBT_STORAGE_GATE_JSON" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --numba-cache-dir "$LBT_NUMBA_CACHE_DIR" \
+  --cpu-affinity auto \
+  --warmup-only
+```
+
+`WARMUP_CHECKED` 只證明這個獨立檢查程序成功，不代表任何 shard 或 run 完成，也不會保存可供
+其他 process 重用的編譯快取。記錄它輸出的 `log_session` 與 summary；若檢查失敗，保留
+`numba-warmup.log`。正式 worker 仍會在各自程序內再次預熱一次。
+
+#### 8.4 執行固定 worker 的正式完整母體
+
+沿用同一 workspace、設定、roots、worker count、storage gate 與（如適用）Numba cache。runner
+會在啟動子程序前以 `findmnt` 核對本次 `scratch_root` 的 NFS source token 與 PASS gate 相同；
+若掛載來源已改變即停止，不能沿用舊快照。`auto` 在
+Linux 可用時為每個長壽命 worker 固定分配允許的 CPU；在其他平台或 cpuset API 不可用時安全不綁定，
+並在 worker summary 記錄 fallback。worker group 按 run plan scenario 順序保持連續，以 plan 中的
+region／arrival month 與表格已有 site／flow-domain 欄位摘要 locality，不會猜欄位，也不改物理設定：
+
+```bash
+PARALLEL_CACHE_ARGS=()
+if [[ -n "${LBT_NUMBA_CACHE_DIR:-}" ]]; then
+  PARALLEL_CACHE_ARGS=(--numba-cache-dir "$LBT_NUMBA_CACHE_DIR")
+fi
+set -o pipefail
+uv run python scripts/run_formal_parallel.py \
+  "$WORKSPACE" \
+  --config "$FORMAL_CONFIG" \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --worker-count "$FORMAL_WORKER_COUNT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --log-root "$LBT_PARALLEL_LOG_ROOT" \
+  --storage-gate-evidence "$LBT_STORAGE_GATE_JSON" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --cpu-affinity auto \
+  "${PARALLEL_CACHE_ARGS[@]}" \
+  2>&1 | tee "$LBT_PARALLEL_CONSOLE_LOG"
+RUNNER_EXIT=${PIPESTATUS[0]}
+test "$RUNNER_EXIT" -eq 0
+```
+
+若不用 Numba backend，應先 `unset LBT_NUMBA_CACHE_DIR`，上方條件展開就不會傳 cache 參數；若
+`auto` 不符合核准的排程政策，可改成 `--cpu-affinity 0,1,2` 等實際 cpuset 內 ID，不能憑機器核心
+總數猜測。需要恢復部分 run 時，僅在下次明確加 `--resume`；不能更換 run ID、seed、config、輸入或
+checkpoint root。worker count 只影響執行分組，不會改 run identity。
+
+#### 8.5 完成條件與失敗處置
+
+取得 CLI 回報的 log session 並核對完整摘要與正式 validator：
+
+```bash
+PARALLEL_SESSION="$(jq -r '.log_session // empty' "$LBT_PARALLEL_CONSOLE_LOG")"
+test -n "$PARALLEL_SESSION" || { echo "沒有執行摘要；保留 console log 並停止"; exit 2; }
+PARALLEL_SUMMARY="$LBT_PARALLEL_LOG_ROOT/$PARALLEL_SESSION/summary.json"
+test "$(jq -r '.status' "$PARALLEL_SUMMARY")" = COMPLETE
+jq -e '.valid == true and (.worker_records | all(.[]; .exit_code == 0 and .status == "EXITED"))' \
+  "$PARALLEL_SUMMARY"
+uv run lbt validate-run "$WORKSPACE" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --require-complete
+```
+
+只有 runner shell 退出碼 0、machine summary 的 `status=COMPLETE`、每個 worker exit code 為 0、
+完整 shard lifecycle 驗證全數 `COMPLETE`，且獨立 validator 回傳 `valid=true`、
+`run_lifecycle=COMPLETE`、completed shard count 等於 shard count，才可記為正式 run 完成。
+summary 的整機 elapsed、分組、CPU affinity 與每 worker log 是操作／資源資訊，不是新舊版本倍率
+比較，也不能替代輸入與科學驗證。
+
+任何 preflight 失敗都不得啟動 child；依 JSON 錯誤修正核准路徑、clean provenance 或 gate 後，重新
+產生本次 storage snapshot，再從 8.2 重做。若有 child exit 非零、`INCOMPLETE`、SIGINT／SIGTERM，
+或 SSH／程序中斷：不要把部分成果標成完成，也不要立刻啟動第二批。先確認程序已停止並保存完整
+log session、console log、summary、trajectory 與 checkpoint；接著執行 `run-reconcile` 和不帶
+`--require-complete` 的唯讀 validator，交由 run owner 檢查後，再以同 run identity 明示 `--resume`
+恢復。若 checkpoint、RNG continuation、input binding 或 provenance 不符，停止並升級處理，不得從 seed
+靜默重算或自行重建不同 run。
+
 ## 9. 操作時不可跨越的界線
 
 | 發現 | 處理方式 |

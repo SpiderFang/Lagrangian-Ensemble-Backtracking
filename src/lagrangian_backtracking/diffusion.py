@@ -22,6 +22,13 @@ from typing import Protocol, TypeAlias, runtime_checkable
 
 import numpy as np
 
+from .accelerated import (
+    PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1,
+    PHYSICS_KERNEL_BACKEND_NUMPY_V1,
+    choose_time_step_numba_kernel,
+    diffusion_displacement_numba_kernel,
+    validate_physics_kernel_backend,
+)
 from .models import SampleQC
 
 
@@ -283,6 +290,8 @@ def diffusion_displacement(
     sample: DiffusionSample,
     dt_seconds: float,
     rng: np.random.Generator,
+    *,
+    physics_kernel_backend: str = PHYSICS_KERNEL_BACKEND_NUMPY_V1,
 ) -> np.ndarray:
     """以 ``+div(K)|dt|`` 加 Brownian 增量產生三軸擴散位移。
 
@@ -290,6 +299,11 @@ def diffusion_displacement(
     與隨機項都使用 ``abs(dt_seconds)``，所以同一個 RNG state 下正、負時間步長得到完全
     相同的擴散位移。函式先驗證樣本再呼叫亂數，無效樣本因此不會消耗 RNG；完整 RK4
     順序由 ``split_rk4_brownian_step`` 保證，而不是在這裡重新取樣速度。
+
+    ``physics_kernel_backend`` 預設為 ``numpy_v1``；選擇 ``numba_cpu_v1`` 時，三個標準
+    常態數仍由傳入的每粒子 RNG 以一次 ``normal(size=3)`` 產生，再交給只含 scalar
+    乘法、平方根與漂移加法的 kernel。回傳仍是東、北、向上三軸的公尺制 NumPy 向量；
+    物理係數、散度與時間步長的單位／符號約定完全不變。
     """
 
     if not isinstance(sample, DiffusionSample):
@@ -297,16 +311,42 @@ def diffusion_displacement(
     sample.validate()
     if not math.isfinite(dt_seconds) or dt_seconds == 0:
         raise ValueError("dt_seconds 必須是有限非零值")
+    backend = validate_physics_kernel_backend(physics_kernel_backend)
     absolute_dt = abs(dt_seconds)
-    divergence = np.asarray(sample.diffusivity_divergence_mps, dtype=np.float64)
+    divergence = sample.diffusivity_divergence_mps
     # 零梯度走既有 Brownian helper，刻意保留原本的浮點運算與亂數消耗順序，讓常數
-    # DiffusionCoefficients 的固定 seed 結果維持 bit-for-bit 相容。
-    if not np.any(divergence):
-        return brownian_displacement(sample.coefficients, dt_seconds=dt_seconds, rng=rng)
-    return divergence * absolute_dt + brownian_displacement(
+    # DiffusionCoefficients 的固定 seed 結果維持 bit-for-bit 相容。tuple 的檢查不建立
+    # NumPy 暫存；Numba 分支也直接讀取三個 scalar，避免每粒子每步配置小型陣列。
+    if not any(divergence):
+        return brownian_displacement(
+            sample.coefficients,
+            dt_seconds=dt_seconds,
+            rng=rng,
+            physics_kernel_backend=backend,
+        )
+    if backend == PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1:
+        # 亂數仍由每粒子 Generator 一次產生三個常態數；只把已抽樣值交給純數值 kernel，
+        # 因此不改變 checkpoint RNG state，也不在 RK4 stage 內插入隨機項。
+        normals = rng.normal(size=3)
+        displacement = diffusion_displacement_numba_kernel(
+            normals,
+            sample.coefficients.kx_m2ps,
+            sample.coefficients.ky_m2ps,
+            sample.coefficients.kz_m2ps,
+            absolute_dt,
+            float(divergence[0]),
+            float(divergence[1]),
+            float(divergence[2]),
+            True,
+        )
+        return np.asarray(displacement, dtype=np.float64)
+    # NumPy reference 路徑保留原有 array*scalar 與 Brownian array 加法，避免 tuple/scalar
+    # 運算改變 broadcasting 規則或參考路徑的浮點順序。
+    return np.asarray(divergence, dtype=np.float64) * absolute_dt + brownian_displacement(
         sample.coefficients,
         dt_seconds=dt_seconds,
         rng=rng,
+        physics_kernel_backend=backend,
     )
 
 
@@ -319,13 +359,46 @@ class TimeStepDecision:
 
 
 def brownian_displacement(
-    coefficients: DiffusionCoefficients, *, dt_seconds: float, rng: np.random.Generator
+    coefficients: DiffusionCoefficients,
+    *,
+    dt_seconds: float,
+    rng: np.random.Generator,
+    physics_kernel_backend: str = PHYSICS_KERNEL_BACKEND_NUMPY_V1,
 ) -> np.ndarray:
-    """產生東、北、垂向彼此獨立的隨機擴散位移，回傳三個公尺值。"""
+    """產生三軸彼此獨立的布朗擴散位移並回傳公尺制向量。
+
+    ``coefficients`` 的東、北、垂向擴散係數單位為 m²/s，均須有限且非負；
+    ``dt_seconds`` 是 signed 秒，只取絕對值計算方差，且不可為零或非有限。
+    三個標準常態數由 ``rng`` 一次以 ``normal(size=3)`` 取得，欄位順序固定為東、北、
+    向上；固定 seed 下不可改成三次 scalar 抽樣或變更次序。``physics_kernel_backend``
+    只選擇純 NumPy 參考或 Numba CPU scalar primitive，不改變隨機數消耗、公式
+    ``sqrt(2*K*abs(dt))*N``、缺值政策或回傳 ndarray 的介面。
+
+    Raises:
+        ValueError: 擴散係數不合法，或時間步長非有限／為零。
+        TypeError: 後端識別碼不是字串；未知字串由後端驗證器以 ``ValueError`` 拒絕。
+    """
 
     coefficients.validate()
     if not math.isfinite(dt_seconds) or dt_seconds == 0:
         raise ValueError("dt_seconds 必須是有限非零值")
+    backend = validate_physics_kernel_backend(physics_kernel_backend)
+    if backend == PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1:
+        # 保留既有 normal(size=3) 的抽樣 shape 與呼叫位置。核心只回傳三個 scalar，
+        # wrapper 再建立一個公開 API 所需的三元素結果，不配置 diffusivity/sqrt 暫存陣列。
+        normals = rng.normal(size=3)
+        displacement = diffusion_displacement_numba_kernel(
+            normals,
+            coefficients.kx_m2ps,
+            coefficients.ky_m2ps,
+            coefficients.kz_m2ps,
+            abs(dt_seconds),
+            0.0,
+            0.0,
+            0.0,
+            False,
+        )
+        return np.asarray(displacement, dtype=np.float64)
     diffusivity = np.array(
         [coefficients.kx_m2ps, coefficients.ky_m2ps, coefficients.kz_m2ps], dtype=np.float64
     )
@@ -386,6 +459,7 @@ def choose_time_step(
     advective_fraction: float = 0.25,
     vertical_fraction: float = 0.25,
     diffusive_fraction: float = 0.25,
+    physics_kernel_backend: str = PHYSICS_KERNEL_BACKEND_NUMPY_V1,
 ) -> TimeStepDecision:
     """從水平移動、垂向移動、擴散與資料時間邊界中選擇最小且安全的步長。
 
@@ -401,7 +475,8 @@ def choose_time_step(
     若所需步長小於設定最小值，函式仍回傳最小值並標記此情況。粒子引擎必須累計
     ``minimum_clamp`` 發生次數，超過核定上限時以數值計算失敗停止，而不是在本函式
     改變 minimum clamp 政策或無限縮小步長。本函式只選步長，不改 Brownian displacement、
-    RK4 stage 或 operator-split 的執行順序。
+    RK4 stage 或 operator-split 的執行順序。``physics_kernel_backend`` 選擇相同候選
+    公式的純 NumPy 參考計算或 Numba 純量比較；後端不變更候選順序及平手時的原因。
     """
 
     coefficients.validate()
@@ -422,6 +497,39 @@ def choose_time_step(
         or dt_max_seconds < dt_min_seconds
     ):
         raise ValueError("尺度與 dt 範圍無效")
+    if seconds_to_forcing_boundary is not None and (
+        not math.isfinite(seconds_to_forcing_boundary) or seconds_to_forcing_boundary <= 0
+    ):
+        raise ValueError("seconds_to_forcing_boundary 必須是有限正值")
+    backend = validate_physics_kernel_backend(physics_kernel_backend)
+    if backend == PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1:
+        seconds, reason_code = choose_time_step_numba_kernel(
+            speed_horizontal_mps,
+            speed_vertical_mps,
+            horizontal_scale_m,
+            vertical_scale_m,
+            coefficients.kx_m2ps,
+            coefficients.ky_m2ps,
+            coefficients.kz_m2ps,
+            dt_min_seconds,
+            dt_max_seconds,
+            advective_fraction,
+            vertical_fraction,
+            diffusive_fraction,
+            0.0 if seconds_to_forcing_boundary is None else seconds_to_forcing_boundary,
+            seconds_to_forcing_boundary is not None,
+        )
+        reasons = (
+            "maximum",
+            "horizontal_advection",
+            "vertical_advection",
+            "horizontal_diffusion",
+            "vertical_diffusion",
+            "forcing_boundary",
+            "minimum_clamp",
+        )
+        return TimeStepDecision(float(seconds), reasons[reason_code])
+
     candidates: list[tuple[float, str]] = [(dt_max_seconds, "maximum")]
     if speed_horizontal_mps > 0:
         candidates.append(
@@ -452,8 +560,6 @@ def choose_time_step(
             )
         )
     if seconds_to_forcing_boundary is not None:
-        if not math.isfinite(seconds_to_forcing_boundary) or seconds_to_forcing_boundary <= 0:
-            raise ValueError("seconds_to_forcing_boundary 必須是有限正值")
         candidates.append((seconds_to_forcing_boundary, "forcing_boundary"))
     seconds, reason = min(candidates, key=lambda item: item[0])
     if seconds < dt_min_seconds:

@@ -413,6 +413,80 @@ worker 的總計時包含本次 handler 的前置驗證與連續分片執行，�
 樣本最大值，不跨片相加；大型陣列的映射位元組數不是實際 RSS 或 NFS 傳輸量，也不代表
 多程序同時使用量或連續量測峰值。完整基準規範見[效能改善工作線](16_performance_improvement_tracks.md)。
 
+### 正式完整母體的固定 worker 平行執行
+
+`run-formal-parallel` 僅接受 `run_kind=formal`，依 run plan 的全部 shard ID 建立一次
+確定性 worker assignment。scenario index 範圍維持連續，並以 plan 已有的分析區域／UTC 月份
+和 scenario table 已存在的站點／flow-domain 欄位產生 locality 摘要；缺少表格欄位時會在
+assignment JSON 明示 `plan_order_only`，不從 config、路徑或名稱推測 flow domain。每個固定
+worker 只啟動一次 Python，內部以一個既有 `run-worker` controller 依序處理其整組 shard，因而
+可在同程序重用 forcing manager 與 JIT import。assignment 綁定 run ID 和 run-plan SHA-256，
+不寫回 run plan，也不因 worker 完成順序改變 run identity。
+
+先準備 caller 明示且已通過 `scripts/validate_server_storage.py` 的 PASS JSON；runner 會再用
+`findmnt` 即時確認本次 `scratch_root` 仍為 NFS 且 mount source token 與該 PASS JSON 相同，
+防止把其他掛載點或過期環境的證據誤用。scratch、log 與 Numba cache 都必須是該 scratch root
+下的非 symbolic-link 嚴格子目錄。下例的 worker 數由
+本次排程負責人明示，不能由 CLI 猜測或代替研究設定。Numba backend 還必須明示
+`--numba-cache-dir`；純 NumPy backend 可省略。建議透過 repository wrapper 啟動，使 cache
+環境值在本程序第一次匯入科學套件之前設定：
+
+```bash
+uv run python scripts/run_formal_parallel.py \
+  "$LBT_OUTPUT_ROOT/runs/$RUN_ID" \
+  --config "$FORMAL_CONFIG" \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --worker-count "$FORMAL_WORKER_COUNT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --log-root "$LBT_SCRATCH_ROOT/formal-parallel/logs" \
+  --storage-gate-evidence "$LBT_STORAGE_GATE_JSON" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --cpu-affinity auto
+```
+
+目前的 Numba dispatcher 明確使用 `cache=False`，因此 `NUMBA_CACHE_DIR` 只作為已驗證的安全
+執行環境值，不會保存 `.nbc`／`.nbi`，不能宣稱不同 worker 或下次執行能重用磁碟編譯結果。
+正式執行時每個長壽命 worker 都會在自己的 Python 程序內呼叫一次
+`accelerated.warmup_numba_backend()`，編譯結果只留在該程序記憶體；它隨後執行該 worker 的
+`run-worker`，因而同一程序內可重用 dispatcher。`--warmup-only` 是可選的獨立程序編譯檢查，
+檢查 log／summary 保存在新 session，但不會取代正式 worker 內的暖機，也不會快取供後續程序：
+
+```bash
+uv run python scripts/run_formal_parallel.py \
+  "$LBT_OUTPUT_ROOT/runs/$RUN_ID" \
+  --config "$FORMAL_CONFIG" \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --worker-count "$FORMAL_WORKER_COUNT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --log-root "$LBT_SCRATCH_ROOT/formal-parallel/logs" \
+  --storage-gate-evidence "$LBT_STORAGE_GATE_JSON" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --numba-cache-dir "$LBT_SCRATCH_ROOT/formal-parallel/numba/$RUN_ID" \
+  --cpu-affinity auto \
+  --warmup-only
+```
+
+正式 run 再以同一組 workspace、config、roots、worker count 與 cache dir 執行上方主命令，並加
+`--numba-cache-dir`；不要再帶 `--warmup-only`。cache 目錄仍須通過 scratch／NFS gate，即使目前
+dispatcher 不落磁碟也不得把其值指向 `/home` 或未驗證 temporary directory。Linux 可用時 `auto` 會在 worker import 前套用
+固定 CPU affinity；其他平台或不可用 cpuset 會不綁定並記錄 fallback，不能宣稱已綁定。需要指定
+CPU 時可傳 `--cpu-affinity 0,1,2`，ID 必須屬目前允許 cpuset。`--resume` 只在任何 shard 已有
+執行狀態時明示；全新 run 不加。此入口不提供 sweep budget，因此 worker 必須處理每個分配 shard
+直到完整生命周期狀態。
+
+只有 CLI 退出 0、summary `status=COMPLETE`、所有 child exit code 為 0、每個 worker summary
+涵蓋分配的全部 shard 且 lifecycle 均為 `COMPLETE`，並且最後的 `validate-run --require-complete`
+回傳 `valid=true`，才算整批完成。summary 同時記錄 whole-machine elapsed、各 child exit、CPU
+affinity 實際狀態、固定分組與獨立 log 名稱。任何 child 失敗即停止後續派發；SIGINT／SIGTERM
+會轉送至執行器建立的 worker process group，停止後保留 log、已完成 trajectory 與 checkpoint，
+並以非零狀態回報。失敗或中斷不會自動恢復：先保留現場、執行 `run-reconcile` 與唯讀 validator，
+確認原 run ID／config／checkpoint root 後，才由負責人明示 `--resume` 重啟；不得建立同內容的新
+run 來掩蓋部分完成。此命令是正式運算入口，不是舊版／新版倍率比較或 benchmark A/B 工具。
+
 ### reconcile 與唯讀驗證
 
 ```bash

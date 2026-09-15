@@ -524,6 +524,83 @@ def _run_worker_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_formal_parallel_parser() -> argparse.ArgumentParser:
+    """建立正式完整母體的固定 worker 平行入口 parser。
+
+    workspace、版本、儲存 gate、log 與 Numba cache 路徑都由操作者明示；worker 數也
+    必須明示，不從主機 CPU 數量或研究設定推算。run plan 決定分片與 checkpoint cadence，
+    本命令不接受科學參數或每片步數上限；``--warmup-only`` 只編譯 JIT，不跑粒子。
+    """
+
+    parser = argparse.ArgumentParser(
+        description="依 immutable run plan 以固定長壽命 worker 執行正式完整母體"
+    )
+    parser.add_argument("workspace", type=Path, help="已建立且通過驗證的 formal run workspace")
+    parser.add_argument("--config", required=True, type=Path, help="與 run plan 綁定的正式設定")
+    parser.add_argument(
+        "--project-root",
+        required=True,
+        type=Path,
+        help="乾淨且符合 run plan provenance 的程式根目錄",
+    )
+    parser.add_argument(
+        "--worker-count",
+        required=True,
+        type=_positive_cli_int,
+        help="固定長壽命 worker 數；不得大於 shard 數",
+    )
+    parser.add_argument(
+        "--scratch-root",
+        required=True,
+        type=Path,
+        help="已通過 SERVER 儲存 gate 的 NFS scratch 根目錄",
+    )
+    parser.add_argument(
+        "--log-root",
+        required=True,
+        type=Path,
+        help="scratch root 下既有的平行執行日誌根目錄",
+    )
+    parser.add_argument(
+        "--storage-gate-evidence",
+        required=True,
+        type=Path,
+        help="本次 validate_server_storage.py 產生的 PASS JSON",
+    )
+    parser.add_argument("--checkpoint-root", type=Path, help="本次 run 使用的既有 external checkpoint root")
+    parser.add_argument(
+        "--ocm-native-root",
+        type=Path,
+        help="OCM native 根目錄；省略時使用 config 指定的環境變數",
+    )
+    parser.add_argument(
+        "--nww-analysis-root",
+        type=Path,
+        help="NWW3 analysis 根目錄；省略時使用 config 指定的環境變數",
+    )
+    parser.add_argument(
+        "--numba-cache-dir",
+        type=Path,
+        help="Numba backend 必填；scratch 下的安全環境路徑，現行 cache=False kernels 不寫入磁碟快取",
+    )
+    parser.add_argument(
+        "--cpu-affinity",
+        default="auto",
+        help="Linux CPU 綁定：auto、none 或明示逗號分隔 CPU ID；平台不支援時記錄安全退回",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="只在恢復既有 RUNNING／PAUSED／FAILED 等 run 時明示",
+    )
+    parser.add_argument(
+        "--warmup-only",
+        action="store_true",
+        help="單次獨立 JIT 編譯檢查，不啟動粒子；正式 Numba worker 仍會各自在程序內預熱",
+    )
+    return parser
+
+
 def _run_reconcile_parser() -> argparse.ArgumentParser:
     """建立只做 checkpoint／progress reconcile 的 parser。"""
 
@@ -1628,6 +1705,53 @@ def run_worker(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def run_formal_parallel(argv: Sequence[str] | None = None) -> int:
+    """執行 formal parallel coordinator 並輸出整機摘要，不將部分成果標成 COMPLETE。"""
+
+    from .parallel_execution import execute_formal_parallel
+
+    args = _run_formal_parallel_parser().parse_args(argv)
+    try:
+        summary, exit_code = execute_formal_parallel(
+            workspace=args.workspace,
+            config_path=args.config,
+            project_root=args.project_root,
+            worker_count=args.worker_count,
+            scratch_root=args.scratch_root,
+            log_root=args.log_root,
+            storage_gate_evidence=args.storage_gate_evidence,
+            checkpoint_root=args.checkpoint_root,
+            numba_cache_dir=args.numba_cache_dir,
+            ocm_native_root=args.ocm_native_root,
+            nww_analysis_root=args.nww_analysis_root,
+            resume=args.resume,
+            cpu_affinity=args.cpu_affinity,
+            warmup_only=args.warmup_only,
+        )
+    except Exception as exc:  # noqa: BLE001 - CLI 必須以機器可讀失敗狀態 fail closed
+        print(
+            json.dumps(
+                {
+                    "artifact_type": "formal_parallel_coordinator_error",
+                    "schema_version": "1.0.0",
+                    "status": "COORDINATOR_ERROR",
+                    "valid": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    # 一般例外可能發生於驗證階段，也可能出現在 child 已結束後的摘要／驗證階段；
+                    # 未取得正式執行摘要時不得錯誤宣稱「尚未啟動 child」。
+                    "children_started": None,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    return exit_code
+
+
 def run_reconcile(argv: Sequence[str] | None = None) -> int:
     """只 reconcile checkpoint／progress，禁止載入 config 或進入物理計算。
 
@@ -2067,6 +2191,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers.add_parser("run-create", parents=[_run_create_parser()], add_help=False)
     subparsers.add_parser("run-shard", parents=[_run_shard_parser()], add_help=False)
     subparsers.add_parser("run-worker", parents=[_run_worker_parser()], add_help=False)
+    subparsers.add_parser(
+        "run-formal-parallel",
+        parents=[_run_formal_parallel_parser()],
+        add_help=False,
+    )
     subparsers.add_parser("run-reconcile", parents=[_run_reconcile_parser()], add_help=False)
     subparsers.add_parser(
         "aggregate-spec-create",
@@ -2150,6 +2279,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_shard(command_argv)
     if parsed.command == "run-worker":
         return run_worker(command_argv)
+    if parsed.command == "run-formal-parallel":
+        return run_formal_parallel(command_argv)
     if parsed.command == "run-reconcile":
         return run_reconcile(command_argv)
     if parsed.command == "aggregate-spec-create":

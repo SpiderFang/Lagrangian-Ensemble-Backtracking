@@ -20,6 +20,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
+from .accelerated import PHYSICS_KERNEL_BACKEND_NUMPY_V1
+
 # 這組名稱取自海洋保育署 iOcean 海洋廢棄物管理頁於 2026-08-27 顯示的查詢類別。
 # 常數只用來驗證臺灣情境的分類追溯是否完整；該網站的清除重量與件數不含單體物性，
 # 因此不得用這組分類或統計量反推密度、阻力或終端沉降速度。
@@ -69,6 +71,10 @@ OcmInterpolationBackend = Literal[
     "numpy_v1",
     "numba_ocm_v1",
 ]
+
+# 完整 CPU 數值 primitive 的版本化選項與 OCM 插值開關分開保存；前者控制 Stokes、
+# 步長候選、RK4 純量組合與擴散位移，後者仍只控制 OCM 網格內插。
+PhysicsKernelBackend = Literal["numpy_v1", "numba_cpu_v1"]
 
 NORTHEAST_V3_FLOW_DOMAIN_ID = "northeast_taiwan_common_cache_v3"
 NORTHEAST_V3_BBOX_LON_LAT = (121.306315, 122.793685, 24.600844, 25.499156)
@@ -324,21 +330,23 @@ class ScenarioConfig(StrictModel):
 
 
 class ExecutionConfig(StrictModel):
-    """CPU backend、分片、checkpoint cadence 與 forcing cache 的工程欄位。
+    """CPU 數值後端、分片、checkpoint cadence 與 forcing cache 的工程欄位。
 
     ``checkpoint_interval_sweeps`` 的單位是完整批次 sweep，不是輸出觀測點；兩者在
     adaptive time-step 下不等價。``active_chunk_size`` 控制一次散射／回寫的粒子數，
     ``max_resident_forcing_months`` 控制單一 process 的月份 cache 上限。
-    ``ocm_interpolation_backend`` 只選擇 OCM 內層插值的 NumPy 參考實作或 Numba 等價
-    kernel；它不代表完整 Numba physics backend，也不改變 Scenario、粒子 seed、Python
-    RK4、NWW3、Stokes、邊界或 checkpoint 行為。未出現在既有 YAML 時，runtime 以
-    ``numpy_v1`` 執行；canonical payload 會省略這個由 Pydantic 補上的預設，維持舊
-    run 的 config hash。
+    ``ocm_interpolation_backend`` 單獨選擇 OCM 垂向／水平／時間插值的 NumPy 或 Numba
+    kernel；``physics_kernel_backend`` 選擇有限水深 Stokes、步長候選、RK4 最後 scalar
+    組合／時間更新與擴散位移的參考或 Numba CPU primitive。後者不改變 Scenario、seed、
+    RK4 stage 查詢順序、品質檢查旗標（QC）、事件、邊界、checkpoint 或缺值政策。兩欄
+    未出現在舊 YAML 時分別沿用 NumPy 語意；canonical payload 會省略 Pydantic 補上的預設，
+    維持舊 run 的 config hash。明示任一後端時，版本 token 會進入 hash 供重現與追溯。
     """
 
     reference_backend: str
     production_backend: str
     ocm_interpolation_backend: OcmInterpolationBackend = OCM_INTERPOLATION_BACKEND_NUMPY_V1
+    physics_kernel_backend: PhysicsKernelBackend = PHYSICS_KERNEL_BACKEND_NUMPY_V1
     shard_scenario_count: int | None = None
     checkpoint_interval_sweeps: int | None = None
     active_chunk_size: int | None = None
@@ -743,6 +751,15 @@ class ProjectConfig(StrictModel):
             # 只有 YAML 明示 backend（包括明示 ``numpy_v1``）時，才把選擇寫入 normalized
             # config，形成可追溯且可驗證的 execution binding。
             del execution_payload["ocm_interpolation_backend"]
+        if (
+            isinstance(execution_payload, dict)
+            and "physics_kernel_backend" in execution_payload
+            and "physics_kernel_backend" not in self.execution.model_fields_set
+        ):
+            # 舊 YAML 未提供新增的 CPU primitive 後端時固定採純 NumPy；省略 default 可
+            # 保護既有 run/checkpoint config hash。若 YAML 明示 ``numpy_v1`` 或
+            # ``numba_cpu_v1``，則把選擇保存於 canonical payload，形成可稽核的版本邊界。
+            del execution_payload["physics_kernel_backend"]
         domain_payloads = payload.get("domains")
         if isinstance(domain_payloads, list):
             for domain, domain_payload in zip(self.domains, domain_payloads, strict=False):

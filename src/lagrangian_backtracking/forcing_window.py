@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .accelerated import validate_physics_kernel_backend
 from .diffusion import DiffusionCoefficients, DiffusionSample, SmagorinskySettings
 from .forcing import (
     CombinedMonthForcing,
@@ -389,8 +390,14 @@ class ForcingWindowManager:
         ocm_loader: Callable[[str], OCMNativeMonth | None],
         nww_loader: Callable[[str], NWWAnalysisMonth | None] | None = None,
         max_resident_months: int = 2,
+        physics_kernel_backend: str = "numpy_v1",
     ) -> None:
-        """建立注入式 manager，測試可用小型 loader，production 則由 ``from_roots`` 建立。"""
+        """建立注入式 manager，測試可用小型 loader，production 則由 ``from_roots`` 建立。
+
+        ``physics_kernel_backend`` 固定此 manager 所有材質 provider 共用的數值 primitive
+        版本；這樣同月 combined cache 不必在每次 RK stage 依 request 改寫，也不會讓同一
+        run 中有些粒子走不同 Stokes 方程實作。舊 caller 省略時使用 NumPy reference。
+        """
 
         if not isinstance(flow_domain_id, str) or not flow_domain_id.strip():
             raise ValueError("flow_domain_id 不可為空白")
@@ -412,6 +419,7 @@ class ForcingWindowManager:
         self._ocm_loader = ocm_loader
         self._nww_loader = nww_loader
         self.max_resident_months = max_resident_months
+        self.physics_kernel_backend = validate_physics_kernel_backend(physics_kernel_backend)
         self._months: OrderedDict[str, _MonthEntry] = OrderedDict()
         self._ocm_load_count = 0
         self._nww_load_count = 0
@@ -441,6 +449,7 @@ class ForcingWindowManager:
         nww_root: str | Path | None,
         max_resident_months: int = 2,
         use_numba_kernel: bool = False,
+        physics_kernel_backend: str = "numpy_v1",
     ) -> ForcingWindowManager:
         """從正式 root layout 建立 manager，且 OCM mesh 只在此處載入一次。
 
@@ -448,13 +457,15 @@ class ForcingWindowManager:
         ``months/YYYYMM``；NWW 讀取位置為 ``<nww_root>/<flow_domain_id>/grid`` 與
         ``months/YYYYMM``。缺少整個月份目錄回傳 ``MissingForcingMonth``，但已存在目錄
         的必要檔案或 schema 錯誤由既有 reader 原樣上拋。``use_numba_kernel`` 只傳給
-        ``OCMNativeMonth.from_directory`` 的 OCM 內層插值 kernel；月份快取、NWW3、
-        Stokes、缺值／遮罩與品質檢查維持既有 Python 控制流程。預設 ``False`` 是為了
-        保留未提供新 execution backend 的舊 caller 行為。
+        ``OCMNativeMonth.from_directory`` 的 OCM 內層插值 kernel；
+        ``physics_kernel_backend`` 另決定 Stokes、步長、RK4 最後純量更新及 Brownian 位移
+        的數值 primitive。月份選擇、NWW 載入、缺值／遮罩、QC 與邊界判定仍由 Python 控制層
+        負責。兩個參數都使用舊 caller 相容預設，不會因省略而切換到 Numba。
         """
 
         if type(use_numba_kernel) is not bool:
             raise TypeError("use_numba_kernel 必須是 bool")
+        backend = validate_physics_kernel_backend(physics_kernel_backend)
 
         ocm_domain_root = Path(ocm_root) / flow_domain_id
         nww_domain_root = Path(nww_root) / flow_domain_id if nww_root is not None else None
@@ -495,6 +506,7 @@ class ForcingWindowManager:
             ocm_loader=load_ocm,
             nww_loader=load_nww,
             max_resident_months=max_resident_months,
+            physics_kernel_backend=backend,
         )
 
     def _evict_if_needed(self) -> None:
@@ -942,6 +954,7 @@ class ForcingWindowManager:
             projection=self.projection,
             settling_velocity_mps=settling_velocity_mps,
             include_stokes=include_stokes,
+            physics_kernel_backend=self.physics_kernel_backend,
         )
         entry.combined[key] = value
         return value
@@ -1140,6 +1153,7 @@ class ForcingWindowManager:
                 projection=self.projection,
                 settling_velocity_mps=settling_velocity_mps,
                 include_stokes=include_stokes,
+                physics_kernel_backend=self.physics_kernel_backend,
             )
             return combined.sample_from_endpoints(
                 x_m=x_m,
@@ -1164,6 +1178,7 @@ class ForcingWindowManager:
             projection=self.projection,
             settling_velocity_mps=settling_velocity_mps,
             include_stokes=False,
+            physics_kernel_backend=self.physics_kernel_backend,
         )
         current = combined.sample_from_endpoints(
             x_m=x_m,

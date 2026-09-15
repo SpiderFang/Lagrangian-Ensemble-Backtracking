@@ -15,6 +15,13 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from .accelerated import (
+    PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1,
+    PHYSICS_KERNEL_BACKEND_NUMPY_V1,
+    rk4_finalize_numba_kernel,
+    rk4_time_age_numba_kernel,
+    validate_physics_kernel_backend,
+)
 from .diffusion import (
     DiffusionCoefficients,
     DiffusionSample,
@@ -302,6 +309,7 @@ def rk4_step(
     dt_seconds: float,
     velocity: VelocityProvider,
     step_start_sample: VelocitySample | None = None,
+    physics_kernel_backend: str = PHYSICS_KERNEL_BACKEND_NUMPY_V1,
 ) -> ParticleState:
     """以四階 Runge-Kutta 法計算一次不含隨機擴散的粒子移動。
 
@@ -316,8 +324,14 @@ def rk4_step(
     ``step_start_sample`` 必須是與傳入的粒子狀態（``state``）位置及 UTC 時刻完全相同的有效樣本；呼叫端
     若無法證明速度取樣器在相同輸入下具有唯讀、穩定結果，應保留 ``None``，讓一般有狀態
     速度取樣器的原始呼叫語意不變。
+
+    ``physics_kernel_backend`` 可選版本化的 ``numpy_v1`` 或 ``numba_cpu_v1``。Numba
+    僅接手四個 stage 都通過既有 QC 後的最後向量加權，stage 位置與 UTC 奈秒仍由 Python
+    按原順序產生；時間更新只在有號 64 位整數範圍內交給純量 kernel，超出時保留 Python
+    任意精度運算。此選項不調整積分公式、容差、失敗分類或邊界處理。
     """
 
+    backend = validate_physics_kernel_backend(physics_kernel_backend)
     if not np.isfinite(dt_seconds) or dt_seconds == 0:
         raise ValueError("RK4 dt_seconds 必須是有限非零值")
     position = np.array([state.x_m, state.y_m, state.z_m], dtype=np.float64)
@@ -353,14 +367,63 @@ def rk4_step(
         velocity(*p4, state.time_utc_ns + dt_ns), "k4",
         position=p4, time_utc_ns=state.time_utc_ns + dt_ns,
     )
-    advanced = position + dt_seconds * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+    if backend == PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1:
+        # 所有 velocity stage 與其 QC 已由上方 Python 控制層完成；此處只以 scalar kernel
+        # 保留原始加權括號，避免建立 k1+2*k2、再加 2*k3 與 k4 的多個三元素暫存陣列。
+        advanced_x, advanced_y, advanced_z = rk4_finalize_numba_kernel(
+            float(position[0]),
+            float(position[1]),
+            float(position[2]),
+            float(dt_seconds),
+            float(k1[0]),
+            float(k1[1]),
+            float(k1[2]),
+            float(k2[0]),
+            float(k2[1]),
+            float(k2[2]),
+            float(k3[0]),
+            float(k3[1]),
+            float(k3[2]),
+            float(k4[0]),
+            float(k4[1]),
+            float(k4[2]),
+        )
+    else:
+        advanced = position + dt_seconds * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+        advanced_x, advanced_y, advanced_z = advanced
+    # UTC 奈秒的既有 round 仍由 Python 決定。先以不會溢位的界限比較判斷結果是否可由
+    # int64 表示，避免為了檢查而先做一次 Python 加法；超出範圍或非標準 scalar 時才
+    # 沿用 Python 任意精度路徑，防止 Numba 的整數 wrap-around 改變時間軸契約。
+    can_update_time_in_numba = (
+        backend == PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1
+        and type(state.age_seconds) in (int, float)
+        and type(dt_seconds) in (int, float)
+        and type(state.time_utc_ns) is int
+        and -(1 << 63) <= state.time_utc_ns < (1 << 63)
+        and -(1 << 63) <= dt_ns < (1 << 63)
+    )
+    if can_update_time_in_numba:
+        if dt_ns >= 0:
+            can_update_time_in_numba = state.time_utc_ns < (1 << 63) - dt_ns
+        else:
+            can_update_time_in_numba = state.time_utc_ns >= -(1 << 63) - dt_ns
+    if can_update_time_in_numba:
+        new_time_utc_ns, new_age_seconds = rk4_time_age_numba_kernel(
+            state.time_utc_ns,
+            dt_ns,
+            float(state.age_seconds),
+            abs(float(dt_seconds)),
+        )
+    else:
+        new_time_utc_ns = state.time_utc_ns + dt_ns
+        new_age_seconds = state.age_seconds + abs(dt_seconds)
     return replace(
         state,
-        x_m=float(advanced[0]),
-        y_m=float(advanced[1]),
-        z_m=float(advanced[2]),
-        time_utc_ns=state.time_utc_ns + dt_ns,
-        age_seconds=state.age_seconds + abs(dt_seconds),
+        x_m=float(advanced_x),
+        y_m=float(advanced_y),
+        z_m=float(advanced_z),
+        time_utc_ns=new_time_utc_ns,
+        age_seconds=new_age_seconds,
     )
 
 
@@ -370,6 +433,7 @@ def apply_diffusion_step(
     dt_seconds: float,
     coefficients: DiffusionCoefficients | DiffusionSample,
     rng: np.random.Generator,
+    physics_kernel_backend: str = PHYSICS_KERNEL_BACKEND_NUMPY_V1,
 ) -> ParticleState:
     """對已完成確定性步驟的狀態套用一次 operator-split 擴散位移。
 
@@ -379,12 +443,26 @@ def apply_diffusion_step(
     本函式只改變三個公尺制位置，不再次取樣速度、不在 RK4 stage 中插入亂數，而且每次
     呼叫恰消耗一次三軸 ``normal(size=3)``。若呼叫端已判定邊界為終止狀態，禁止呼叫
     本函式，因為終止邊界定位不應在停止時間之後追加擴散。
+
+    ``physics_kernel_backend`` 只替換已預抽常態數轉成公尺位移的純數值運算；QC 與輸入
+    驗證仍在 Python 執行，且亂數抽樣仍由此函式下游以原來的一次 ``normal(size=3)`` 完成。
     """
 
+    backend = validate_physics_kernel_backend(physics_kernel_backend)
     if isinstance(coefficients, DiffusionCoefficients):
-        displacement = brownian_displacement(coefficients, dt_seconds=dt_seconds, rng=rng)
+        displacement = brownian_displacement(
+            coefficients,
+            dt_seconds=dt_seconds,
+            rng=rng,
+            physics_kernel_backend=backend,
+        )
     elif isinstance(coefficients, DiffusionSample):
-        displacement = diffusion_displacement(coefficients, dt_seconds, rng)
+        displacement = diffusion_displacement(
+            coefficients,
+            dt_seconds,
+            rng,
+            physics_kernel_backend=backend,
+        )
     else:
         raise TypeError("coefficients 必須是 DiffusionCoefficients 或 DiffusionSample")
     return replace(
@@ -403,6 +481,7 @@ def split_rk4_brownian_step(
     coefficients: DiffusionCoefficients | DiffusionSample,
     rng: np.random.Generator,
     step_start_sample: VelocitySample | None = None,
+    physics_kernel_backend: str = PHYSICS_KERNEL_BACKEND_NUMPY_V1,
 ) -> ParticleState:
     """先依流速移動，再加入一次隨機擴散位移。
 
@@ -414,6 +493,9 @@ def split_rk4_brownian_step(
     明示提供，會交給 RK4 重用為同一個粒子狀態／UTC 的 k1；未提供時維持四次階段查詢。
     這項參數不能單獨證明等價性，粒子引擎只會在速度取樣器明示具備唯讀穩定能力時傳入，
     反射重試的特殊包裝器也不會自動取得此能力。
+
+    ``physics_kernel_backend`` 會沿同一順序傳給 RK4 最後向量組合與擴散位移核心；它不
+    會把 Brownian 抽樣移入 RK4 stage，也不改變步長方向或散度漂移的 pseudo-time 約定。
     """
 
     advanced = rk4_step(
@@ -421,6 +503,7 @@ def split_rk4_brownian_step(
         dt_seconds=dt_seconds,
         velocity=velocity,
         step_start_sample=step_start_sample,
+        physics_kernel_backend=physics_kernel_backend,
     )
     # 一般完整 RK4 路徑與特殊 recovery 路徑都共用同一個 helper，確保 Brownian 與
     # +div(K)|dt| 只在確定性計算完成後套用一次，且維持既有 seed／亂數消耗順序。
@@ -429,4 +512,5 @@ def split_rk4_brownian_step(
         dt_seconds=dt_seconds,
         coefficients=coefficients,
         rng=rng,
+        physics_kernel_backend=physics_kernel_backend,
     )

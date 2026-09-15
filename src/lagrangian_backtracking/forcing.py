@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .accelerated import interpolate_ocm_support_numba
+from .accelerated import interpolate_ocm_support_numba, validate_physics_kernel_backend
 from .diffusion import (
     DiffusionCoefficients,
     DiffusionSample,
@@ -1535,8 +1535,14 @@ class CombinedMonthForcing:
         projection: DomainProjection,
         settling_velocity_mps: float,
         include_stokes: bool,
+        physics_kernel_backend: str = "numpy_v1",
     ) -> None:
-        """不納入波浪表面漂移的案例可不讀波浪資料；納入時則必須提供 NWW 資料。"""
+        """不納入波浪表面漂移的案例可不讀波浪資料；納入時則必須提供 NWW 資料。
+
+        ``physics_kernel_backend`` 只選擇有限水深 Stokes 數值 primitive 的參考或 Numba
+        實作；不改變 OCM／NWW 空間與時間取樣、品質檢查、缺值分類或速度合成順序。預設
+        ``numpy_v1`` 保留舊 caller 直接建立此 provider 時的原有數值路徑。
+        """
 
         if include_stokes and nww is None:
             raise ValueError("include_stokes=True 時必須提供 NWW month")
@@ -1545,6 +1551,7 @@ class CombinedMonthForcing:
         self.projection = projection
         self.settling_velocity_mps = float(settling_velocity_mps)
         self.include_stokes = include_stokes
+        self.physics_kernel_backend = validate_physics_kernel_backend(physics_kernel_backend)
 
     def sample(
         self,
@@ -1596,6 +1603,7 @@ class CombinedMonthForcing:
                     particle_z_m=z_m,
                     surface_z_m=current.eta_m,
                     bed_z_m=current.bed_z_m,
+                    physics_kernel_backend=self.physics_kernel_backend,
                 )
             except ValueError:
                 return VelocitySample(
@@ -1883,6 +1891,7 @@ class CombinedMonthForcing:
                     particle_z_m=z_m,
                     surface_z_m=eta,
                     bed_z_m=bed,
+                    physics_kernel_backend=self.physics_kernel_backend,
                 )
             except ValueError:
                 return VelocitySample(
