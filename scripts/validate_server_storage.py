@@ -3,9 +3,14 @@
 
 這個獨立腳本是正式數值 runner 的儲存硬閘門。它把專案程式碼與既有虛擬環境
 視為可位於 ``/home`` 的部署內容；輸出、scratch、checkpoint、執行 package 與
-Python／繪圖／系統暫存快取則必須是 operator 指定 NFS 結果根目錄的嚴格子目錄。
-每個目錄都會檢查實體目錄、路徑元件不可為符號連結、可寫性、剩餘空間及掛載
-資訊。結果快照只保存 label、檔案系統型別、來源 token 的雜湊、可用 bytes 與
+Python／繪圖／系統暫存快取則必須是 operator 指定的網路檔案系統（NFS）結果根目錄
+之嚴格子目錄。
+每個目錄都會檢查實體目錄、路徑元件不可為符號連結、可搜尋性、實際寫入能力、
+剩餘空間及掛載資訊。NFS 的存取控制清單（ACL）或伺服器匯出設定（export）可能使
+Unix 權限查詢系統呼叫（``access(2)``）的寫入權限旗標（``W_OK``）預檢，與實際
+開啟檔案（``open``）及寫入結果不同。因此，寫入能力以建立探針檔、寫入、要求同步
+檔案資料（``fsync``）、同目錄原子改名及清理的完整操作為準；任何一步失敗都會關閉閘門。
+結果快照只保存 label、檔案系統型別、來源 token 的雜湊、可用 bytes 與
 閘門狀態，避免把 SERVER 絕對路徑寫進可搬移的稽核證據。
 
 正式 runner 會在任何 ``mkdir``、``uv`` 或 ``run-create`` 前執行本腳本。測試可以
@@ -182,7 +187,9 @@ def _existing_directory(value: PathLike, label: str) -> Path:
 
     專案根與 ``.venv`` 也走同一個 symlink-component 檢查，避免 deployment
     contract 對程式環境與資料環境產生不同的路徑語意；它們可以位於 ``/home``，
-    但仍必須是已存在的目錄。
+    但仍必須是已存在且具目錄搜尋權限旗標（``X_OK``）的目錄。這裡不以寫入權限旗標
+    （``W_OK``）判斷可寫，因為 NFS 存取控制清單或伺服器匯出設定的權限映射可能使
+    ``access(2)`` 預檢與實際檔案操作不一致；執行資料根的寫入能力由後續完整探針確認。
     """
 
     path = _absolute_path(value, label)
@@ -284,10 +291,12 @@ def _source_token_hash(source: str) -> str:
 
 
 def _write_probe(path: Path) -> bool:
-    """在指定目錄建立、寫入、同步並移除小型探針檔。
+    """以正式流程會使用的檔案操作驗證指定目錄的實際寫入能力。
 
-    探針只寫入少量 bytes 並使用隨機檔名，確認 NFS permission 與實際寫入路徑
-    有效；檔案成功同步後立即清除，不把測試資料留在研究成果目錄。任何錯誤
+    探針使用隨機名稱建立新檔、寫入少量位元組並呼叫 ``fsync`` 要求同步檔案資料，
+    再於同一目錄原子改名、重新開啟並同步已發布檔案，最後清除暫存與發布名稱。
+    NFS 存取控制清單或伺服器匯出設定的權限映射下，``access(2)`` 的 ``W_OK`` 預檢
+    不一定能預測這些實際操作，因此不以預檢結果取代探針。任何建立、寫入、同步、改名或清理錯誤
     都回傳 False，呼叫端會以 ``write_probe_failed`` 停止正式 runner。
     """
 
@@ -451,9 +460,12 @@ def validate_storage_policy(
 ) -> dict[str, object]:
     """驗證整個 SERVER 儲存部署並回傳 machine-readable gate snapshot。
 
-    ``result_nfs_root`` 下的八個 execution roots 必須是已存在、可寫且不含符號
-    連結元件的嚴格後代；它們各自需通過同一 NFS mount/source、空間、寫入探針，
-    並由 NFS root 上的跨程序 flock probe 證明互斥語意。``project_root`` 與
+    ``result_nfs_root`` 下的八個 execution roots 必須是已存在、可搜尋且不含符號
+    連結元件的嚴格後代；它們各自需通過同一 NFS mount/source、空間及實際寫入探針，
+    並由 NFS 根目錄上的跨程序檔案鎖（flock）探針證明互斥語意。NFS 存取控制清單或
+    伺服器匯出設定的權限映射可能使 ``access(2)`` 的 ``W_OK`` 預檢與實際開啟、寫入結果
+    不一致，因此不把該預檢當作寫入閘門；完整探針失敗仍以 ``write_probe_failed`` 硬性拒絕。
+    ``project_root`` 與
     ``project_venv`` 只驗證為既有目錄且 ``project_venv`` 精確位於 project root
     的 ``.venv``，因此可合法位於 ``/home``。所有預期失敗都彙整為 code，避免
     例外文字把任何絕對路徑寫入快照。
@@ -610,13 +622,12 @@ def validate_storage_policy(
         except (OSError, AttributeError, TypeError, ValueError):
             issue(label, "disk_usage_failed")
 
-    # execution roots 必須真的可寫；project root／venv 只提供 code/runtime，不
-    # 會因為部署權限而被要求可寫。這保留 /home 上唯讀 code checkout 的合法性。
+    # 只用實際檔案操作判定執行資料根的寫入能力，避免 NFS 存取控制清單／匯出設定
+    # 的權限映射使 access(2) 的 W_OK 預檢與實際 open/write 不一致。專案根目錄與
+    # 虛擬環境只提供程式碼／執行環境，不要求可寫，以保留 /home 唯讀程式目錄。
     for label, resolved in resolved_roots.items():
         if resolved is None:
             continue
-        if not os.access(resolved, os.W_OK | os.X_OK):
-            issue(label, "root_not_writable")
         try:
             if not (write_probe or _write_probe)(resolved):
                 issue(label, "write_probe_failed")
