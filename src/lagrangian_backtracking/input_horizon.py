@@ -25,6 +25,12 @@ from datetime import UTC, datetime, timedelta
 from numbers import Integral, Real
 from typing import Any
 
+from .gap_policy import (
+    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
+    GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+)
+
 UTC_HOUR_NS = 3_600_000_000_000
 """逐時時間軸的一小時 nanoseconds；所有算術均使用整數避免浮點日期誤差。"""
 
@@ -32,6 +38,7 @@ LEGACY_INPUT_SCHEMA_VERSION = "1.0.0"
 """未啟用隨機沉底政策的既有輸入文件版本，供舊 artifact 維持精確相容。"""
 
 BED_RESIDENCE_INPUT_SCHEMA_VERSION = "1.1.0"
+"""既有沉底 arrival／horizon schema；保留供 observation-2025 legacy 唯讀載入。"""
 """隨機沉底輸入文件版本，只用於新增沉底中繼資料的 arrival、gap 與 release binding。"""
 
 INT64_MIN = -(1 << 63)
@@ -51,6 +58,12 @@ BED_RESIDENCE_HORIZON_METHOD_ID = "server_v3_ocm_bed_deposition_horizon_v1"
 
 LEGACY_HORIZON_POLICY_ID = "7_day_gap_safe_baseline"
 LEGACY_HORIZON_METHOD_ID = "server_v3_ocm_gap_safe_arrival_horizon_v1"
+
+# 新版共用母體 root policy。它描述的是「已知缺口可被列舉，runtime 遇第一個缺口
+# 即截尾」的資料契約，不是宣稱整段 H30/H60/H90 連續可用。method ID 刻意獨立，
+# 讓 input-build 的 provenance 不會把新版 artifact 誤認成舊 gap-safe 輸入。
+GAP_CENSORED_HORIZON_POLICY_ID = OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID
+GAP_CENSORED_HORIZON_METHOD_ID = "server_v3_ocm_gap_censored_stop_at_first_gap_v1"
 
 
 class HorizonContractError(ValueError):
@@ -186,6 +199,24 @@ def _configured_support(config: Any) -> Any:
     return getattr(inputs, "backtrack_support_days", None)
 
 
+def _configured_gap_policy(config: Any | None) -> str | None:
+    """取得設定明示的 OCM 缺口政策，不以缺省值猜測新版語意。
+
+    設定層使用 ``inputs.time_axis_contract.gap_policy`` 作為唯一來源；缺少欄位代表
+    legacy，不能在 horizon validator 內自動升格為截尾母體。此 helper 僅讀取 typed
+    或 mapping-like config，實際值仍由 ``validate_generic_gap_payload`` exact 驗證。
+    """
+
+    if config is None:
+        return None
+    inputs = getattr(config, "inputs", None)
+    contract = getattr(inputs, "time_axis_contract", None) if inputs is not None else None
+    if isinstance(contract, Mapping):
+        value = contract.get("gap_policy")
+        return value if isinstance(value, str) else None
+    return None
+
+
 def resolve_configured_horizon(
     config: Any,
     *,
@@ -242,6 +273,12 @@ def resolve_configured_horizon(
     runtime_support: int | None
     policy_id = GENERIC_HORIZON_POLICY_ID
     method_id = GENERIC_HORIZON_METHOD_ID
+    configured_gap_policy = _configured_gap_policy(config)
+    if configured_gap_policy not in {
+        None,
+        OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+    }:
+        raise HorizonContractError(f"未知 inputs.time_axis_contract.gap_policy：{configured_gap_policy!r}")
     if bed_enabled:
         # 含隨機沉底年齡時，inputs 支援窗涵蓋「觀測選時最長回溯期 + 最老沉底年齡」；
         # 沉底後逐筆實際 gap 檢查只使用 runtime horizon。來源 template 可將 runtime
@@ -272,8 +309,12 @@ def resolve_configured_horizon(
             raise HorizonContractError(
                 "boundaries.max_backtrack_days 不得超過 bed residence runtime_horizon_support_days"
             )
-        policy_id = BED_RESIDENCE_HORIZON_POLICY_ID
-        method_id = BED_RESIDENCE_HORIZON_METHOD_ID
+        if configured_gap_policy == OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID:
+            policy_id = GAP_CENSORED_HORIZON_POLICY_ID
+            method_id = GAP_CENSORED_HORIZON_METHOD_ID
+        else:
+            policy_id = BED_RESIDENCE_HORIZON_POLICY_ID
+            method_id = BED_RESIDENCE_HORIZON_METHOD_ID
     else:
         runtime_support = support
         if requested is not None and requested > float(support):
@@ -572,6 +613,24 @@ def _strict_json_int_equal(value: Any, expected: int) -> bool:
     return type(value) is int and value == expected
 
 
+def _backward_censor_summary(
+    window: HorizonWindow, coverage: HorizonCoverage
+) -> tuple[str | None, int]:
+    """回傳由 arrival 往回遇到的第一個 missing node 與其前可用小時數。
+
+    ``missing_time_ns`` 以時間遞增保存；逆向積分的第一個缺口因此是其中最大的
+    missing UTC。arrival 本身可用時，arrival 與該節點之間的 exact-hour node 數為
+    ``delta_hours - 1``；沒有缺口時則回傳完整窗口的節點間隔數。這個摘要不把缺口
+    兩側端點誤當成可插值節點，且只依 canonical inventory 重算。
+    """
+
+    if not coverage.missing_time_ns:
+        return None, window.expected_step_count - 1
+    first_backward = max(coverage.missing_time_ns)
+    delta_hours = (window.end_time_ns - first_backward) // UTC_HOUR_NS
+    return utc_string(first_backward), max(0, int(delta_hours) - 1)
+
+
 def _parse_inventory_period(inventory: Mapping[str, Any]) -> tuple[int, int, int]:
     """解析 forcing inventory 的 expected period 並驗證宣稱筆數。"""
 
@@ -675,9 +734,10 @@ def validate_generic_gap_payload(
 
     驗證順序先檢查版本化政策、設定 support 與 forcing inventory 的 canonical 期別，之後
     才逐筆對照 arrival／gap records。每筆 gap 的 site、region、flow、UTC、起終點、
-    ``support*24+1`` 節點數與 missing 清單都由 arrival／inventory 重算；strict 模式遇到
-    任一缺口會失敗。非 strict generated artifact 可保留缺口診斷 warning，但只要政策或
-    來源 metadata 自相矛盾仍會失敗，不能退回 legacy 驗證。
+    ``support*24+1`` 節點數與 missing 清單都由 arrival／inventory 重算。legacy policy
+    在 strict 模式遇到任一缺口會失敗；新版 gap-censored policy 則要求 root／record
+    exact 保存第一個逆向缺口、截尾旗標、起點可用性與分母政策，並允許被明示的窗口
+    相交。兩種 policy 都會對未知欄位語意、來源 metadata 矛盾與 anchor 缺值 fail closed。
     """
 
     errors: list[str] = []
@@ -697,8 +757,12 @@ def validate_generic_gap_payload(
             getattr(scenarios, "bed_residence_time", None) if scenarios is not None else None
         )
     bed_enabled = bed_residence is not None
+    configured_gap_policy = _configured_gap_policy(config)
+    gap_censored = configured_gap_policy == OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID
     expected_schema_version = (
-        BED_RESIDENCE_INPUT_SCHEMA_VERSION
+        GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+        if gap_censored
+        else BED_RESIDENCE_INPUT_SCHEMA_VERSION
         if bed_enabled
         else LEGACY_INPUT_SCHEMA_VERSION
     )
@@ -707,10 +771,51 @@ def validate_generic_gap_payload(
     policy = gap_payload.get("policy")
     method = (gap_payload.get("provenance") or {}).get("method_id")
     root_support = gap_payload.get("support_days")
-    expected_policy = BED_RESIDENCE_HORIZON_POLICY_ID if bed_enabled else GENERIC_HORIZON_POLICY_ID
-    expected_method = BED_RESIDENCE_HORIZON_METHOD_ID if bed_enabled else GENERIC_HORIZON_METHOD_ID
+    expected_policy = (
+        GAP_CENSORED_HORIZON_POLICY_ID
+        if gap_censored
+        else BED_RESIDENCE_HORIZON_POLICY_ID
+        if bed_enabled
+        else GENERIC_HORIZON_POLICY_ID
+    )
+    expected_method = (
+        GAP_CENSORED_HORIZON_METHOD_ID
+        if gap_censored
+        else BED_RESIDENCE_HORIZON_METHOD_ID
+        if bed_enabled
+        else GENERIC_HORIZON_METHOD_ID
+    )
     if policy != expected_policy or method != expected_method:
         errors.append("generic_horizon_policy_or_method_invalid")
+    if gap_censored:
+        # 新版 root 必須把「可列舉缺口、遇第一個缺口停止」與統計分母一併綁定；
+        # 只改 policy 字串而遺漏其中一項，會讓 downstream 無法判定截尾成員如何
+        # 進入母體與有效條件式分母，因此即使 records 數值看似合理也拒絕。
+        if gap_payload.get("gap_censoring_policy") != OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID:
+            errors.append("generic_horizon_gap_censoring_policy_missing_or_invalid")
+        if gap_payload.get("stop_at_first_gap") is not True:
+            errors.append("generic_horizon_stop_at_first_gap_missing_or_invalid")
+        if (
+            gap_payload.get("denominator_policy")
+            != EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+        ):
+            errors.append("generic_horizon_denominator_policy_missing_or_invalid")
+        if config is not None:
+            inputs = getattr(config, "inputs", None)
+            time_contract = getattr(inputs, "time_axis_contract", None)
+            if not isinstance(time_contract, Mapping) or any(
+                (
+                    time_contract.get("gap_policy")
+                    != OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+                    time_contract.get("stop_at_first_gap") is not True,
+                    time_contract.get("denominator_policy")
+                    != EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
+                )
+            ):
+                errors.append("generic_horizon_config_gap_policy_invalid")
+            boundaries = getattr(config, "boundaries", None)
+            if getattr(boundaries, "stop_at_data_gap", None) is not True:
+                errors.append("generic_horizon_config_stop_at_data_gap_invalid")
     try:
         support = validate_support_days(
             root_support if root_support is not None else gap_payload.get("max_backtrack_days"),
@@ -970,8 +1075,41 @@ def validate_generic_gap_payload(
             errors.append(f"generic_horizon_missing_nodes_mismatch:{arrival_id}")
         if gap.get("crossed_gap") is not coverage.crossed_gap:
             errors.append(f"generic_horizon_crossed_gap_mismatch:{arrival_id}")
+        if gap_censored:
+            first_backward_gap_utc, supported_before_gap = _backward_censor_summary(
+                window, coverage
+            )
+            expected_censor_fields = {
+                "censoring_policy": OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+                "stop_at_first_gap": True,
+                "denominator_policy": (
+                    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+                ),
+                "censored_by_data_gap": coverage.crossed_gap,
+                "first_backward_gap_utc": first_backward_gap_utc,
+                "supported_hours_before_first_gap": supported_before_gap,
+                "arrival_time_available": arrival_ns_int not in coverage.missing_time_ns,
+                # arrival_time is the deposition UTC in bed mode; generic mode uses the
+                # same exact-hour anchor and keeps this field for uniform audit shape.
+                "deposition_time_available": arrival_ns_int not in coverage.missing_time_ns,
+            }
+            for field_name, expected_value in expected_censor_fields.items():
+                if gap.get(field_name) != expected_value:
+                    errors.append(f"generic_horizon_censor_field_mismatch:{arrival_id}:{field_name}")
+            for availability_field in (
+                "arrival_time_available",
+                "deposition_time_available",
+            ):
+                if gap.get(availability_field) is not True:
+                    errors.append(
+                        f"generic_horizon_required_anchor_unavailable:{arrival_id}:{availability_field}"
+                    )
         expected_record_policy = (
-            BED_RESIDENCE_HORIZON_POLICY_ID if bed_enabled else GENERIC_HORIZON_POLICY_ID
+            GAP_CENSORED_HORIZON_POLICY_ID
+            if gap_censored
+            else BED_RESIDENCE_HORIZON_POLICY_ID
+            if bed_enabled
+            else GENERIC_HORIZON_POLICY_ID
         )
         if gap.get("time_support_policy") != expected_record_policy:
             errors.append(f"generic_horizon_record_policy_mismatch:{arrival_id}")
@@ -1027,19 +1165,41 @@ def validate_generic_gap_payload(
                     errors.append(f"generic_horizon_selection_missing_mismatch:{arrival_id}")
                 if gap.get("selection_crossed_gap") is not selection_coverage.crossed_gap:
                     errors.append(f"generic_horizon_selection_crossed_gap_mismatch:{arrival_id}")
+                if gap_censored:
+                    selection_first_gap, selection_supported_before_gap = _backward_censor_summary(
+                        selection_window, selection_coverage
+                    )
+                    selection_censor_fields = {
+                        "selection_censored_by_data_gap": selection_coverage.crossed_gap,
+                        "selection_first_backward_gap_utc": selection_first_gap,
+                        "selection_supported_hours_before_first_gap": selection_supported_before_gap,
+                        "observation_time_available": observation_time
+                        not in selection_coverage.missing_time_ns,
+                    }
+                    for field_name, expected_value in selection_censor_fields.items():
+                        if gap.get(field_name) != expected_value:
+                            errors.append(
+                                f"generic_horizon_selection_censor_field_mismatch:"
+                                f"{arrival_id}:{field_name}"
+                            )
+                    if gap.get("observation_time_available") is not True:
+                        errors.append(
+                            f"generic_horizon_required_anchor_unavailable:{arrival_id}:"
+                            "observation_time_available"
+                        )
                 if selection_coverage.crossed_gap:
                     crossed += 1
-                    if strict:
+                    if strict and not gap_censored:
                         errors.append(f"generic_horizon_selection_crosses_gap:{arrival_id}")
-                    else:
+                    elif not strict or gap_censored:
                         warnings.append(f"generic_horizon_selection_crosses_gap:{arrival_id}")
             except HorizonContractError as exc:
                 errors.append(f"generic_horizon_selection_window_invalid:{arrival_id}:{exc}")
         if coverage.crossed_gap:
             crossed += 1
-            if strict:
+            if strict and not gap_censored:
                 errors.append(f"generic_horizon_crosses_gap:{arrival_id}")
-            else:
+            elif not strict or gap_censored:
                 warnings.append(f"generic_horizon_crosses_gap:{arrival_id}")
 
     if expected_count is not None and expected_count < 1:
@@ -1065,6 +1225,9 @@ validate_shared_horizon_payload = validate_generic_gap_payload
 
 __all__ = [
     "BED_RESIDENCE_INPUT_SCHEMA_VERSION",
+    "GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION",
+    "GAP_CENSORED_HORIZON_METHOD_ID",
+    "GAP_CENSORED_HORIZON_POLICY_ID",
     "GENERIC_HORIZON_METHOD_ID",
     "GENERIC_HORIZON_POLICY_ID",
     "HorizonContractError",

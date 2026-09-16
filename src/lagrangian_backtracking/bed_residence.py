@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -18,6 +18,9 @@ from typing import Final, Literal
 
 import numpy as np
 
+from .gap_policy import (
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+)
 from .scenarios import ArrivalTime, stable_identifier
 
 __all__ = [
@@ -25,12 +28,17 @@ __all__ = [
     "BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION",
     "BED_RESIDENCE_POLICY_ID",
     "BED_RESIDENCE_SAMPLING_METHOD_ID",
+    "BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID",
     "BED_RESIDENCE_SAMPLING_POLICY_ID",
+    "BedResidenceAvailabilitySampling",
+    "BedResidenceStratumRejectionAudit",
     "BedResidenceMode",
     "BedResidenceTiming",
     "apply_bed_residence_sampling",
     "resolve_bed_residence_timing",
     "sample_bed_residence_age_hours",
+    "sample_bed_residence_age_hours_conditioned_on_availability",
+    "sample_bed_residence_age_hours_gap_aware",
 ]
 
 # 模式字串會進入設定、run 身分與輸出，採具名值以避免裸數字 1/2 在不同介面有歧義。
@@ -49,6 +57,12 @@ BED_RESIDENCE_SAMPLING_POLICY_ID: Final[str] = (
 BED_RESIDENCE_SAMPLING_METHOD_ID: Final[str] = (
     "numpy_pcg64dxsm_one_per_stratum_then_permutation_v1"
 )
+# 新版條件式抽樣將第 n 個 age stratum 固定配對到各站排序後的第 n 個
+# observation rank，再使用同一個 PCG64DXSM generator 在該 stratum 內逐一嘗試候選。
+# 此識別碼不可沿用 legacy method，否則 loader 無法區分「缺口拒絕抽樣」與舊向量。
+BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID: Final[str] = (
+    "numpy_pcg64dxsm_stratum_rank_first_available_deposition_v1"
+)
 
 _HOURS_PER_DAY: Final[int] = 24
 _NANOSECONDS_PER_SECOND: Final[int] = 1_000_000_000
@@ -57,6 +71,58 @@ _NANOSECONDS_PER_DAY: Final[int] = 86_400 * _NANOSECONDS_PER_SECOND
 _INT64_MIN: Final[int] = -(1 << 63)
 _INT64_MAX: Final[int] = (1 << 63) - 1
 _SAMPLE_COUNT: Final[int] = 50
+
+
+@dataclass(frozen=True, slots=True)
+class BedResidenceStratumRejectionAudit:
+    """一個沉底年齡分層的候選拒絕稽核。
+
+    ``observation_rank`` 是每一站按 observation UTC、arrival ID 穩定排序後的共同
+    rank；``rejected_by_site`` 逐候選保存哪些站點的 deposition exact-hour 不在
+    canonical available-time set。這些欄位只描述可重現的候選篩選，不代表資料缺口
+    已被補齊；完全沒有可用候選時，抽樣器會直接丟出例外。
+    """
+
+    stratum_index: int
+    observation_rank: int
+    candidate_count: int
+    rejected_age_hours: tuple[int, ...]
+    rejected_by_site: tuple[tuple[int, tuple[str, ...]], ...]
+    selected_age_hours: int
+
+    def as_metadata(self) -> dict[str, object]:
+        """轉為 JSON manifest 可保存的純 Python mapping。"""
+
+        return {
+            "stratum_index": self.stratum_index,
+            "observation_rank": self.observation_rank,
+            "candidate_count": self.candidate_count,
+            "rejected_age_hours": list(self.rejected_age_hours),
+            "rejected_by_site": [
+                {"age_hours": age, "missing_site_ids": list(site_ids)}
+                for age, site_ids in self.rejected_by_site
+            ],
+            "selected_age_hours": self.selected_age_hours,
+            "rejection_count": len(self.rejected_age_hours),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BedResidenceAvailabilitySampling:
+    """缺口條件式沉底年齡母體及逐分層拒絕稽核。
+
+    ``age_hours`` 已按排序後 observation rank 排列，五站必須共用同一向量。因為
+    可用性判斷要求每一個候選沉底時刻都出現在五站各自 canonical time set，返回
+    向量不會含 nearest、linear、zero-fill 或跨缺口外插的時間。``rejection_audit``
+    可直接放入 arrival provenance；其順序固定為 stratum index 0 到 49。
+    """
+
+    age_hours: tuple[int, ...]
+    rejection_audit: tuple[BedResidenceStratumRejectionAudit, ...]
+    sampling_method_id: str = BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID
+    availability_conditioning_policy: str = (
+        REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +231,190 @@ def sample_bed_residence_age_hours(
     return output
 
 
+def _available_hour_set(
+    values: Iterable[int], *, site_id: str, field_name: str
+) -> frozenset[int]:
+    """把 canonical available-time set 正規化為 exact-hour 整數集合。
+
+    available set 必須來自已驗收 OCM canonical time axis；此函式只檢查交換介面的
+    時間格式，不讀取檔案，也不把相鄰時刻推算成可用節點。任何非整點、bool、字串或
+    int64 範圍外值都直接拒絕，避免條件式抽樣在缺口附近產生隱含補值。
+    """
+
+    try:
+        raw_values = tuple(values)
+    except TypeError as error:
+        raise TypeError(f"{field_name}[{site_id}] 必須是 exact-hour UTC nanoseconds 序列") from error
+    normalised: set[int] = set()
+    for index, value in enumerate(raw_values):
+        if type(value) is not int:
+            raise TypeError(f"{field_name}[{site_id}][{index}] 必須是原生 int UTC nanoseconds")
+        if not _INT64_MIN <= value <= _INT64_MAX:
+            raise ValueError(f"{field_name}[{site_id}][{index}] 超出有號 64 位範圍")
+        if value % _NANOSECONDS_PER_HOUR:
+            raise ValueError(f"{field_name}[{site_id}][{index}] 必須落在 exact-hour")
+        normalised.add(value)
+    return frozenset(normalised)
+
+
+def _sorted_observation_rank_times(
+    observation_times_by_site: Mapping[str, Sequence[int]], *, sample_count: int
+) -> tuple[tuple[str, ...], tuple[tuple[int, ...], ...]]:
+    """依 UTC 與原始索引建立五站共同 observation rank。
+
+    年齡抽樣的科學語意是「同一 rank 使用同一 age」，不是把不同站點的第 n 筆
+    輸入列碰巧配在一起。因此這裡先對每站排序，再要求各站有相同 rank 數量與唯一
+    exact-hour；輸入順序可改變，但排序後的 rank 與候選結果不會改變。
+    """
+
+    if not isinstance(observation_times_by_site, Mapping) or not observation_times_by_site:
+        raise ValueError("observation_times_by_site 必須是非空站點 mapping")
+    site_ids = tuple(sorted(observation_times_by_site))
+    if any(type(site_id) is not str or not site_id.strip() for site_id in site_ids):
+        raise TypeError("observation_times_by_site 的站點 ID 必須是非空 str")
+    sorted_times: list[tuple[int, ...]] = []
+    for site_id in site_ids:
+        values = observation_times_by_site[site_id]
+        if isinstance(values, (str, bytes, bytearray)):
+            raise TypeError(f"observation_times_by_site[{site_id}] 不可為文字")
+        try:
+            converted = tuple(values)
+        except TypeError as error:
+            raise TypeError(f"observation_times_by_site[{site_id}] 必須是時間序列") from error
+        if len(converted) != sample_count:
+            raise ValueError(
+                f"observation_times_by_site[{site_id}] 必須恰有 {sample_count} 筆 observation"
+            )
+        checked: list[int] = []
+        for index, value in enumerate(converted):
+            if type(value) is not int:
+                raise TypeError(
+                    f"observation_times_by_site[{site_id}][{index}] 必須是原生 int UTC nanoseconds"
+                )
+            if not _INT64_MIN <= value <= _INT64_MAX:
+                raise ValueError(f"observation_times_by_site[{site_id}][{index}] 超出有號 64 位範圍")
+            if value % _NANOSECONDS_PER_HOUR:
+                raise ValueError(f"observation_times_by_site[{site_id}][{index}] 必須落在 exact-hour")
+            checked.append(value)
+        ordered = tuple(sorted(checked))
+        if len(set(ordered)) != sample_count:
+            raise ValueError(f"observation_times_by_site[{site_id}] UTC 不可重複")
+        sorted_times.append(ordered)
+    if len({len(values) for values in sorted_times}) != 1:
+        raise ValueError("五站 observation rank 數量必須一致")
+    return site_ids, tuple(sorted_times)
+
+
+def sample_bed_residence_age_hours_conditioned_on_availability(
+    *,
+    observation_times_by_site: Mapping[str, Sequence[int]],
+    available_time_ns_by_site: Mapping[str, Iterable[int]],
+    maximum_age_days: int,
+    sample_count: int,
+    seed: int,
+) -> BedResidenceAvailabilitySampling:
+    """依五站 canonical available-time set 條件式抽樣沉底年齡。
+
+    先把每站 observation UTC 以 ``(time_utc_ns, 原始輸入順序)`` 的穩定規則排序，將
+    stratum ``i`` 固定配對至 rank ``i``。每層再由同一個 NumPy PCG64DXSM generator
+    對該層所有整點候選建立無放回順序，選出第一個使「每一站該 rank observation
+    UTC 減 age」均存在於該站 canonical available-time set 的年齡。被拒絕的候選與
+    缺少該 deposition hour 的站點逐項保存於 audit；某層無候選時 fail closed。
+
+    ``age_hours`` 的順序是排序後 observation rank 順序，不是 legacy sampler 的
+    額外 permutation 順序。這是有意的新版 method identity；呼叫端不得以舊
+    ``BED_RESIDENCE_SAMPLING_METHOD_ID`` 寫入新版 manifest。函式只做 exact-hour
+    membership，不允許 nearest、linear、zero fill 或跨 gap 推估。
+    """
+
+    maximum_age_days = _strict_int(maximum_age_days, label="maximum_age_days", minimum=1)
+    sample_count = _strict_int(sample_count, label="sample_count", minimum=1)
+    seed = _strict_int(seed, label="seed", minimum=0)
+    if sample_count != _SAMPLE_COUNT:
+        raise ValueError("正式缺口條件式 bed residence 抽樣必須使用 50 個分層")
+    available_hour_count = maximum_age_days * _HOURS_PER_DAY + 1
+    if sample_count > available_hour_count:
+        raise ValueError("sample_count 不可大於可抽取的唯一整點小時數")
+    site_ids, observation_ranks = _sorted_observation_rank_times(
+        observation_times_by_site, sample_count=sample_count
+    )
+    if set(available_time_ns_by_site) != set(site_ids):
+        raise ValueError("available_time_ns_by_site 必須與 observation_times_by_site 站點集合 exact 相同")
+    available_by_site = {
+        site_id: _available_hour_set(
+            available_time_ns_by_site[site_id],
+            site_id=site_id,
+            field_name="available_time_ns_by_site",
+        )
+        for site_id in site_ids
+    }
+
+    generator = np.random.Generator(np.random.PCG64DXSM(seed))
+    selected_ages: list[int] = []
+    audits: list[BedResidenceStratumRejectionAudit] = []
+    for stratum_index in range(sample_count):
+        start, stop = _stratum_bounds(
+            maximum_age_days=maximum_age_days,
+            sample_count=sample_count,
+            stratum_index=stratum_index,
+        )
+        if stop <= start:
+            raise ValueError(f"bed residence stratum {stratum_index} 不可為空")
+        # permutation 產生每層無放回候選順序；使用同一 generator 並保留層順序，
+        # 使 seed、站點集合與 canonical axis 一起決定唯一的 rejection audit。
+        candidates = tuple(
+            int(value)
+            for value in generator.permutation(np.arange(start, stop, dtype=np.int64))
+        )
+        rejected: list[int] = []
+        rejected_by_site: list[tuple[int, tuple[str, ...]]] = []
+        selected: int | None = None
+        rank_observation = tuple(times[stratum_index] for times in observation_ranks)
+        for age in candidates:
+            missing_sites = tuple(
+                site_id
+                for site_id, observation_ns in zip(site_ids, rank_observation, strict=True)
+                if observation_ns - age * _NANOSECONDS_PER_HOUR
+                not in available_by_site[site_id]
+            )
+            if missing_sites:
+                rejected.append(age)
+                rejected_by_site.append((age, missing_sites))
+                continue
+            selected = age
+            break
+        if selected is None:
+            raise ValueError(
+                "bed residence 缺口條件式抽樣無可用候選："
+                f"stratum={stratum_index}, observation_rank={stratum_index}, "
+                f"candidate_count={len(candidates)}"
+            )
+        selected_ages.append(selected)
+        audits.append(
+            BedResidenceStratumRejectionAudit(
+                stratum_index=stratum_index,
+                observation_rank=stratum_index,
+                candidate_count=len(candidates),
+                rejected_age_hours=tuple(rejected),
+                rejected_by_site=tuple(rejected_by_site),
+                selected_age_hours=selected,
+            )
+        )
+
+    age_vector = _validated_age_vector(selected_ages, maximum_age_days=maximum_age_days)
+    return BedResidenceAvailabilitySampling(
+        age_hours=age_vector,
+        rejection_audit=tuple(audits),
+    )
+
+
+# 這個較短 alias 提供 input builder 使用；它與完整名稱共用同一實作，不另外產生
+# 可能漂移的抽樣算法。對外文件應優先使用完整名稱，避免把「條件式」誤讀成舊抽樣。
+sample_bed_residence_age_hours_gap_aware = (
+    sample_bed_residence_age_hours_conditioned_on_availability
+)
+
+
 def _format_utc_ns(value: int) -> str:
     """將有號 64 位 UTC 奈秒轉為保留奈秒精度的 ISO-8601 Z 文字。"""
 
@@ -198,6 +448,9 @@ def _source_metadata(metadata: object) -> dict[str, object]:
         "bed_residence_stratum_index",
         "bed_residence_policy_id",
         "bed_residence_sampling_policy_id",
+        "bed_residence_sampling_method_id",
+        "bed_residence_availability_conditioning_policy",
+        "bed_residence_availability_rejection_audit",
         "bed_residence_sampling_seed",
         "observation_arrival_time_id",
     }
@@ -261,6 +514,9 @@ def apply_bed_residence_sampling(
     sampling_seed: int,
     maximum_age_days: int,
     design_version: str,
+    sampling_method_id: str = BED_RESIDENCE_SAMPLING_METHOD_ID,
+    availability_conditioning_policy: str | None = None,
+    availability_rejection_audit: Sequence[BedResidenceStratumRejectionAudit] | None = None,
 ) -> tuple[ArrivalTime, ...]:
     """把單站觀測錨點依穩定順序轉為沉底 UTC 到達紀錄。
 
@@ -268,8 +524,12 @@ def apply_bed_residence_sampling(
     共用的同一向量。配對順序固定以 (time_utc_ns, arrival_time_id) 排序；沉底時間等於
     observation UTC 減去整數小時年齡。year/season 改依沉底 UTC 重算，潮況及事件標籤
     保持原 observation strata，並另存原始 year/season 供追溯。metadata 保存兩個 UTC
-    時間、年齡、分層、算法版本、seed、設計版本及原始 arrival ID。重複沉底 UTC、pilot
-    provenance、已轉換紀錄或不完整分層向量均會拒絕整站輸出。
+    時間、年齡、分層、算法版本、seed、設計版本及原始 arrival ID。新版條件式抽樣
+    可以另帶 availability policy 與每分層 rejection audit；這些欄位只作 provenance，
+    不會替缺少的 forcing 節點補值。legacy method 仍拒絕站內重複沉底 UTC；新版
+    條件式 method 則以 observation identity 區分資料列，只要求候選沉底整點在五站
+    canonical available-time set 中存在，不額外加入未登錄的唯一性限制。兩者都會拒絕
+    pilot provenance、已轉換紀錄或不完整分層向量。
     """
 
     maximum_age_days = _strict_int(
@@ -278,6 +538,28 @@ def apply_bed_residence_sampling(
     sampling_seed = _strict_int(sampling_seed, label="sampling_seed", minimum=0)
     design_version = _nonempty_text(design_version, label="design_version")
     ages = _validated_age_vector(age_hours, maximum_age_days=maximum_age_days)
+    sampling_method_id = _nonempty_text(sampling_method_id, label="sampling_method_id")
+    if sampling_method_id not in {
+        BED_RESIDENCE_SAMPLING_METHOD_ID,
+        BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
+    }:
+        raise ValueError(f"不支援的 bed residence sampling method：{sampling_method_id!r}")
+    if sampling_method_id == BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID:
+        if availability_conditioning_policy != REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID:
+            raise ValueError(
+                "新版條件式 bed residence method 必須 exact 綁定 availability_conditioning_policy"
+            )
+        if availability_rejection_audit is None:
+            raise ValueError("新版條件式 bed residence method 必須保存 rejection audit")
+        audit_records = tuple(availability_rejection_audit)
+        if len(audit_records) != _SAMPLE_COUNT:
+            raise ValueError("新版條件式 bed residence method 必須保存 50 筆 rejection audit")
+        if tuple(item.stratum_index for item in audit_records) != tuple(range(_SAMPLE_COUNT)):
+            raise ValueError("rejection audit 必須依 stratum index 0..49 排列")
+        if tuple(item.selected_age_hours for item in audit_records) != ages:
+            raise ValueError("rejection audit 的 selected age 與 age_hours 不一致")
+    elif availability_conditioning_policy is not None or availability_rejection_audit is not None:
+        raise ValueError("legacy bed residence method 不得攜帶新版 availability provenance")
     if isinstance(arrivals, (str, bytes, bytearray)):
         raise TypeError("arrivals 必須是 ArrivalTime 序列")
     records = tuple(arrivals)
@@ -317,7 +599,13 @@ def apply_bed_residence_sampling(
             raise ValueError("deposition UTC 奈秒超出有號 64 位範圍")
         by_original_index[original_index] = (observation_ns, age, metadata)
         deposition_values.append(deposition_ns)
-    if len(set(deposition_values)) != _SAMPLE_COUNT:
+    if (
+        len(set(deposition_values)) != _SAMPLE_COUNT
+        and sampling_method_id == BED_RESIDENCE_SAMPLING_METHOD_ID
+    ):
+        # legacy arrival identity 尚未把 observation rank 納入完整 identity，維持舊版
+        # 對重複沉底 UTC 的拒絕；新版條件式 identity 已綁定 observation arrival ID，
+        # 且候選規則只要求五站 exact-hour available，不額外偷偷增加全站唯一時間限制。
         raise ValueError("50 筆沉底時間出現重複 UTC，拒絕建立模糊 arrival identity")
 
     design_hash = hashlib.sha256(design_version.encode("utf-8")).hexdigest()
@@ -353,7 +641,7 @@ def apply_bed_residence_sampling(
                 ),
                 "bed_residence_policy_id": BED_RESIDENCE_POLICY_ID,
                 "bed_residence_sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
-                "bed_residence_sampling_method_id": BED_RESIDENCE_SAMPLING_METHOD_ID,
+                "bed_residence_sampling_method_id": sampling_method_id,
                 "bed_residence_sampling_seed": sampling_seed,
                 "bed_residence_maximum_age_days": maximum_age_days,
                 "bed_residence_design_version": design_version,
@@ -361,17 +649,34 @@ def apply_bed_residence_sampling(
                 "observation_arrival_time_id": arrival.arrival_time_id,
             }
         )
-        new_id = stable_identifier(
-            "arrival_bed",
-            [
-                arrival.arrival_time_id,
-                str(deposition_ns),
-                BED_RESIDENCE_POLICY_ID,
-                BED_RESIDENCE_SAMPLING_POLICY_ID,
-                str(sampling_seed),
-                design_hash,
-            ],
-        )
+        if sampling_method_id == BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID:
+            assert availability_rejection_audit is not None
+            stratum_index = _stratum_index_for_age(
+                age,
+                maximum_age_days=maximum_age_days,
+                sample_count=_SAMPLE_COUNT,
+            )
+            metadata.update(
+                {
+                    "bed_residence_availability_conditioning_policy": availability_conditioning_policy,
+                    "bed_residence_availability_rejection_audit": (
+                        availability_rejection_audit[stratum_index].as_metadata()
+                    ),
+                }
+            )
+        identity_fields = [
+            arrival.arrival_time_id,
+            str(deposition_ns),
+            BED_RESIDENCE_POLICY_ID,
+            BED_RESIDENCE_SAMPLING_POLICY_ID,
+        ]
+        # 舊 method 的 identity 欄位不可改動，否則同一份 legacy config 會因新增
+        # optional schema 欄位產生 hash／arrival ID 漂移。只有新版 method 需要把
+        # method 與 availability policy 納入 identity，避免兩種抽樣結果混用。
+        if sampling_method_id == BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID:
+            identity_fields.extend([sampling_method_id, availability_conditioning_policy])
+        identity_fields.extend([str(sampling_seed), design_hash])
+        new_id = stable_identifier("arrival_bed", identity_fields)
         output[original_index] = ArrivalTime(
             arrival_time_id=new_id,
             study_site_id=arrival.study_site_id,
@@ -493,8 +798,27 @@ def resolve_bed_residence_timing(
         raise ValueError("arrival metadata bed residence policy 不一致")
     if metadata.get("bed_residence_sampling_policy_id") != BED_RESIDENCE_SAMPLING_POLICY_ID:
         raise ValueError("arrival metadata sampling policy 不一致")
-    if metadata.get("bed_residence_sampling_method_id") != BED_RESIDENCE_SAMPLING_METHOD_ID:
-        raise ValueError("arrival metadata sampling method 不一致")
+    sampling_method = metadata.get("bed_residence_sampling_method_id")
+    if sampling_method not in {
+        BED_RESIDENCE_SAMPLING_METHOD_ID,
+        BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
+    }:
+        raise ValueError("arrival metadata sampling method 不一致或未登錄")
+    if sampling_method == BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID:
+        if metadata.get("bed_residence_availability_conditioning_policy") != (
+            REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+        ):
+            raise ValueError("arrival metadata availability conditioning policy 不一致")
+        if not isinstance(metadata.get("bed_residence_availability_rejection_audit"), dict):
+            raise ValueError("arrival metadata 缺少 availability rejection audit")
+    elif any(
+        key in metadata
+        for key in (
+            "bed_residence_availability_conditioning_policy",
+            "bed_residence_availability_rejection_audit",
+        )
+    ):
+        raise ValueError("legacy arrival metadata 不得帶 availability provenance")
     _nonempty_text(
         metadata.get("observation_arrival_time_id"),
         label="ArrivalTime.metadata.observation_arrival_time_id",

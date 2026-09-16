@@ -35,6 +35,13 @@ def _legacy_example_payload() -> dict:
     """由正式範例明確建立未啟用隨機沉底與共同支援窗的舊相容 fixture。"""
 
     payload = deepcopy(_payload())
+    # 範例 YAML 現在屬於 gap-censored 新版；legacy fixture 必須明確移除新增的
+    # time-axis policy，才能驗證「未宣告新欄位的舊 hash 不漂移」，而不是把新版
+    # 語意誤當成舊設定的一部分。
+    time_axis_contract = payload["inputs"].get("time_axis_contract")
+    if isinstance(time_axis_contract, dict):
+        for field in ("gap_policy", "stop_at_first_gap", "denominator_policy"):
+            time_axis_contract.pop(field, None)
     payload["scenarios"].pop("bed_residence_time", None)
     payload["inputs"].pop("backtrack_support_days", None)
     payload["design_version"] = "design_baseline_v3_non_rising_a_v3_local20_20260909"
@@ -62,6 +69,9 @@ def _bed_residence_block() -> dict:
         "sampling_policy": "discrete_hourly_stratified_uniform_v1",
         "sampling_seed": 20260916,
         "shared_age_offsets_across_sites": True,
+        "availability_conditioning_policy": (
+            "reject_unavailable_deposition_hour_within_stratum_v1"
+        ),
         "pre_window_policy": "record_pre_window_deposition_without_transport",
         "runtime_horizon_support_days": 90,
     }

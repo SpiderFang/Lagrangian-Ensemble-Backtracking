@@ -169,7 +169,7 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 `full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
 
 `horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation
-選時包絡為 180 日，沉底後 gap-safe 執行支援為 90 日，再發布兩種模式共六份 release。
+選時包絡為 180 日，沉底後 gap-censored 執行支援上限為 90 日，再發布兩種模式共六份 release。
 六份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及
 綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見
 [輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及
@@ -185,10 +185,12 @@ arrival anchor。
 因此最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，不需要把 2024 早季
 當作 observation strata，也不需另補 2023 前置流場資料。180/90 仍是待驗證的資料支援契約，
 不是已完成 SERVER 或 `inputs-build` 的證據；若實際 accepted product 在 2024-07-05 前仍
-有缺時，strict preflight/build 會 fail closed，不能用最近值、零值或未登錄外插繞過。
-正式執行前須由當次流場清冊與 gap-safe 證據證明這段支援確實存在；本次不宣稱
+有缺時，legacy strict preflight/build 會 fail closed；明示
+`observed_gap_censored_stop_at_first_gap_v1` 的 bed-residence build 則保留缺口清單並
+依第一缺口截尾契約產生 `data_gap` 可稽核紀錄。兩者都不能用最近值、零值或未登錄外插繞過。
+正式執行前須由當次流場清冊與對應 gap-safe／gap-censored 證據完成驗證；本次不宣稱
 已在 SERVER 執行，也不把 design_pending template 稱為 approved release。
-正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
+正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建、legacy 缺口安全到達視窗，或本期版本化的第一缺口截尾政策，執行流程不臨時外插，不以最近值或零值補資料。
 
 ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。
 四區的明示 pilot registry 共用 `2024-01-02T01:00:00Z`、24 小時回溯與 25 個逐時節點；A

@@ -8,9 +8,10 @@ domain 中心投影成公尺，避免把經緯度直接拿去做距離、邊界�
 
 material manifest 為相容既有 ``lbt behavior-manifest`` 的 schema 2.0.0；該格式沒有
 共同 provenance object，因此保留原本的分類來源、速度來源及校準範圍三欄。receptor、
-legacy arrival-time 與三種幾何文件採 schema 1.0.0；新增沉底時間 metadata 的 arrival
-採獨立 schema 1.1.0，loader 依 config 模式拒絕跨版本載入。所有 root 都必須含完整
-provenance。情境清單仍以 tuple 保存，50,000 個基礎情境只由既有 deterministic
+legacy arrival-time 與三種幾何文件採 schema 1.0.0；未套用缺口條件式的沉底 arrival
+採 schema 1.1.0，新版 exact deposition-hour 條件式抽樣與缺口截尾採 schema 1.2.0，
+loader 依 config 模式拒絕跨版本載入。所有 root 都必須含完整 provenance。情境清單仍以
+tuple 保存，50,000 個基礎情境只由既有 deterministic
 cross-product builder 產生，不另建 NumPy object array。
 """
 
@@ -33,6 +34,7 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from .bed_residence import (
+    BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
     BED_RESIDENCE_POLICY_ID,
@@ -42,6 +44,12 @@ from .bed_residence import (
 )
 from .boundaries import BoundaryGeometry
 from .config import ProjectConfig, resolve_flow_domain_id
+from .gap_policy import (
+    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
+    GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+)
 from .geometry import DomainProjection
 from .input_horizon import (
     BED_RESIDENCE_INPUT_SCHEMA_VERSION,
@@ -358,14 +366,22 @@ def _boolean(value: Any, label: str) -> bool:
     return value
 
 
-def _metadata(value: Any, label: str) -> dict[str, float | int | str]:
-    """驗證 metadata 僅含非空 key 及有限 float、非 bool int、非空 string scalar。"""
+def _metadata(value: Any, label: str) -> dict[str, Any]:
+    """驗證 metadata scalar，並保留新版沉底 rejection audit 的限定 nested object。
+
+    一般 row metadata 維持 scalar-only，避免任意未登錄 JSON 結構進入正式 identity。
+    唯一例外是新版條件式沉底抽樣的 ``bed_residence_availability_rejection_audit``，
+    其 nested mapping 會在 bed-residence validator 依 root provenance 逐欄 exact 比對。
+    """
 
     if not isinstance(value, dict):
         raise ValueError(f"{label} 必須是 object")
-    result: dict[str, float | int | str] = {}
+    result: dict[str, Any] = {}
     for key, item in value.items():
         clean_key = _nonempty_string(key, f"{label} key")
+        if clean_key == "bed_residence_availability_rejection_audit" and isinstance(item, dict):
+            result[clean_key] = item
+            continue
         if isinstance(item, bool) or item is None or isinstance(item, (list, dict)):
             raise ValueError(f"{label}.{clean_key} 必須是有限 float、非 bool int 或非空 string")
         if isinstance(item, str):
@@ -1116,11 +1132,70 @@ def _validate_bed_residence_arrival_records(
         raise ValueError("bed residence backtrack_mode 不在 supported_backtrack_modes")
     if bed.shared_age_offsets_across_sites is not True:
         raise ValueError("正式五站設計必須共用同一 50-age vector")
-    offsets = sample_bed_residence_age_hours(
-        maximum_age_days=bed.maximum_age_days,
-        sample_count=bed.sample_count_per_site,
-        seed=bed.sampling_seed,
+    conditioned_sampling = (
+        bed.availability_conditioning_policy
+        == REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
     )
+    expected_sampling_method = (
+        BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID
+        if conditioned_sampling
+        else BED_RESIDENCE_SAMPLING_METHOD_ID
+    )
+    provenance_audit_by_stratum: dict[int, Mapping[str, Any]] = {}
+    if conditioned_sampling:
+        # 新版年齡向量取決於 canonical available-time set，loader 不會自行讀取 forcing
+        # 或另抽一組 seed 來猜測；input-build 已將完整向量與 rejection audit 寫入
+        # provenance。這裡只驗證其 shape、分層與 hash，避免改寫 manifest 後冒用新版。
+        sampling_provenance = provenance.get("bed_residence_sampling")
+        if not isinstance(sampling_provenance, Mapping):
+            raise ValueError("新版 bed residence 缺少 sampling provenance")
+        raw_offsets = sampling_provenance.get("age_offsets_hours")
+        if not isinstance(raw_offsets, list) or any(type(value) is not int for value in raw_offsets):
+            raise ValueError("新版 bed residence provenance 必須保存 age_offsets_hours 整數向量")
+        offsets = tuple(raw_offsets)
+        if len(offsets) != bed.sample_count_per_site:
+            raise ValueError("新版 bed residence age_offsets_hours 長度不符")
+        if len(set(offsets)) != len(offsets):
+            raise ValueError("新版 bed residence age_offsets_hours 不得重複")
+        # 使用既有 helper 的 exact 分層規則；sample_bed... 的 seed-only 版本不能用於
+        # 重現條件式向量，否則會把缺口拒絕結果誤當成可用性證據。
+        total_hour_count = bed.maximum_age_days * 24 + 1
+        strata = {
+            index
+            for age in offsets
+            for index in range(bed.sample_count_per_site)
+            if index * total_hour_count // bed.sample_count_per_site
+            <= age
+            < (index + 1) * total_hour_count // bed.sample_count_per_site
+        }
+        if strata != set(range(bed.sample_count_per_site)) or any(
+            age < 0 or age > bed.maximum_age_days * 24 for age in offsets
+        ):
+            raise ValueError("新版 bed residence age_offsets_hours 分層或範圍不符")
+        audit = sampling_provenance.get("rejection_audit")
+        # input_derivation 可能以 ``{"strata": [...]}`` 保存 dataclass audit 的
+        # 可序列化包裝；其餘欄位不得被默默忽略。loader 先拆開這個固定形狀，後續
+        # 仍以 0..49 rank、selected age 與每列 nested audit exact 驗證。
+        if isinstance(audit, Mapping):
+            if set(audit) != {"strata"}:
+                raise ValueError("新版 bed residence rejection_audit 包裝欄位不符")
+            audit = audit.get("strata")
+        if not isinstance(audit, list) or len(audit) != bed.sample_count_per_site:
+            raise ValueError("新版 bed residence provenance 必須保存每個 stratum 的 rejection audit")
+        for index, item in enumerate(audit):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"新版 bed residence rejection audit[{index}] 必須是 mapping")
+            if item.get("stratum_index") != index or item.get("observation_rank") != index:
+                raise ValueError(f"新版 bed residence rejection audit[{index}] rank 不一致")
+            if item.get("selected_age_hours") != offsets[index]:
+                raise ValueError(f"新版 bed residence rejection audit[{index}] selected age 不一致")
+            provenance_audit_by_stratum[index] = item
+    else:
+        offsets = sample_bed_residence_age_hours(
+            maximum_age_days=bed.maximum_age_days,
+            sample_count=bed.sample_count_per_site,
+            seed=bed.sampling_seed,
+        )
     if len(offsets) != bed.sample_count_per_site:
         raise ValueError("重算的 bed residence age vector 長度與設定不一致")
     age_vector_hash = sha256(
@@ -1140,6 +1215,38 @@ def _validate_bed_residence_arrival_records(
         sampling_provenance.get(field) != expected for field, expected in expected_provenance.items()
     ):
         raise ValueError("arrival provenance 的 bed-residence sampling 不可由設定 seed 重現")
+    provenance_method = sampling_provenance.get("sampling_method_id")
+    if conditioned_sampling and provenance_method != expected_sampling_method:
+        raise ValueError("arrival provenance 的 bed-residence sampling method 不符")
+    if not conditioned_sampling and provenance_method not in {
+        None,
+        BED_RESIDENCE_SAMPLING_METHOD_ID,
+    }:
+        raise ValueError("legacy arrival provenance 的 bed-residence sampling method 不符")
+    if conditioned_sampling:
+        if sampling_provenance.get("availability_conditioning_policy") != (
+            REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+        ):
+            raise ValueError("arrival provenance 缺少新版 bed residence availability policy")
+        # 新版 arrival 的條件式抽樣不只保存演算法，還必須與共同缺口政策及統計
+        # 分母 exact 綁定；缺少任一 binding 都不能把 schema 1.2.0 當正式母體。
+        expected_policy_fields = {
+            "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+            "deposition_availability_policy_id": (
+                REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+            ),
+            "denominator_policy_id": (
+                EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+            ),
+        }
+        for field, expected in expected_policy_fields.items():
+            if sampling_provenance.get(field) != expected:
+                raise ValueError(f"arrival provenance 的新版 policy binding 不符：{field}")
+    elif any(
+        key in sampling_provenance
+        for key in ("availability_conditioning_policy", "age_offsets_hours", "rejection_audit")
+    ):
+        raise ValueError("legacy bed residence provenance 不得帶新版 availability 欄位")
     if provenance.get("method_id") != _BED_RESIDENCE_ARRIVAL_SELECTION_METHOD_ID:
         raise ValueError("arrival provenance 未登錄 bed residence observation selector")
     if sampling_provenance.get("observation_anchor_selection_method_id") != (
@@ -1201,8 +1308,40 @@ def _validate_bed_residence_arrival_records(
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence policy 不符")
         if metadata.get("bed_residence_sampling_policy_id") != BED_RESIDENCE_SAMPLING_POLICY_ID:
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence sampling policy 不符")
-        if metadata.get("bed_residence_sampling_method_id") != BED_RESIDENCE_SAMPLING_METHOD_ID:
+        if metadata.get("bed_residence_sampling_method_id") != expected_sampling_method:
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence sampling method 不符")
+        if conditioned_sampling:
+            if metadata.get("bed_residence_availability_conditioning_policy") != (
+                REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+            ):
+                raise ValueError(
+                    f"arrival[{arrival.arrival_time_id}] 缺少 bed residence availability policy"
+                )
+            row_audit = metadata.get("bed_residence_availability_rejection_audit")
+            if not isinstance(row_audit, Mapping):
+                raise ValueError(
+                    f"arrival[{arrival.arrival_time_id}] 缺少 bed residence rejection audit"
+                )
+            if row_audit.get("selected_age_hours") != age_hours:
+                raise ValueError(
+                    f"arrival[{arrival.arrival_time_id}] rejection audit selected age 不一致"
+                )
+            expected_row_audit = provenance_audit_by_stratum.get(stratum_index)
+            if expected_row_audit is None or dict(row_audit) != dict(expected_row_audit):
+                raise ValueError(
+                    f"arrival[{arrival.arrival_time_id}] rejection audit 與 root provenance 不一致"
+                )
+        elif any(
+            key in metadata
+            for key in (
+                "bed_residence_availability_conditioning_policy",
+                "bed_residence_availability_rejection_audit",
+            )
+        ):
+            raise ValueError(
+                f"arrival[{arrival.arrival_time_id}] legacy metadata 不得帶 "
+                "availability provenance"
+            )
         if sampling_seed != bed.sampling_seed:
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence seed 與 config 不一致")
         if metadata.get("bed_residence_maximum_age_days") != bed.maximum_age_days:
@@ -1327,17 +1466,21 @@ def _validate_bed_residence_arrival_records(
             or arrival.season != _season_for_observation_month(deposition.month)
         ):
             raise ValueError(f"arrival[{arrival.arrival_time_id}] 頂層年份／季節未依 deposition UTC 重算")
-        expected_arrival_id = stable_identifier(
-            "arrival_bed",
-            [
-                observation_id,
-                str(deposition_ns),
-                BED_RESIDENCE_POLICY_ID,
-                BED_RESIDENCE_SAMPLING_POLICY_ID,
-                str(bed.sampling_seed),
-                design_hash,
-            ],
-        )
+        identity_fields = [
+            observation_id,
+            str(deposition_ns),
+            BED_RESIDENCE_POLICY_ID,
+            BED_RESIDENCE_SAMPLING_POLICY_ID,
+        ]
+        if conditioned_sampling:
+            identity_fields.extend(
+                [
+                    expected_sampling_method,
+                    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+                ]
+            )
+        identity_fields.extend([str(bed.sampling_seed), design_hash])
+        expected_arrival_id = stable_identifier("arrival_bed", identity_fields)
         if arrival.arrival_time_id != expected_arrival_id:
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence identity 不可重算")
         per_site[site_id].append((observation_ns, observation_id, age_hours))
@@ -1392,6 +1535,12 @@ def _load_arrival_document(
     document = _document(path)
     payload = document.payload
     bed_residence_enabled = config.scenarios.bed_residence_time is not None
+    bed_gap_censored = bool(
+        bed_residence_enabled
+        and config.scenarios.bed_residence_time is not None
+        and config.scenarios.bed_residence_time.availability_conditioning_policy
+        == REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+    )
     selection_contract = _arrival_selection_contract(config)
     _, _, provenance = _validate_component_root(
         payload,
@@ -1401,7 +1550,9 @@ def _load_arrival_document(
         formal=formal,
         require_coordinate_reference=False,
         expected_schema_version=(
-            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if bed_gap_censored
+            else BED_RESIDENCE_INPUT_SCHEMA_VERSION
             if bed_residence_enabled
             else MANIFEST_SCHEMA_VERSION
         ),
@@ -1437,7 +1588,7 @@ def _load_arrival_document(
         site = _site_reference(row, config, label=label, formal=formal)
         time_ns = _integer(row["time_utc_ns"], f"{label}.time_utc_ns")
         utc = _utc_datetime(time_ns, f"{label}.time_utc_ns")
-        if (site.study_site_id, time_ns) in site_times:
+        if (site.study_site_id, time_ns) in site_times and not bed_gap_censored:
             raise ValueError(f"同一 study_site 的 UTC 必須唯一：{site.study_site_id}/{time_ns}")
         site_times.add((site.study_site_id, time_ns))
         year = _integer(row["year"], f"{label}.year")
@@ -2480,6 +2631,7 @@ def load_boundary_geometries(
 
 __all__ = [
     "BED_RESIDENCE_INPUT_SCHEMA_VERSION",
+    "GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION",
     "BoundaryGeometryBundle",
     "MANIFEST_SCHEMA_VERSION",
     "ScenarioInputs",

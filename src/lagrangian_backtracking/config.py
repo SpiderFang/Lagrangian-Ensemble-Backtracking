@@ -27,6 +27,11 @@ from .bed_residence import (
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
 )
+from .gap_policy import (
+    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
+    OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+)
 
 # 這組名稱取自海洋保育署 iOcean 海洋廢棄物管理頁於 2026-08-27 顯示的查詢類別。
 # 常數只用來驗證臺灣情境的分類追溯是否完整；該網站的清除重量與件數不含單體物性，
@@ -47,14 +52,20 @@ EXPECTED_OCA_CATEGORIES_ZH = frozenset(
 )
 
 # 設計版本是整個設定／manifest／checkpoint 身分的一部分，不能讓不同模組自行拼接
-# 版本字串。新的 CURRENT_DESIGN_VERSION 將「2025 observation、2024–2025 forcing」
-# 的選時母體納入設計身分；前一版 v3/20 km 仍列為 legacy，讓既有 config／manifest
-# 可以載入，但不會被誤認為新 observation population。兩個 v3-family 都必須繼續
-# 使用同一個 A 區 v3/local20 空間政策，不能藉版本切換回 expanded domain。
+# 版本字串。新的 CURRENT_DESIGN_VERSION 同時綁定「2025 observation、2024–2025
+# forcing」與「遇第一個已知缺口即截尾」母體政策；前一版 observation-2025 保留為
+# 唯讀 legacy，較早的 v3/20 km 與 v2 也只能載入其既有 artifact。所有 v3-family
+# 都必須繼續使用同一個 A 區 v3/local20 空間政策，不能藉版本切換回 expanded domain。
 LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909 = (
     "design_baseline_v3_non_rising_a_v3_local20_20260909"
 )
 CURRENT_DESIGN_VERSION = (
+    "design_baseline_v3_non_rising_a_v3_local20_observation_2025_gap_censored_20260916"
+)
+# 舊版已選 observation-2025、但尚未把已知 OCM 缺口正式納入母體政策；它只能讀取
+# 舊 artifact，不得被當成新版「遇第一個缺口截尾」的正式設計。保留 exact 字串是為
+# 了讓既有 manifest／config 可唯讀稽核，不讓新版 loader 以模糊前綴接受它。
+LEGACY_DESIGN_VERSION_OBSERVATION_2025 = (
     "design_baseline_v3_non_rising_a_v3_local20_observation_2025_20260916"
 )
 LEGACY_DESIGN_VERSION_V2 = "design_baseline_v2_non_rising_oca_proxy"
@@ -358,6 +369,12 @@ class BedResidenceTimeConfig(StrictModel):
     maximum_age_days: StrictInt
     sample_count_per_site: StrictInt
     sampling_policy: Literal["discrete_hourly_stratified_uniform_v1"]
+    # 新版缺口條件式母體要求每一分層只接受五站均有 exact deposition hour 的
+    # 年齡；欄位 optional 是為了載入舊 1.1.0 artifact，normalized_payload 會保留
+    # 舊 hash。新版 CURRENT_DESIGN_VERSION 則在 ProjectConfig 層強制明示 exact ID。
+    availability_conditioning_policy: Literal[
+        "reject_unavailable_deposition_hour_within_stratum_v1"
+    ] | None = None
     sampling_seed: StrictInt
     shared_age_offsets_across_sites: StrictBool
     pre_window_policy: Literal[
@@ -394,6 +411,13 @@ class BedResidenceTimeConfig(StrictModel):
         if self.sampling_policy != BED_RESIDENCE_SAMPLING_POLICY_ID:
             raise ValueError(
                 "scenarios.bed_residence_time.sampling_policy 不支援；不得靜默採用其他算法"
+            )
+        if self.availability_conditioning_policy not in {
+            None,
+            REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+        }:
+            raise ValueError(
+                "scenarios.bed_residence_time.availability_conditioning_policy 不支援"
             )
         if self.sampling_seed < 0:
             raise ValueError(
@@ -691,6 +715,7 @@ class ProjectConfig(StrictModel):
             raise ValueError("foreign-local crossing 不得改變 study_site_id")
         self.assert_research_domain_policy()
         self._validate_arrival_time_selection_contract()
+        self._validate_gap_censoring_contract()
         return self
 
     def _validate_arrival_time_selection_contract(self) -> None:
@@ -723,9 +748,12 @@ class ProjectConfig(StrictModel):
                     "arrival_time_selection.observation_years 必須是 inputs.years 的子集"
                 )
         if selection.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1:
-            if self.design_version != CURRENT_DESIGN_VERSION:
+            if self.design_version not in {
+                CURRENT_DESIGN_VERSION,
+                LEGACY_DESIGN_VERSION_OBSERVATION_2025,
+            }:
                 raise ValueError(
-                    "新版 observation arrival policy 必須搭配目前 CURRENT_DESIGN_VERSION"
+                    "新版 observation arrival policy 必須搭配目前 gap-censored design 或其唯讀 legacy"
                 )
             if observation_years is None or not observation_years:
                 raise ValueError("新版 observation arrival policy 必須有 observation_years")
@@ -734,6 +762,64 @@ class ProjectConfig(StrictModel):
                 f"{CURRENT_DESIGN_VERSION} 必須使用 "
                 f"{ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1}"
             )
+
+    def _validate_gap_censoring_contract(self) -> None:
+        """驗證新版母體確實把已知 OCM 缺口當成可稽核的截尾政策。
+
+        新版不宣稱 2024--2025 forcing 已連續，也不要求輸入建置把缺口補齊；它只
+        要求設定把「遇第一個缺口停止」、「統計分母如何處理截尾成員」與沉底起點
+        exact-hour 可用性條件寫入 canonical config。舊 observation-2025 config
+        可以唯讀載入而不補寫欄位，但一旦宣稱新 design，三者缺一即在任何大型輸入
+        I/O 前 fail closed。
+        """
+
+        time_contract = self.inputs.time_axis_contract
+        if not isinstance(time_contract, dict):
+            raise ValueError("inputs.time_axis_contract 必須是 mapping")
+        if self.design_version == CURRENT_DESIGN_VERSION:
+            if time_contract.get("gap_policy") != OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID:
+                raise ValueError(
+                    f"{CURRENT_DESIGN_VERSION} 必須明示 inputs.time_axis_contract.gap_policy="
+                    f"{OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID}"
+                )
+            if time_contract.get("stop_at_first_gap") is not True:
+                raise ValueError(
+                    f"{CURRENT_DESIGN_VERSION} 必須明示 inputs.time_axis_contract.stop_at_first_gap=true"
+                )
+            if (
+                time_contract.get("denominator_policy")
+                != EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+            ):
+                raise ValueError(
+                    f"{CURRENT_DESIGN_VERSION} 必須明示 inputs.time_axis_contract.denominator_policy="
+                    f"{EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID}"
+                )
+            if self.boundaries.stop_at_data_gap is not True:
+                raise ValueError(
+                    f"{CURRENT_DESIGN_VERSION} 必須設定 boundaries.stop_at_data_gap=true"
+                )
+            bed = self.scenarios.bed_residence_time
+            if bed is not None and bed.availability_conditioning_policy != (
+                REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+            ):
+                raise ValueError(
+                    f"{CURRENT_DESIGN_VERSION} 必須明示 scenarios.bed_residence_time."
+                    "availability_conditioning_policy="
+                    f"{REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID}"
+                )
+            return
+
+        # 舊版本只能以舊 contract 載入。若有人把新政策欄位塞進舊 design，拒絕
+        # 「舊 hash + 新語意」的混合 artifact，而不是替它自動升版。
+        if self.design_version == LEGACY_DESIGN_VERSION_OBSERVATION_2025:
+            if any(
+                time_contract.get(field) is not None
+                for field in ("gap_policy", "stop_at_first_gap", "denominator_policy")
+            ):
+                raise ValueError("唯讀 observation-2025 legacy 不得宣稱新版 gap-censored policy")
+            bed = self.scenarios.bed_residence_time
+            if bed is not None and bed.availability_conditioning_policy is not None:
+                raise ValueError("唯讀 observation-2025 legacy 不得宣稱新版沉底可用性條件")
 
     @property
     def effective_backtrack_support_days(self) -> int | None:
@@ -823,10 +909,14 @@ class ProjectConfig(StrictModel):
                     f"{CURRENT_DESIGN_VERSION} 必須明示 A 區 formal_domain_policy="
                     f"{FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1}"
                 )
-        elif self.design_version == LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909:
+        elif self.design_version in {
+            LEGACY_DESIGN_VERSION_OBSERVATION_2025,
+            LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909,
+        }:
             if region_a_policy != FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
                 raise ValueError(
-                    f"舊 v3 design 必須搭配 A 區 {FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1}"
+                    "v3-family legacy design 必須搭配 A 區 "
+                    f"{FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1}"
                 )
         elif region_a_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
             raise ValueError(
@@ -834,9 +924,10 @@ class ProjectConfig(StrictModel):
             )
         elif self.design_version != LEGACY_DESIGN_VERSION_V2:
             raise ValueError(
-                "design_version 必須是目前 CURRENT_DESIGN_VERSION 或已登錄的 v3/v2 legacy："
-                f"{CURRENT_DESIGN_VERSION}、{LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909}、"
-                f"{LEGACY_DESIGN_VERSION_V2}"
+                "design_version 必須是目前 gap-censored CURRENT_DESIGN_VERSION 或已登錄的 "
+                f"observation/v3/v2 legacy：{CURRENT_DESIGN_VERSION}、"
+                f"{LEGACY_DESIGN_VERSION_OBSERVATION_2025}、"
+                f"{LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909}、{LEGACY_DESIGN_VERSION_V2}"
             )
 
         allowed_policies = {
@@ -1006,6 +1097,20 @@ class ProjectConfig(StrictModel):
             # 不能改變舊設定的 canonical config hash 或 checkpoint identity。只有 YAML
             # 明示此區塊時才將其納入 payload；明示 null 則仍保留 operator 的停用意圖。
             del scenarios_payload["bed_residence_time"]
+        elif isinstance(scenarios_payload, dict) and isinstance(
+            scenarios_payload.get("bed_residence_time"), dict
+        ):
+            # availability_conditioning_policy 是為缺口條件式抽樣新增的 optional
+            # 欄位。舊 1.1.0 YAML 沒有它時，Pydantic 的 None default 不可改變既有
+            # config hash；只有來源 YAML 明示欄位（包括明示 null）才進 canonical。
+            bed_payload = scenarios_payload["bed_residence_time"]
+            bed_model = self.scenarios.bed_residence_time
+            if (
+                bed_model is not None
+                and "availability_conditioning_policy" in bed_payload
+                and "availability_conditioning_policy" not in bed_model.model_fields_set
+            ):
+                del bed_payload["availability_conditioning_policy"]
         selection_payload = payload.get("arrival_time_selection")
         if selection_payload is None and "arrival_time_selection" not in self.model_fields_set:
             # 舊 YAML 根本沒有 typed selection block 時，Pydantic 的 None default

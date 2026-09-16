@@ -47,7 +47,7 @@ byte size。`artifact_index.json` 綁定十個 component，`artifact_bindings.js
 | kind | 檔名 | 主要內容 |
 |---|---|---|
 | `forcing_inventory` | `forcing_inventory.json` | 四域各自 OCM native／OCM surface／NWW3 月份、schema、時間軸、source files、metadata provenance 與 structural fingerprint |
-| `ocm_gap_safe_arrival_horizon` | `ocm_gap_safe_arrival.json` | 每個 arrival 的回溯支援窗、缺時與跨缺口判定；舊政策為 7 日，新政策依設定的正整日上限 |
+| `ocm_gap_safe_arrival_horizon` | `ocm_gap_safe_arrival.json` | legacy gap-safe 或 `observed_gap_censored_stop_at_first_gap_v1` 的逐 arrival 缺時／第一缺口截尾 evidence；檔名保留相容性，不代表新版要求連續 coverage |
 | `nww_full_hourly` | `nww_full_hourly.json` | 四域 NWW3 完整逐時 UTC 與 grid binding |
 | `domain_geometry` | `domain.json` | 四個 flow-domain 外層幾何 |
 | `local_geometry` | `local.json` | 五個 study-site local domain |
@@ -63,12 +63,16 @@ byte size。`artifact_index.json` 綁定十個 component，`artifact_bindings.js
 prefer-last，並保存原始／canonical 計數與 gap 描述。正式研究期間為 2024-01-01
 00:00 UTC 至 2025-12-31 23:00 UTC，共 17,544 個逐時步。
 
-OCM gap 不可用最近值或零值穿越。每一個候選 arrival 都必須檢查 inclusive
-`[arrival - support days, arrival]` 的每個整點是否存在（舊政策為 7 日）；缺任何一點就將 `crossed_gap` 設為
-true，正式 validator 拒絕該目錄。只有已通過版本化重建與 blocked cross-validation 的
-manifest，或逐 arrival 均 gap-safe 的 arrival/horizon manifest，才能成為正式 release
-輸入。NWW3 完整逐時 analysis 不沿用 OCM 的缺時軸，也不進行統計填補；四域均須證明
-17,544 小時才可將 `nww_full_hourly` 標為 `approved`。
+OCM gap 不可用最近值、零值或未登錄外插穿越。legacy config 仍要求每一個候選 arrival
+的 inclusive `[arrival - support days, arrival]` 每個整點存在；缺任何一點即拒絕。新版
+bed-residence 母體若明示 `observed_gap_censored_stop_at_first_gap_v1`、
+`reject_unavailable_deposition_hour_within_stratum_v1`、
+`exclude_data_gap_numerical_failure_and_pre_window_deposition_v1` 且
+`boundaries.stop_at_data_gap=true`，則只要求 observation／deposition 起點 exact UTC
+可用；長窗的缺時完整列舉，runtime 遇第一個向後缺口即產生 `data_gap` 並截尾。新版
+manifest 的 `approved` 表示缺口、第一缺口與分母契約可重算且可執行，不表示連續 coverage。
+NWW3 完整逐時 analysis 不沿用 OCM 的缺時軸，也不進行統計填補；四域均須證明 17,544
+小時才可將 `nww_full_hourly` 標為 `approved`。
 
 NWW 月份 metadata 的 allowlist 同時保留既有
 `ocm_analysis_grid_resample_from_nww3_native`，並接受目前 SERVER 使用的
@@ -111,26 +115,39 @@ UTC、年齡、stratum、sampling method／seed／policy 與原 observation iden
 重建原有 48+2 formal strata。沉底轉換發生在 A 區 paired UTC 完成後、受體及 dynamic pair 建立前，
 因此 receptor 與 OCM／NWW dynamic initial condition 都以 deposition UTC 為起點。
 
-為區隔欄位集合，bed-residence arrival 與 gap-horizon manifest、bed release 的
-`release_binding.schema_version` 及 bed suite 的 `source_schema_version` 固定為 `1.1.0`；舊
-generic arrival/gap/release binding 與非沉底 suite 維持 `1.0.0`。loader 不接受跨模式版本；其他
-schema 未改變的 component、`artifact_index.json` 與 `artifact_bindings.json` 仍為 `1.0.0`，不因
-沉底功能一併升版。
+新版可用性條件式抽樣由 `sample_bed_residence_age_hours_conditioned_on_availability`
+執行：五站先按 observation UTC／arrival ID 排序形成共同 rank，再在每個 age stratum
+逐一拒絕任何一站 deposition exact-hour 不在 canonical available-time set 的候選。每個
+拒絕候選、缺時站點、選定 age 與 age-vector hash 都保存於 arrival provenance；不使用
+nearest、linear、zero fill 或跨 gap 外插。`data_gap`、`numerical_failure`、
+`pre_window_deposition` 依 `exclude_data_gap_numerical_failure_and_pre_window_deposition_v1`
+自總母體暴露率與條件式來源足跡分開統計，不把截尾成員當作沒有邊界進入。
+
+為區隔欄位集合，既有 observation-2025 bed-residence arrival／gap-horizon manifest 與 bed
+release 的 `release_binding.schema_version` 使用 `1.1.0`；新版 gap-censored bed 母體使用
+schema `1.2.0`，並
+在 root／record 保存第一缺口與分母欄位。舊 generic arrival/gap/release binding 與非沉底 suite
+維持 `1.0.0`。loader 不接受跨模式版本；其他 schema 未改變的 component、`artifact_index.json`
+與 `artifact_bindings.json` 不因沉底功能一併升版。
 
 H30/H60/H90 共用的兩種時間支援不可混為一談：
 
 - `inputs.backtrack_support_days: 180` 是 **selection envelope**，即最大 runtime H90 加最大沉底年齡 90 日。
-  observation anchor 必須以 `[observation - 180 日, observation]` inclusive 逐時節點通過選時與 gap gate。
+  legacy policy 要求 `[observation - 180 日, observation]` inclusive 逐時節點完整；本期
+  gap-censored policy 只要求 observation anchor 本身可用，並對同一包絡完整列舉缺時及第一缺口。
 - `scenarios.bed_residence_time.runtime_horizon_support_days: 90` 是 **per-deposition runtime support**。
-  沉底轉換後，generic gap artifact 對每個 deposition UTC 逐筆驗證 `[deposition - 90 日, deposition]`；
-  artifact root 的 `max_backtrack_days`／`support_days` 應為 90，而非 180。selection 與 runtime 數值及
-  每筆 evidence 必須分別保存、重算及 fail closed。
+  沉底轉換後，gap artifact 對每個 deposition UTC 逐筆保存 `[deposition - 90 日, deposition]`；
+  artifact root 的 `max_backtrack_days`／`support_days` 應為 90，而非 180。legacy policy 要求
+  selection 與 runtime 逐時完整，gap-censored policy 則保存完整缺時清單、第一個向後缺口與
+  起點連續支援時數；兩者的 selection/runtime 數值及每筆 evidence 都必須分別重算。
 
 `--backtrack-days` 接受任意數量的正整日。當輸入 30、60、90 時，suite 以 Hmax=90 建立
 `common-config`，將 selection support 設為 `90 + 90 = 180`、runtime support 及共同
 `boundaries.max_backtrack_days` 設為 90，然後對 caller 提供的同一組 accepted roots **只執行一次**
-`inputs-build`。selection window 或任一 deposition runtime window 缺少逐時節點時 strict build／validator
-必須拒絕，不能用較短 horizon、零值、最近值、跨缺口內插或未登錄外插繞過。
+`inputs-build`。legacy suite 的 selection window 或 deposition runtime window 缺少逐時節點時 strict
+build／validator 仍必須拒絕；新版 gap-censored suite 會保留相同缺時清單，將 `censoring_required=true`、
+第一個向後缺口與起點連續可追時數寫入 evidence。只有 deposition exact-hour 起點缺資料或 policy
+不完整才拒絕，不能用零值、最近值、跨缺口內插或未登錄外插繞過。
 
 兩個 `backtrack_mode` 均由正式範例明確登錄，release 時只切換該欄位：
 
@@ -217,8 +234,9 @@ uv run lbt horizon-suite-validate \
 因此不把 2024 早季當作 observation strata，也不需另補 2023 forcing。`configs/lagrangian_backtracking.example.yaml`
 仍是 `design_pending` template，不是 approved release；180/90 是待驗支援契約，不代表目前
 accepted forcing 已通過或已執行 SERVER/input-build。若 2024-07-05 前的實際 accepted product
-仍有缺時，strict preflight/build 必須拒絕，不能以最近值、零值或未登錄外插補足。正式運算前須由
-forcing inventory 與 gap-safe evidence 證明這段支援確實存在。
+仍有缺時，legacy strict preflight/build 必須拒絕；新版 gap-censored build 則由 forcing inventory
+與 gap-censored evidence 列舉缺口、確認起點 exact-hour 可用並固定第一缺口截尾。兩者都不能以最近值、
+零值或未登錄外插補足；新版不宣稱每粒子具有連續完整軌跡。
 
 ## 4. 幾何、受體與 arrival
 

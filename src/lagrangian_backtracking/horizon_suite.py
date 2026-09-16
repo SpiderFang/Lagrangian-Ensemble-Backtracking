@@ -37,7 +37,10 @@ from .bed_residence import (
 from .config import ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1, ProjectConfig
 from .input_derivation import (
     ARTIFACT_FILENAMES,
+    DENOMINATOR_POLICY_ID,
+    DEPOSITION_AVAILABILITY_POLICY_ID,
     DERIVED_INPUT_SCHEMA_VERSION,
+    OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
     _assert_no_symlink_components,
     _assert_regular_directory,
     _assert_regular_file,
@@ -50,7 +53,10 @@ from .input_derivation import (
     validate_release_config,
     write_canonical_json,
 )
-from .input_horizon import BED_RESIDENCE_INPUT_SCHEMA_VERSION
+from .input_horizon import (
+    BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+)
 from .report_release import _call_exclusive_rename, _load_exclusive_rename_backend
 
 HORIZON_SUITE_SCHEMA_VERSION = "1.1.0"
@@ -207,12 +213,104 @@ _BED_RELEASE_HORIZON_BINDING_KEYS = _RELEASE_HORIZON_BINDING_KEYS | frozenset(
         "backtrack_mode",
     }
 )
+
+_GAP_CENSOR_RELEASE_BINDING_KEYS = frozenset(
+    {
+        "gap_policy_id",
+        "deposition_availability_policy_id",
+        "denominator_policy_id",
+    }
+)
+_GAP_CENSOR_SUITE_MANIFEST_KEYS = frozenset(
+    {
+        "gap_policy_id",
+        "deposition_availability_policy_id",
+        "denominator_policy_id",
+    }
+)
 """隨機沉底設計將選時包絡與沉底後 runtime 支援分開綁定。"""
 
 _BED_RESIDENCE_MODES = (
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
 )
+
+
+def _payload_gap_censoring_enabled(payload: Mapping[str, Any]) -> bool:
+    """判定 suite source/common/release YAML 是否完整明示缺時截尾契約。
+
+    suite 必須把政策寫入每一份 release binding；這裡只接受 bed-residence block、
+    三個 exact policy ID 與 ``stop_at_data_gap=true``，legacy template 不會因 suite
+    validator 的預設值而被重新解讀。
+    """
+
+    inputs = payload.get("inputs")
+    boundaries = payload.get("boundaries")
+    scenarios = payload.get("scenarios")
+    bed = scenarios.get("bed_residence_time") if isinstance(scenarios, Mapping) else None
+    time_contract = (
+        inputs.get("time_axis_contract")
+        if isinstance(inputs, Mapping)
+        else None
+    )
+    # canonical gap policy 位於 inputs.time_axis_contract；為了讓 validator 能讀取
+    # 尚未正規化的 YAML 與已產出的 release，仍接受過渡期把同一欄位放在 root／inputs
+    # 的 alias。這些 mapping 只作 exact policy 比對，不會由 validator 自行推導缺時策略。
+    sections = [payload, inputs, time_contract, boundaries, scenarios, bed]
+
+    def read(name: str) -> Any:
+        values = [
+            section.get(name)
+            for section in sections
+            if isinstance(section, Mapping) and name in section
+        ]
+        if not values:
+            return None
+        if len({json.dumps(value, sort_keys=True, ensure_ascii=False) for value in values}) != 1:
+            raise HorizonSuiteError(f"suite 缺時 policy 欄位 {name} 宣告衝突")
+        return values[0]
+
+    gap_value = next(
+        (
+            read(name)
+            for name in ("gap_policy", "ocm_gap_policy", "time_gap_policy", "data_gap_policy")
+            if read(name) is not None
+        ),
+        None,
+    )
+    deposition_value = next(
+        (
+            read(name)
+            for name in (
+                "deposition_availability_policy",
+                "deposition_policy",
+                "availability_conditioning_policy",
+            )
+            if read(name) is not None
+        ),
+        None,
+    )
+    denominator_value = read("denominator_policy")
+    return (
+        isinstance(bed, Mapping)
+        and gap_value == OBSERVED_GAP_CENSORED_STOP_POLICY_ID
+        and deposition_value == DEPOSITION_AVAILABILITY_POLICY_ID
+        and denominator_value == DENOMINATOR_POLICY_ID
+        and isinstance(boundaries, Mapping)
+        and boundaries.get("stop_at_data_gap") is True
+    )
+
+
+def _payload_gap_censoring_contract(payload: Mapping[str, Any]) -> dict[str, str] | None:
+    """回傳 suite manifest 要保存的 exact policy snapshot，未知設定回傳 None。"""
+
+    if not _payload_gap_censoring_enabled(payload):
+        return None
+    return {
+        "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+        "deposition_availability_policy_id": DEPOSITION_AVAILABILITY_POLICY_ID,
+        "denominator_policy_id": DENOMINATOR_POLICY_ID,
+    }
 
 
 def _arrival_population_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -840,8 +938,16 @@ def _release_records(payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]
     """
 
     binding = payload.get("release_binding")
-    if not isinstance(binding, Mapping) or set(binding) != _RELEASE_BINDING_KEYS:
+    gap_contract = _payload_gap_censoring_contract(payload)
+    expected_binding_keys = _RELEASE_BINDING_KEYS | (
+        _GAP_CENSOR_RELEASE_BINDING_KEYS if gap_contract is not None else frozenset()
+    )
+    if not isinstance(binding, Mapping) or set(binding) != expected_binding_keys:
         raise HorizonSuiteError("release_binding 欄位集合不符")
+    if gap_contract is not None and any(
+        binding.get(field) != expected for field, expected in gap_contract.items()
+    ):
+        raise HorizonSuiteError("release_binding 缺時截尾 policy 不一致")
     arrival_binding = binding.get("arrival_selection_binding")
     if (
         not isinstance(arrival_binding, Mapping)
@@ -1354,10 +1460,20 @@ def _validate_release_registered_metadata(
     binding = payload.get("release_binding")
     if not isinstance(binding, Mapping):
         return ["release_binding_missing"]
-    if set(binding) != _RELEASE_BINDING_KEYS:
+    gap_contract = _payload_gap_censoring_contract(payload)
+    expected_release_binding_keys = _RELEASE_BINDING_KEYS | (
+        _GAP_CENSOR_RELEASE_BINDING_KEYS if gap_contract is not None else frozenset()
+    )
+    if set(binding) != expected_release_binding_keys:
         errors.append(f"release_binding_keys_invalid:{days}")
+    if gap_contract is not None:
+        for field, expected in gap_contract.items():
+            if binding.get(field) != expected:
+                errors.append(f"release_gap_policy_binding_invalid:{days}:{field}")
     expected_binding_schema_version = (
-        BED_RESIDENCE_INPUT_SCHEMA_VERSION
+        GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+        if backtrack_mode is not None and gap_contract is not None
+        else BED_RESIDENCE_INPUT_SCHEMA_VERSION
         if backtrack_mode is not None
         else DERIVED_INPUT_SCHEMA_VERSION
     )
@@ -1469,7 +1585,11 @@ def _validate_suite_contents(
     """重新計算所有 suite fingerprint 與 downstream gate，任何例外均轉成 errors。"""
 
     errors: list[str] = []
-    if set(manifest) != _SUITE_MANIFEST_KEYS:
+    manifest_gap_keys_present = _GAP_CENSOR_SUITE_MANIFEST_KEYS.issubset(set(manifest))
+    if set(manifest) not in (
+        _SUITE_MANIFEST_KEYS,
+        _SUITE_MANIFEST_KEYS | _GAP_CENSOR_SUITE_MANIFEST_KEYS,
+    ):
         errors.append("manifest_key_set_invalid")
     try:
         horizons = normalize_horizons(manifest.get("horizons_days"))
@@ -1555,6 +1675,14 @@ def _validate_suite_contents(
         if common_payload != expected_common:
             errors.append("common_config_derived_payload_mismatch")
         population_contract = _arrival_population_contract(common_payload)
+        gap_contract = _payload_gap_censoring_contract(common_payload)
+        if (gap_contract is not None) != manifest_gap_keys_present:
+            # legacy 必須完全沒有新 policy keys；新 suite 必須完整保存三個 exact ID。
+            errors.append("manifest_gap_censoring_policy_presence_mismatch")
+        elif gap_contract is not None:
+            for field, expected in gap_contract.items():
+                if manifest.get(field) != expected:
+                    errors.append(f"manifest_gap_censoring_policy_mismatch:{field}")
         for field in (
             "forcing_years",
             "observation_years",
@@ -1569,7 +1697,9 @@ def _validate_suite_contents(
             common_payload, maximum_horizon
         )
         expected_source_schema_version = (
-            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if expected_modes and gap_contract is not None
+            else BED_RESIDENCE_INPUT_SCHEMA_VERSION
             if expected_modes
             else DERIVED_INPUT_SCHEMA_VERSION
         )
@@ -2178,7 +2308,9 @@ def build_horizon_suite(
             "manifest_kind": "horizon_suite_manifest",
             "schema_version": HORIZON_SUITE_SCHEMA_VERSION,
             "source_schema_version": (
-                BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                if backtrack_modes and _payload_gap_censoring_contract(common_payload) is not None
+                else BED_RESIDENCE_INPUT_SCHEMA_VERSION
                 if backtrack_modes
                 else DERIVED_INPUT_SCHEMA_VERSION
             ),
@@ -2212,6 +2344,11 @@ def build_horizon_suite(
             "paths": _expected_suite_paths(),
             "input_build_count": 1,
         }
+        gap_contract = _payload_gap_censoring_contract(common_payload)
+        if gap_contract is not None:
+            # 六份 release 共用同一份 gap-censored common input；policy snapshot 放在
+            # suite root，讓後續 validator 不必從任一 release 猜測科學分母語意。
+            manifest.update(gap_contract)
         manifest_path = partial / HORIZON_SUITE_MANIFEST_FILENAME
         write_canonical_json(manifest_path, manifest)
         validation = validate_horizon_suite(

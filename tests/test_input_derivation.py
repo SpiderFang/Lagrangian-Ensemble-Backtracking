@@ -385,6 +385,14 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
     # 新欄位，避免把原本只涵蓋 2024–2025 的 synthetic source 假裝成通過新 180 日 gate。
     payload["scenarios"].pop("bed_residence_time", None)
     payload["inputs"].pop("backtrack_support_days", None)
+    # example template 的新版 gap-censored policy 只適用 bed-residence suite；這組
+    # fixture 明確測 legacy generic selector，因此移除整組 policy，避免測試資料落入
+    # 「已明示但不完整」的 fail-closed 分支。
+    time_axis_contract = payload["inputs"].get("time_axis_contract")
+    if isinstance(time_axis_contract, dict):
+        for field in ("gap_policy", "stop_at_first_gap", "denominator_policy"):
+            time_axis_contract.pop(field, None)
+    payload["boundaries"].pop("stop_at_data_gap", None)
     # 新正式範例的 observation-year policy 不屬於本 fixture 的 legacy 兩年份測試；
     # 移除新版三個欄位後，ProjectConfig 應保留舊 selector／hash 語意。
     payload["arrival_time_selection"].pop("policy", None)

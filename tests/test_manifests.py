@@ -16,19 +16,25 @@ from shapely.geometry import LineString, box, mapping
 
 from lagrangian_backtracking.arrival_times import select_arrival_times
 from lagrangian_backtracking.bed_residence import (
+    BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
     BED_RESIDENCE_POLICY_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
     apply_bed_residence_sampling,
-    sample_bed_residence_age_hours,
+    sample_bed_residence_age_hours_conditioned_on_availability,
 )
 from lagrangian_backtracking.config import (
     ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
     ProjectConfig,
     resolve_flow_domain_id,
 )
-from lagrangian_backtracking.input_horizon import BED_RESIDENCE_INPUT_SCHEMA_VERSION
+from lagrangian_backtracking.gap_policy import (
+    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
+    GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+)
 from lagrangian_backtracking.manifests import (
     load_arrival_time_manifest,
     load_boundary_geometries,
@@ -341,11 +347,59 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
 
     bed = config.scenarios.bed_residence_time
     assert bed is not None
-    offsets = sample_bed_residence_age_hours(
+    # 新版條件式 sampler 的 synthetic available-time set 包含每個 observation rank
+    # 的全部候選 deposition hour；因此測試可驗證新版 method／audit／schema，而不把
+    # 真實 OCM forcing 讀入 manifest 單元測試。
+    hour_ns = 3_600_000_000_000
+    ordered_observations = {
+        site_id: tuple(
+            sorted(records, key=lambda item: (item.time_utc_ns, item.arrival_time_id))
+        )
+        for site_id, records in observations_by_site.items()
+    }
+    total_hours = bed.maximum_age_days * 24 + 1
+    allowed_age_by_rank: list[int] = []
+    used_deposition_by_site: dict[str, set[int]] = {
+        site_id: set() for site_id in observations_by_site
+    }
+    # 只為 synthetic fixture 選一個每層可用且跨 rank 不碰撞的候選；真實 input-build
+    # 會直接把 canonical available-time set 交給同一個 sampler，這裡不改變其算法。
+    for rank in range(bed.sample_count_per_site):
+        start = rank * total_hours // bed.sample_count_per_site
+        stop = (rank + 1) * total_hours // bed.sample_count_per_site
+        for age in range(start, stop):
+            deposition_by_site = {
+                site_id: ordered_observations[site_id][rank].time_utc_ns - age * hour_ns
+                for site_id in observations_by_site
+            }
+            if all(
+                deposition_by_site[site_id] not in used_deposition_by_site[site_id]
+                for site_id in observations_by_site
+            ):
+                allowed_age_by_rank.append(age)
+                for site_id, deposition_ns in deposition_by_site.items():
+                    used_deposition_by_site[site_id].add(deposition_ns)
+                break
+        else:
+            raise AssertionError(f"synthetic stratum {rank} 無法建立唯一 deposition")
+    available_by_site = {
+        site_id: {
+            ordered_observations[site_id][rank].time_utc_ns - allowed_age_by_rank[rank] * hour_ns
+            for rank in range(bed.sample_count_per_site)
+        }
+        for site_id in observations_by_site
+    }
+    conditioned = sample_bed_residence_age_hours_conditioned_on_availability(
+        observation_times_by_site={
+            site_id: tuple(item.time_utc_ns for item in records)
+            for site_id, records in observations_by_site.items()
+        },
+        available_time_ns_by_site=available_by_site,
         maximum_age_days=bed.maximum_age_days,
         sample_count=bed.sample_count_per_site,
         seed=bed.sampling_seed,
     )
+    offsets = conditioned.age_hours
     deposition_records = [
         asdict(arrival)
         for site_id in sorted(observations_by_site)
@@ -355,6 +409,9 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
             sampling_seed=bed.sampling_seed,
             maximum_age_days=bed.maximum_age_days,
             design_version=design_version,
+            sampling_method_id=conditioned.sampling_method_id,
+            availability_conditioning_policy=conditioned.availability_conditioning_policy,
+            availability_rejection_audit=conditioned.rejection_audit,
         )
     ]
     age_vector_hash = sha256(
@@ -362,7 +419,7 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
     ).hexdigest()
     return {
         "manifest_kind": "arrival_time_manifest",
-        "schema_version": BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+        "schema_version": GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
         "status": "approved",
         "design_version": design_version,
         "time_standard": "UTC",
@@ -383,6 +440,17 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
                 "sampling_seed": bed.sampling_seed,
                 "shared_age_offsets_across_sites": True,
                 "age_offsets_hours_sha256": age_vector_hash,
+                "sampling_method_id": BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
+                "availability_conditioning_policy": conditioned.availability_conditioning_policy,
+                "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+                "deposition_availability_policy_id": (
+                    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+                ),
+                "denominator_policy_id": (
+                    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+                ),
+                "age_offsets_hours": list(offsets),
+                "rejection_audit": [item.as_metadata() for item in conditioned.rejection_audit],
                 "selection_support_days": 180,
                 "runtime_support_days": 90,
                 "pre_window_policy": bed.pre_window_policy,
@@ -737,6 +805,9 @@ def test_bed_residence_formal_loader_recomputes_shared_age_vector_and_paired_a_i
     _write_json(path, payload)
 
     loaded = load_arrival_time_manifest(path, config, formal=True)
+    expected_offsets = tuple(
+        payload["provenance"]["bed_residence_sampling"]["age_offsets_hours"]
+    )
     assert len(loaded) == 250
     assert {
         datetime.fromtimestamp(
@@ -762,13 +833,7 @@ def test_bed_residence_formal_loader_recomputes_shared_age_vector_and_paired_a_i
                 item.metadata["observation_arrival_time_id"],
             ),
         )
-        assert tuple(item.metadata["bed_residence_age_hours"] for item in ordered) == (
-            sample_bed_residence_age_hours(
-                maximum_age_days=90,
-                sample_count=50,
-                seed=20260916,
-            )
-        )
+        assert tuple(item.metadata["bed_residence_age_hours"] for item in ordered) == expected_offsets
     guishan_events = [
         arrival
         for arrival in loaded

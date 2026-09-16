@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from lagrangian_backtracking.bed_residence import (
+    BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
     BED_RESIDENCE_POLICY_ID,
@@ -15,6 +16,10 @@ from lagrangian_backtracking.bed_residence import (
     apply_bed_residence_sampling,
     resolve_bed_residence_timing,
     sample_bed_residence_age_hours,
+    sample_bed_residence_age_hours_conditioned_on_availability,
+)
+from lagrangian_backtracking.gap_policy import (
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
 )
 from lagrangian_backtracking.scenarios import ArrivalTime
 
@@ -156,6 +161,69 @@ def test_age_sampler_is_reproducible_unique_and_stratified_for_all_sites() -> No
         key.replace("guishan", "gongliao"): value
         for key, value in age_by_anchor_b.items()
     }
+
+
+def test_gap_aware_age_sampler_rejects_unavailable_candidates_and_audits_each_stratum() -> None:
+    """新版抽樣只接受五站 exact-hour 共同可用候選，且逐層保存拒絕稽核。"""
+
+    base_ns = int(datetime(2025, 10, 31, tzinfo=UTC).timestamp()) * 1_000_000_000
+    observation_times = {
+        site_id: tuple(base_ns + rank * 500 * _HOUR_NS for rank in range(_SAMPLE_COUNT))
+        for site_id in ("gongliao", "guishan", "hsinchu", "houwan", "lienchiang")
+    }
+    total_hours = _MAX_AGE_DAYS * 24 + 1
+    allowed_by_stratum = {
+        index: index * total_hours // _SAMPLE_COUNT
+        for index in range(_SAMPLE_COUNT)
+    }
+    available = {
+        site_id: {
+            observation_ns - allowed_by_stratum[stratum] * _HOUR_NS
+            for stratum, observation_ns in enumerate(observation_times[site_id])
+        }
+        for site_id in observation_times
+    }
+    sampled = sample_bed_residence_age_hours_conditioned_on_availability(
+        observation_times_by_site=observation_times,
+        available_time_ns_by_site=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        sample_count=_SAMPLE_COUNT,
+        seed=_SEED,
+    )
+    assert sampled.sampling_method_id == BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID
+    assert sampled.availability_conditioning_policy == (
+        REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+    )
+    assert len(sampled.age_hours) == len(sampled.rejection_audit) == _SAMPLE_COUNT
+    assert tuple(item.selected_age_hours for item in sampled.rejection_audit) == sampled.age_hours
+    assert all(item.observation_rank == item.stratum_index for item in sampled.rejection_audit)
+    assert any(item.rejected_age_hours for item in sampled.rejection_audit)
+    assert sampled == sample_bed_residence_age_hours_conditioned_on_availability(
+        observation_times_by_site=observation_times,
+        available_time_ns_by_site=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        sample_count=_SAMPLE_COUNT,
+        seed=_SEED,
+    )
+
+
+def test_gap_aware_age_sampler_fails_closed_when_a_stratum_has_no_common_candidate() -> None:
+    """五站任一分層沒有共同 deposition hour 時，不以 nearest 或填值繼續。"""
+
+    base_ns = int(datetime(2025, 10, 31, tzinfo=UTC).timestamp()) * 1_000_000_000
+    observation_times = {
+        site_id: tuple(base_ns + rank * 500 * _HOUR_NS for rank in range(_SAMPLE_COUNT))
+        for site_id in ("gongliao", "guishan", "hsinchu", "houwan", "lienchiang")
+    }
+    available = {site_id: set() for site_id in observation_times}
+    with pytest.raises(ValueError, match="無可用候選"):
+        sample_bed_residence_age_hours_conditioned_on_availability(
+            observation_times_by_site=observation_times,
+            available_time_ns_by_site=available,
+            maximum_age_days=_MAX_AGE_DAYS,
+            sample_count=_SAMPLE_COUNT,
+            seed=_SEED,
+        )
 
 
 def test_conversion_preserves_observation_provenance_and_recomputes_deposition_season() -> None:

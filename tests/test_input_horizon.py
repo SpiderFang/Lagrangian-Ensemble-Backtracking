@@ -16,10 +16,17 @@ import numpy as np
 import pytest
 
 import lagrangian_backtracking.input_derivation as input_derivation_module
+from lagrangian_backtracking.gap_policy import (
+    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
+    OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+)
 from lagrangian_backtracking.input_horizon import (
     BED_RESIDENCE_HORIZON_METHOD_ID,
     BED_RESIDENCE_HORIZON_POLICY_ID,
     BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    GAP_CENSORED_HORIZON_METHOD_ID,
+    GAP_CENSORED_HORIZON_POLICY_ID,
     GENERIC_HORIZON_METHOD_ID,
     GENERIC_HORIZON_POLICY_ID,
     LEGACY_INPUT_SCHEMA_VERSION,
@@ -253,6 +260,139 @@ def test_generic_validator_strict_rejects_real_gap_and_checks_identity() -> None
     gap["records"][0]["study_site_id"] = "other-site"
     identity_result = validate_generic_gap_payload(gap, arrival, inventory, strict=False)
     assert any("site_region_mismatch" in error for error in identity_result.errors)
+
+
+def test_gap_censored_policy_allows_crossing_when_every_anchor_is_available() -> None:
+    """新版 strict validator 接受列舉過的 gap，並核對第一個逆向缺口摘要。"""
+
+    arrival_ns = _utc_ns("2024-02-15T00:00:00Z")
+    inventory = _gap_inventory(gap=True)
+    inventory["expected_period"]["end_utc"] = "2024-12-31T23:00:00Z"
+    inventory["expected_period"]["hourly_step_count"] = 8784
+    inventory["products"][0]["canonical_time"]["time_end_utc"] = "2024-12-31T23:00:00Z"
+    inventory["products"][0]["canonical_time"]["canonical_time_count"] = 8782
+    runtime_window = build_horizon_window(
+        arrival_ns,
+        7,
+        expected_start_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        expected_end_ns=_utc_ns("2024-02-29T23:00:00Z"),
+    )
+    runtime_coverage = compute_horizon_coverage(
+        runtime_window,
+        expected_start_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        expected_end_ns=_utc_ns("2024-02-29T23:00:00Z"),
+        canonical_start_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        canonical_end_ns=_utc_ns("2024-02-29T23:00:00Z"),
+        canonical_gaps=inventory["products"][0]["canonical_time"]["gaps"],
+    )
+    selection_window = build_horizon_window(
+        arrival_ns,
+        14,
+        expected_start_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        expected_end_ns=_utc_ns("2024-02-29T23:00:00Z"),
+    )
+    selection_coverage = compute_horizon_coverage(
+        selection_window,
+        expected_start_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        expected_end_ns=_utc_ns("2024-02-29T23:00:00Z"),
+        canonical_start_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        canonical_end_ns=_utc_ns("2024-02-29T23:00:00Z"),
+        canonical_gaps=inventory["products"][0]["canonical_time"]["gaps"],
+    )
+    first_gap = "2024-02-10T02:00:00Z"
+    arrival_payload = {
+        "records": [
+            {
+                "arrival_time_id": "bed-arrival-gap-censored",
+                "study_site_id": "houwan",
+                "analysis_region_id": "C",
+                "time_utc_ns": arrival_ns,
+                "metadata": {"observation_time_utc_ns": arrival_ns},
+            }
+        ]
+    }
+    censor_policy = OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID
+    denominator_policy = EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+    gap_row = {
+        "arrival_time_id": "bed-arrival-gap-censored",
+        "study_site_id": "houwan",
+        "analysis_region_id": "C",
+        "flow_domain_id": "flow-c",
+        "arrival_time_utc": utc_string(arrival_ns),
+        "horizon_start_utc": utc_string(runtime_window.start_time_ns),
+        "horizon_end_utc": utc_string(arrival_ns),
+        "max_backtrack_days": 7,
+        "support_days": 7,
+        "expected_step_count": runtime_window.expected_step_count,
+        "supported_step_count": runtime_coverage.supported_step_count,
+        "crossed_gap": True,
+        "missing_utc": [utc_string(value) for value in runtime_coverage.missing_time_ns],
+        "time_support_policy": GAP_CENSORED_HORIZON_POLICY_ID,
+        "censoring_policy": censor_policy,
+        "stop_at_first_gap": True,
+        "denominator_policy": denominator_policy,
+        "censored_by_data_gap": True,
+        "first_backward_gap_utc": first_gap,
+        "supported_hours_before_first_gap": (arrival_ns - _utc_ns(first_gap)) // 3_600_000_000_000 - 1,
+        "arrival_time_available": True,
+        "deposition_time_available": True,
+        "observation_time_utc": utc_string(arrival_ns),
+        "selection_horizon_start_utc": utc_string(selection_window.start_time_ns),
+        "selection_horizon_end_utc": utc_string(arrival_ns),
+        "selection_support_days": 14,
+        "selection_expected_step_count": selection_window.expected_step_count,
+        "selection_supported_step_count": selection_coverage.supported_step_count,
+        "selection_crossed_gap": True,
+        "selection_missing_utc": [utc_string(value) for value in selection_coverage.missing_time_ns],
+        "selection_censored_by_data_gap": True,
+        "selection_first_backward_gap_utc": first_gap,
+        "selection_supported_hours_before_first_gap": (
+            (arrival_ns - _utc_ns(first_gap)) // 3_600_000_000_000 - 1
+        ),
+        "observation_time_available": True,
+    }
+    gap_payload = {
+        "schema_version": GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+        "policy": GAP_CENSORED_HORIZON_POLICY_ID,
+        "gap_censoring_policy": censor_policy,
+        "stop_at_first_gap": True,
+        "denominator_policy": denominator_policy,
+        "max_backtrack_days": 7,
+        "support_days": 7,
+        "selection_support_days": 14,
+        "runtime_support_days": 7,
+        "provenance": {"method_id": GAP_CENSORED_HORIZON_METHOD_ID},
+        "records": [gap_row],
+    }
+    config = SimpleNamespace(
+        inputs=SimpleNamespace(
+            backtrack_support_days=14,
+            model_fields_set={"backtrack_support_days"},
+            years=[2024],
+            time_axis_contract={
+                "expected_timestep_hours": 1.0,
+                "gap_policy": censor_policy,
+                "stop_at_first_gap": True,
+                "denominator_policy": denominator_policy,
+            },
+        ),
+        boundaries=SimpleNamespace(max_backtrack_days=7.0, stop_at_data_gap=True),
+        scenarios=SimpleNamespace(
+            bed_residence_time=SimpleNamespace(
+                maximum_age_days=7,
+                runtime_horizon_support_days=7,
+            )
+        ),
+        study_sites=[SimpleNamespace(study_site_id="houwan", analysis_region_id="C")],
+    )
+    result = validate_generic_gap_payload(
+        gap_payload,
+        arrival_payload,
+        inventory,
+        config=config,
+        strict=True,
+    )
+    assert result.valid is True, result.errors
 
 
 def test_bed_residence_gap_evidence_separates_180_day_selection_from_90_day_runtime() -> None:

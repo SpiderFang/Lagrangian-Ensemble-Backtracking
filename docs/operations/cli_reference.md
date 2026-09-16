@@ -116,8 +116,10 @@ selection envelope（H90 + 最大年齡 90），而沉底後的逐筆 runtime su
 先用觀測 anchor selector 驗 180 日，再轉為 deposition UTC；receptor 與 OCM dynamic initial
 condition 以 deposition UTC 建立。Gap artifact 會分開保存 `selection_support_days=180` 與
 `runtime_support_days=90`，root/per-deposition runtime `max_backtrack_days` 為 90，不能錯誤要求等於
-selection envelope。bed arrival/gap 與 release binding 使用 schema `1.1.0`；legacy generic 保持
-`1.0.0`，validator 拒絕跨模式載入，artifact index／bindings 的自身 schema 不變。
+selection envelope。legacy bed arrival/gap 與 release binding 使用 schema `1.1.0`；明示
+gap-censored policy 的 bed 母體使用 schema `1.2.0`，
+並在 root／record 保存第一缺口、截尾與分母 evidence；legacy generic 保持 `1.0.0`，validator
+拒絕跨模式載入，artifact index／bindings 的自身 schema 不變。
 
 兩種 config 模式的意思不同：`fixed_calendar_window` 從固定日曆終點回溯 H 日，若隨機沉底早於該窗，
 實際期間為 H 減沉底年齡；`full_horizon_from_deposition` 則以沉底 UTC 為起點，再向前完整回溯 H 日。
@@ -132,7 +134,9 @@ selection envelope。bed arrival/gap 與 release binding 使用 schema `1.1.0`�
 每份 step budget 依該 H 計算 `ceil(H * 86400 / integration.dt_min_seconds) + 1`；mode、selection/runtime
 support 證據都進 release config hash/binding。六個檔名、validation 路徑與 manifest record 帶有 mode；
 共同 input artifacts 與五站母體 fingerprint 必須完全相同，validator 會重建 exact expected payload 並拒絕
-mode 或 topology tamper。缺少任何必要 180/90 日逐時節點都 fail closed；不能降短、補零或用最近值繞過。
+mode 或 topology tamper。legacy suite 缺少必要 180/90 日逐時節點時 fail closed；明示
+gap-censored suite 則完整列舉缺時，runtime 在第一個向後缺口產生 `data_gap` 並截尾，但仍拒絕
+deposition 起點缺資料、manifest 漂移或不完整 policy；任何模式都不能補零、用最近值或未登錄外插繞過。
 
 ```bash
 uv run lbt horizon-suite-create \
@@ -202,9 +206,9 @@ uv run lbt horizon-suite-validate \
 2024–2025。最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，因此不把 2024
 早季當作 observation strata，也不需另補 2023 forcing。範例仍為 `design_pending` template，
 180/90 是必須驗證的支援契約，不是 accepted forcing 已通過的聲明，也不是 approved release 或
-SERVER/input-build 實測；若 2024-07-05 前實際 accepted product 有缺時，strict preflight/build 仍會
-拒絕，不能以最近值、零值或未登錄外插補足。正式運算前須由 forcing inventory 與 gap-safe evidence
-證明支援確實存在。
+SERVER/input-build 實測；若 2024-07-05 前實際 accepted product 有缺時，legacy strict preflight/build 仍會
+拒絕；新版 gap-censored build 則由 forcing inventory 與 gap-censored evidence 列舉缺口、確認
+起點 exact-hour 可用並固定第一缺口截尾。任何模式都不能以最近值、零值或未登錄外插補足。
 
 ### 同一套 legacy generic 輸入產生不同回溯長度（手動模式）
 

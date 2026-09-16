@@ -31,6 +31,9 @@ from lagrangian_backtracking.bed_residence import (
 from lagrangian_backtracking.boundaries import BoundaryGeometry
 from lagrangian_backtracking.config import BedResidenceTimeConfig, ProjectConfig
 from lagrangian_backtracking.diffusion import DiffusionCoefficients, SmagorinskySettings
+from lagrangian_backtracking.gap_policy import (
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+)
 from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.manifests import BoundaryGeometryBundle, ScenarioInputs
 from lagrangian_backtracking.mesh import MeshLocation
@@ -1138,6 +1141,85 @@ def test_explicit_support_checks_no_gap_window_against_formal_period_and_legacy_
             explicit_config,
             data["inputs"],
             ocm_axes=no_gap_axes,
+        )
+
+
+def test_gap_censored_formal_gate_allows_window_gap_but_rejects_deposition_gap(
+    runtime_fixture: dict[str, Any],
+) -> None:
+    """新版只放寬長窗相交；沉底 exact-hour 落在缺口仍須 fail closed。
+
+    這個測試不建立 forcing array，只用 formal inventory 會傳入的 canonical gap interval
+    驗證啟動閘門。第一組缺口位於沉底前 24 小時，代表 runtime 可啟動並在實際回溯時
+    以 ``data_gap`` 截尾；第二組把相同缺口移到沉底起點，必須立即拒絕，不能用新政策
+    把缺少初始條件的情境放行。
+    """
+
+    data = _formal_test_data(runtime_fixture, gap_safe=True)
+    bed = BedResidenceTimeConfig(
+        backtrack_mode=BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+        supported_backtrack_modes=(
+            BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+            BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+        ),
+        maximum_age_days=_BED_RESIDENCE_MAX_AGE_DAYS,
+        sample_count_per_site=50,
+        sampling_policy=BED_RESIDENCE_SAMPLING_POLICY_ID,
+        availability_conditioning_policy=(
+            REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+        ),
+        sampling_seed=_BED_RESIDENCE_SEED,
+        shared_age_offsets_across_sites=True,
+        pre_window_policy="record_pre_window_deposition_without_transport",
+        runtime_horizon_support_days=90,
+    )
+    config = data["config"].model_copy(
+        update={
+            "scenarios": data["config"].scenarios.model_copy(
+                update={"bed_residence_time": bed}
+            )
+        }
+    )
+    flow = runtime.resolve_flow_domain_id(
+        config,
+        data["arrival"].metadata.get("analysis_region_id", "A"),
+        formal=True,
+    )
+    flow_ids = runtime._formal_flow_domain_ids(config)
+    arrival_ns = data["arrival"].time_utc_ns
+    earlier_gap = (
+        arrival_ns - 24 * _HOUR_NS,
+        arrival_ns - 23 * _HOUR_NS,
+    )
+    crossing_axes = [
+        (
+            "ocm_native",
+            flow_id,
+            _HOUR_NS,
+            (earlier_gap,) if flow_id == flow else (),
+        )
+        for flow_id in flow_ids
+    ]
+    runtime._validate_formal_ocm_gap_support(
+        config,
+        data["inputs"],
+        ocm_axes=crossing_axes,
+    )
+
+    deposition_gap_axes = [
+        (
+            product,
+            flow_id,
+            step,
+            ((arrival_ns, arrival_ns),) if flow_id == flow else gaps,
+        )
+        for product, flow_id, step, gaps in crossing_axes
+    ]
+    with pytest.raises(ValueError, match="deposition 起點落在 OCM gap"):
+        runtime._validate_formal_ocm_gap_support(
+            config,
+            data["inputs"],
+            ocm_axes=deposition_gap_axes,
         )
 
 

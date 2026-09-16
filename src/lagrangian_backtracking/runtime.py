@@ -1246,16 +1246,22 @@ def _validate_formal_ocm_gap_support(
     *,
     ocm_axes: Sequence[tuple[str, str, int, tuple[tuple[int, int], ...]]],
 ) -> None:
-    """驗證 OCM 全覆蓋或逐 arrival 的 gap-safe 回溯窗，不接受重建-only 假設。
+    """驗證 OCM 全覆蓋、逐 arrival gap-safe 或明示截尾母體。
 
-    每個 arrival 的合法支援窗是 ``[arrival - max_backtrack_days, arrival]``，兩端都算
-    入檢查。若任何正式 OCM axis 仍有 gap，只有 config 明示的 gap-safe manifest 能使
-    gate 繼續；reconstruction manifest 本身不是已完成重建的證據，不能代替時間 coverage。
-    函式只比較 inventory 的 UTC 摘要與已載入的 arrival records，不讀 OCM 大型陣列，也不
-    執行缺口重建。天數轉奈秒與 request factory 共用有界浮點往返規則；接受可還原的
-    小時分數，不捨入真正次奈秒，也不移動 gap-safe 窗口的任一端點。
+    legacy／一般 gap-safe 每個 arrival 的合法支援窗是
+    ``[arrival - max_backtrack_days, arrival]``，兩端都算入檢查。明示
+    ``observed_gap_censored_stop_at_first_gap_v1`` 時，長窗與缺口相交是可預期的
+    data-gap exposure，不阻擋啟動；本 gate 仍要求 deposition exact-hour 在研究期內、
+    不位於 gap、manifest reference 存在且 ``stop_at_data_gap=true``。這裡只比較
+    inventory UTC 摘要與 arrival metadata，不讀 OCM 大型陣列，也不執行缺口重建。
     """
 
+    # 這個政策只改變「長窗與缺口相交」的 gate；起點 exact-hour／finite／不在 gap
+    # 仍必須逐筆通過。常數與 legacy config 不會讀取此分支，維持既有 full-window
+    # gap-safe 語意。
+    from .input_derivation import _gap_censoring_enabled
+
+    gap_censoring_enabled = _gap_censoring_enabled(config)
     site_flow_ids: dict[str, str] = {}
     for site in config.study_sites:
         site_id = site.study_site_id
@@ -1285,6 +1291,49 @@ def _validate_formal_ocm_gap_support(
             raise ValueError(f"arrival {arrival.arrival_time_id} 的 study_site_id 未登錄")
         arrival_flows.append((arrival, flow_id))
     has_residual_gaps = any(gaps_by_flow.values())
+    if gap_censoring_enabled:
+        safe_manifest = config.inputs.ocm_gap_safe_arrival_manifest
+        if type(safe_manifest) is not str or not safe_manifest.strip():
+            raise ValueError(
+                "gap-censored formal runtime 必須明示 ocm_gap_safe_arrival_manifest"
+            )
+        if config.boundaries.stop_at_data_gap is not True:
+            raise ValueError("gap-censored formal runtime 必須設定 stop_at_data_gap=true")
+        # input manifest 的完整 hash／path closure 由
+        # _validate_declared_support_release 驗證；這裡再確認其欄位確實存在，避免只
+        # 依 runtime 開關便放行一份未登錄的截尾政策。
+        if not isinstance(safe_manifest, str) or Path(safe_manifest).is_absolute():
+            raise ValueError("ocm_gap_safe_arrival_manifest 必須是相對 manifest reference")
+        for arrival, flow_id in arrival_flows:
+            expected_step_ns = step_by_flow[flow_id]
+            period_start_ns, period_end_ns, _ = _formal_period_contract(
+                config,
+                expected_step_ns=expected_step_ns,
+            )
+            arrival_ns = arrival.time_utc_ns
+            if (arrival_ns - period_start_ns) % expected_step_ns != 0:
+                raise ValueError(
+                    f"gap-censored deposition 起點非 exact UTC hour：{arrival.arrival_time_id}"
+                )
+            if arrival_ns < period_start_ns or arrival_ns > period_end_ns:
+                raise ValueError(
+                    f"gap-censored deposition 起點超出 config years：{arrival.arrival_time_id}"
+                )
+            if any(gap_start <= arrival_ns <= gap_end for gap_start, gap_end in gaps_by_flow[flow_id]):
+                raise ValueError(
+                    f"gap-censored deposition 起點落在 OCM gap：{arrival.arrival_time_id}"
+                )
+            metadata = getattr(arrival, "metadata", None)
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"gap-censored arrival 缺少 metadata：{arrival.arrival_time_id}")
+            observation_ns = metadata.get("observation_time_utc_ns")
+            if observation_ns is not None and (
+                isinstance(observation_ns, bool) or not isinstance(observation_ns, int)
+            ):
+                raise ValueError(
+                    f"gap-censored observation anchor UTC 型別無效：{arrival.arrival_time_id}"
+                )
+        return
     support_declared = "backtrack_support_days" in config.inputs.model_fields_set
     if not has_residual_gaps and not support_declared:
         # 舊設定沒有獨立的母體支援窗；維持原本「全覆蓋時不再檢查 gap-safe window」

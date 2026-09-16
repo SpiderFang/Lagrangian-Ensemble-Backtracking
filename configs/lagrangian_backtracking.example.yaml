@@ -1,4 +1,4 @@
-# 本檔固定 design_baseline_v3_non_rising_a_v3_local20_observation_2025_20260916 的科學與工程規則，但仍不是
+# 本檔固定 design_baseline_v3_non_rising_a_v3_local20_observation_2025_gap_censored_20260916 的科學與工程規則，但仍不是
 # 可直接送入正式批次的 release config。v3 依研究主持人意見保留 A 區 v3 forcing source，
 # 將貢寮與龜山島 local domain 定為 20 km、receptor core 定為 12.5 km，並將本期 A 區
 # 35 km／南擴 sensitivity 排除在研究範圍外；十個嚴格負值沉降格點仍指定 iOcean 分類、
@@ -8,7 +8,7 @@
 # 等待研究人員任意選值。正式批次只接受所有 derived gate 均通過的 approved release config。
 schema_version: "0.4.0"
 config_status: design_pending
-design_version: design_baseline_v3_non_rising_a_v3_local20_observation_2025_20260916
+design_version: design_baseline_v3_non_rising_a_v3_local20_observation_2025_gap_censored_20260916
 project_id: lagrangian_ensemble_backtracking
 time_standard: UTC
 
@@ -20,8 +20,9 @@ inputs:
   years: [2024, 2025]
   # H90 加最長 90 日沉底年齡需要 180 日 observation 選時包絡；設定值本身不是資料證據。
   # 新版只在 2025 選 observation anchor，因此最早時次往前 180 日約落在 2024-07-05。
-  # 本範例仍為 design_pending：若 accepted forcing 未涵蓋實際候選所需的完整前置窗口，
-  # strict input-build 必須拒絕，不可補值，也不可把 2024 誤列為 observation strata。
+  # 本範例仍為 design_pending：180 日只界定要列舉的最大 observation 包絡，不要求
+  # 包絡內連續無缺時；strict input-build 會核對起點可用性並保存第一缺口截尾證據，
+  # 不可補值，也不可把 2024 誤列為 observation strata。
   backtrack_support_days: 180
 
   # 研究團隊已裁決：現有 OCM/NWW 是可取得的全部正式資料，供應者不可考，不能把
@@ -35,9 +36,9 @@ inputs:
     unknown_provider_metadata_policy: preserve_unknown_and_use_versioned_project_contract
     do_not_claim: provider_confirmed_best_forecast_cycle
 
-  # OCM-SVD-Analysis 已採相同的跨月 stable-sort/prefer-last 去重。LBT 另外要求連續
-  # forcing：單一缺時與整段缺時都必須先通過 blocked cross-validation，重建 provenance
-  # 逐時保存；未通過時改用 gap-safe arrival window，不把所有軌跡停在缺口。
+  # OCM-SVD-Analysis 已採相同的跨月 stable-sort/prefer-last 去重。已知 OCM 缺口
+  # 無法補齊時，正式母體完整保留可得資料；粒子回溯遇到第一個缺口即以 data_gap
+  # 截尾。此政策不做最近值、零值或外插，且不宣稱連續完整軌跡。
   time_axis_contract:
     canonicalization_policy: sort_and_deduplicate_prefer_last
     expected_timestep_hours: 1.0
@@ -48,11 +49,14 @@ inputs:
     validation: blocked_mask_actual_gap_shapes_plus_eulerian_and_lagrangian_skill
     baseline_fallback: gap_safe_stratified_arrival_windows
     preserve_origin_labels: [observed, reconstructed_short, reconstructed_state_space]
+    gap_policy: observed_gap_censored_stop_at_first_gap_v1
+    stop_at_first_gap: true
+    denominator_policy: exclude_data_gap_numerical_failure_and_pre_window_deposition_v1
   # OCM 兩種時間支撐擇一，加上 NWW 完整逐時 manifest，均由 SERVER 實值驗證產生；
   # null 是實作 gate，不是等待外部資料。
   ocm_gap_reconstruction_manifest: null
-  # 若長缺口重建未達預登錄門檻，以此 manifest 證明 50 個分層時次及核定 horizon
-  # 全程不跨缺口；正式 release 接受兩種 OCM 時間支撐方案至少一種。
+  # 保存每個 arrival／沉底起點的 exact available hour、缺口清單與第一缺口截尾
+  # evidence；它不宣稱長窗連續，也不允許以最近值、零值或外插跨越缺口。
   ocm_gap_safe_arrival_manifest: null
   nww_full_hourly_analysis_manifest: null
 
@@ -539,6 +543,7 @@ scenarios:
     maximum_age_days: 90
     sample_count_per_site: 50
     sampling_policy: discrete_hourly_stratified_uniform_v1
+    availability_conditioning_policy: reject_unavailable_deposition_hour_within_stratum_v1
     sampling_seed: 20260916
     shared_age_offsets_across_sites: true
     pre_window_policy: record_pre_window_deposition_without_transport

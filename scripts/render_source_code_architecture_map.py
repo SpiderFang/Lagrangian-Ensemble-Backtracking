@@ -41,6 +41,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
         "color": "#3b82f6",
         "modules": (
             "config",
+            "gap_policy",
             "preflight",
             "time_axis",
             "geometry",
@@ -169,6 +170,19 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "entrypoints": ["ProjectConfig", "load_config"],
         "read_first": (
             "先確認哪些設定可以進入正式發布，以及 10 × 20 × 50 的不可縮減契約。"
+        ),
+    },
+    "gap_policy": {
+        "role": "集中定義已知 OCM 缺口截尾、沉底整點條件與統計分母政策",
+        "inputs": "研究主持人核定的不可補值原則與既有粒子停止狀態",
+        "outputs": "跨設定、輸入、執行及報告共用的版本化政策識別碼",
+        "entrypoints": [
+            "OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID",
+            "REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID",
+        ],
+        "read_first": (
+            "先確認新版只允許在第一個缺口截尾，不會補零、最近值或跨缺口外插；"
+            "data_gap 仍保留於總母體曝露率，但不進條件式來源足跡有效分母。"
         ),
     },
     "preflight": {
@@ -1201,6 +1215,9 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "engineering_window", "target": "runtime", "label": "engineering artifact／pilot request"},
     {"source": "engineering_window", "target": "run_control", "label": "workspace／shard resume"},
     {"source": "config", "target": "preflight", "label": "設定約束"},
+    {"source": "gap_policy", "target": "config", "label": "缺口／分母政策識別碼"},
+    {"source": "gap_policy", "target": "input_derivation", "label": "第一缺口截尾契約"},
+    {"source": "gap_policy", "target": "runtime", "label": "data_gap 停止政策"},
     {"source": "preflight", "target": "time_axis", "label": "時間支援"},
     {"source": "geometry", "target": "mesh", "label": "座標／網格"},
     {"source": "geometry", "target": "receptors", "label": "候選範圍"},

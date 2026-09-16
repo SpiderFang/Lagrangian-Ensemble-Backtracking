@@ -25,7 +25,10 @@ from lagrangian_backtracking.input_derivation import (
     read_canonical_json,
     write_canonical_json,
 )
-from lagrangian_backtracking.input_horizon import BED_RESIDENCE_INPUT_SCHEMA_VERSION
+from lagrangian_backtracking.input_horizon import (
+    BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
@@ -42,6 +45,12 @@ def _write_template(path: Path, *, support_days: int | None = None) -> bytes:
     payload.pop("arrival_time_selection", None)
     payload["scenarios"].pop("bed_residence_time", None)
     payload["inputs"].pop("backtrack_support_days", None)
+    # 此 helper 專門建立 legacy suite；example 的 gap-censored policy 必須整組移除，
+    # 否則沒有 bed block 的 legacy config 會被正確視為不完整宣告。
+    time_axis_contract = payload["inputs"].get("time_axis_contract")
+    if isinstance(time_axis_contract, dict):
+        for field in ("gap_policy", "stop_at_first_gap", "denominator_policy"):
+            time_axis_contract.pop(field, None)
     payload["integration"]["dt_min_seconds"] = 30.0
     if support_days is not None:
         payload["inputs"]["backtrack_support_days"] = support_days
@@ -193,7 +202,11 @@ def _install_small_suite_doubles(
         payload["config_status"] = status
         payload["release_binding"] = {
             "schema_version": (
-                BED_RESIDENCE_INPUT_SCHEMA_VERSION if bed is not None else "1.0.0"
+                GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                if bed is not None and horizon_suite._payload_gap_censoring_enabled(payload)
+                else BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                if bed is not None
+                else "1.0.0"
             ),
             "source_config_template_sha256": horizon_suite._yaml_fingerprint(
                 template, "common-config.yaml"
@@ -240,6 +253,9 @@ def _install_small_suite_doubles(
                     "backtrack_mode": mode,
                 }
             )
+            gap_contract = horizon_suite._payload_gap_censoring_contract(payload)
+            if gap_contract is not None:
+                payload["release_binding"].update(gap_contract)
         payload["release_approval"] = {
             "status": status,
             "blockers": [],
@@ -398,7 +414,7 @@ def test_bed_suite_builds_one_180_day_selection_mother_and_six_mode_releases(
     manifest, manifest_path = _load_manifest(destination)
     assert manifest["selection_support_days"] == 180
     assert manifest["runtime_support_days"] == 90
-    assert manifest["source_schema_version"] == BED_RESIDENCE_INPUT_SCHEMA_VERSION
+    assert manifest["source_schema_version"] == GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
     assert manifest["forcing_years"] == [2024, 2025]
     assert manifest["observation_years"] == [2025]
     assert manifest["arrival_selection_policy_id"] == (

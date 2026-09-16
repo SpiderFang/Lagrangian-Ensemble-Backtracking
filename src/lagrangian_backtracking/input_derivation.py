@@ -23,6 +23,7 @@ renderer 與互動式架構地圖不在本 Slice 範圍。
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -44,9 +45,12 @@ import yaml
 from shapely.geometry import LineString, Point, Polygon, mapping, shape
 from shapely.ops import unary_union
 
+from . import bed_residence as _bed_residence_module
 from .arrival_times import select_arrival_times
 from .bed_residence import (
+    BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_POLICY_ID,
+    BED_RESIDENCE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
     apply_bed_residence_sampling,
     sample_bed_residence_age_hours,
@@ -67,11 +71,19 @@ from .config import (
     load_config,
     resolve_flow_domain_id,
 )
+from .gap_policy import (
+    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
+    OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+)
 from .geometry import DomainProjection, build_anchor_local_domain, densified_bbox_polygon
 from .input_horizon import (
     BED_RESIDENCE_HORIZON_METHOD_ID,
     BED_RESIDENCE_HORIZON_POLICY_ID,
     BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    GAP_CENSORED_HORIZON_METHOD_ID,
+    GAP_CENSORED_HORIZON_POLICY_ID,
     GENERIC_HORIZON_METHOD_ID,
     GENERIC_HORIZON_POLICY_ID,
     LEGACY_INPUT_SCHEMA_VERSION,
@@ -115,6 +127,213 @@ EXPECTED_STUDY_SITE_COUNT = 5
 EXPECTED_RECEPTOR_COUNT = 100
 EXPECTED_ARRIVAL_COUNT = 250
 EXPECTED_DYNAMIC_INITIAL_CONDITION_COUNT = 5_000
+
+# 已知 OCM 缺時無法補齊時，正式 bed-residence 母體採用「走到第一個缺口就截尾」；
+# 這些識別碼會進入 input、release 與報告 provenance。它們刻意在本模組集中宣告，
+# 讓舊版 legacy config 沒有明示 policy 時仍維持原本的 gap-safe 行為，避免由預設值
+# 把一份未核准的缺時資料誤升格成截尾母體。
+OBSERVED_GAP_CENSORED_STOP_POLICY_ID = (
+    OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID
+)
+DEPOSITION_AVAILABILITY_POLICY_ID = (
+    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+)
+DENOMINATOR_POLICY_ID = (
+    EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+)
+
+_GAP_POLICY_FIELD_NAMES = (
+    "gap_policy",
+    "ocm_gap_policy",
+    "time_gap_policy",
+    "data_gap_policy",
+    "gap_handling_policy",
+)
+
+
+def _mapping_model_payload(value: Any) -> Mapping[str, Any] | None:
+    """把 config model 或 YAML mapping 轉成可唯讀查詢的第一層 mapping。
+
+    ProjectConfig 使用 Pydantic frozen model，且不同版本的設定可能把新增的缺時
+    policy 放在 model field 或 ``model_extra``。這個 helper 只讀取既有公開 mapping
+    介面，不修改設定，也不把未知欄位猜成可啟用的 policy。
+    """
+
+    if isinstance(value, Mapping):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="json", exclude_none=False)
+        except TypeError:
+            dumped = model_dump()
+        if isinstance(dumped, Mapping):
+            return dumped
+    return None
+
+
+def _gap_censoring_contract(value: Any) -> tuple[str | None, str | None, str | None, bool]:
+    """回傳 ``(gap, deposition, denominator, stop_at_gap)`` 的明示設定摘要。
+
+    新增欄位可能由相鄰設定實作者放在 ``inputs``、``boundaries`` 或 bed-residence
+    block；本函式接受這些已登錄位置的同義欄位，並拒絕同時出現互相衝突的宣告。回傳
+    ``None`` 代表沒有明示，不會把 legacy 設定自動切換到截尾語意；只有三個 policy
+    皆精確符合、且 ``stop_at_data_gap`` 為 true 時，caller 才可啟用新流程。
+    """
+
+    root = _mapping_model_payload(value)
+    if root is None:
+        root = {}
+    candidates: list[tuple[str, Any]] = []
+
+    def collect(section: Any, label: str) -> None:
+        mapping = _mapping_model_payload(section)
+        if mapping is None:
+            return
+        for field in _GAP_POLICY_FIELD_NAMES:
+            if field in mapping:
+                candidates.append((f"{label}.{field}", mapping[field]))
+
+    collect(root, "config")
+    for section_name in ("inputs", "boundaries", "scenarios"):
+        section = root.get(section_name)
+        collect(section, section_name)
+        section_mapping = _mapping_model_payload(section)
+        if section_name == "inputs" and section_mapping is not None:
+            # 新版 ProjectConfig 的唯一 canonical policy source 是
+            # inputs.time_axis_contract；保留上層 aliases 只為了讀取過渡期 fixture。
+            time_contract = section_mapping.get("time_axis_contract")
+            time_mapping = _mapping_model_payload(time_contract)
+            if time_mapping is not None:
+                if "gap_policy" in time_mapping:
+                    candidates.append(("inputs.time_axis_contract.gap_policy", time_mapping["gap_policy"]))
+                if "ocm_gap_policy" in time_mapping:
+                    candidates.append(
+                        ("inputs.time_axis_contract.ocm_gap_policy", time_mapping["ocm_gap_policy"])
+                    )
+                if "denominator_policy" in time_mapping:
+                    candidates.append(
+                        (
+                            "inputs.time_axis_contract.denominator_policy",
+                            time_mapping["denominator_policy"],
+                        )
+                    )
+        if section_mapping is not None and section_name == "scenarios":
+            bed_mapping = _mapping_model_payload(section_mapping.get("bed_residence_time"))
+            collect(bed_mapping, "scenarios.bed_residence_time")
+            if bed_mapping is not None and "availability_conditioning_policy" in bed_mapping:
+                candidates.append(
+                    (
+                        "scenarios.bed_residence_time.availability_conditioning_policy",
+                        bed_mapping["availability_conditioning_policy"],
+                    )
+                )
+
+    # Pydantic object 可能沒有把 extra 欄位放進 model_dump；補查一層 model_extra，仍只
+    # 掃描已知欄位名稱，避免任何任意文字值變成執行政策。
+    for label, section in (
+        ("config", value),
+        ("inputs", getattr(value, "inputs", None)),
+        ("boundaries", getattr(value, "boundaries", None)),
+        ("scenarios", getattr(value, "scenarios", None)),
+    ):
+        extra = getattr(section, "model_extra", None)
+        if isinstance(extra, Mapping):
+            collect(extra, label)
+        if label == "scenarios":
+            bed = getattr(section, "bed_residence_time", None)
+            bed_extra = getattr(bed, "model_extra", None)
+            if isinstance(bed_extra, Mapping):
+                collect(bed_extra, "scenarios.bed_residence_time")
+            availability_policy = getattr(bed, "availability_conditioning_policy", None)
+            if availability_policy is not None:
+                candidates.append(
+                    (
+                        "scenarios.bed_residence_time.availability_conditioning_policy",
+                        availability_policy,
+                    )
+                )
+
+    gap_candidates = [
+        item
+        for label, item in candidates
+        if label.endswith((".gap_policy", ".ocm_gap_policy", ".time_gap_policy", ".data_gap_policy"))
+        or label == "config.gap_policy"
+    ]
+    unique_values = {str(item) if item is not None else None for item in gap_candidates}
+    if len(unique_values) > 1:
+        raise InputDerivationError("缺時 policy 在設定不同區段互相衝突")
+    gap_policy = next(iter(unique_values), None)
+
+    def first_scalar(names: tuple[str, ...]) -> str | None:
+        values: list[str] = []
+        for label, section in (("config", root), ("inputs", root.get("inputs")),
+                               ("boundaries", root.get("boundaries")),
+                               ("scenarios", root.get("scenarios"))):
+            mapping = _mapping_model_payload(section)
+            if mapping is None:
+                continue
+            if label == "inputs":
+                nested = _mapping_model_payload(mapping.get("time_axis_contract"))
+                if nested is not None:
+                    for name in names:
+                        if name in nested:
+                            values.append(str(nested[name]))
+            if label == "scenarios":
+                nested_bed = _mapping_model_payload(mapping.get("bed_residence_time"))
+                if nested_bed is not None and "availability_conditioning_policy" in nested_bed and (
+                    "deposition_availability_policy" in names or "deposition_policy" in names
+                ):
+                    values.append(str(nested_bed["availability_conditioning_policy"]))
+            for name in names:
+                if name in mapping:
+                    raw = mapping[name]
+                    if raw is not None:
+                        values.append(str(raw))
+        if not values:
+            return None
+        if len(set(values)) != 1:
+            raise InputDerivationError(f"缺時 policy 欄位 {names} 在設定不同區段互相衝突")
+        return values[0]
+
+    deposition_policy = first_scalar(("deposition_availability_policy", "deposition_policy"))
+    denominator_policy = first_scalar(("denominator_policy", "statistics_denominator_policy"))
+    boundaries = _mapping_model_payload(root.get("boundaries"))
+    stop_value = boundaries.get("stop_at_data_gap") if boundaries is not None else None
+    if stop_value is None:
+        stop_value = getattr(getattr(value, "boundaries", None), "stop_at_data_gap", None)
+    time_contract = None
+    inputs_mapping = _mapping_model_payload(root.get("inputs"))
+    if inputs_mapping is not None:
+        time_contract = _mapping_model_payload(inputs_mapping.get("time_axis_contract"))
+    stop_first_gap = time_contract.get("stop_at_first_gap") if time_contract is not None else None
+    if stop_first_gap is None:
+        stop_first_gap = getattr(
+            getattr(getattr(value, "inputs", None), "time_axis_contract", None),
+            "stop_at_first_gap",
+            None,
+        )
+    stop_at_gap = stop_value is True and stop_first_gap is True
+    return gap_policy, deposition_policy, denominator_policy, stop_at_gap
+
+
+def _gap_censoring_enabled(config: Any, *, require_bed_residence: bool = True) -> bool:
+    """確認 config 是否完整明示本期缺時截尾契約。"""
+
+    gap_policy, deposition_policy, denominator_policy, stop_at_gap = _gap_censoring_contract(config)
+    if isinstance(config, Mapping):
+        scenarios_mapping = _mapping_model_payload(config.get("scenarios"))
+        bed = scenarios_mapping.get("bed_residence_time") if scenarios_mapping is not None else None
+    else:
+        bed = getattr(getattr(config, "scenarios", None), "bed_residence_time", None)
+    if require_bed_residence and bed is None:
+        return False
+    return (
+        gap_policy == OBSERVED_GAP_CENSORED_STOP_POLICY_ID
+        and deposition_policy == DEPOSITION_AVAILABILITY_POLICY_ID
+        and denominator_policy == DENOMINATOR_POLICY_ID
+        and stop_at_gap
+    )
 
 ARTIFACT_FILENAMES: dict[str, str] = {
     "forcing_inventory": "forcing_inventory.json",
@@ -2761,6 +2980,7 @@ def _select_arrivals_for_site(
     observation_years: Sequence[int] | None = None,
     replicates: int | None = None,
     selection_policy: str | None = None,
+    allow_gap_censored_anchor: bool = False,
 ) -> list[ArrivalTime]:
     """依版本化 observation policy 產生單站 48+2 arrival。
 
@@ -2768,7 +2988,9 @@ def _select_arrivals_for_site(
     ``observation_years`` 傳給 selector，故 2024 能繼續參與 180 日
     ``backward_window_available``，卻不會被選成 2025 observation anchor。非 strict
     synthetic fixture 也沿用同一 policy 產生 metadata；它只服務測試，不代表正式資料
-    通過 accepted-product 或 gap-safe gate。
+    通過 accepted-product 或 gap-safe gate。缺時截尾政策另外只要求 observation anchor
+    本身 exact UTC、OCM/NWW finite；完整支援窗會由 gap manifest 列舉，runtime 在第一個
+    缺口停止，不能在 selector 階段以零值或最近值補齊。
     """
 
     times = np.asarray(product.canonical.time_utc_ns, dtype=np.int64)
@@ -2786,11 +3008,15 @@ def _select_arrivals_for_site(
         nww_available = np.asarray(
             [bool(nww_valid_for_site.get(int(value), False)) for value in times], dtype=bool
         )
-    backward = _backward_window_mask(
-        times,
-        expected_axis=expected_axis,
-        available_axis=product.canonical.time_utc_ns,
-        max_backtrack_days=max_backtrack_days,
+    backward = (
+        np.ones(times.shape, dtype=bool)
+        if allow_gap_censored_anchor
+        else _backward_window_mask(
+            times,
+            expected_axis=expected_axis,
+            available_axis=product.canonical.time_utc_ns,
+            max_backtrack_days=max_backtrack_days,
+        )
     )
     valid = np.isfinite(values) & np.isfinite(waves) & np.isfinite(speeds) & nww_available
     valid &= np.isin(times, expected_axis)
@@ -3384,6 +3610,7 @@ def _site_arrival_support_by_time(
     nww_valid: Mapping[int, bool],
     expected_axis: np.ndarray,
     max_backtrack_days: float,
+    allow_gap_censored_anchor: bool = False,
 ) -> dict[int, bool]:
     """建立單站每 UTC 的 OCM／NWW／gap-safe 共同有效旗標。
 
@@ -3394,11 +3621,15 @@ def _site_arrival_support_by_time(
     """
 
     times = np.asarray(product.canonical.time_utc_ns, dtype=np.int64)
-    backward = _backward_window_mask(
-        times,
-        expected_axis=expected_axis,
-        available_axis=product.canonical.time_utc_ns,
-        max_backtrack_days=max_backtrack_days,
+    backward = (
+        np.ones(times.shape, dtype=bool)
+        if allow_gap_censored_anchor
+        else _backward_window_mask(
+            times,
+            expected_axis=expected_axis,
+            available_axis=product.canonical.time_utc_ns,
+            max_backtrack_days=max_backtrack_days,
+        )
     )
     expected = np.isin(times, np.asarray(expected_axis, dtype=np.int64))
     result: dict[int, bool] = {}
@@ -3434,6 +3665,7 @@ def _select_arrivals_with_nww_metric_location(
     observation_years: Sequence[int] | None = None,
     replicates: int | None = None,
     selection_policy: str | None = None,
+    allow_gap_censored_anchor: bool = False,
 ) -> tuple[list[ArrivalTime], _SiteArrivalSelectionContext]:
     """以 anchor-first policy 選出 arrival 並保存 NWW metric location binding。
 
@@ -3484,6 +3716,7 @@ def _select_arrivals_with_nww_metric_location(
             observation_years=observation_years,
             replicates=replicates,
             selection_policy=selection_policy,
+            allow_gap_censored_anchor=allow_gap_censored_anchor,
         )
         binding = _nww_metric_location_binding(
             nww_cache,
@@ -3553,14 +3786,16 @@ def _clone_paired_a_arrivals(
     max_backtrack_days: float,
     design_version: str,
     strict: bool,
+    allow_gap_censored_anchor: bool = False,
 ) -> list[ArrivalTime]:
     """以 guishan 自己的序列重建 A 區 paired UTC arrival metadata。
 
     貢寮只提供 shared UTC、潮汐類別與潮內 phase label；龜山島的 elevation、Hs、current
     與 NWW metric location binding 必須從自己的序列取得。strict pipeline 會先逐一驗證
     每個 shared UTC 的 OCM finite、NWW exact-hour validity 與 inclusive gap-safe window；
-    任一時次不支援就直接 fail closed。非 strict internal fixture 保留既有小型資料的相容
-    行為，但仍不把貢寮的物理 metadata 複製給龜山島。
+    任一時次不支援就直接 fail closed。缺時截尾政策下 paired gate 僅驗證 shared
+    observation anchor 當下節點，沉底與長窗缺口由後續 manifest／sampler 處理。非 strict
+    internal fixture 保留既有小型資料的相容行為，但仍不把貢寮的物理 metadata 複製給龜山島。
     """
 
     if strict:
@@ -3572,6 +3807,7 @@ def _clone_paired_a_arrivals(
             nww_valid=guishan_context.nww_valid,
             expected_axis=expected_axis,
             max_backtrack_days=max_backtrack_days,
+            allow_gap_censored_anchor=allow_gap_censored_anchor,
         )
         unsupported_shared = [
             int(item.time_utc_ns)
@@ -4596,28 +4832,116 @@ def _arrival_payload(
     if bed_config is not None:
         if horizon_settings is None or not horizon_settings.bed_residence_enabled:
             raise InputDerivationError("bed residence arrival manifest 缺少共同 horizon 設定")
-        offsets = sample_bed_residence_age_hours(
-            maximum_age_days=bed_config.maximum_age_days,
-            sample_count=bed_config.sample_count_per_site,
-            seed=bed_config.sampling_seed,
-        )
+        gap_censoring_enabled = _gap_censoring_enabled(config)
+        metadata_rows = [
+            item.metadata
+            for item in arrivals
+            if isinstance(item.metadata, Mapping)
+        ]
+        observed_hashes = {
+            str(item.get("bed_residence_age_offsets_hours_sha256"))
+            for item in metadata_rows
+            if item.get("bed_residence_age_offsets_hours_sha256") is not None
+        }
+        if gap_censoring_enabled:
+            if len(observed_hashes) != 1:
+                raise InputDerivationError(
+                    "gap-conditioned age vector hash 未在所有 deposition arrival 一致保存"
+                )
+            age_offsets_hash = next(iter(observed_hashes))
+            # apply_bed_residence_sampling 已把每個分層的 rejection audit 寫到對應
+            # arrival；這裡從五站 rows 重建唯一的 0..49 順序，並確認各站對同一
+            # observation rank 保存完全相同的候選拒絕證據。root provenance 不能只存一
+            # 個「有抽過」旗標，否則 validator 無法重算條件式 age vector。
+            audit_by_stratum: dict[int, dict[str, Any]] = {}
+            age_by_stratum: dict[int, int] = {}
+            for item in metadata_rows:
+                raw_audit = item.get("bed_residence_availability_rejection_audit")
+                if not isinstance(raw_audit, Mapping):
+                    raise InputDerivationError(
+                        "gap-conditioned sampler 缺少逐筆 availability rejection audit"
+                    )
+                stratum_index = raw_audit.get("stratum_index")
+                if type(stratum_index) is not int or not 0 <= stratum_index < 50:
+                    raise InputDerivationError("gap-conditioned rejection audit stratum index 無效")
+                age_hours = item.get("bed_residence_age_hours")
+                if type(age_hours) is not int:
+                    raise InputDerivationError("gap-conditioned arrival age 必須是整數小時")
+                previous_age = age_by_stratum.get(stratum_index)
+                if previous_age is None:
+                    age_by_stratum[stratum_index] = age_hours
+                elif previous_age != age_hours:
+                    raise InputDerivationError(
+                        "gap-conditioned age vector 在站點間不一致"
+                    )
+                audit_payload = dict(raw_audit)
+                previous = audit_by_stratum.get(stratum_index)
+                if previous is None:
+                    audit_by_stratum[stratum_index] = audit_payload
+                elif previous != audit_payload:
+                    raise InputDerivationError(
+                        "gap-conditioned sampler rejection audit 在站點間不一致"
+                    )
+            if set(audit_by_stratum) != set(range(50)):
+                raise InputDerivationError("gap-conditioned sampler rejection audit 分層不完整")
+            if set(age_by_stratum) != set(range(50)):
+                raise InputDerivationError("gap-conditioned age vector 分層不完整")
+            rejection_audit = [audit_by_stratum[index] for index in range(50)]
+            age_offsets = [age_by_stratum[index] for index in range(50)]
+        else:
+            offsets = sample_bed_residence_age_hours(
+                maximum_age_days=bed_config.maximum_age_days,
+                sample_count=bed_config.sample_count_per_site,
+                seed=bed_config.sampling_seed,
+            )
+            age_offsets_hash = sha256(
+                json.dumps(
+                    list(offsets), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+            ).hexdigest()
+            rejection_audit = {"policy": BED_RESIDENCE_SAMPLING_POLICY_ID, "rejected_candidates": 0}
         provenance_extra["bed_residence_sampling"] = {
             "policy_id": BED_RESIDENCE_POLICY_ID,
+            # sampling_policy_id 描述離散整點分層抽樣本身；缺時條件式另以
+            # availability_conditioning_policy 綁定，不能把兩個不同層次的 policy
+            # 混成一個 ID，否則既有 manifest loader 無法辨識抽樣算法。
             "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+            "sampling_method_id": (
+                BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID
+                if gap_censoring_enabled
+                else BED_RESIDENCE_SAMPLING_METHOD_ID
+            ),
             "maximum_age_days": bed_config.maximum_age_days,
             "sample_count_per_site": bed_config.sample_count_per_site,
             "sampling_seed": bed_config.sampling_seed,
             "shared_age_offsets_across_sites": bed_config.shared_age_offsets_across_sites,
-            "age_offsets_hours_sha256": sha256(canonical_json_bytes(list(offsets))).hexdigest(),
+            "age_offsets_hours_sha256": age_offsets_hash,
             "selection_support_days": horizon_settings.selection_support_days,
             "runtime_support_days": horizon_settings.runtime_support_days,
             "pre_window_policy": bed_config.pre_window_policy,
             "observation_anchor_selection_method_id": ARRIVAL_SELECTION_METHOD_ID,
         }
+        if gap_censoring_enabled:
+            provenance_extra["bed_residence_sampling"].update(
+                {
+                    # 新版 loader 需要完整向量與 hash 同時存在；hash 只證明 bytes
+                    # 一致，不能取代分層與可用性拒絕 audit。
+                    "age_offsets_hours": [
+                        int(value) for value in age_offsets
+                    ],
+                    "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+                    "deposition_availability_policy_id": DEPOSITION_AVAILABILITY_POLICY_ID,
+                    "denominator_policy_id": DENOMINATOR_POLICY_ID,
+                    "availability_conditioning_policy": DEPOSITION_AVAILABILITY_POLICY_ID,
+                    "rejection_audit": rejection_audit,
+                }
+            )
     return {
         "manifest_kind": "arrival_time_manifest",
         "schema_version": (
-            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if bed_config is not None and _gap_censoring_enabled(config)
+            else BED_RESIDENCE_INPUT_SCHEMA_VERSION
             if bed_config is not None
             else DERIVED_INPUT_SCHEMA_VERSION
         ),
@@ -4632,6 +4956,269 @@ def _arrival_payload(
         ),
         "records": [asdict(item) for item in arrivals],
     }
+
+
+def _gap_interval_value(interval: Any, name: str) -> int | None:
+    """讀取 canonical gap dataclass 或 mapping 的整數 UTC 欄位。"""
+
+    raw = interval.get(name) if isinstance(interval, Mapping) else getattr(interval, name, None)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _gap_censoring_record(
+    *,
+    window: Any,
+    coverage: Any,
+    canonical_gaps: Sequence[Any],
+    expected_axis_set: set[int],
+    available_axis_set: set[int],
+) -> dict[str, Any]:
+    """把單一 inclusive window 轉成可稽核的第一缺口截尾 evidence。
+
+    ``missing_time_ns`` 仍完整列出 exact UTC，供 validator 重新計算；額外的
+    ``first_gap_toward_backward_utc`` 與連續支援步數描述 runtime 從起點向後能走到哪裡。
+    這些欄位是資料缺失曝露，不代表粒子在缺口後被補值或被判定為未進入邊界。
+    """
+
+    missing = tuple(int(value) for value in coverage.missing_time_ns)
+    first_missing = max(missing) if missing else None
+    first_gap_start = first_gap_end = None
+    if first_missing is not None:
+        for interval in canonical_gaps:
+            start = _gap_interval_value(interval, "missing_start_utc_ns")
+            if start is None:
+                start = _gap_interval_value(interval, "start_time_ns")
+            end = _gap_interval_value(interval, "missing_end_utc_ns")
+            if end is None:
+                end = _gap_interval_value(interval, "end_time_ns")
+            before = _gap_interval_value(interval, "before_utc_ns")
+            after = _gap_interval_value(interval, "after_utc_ns")
+            if start is None and before is not None:
+                start = before + _UTC_HOUR_NS
+            if end is None and after is not None:
+                end = after - _UTC_HOUR_NS
+            if start is not None and end is not None and start <= first_missing <= end:
+                first_gap_start, first_gap_end = start, end
+                break
+    contiguous_steps = 0
+    for value in range(window.expected_step_count):
+        node = int(window.arrival_time_ns) - value * _UTC_HOUR_NS
+        if node not in expected_axis_set or node not in available_axis_set:
+            break
+        contiguous_steps += 1
+    return {
+        "censoring_required": bool(missing),
+        "censoring_terminal_status": "data_gap" if missing else None,
+        "first_gap_toward_backward_utc": (
+            _utc_string(first_missing) if first_missing is not None else None
+        ),
+        "first_gap_missing_start_utc": (
+            _utc_string(first_gap_start) if first_gap_start is not None else None
+        ),
+        "first_gap_missing_end_utc": (
+            _utc_string(first_gap_end) if first_gap_end is not None else None
+        ),
+        "supported_contiguous_step_count_from_start": contiguous_steps,
+        "supported_contiguous_hours_from_start": max(0.0, float(contiguous_steps - 1)),
+    }
+
+
+def _gap_censored_payload(
+    *,
+    config: ProjectConfig,
+    ocm_by_region: Mapping[str, _ProductData],
+    arrivals: Sequence[ArrivalTime],
+    expected_axis: np.ndarray,
+    source_hashes: Mapping[str, str],
+    max_backtrack_days: float,
+    strict: bool,
+    horizon_settings: HorizonSettings | None,
+) -> dict[str, Any]:
+    """建立 known-gap 截尾母體的共同逐 arrival evidence。
+
+    input-build 只需一次，故這裡以 Hmax runtime 與 observation selection envelope 各列一
+    份 exact coverage。任一長窗跨 gap 會保留完整 missing 清單並標記 censoring_required；
+    只有 deposition 起點本身缺失、超出研究期或 policy/manifest 不一致才 fail closed。
+    """
+
+    if horizon_settings is None or not horizon_settings.bed_residence_enabled:
+        raise InputDerivationError("gap-censored payload 只能搭配 bed-residence horizon")
+    selection_days = horizon_settings.selection_support_days
+    runtime_days = horizon_settings.runtime_support_days
+    if selection_days is None or runtime_days is None:
+        raise InputDerivationError("gap-censored payload 缺少 selection/runtime support days")
+    if not math.isclose(float(max_backtrack_days), float(runtime_days), rel_tol=0.0, abs_tol=1e-12):
+        raise InputDerivationError("gap-censored payload max_backtrack_days 必須等於 runtime support")
+    expected_start_ns = int(expected_axis[0])
+    expected_end_ns = int(expected_axis[-1])
+    expected_set = {int(value) for value in expected_axis}
+    site_region = {site.study_site_id: site.analysis_region_id for site in config.study_sites}
+    records: list[dict[str, Any]] = []
+    for arrival in sorted(arrivals, key=lambda item: (item.study_site_id, item.time_utc_ns)):
+        region = site_region.get(arrival.study_site_id)
+        product = ocm_by_region.get(region) if region is not None else None
+        if product is None:
+            raise InputDerivationError(f"gap-censored arrival 找不到 OCM region：{arrival.study_site_id}")
+        available_set = {int(value) for value in product.canonical.time_utc_ns}
+        deposition_ns = int(arrival.time_utc_ns)
+        if deposition_ns not in expected_set or deposition_ns not in available_set:
+            raise InputDerivationError(
+                f"deposition exact UTC 不可用，拒絕建立母體：{arrival.arrival_time_id}"
+            )
+        try:
+            runtime_window = build_horizon_window(
+                deposition_ns,
+                runtime_days,
+                expected_start_ns=expected_start_ns,
+                expected_end_ns=expected_end_ns,
+                context=f"arrival[{arrival.arrival_time_id}]",
+            )
+            runtime_coverage = compute_horizon_coverage(
+                runtime_window,
+                expected_start_ns=expected_start_ns,
+                expected_end_ns=expected_end_ns,
+                canonical_start_ns=int(product.canonical.time_utc_ns[0]),
+                canonical_end_ns=int(product.canonical.time_utc_ns[-1]),
+                canonical_gaps=product.canonical.gaps,
+            )
+            observation_ns = arrival.metadata.get("observation_time_utc_ns")
+            selection_window = build_horizon_window(
+                observation_ns,
+                selection_days,
+                expected_start_ns=expected_start_ns,
+                expected_end_ns=expected_end_ns,
+                context=f"observation[{arrival.arrival_time_id}]",
+            )
+            selection_coverage = compute_horizon_coverage(
+                selection_window,
+                expected_start_ns=expected_start_ns,
+                expected_end_ns=expected_end_ns,
+                canonical_start_ns=int(product.canonical.time_utc_ns[0]),
+                canonical_end_ns=int(product.canonical.time_utc_ns[-1]),
+                canonical_gaps=product.canonical.gaps,
+            )
+        except (HorizonContractError, IndexError, TypeError, ValueError) as exc:
+            raise InputDerivationError(
+                f"gap-censored arrival window 無法建立：{arrival.arrival_time_id}: {exc}"
+            ) from exc
+        runtime_record = _gap_censoring_record(
+            window=runtime_window,
+            coverage=runtime_coverage,
+            canonical_gaps=product.canonical.gaps,
+            expected_axis_set=expected_set,
+            available_axis_set=available_set,
+        )
+        selection_record = _gap_censoring_record(
+            window=selection_window,
+            coverage=selection_coverage,
+            canonical_gaps=product.canonical.gaps,
+            expected_axis_set=expected_set,
+            available_axis_set=available_set,
+        )
+        record: dict[str, Any] = {
+            "arrival_time_id": arrival.arrival_time_id,
+            "study_site_id": arrival.study_site_id,
+            "analysis_region_id": region,
+            "flow_domain_id": product.flow_domain_id,
+            "arrival_time_utc": _utc_string(deposition_ns),
+            "horizon_start_utc": _utc_string(runtime_window.start_time_ns),
+            "horizon_end_utc": _utc_string(runtime_window.end_time_ns),
+            "max_backtrack_days": int(runtime_days),
+            "support_days": int(runtime_days),
+            "expected_step_count": runtime_window.expected_step_count,
+            "supported_step_count": runtime_coverage.supported_step_count,
+            "crossed_gap": runtime_coverage.crossed_gap,
+            "missing_utc": [_utc_string(value) for value in runtime_coverage.missing_time_ns],
+            "time_support_policy": GAP_CENSORED_HORIZON_POLICY_ID,
+            **runtime_record,
+            "censoring_policy": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+            "stop_at_first_gap": True,
+            "denominator_policy": DENOMINATOR_POLICY_ID,
+            "censored_by_data_gap": bool(runtime_coverage.crossed_gap),
+            "first_backward_gap_utc": runtime_record["first_gap_toward_backward_utc"],
+            "supported_hours_before_first_gap": runtime_record[
+                "supported_contiguous_hours_from_start"
+            ],
+            "arrival_time_available": True,
+            "deposition_time_available": True,
+            "observation_time_utc": _utc_string(int(observation_ns)),
+            "selection_horizon_start_utc": _utc_string(selection_window.start_time_ns),
+            "selection_horizon_end_utc": _utc_string(selection_window.end_time_ns),
+            "selection_support_days": int(selection_days),
+            "selection_expected_step_count": selection_window.expected_step_count,
+            "selection_supported_step_count": selection_coverage.supported_step_count,
+            "selection_crossed_gap": selection_coverage.crossed_gap,
+            "selection_missing_utc": [_utc_string(value) for value in selection_coverage.missing_time_ns],
+            "selection_censoring_required": selection_record["censoring_required"],
+            "selection_censored_by_data_gap": bool(selection_coverage.crossed_gap),
+            "selection_first_backward_gap_utc": selection_record[
+                "first_gap_toward_backward_utc"
+            ],
+            "selection_supported_hours_before_first_gap": selection_record[
+                "supported_contiguous_hours_from_start"
+            ],
+            "observation_time_available": True,
+            "selection_first_gap_toward_backward_utc": selection_record[
+                "first_gap_toward_backward_utc"
+            ],
+            "selection_first_gap_missing_start_utc": selection_record[
+                "first_gap_missing_start_utc"
+            ],
+            "selection_first_gap_missing_end_utc": selection_record[
+                "first_gap_missing_end_utc"
+            ],
+            "selection_supported_contiguous_step_count_from_start": selection_record[
+                "supported_contiguous_step_count_from_start"
+            ],
+            "selection_supported_contiguous_hours_from_start": selection_record[
+                "supported_contiguous_hours_from_start"
+            ],
+        }
+        records.append(record)
+    root_payload: dict[str, Any] = {
+        "manifest_kind": "ocm_gap_safe_arrival_horizon_manifest",
+        "schema_version": GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+        "status": "approved" if strict else "generated",
+        "design_version": config.design_version,
+        "time_standard": "UTC",
+        "policy": GAP_CENSORED_HORIZON_POLICY_ID,
+        "gap_censoring_policy": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+        "stop_at_first_gap": True,
+        "denominator_policy": DENOMINATOR_POLICY_ID,
+        "gap_policy": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+        "deposition_availability_policy": DEPOSITION_AVAILABILITY_POLICY_ID,
+        "max_backtrack_days": int(runtime_days),
+        "support_days": int(runtime_days),
+        "selection_support_days": int(selection_days),
+        "runtime_support_days": int(runtime_days),
+        "stop_at_data_gap": True,
+        "provenance": _provenance(
+            method_id=GAP_CENSORED_HORIZON_METHOD_ID,
+            source_hashes=source_hashes,
+            expected_time_count=int(expected_axis.size),
+            selection_support_days=int(selection_days),
+            runtime_support_days=int(runtime_days),
+            gap_policy=OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+            deposition_availability_policy=DEPOSITION_AVAILABILITY_POLICY_ID,
+            denominator_policy=DENOMINATOR_POLICY_ID,
+            no_fill_policy="no_nearest_no_zero_no_extrapolation",
+            status_semantics=(
+                "approved means all gaps are enumerated and first-gap censoring is executable; "
+                "it does not mean continuous coverage"
+            ),
+            censoring_required_records=sum(int(item["censoring_required"]) for item in records),
+            selection_censoring_required_records=sum(
+                int(item["selection_censoring_required"]) for item in records
+            ),
+        ),
+        "records": records,
+    }
+    return root_payload
 
 
 def _gap_safe_payload(
@@ -4654,6 +5241,18 @@ def _gap_safe_payload(
     2024-01-02T01:00:00Z 會明確呈現 2024-01-01T01:00:00Z 至自身共 25 個節點，不能
     把 global 7 日預設誤讀成該展示案例的回推期。
     """
+
+    if _gap_censoring_enabled(config):
+        return _gap_censored_payload(
+            config=config,
+            ocm_by_region=ocm_by_region,
+            arrivals=arrivals,
+            expected_axis=expected_axis,
+            source_hashes=source_hashes,
+            max_backtrack_days=max_backtrack_days,
+            strict=strict,
+            horizon_settings=horizon_settings,
+        )
 
     records: list[dict[str, Any]] = []
     expected_set = {int(value) for value in expected_axis}
@@ -5414,6 +6013,8 @@ def _apply_bed_residence_sampling_by_site(
     *,
     bed_residence: BedResidenceTimeConfig,
     design_version: str,
+    canonical_available_time_ns_by_site: Mapping[str, Sequence[int]] | None = None,
+    gap_censoring_enabled: bool = False,
 ) -> dict[str, list[ArrivalTime]]:
     """把五站 observation anchors 轉為 deposition UTC，回傳供後續 builder 共用的新 mapping。
 
@@ -5425,11 +6026,17 @@ def _apply_bed_residence_sampling_by_site(
     180/90 日 window，該證據仍由 selector 和 gap validator 建立。
     """
 
-    age_offsets = sample_bed_residence_age_hours(
-        maximum_age_days=bed_residence.maximum_age_days,
-        sample_count=bed_residence.sample_count_per_site,
-        seed=bed_residence.sampling_seed,
+    age_offsets, _, sampling_audit_records = _sample_bed_residence_age_offsets(
+        arrivals_by_site,
+        bed_residence=bed_residence,
+        canonical_available_time_ns_by_site=canonical_available_time_ns_by_site,
+        gap_censoring_enabled=gap_censoring_enabled,
     )
+    age_vector_hash = sha256(
+        json.dumps(
+            list(age_offsets), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    ).hexdigest()
     transformed: dict[str, list[ArrivalTime]] = {}
     for site_id in sorted(arrivals_by_site):
         site_arrivals = tuple(arrivals_by_site[site_id])
@@ -5437,16 +6044,200 @@ def _apply_bed_residence_sampling_by_site(
             raise InputDerivationError(
                 f"bed-residence site mapping key mismatch: {site_id}"
             )
-        transformed[site_id] = list(
-            apply_bed_residence_sampling(
-                site_arrivals,
-                age_hours=age_offsets,
-                sampling_seed=bed_residence.sampling_seed,
-                maximum_age_days=bed_residence.maximum_age_days,
-                design_version=design_version,
+        apply_kwargs: dict[str, Any] = {
+            "age_hours": age_offsets,
+            "sampling_seed": bed_residence.sampling_seed,
+            "maximum_age_days": bed_residence.maximum_age_days,
+            "design_version": design_version,
+        }
+        if gap_censoring_enabled:
+            if sampling_audit_records is None:
+                raise InputDerivationError(
+                    "gap-conditioned sampler 未提供可傳遞至 arrival metadata 的 rejection audit"
+                )
+            # bed_residence.apply_bed_residence_sampling 會依每站排序後的 stratum，
+            # 將對應 audit 寫入正式欄位；這比在此層把同一份整體 audit 複製到 50 筆
+            # arrival 更不易造成跨 rank 誤綁。
+            apply_kwargs.update(
+                {
+                    "sampling_method_id": BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
+                    "availability_conditioning_policy": DEPOSITION_AVAILABILITY_POLICY_ID,
+                    "availability_rejection_audit": sampling_audit_records,
+                }
             )
-        )
+        converted = list(apply_bed_residence_sampling(site_arrivals, **apply_kwargs))
+        # 這些欄位讓每筆沉底起點都能回指同一個五站共用 age vector、拒絕規則與
+        # rejection audit；不把缺口成員改寫成「沒有進入邊界」。metadata 是既有
+        # ArrivalTime schema 的延伸，不影響 arrival ID 或 runtime 時間解析。
+        for arrival in converted:
+            arrival.metadata.update(
+                {
+                    "bed_residence_age_offsets_hours_sha256": age_vector_hash,
+                }
+            )
+        transformed[site_id] = converted
     return transformed
+
+
+def _sample_bed_residence_age_offsets(
+    arrivals_by_site: Mapping[str, Sequence[ArrivalTime]],
+    *,
+    bed_residence: BedResidenceTimeConfig,
+    canonical_available_time_ns_by_site: Mapping[str, Sequence[int]] | None,
+    gap_censoring_enabled: bool,
+) -> tuple[
+    tuple[int, ...],
+    Mapping[str, Any],
+    tuple[Any, ...] | None,
+]:
+    """呼叫 gap-conditioned sampler，並把其回傳正規化為 age vector 與 audit。
+
+    gap-conditioned sampler 由 bed-residence 模組維護抽樣演算法；本層只負責提供五站
+    observation rank 與每站 canonical exact-hour set，避免 input builder 自行複製一套
+    隨機邏輯。為兼容短暫的實作介面差異，依函式簽名填入同義參數；找不到新 sampler
+    時，正式截尾政策 fail closed，legacy 才退回既有 deterministic sampler。
+    """
+
+    if not gap_censoring_enabled:
+        return (
+            sample_bed_residence_age_hours(
+                maximum_age_days=bed_residence.maximum_age_days,
+                sample_count=bed_residence.sample_count_per_site,
+                seed=bed_residence.sampling_seed,
+            ),
+            {"policy": BED_RESIDENCE_SAMPLING_POLICY_ID, "rejected_candidates": 0},
+            None,
+        )
+    if canonical_available_time_ns_by_site is None:
+        raise InputDerivationError("gap-conditioned bed sampler 缺少五站 canonical available-time set")
+
+    observation_times: dict[str, tuple[int, ...]] = {}
+    for site_id in sorted(arrivals_by_site):
+        rows = sorted(
+            arrivals_by_site[site_id],
+            key=lambda item: (int(item.time_utc_ns), item.arrival_time_id),
+        )
+        if len(rows) != bed_residence.sample_count_per_site:
+            raise InputDerivationError(f"{site_id} observation rank 數量不符 bed sample_count")
+        observation_times[site_id] = tuple(int(item.time_utc_ns) for item in rows)
+    available = {
+        str(site_id): tuple(sorted({int(value) for value in values}))
+        for site_id, values in canonical_available_time_ns_by_site.items()
+    }
+    sampler = None
+    for name in (
+        "sample_bed_residence_age_hours_conditioned_on_availability",
+        "sample_bed_residence_age_hours_gap_aware",
+        "sample_gap_conditioned_bed_residence_age_hours",
+        "sample_bed_residence_age_hours_gap_conditioned",
+        "sample_bed_residence_age_hours_with_availability",
+    ):
+        candidate = getattr(_bed_residence_module, name, None)
+        if callable(candidate):
+            sampler = candidate
+            break
+    if sampler is None:
+        raise InputDerivationError(
+            "正式缺時截尾政策需要 bed_residence gap-conditioned sampler；目前未匯出"
+        )
+
+    # 依 callable 的實際參數名稱準備 kwargs；若另一實作者採用同義名稱，仍可在不
+    # 偷猜位置參數的前提下接入。所有候選資料都以 canonical integer UTC 傳遞。
+    signature = inspect.signature(sampler)
+    semantic_values: dict[str, Any] = {
+        "maximum_age_days": bed_residence.maximum_age_days,
+        "sample_count": bed_residence.sample_count_per_site,
+        "sample_count_per_site": bed_residence.sample_count_per_site,
+        "seed": bed_residence.sampling_seed,
+        "sampling_seed": bed_residence.sampling_seed,
+        "observation_times_by_site": observation_times,
+        "observation_time_utc_ns_by_site": observation_times,
+        "available_time_ns_by_site": available,
+        "canonical_available_time_ns_by_site": available,
+        "available_utc_ns_by_site": available,
+    }
+    kwargs: dict[str, Any] = {}
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    for name, parameter in signature.parameters.items():
+        if name in semantic_values:
+            kwargs[name] = semantic_values[name]
+        elif parameter.default is inspect.Parameter.empty and parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            raise InputDerivationError(f"gap-conditioned sampler 缺少可辨識參數：{name}")
+    if accepts_kwargs:
+        kwargs.update(
+            {
+                "observation_time_utc_ns_by_site": observation_times,
+                "canonical_available_time_ns_by_site": available,
+            }
+        )
+    try:
+        result = sampler(**kwargs)
+    except Exception as exc:
+        raise InputDerivationError(
+            f"gap-conditioned bed sampler failed closed：{type(exc).__name__}: {exc}"
+        ) from exc
+
+    audit: Mapping[str, Any] = {}
+    audit_records: tuple[Any, ...] | None = None
+    raw_offsets: Any = None
+    if isinstance(result, Mapping):
+        raw_offsets = result.get("age_offsets_hours", result.get("age_hours"))
+        raw_audit = result.get("rejection_audit", result.get("audit", {}))
+        audit = raw_audit if isinstance(raw_audit, Mapping) else {"detail": raw_audit}
+    elif isinstance(result, tuple) and len(result) == 2:
+        raw_offsets, raw_audit = result
+        if isinstance(raw_audit, Mapping):
+            audit = raw_audit
+        elif isinstance(raw_audit, (tuple, list)):
+            audit_records = tuple(raw_audit)
+            audit = {
+                "strata": [
+                    item.as_metadata() if callable(getattr(item, "as_metadata", None)) else item
+                    for item in raw_audit
+                ]
+            }
+        else:
+            audit = {"detail": raw_audit}
+    else:
+        raw_offsets = getattr(result, "age_offsets_hours", None)
+        if raw_offsets is None:
+            raw_offsets = getattr(result, "age_hours", None)
+        raw_audit = getattr(result, "rejection_audit", getattr(result, "audit", {}))
+        if isinstance(raw_audit, Mapping):
+            audit = raw_audit
+        elif isinstance(raw_audit, (tuple, list)):
+            audit_records = tuple(raw_audit)
+            audit = {
+                "strata": [
+                    item.as_metadata() if callable(getattr(item, "as_metadata", None)) else item
+                    for item in raw_audit
+                ]
+            }
+        else:
+            audit = {"detail": raw_audit}
+    if raw_offsets is None:
+        raise InputDerivationError("gap-conditioned sampler 未回傳 age_offsets_hours")
+    try:
+        offsets = tuple(int(value) for value in raw_offsets)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InputDerivationError("gap-conditioned sampler age vector 不是整數小時") from exc
+    if len(offsets) != bed_residence.sample_count_per_site:
+        raise InputDerivationError("gap-conditioned sampler age vector 數量不符")
+    serialisable_audit = json.loads(json.dumps(dict(audit), ensure_ascii=False, default=str))
+    if audit_records is None:
+        # 目前正式 sampler 回傳 dataclass result；若未來相容介面只提供已序列化
+        # mapping，無法安全重建 bed_residence 的型別化 audit，正式政策必須拒絕而不
+        # 嘗試猜測欄位或自行重抽。
+        raise InputDerivationError(
+            "gap-conditioned sampler rejection audit 缺少型別化逐分層 records"
+        )
+    return offsets, serialisable_audit, audit_records
 
 
 def build_input_derivatives(
@@ -5498,6 +6289,17 @@ def build_input_derivatives(
             "generic shared horizon 不得同時使用 pilot_arrival_utc；請以同一母體選取 arrival"
         )
     bed_residence = config.scenarios.bed_residence_time
+    gap_policy, deposition_policy, denominator_policy, stop_at_data_gap = _gap_censoring_contract(
+        config
+    )
+    gap_censoring_enabled = _gap_censoring_enabled(config)
+    if gap_policy is not None and not gap_censoring_enabled:
+        raise InputDerivationError(
+            "缺時截尾 policy 必須完整明示 gap、沉底可用性、分母 policy，且 "
+            "boundaries.stop_at_data_gap=true"
+        )
+    if gap_censoring_enabled and bed_residence is None:
+        raise InputDerivationError("缺時截尾 policy 目前只適用 random bed-residence suite")
     if bed_residence is not None and not horizon_settings.bed_residence_enabled:
         raise InputDerivationError(
             "bed residence config 必須明示 inputs.backtrack_support_days 才能建立共同包絡"
@@ -5701,6 +6503,7 @@ def build_input_derivatives(
                 observation_years=observation_years,
                 replicates=selection_replicates,
                 selection_policy=selection_policy,
+                allow_gap_censored_anchor=gap_censoring_enabled,
             )
             explicit = pilot_arrivals.get(site_id)
             # A 區 exact pair 必須先建立共同 UTC，再各自套用明示 replacement；若在
@@ -5738,6 +6541,7 @@ def build_input_derivatives(
             max_backtrack_days=horizon_settings.selection_days,
             design_version=config.design_version,
             strict=selection_strict,
+            allow_gap_censored_anchor=gap_censoring_enabled,
         )
         if set(pilot_arrivals) == {"gongliao", "guishan"}:
             # paired clone 完成後，兩站都以自己的 baseline arrival identity 建立固定
@@ -5774,6 +6578,14 @@ def build_input_derivatives(
                 arrivals_by_site,
                 bed_residence=bed_residence,
                 design_version=config.design_version,
+                canonical_available_time_ns_by_site={
+                    site.study_site_id: tuple(
+                        int(value)
+                        for value in ocm_by_region[site.analysis_region_id].canonical.time_utc_ns
+                    )
+                    for site in config.study_sites
+                },
+                gap_censoring_enabled=gap_censoring_enabled,
             )
             all_arrivals = tuple(
                 item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site]
@@ -6420,11 +7232,19 @@ def validate_input_derivatives(
         except Exception as exc:
             errors.append(f"runtime_spatial_support_binding_invalid:{type(exc).__name__}")
     horizon_settings: HorizonSettings | None = None
+    gap_censoring_enabled = False
     if config is not None:
         try:
             horizon_settings = resolve_configured_horizon(config)
         except HorizonContractError as exc:
             errors.append(f"horizon_config_invalid:{exc}")
+        try:
+            gap_censoring_enabled = _gap_censoring_enabled(config)
+            configured_gap_policy = _gap_censoring_contract(config)
+            if configured_gap_policy[0] is not None and not gap_censoring_enabled:
+                errors.append("gap_censoring_policy_incomplete_or_stop_disabled")
+        except Exception as exc:
+            errors.append(f"gap_censoring_policy_invalid:{type(exc).__name__}")
     # generic policy 一旦出現就必須走完整的 shared semantic validator；即使 config 沒有
     # 提供，也不能因 unknown/missing policy 自動套回 legacy 7 日檢查。validator 會只讀
     # forcing inventory 的 expected period 與 OCM canonical bounds/gaps 重算每筆 row。
@@ -6457,7 +7277,10 @@ def validate_input_derivatives(
             config=config,
             # 共同母體的完整支援窗是重用前提，與本次是否正式發布無關。即使只跑
             # 七日工程驗證，三十日母體較早的缺口也不能降為警告而繼續執行。
-            strict=True,
+            # 舊 validator 將 crossed gap 視為 strict error；新 policy 將同一份
+            # exact coverage 重新核對後改由 DATA_GAP 截尾，因此只放寬這個已完整
+            # 明示的 bed-residence policy，未知／不完整設定仍維持 fail closed。
+            strict=not gap_censoring_enabled,
         )
         errors.extend(generic_result.errors)
         warnings.extend(generic_result.warnings)
@@ -6600,10 +7423,30 @@ def validate_input_derivatives(
                 or crossed_gap is not (len(missing) > 0)
             ):
                 errors.append("gap_safe_record_consistency_invalid")
-        if formal and any(
+        if formal and not gap_censoring_enabled and any(
             row.get("crossed_gap") is not False for row in gap_rows if isinstance(row, Mapping)
         ):
             errors.append("gap_safe_horizon_crosses_gap")
+        if gap_censoring_enabled:
+            if gap.get("policy") != OBSERVED_GAP_CENSORED_STOP_POLICY_ID:
+                errors.append("gap_censoring_root_policy_mismatch")
+            if gap.get("gap_policy") != OBSERVED_GAP_CENSORED_STOP_POLICY_ID:
+                errors.append("gap_censoring_gap_policy_missing")
+            if gap.get("deposition_availability_policy") != DEPOSITION_AVAILABILITY_POLICY_ID:
+                errors.append("gap_censoring_deposition_policy_mismatch")
+            if gap.get("denominator_policy") != DENOMINATOR_POLICY_ID:
+                errors.append("gap_censoring_denominator_policy_mismatch")
+            if gap.get("stop_at_data_gap") is not True:
+                errors.append("gap_censoring_stop_at_data_gap_invalid")
+            for row in gap_rows:
+                if not isinstance(row, Mapping):
+                    continue
+                if type(row.get("censoring_required")) is not bool:
+                    errors.append("gap_censoring_record_censoring_required_invalid")
+                if row.get("crossed_gap") is not row.get("censoring_required"):
+                    errors.append("gap_censoring_record_crossing_mismatch")
+                if row.get("crossed_gap") and not row.get("first_gap_toward_backward_utc"):
+                    errors.append("gap_censoring_record_first_gap_missing")
     # pilot replacement 維持 250 筆總量，但它的非潮汐 label 不是正式 48+2 strata；
     # 這裡在既有 formal loader 之外再保存一個可搜尋的明確錯誤。非正式 validator 則
     # 檢查 25-node、1 日 gap record 與 arrival metadata 是否彼此一致，避免只因 count
@@ -7328,7 +8171,9 @@ def create_release_config(
     arrival_selection_binding = _arrival_selection_release_binding(candidate_config)
     rewritten["release_binding"] = {
         "schema_version": (
-            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if source_bed is not None and _gap_censoring_enabled(candidate_config)
+            else BED_RESIDENCE_INPUT_SCHEMA_VERSION
             if source_bed is not None
             else DERIVED_INPUT_SCHEMA_VERSION
         ),
@@ -7344,6 +8189,16 @@ def create_release_config(
         # artifact index hash 推測 2024 forcing 與 2025 observation 的分離仍然成立。
         "arrival_selection_binding": arrival_selection_binding,
     }
+    if _gap_censoring_enabled(candidate_config):
+        # release 的 H／mode 只改執行窗口；缺時截尾與統計分母必須 exact 綁在共同
+        # input，避免六份 release 其中一份悄悄改成跨 gap 或把 data_gap 當 no-entry。
+        rewritten["release_binding"].update(
+            {
+                "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+                "deposition_availability_policy_id": DEPOSITION_AVAILABILITY_POLICY_ID,
+                "denominator_policy_id": DENOMINATOR_POLICY_ID,
+            }
+        )
     if not blockers and formal:
         rewritten["config_status"] = "approved"
     elif not formal:
@@ -7391,6 +8246,7 @@ def validate_release_config(
     raw_inputs = payload.get("inputs")
     support_declared = isinstance(raw_inputs, Mapping) and "backtrack_support_days" in raw_inputs
     release_config: ProjectConfig | None = None
+    gap_enabled = False
     try:
         release_config = ProjectConfig.model_validate(payload)
     except Exception as exc:
@@ -7422,6 +8278,30 @@ def validate_release_config(
             for field in expected_arrival_binding
         ):
             errors.append("release_arrival_selection_binding_mismatch")
+        try:
+            gap_enabled = _gap_censoring_enabled(release_config)
+            gap_binding_keys = {
+                "gap_policy_id",
+                "deposition_availability_policy_id",
+                "denominator_policy_id",
+            }
+            actual_gap_keys = set(binding).intersection(gap_binding_keys)
+            if gap_enabled:
+                if actual_gap_keys != gap_binding_keys:
+                    errors.append("release_gap_censoring_binding_missing")
+                else:
+                    expected_gap_values = {
+                        "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+                        "deposition_availability_policy_id": DEPOSITION_AVAILABILITY_POLICY_ID,
+                        "denominator_policy_id": DENOMINATOR_POLICY_ID,
+                    }
+                    for field, expected in expected_gap_values.items():
+                        if binding.get(field) != expected:
+                            errors.append(f"release_gap_censoring_binding_mismatch:{field}")
+            elif actual_gap_keys:
+                errors.append("release_gap_censoring_binding_unexpected")
+        except Exception as exc:
+            errors.append(f"release_gap_censoring_binding_invalid:{type(exc).__name__}")
     if binding.get("source_config_template_sha256") and not _SHA256_RE.fullmatch(
         str(binding["source_config_template_sha256"])
     ):
@@ -7631,7 +8511,9 @@ def validate_release_config(
                 else None
             )
             expected_binding_schema_version = (
-                BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                if raw_bed_residence is not None and gap_enabled
+                else BED_RESIDENCE_INPUT_SCHEMA_VERSION
                 if raw_bed_residence is not None
                 else DERIVED_INPUT_SCHEMA_VERSION
             )
