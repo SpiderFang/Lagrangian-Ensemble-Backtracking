@@ -219,6 +219,42 @@ def test_chunked_source_never_reads_more_than_configured_feature_block(tmp_path:
     assert max(recorded) <= _config().feature_block_size
 
 
+def test_one_hour_gap_reads_each_field_once_without_small_nfs_blocks(tmp_path: Path) -> None:
+    """短缺口應一次讀兩端完整欄位，避免正式 NFS 月檔出現數千次小讀取。"""
+
+    source, _ = _source()
+    masked = source.masked(source.times_utc_ns[100:101])
+    calls: list[tuple[str, object, object]] = []
+    original = masked.read_times
+
+    def recording_read(*args: object, **kwargs: object) -> np.ndarray:
+        calls.append(
+            (
+                str(args[1]),
+                kwargs.get("flat_start"),
+                kwargs.get("flat_stop"),
+            )
+        )
+        return original(*args, **kwargs)
+
+    masked.read_times = recording_read  # type: ignore[method-assign]
+    build_reconstruction_patch(masked, tmp_path, flow_id="short", config=_config())
+    assert len(calls) == 6
+    assert {name for name, _, _ in calls} == {
+        "hvel",
+        "vertical_velocity",
+        "zcor",
+        "elev",
+        "diffusivity",
+        "wetdry_elem",
+    }
+    assert all(
+        (start is None and stop is None)
+        or (name == "wetdry_elem" and start == 0 and stop == 4)
+        for name, start, stop in calls
+    )
+
+
 def test_wetdry_mixed_support_is_nan_and_flagged(tmp_path: Path) -> None:
     """兩端一乾一濕不得創造海域，patch 以 NaN 與 quality flag 保存限制。"""
 

@@ -683,8 +683,12 @@ def _state_space_block(
     config: ReconstructionConfig,
     flat_start: int,
     flat_stop: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """以一個 spatial feature block 產生 long-gap 預測與 row quality flags。"""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """產生 long-gap 預測、row flags 與已讀取的訓練區塊。
+
+    第三個回傳值讓 Kz 物理範圍 gate 重用同一批雙側觀測，不再對 NFS 月檔做第二次
+    完全相同的 strided read；其他欄位可直接忽略它。
+    """
 
     left = source.read_times(
         left_times, field_name, flat_start=flat_start, flat_stop=flat_stop
@@ -754,7 +758,7 @@ def _state_space_block(
     row_flags |= QUALITY_STATE_SPACE
     if np.any(invalid):
         row_flags |= QUALITY_NONFINITE_CELL
-    return prediction, row_flags
+    return prediction, row_flags, training
 
 
 def _linear_short_block(
@@ -885,14 +889,33 @@ def _reconstruct_gap(
     for field_name in CONTINUOUS_FIELD_NAMES:
         shape = source.field_shapes[field_name]
         feature_count = int(np.prod(shape, dtype=np.int64))
-        output = np.empty((gap.missing_times_ns.size, feature_count), dtype=np.float64)
-        for start in range(0, feature_count, config.feature_block_size):
-            stop = min(feature_count, start + config.feature_block_size)
-            if is_short:
-                block = _linear_short_block(source, field_name, gap, start, stop)
-                flags = np.full(gap.missing_times_ns.size, QUALITY_SHORT_LINEAR, dtype=np.uint16)
-            else:
-                block, flags = _state_space_block(
+        if is_short:
+            # 單小時缺口只需兩個 endpoint，最大 A 區兩列 hvel 約 50 MiB，可安全一次
+            # 連續讀取。這避免對 NFS 月檔依 4,096 features 重複數千次小讀取；長缺口
+            # 仍維持下方 block path，避免把 192 個 context rows 全載入記憶體。
+            supports = source.read_times(
+                np.asarray([gap.left_time_ns, gap.right_time_ns], dtype=np.int64),
+                field_name,
+            ).astype(np.float64)
+            output = (supports[0] + 0.5 * (supports[1] - supports[0]))[None, :]
+            output[:, ~np.isfinite(supports).all(axis=0)] = np.nan
+            arrays["quality_flags"] |= QUALITY_SHORT_LINEAR
+            if field_name == "diffusivity":
+                output, constraint_flags = _enforce_constraints(
+                    field_name,
+                    output,
+                    source,
+                    config,
+                    flat_start=0,
+                    flat_stop=feature_count,
+                    training_values=supports,
+                )
+                arrays["quality_flags"] |= constraint_flags
+        else:
+            output = np.empty((gap.missing_times_ns.size, feature_count), dtype=np.float64)
+            for start in range(0, feature_count, config.feature_block_size):
+                stop = min(feature_count, start + config.feature_block_size)
+                block, flags, training_block = _state_space_block(
                     source,
                     field_name,
                     gap,
@@ -902,26 +925,21 @@ def _reconstruct_gap(
                     start,
                     stop,
                 )
-            block = block.reshape(gap.missing_times_ns.size, -1)
-            if field_name == "diffusivity":
-                block_reshaped, block_constraint_flags = _enforce_constraints(
-                    field_name,
-                    block,
-                    source,
-                    config,
-                    flat_start=start,
-                    flat_stop=stop,
-                    training_values=source.read_times(
-                        np.concatenate((left_times, right_times)),
+                block = block.reshape(gap.missing_times_ns.size, -1)
+                if field_name == "diffusivity":
+                    block_reshaped, block_constraint_flags = _enforce_constraints(
                         field_name,
+                        block,
+                        source,
+                        config,
                         flat_start=start,
                         flat_stop=stop,
-                    ),
-                )
-                block = block_reshaped.reshape(gap.missing_times_ns.size, -1)
-                arrays["quality_flags"] |= block_constraint_flags
-            output[:, start:stop] = block
-            arrays["quality_flags"] |= flags
+                        training_values=training_block,
+                    )
+                    block = block_reshaped.reshape(gap.missing_times_ns.size, -1)
+                    arrays["quality_flags"] |= block_constraint_flags
+                output[:, start:stop] = block
+                arrays["quality_flags"] |= flags
         shaped = output.reshape((gap.missing_times_ns.size, *shape))
         # zcor 的層序檢查需要看到完整 node×layer 軸；其他連續場只需保留 finite
         # provenance。diffusivity 已在 block 階段用鄰近訓練 range 檢查，這裡不重讀全域。
@@ -943,11 +961,15 @@ def _reconstruct_gap(
     wet_shape = source.field_shapes["wetdry_elem"]
     wet_features = int(np.prod(wet_shape, dtype=np.int64))
     wet_output = np.empty((gap.missing_times_ns.size, wet_features), dtype=np.float32)
-    for start in range(0, wet_features, config.feature_block_size):
-        stop = min(wet_features, start + config.feature_block_size)
-        block, flags = _wetdry_block(source, gap, start, stop)
-        wet_output[:, start:stop] = block
+    if is_short:
+        wet_output, flags = _wetdry_block(source, gap, 0, wet_features)
         arrays["quality_flags"] |= flags
+    else:
+        for start in range(0, wet_features, config.feature_block_size):
+            stop = min(wet_features, start + config.feature_block_size)
+            block, flags = _wetdry_block(source, gap, start, stop)
+            wet_output[:, start:stop] = block
+            arrays["quality_flags"] |= flags
     arrays["wetdry_elem"] = wet_output.reshape((gap.missing_times_ns.size, *wet_shape))
     return arrays
 
