@@ -50,6 +50,7 @@ from shapely.geometry import Point
 
 from .bed_residence import BedResidenceTiming, resolve_bed_residence_timing
 from .config import (
+    CURRENT_DESIGN_VERSION,
     OCM_INTERPOLATION_BACKEND_NUMBA_V1,
     ProjectConfig,
     load_config,
@@ -58,6 +59,7 @@ from .config import (
 from .diffusion import DiffusionCoefficients, SmagorinskySettings
 from .engine import EngineSettings
 from .forcing_window import ForcingWindowManager
+from .gap_policy import APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID
 from .manifests import (
     BoundaryGeometryBundle,
     ScenarioInputs,
@@ -1291,19 +1293,34 @@ def _validate_formal_ocm_gap_support(
             raise ValueError(f"arrival {arrival.arrival_time_id} 的 study_site_id 未登錄")
         arrival_flows.append((arrival, flow_id))
     has_residual_gaps = any(gaps_by_flow.values())
+    reconstruction_enabled = (
+        config.inputs.time_axis_contract.get("reconstruction_policy")
+        == APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID
+        and config.design_version == CURRENT_DESIGN_VERSION
+    )
     if gap_censoring_enabled:
-        safe_manifest = config.inputs.ocm_gap_safe_arrival_manifest
-        if type(safe_manifest) is not str or not safe_manifest.strip():
-            raise ValueError(
-                "gap-censored formal runtime 必須明示 ocm_gap_safe_arrival_manifest"
+        # reconstruction baseline 以已登錄 patch 跨越 approved gaps；沒有該 artifact
+        # 時才退回 gap-safe arrival manifest。兩者都仍保留 exact deposition／period
+        # 檢查，避免把「有 patch」誤當成完整研究期或允許未知缺檔外插。
+        support_manifest = (
+            config.inputs.ocm_gap_reconstruction_manifest
+            if reconstruction_enabled
+            else config.inputs.ocm_gap_safe_arrival_manifest
+        )
+        if type(support_manifest) is not str or not support_manifest.strip():
+            expected_name = (
+                "ocm_gap_reconstruction_manifest"
+                if reconstruction_enabled
+                else "ocm_gap_safe_arrival_manifest"
             )
+            raise ValueError(f"gap-censored formal runtime 必須明示 {expected_name}")
         if config.boundaries.stop_at_data_gap is not True:
             raise ValueError("gap-censored formal runtime 必須設定 stop_at_data_gap=true")
         # input manifest 的完整 hash／path closure 由
         # _validate_declared_support_release 驗證；這裡再確認其欄位確實存在，避免只
         # 依 runtime 開關便放行一份未登錄的截尾政策。
-        if not isinstance(safe_manifest, str) or Path(safe_manifest).is_absolute():
-            raise ValueError("ocm_gap_safe_arrival_manifest 必須是相對 manifest reference")
+        if not isinstance(support_manifest, str) or Path(support_manifest).is_absolute():
+            raise ValueError("formal OCM support manifest 必須是相對 manifest reference")
         for arrival, flow_id in arrival_flows:
             expected_step_ns = step_by_flow[flow_id]
             period_start_ns, period_end_ns, _ = _formal_period_contract(
@@ -2079,6 +2096,7 @@ class RuntimeRequestFactory:
         geometries: BoundaryGeometryBundle,
         ocm_native_root: str | Path,
         nww_analysis_root: str | Path | None,
+        ocm_reconstruction_root: str | Path | None = None,
         experiment_case_id: str,
         run_kind: str = "pilot",
     ) -> None:
@@ -2104,6 +2122,22 @@ class RuntimeRequestFactory:
         # root gate 只檢查容器本身；no-Stokes 分支刻意不把傳入的 NWW 物件轉成 Path，
         # 以保證錯誤路徑、缺失路徑或會觸發 __fspath__ 的 sentinel 都不會被探查。
         self._ocm_root = _validated_root(ocm_native_root, label="ocm_native_root")
+        self._ocm_reconstruction_root = (
+            _validated_root(ocm_reconstruction_root, label="ocm_reconstruction_root")
+            if ocm_reconstruction_root is not None
+            else None
+        )
+        reconstruction_policy = config.inputs.time_axis_contract.get("reconstruction_policy")
+        if (
+            reconstruction_policy == APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID
+            and config.design_version == CURRENT_DESIGN_VERSION
+            and config.inputs.ocm_gap_reconstruction_manifest
+            and self._ocm_reconstruction_root is None
+        ):
+            raise ValueError(
+                "approved OCM reconstruction policy 已綁定 manifest，必須提供 "
+                "ocm_reconstruction_root 或其設定的環境變數"
+            )
         if include_stokes:
             self._nww_root = _validated_root(nww_analysis_root, label="nww_analysis_root")
         else:
@@ -2406,6 +2440,7 @@ class RuntimeRequestFactory:
                 projection=projection,
                 ocm_root=self._ocm_root,
                 nww_root=self._nww_root,
+                reconstruction_root=self._ocm_reconstruction_root,
                 max_resident_months=self._max_resident_months,
                 use_numba_kernel=self._ocm_use_numba_kernel,
                 physics_kernel_backend=self._physics_kernel_backend,
@@ -2562,6 +2597,7 @@ def _open_run_controller(
     config_path: str | Path,
     ocm_native_root: str | Path,
     nww_analysis_root: str | Path | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
     expected_run_kind: str | None = None,
@@ -2597,14 +2633,19 @@ def _open_run_controller(
     # 所有 immutable binding 均已通過後才建立 factory；其 constructor 只建立 lookup，並
     # 不建立 ForcingWindowManager。controller 也只載入 plan/progress topology，不會自動
     # 執行 shard 或 reconcile，forcing 必須等 caller 明確執行後才由 request lazy 開啟。
+    factory_kwargs: dict[str, object] = {
+        "config": config,
+        "scenario_inputs": scenario_inputs,
+        "geometries": geometries,
+        "ocm_native_root": ocm_native_root,
+        "nww_analysis_root": nww_analysis_root,
+        "experiment_case_id": experiment_case_id,
+        "run_kind": run_kind,
+    }
+    if ocm_reconstruction_root is not None:
+        factory_kwargs["ocm_reconstruction_root"] = ocm_reconstruction_root
     factory = RuntimeRequestFactory(
-        config=config,
-        scenario_inputs=scenario_inputs,
-        geometries=geometries,
-        ocm_native_root=ocm_native_root,
-        nww_analysis_root=nww_analysis_root,
-        experiment_case_id=experiment_case_id,
-        run_kind=run_kind,
+        **factory_kwargs,
     )
     return RunController(
         root,
@@ -2621,6 +2662,7 @@ def open_run_controller(
     config_path: str | Path,
     ocm_native_root: str | Path,
     nww_analysis_root: str | Path | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
 ) -> RunController:
@@ -2636,6 +2678,7 @@ def open_run_controller(
         config_path=config_path,
         ocm_native_root=ocm_native_root,
         nww_analysis_root=nww_analysis_root,
+        ocm_reconstruction_root=ocm_reconstruction_root,
         resume=resume,
         checkpoint_root=checkpoint_root,
     )
@@ -2647,6 +2690,7 @@ def open_pilot_run_controller(
     config_path: str | Path,
     ocm_native_root: str | Path,
     nww_analysis_root: str | Path | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
 ) -> RunController:
@@ -2657,6 +2701,7 @@ def open_pilot_run_controller(
         config_path=config_path,
         ocm_native_root=ocm_native_root,
         nww_analysis_root=nww_analysis_root,
+        ocm_reconstruction_root=ocm_reconstruction_root,
         resume=resume,
         checkpoint_root=checkpoint_root,
         expected_run_kind="pilot",
@@ -2669,6 +2714,7 @@ def open_formal_run_controller(
     config_path: str | Path,
     ocm_native_root: str | Path,
     nww_analysis_root: str | Path | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
 ) -> RunController:
@@ -2679,6 +2725,7 @@ def open_formal_run_controller(
         config_path=config_path,
         ocm_native_root=ocm_native_root,
         nww_analysis_root=nww_analysis_root,
+        ocm_reconstruction_root=ocm_reconstruction_root,
         resume=resume,
         checkpoint_root=checkpoint_root,
         expected_run_kind="formal",

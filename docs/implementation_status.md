@@ -9,7 +9,7 @@
 | 領域 | 目前可由程式與測試確認的內容 | 正式性界線 |
 |---|---|---|
 | 設定與輸入 | 設定、來源 manifest、OCM／NWW3 schema、UTC 軸、幾何與 dynamic pair 的 strict loader／validator | 仍須以當次 accepted-product inventory 與正式 release manifest 通過 gate |
-| forcing | OCM native 三維 current、OCM surface selector、NWW3 analysis、有限水深 Stokes、月份視窗與 cache | 只讀已驗收產品；缺值不補零、未知跨月／跨網格外插拒絕 |
+| forcing 與缺口重建 | OCM native 三維 current、OCM surface selector、NWW3 analysis、有限水深 Stokes、月份視窗與 cache；已知 OCM 內部缺時可由 `ocm_reconstruction.py` 建立稀疏 immutable patch，runtime 以 checksum、source／mesh fingerprint 與 origin/QC 掛載，不複製或覆寫 observed 月檔 | 只讀已驗收產品；研究期起點單側缺時與 manifest 外新缺口仍 `data_gap`，局部乾點／海床以下 NaN 只在粒子所在面與節點 fail closed，不可誤判為整區同時失效；工程測試不取代真資料 blocked／Lagrangian 驗證 |
 | engine | 正向物理速度的 signed-time RK4、獨立隨機擴散、沉降、巢狀邊界與事件；CPU／NumPy reference orchestration | synthetic 與 unit／integration tests 不構成真資料科學驗證 |
 | 情境與執行 | 五站點 scenario builder、固定排序、pilot／formal workspace、shard／chunk、progress／lock、reconcile／validate | formal 仍須 approved config、完整 inventory、gap-safe／full-product evidence |
 | checkpoint | execution checkpoint writer schema `3.1.0`；compact／history payload 使用 deterministic gzip、immutable history segment + compact current state、SHA-256 chain、cursor／identity／binding／RNG continuation 驗證；保留 schema `3.0.0` 舊拓撲與讀取 schema `2.0.0`、`2.1.0`、`2.2.0` | 舊 2.x 與 3.0 目錄唯讀且不原地升級；3.0→3.1 混合 chain 可讀，禁止降級；gzip／resume／故障測試仍屬 engineering candidate，不構成真資料 30 天正式成果證據 |

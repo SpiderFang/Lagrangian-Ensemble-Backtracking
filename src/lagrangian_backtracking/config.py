@@ -28,6 +28,7 @@ from .bed_residence import (
     BED_RESIDENCE_SAMPLING_POLICY_ID,
 )
 from .gap_policy import (
+    APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID,
     EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
     OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
@@ -194,6 +195,9 @@ class InputContract(StrictModel):
     ocm_native_root_env: str
     ocm_surface_root_env: str
     nww_analysis_root_env: str
+    # 已核准 OCM hybrid reconstruction patch 的 root 環境變數名稱；路徑只在 runtime
+    # CLI／worker 啟動時解析，絕不寫入 immutable run plan。舊 YAML 未明示時保持 None。
+    ocm_reconstruction_root_env: str | None = None
     years: list[int]
     ocm_contract: dict[str, Any]
     nww_contract: dict[str, Any]
@@ -777,6 +781,61 @@ class ProjectConfig(StrictModel):
         if not isinstance(time_contract, dict):
             raise ValueError("inputs.time_axis_contract 必須是 mapping")
         if self.design_version == CURRENT_DESIGN_VERSION:
+            configured_reconstruction_policy = time_contract.get("reconstruction_policy")
+            if configured_reconstruction_policy == APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID:
+                # 範例設定可先宣告未來要採用的正式 policy，但在 design_pending 階段
+                # 尚未產出 manifest 時仍須能被工具載入，讓 input-build 能依同一份
+                # canonical config 產生 artifact。只有 approved 且連 gap-safe 替代品也
+                # 沒有時，才在 schema 層拒絕；正式 release 仍由下方 formal gate 重驗。
+                if (
+                    self.config_status == "approved"
+                    and not self.inputs.ocm_gap_reconstruction_manifest
+                    and not self.inputs.ocm_gap_safe_arrival_manifest
+                ):
+                    raise ValueError(
+                        f"{CURRENT_DESIGN_VERSION} reconstruction baseline 必須明示 "
+                        "inputs.ocm_gap_reconstruction_manifest 或 "
+                        "inputs.ocm_gap_safe_arrival_manifest"
+                    )
+                if not self.inputs.ocm_reconstruction_root_env:
+                    raise ValueError(
+                        f"{CURRENT_DESIGN_VERSION} reconstruction baseline 必須明示 "
+                        "inputs.ocm_reconstruction_root_env"
+                    )
+                if time_contract.get("gap_policy") != OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID:
+                    raise ValueError(
+                        f"{CURRENT_DESIGN_VERSION} reconstruction baseline 仍須保留 "
+                        "inputs.time_axis_contract.gap_policy=observed_gap_censored_stop_at_first_gap_v1"
+                    )
+                if time_contract.get("stop_at_first_gap") is not True:
+                    raise ValueError(
+                        f"{CURRENT_DESIGN_VERSION} reconstruction baseline 必須明示 "
+                        "inputs.time_axis_contract.stop_at_first_gap=true"
+                    )
+                if (
+                    time_contract.get("denominator_policy")
+                    != EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+                ):
+                    raise ValueError(
+                        f"{CURRENT_DESIGN_VERSION} reconstruction baseline 必須明示 "
+                        "inputs.time_axis_contract.denominator_policy="
+                        f"{EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID}"
+                    )
+                if self.boundaries.stop_at_data_gap is not True:
+                    raise ValueError(
+                        f"{CURRENT_DESIGN_VERSION} reconstruction baseline 必須設定 "
+                        "boundaries.stop_at_data_gap=true"
+                    )
+                bed = self.scenarios.bed_residence_time
+                if bed is not None and bed.availability_conditioning_policy != (
+                    REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+                ):
+                    raise ValueError(
+                        f"{CURRENT_DESIGN_VERSION} reconstruction baseline 必須明示 "
+                        "scenarios.bed_residence_time.availability_conditioning_policy="
+                        f"{REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID}"
+                    )
+                return
             if time_contract.get("gap_policy") != OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID:
                 raise ValueError(
                     f"{CURRENT_DESIGN_VERSION} 必須明示 inputs.time_axis_contract.gap_policy="
@@ -1087,6 +1146,29 @@ class ProjectConfig(StrictModel):
             # 舊 YAML 保留既有 canonical hash；若 YAML 明示 null，欄位仍會留下來，
             # 讓「尚未具備支援證據」的意圖可被追溯。
             del inputs_payload["backtrack_support_days"]
+        if (
+            isinstance(inputs_payload, dict)
+            and "ocm_reconstruction_root_env" in inputs_payload
+            and (
+                "ocm_reconstruction_root_env" not in self.inputs.model_fields_set
+                or self.design_version != CURRENT_DESIGN_VERSION
+            )
+        ):
+            # 舊 YAML 未提供 reconstruction root 時，Pydantic 的 None default 不應改變
+            # 既有 config hash；legacy design 即使由新版範例複製欄位，也不能把新 root
+            # 名稱誤寫入舊 run identity。正式 reconstruction baseline 必須在來源 YAML 明示名稱。
+            del inputs_payload["ocm_reconstruction_root_env"]
+        time_axis_payload = (
+            inputs_payload.get("time_axis_contract") if isinstance(inputs_payload, dict) else None
+        )
+        if (
+            isinstance(time_axis_payload, dict)
+            and "reconstruction_policy" in time_axis_payload
+            and self.design_version != CURRENT_DESIGN_VERSION
+        ):
+            # 舊 v2／legacy fixture 可能由目前範例複製後移除新版 gap 欄位；重建 policy
+            # 只屬於目前 v3 canonical design，不應讓相容性 hash 因殘留的 extra key 漂移。
+            del time_axis_payload["reconstruction_policy"]
         scenarios_payload = payload.get("scenarios")
         if (
             isinstance(scenarios_payload, dict)

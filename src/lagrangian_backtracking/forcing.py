@@ -161,6 +161,128 @@ def _interpolate_optional_float(first: float, second: float, alpha: float) -> fl
 
 
 @dataclass(frozen=True, slots=True)
+class OCMReconstructionPatchMonth:
+    """一個月份的稀疏 OCM 重建列，以及其逐列來源標記。
+
+    重建產品只保存原始 OCM 時間軸缺少的 UTC 列，所有大陣列仍由觀測月份以唯讀
+    memory-map 保留；這個小型資料物件不會把 observed 與 patch concatenate 成新的
+    月檔。``origin_code`` 使用核心重建契約的 1（短缺口）或 2（狀態空間重建），
+    ``quality_flags`` 的 1／2 表示重建方法，4／8／16／32 表示該列含局部不可用
+    格點，64 才表示整列缺少雙側支援。局部品質由粒子所在面與節點的既有取樣 gate
+    fail closed，不能因遠端乾點讓整區粒子停止，也不能把重建失敗轉成靜止流場。
+
+    ``metadata`` 保存方法版本、gap ID、來源 fingerprint 等小型 provenance；其內容
+    只作診斷與 manifest binding，不參與速度數值運算。所有欄位的時間軸均為 UTC 奈秒，
+    速度、海面與深度為公尺制，擴散係數為 m²/s。
+    """
+
+    month_id: str
+    time_utc_ns: np.ndarray
+    hvel: np.ndarray
+    vertical_velocity: np.ndarray
+    zcor: np.ndarray
+    elev: np.ndarray
+    wetdry_elem: np.ndarray
+    diffusivity: np.ndarray
+    origin_code: np.ndarray
+    quality_flags: np.ndarray
+    metadata: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        """驗證 patch row 與 OCM mesh 的時間、節點、層數及 QC 欄位形狀。"""
+
+        time_axis = np.asarray(self.time_utc_ns)
+        if time_axis.ndim != 1 or time_axis.dtype != np.int64 or time_axis.size == 0:
+            raise ValueError("OCM reconstruction patch time_utc_ns 必須是非空 int64 一維軸")
+        if np.any(np.diff(time_axis) <= 0):
+            raise ValueError("OCM reconstruction patch time_utc_ns 必須嚴格遞增")
+        row_count = int(time_axis.size)
+        arrays = {
+            "hvel": np.asarray(self.hvel),
+            "vertical_velocity": np.asarray(self.vertical_velocity),
+            "zcor": np.asarray(self.zcor),
+            "elev": np.asarray(self.elev),
+            "wetdry_elem": np.asarray(self.wetdry_elem),
+            "diffusivity": np.asarray(self.diffusivity),
+        }
+        if arrays["hvel"].ndim != 4 or arrays["hvel"].shape[0] != row_count:
+            raise ValueError("reconstruction patch hvel 必須是 (time,node,layer,component>=2)")
+        expected_tnl = arrays["hvel"].shape[:3]
+        if arrays["hvel"].shape[-1] < 2:
+            raise ValueError("reconstruction patch hvel component 不足")
+        if arrays["vertical_velocity"].shape != expected_tnl:
+            raise ValueError("reconstruction patch vertical_velocity shape 不符")
+        if arrays["zcor"].shape != expected_tnl:
+            raise ValueError("reconstruction patch zcor shape 不符")
+        if arrays["diffusivity"].shape != expected_tnl:
+            raise ValueError("reconstruction patch diffusivity shape 不符")
+        if arrays["elev"].shape != expected_tnl[:2]:
+            raise ValueError("reconstruction patch elev shape 不符")
+        if arrays["wetdry_elem"].ndim != 2 or arrays["wetdry_elem"].shape[0] != row_count:
+            raise ValueError("reconstruction patch wetdry_elem shape 不符")
+        origin = np.asarray(self.origin_code)
+        quality = np.asarray(self.quality_flags)
+        if origin.shape != (row_count,) or quality.shape != (row_count,):
+            raise ValueError("reconstruction patch origin_code/quality_flags shape 不符")
+        if not np.issubdtype(origin.dtype, np.integer) or not np.all(np.isin(origin, (1, 2))):
+            raise ValueError("reconstruction patch origin_code 只允許 1 或 2")
+        if not np.issubdtype(quality.dtype, np.integer):
+            raise ValueError("reconstruction patch quality_flags 必須是整數")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("reconstruction patch metadata 必須是 mapping")
+
+    @property
+    def valid(self) -> bool:
+        """確認所有 patch row 都沒有致命 QC；方法旗標 1／2 不是失敗。
+
+        核心重建產品會把 1（短缺口線性內插）與 2（狀態空間重建）寫入
+        ``quality_flags``；4／8／16／32 是局部 cell 警示，64 才是整列致命狀態。
+        因此不能簡單以 ``quality_flags == 0`` 判斷，否則正常海岸缺值會使全域失效。
+        """
+
+        return all(self.row_is_valid(index) for index in range(self.time_utc_ns.size))
+
+    def row_is_valid(self, row_index: int) -> bool:
+        """確認單列沒有「整列」致命 QC；局部格點品質留給空間取樣判定。
+
+        OCM 在海床以下、乾面或兩端 wet/dry 不一致的位置本來就會保留 NaN。這些
+        ``QUALITY_*`` 旗標表示該時間列內「存在」局部不可用格點，不代表整個 flow
+        domain 同時失效；若在此要求全陣列有限，任何正常海岸網格都會令所有粒子在
+        第一個重建時刻停止。只有缺少雙側支援的 bit 64 是整列致命狀態；正式建置器
+        原則上不會發布這種 row，查詢位置需要的節點與面仍由既有插值 QC fail closed。
+        """
+
+        index = int(row_index)
+        if index < 0 or index >= self.time_utc_ns.size:
+            raise IndexError(f"reconstruction patch row 超出範圍：{index}")
+        flags = np.uint16(np.asarray(self.quality_flags)[index])
+        return not bool(flags & np.uint16(64))
+
+    def row_diagnostics(self, row_index: int) -> dict[str, int | str]:
+        """回傳單一重建 row 的 provenance diagnostics，不複製大型物理陣列。"""
+
+        index = int(row_index)
+        if index < 0 or index >= self.time_utc_ns.size:
+            raise IndexError(f"reconstruction patch row 超出範圍：{index}")
+        method = self.metadata.get("method", self.metadata.get("reconstruction_method", ""))
+        gap_id = self.metadata.get("gap_id", self.metadata.get("gap_id_utc", ""))
+        if not gap_id:
+            gap_ids = self.metadata.get("gap_ids", ())
+            if isinstance(gap_ids, (list, tuple)) and len(gap_ids) == 1:
+                gap_id = gap_ids[0]
+        result: dict[str, int | str] = {
+            "ocm_time_origin": "reconstructed",
+            "ocm_reconstruction_origin_code": int(np.asarray(self.origin_code)[index]),
+            "ocm_reconstruction_quality_flags": int(np.asarray(self.quality_flags)[index]),
+        }
+        if isinstance(method, str) and method:
+            result["ocm_reconstruction_method"] = method
+        if isinstance(gap_id, str) and gap_id:
+            result["ocm_reconstruction_gap_id"] = gap_id
+        return result
+
+
+@dataclass(frozen=True, slots=True)
 class WaveSample:
     """一筆 NWW3 波浪摘要資料；保留波向圓向量供跨月原語意內插。
 
@@ -275,12 +397,20 @@ class OCMNativeMonth:
         maximum_time_gap_seconds: float = 5_400.0,
         wet_value: float = 0.0,
         use_numba_kernel: bool = False,
+        reconstruction_patch: OCMReconstructionPatchMonth | None = None,
     ) -> None:
-        """保留唯讀的大型陣列並檢查各欄位的時間、節點與深度維度一致。"""
+        """保留唯讀的大型陣列並檢查各欄位的時間、節點與深度維度一致。
+
+        ``reconstruction_patch`` 僅保存缺少 UTC 列的 sparse memmap；本月份的公開時間軸
+        會建立一份小型 merged index，將每一列指向 observed 或 patch 的原始 row。如此
+        observed 74 GiB 月檔不會被複製或串接，且 observed endpoint 仍能使用原本的
+        Numba kernel；patch endpoint 則走同一套 NumPy 空間／垂向支援與 QC 流程。
+        """
 
         self.month_id = month_id
         self.mesh = mesh
-        self.time_utc_ns = np.asarray(time_utc_ns)
+        self._observed_time_utc_ns = np.asarray(time_utc_ns)
+        self.time_utc_ns = self._observed_time_utc_ns
         self.hvel = hvel
         self.vertical_velocity = vertical_velocity
         self.zcor = zcor
@@ -290,7 +420,8 @@ class OCMNativeMonth:
         self.maximum_time_gap_ns = int(round(maximum_time_gap_seconds * 1_000_000_000))
         self.wet_value = float(wet_value)
         self.use_numba_kernel = bool(use_numba_kernel)
-        expected_tn = (self.time_utc_ns.size, self.mesh.node_xy.shape[0])
+        self.reconstruction_patch = reconstruction_patch
+        expected_tn = (self._observed_time_utc_ns.size, self.mesh.node_xy.shape[0])
         if self.hvel.shape[:2] != expected_tn or self.hvel.ndim != 4 or self.hvel.shape[-1] < 2:
             raise ValueError("hvel shape 必須是 (time,node,layer,component>=2)")
         expected_tnl = self.hvel.shape[:3]
@@ -301,12 +432,119 @@ class OCMNativeMonth:
         ):
             raise ValueError("vertical_velocity/zcor/diffusivity 必須與 hvel time/node/layer 對齊")
         if self.elev.shape != expected_tn or self.wetdry_elem.shape != (
-            self.time_utc_ns.size,
+            self._observed_time_utc_ns.size,
             self.mesh.source_face_global_index.size,
         ):
             raise ValueError("elev 或 wetdry_elem shape 與 mesh/time 不符")
-        if self.time_utc_ns.dtype != np.int64 or np.any(np.diff(self.time_utc_ns) <= 0):
+        if self._observed_time_utc_ns.dtype != np.int64 or np.any(
+            np.diff(self._observed_time_utc_ns) <= 0
+        ):
             raise ValueError("OCM time_utc_ns 必須是嚴格遞增 int64")
+        self._time_source_kind = np.zeros(self._observed_time_utc_ns.size, dtype=np.int8)
+        self._time_source_index = np.arange(self._observed_time_utc_ns.size, dtype=np.int64)
+        if reconstruction_patch is not None:
+            if reconstruction_patch.month_id != month_id:
+                raise ValueError(
+                    "OCM reconstruction patch month_id 不一致："
+                    f"{reconstruction_patch.month_id} != {month_id}"
+                )
+            patch_times = np.asarray(reconstruction_patch.time_utc_ns)
+            if np.intersect1d(self._observed_time_utc_ns, patch_times).size:
+                raise ValueError("OCM reconstruction patch 不得與 observed UTC 重複")
+            if reconstruction_patch.hvel.shape[1:] != self.hvel.shape[1:]:
+                raise ValueError("OCM reconstruction patch hvel 網格 shape 與 observed 不一致")
+            if reconstruction_patch.vertical_velocity.shape[1:] != self.vertical_velocity.shape[1:]:
+                raise ValueError("OCM reconstruction patch vertical_velocity shape 不一致")
+            if reconstruction_patch.zcor.shape[1:] != self.zcor.shape[1:]:
+                raise ValueError("OCM reconstruction patch zcor shape 不一致")
+            if reconstruction_patch.diffusivity.shape[1:] != self.diffusivity.shape[1:]:
+                raise ValueError("OCM reconstruction patch diffusivity shape 不一致")
+            if reconstruction_patch.elev.shape[1:] != self.elev.shape[1:]:
+                raise ValueError("OCM reconstruction patch elev 網格 shape 不一致")
+            if reconstruction_patch.wetdry_elem.shape[1:] != self.wetdry_elem.shape[1:]:
+                raise ValueError("OCM reconstruction patch wetdry_elem 網格 shape 不一致")
+            merged_times = np.concatenate((self._observed_time_utc_ns, patch_times))
+            order = np.argsort(merged_times, kind="stable")
+            self.time_utc_ns = merged_times[order]
+            source_kind = np.concatenate(
+                (
+                    np.zeros(self._observed_time_utc_ns.size, dtype=np.int8),
+                    np.ones(patch_times.size, dtype=np.int8),
+                )
+            )
+            source_index = np.concatenate(
+                (
+                    np.arange(self._observed_time_utc_ns.size, dtype=np.int64),
+                    np.arange(patch_times.size, dtype=np.int64),
+                )
+            )
+            self._time_source_kind = source_kind[order]
+            self._time_source_index = source_index[order]
+
+    def _time_source(self, time_index: int) -> tuple[int, int]:
+        """把 merged time index 解析成 observed(0) 或 reconstruction patch(1) row。"""
+
+        index = self._validate_time_index(time_index)
+        return int(self._time_source_kind[index]), int(self._time_source_index[index])
+
+    def _row_array(self, name: str, time_index: int) -> np.ndarray:
+        """由 merged time index 取出指定欄位的原始 row，不複製整月份陣列。"""
+
+        source_kind, source_index = self._time_source(time_index)
+        if source_kind == 0:
+            return np.asarray(getattr(self, name)[source_index])
+        patch = self.reconstruction_patch
+        if patch is None:
+            raise RuntimeError("merged time index 指向不存在的 reconstruction patch")
+        return np.asarray(getattr(patch, name)[source_index])
+
+    def _row_diagnostics(self, time_index: int) -> dict[str, int | str]:
+        """回傳 merged row 的 observed/reconstructed provenance 與 patch QC 摘要。"""
+
+        source_kind, source_index = self._time_source(time_index)
+        if source_kind == 0:
+            # 舊 observed-only caller 的 diagnostics 保持原欄位集合；一旦啟用 sparse
+            # patch，才明示 observed endpoint，讓 observed/reconstructed 混合 bracket
+            # 可在正式輸出中被區分而不破壞 legacy JSON 相容性。
+            return {"ocm_time_origin": "observed"} if self.reconstruction_patch else {}
+        patch = self.reconstruction_patch
+        if patch is None:
+            return {"ocm_time_origin": "reconstructed", "ocm_reconstruction_invalid": 1}
+        return patch.row_diagnostics(source_index)
+
+    def _row_quality_valid(self, time_index: int) -> bool:
+        """確認 patch row 沒有整列致命 QC；局部 NaN 仍由查詢位置的既有 gate 處理。"""
+
+        source_kind, source_index = self._time_source(time_index)
+        if source_kind == 0:
+            return True
+        patch = self.reconstruction_patch
+        if patch is None:
+            return False
+        return patch.row_is_valid(source_index)
+
+    def _bracket_diagnostics(self, before: int, after: int) -> dict[str, int | str]:
+        """合併時間 bracket 的來源標記，讓 mixed observed/patch 不被誤標成 observed。"""
+
+        if self.reconstruction_patch is None:
+            return {}
+        before_diag = self._row_diagnostics(before)
+        after_diag = self._row_diagnostics(after)
+        before_origin = before_diag.get("ocm_time_origin", "observed")
+        after_origin = after_diag.get("ocm_time_origin", "observed")
+        origin = before_origin if before_origin == after_origin else "mixed"
+        diagnostics: dict[str, int | str] = {"ocm_time_origin": str(origin)}
+        for label, item in (("before", before_diag), ("after", after_diag)):
+            for key, value in item.items():
+                if key == "ocm_time_origin":
+                    continue
+                diagnostics[f"{key}_{label}"] = value
+        if origin == "reconstructed":
+            for key in ("ocm_reconstruction_method", "ocm_reconstruction_gap_id"):
+                value = before_diag.get(key)
+                if value is not None:
+                    diagnostics[key] = value
+        return diagnostics
 
     @classmethod
     def from_directory(
@@ -365,13 +603,16 @@ class OCMNativeMonth:
         執行；底層沒有對稱 hold，缺少最高層必要物理量仍回傳 ``None``。
         """
 
-        physical_z = np.asarray(self.zcor[time_index, node_index], dtype=np.float64)
+        physical_z = np.asarray(self._row_array("zcor", time_index)[node_index], dtype=np.float64)
+        hvel_row = self._row_array("hvel", time_index)
+        vertical_row = self._row_array("vertical_velocity", time_index)
+        diffusivity_row = self._row_array("diffusivity", time_index)
         values = np.column_stack(
             (
-                np.asarray(self.hvel[time_index, node_index, :, 0], dtype=np.float64),
-                np.asarray(self.hvel[time_index, node_index, :, 1], dtype=np.float64),
-                np.asarray(self.vertical_velocity[time_index, node_index], dtype=np.float64),
-                np.asarray(self.diffusivity[time_index, node_index], dtype=np.float64),
+                np.asarray(hvel_row[node_index, :, 0], dtype=np.float64),
+                np.asarray(hvel_row[node_index, :, 1], dtype=np.float64),
+                np.asarray(vertical_row[node_index], dtype=np.float64),
+                np.asarray(diffusivity_row[node_index], dtype=np.float64),
             )
         )
         usable = np.isfinite(physical_z) & np.all(np.isfinite(values), axis=1)
@@ -402,9 +643,9 @@ class OCMNativeMonth:
 
         if not np.isfinite(z_m):
             return None
-        physical_z = np.asarray(self.zcor[time_index, node_index], dtype=np.float64)
+        physical_z = np.asarray(self._row_array("zcor", time_index)[node_index], dtype=np.float64)
         horizontal_velocity = np.asarray(
-            self.hvel[time_index, node_index, :, :2], dtype=np.float64
+            self._row_array("hvel", time_index)[node_index, :, :2], dtype=np.float64
         )
         usable = np.isfinite(physical_z) & np.all(np.isfinite(horizontal_velocity), axis=1)
         support = _vertical_support_indices(physical_z, usable, z_m)
@@ -459,7 +700,7 @@ class OCMNativeMonth:
 
         for incident_id in incident_triangle_ids:
             face = int(self.mesh.triangle_face_local[incident_id])
-            wetdry = float(self.wetdry_elem[time_index, face])
+            wetdry = float(self._row_array("wetdry_elem", time_index)[face])
             if not np.isfinite(wetdry) or not np.isclose(wetdry, self.wet_value, atol=0.1):
                 excluded_count += 1
                 continue
@@ -525,7 +766,7 @@ class OCMNativeMonth:
         valid_count = len(bounded_by_triangle)
         if triangle_id not in bounded_by_triangle:
             current_face = int(self.mesh.triangle_face_local[triangle_id])
-            current_wetdry = float(self.wetdry_elem[time_index, current_face])
+            current_wetdry = float(self._row_array("wetdry_elem", time_index)[current_face])
             if not np.isfinite(current_wetdry) or not np.isclose(
                 current_wetdry, self.wet_value, atol=0.1
             ):
@@ -898,7 +1139,7 @@ class OCMNativeMonth:
         """在三個三角形節點完成垂向及水平內插，並區分乾涸與深度資料不足。"""
 
         face = location.source_face_local_index
-        wetdry = float(self.wetdry_elem[time_index, face])
+        wetdry = float(self._row_array("wetdry_elem", time_index)[face])
         if not np.isfinite(wetdry) or not np.isclose(wetdry, self.wet_value, atol=0.1):
             return None, SampleQC.DRY_FACE
         node_values: list[np.ndarray] = []
@@ -912,7 +1153,9 @@ class OCMNativeMonth:
             spans.append(span)
         weights = np.asarray(location.barycentric_weights, dtype=np.float64)
         combined = weights @ np.asarray(node_values)
-        eta_nodes = np.asarray(self.elev[time_index, list(location.node_indices)], dtype=np.float64)
+        eta_nodes = np.asarray(
+            self._row_array("elev", time_index)[list(location.node_indices)], dtype=np.float64
+        )
         if not np.all(np.isfinite(eta_nodes)):
             return None, SampleQC.VERTICAL_UNSUPPORTED
         eta = float(weights @ eta_nodes)
@@ -947,8 +1190,8 @@ class OCMNativeMonth:
             return None
         if not np.all(np.isfinite(weights)):
             return None
-        eta_before = np.asarray(self.elev[before, nodes], dtype=np.float64)
-        eta_after = np.asarray(self.elev[after, nodes], dtype=np.float64)
+        eta_before = np.asarray(self._row_array("elev", before)[nodes], dtype=np.float64)
+        eta_after = np.asarray(self._row_array("elev", after)[nodes], dtype=np.float64)
         source_depth = np.asarray(self.mesh.source_depth_m[nodes], dtype=np.float64)
         if not (
             np.all(np.isfinite(eta_before))
@@ -1057,6 +1300,21 @@ class OCMNativeMonth:
             after=index,
             alpha=0.0,
         )
+        row_diagnostics = self._row_diagnostics(index)
+        if not self._row_quality_valid(index):
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                *(geometric_bounds or (np.nan, np.nan)),
+                np.sqrt(location.triangle_area_m2),
+                np.nan,
+                SampleQC.NUMERICAL_FAILURE,
+                source_face_id=location.source_face_global_index,
+                triangle_id=location.triangle_id,
+                forcing_month_id=self.month_id,
+                diagnostics={**row_diagnostics, "ocm_reconstruction_qc_invalid": 1},
+            )
         target_z = z_m if support_z_m is None else support_z_m
         if not np.isfinite(target_z):
             return VelocitySample(
@@ -1070,10 +1328,12 @@ class OCMNativeMonth:
                 source_face_id=location.source_face_global_index,
                 triangle_id=location.triangle_id,
                 forcing_month_id=self.month_id,
+                diagnostics=row_diagnostics,
             )
-        if self.use_numba_kernel:
+        source_kind, source_index = self._time_source(index)
+        if self.use_numba_kernel and source_kind == 0:
             face = location.source_face_local_index
-            wet_value = float(self.wetdry_elem[index, face])
+            wet_value = float(self.wetdry_elem[source_index, face])
             if not np.isfinite(wet_value) or not np.isclose(wet_value, self.wet_value, atol=0.1):
                 values: np.ndarray | None = None
                 vertical_scale = np.nan
@@ -1088,8 +1348,8 @@ class OCMNativeMonth:
                     self.vertical_velocity,
                     self.zcor,
                     self.diffusivity,
-                    index,
-                    index,
+                    source_index,
+                    source_index,
                     0.0,
                     np.asarray(location.node_indices, dtype=np.int64),
                     np.asarray(location.barycentric_weights, dtype=np.float64),
@@ -1122,6 +1382,7 @@ class OCMNativeMonth:
                 source_face_id=location.source_face_global_index,
                 triangle_id=location.triangle_id,
                 forcing_month_id=self.month_id,
+                diagnostics=row_diagnostics,
             )
         if enforce_geometric_bounds and not _query_z_within_geometric_bounds(z_m, geometric_bounds):
             return VelocitySample(
@@ -1149,7 +1410,7 @@ class OCMNativeMonth:
             source_face_id=location.source_face_global_index,
             triangle_id=location.triangle_id,
             forcing_month_id=self.month_id,
-            diagnostics={"kz_m2ps": float(values[3])},
+            diagnostics={**row_diagnostics, "kz_m2ps": float(values[3])},
         )
 
     def sample(
@@ -1191,10 +1452,29 @@ class OCMNativeMonth:
             after=after,
             alpha=alpha,
         )
+        row_diagnostics = self._bracket_diagnostics(before, after)
+        if not self._row_quality_valid(before) or not self._row_quality_valid(after):
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                *(geometric_bounds or (np.nan, np.nan)),
+                np.sqrt(location.triangle_area_m2),
+                np.nan,
+                SampleQC.NUMERICAL_FAILURE,
+                source_face_id=location.source_face_global_index,
+                triangle_id=location.triangle_id,
+                forcing_month_id=self.month_id,
+                diagnostics={**row_diagnostics, "ocm_reconstruction_qc_invalid": 1},
+            )
+        before_kind, before_index = self._time_source(before)
+        after_kind, after_index = self._time_source(after)
         support_z_m = _query_z_for_vertical_support(z_m, geometric_bounds)
-        if self.use_numba_kernel:
+        if self.use_numba_kernel and before_kind == 0 and after_kind == 0:
             face = location.source_face_local_index
-            wet_values = np.asarray(self.wetdry_elem[[before, after], face], dtype=np.float64)
+            wet_values = np.asarray(
+                self.wetdry_elem[[before_index, after_index], face], dtype=np.float64
+            )
             if not np.all(np.isfinite(wet_values)) or not np.allclose(wet_values, self.wet_value, atol=0.1):
                 first = second = None
                 first_qc = second_qc = SampleQC.DRY_FACE
@@ -1207,8 +1487,8 @@ class OCMNativeMonth:
                     self.vertical_velocity,
                     self.zcor,
                     self.diffusivity,
-                    before,
-                    after,
+                    before_index,
+                    after_index,
                     alpha,
                     np.asarray(location.node_indices, dtype=np.int64),
                     np.asarray(location.barycentric_weights, dtype=np.float64),
@@ -1218,11 +1498,15 @@ class OCMNativeMonth:
                 if valid:
                     eta_first = float(
                         np.asarray(location.barycentric_weights)
-                        @ np.asarray(self.elev[before, list(location.node_indices)], dtype=np.float64)
+                        @ np.asarray(
+                            self.elev[before_index, list(location.node_indices)], dtype=np.float64
+                        )
                     )
                     eta_second = float(
                         np.asarray(location.barycentric_weights)
-                        @ np.asarray(self.elev[after, list(location.node_indices)], dtype=np.float64)
+                        @ np.asarray(
+                            self.elev[after_index, list(location.node_indices)], dtype=np.float64
+                        )
                     )
                     eta_combined = eta_first + alpha * (eta_second - eta_first)
                     first = (values, eta_combined, vertical_scale)
@@ -1251,6 +1535,7 @@ class OCMNativeMonth:
                 source_face_id=location.source_face_global_index,
                 triangle_id=location.triangle_id,
                 forcing_month_id=self.month_id,
+                diagnostics=row_diagnostics,
             )
         values = first[0] + alpha * (second[0] - first[0])
         vertical_scale = min(first[2], second[2])
@@ -1270,6 +1555,7 @@ class OCMNativeMonth:
                 source_face_id=location.source_face_global_index,
                 triangle_id=location.triangle_id,
                 forcing_month_id=self.month_id,
+                diagnostics=row_diagnostics,
             )
         return VelocitySample(
             u_mps=float(values[0]),
@@ -1282,7 +1568,7 @@ class OCMNativeMonth:
             source_face_id=location.source_face_global_index,
             triangle_id=location.triangle_id,
             forcing_month_id=self.month_id,
-            diagnostics={"kz_m2ps": float(values[3])},
+            diagnostics={**row_diagnostics, "kz_m2ps": float(values[3])},
         )
 
 

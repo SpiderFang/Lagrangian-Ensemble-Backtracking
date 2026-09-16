@@ -738,6 +738,7 @@ def _worker_cli_arguments(
     checkpoint_root: Path | None,
     resume: bool,
     sweep_budget: int | None,
+    ocm_reconstruction_root: Path | None = None,
 ) -> list[str]:
     """將一個穩定 worker group 轉成唯一的一次 run-worker invocation。"""
 
@@ -746,6 +747,8 @@ def _worker_cli_arguments(
         argv.extend(("--shard-id", shard_id))
     if ocm_native_root is not None:
         argv.extend(("--ocm-native-root", str(ocm_native_root)))
+    if ocm_reconstruction_root is not None:
+        argv.extend(("--ocm-reconstruction-root", str(ocm_reconstruction_root)))
     if nww_analysis_root is not None:
         argv.extend(("--nww-analysis-root", str(nww_analysis_root)))
     if checkpoint_root is not None:
@@ -900,6 +903,7 @@ def execute_worker_groups(
     poll_interval_seconds: float = 0.05,
     shutdown_grace_seconds: float = 30.0,
     popen_factory: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
+    ocm_reconstruction_root: Path | None = None,
 ) -> tuple[list[dict[str, object]], int | None]:
     """啟動固定 worker groups、監看整機批次並於失敗／訊號時保留現場。"""
 
@@ -961,6 +965,7 @@ def execute_worker_groups(
                     config=config,
                     group=group,
                     ocm_native_root=ocm_native_root,
+                    ocm_reconstruction_root=ocm_reconstruction_root,
                     nww_analysis_root=nww_analysis_root,
                     checkpoint_root=checkpoint_root,
                     resume=resume,
@@ -1364,6 +1369,7 @@ def execute_formal_parallel(
     checkpoint_root: str | Path | None = None,
     numba_cache_dir: str | Path | None = None,
     ocm_native_root: str | Path | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
     nww_analysis_root: str | Path | None = None,
     resume: bool = False,
     cpu_affinity: str = "auto",
@@ -1425,6 +1431,13 @@ def execute_formal_parallel(
         environment_name=input_config.nww_analysis_root_env,
         label="NWW3 analysis root",
         required=False,
+    )
+    reconstruction_required = bool(input_config.ocm_gap_reconstruction_manifest)
+    reconstruction_root = _input_root(
+        ocm_reconstruction_root,
+        environment_name=input_config.ocm_reconstruction_root_env or "OCM_RECONSTRUCTION_ROOT",
+        label="OCM reconstruction root",
+        required=reconstruction_required,
     )
 
     # 情境表只讀已存在的站點／流域識別欄位；目前 run plan 固定提供區域與 UTC 到達時刻，
@@ -1540,6 +1553,7 @@ def execute_formal_parallel(
         project_root=project_path,
         config=_strict_regular_file(config_path, label="config"),
         ocm_native_root=ocm_root,
+        ocm_reconstruction_root=reconstruction_root,
         nww_analysis_root=nww_root,
         checkpoint_root=checkpoint_path,
         numba_cache_dir=prepared_cache,

@@ -62,6 +62,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
         "color": "#16a34a",
         "modules": (
             "models",
+            "ocm_reconstruction",
             "forcing",
             "forcing_window",
             "accelerated",
@@ -265,6 +266,22 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "entrypoints": ["OCMNativeMonth.sample", "NWWAnalysisMonth.sample", "CombinedMonthForcing"],
         "read_first": (
             "確認海流、Stokes 漂流、向下沉降與擴散係數的資料來源與遮罩；目前沉降材質契約不含上浮情境。"
+        ),
+    },
+    "ocm_reconstruction": {
+        "role": "把已知 OCM 逐時缺口建成版本化、稀疏且不可覆寫的重建 patch",
+        "inputs": "已驗收 schema 3 月資料、canonical prefer-last UTC 軸、原生網格與雙側觀測 context",
+        "outputs": "逐月 missing-row NPY、來源／網格 fingerprint、品質旗標、domain manifest 與 checksum",
+        "entrypoints": [
+            "NpyDomainSource",
+            "build_reconstruction_patch",
+            "validate_reconstruction_patch",
+            "scripts/build_ocm_reconstruction.py",
+        ],
+        "read_first": (
+            "一小時缺口採雙側 component 線性值；23--49 小時採 harmonic、低秩 EOF score "
+            "AR(2) 與雙向融合。研究期起點沒有雙側支援時不重建；局部乾點／海床以下 "
+            "NaN 保留到粒子所在節點的 runtime gate，不得誤使整個 domain 同時停止。"
         ),
     },
     "accelerated": {
@@ -1254,6 +1271,7 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "pilot_calibration", "target": "pilot_config", "label": "candidate evidence"},
     {"source": "pilot_config", "target": "runtime", "label": "generated pilot config"},
     {"source": "runtime", "target": "forcing_window", "label": "RuntimeRequestFactory"},
+    {"source": "ocm_reconstruction", "target": "forcing_window", "label": "registered sparse patch"},
     {"source": "forcing_window", "target": "run_control", "label": "UTC forcing window"},
     {"source": "run_control", "target": "production", "label": "run controller"},
     {"source": "runner", "target": "production", "label": "RunUnit shard"},

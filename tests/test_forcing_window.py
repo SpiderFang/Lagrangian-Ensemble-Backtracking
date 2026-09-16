@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +13,7 @@ import numpy as np
 import pytest
 from shapely.geometry import box
 
+import lagrangian_backtracking.forcing as forcing_module
 import lagrangian_backtracking.forcing_window as forcing_window_module
 from lagrangian_backtracking.boundaries import BoundaryGeometry
 from lagrangian_backtracking.checkpoint import CheckpointBinding
@@ -25,6 +28,7 @@ from lagrangian_backtracking.forcing import (
     CombinedMonthForcing,
     NWWAnalysisMonth,
     OCMNativeMonth,
+    OCMReconstructionPatchMonth,
 )
 from lagrangian_backtracking.forcing_window import (
     ForcingWindowManager,
@@ -153,6 +157,66 @@ def _ocm_cross_month(
         diffusivity=diffusivity,
         maximum_time_gap_seconds=maximum_time_gap_seconds,
         use_numba_kernel=use_numba_kernel,
+    )
+
+
+def _ocm_with_sparse_patch(
+    *, invalid_quality: int = 1, trailing_observed: bool = False,
+    maximum_time_gap_seconds: float = 7_200.0,
+) -> OCMNativeMonth:
+    """建立兩個 observed endpoint 加一個 sparse reconstruction row 的月份。
+
+    observed 仍保留原始兩小時端點；patch 只提供中間缺失的 01:00 row。這個 fixture
+    同時驗證 merged UTC index、patch NumPy endpoint、mixed bracket 內插與 row-level QC。
+    ``quality_flags=1`` 是核心產品的短缺口方法旗標，不是失敗旗標；測試另以 64
+    驗證缺少雙側支援的整列致命 QC 會被 runtime 拒絕。
+    """
+
+    mesh = _mesh()
+    observed_times = [
+        _utc_ns("2024-08-01T00:00:00Z"),
+        _utc_ns("2024-08-01T02:00:00Z"),
+    ]
+    if trailing_observed:
+        observed_times.append(_utc_ns("2024-08-01T04:00:00Z"))
+    times = np.asarray(observed_times, dtype=np.int64)
+    observed_count = times.size
+    zcor = np.broadcast_to(np.array([-10.0, 0.0]), (observed_count, 3, 2)).copy()
+    observed_hvel = np.zeros((observed_count, 3, 2, 2), dtype=np.float64)
+    observed_hvel[0, ..., 0] = 1.0
+    observed_hvel[1, ..., 0] = 3.0
+    if trailing_observed:
+        observed_hvel[2, ..., 0] = 5.0
+    observed_v = np.zeros((observed_count, 3, 2), dtype=np.float64)
+    observed_k = np.full((observed_count, 3, 2), 0.01, dtype=np.float64)
+    patch_hvel = np.zeros((1, 3, 2, 2), dtype=np.float64)
+    patch_hvel[..., 0] = 2.0
+    patch = OCMReconstructionPatchMonth(
+        month_id="202408",
+        time_utc_ns=np.asarray([_utc_ns("2024-08-01T01:00:00Z")], dtype=np.int64),
+        hvel=patch_hvel,
+        vertical_velocity=np.zeros((1, 3, 2), dtype=np.float64),
+        zcor=np.broadcast_to(np.array([-10.0, 0.0]), (1, 3, 2)).copy(),
+        elev=np.zeros((1, 3), dtype=np.float64),
+        wetdry_elem=np.zeros((1, 1), dtype=np.float64),
+        diffusivity=np.full((1, 3, 2), 0.01, dtype=np.float64),
+        origin_code=np.asarray([1], dtype=np.uint8),
+        quality_flags=np.asarray([invalid_quality], dtype=np.uint16),
+        metadata={"method": "synthetic_short_v1", "gap_ids": ["gap-01"]},
+    )
+    return OCMNativeMonth(
+        month_id="202408",
+        mesh=mesh,
+        time_utc_ns=times,
+        hvel=observed_hvel,
+        vertical_velocity=observed_v,
+        zcor=zcor,
+        elev=np.zeros((observed_count, 3), dtype=np.float64),
+        wetdry_elem=np.zeros((observed_count, 1), dtype=np.float64),
+        diffusivity=observed_k,
+        maximum_time_gap_seconds=maximum_time_gap_seconds,
+        use_numba_kernel=True,
+        reconstruction_patch=patch,
     )
 
 
@@ -1435,6 +1499,86 @@ def _write_production_fixture(root: Path, month_id: str) -> None:
     _save_npy(nww_grid, "lat.npy", nww_data.lat)
 
 
+def _write_reconstruction_fixture(root: Path, month_id: str) -> Path:
+    """建立含 root index、domain manifest、metadata 與 array hash 的 sparse patch。"""
+
+    patch_root = root / "reconstruction"
+    domain_root = patch_root / "synthetic_domain"
+    month_root = domain_root / "months" / month_id
+    month_root.mkdir(parents=True)
+    observed = _ocm(month_id, _mesh())
+    # 正式 ``from_roots`` 會先用經緯度與投影建立 native mesh，再驗證 patch 的
+    # mesh fingerprint；因此 fixture 必須對同一份 production grid 做相同的載入，
+    # 不能直接使用單元測試中手工指定的十公尺座標 ``_mesh()``。
+    production_mesh = NativeMesh.from_directory(
+        root / "ocm" / "synthetic_domain" / "grid",
+        projection=DomainProjection(121.0, 25.0),
+    )
+    arrays: dict[str, np.ndarray] = {
+        "time_utc_ns": np.asarray([observed.time_utc_ns[0] + 2 * 3_600_000_000_000], dtype=np.int64),
+        "hvel": np.asarray(observed.hvel[:1]),
+        "vertical_velocity": np.asarray(observed.vertical_velocity[:1]),
+        "zcor": np.asarray(observed.zcor[:1]),
+        "elev": np.asarray(observed.elev[:1]),
+        "wetdry_elem": np.asarray(observed.wetdry_elem[:1]),
+        "diffusivity": np.asarray(observed.diffusivity[:1]),
+        "origin_code": np.asarray([1], dtype=np.uint8),
+        "quality_flags": np.asarray([1], dtype=np.uint16),
+    }
+    array_metadata: dict[str, dict[str, object]] = {}
+    for name, value in arrays.items():
+        path = month_root / f"{name}.npy"
+        np.save(path, value)
+        array_metadata[name] = {
+            "path": path.name,
+            "shape": list(value.shape),
+            "dtype": value.dtype.name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    metadata = {
+        "schema_version": "ocm_reconstruction_patch_v1",
+        "flow_domain_id": "synthetic_domain",
+        "month_id": month_id,
+        "method": "synthetic_short_v1",
+        "gap_ids": ["synthetic-gap"],
+        "arrays": array_metadata,
+    }
+    metadata_bytes = json.dumps(
+        metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    metadata_path = month_root / "metadata.json"
+    metadata_path.write_bytes(metadata_bytes)
+    (month_root / "metadata.json.sha256").write_text(
+        hashlib.sha256(metadata_bytes).hexdigest() + "\n", encoding="ascii"
+    )
+    manifest = {
+        "schema_version": "ocm_reconstruction_patch_v1",
+        "flow_domain_id": "synthetic_domain",
+        "mesh_fingerprint": forcing_window_module._mesh_fingerprint(production_mesh),
+        "source_fingerprint": "synthetic-source-v1",
+        "months": [
+            {
+                "month_id": month_id,
+                "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+                "files": {name: item["sha256"] for name, item in array_metadata.items()},
+            }
+        ],
+    }
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    manifest_path = domain_root / "reconstruction-manifest.json"
+    manifest_path.write_bytes(manifest_bytes)
+    (domain_root / "reconstruction-manifest.json.sha256").write_text(
+        hashlib.sha256(manifest_bytes).hexdigest() + "\n", encoding="ascii"
+    )
+    index_path = patch_root / "reconstruction-index.json"
+    index_path.write_text(
+        json.dumps({"flow_domains": ["synthetic_domain"]}, sort_keys=True), encoding="utf-8"
+    )
+    return month_root
+
+
 @pytest.mark.parametrize("use_numba_kernel", [False, True])
 def test_from_roots_loads_mesh_once_and_production_missing_month_is_qc(
     tmp_path: Path, use_numba_kernel: bool
@@ -1456,6 +1600,40 @@ def test_from_roots_loads_mesh_once_and_production_missing_month_is_qc(
     missing = manager.provider(-0.1, False).sample(1.0, 1.0, -5.0, _sample_time("197002"))
     assert missing.qc == SampleQC.OUTSIDE_TIME_RANGE
     assert manager.cache_stats.ocm_load_count == 1
+
+
+def test_from_roots_loads_registered_reconstruction_patch_and_rejects_tamper(
+    tmp_path: Path,
+) -> None:
+    """正式 root layout 會接入 sparse patch；array checksum 損壞時不得退回 observed。"""
+
+    month = "197001"
+    _write_production_fixture(tmp_path, month)
+    patch_month = _write_reconstruction_fixture(tmp_path, month)
+    manager = ForcingWindowManager.from_roots(
+        flow_domain_id="synthetic_domain",
+        projection=DomainProjection(121.0, 25.0),
+        ocm_root=tmp_path / "ocm",
+        nww_root=None,
+        reconstruction_root=tmp_path / "reconstruction",
+        use_numba_kernel=True,
+    )
+    patch_time = _month_start_ns(month) + 2 * 3_600_000_000_000
+    sample = manager.provider(-0.1, False).sample(1.0, 1.0, -5.0, patch_time)
+    assert sample.valid
+    assert sample.diagnostics["ocm_time_origin"] == "reconstructed"
+
+    tampered = patch_month / "hvel.npy"
+    tampered.write_bytes(tampered.read_bytes() + b"tampered")
+    manager = ForcingWindowManager.from_roots(
+        flow_domain_id="synthetic_domain",
+        projection=DomainProjection(121.0, 25.0),
+        ocm_root=tmp_path / "ocm",
+        nww_root=None,
+        reconstruction_root=tmp_path / "reconstruction",
+    )
+    with pytest.raises(ValueError, match="checksum"):
+        manager.provider(-0.1, False).sample(1.0, 1.0, -5.0, patch_time)
 
 
 def test_from_roots_rejects_non_boolean_ocm_kernel_switch(tmp_path: Path) -> None:
@@ -1489,3 +1667,64 @@ def test_missing_month_exception_is_supported_by_injected_loader() -> None:
         manager.provider(-0.1, False).sample(1.0, 1.0, -5.0, _sample_time("197001")).qc
         == SampleQC.OUTSIDE_TIME_RANGE
     )
+
+
+def test_sparse_reconstruction_patch_merges_exact_and_mixed_time_rows() -> None:
+    """registered patch row 可跨過 observed gap，且不使 observed Numba endpoint 退回全月慢路徑。"""
+
+    month = _ocm_with_sparse_patch()
+    exact = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T01:00:00Z"))
+    assert exact.valid
+    assert np.isclose(exact.u_mps, 2.0)
+    assert exact.diagnostics["ocm_time_origin"] == "reconstructed"
+    assert exact.diagnostics["ocm_reconstruction_method"] == "synthetic_short_v1"
+    assert exact.diagnostics["ocm_reconstruction_gap_id"] == "gap-01"
+
+    mixed = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T01:30:00Z"))
+    assert mixed.valid
+    assert np.isclose(mixed.u_mps, 2.5)
+    assert mixed.diagnostics["ocm_time_origin"] == "mixed"
+
+
+def test_sparse_reconstruction_patch_fails_closed_on_qc() -> None:
+    """patch row 的致命 QC 不可被當成零流速或 observed 繼續積分。"""
+
+    month = _ocm_with_sparse_patch(invalid_quality=64)
+    sample = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T01:00:00Z"))
+    assert sample.qc == SampleQC.NUMERICAL_FAILURE
+    assert sample.diagnostics["ocm_time_origin"] == "reconstructed"
+    assert sample.diagnostics["ocm_reconstruction_qc_invalid"] == 1
+
+
+def test_manifest_outside_gap_remains_time_gap() -> None:
+    """patch 未登錄的時間缺口仍須回傳 TIME_GAP，不得擴張重建適用範圍。"""
+
+    month = _ocm_with_sparse_patch(
+        trailing_observed=True,
+        maximum_time_gap_seconds=3_600.0,
+    )
+    sample = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T03:00:00Z"))
+    assert not sample.valid
+    assert sample.qc == SampleQC.TIME_GAP
+
+
+def test_sparse_patch_does_not_disable_numba_for_observed_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一月份掛載 patch 後，observed endpoint 仍走既有 Numba primitive。"""
+
+    month = _ocm_with_sparse_patch()
+    calls: list[int] = []
+    original = forcing_module.interpolate_ocm_support_numba
+
+    def recording_kernel(*args: object, **kwargs: object):
+        """記錄 observed endpoint 的 primitive 呼叫，再回傳原始數值。"""
+
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(forcing_module, "interpolate_ocm_support_numba", recording_kernel)
+    sample = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T00:00:00Z"))
+    assert sample.valid
+    assert calls
+    assert sample.diagnostics["ocm_time_origin"] == "observed"

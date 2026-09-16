@@ -122,27 +122,50 @@ source-cycle audit。這是重新格網化，不是資料插補。
 
 正式候選為 `ocm_multivariate_eof_harmonic_state_space_smoother_v1`：
 
-1. 在每一 flow domain 以完整可用時段建立多變量、面積／體積加權 EOF 空間基底；u/v
-   必須聯合建模，w、elev、垂向座標及 log-transformed Kz 以明示 scaling 納入或建立耦合
-   子模型，不能各自任意補值。
-2. EOF 係數先以主要日潮／半日潮 harmonic regression 表達可解析週期，再對殘差建立
-   regularized vector autoregression/state-space model。這是對 Frolov et al. EOF-AR 方法的
-   缺口內插延伸；因缺口左右都有樣本，正式估計使用前向與後向資訊的 Kalman smoother，
-   不只作單向 forecast。
-3. 對模型 state posterior 抽樣形成 forcing reconstruction members；posterior mean 作
-   deterministic reference。重建 member 透過 `member_id` 決定性配對，不另把基礎情境數
-   乘上一個未揭露的因子；若獨立執行 reconstruction sensitivity，則以
-   `experiment_case_id` 與 `reconstruction_member_id` 明示。
+1. 目前 deterministic v1 以缺口左右各最多 `context_hours` 的 exact observed rows 建模；
+   每一物理欄位按固定 feature block 縮放，u/v 在 `hvel` 的同一區塊中聯合處理，w、elev、
+   zcor 與 Kz 則使用各自的明示子模型。這個實作不宣稱已具面積／體積加權或跨全部欄位的
+   單一 EOF basis，實際設定會完整寫入 manifest。
+2. 每一 feature block 先以 M2、S2、K1、O1 週期及趨勢做正則化 harmonic regression，
+   再對 residual 建立低秩 EOF scores。每個 score 分別估計 regularized AR(2)，由缺口左側
+   向前及右側反向預測，依距離與 score spread 做 deterministic 雙向融合；目前不是
+   Kalman posterior sampler，也不把單向 persistence 當成重建。
+3. 本版 patch 只發布 deterministic reconstructed row，不額外擴增粒子情境或 forcing
+   member。任何後續 ensemble／方法敏感度另以版本化設定及結果記錄，不暗中改變目前
+   `10 × 20 × 50 × M` 的研究母體。
 4. wet/dry 採保守政策：只有缺口雙側及 persistent-wet 契約皆為 wet 的 face 才允許重建
    forcing；其餘維持無支撐，不以分類器創造海域。zcor 必須保持由海床至海面的嚴格次序，
    Kz 必須非負且不得超出訓練資料的核定物理範圍；違反限制的 cell/member 標為 reconstruction
    failure，不以截斷後的數值冒充原場。
-5. 重建值寫入獨立 immutable patch，不覆寫 OCM 上游 cache。每個值至少保存
-   `origin=observed|reconstructed_short|reconstructed_state_space`、模型版本、fold、均值、
-   標準差、QC 與 input fingerprint。
+5. 重建值寫入獨立 immutable patch，不覆寫 OCM 上游 cache。每一缺失 row 保存
+   `origin_code=reconstructed_short|reconstructed_state_space`、模型版本、gap ID、逐列 QC、
+   source／mesh fingerprint、設定、陣列 shape／dtype／bytes 與 SHA-256；observed rows
+   仍只由原始月份提供，runtime diagnostics 另區分 observed、reconstructed 與 mixed bracket。
 
 研究期間起點缺少的 `2024-01-01 00:00 UTC` 沒有雙側支撐，不納入雙向重建。它只定義
 forcing 起始邊界；arrival selector 不會建立需要越過該時刻的 backward window。
+
+### 4.5 四區稀疏 patch 建置操作
+
+四區使用同一個 output root，一次發布 domain manifests 與 root index。來源與輸出必須是
+已核對的絕對路徑；輸出位於 NFS，不能放在 SERVER `/home`：
+
+```bash
+python scripts/build_ocm_reconstruction.py \
+  --source-root "$OCM_NATIVE_ROOT" \
+  --output-root "$OCM_RECONSTRUCTION_ROOT" \
+  --flow-id northeast_taiwan_common_cache_v3 \
+  --flow-id hsinchu_cache_v3 \
+  --flow-id houwan_nmmba_cache_v3 \
+  --flow-id lienchiang_common_cache_v3
+```
+
+背景 log 逐行輸出 JSON，依 `flow_start`、`gap_start`、`gap_complete`、
+`month_published`、`flow_complete` 與 `root_index_published` 判讀進度。若程序在完整 domain
+發布後中斷，可用相同參數加 `--resume`；程式只沿用已通過 manifest、sidecar 與全部 array
+checksum 的 domain。只有部分月份、沒有 domain manifest 的目錄不會被跳過或覆寫，須先保存
+故障現場並由操作者處理。四區完成後將同一 output root 注入 `OCM_RECONSTRUCTION_ROOT`；
+H30／H60／H90 與兩種沉底模式共用這份 patch，不因 horizon 或 mode 重建六次。
 
 ## 5. 預先登錄的驗證與接受規則
 

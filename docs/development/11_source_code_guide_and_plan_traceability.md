@@ -62,7 +62,7 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 2. 先開啟[互動式程式架構地圖](../source_code_architecture_map.html)建立全貌，再閱讀本文件第 3、4 節的五個程式群組與兩張流程圖。
 3. [設定範例](../../configs/lagrangian_backtracking.example.yaml) 與 `config.py`：了解何者被鎖定為科學契約，何者尚不可用於正式發布。
 4. `models.py`、`scenarios.py`、`runner.py`、`batch_state.py`：了解一條軌跡如何由站點、受體、到達時間、行為、成員唯一識別並進入 SoA 批次。
-5. `forcing.py`、`forcing_window.py`、`mesh.py`、`stokes.py`、`diffusion.py`、`integrators.py`：了解每一時間步的速度如何取得與計算。
+5. `ocm_reconstruction.py`、`forcing.py`、`forcing_window.py`、`mesh.py`、`stokes.py`、`diffusion.py`、`integrators.py`：了解已登錄缺口如何形成稀疏 patch，以及每一時間步的速度如何取得與計算。
 6. `boundaries.py`、`engine.py`、`production.py`：了解何時記錄事件、何時停止回溯，以及 CPU batch 如何呼叫共用單步 engine。
 7. `runtime.py`、`run_control.py`、`run_locking.py`、`run_validation.py`、`pilot_matrix_validation.py`、`cli.py`：了解 pilot／formal request、workspace、鎖定、reconcile、跨區共同設定比較與命令列邊界。
 8. `outputs.py`、`checkpoint.py`、`report_material_statistics.py`、`aggregation.py`：了解如何保存可追溯結果，以及如何產生材質／底部接觸、密度與路徑統計。
@@ -84,6 +84,7 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 只
 | 資料與幾何 | `receptors.py`、`arrival_times.py` | 可長期濕潤的網格面、各時段資料品質指標 | 選取每站 5 個水平位置 × 4 個垂向層位，以及 48 個分層時刻加 2 個事件時刻。 | `select_horizontal_receptors`、`build_vertical_targets`、`select_arrival_times` |
 | 資料與幾何 | `manifests.py` | 已產製的 component／geometry JSON 與 config resolver | 嚴格驗證 material、receptor、arrival、dynamic pair 與巢狀邊界；formal A 依 resolver 綁定當期 `formal_domain_policy` 與 v3 flow-domain ID，舊 `formal_domain_policy=expanded_domain_v1` 僅作相容讀取。 | `load_scenario_inputs`、`load_boundary_geometries` |
 | 物理與邊界 | `models.py` | 無 | 定義所有模組共用的粒子狀態、速度樣本、品質旗標、事件與停止狀態。 | `ParticleState`、`VelocitySample`、`BoundaryEvent` |
+| 物理與邊界 | `ocm_reconstruction.py` | 已驗收 OCM schema 3 月資料、canonical UTC 軸、原生網格與雙側觀測 context | 只為已知內部缺口產生 immutable sparse rows；保存來源／網格 fingerprint、逐列 origin、局部品質旗標與 checksum，研究期起點的單側缺時不重建。 | `NpyDomainSource`、`build_reconstruction_patch`、`validate_reconstruction_patch` |
 | 物理與邊界 | `forcing.py`、`forcing_window.py` | OCM／NWW3 產品、時間、粒子位置與 UTC stage | 取樣海流、波浪、Stokes、沉降與擴散資料；以月份 lazy window 管理 resident cache。 | `CombinedMonthForcing`、`ForcingWindowManager` |
 | 物理與邊界 | `accelerated.py`、`stokes.py`、`diffusion.py`、`integrators.py` | 欄位、波浪條件、擴散係數與速度取樣器 | 提供 OCM 內插加速、有限水深 Stokes、隨機擴散與逆向四階時間積分。 | `interpolate_ocm_support_numba`、`finite_depth_stokes`、`brownian_displacement`、`rk4_step` |
 | 物理與邊界 | `boundaries.py`、`engine.py` | 提議的新粒子位置、局部／外層範圍、海面與海床資料 | 解析海岸、局部範圍、共同流場外框、海面與海床事件，控制單粒子回溯至停止。 | `resolve_horizontal_boundaries`、`resolve_vertical_boundaries`、`run_particle` |

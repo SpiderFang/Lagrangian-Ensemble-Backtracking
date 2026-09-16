@@ -17,9 +17,11 @@ Phase 3B benchmark，以量測月份 I/O、命中率、淘汰與 resident ndarra
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -34,6 +36,7 @@ from .forcing import (
     CombinedMonthForcing,
     NWWAnalysisMonth,
     OCMNativeMonth,
+    OCMReconstructionPatchMonth,
     _query_z_within_geometric_bounds,
 )
 from .geometry import DomainProjection
@@ -239,6 +242,286 @@ class _MonthEntry:
             self.combined = {}
 
 
+def _sha256_file(path: Path) -> str:
+    """以串流方式計算小型重建檔案的 SHA-256，不把 patch 全檔讀入記憶體。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_json_object(path: Path, *, label: str) -> dict[str, object]:
+    """讀取 reconstruction manifest 的 JSON object，拒絕陣列、scalar 與損壞內容。"""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} 無法讀取或不是合法 JSON：{path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} 必須是 JSON object：{path}")
+    return payload
+
+
+def _checksum_from_sidecar(path: Path) -> str | None:
+    """解析可選 sidecar 的 hash 文字或 JSON ``sha256`` 欄位。"""
+
+    sidecar = path.with_name(path.name + ".sha256")
+    if not sidecar.is_file():
+        return None
+    text = sidecar.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"重建檔案 checksum sidecar 不可為空：{sidecar}")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text.split()[0]
+    if isinstance(payload, dict) and isinstance(payload.get("sha256"), str):
+        return payload["sha256"]
+    raise ValueError(f"重建檔案 checksum sidecar 缺少 sha256：{sidecar}")
+
+
+def _validate_checksum(path: Path, expected: object, *, label: str) -> None:
+    """驗證一個 patch manifest／array 的 SHA-256；不接受模糊或短 hash。"""
+
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise ValueError(f"{label} checksum 必須是 64 位 SHA-256")
+    normalized = expected.lower()
+    if any(char not in "0123456789abcdef" for char in normalized):
+        raise ValueError(f"{label} checksum 不是小寫十六進位 SHA-256")
+    actual = _sha256_file(path)
+    if actual != normalized:
+        raise ValueError(f"{label} checksum 不一致：{path}")
+
+
+def _mesh_fingerprint(mesh: NativeMesh) -> str:
+    """建立不含路徑、且不受受體投影影響的 native mesh fingerprint。
+
+    A 區同一份 forcing 會供貢寮與龜山島兩個投影中心使用；``node_xy`` 會隨投影
+    改變，不能作 patch identity。原生經緯度、深度、bottom index 與 face topology
+    已足以唯一綁定 schema 3 網格，也能由重建建置器直接從 grid NPY 重算。
+    """
+
+    digest = hashlib.sha256()
+    for field_name in (
+        "node_lon",
+        "node_lat",
+        "source_depth_m",
+        "source_node_bottom_index",
+        "face_nodes_local",
+        "face_node_count",
+        "source_face_global_index",
+    ):
+        value = np.ascontiguousarray(np.asarray(getattr(mesh, field_name)))
+        digest.update(field_name.encode("utf-8"))
+        digest.update(value.dtype.str.encode("ascii"))
+        digest.update(repr(tuple(value.shape)).encode("ascii"))
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+class _ReconstructionPatchStore:
+    """驗證單一 flow domain 的稀疏重建 manifest，並 lazy 讀取月份 patch。
+
+    store 只保存小型 JSON manifest 與網格 fingerprint；月份物理陣列仍在首次取樣時
+    以唯讀 memory-map 開啟。已登錄 patch 的 checksum／QC／mesh binding 任一失敗都直接
+    上拋，讓 runtime 不會把損壞重建資料誤當成 observed 或零流速；未登錄月份則回傳
+    ``None``，由原本 OCM time axis 判定是否屬於 manifest 外缺口。
+    """
+
+    _ARRAY_NAMES = (
+        "time_utc_ns",
+        "hvel",
+        "vertical_velocity",
+        "zcor",
+        "elev",
+        "wetdry_elem",
+        "diffusivity",
+        "origin_code",
+        "quality_flags",
+    )
+
+    def __init__(self, *, root: str | Path, flow_domain_id: str, mesh: NativeMesh) -> None:
+        """讀取 domain manifest、root index 並驗證當前 native mesh fingerprint。"""
+
+        self.root = Path(root)
+        self.flow_domain_id = flow_domain_id
+        self.domain_root = self.root / flow_domain_id
+        if not self.root.is_dir() or not self.domain_root.is_dir():
+            raise FileNotFoundError(f"缺少 OCM reconstruction flow-domain root：{self.domain_root}")
+        self.manifest_path = self.domain_root / "reconstruction-manifest.json"
+        if not self.manifest_path.is_file():
+            raise FileNotFoundError(f"缺少 OCM reconstruction domain manifest：{self.manifest_path}")
+        self.manifest = _read_json_object(self.manifest_path, label="OCM reconstruction manifest")
+        sidecar_hash = _checksum_from_sidecar(self.manifest_path)
+        if sidecar_hash is None:
+            raise FileNotFoundError(f"缺少 OCM reconstruction manifest checksum：{self.manifest_path}")
+        _validate_checksum(
+            self.manifest_path,
+            sidecar_hash,
+            label="OCM reconstruction manifest sidecar",
+        )
+        manifest_flow = self.manifest.get("flow_domain_id", self.manifest.get("flow_id"))
+        if not isinstance(manifest_flow, str) or manifest_flow != flow_domain_id:
+            raise ValueError("OCM reconstruction manifest flow_domain_id 不一致")
+        expected_mesh = self.manifest.get("mesh_fingerprint")
+        if expected_mesh is None:
+            expected_mesh = self.manifest.get("source_mesh_fingerprint")
+        if not isinstance(expected_mesh, str) or not expected_mesh:
+            raise ValueError("OCM reconstruction manifest 缺少 mesh fingerprint")
+        if expected_mesh != _mesh_fingerprint(mesh):
+            raise ValueError("OCM reconstruction manifest mesh fingerprint 不一致")
+        source_fingerprint = self.manifest.get("source_fingerprint")
+        if not isinstance(source_fingerprint, str) or not source_fingerprint:
+            raise ValueError("OCM reconstruction manifest 缺少 source fingerprint")
+        self.manifest_sha256 = _sha256_file(self.manifest_path)
+        self._months = self._parse_month_records(self.manifest.get("months"))
+        self._validate_root_index()
+
+    @staticmethod
+    def _parse_month_records(value: object) -> dict[str, dict[str, object]]:
+        """將 manifest 的 list/dict 月份索引正規化成唯一 ``YYYYMM`` mapping。"""
+
+        if isinstance(value, dict):
+            records = []
+            for month_id, record in value.items():
+                if not isinstance(record, dict):
+                    raise ValueError("OCM reconstruction manifest.months record 必須是 object")
+                records.append({"month_id": month_id, **record})
+        elif isinstance(value, list):
+            if any(not isinstance(record, dict) for record in value):
+                raise ValueError("OCM reconstruction manifest.months record 必須是 object")
+            records = list(value)
+        else:
+            raise ValueError("OCM reconstruction manifest.months 必須是 list 或 object")
+        parsed: dict[str, dict[str, object]] = {}
+        for record in records:
+            month_id = record.get("month_id", record.get("month"))
+            if not isinstance(month_id, str) or len(month_id) != 6 or not month_id.isdigit():
+                raise ValueError("OCM reconstruction manifest month_id 必須是 YYYYMM")
+            if month_id in parsed:
+                raise ValueError(f"OCM reconstruction manifest month_id 重複：{month_id}")
+            parsed[month_id] = record
+        return parsed
+
+    def _validate_root_index(self) -> None:
+        """驗證 root index 存在且包含目前 domain，不信任 index 取代 domain manifest。"""
+
+        candidates = (
+            self.root / "reconstruction-index.json",
+            self.root / "reconstruction-root-index.json",
+            self.root / "index.json",
+        )
+        index_path = next((path for path in candidates if path.is_file()), None)
+        if index_path is None:
+            raise FileNotFoundError(f"缺少 OCM reconstruction root index：{self.root}")
+        index = _read_json_object(index_path, label="OCM reconstruction root index")
+        sidecar_hash = _checksum_from_sidecar(index_path)
+        if sidecar_hash is not None:
+            _validate_checksum(index_path, sidecar_hash, label="OCM reconstruction root index sidecar")
+        domains = index.get("flow_domains", index.get("domains"))
+        registered: dict[str, Mapping[str, object] | None] = {}
+        if isinstance(domains, Mapping):
+            for flow_id, record in domains.items():
+                if isinstance(flow_id, str):
+                    registered[flow_id] = record if isinstance(record, Mapping) else None
+        elif isinstance(domains, list):
+            for item in domains:
+                if isinstance(item, str):
+                    registered[item] = None
+                elif isinstance(item, Mapping):
+                    flow_id = item.get("flow_id", item.get("flow_domain_id"))
+                    if isinstance(flow_id, str):
+                        registered[flow_id] = item
+        elif index.get("flow_domain_id") == self.flow_domain_id:
+            registered[self.flow_domain_id] = index
+        record = registered.get(self.flow_domain_id)
+        if self.flow_domain_id not in registered:
+            raise ValueError("OCM reconstruction root index 未登錄目前 flow domain")
+        if record is not None:
+            manifest_path = record.get("manifest_path")
+            if manifest_path not in (
+                None,
+                f"{self.flow_domain_id}/reconstruction-manifest.json",
+            ):
+                raise ValueError("OCM reconstruction root index manifest_path 不一致")
+            expected_manifest_hash = record.get("manifest_sha256")
+            if expected_manifest_hash is not None:
+                _validate_checksum(
+                    self.manifest_path,
+                    expected_manifest_hash,
+                    label="OCM reconstruction root index manifest",
+                )
+
+    @staticmethod
+    def _record_checksum(record: Mapping[str, object], name: str) -> object | None:
+        """支援 manifest 的 ``checksums`` 或 ``files[*].sha256`` 表示法。"""
+
+        checksums = record.get("checksums")
+        checksum_key = name if isinstance(checksums, Mapping) and name in checksums else f"{name}.npy"
+        if isinstance(checksums, Mapping) and checksum_key in checksums:
+            value = checksums[checksum_key]
+            if isinstance(value, Mapping):
+                return value.get("sha256", value.get("checksum"))
+            return value
+        files = record.get("files")
+        if isinstance(files, Mapping):
+            item = files.get(name, files.get(f"{name}.npy"))
+            if isinstance(item, Mapping):
+                return item.get("sha256", item.get("checksum"))
+            return item
+        return None
+
+    def load_month(self, month_id: str) -> OCMReconstructionPatchMonth | None:
+        """讀取指定月份 patch；未登錄月份保留 observed-only 相容路徑。"""
+
+        record = self._months.get(month_id)
+        if record is None:
+            return None
+        month_dir = self.domain_root / "months" / month_id
+        if not month_dir.is_dir():
+            raise FileNotFoundError(f"manifest 已登錄但缺少 reconstruction month：{month_dir}")
+        metadata_path = month_dir / "metadata.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(f"缺少 reconstruction patch metadata：{metadata_path}")
+        metadata_checksum = self._record_checksum(record, "metadata")
+        if metadata_checksum is None:
+            metadata_checksum = record.get("metadata_sha256")
+        if metadata_checksum is None:
+            metadata_checksum = _checksum_from_sidecar(metadata_path)
+        if metadata_checksum is None:
+            raise ValueError(f"reconstruction patch metadata 缺少 checksum：{metadata_path}")
+        _validate_checksum(metadata_path, metadata_checksum, label="reconstruction patch metadata")
+        metadata = _read_json_object(metadata_path, label="reconstruction patch metadata")
+        metadata_flow = metadata.get("flow_domain_id", metadata.get("flow_id", self.flow_domain_id))
+        if metadata_flow != self.flow_domain_id:
+            raise ValueError("reconstruction patch metadata flow_domain_id 不一致")
+        metadata_month = metadata.get("month_id", metadata.get("month", month_id))
+        if metadata_month != month_id:
+            raise ValueError("reconstruction patch metadata month_id 不一致")
+        arrays_metadata = metadata.get("arrays")
+        if not isinstance(arrays_metadata, Mapping):
+            arrays_metadata = {}
+        arrays: dict[str, np.ndarray] = {}
+        for name in self._ARRAY_NAMES:
+            path = month_dir / f"{name}.npy"
+            if not path.is_file():
+                raise FileNotFoundError(f"缺少 reconstruction patch array：{path}")
+            expected = self._record_checksum(record, name)
+            if expected is None:
+                descriptor = arrays_metadata.get(name)
+                if isinstance(descriptor, Mapping):
+                    expected = descriptor.get("sha256", descriptor.get("checksum"))
+            if expected is None:
+                expected = _checksum_from_sidecar(path)
+            if expected is None:
+                raise ValueError(f"reconstruction patch 缺少 {name} checksum：{path}")
+            _validate_checksum(path, expected, label=f"reconstruction patch {name}")
+            arrays[name] = np.load(path, mmap_mode="r", allow_pickle=False)
+        return OCMReconstructionPatchMonth(metadata=metadata, month_id=month_id, **arrays)
+
+
 @dataclass(frozen=True, slots=True)
 class _GlobalTimeBracket:
     """跨月份時間軸的兩端來源與內插比例。
@@ -389,6 +672,8 @@ class ForcingWindowManager:
         mesh: NativeMesh,
         ocm_loader: Callable[[str], OCMNativeMonth | None],
         nww_loader: Callable[[str], NWWAnalysisMonth | None] | None = None,
+        reconstruction_loader: Callable[[str], OCMReconstructionPatchMonth | None] | None = None,
+        reconstruction_manifest_sha256: str | None = None,
         max_resident_months: int = 2,
         physics_kernel_backend: str = "numpy_v1",
     ) -> None:
@@ -409,6 +694,8 @@ class ForcingWindowManager:
             raise TypeError("ocm_loader 必須是 callable")
         if nww_loader is not None and not callable(nww_loader):
             raise TypeError("nww_loader 必須是 callable 或 None")
+        if reconstruction_loader is not None and not callable(reconstruction_loader):
+            raise TypeError("reconstruction_loader 必須是 callable 或 None")
         if isinstance(max_resident_months, bool) or not isinstance(max_resident_months, int):
             raise TypeError("max_resident_months 必須是正整數")
         if max_resident_months < 1:
@@ -418,6 +705,8 @@ class ForcingWindowManager:
         self.mesh = mesh
         self._ocm_loader = ocm_loader
         self._nww_loader = nww_loader
+        self._reconstruction_loader = reconstruction_loader
+        self.reconstruction_manifest_sha256 = reconstruction_manifest_sha256
         self.max_resident_months = max_resident_months
         self.physics_kernel_backend = validate_physics_kernel_backend(physics_kernel_backend)
         self._months: OrderedDict[str, _MonthEntry] = OrderedDict()
@@ -447,6 +736,7 @@ class ForcingWindowManager:
         projection: DomainProjection,
         ocm_root: str | Path,
         nww_root: str | Path | None,
+        reconstruction_root: str | Path | None = None,
         max_resident_months: int = 2,
         use_numba_kernel: bool = False,
         physics_kernel_backend: str = "numpy_v1",
@@ -454,6 +744,8 @@ class ForcingWindowManager:
         """從正式 root layout 建立 manager，且 OCM mesh 只在此處載入一次。
 
         OCM 讀取位置為 ``<ocm_root>/<flow_domain_id>/grid`` 與
+        ``months/YYYYMM``；稀疏重建 patch 讀取位置為
+        ``<reconstruction_root>/<flow_domain_id>/reconstruction-manifest.json`` 與
         ``months/YYYYMM``；NWW 讀取位置為 ``<nww_root>/<flow_domain_id>/grid`` 與
         ``months/YYYYMM``。缺少整個月份目錄回傳 ``MissingForcingMonth``，但已存在目錄
         的必要檔案或 schema 錯誤由既有 reader 原樣上拋。``use_numba_kernel`` 只傳給
@@ -474,6 +766,15 @@ class ForcingWindowManager:
             raise FileNotFoundError(f"缺少 OCM flow-domain grid directory：{grid_dir}")
         mesh = NativeMesh.from_directory(grid_dir, projection=projection)
         nww_grid_dir = nww_domain_root / "grid" if nww_domain_root is not None else None
+        reconstruction_store = (
+            _ReconstructionPatchStore(
+                root=reconstruction_root,
+                flow_domain_id=flow_domain_id,
+                mesh=mesh,
+            )
+            if reconstruction_root is not None
+            else None
+        )
 
         def load_ocm(month_id: str) -> OCMNativeMonth:
             """檢查月份目錄後使用既有 OCM reader，避免把缺檔誤轉成時間缺月。"""
@@ -481,11 +782,29 @@ class ForcingWindowManager:
             month_dir = ocm_domain_root / "months" / _validate_month_id(month_id)
             if not month_dir.is_dir():
                 raise MissingForcingMonth(str(month_dir))
-            return OCMNativeMonth.from_directory(
+            observed = OCMNativeMonth.from_directory(
                 month_dir,
                 mesh=mesh,
                 use_numba_kernel=use_numba_kernel,
             )
+            patch = reconstruction_store.load_month(month_id) if reconstruction_store else None
+            if patch is not None:
+                observed = OCMNativeMonth(
+                    month_id=observed.month_id,
+                    mesh=observed.mesh,
+                    time_utc_ns=observed._observed_time_utc_ns,
+                    hvel=observed.hvel,
+                    vertical_velocity=observed.vertical_velocity,
+                    zcor=observed.zcor,
+                    elev=observed.elev,
+                    wetdry_elem=observed.wetdry_elem,
+                    diffusivity=observed.diffusivity,
+                    maximum_time_gap_seconds=observed.maximum_time_gap_ns / 1_000_000_000,
+                    wet_value=observed.wet_value,
+                    use_numba_kernel=use_numba_kernel,
+                    reconstruction_patch=patch,
+                )
+            return observed
 
         def load_nww(month_id: str) -> NWWAnalysisMonth | None:
             """僅在 Stokes facade 需要時開啟 NWW 月份；整個月不存在回傳 None。"""
@@ -505,6 +824,10 @@ class ForcingWindowManager:
             mesh=mesh,
             ocm_loader=load_ocm,
             nww_loader=load_nww,
+            reconstruction_loader=(reconstruction_store.load_month if reconstruction_store else None),
+            reconstruction_manifest_sha256=(
+                reconstruction_store.manifest_sha256 if reconstruction_store else None
+            ),
             max_resident_months=max_resident_months,
             physics_kernel_backend=backend,
         )
@@ -561,6 +884,24 @@ class ForcingWindowManager:
             raise ValueError(f"OCM loader month_id 不一致：{result.month_id} != {month_id}")
         if not self._meshes_match(result.mesh, self.mesh):
             raise ValueError(f"OCM loader mesh identity 不一致：{month_id}")
+        if self._reconstruction_loader is not None and result.reconstruction_patch is None:
+            patch = self._reconstruction_loader(month_id)
+            if patch is not None:
+                result = OCMNativeMonth(
+                    month_id=result.month_id,
+                    mesh=result.mesh,
+                    time_utc_ns=result._observed_time_utc_ns,
+                    hvel=result.hvel,
+                    vertical_velocity=result.vertical_velocity,
+                    zcor=result.zcor,
+                    elev=result.elev,
+                    wetdry_elem=result.wetdry_elem,
+                    diffusivity=result.diffusivity,
+                    maximum_time_gap_seconds=result.maximum_time_gap_ns / 1_000_000_000,
+                    wet_value=result.wet_value,
+                    use_numba_kernel=result.use_numba_kernel,
+                    reconstruction_patch=patch,
+                )
         self._ocm_load_count += 1
         return result
 

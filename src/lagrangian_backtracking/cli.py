@@ -495,6 +495,7 @@ def _run_shard_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--shard-id", required=True)
     parser.add_argument("--ocm-native-root", type=Path)
+    parser.add_argument("--ocm-reconstruction-root", type=Path)
     parser.add_argument("--nww-analysis-root", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--resume", action="store_true")
@@ -517,6 +518,7 @@ def _run_worker_parser() -> argparse.ArgumentParser:
     # 使用 append 保留 caller 的命令列順序；handler 會拒絕重複與不存在的 ID。
     parser.add_argument("--shard-id", action="append", required=True)
     parser.add_argument("--ocm-native-root", type=Path)
+    parser.add_argument("--ocm-reconstruction-root", type=Path)
     parser.add_argument("--nww-analysis-root", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--resume", action="store_true")
@@ -572,6 +574,11 @@ def _run_formal_parallel_parser() -> argparse.ArgumentParser:
         "--ocm-native-root",
         type=Path,
         help="OCM native 根目錄；省略時使用 config 指定的環境變數",
+    )
+    parser.add_argument(
+        "--ocm-reconstruction-root",
+        type=Path,
+        help="已核准 OCM reconstruction patch 根目錄；省略時使用 config 指定的環境變數",
     )
     parser.add_argument(
         "--nww-analysis-root",
@@ -1592,18 +1599,26 @@ def run_shard(argv: Sequence[str] | None = None) -> int:
         args.ocm_native_root,
         input_config.ocm_native_root_env,
     )
+    reconstruction_root = _optional_root_from_env(
+        args.ocm_reconstruction_root,
+        getattr(input_config, "ocm_reconstruction_root_env", None) or "OCM_RECONSTRUCTION_ROOT",
+    )
     nww_root = _optional_root_from_env(
         args.nww_analysis_root,
         input_config.nww_analysis_root_env,
     )
-    controller = open_run_controller(
-        args.workspace,
-        config_path=args.config,
-        ocm_native_root=ocm_root,
-        nww_analysis_root=nww_root,
-        resume=args.resume,
-        checkpoint_root=args.checkpoint_root,
-    )
+    controller_kwargs: dict[str, object] = {
+        "config_path": args.config,
+        "ocm_native_root": ocm_root,
+        "nww_analysis_root": nww_root,
+        "resume": args.resume,
+        "checkpoint_root": args.checkpoint_root,
+    }
+    # legacy fake/config caller 沒有新增欄位時維持既有 kwargs topology；正式設定有
+    # reconstruction root 才把它明確傳入 controller，避免以 None 覆蓋舊 adapter。
+    if reconstruction_root is not None:
+        controller_kwargs["ocm_reconstruction_root"] = reconstruction_root
+    controller = open_run_controller(args.workspace, **controller_kwargs)
     summary = controller.run_shard(args.shard_id, sweep_budget=args.sweep_budget)
     print(json.dumps(asdict(summary), ensure_ascii=False, sort_keys=True))
     return 0
@@ -1656,18 +1671,24 @@ def run_worker(argv: Sequence[str] | None = None) -> int:
         args.ocm_native_root,
         input_config.ocm_native_root_env,
     )
+    reconstruction_root = _optional_root_from_env(
+        args.ocm_reconstruction_root,
+        getattr(input_config, "ocm_reconstruction_root_env", None) or "OCM_RECONSTRUCTION_ROOT",
+    )
     nww_root = _optional_root_from_env(
         args.nww_analysis_root,
         input_config.nww_analysis_root_env,
     )
-    controller = open_run_controller(
-        args.workspace,
-        config_path=args.config,
-        ocm_native_root=ocm_root,
-        nww_analysis_root=nww_root,
-        resume=args.resume,
-        checkpoint_root=args.checkpoint_root,
-    )
+    controller_kwargs = {
+        "config_path": args.config,
+        "ocm_native_root": ocm_root,
+        "nww_analysis_root": nww_root,
+        "resume": args.resume,
+        "checkpoint_root": args.checkpoint_root,
+    }
+    if reconstruction_root is not None:
+        controller_kwargs["ocm_reconstruction_root"] = reconstruction_root
+    controller = open_run_controller(args.workspace, **controller_kwargs)
     preflight_wall = time.perf_counter() - started_wall
     preflight_cpu = time.process_time() - started_cpu
 
@@ -1723,6 +1744,7 @@ def run_formal_parallel(argv: Sequence[str] | None = None) -> int:
             checkpoint_root=args.checkpoint_root,
             numba_cache_dir=args.numba_cache_dir,
             ocm_native_root=args.ocm_native_root,
+            ocm_reconstruction_root=args.ocm_reconstruction_root,
             nww_analysis_root=args.nww_analysis_root,
             resume=args.resume,
             cpu_affinity=args.cpu_affinity,
