@@ -36,6 +36,10 @@ def _write_template(path: Path, *, support_days: int | None = None) -> bytes:
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    # 正式 example 現在是 2025 observation；本 helper 仍專門建立 legacy suite，
+    # 因此要同步退回舊 v3 design 並移除新版 typed selection，而不是只關閉 bed block。
+    payload["design_version"] = "design_baseline_v3_non_rising_a_v3_local20_20260909"
+    payload.pop("arrival_time_selection", None)
     payload["scenarios"].pop("bed_residence_time", None)
     payload["inputs"].pop("backtrack_support_days", None)
     payload["integration"]["dt_min_seconds"] = 30.0
@@ -200,6 +204,20 @@ def _install_small_suite_doubles(
             "input_directory_artifact_index_sha256": index_fingerprint["sha256"],
             "artifacts": records,
             "approved_only_after_exact_hash_validation": True,
+            "arrival_selection_binding": {
+                "forcing_years": horizon_suite._arrival_population_contract(payload)[
+                    "forcing_years"
+                ],
+                "observation_years": horizon_suite._arrival_population_contract(payload)[
+                    "observation_years"
+                ],
+                "policy": horizon_suite._arrival_population_contract(payload)[
+                    "arrival_selection_policy_id"
+                ],
+                "replicates": horizon_suite._arrival_population_contract(payload)[
+                    "replicates_per_stratum"
+                ],
+            },
             "backtrack_horizon_binding": {
                 "source_config_hash": horizon_suite._config_hash_from_payload(
                     yaml.safe_load(template.read_text(encoding="utf-8"))
@@ -381,6 +399,14 @@ def test_bed_suite_builds_one_180_day_selection_mother_and_six_mode_releases(
     assert manifest["selection_support_days"] == 180
     assert manifest["runtime_support_days"] == 90
     assert manifest["source_schema_version"] == BED_RESIDENCE_INPUT_SCHEMA_VERSION
+    assert manifest["forcing_years"] == [2024, 2025]
+    assert manifest["observation_years"] == [2025]
+    assert manifest["arrival_selection_policy_id"] == (
+        "observation_year_stratified_48_plus_2_v1"
+    )
+    assert manifest["replicates_per_stratum"] == 2
+    assert manifest["arrival_core_count"] == 48
+    assert manifest["arrival_event_count"] == 2
     assert manifest["backtrack_modes"] == list(modes)
     assert manifest["input_build_count"] == 1
     assert len(manifest["releases"]) == 6
@@ -697,6 +723,7 @@ def test_validator_rejects_manifest_and_release_record_field_tampering_after_res
     manifest_mutators = {
         "source_schema_version": lambda value: value.__setitem__("source_schema_version", "0.0.0"),
         "dt_min_seconds": lambda value: value.__setitem__("dt_min_seconds", 31.0),
+        "observation_years": lambda value: value.__setitem__("observation_years", [2025]),
         "paths": lambda value: value["paths"].__setitem__("common_input", "other-input"),
         "input_build_count": lambda value: value.__setitem__("input_build_count", True),
     }

@@ -37,6 +37,14 @@ def _legacy_example_payload() -> dict:
     payload = deepcopy(_payload())
     payload["scenarios"].pop("bed_residence_time", None)
     payload["inputs"].pop("backtrack_support_days", None)
+    payload["design_version"] = "design_baseline_v3_non_rising_a_v3_local20_20260909"
+    payload["inputs"]["available_data_contract"]["population_id"] = "available_2024_2025_v1"
+    payload["arrival_time_selection"].pop("policy", None)
+    payload["arrival_time_selection"].pop("observation_years", None)
+    payload["arrival_time_selection"].pop("replicates", None)
+    payload["arrival_time_selection"]["core_design"] = (
+        "two_years_by_four_seasons_by_spring_neap_by_three_tidal_phase_proxies"
+    )
     return payload
 
 
@@ -120,6 +128,20 @@ def test_example_config_has_fixed_scientific_counts() -> None:
     assert bed["sampling_seed"] == 20260916
     assert bed["runtime_horizon_support_days"] is None
     assert config.inputs.backtrack_support_days == 180
+    assert config.arrival_time_selection is not None
+    assert config.arrival_time_selection.policy == "observation_year_stratified_48_plus_2_v1"
+    assert config.arrival_time_selection.observation_years == [2025]
+    assert config.arrival_time_selection.replicates == 2
+
+
+def test_new_observation_years_must_be_nonempty_forcing_subset() -> None:
+    """新版 observation 年份不可脫離 2024–2025 forcing 聯集或變成空集合。"""
+
+    for years in ([], [2023], [2024, 2025, 2025]):
+        payload = _payload()
+        payload["arrival_time_selection"]["observation_years"] = years
+        with pytest.raises(ValueError, match="observation_years"):
+            ProjectConfig.model_validate(payload)
 
 
 def test_receptor_candidate_domain_policy_is_versioned_and_core_aware() -> None:
@@ -135,7 +157,7 @@ def test_example_material_table_matches_runtime_baseline() -> None:
     """YAML 與程式內建表不可各自維護不同的材質、形狀、條件或速度。"""
 
     payload = _payload()
-    assert payload["design_version"] == "design_baseline_v3_non_rising_a_v3_local20_20260909"
+    assert payload["design_version"] == CURRENT_DESIGN_VERSION
     assert payload["physics"]["settling"]["material_classes"] == [asdict(item) for item in BASELINE_BEHAVIORS]
 
 
@@ -430,6 +452,9 @@ def test_flow_domain_resolver_selects_formal_release_id_only_in_formal_mode() ->
     # expanded_domain_v1 是 v2 legacy scope；v3 design 必須和本期 v3 policy 雙向綁定，
     # 不可藉改 policy 將現行 v3 config 降回舊來源。
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    payload["arrival_time_selection"].pop("policy", None)
+    payload["arrival_time_selection"].pop("observation_years", None)
+    payload["arrival_time_selection"].pop("replicates", None)
     payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
     payload["domains"][0].pop("runtime_spatial_support_policy", None)
     payload["domains"][0]["formal_release_flow_domain_id"] = (

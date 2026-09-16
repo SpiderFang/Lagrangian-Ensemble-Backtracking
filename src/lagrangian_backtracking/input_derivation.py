@@ -52,6 +52,8 @@ from .bed_residence import (
     sample_bed_residence_age_hours,
 )
 from .config import (
+    ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1,
+    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
     FORMAL_DOMAIN_POLICY_EXPANDED_V1,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
     FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION,
@@ -138,6 +140,9 @@ _WETDRY_SEMANTICS_ID = "schism_wetdry_elem_0_wet_1_dry"
 NWW_METRIC_LOCATION_POLICY_ID = "anchor_first_nearest_runtime_supported_nww_cell_center_v1"
 NWW_METRIC_LOCATION_MAX_GRID_SCALES = 2.0
 ARRIVAL_SELECTION_METHOD_ID = "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
+ARRIVAL_SELECTION_METHOD_OBSERVATION_YEAR_ID = (
+    "server_v3_observation_year_48_strata_plus_two_events_gap_safe_nww_metric_location_v1"
+)
 
 # 這組 pilot policy 只提供固定 24 小時工程視窗；它不是正式五站 48+2 arrival
 # selection 的替代品。registry 以「可接受站點組合」集中描述入口：B／C／D 各可
@@ -2753,8 +2758,18 @@ def _select_arrivals_for_site(
     design_version: str,
     expected_axis: np.ndarray,
     strict: bool,
+    observation_years: Sequence[int] | None = None,
+    replicates: int | None = None,
+    selection_policy: str | None = None,
 ) -> list[ArrivalTime]:
-    """以既有 48+2 selector 產生單站 arrival；constant synthetic 場只在非 strict fallback。"""
+    """依版本化 observation policy 產生單站 48+2 arrival。
+
+    ``product.canonical.time_utc_ns`` 仍是 forcing 的完整時間軸；新版 policy 只把
+    ``observation_years`` 傳給 selector，故 2024 能繼續參與 180 日
+    ``backward_window_available``，卻不會被選成 2025 observation anchor。非 strict
+    synthetic fixture 也沿用同一 policy 產生 metadata；它只服務測試，不代表正式資料
+    通過 accepted-product 或 gap-safe gate。
+    """
 
     times = np.asarray(product.canonical.time_utc_ns, dtype=np.int64)
     values = np.asarray(
@@ -2789,13 +2804,17 @@ def _select_arrivals_for_site(
             valid_forcing=valid,
             backward_window_available=backward,
             design_version=design_version,
+            observation_years=observation_years,
+            replicates=replicates,
+            selection_policy=selection_policy,
         )
     except ValueError:
         if strict:
             raise
         # 低維 synthetic fixture 常用 constant elevation，原 selector 的 spring/neap
-        # 中位數會讓其中一類沒有候選。這個 fallback 只用於開發產物，仍要求兩年、四季、
-        # 六格核心與兩事件，並將 status 留在 generated，正式 release validator 不接受。
+        # 中位數可能讓其中一類沒有候選。這個 fallback 只用於開發產物，仍依呼叫端
+        # policy 建立固定數量與 metadata，並將 status 留在 generated；正式 release
+        # validator 不接受以 fallback 取代 accepted forcing 的 selector 證據。
         candidate_indices = np.flatnonzero(valid)
         if candidate_indices.size < 50:
             raise
@@ -2804,7 +2823,17 @@ def _select_arrivals_for_site(
             for index in candidate_indices
         }
         years = sorted({item.year for item in datetimes.values()})
-        if len(years) != 2:
+        is_observation_policy = selection_policy == "observation_year_stratified_48_plus_2_v1"
+        if is_observation_policy:
+            if observation_years is None:
+                raise
+            selected_years = [int(value) for value in observation_years]
+            if len(selected_years) != 1 or not set(selected_years).issubset(set(years)):
+                raise
+            if replicates not in (None, 2):
+                raise
+            years = selected_years
+        elif len(years) != 2:
             raise
         season_by_month = {
             12: "DJF",
@@ -2822,40 +2851,117 @@ def _select_arrivals_for_site(
         }
         selected: set[int] = set()
         records: list[ArrivalTime] = []
-        for year in years:
-            for season in ("DJF", "MAM", "JJA", "SON"):
-                cell = [
-                    i
-                    for i in candidate_indices
-                    if datetimes[int(i)].year == year and season_by_month[datetimes[int(i)].month] == season
-                ]
-                if len(cell) < 6:
-                    raise
-                for tide_class, phase_index in (("spring_proxy", 0), ("neap_proxy", 3)):
-                    for phase, offset in (("fastest_rising", 0), ("fastest_falling", 1), ("slack_proxy", 2)):
-                        index = cell[(phase_index + offset) % len(cell)]
-                        while index in selected:
-                            index = cell[(cell.index(index) + 1) % len(cell)]
-                        selected.add(index)
-                        value = int(times[index])
-                        records.append(
-                            ArrivalTime(
-                                arrival_time_id=stable_identifier(
-                                    "arr", [site_id, str(value), tide_class, phase, design_version]
-                                ),
-                                study_site_id=site_id,
-                                time_utc_ns=value,
-                                year=year,
-                                season=season,
-                                tide_class=tide_class,
-                                phase_or_event=phase,
-                                metadata={
-                                    "selection_method": "synthetic_constant_field_fallback",
-                                    "selection_rank": len(records),
-                                },
-                            )
+        if is_observation_policy:
+            selection_label = "observation_year_stratified_48_plus_2_v1"
+            for year in years:
+                for season in ("DJF", "MAM", "JJA", "SON"):
+                    cell = [
+                        int(i)
+                        for i in candidate_indices
+                        if datetimes[int(i)].year == year
+                        and season_by_month[datetimes[int(i)].month] == season
+                    ]
+                    if len(cell) < 24:
+                        raise
+                    half = len(cell) // 2
+                    for tide_class, class_cell in (
+                        ("spring_proxy", cell[:half]),
+                        ("neap_proxy", cell[half:]),
+                    ):
+                        if len(class_cell) < 12:
+                            raise
+                        phases = ("fastest_rising", "fastest_falling", "slack_proxy")
+                        for phase_index, phase in enumerate(phases):
+                            for replicate_rank in range(2):
+                                offset = phase_index * 2 + replicate_rank
+                                index = next(
+                                    candidate
+                                    for candidate in class_cell[offset:]
+                                    if candidate not in selected
+                                )
+                                selected.add(index)
+                                value = int(times[index])
+                                records.append(
+                                    ArrivalTime(
+                                        arrival_time_id=stable_identifier(
+                                            "arr",
+                                            [
+                                                site_id,
+                                                str(value),
+                                                tide_class,
+                                                phase,
+                                                str(replicate_rank),
+                                                selection_label,
+                                                design_version,
+                                            ],
+                                        ),
+                                        study_site_id=site_id,
+                                        time_utc_ns=value,
+                                        year=year,
+                                        season=season,
+                                        tide_class=tide_class,
+                                        phase_or_event=phase,
+                                        metadata={
+                                            "selection_method": "synthetic_constant_field_fallback",
+                                            "selection_rank": len(records),
+                                            "selection_policy": selection_label,
+                                            "observation_year": year,
+                                            "replicate_rank": replicate_rank,
+                                            "replicate_rank_one_based": replicate_rank + 1,
+                                            "stratum_id": f"{year}/{season}/{tide_class}/{phase}",
+                                        },
+                                    )
+                                )
+        else:
+            for year in years:
+                for season in ("DJF", "MAM", "JJA", "SON"):
+                    cell = [
+                        i
+                        for i in candidate_indices
+                        if (
+                            datetimes[int(i)].year == year
+                            and season_by_month[datetimes[int(i)].month] == season
                         )
-        remaining = [int(i) for i in candidate_indices if int(i) not in selected]
+                    ]
+                    if len(cell) < 6:
+                        raise
+                    for tide_class, phase_index in (
+                        ("spring_proxy", 0),
+                        ("neap_proxy", 3),
+                    ):
+                        for phase, offset in (
+                            ("fastest_rising", 0),
+                            ("fastest_falling", 1),
+                            ("slack_proxy", 2),
+                        ):
+                            index = cell[(phase_index + offset) % len(cell)]
+                            while index in selected:
+                                index = cell[(cell.index(index) + 1) % len(cell)]
+                            selected.add(index)
+                            value = int(times[index])
+                            records.append(
+                                ArrivalTime(
+                                    arrival_time_id=stable_identifier(
+                                        "arr", [site_id, str(value), tide_class, phase, design_version]
+                                    ),
+                                    study_site_id=site_id,
+                                    time_utc_ns=value,
+                                    year=year,
+                                    season=season,
+                                    tide_class=tide_class,
+                                    phase_or_event=phase,
+                                    metadata={
+                                        "selection_method": "synthetic_constant_field_fallback",
+                                        "selection_rank": len(records),
+                                    },
+                                )
+                            )
+        remaining = [
+            int(i)
+            for i in candidate_indices
+            if int(i) not in selected
+            and (not is_observation_policy or datetimes[int(i)].year in years)
+        ]
         for event, score in (("high_wave_event", waves), ("strong_current_event", speeds)):
             if not remaining:
                 raise
@@ -2888,6 +2994,15 @@ def _select_arrivals_for_site(
                     metadata={
                         "selection_method": "synthetic_constant_field_fallback",
                         "selection_rank": len(records),
+                        **(
+                            {
+                                "selection_policy": "observation_year_stratified_48_plus_2_v1",
+                                "observation_year": dt.year,
+                                "stratum_id": f"event/{event}",
+                            }
+                            if is_observation_policy
+                            else {}
+                        ),
                     },
                 )
             )
@@ -3316,6 +3431,9 @@ def _select_arrivals_with_nww_metric_location(
     design_version: str,
     expected_axis: np.ndarray,
     strict: bool,
+    observation_years: Sequence[int] | None = None,
+    replicates: int | None = None,
+    selection_policy: str | None = None,
 ) -> tuple[list[ArrivalTime], _SiteArrivalSelectionContext]:
     """以 anchor-first policy 選出 arrival 並保存 NWW metric location binding。
 
@@ -3324,6 +3442,10 @@ def _select_arrivals_with_nww_metric_location(
     static mask 與兩格局地尺度距離，再依公尺距離、``y0``、``x0`` 穩定排序，逐個執行
     同一個 strict selector。所有失敗都在本函式內 fail closed；只有 ``strict=False`` 的
     內部小型 fixture 才保留既有 anchor synthetic fallback，且不會被 CLI 使用。
+
+    ``observation_years``、``replicates`` 與 ``selection_policy`` 會原樣傳給單站
+    selector；metric location 的 anchor/cell-center 重試不得把新版 2025-only policy
+    降級成舊兩年 policy。
     """
 
     representative_scale_m = _nww_representative_grid_scale_m(
@@ -3359,6 +3481,9 @@ def _select_arrivals_with_nww_metric_location(
             design_version=design_version,
             expected_axis=expected_axis,
             strict=selector_strict,
+            observation_years=observation_years,
+            replicates=replicates,
+            selection_policy=selection_policy,
         )
         binding = _nww_metric_location_binding(
             nww_cache,
@@ -3497,17 +3622,47 @@ def _clone_paired_a_arrivals(
                 "tide_phase_label_source": "gongliao_paired_design_inherited",
             }
         )
+        selection_policy = metadata.get("selection_policy")
+        if isinstance(selection_policy, str) and selection_policy:
+            # 新 observation policy 的 paired 站點仍須各自擁有可重算的 arrival ID；
+            # core identity 包含 replicate rank，event identity 則包含 policy。舊兩年份
+            # metadata 沒有 selection_policy，維持下方原有五欄 identity。
+            if item.tide_class == "event":
+                paired_identity_fields = [
+                    "guishan",
+                    str(time_key),
+                    item.phase_or_event,
+                    selection_policy,
+                    design_version,
+                ]
+            else:
+                replicate_rank = metadata.get("replicate_rank")
+                if type(replicate_rank) is not int:
+                    raise InputDerivationError(
+                        f"新版 paired arrival 缺少 replicate_rank：{item.arrival_time_id}"
+                    )
+                paired_identity_fields = [
+                    "guishan",
+                    str(time_key),
+                    item.tide_class,
+                    item.phase_or_event,
+                    str(replicate_rank),
+                    selection_policy,
+                    design_version,
+                ]
+        else:
+            paired_identity_fields = [
+                "guishan",
+                str(time_key),
+                item.tide_class,
+                item.phase_or_event,
+                design_version,
+            ]
         cloned.append(
             ArrivalTime(
                 arrival_time_id=stable_identifier(
                     "arr",
-                    [
-                        "guishan",
-                        str(time_key),
-                        item.tide_class,
-                        item.phase_or_event,
-                        design_version,
-                    ],
+                    paired_identity_fields,
                 ),
                 study_site_id="guishan",
                 time_utc_ns=item.time_utc_ns,
@@ -4358,19 +4513,74 @@ def _arrival_payload(
     """
 
     bed_config = config.scenarios.bed_residence_time
+    selection_config = config.arrival_time_selection
+    observation_policy = (
+        selection_config.policy
+        if selection_config is not None and selection_config.policy is not None
+        else "two_years_stratified_48_plus_2_v1"
+    )
     method_id = (
         PILOT_ARRIVAL_SELECTION_METHOD_ID
         if pilot_selection is not None
         else (
+            # bed-residence 1.1 loader 的 component method identity 已凍結；新版
+            # observation policy 另由 provenance 的 arrival_time_selection 保存，不能
+            # 只改 root method_id 而使既有 bed loader 無法讀取同一份母體。
             "server_v3_48_strata_plus_two_observation_anchors_then_random_deposition_v1"
             if bed_config is not None
-            else ARRIVAL_SELECTION_METHOD_ID
+            else (
+                ARRIVAL_SELECTION_METHOD_OBSERVATION_YEAR_ID
+                if observation_policy == "observation_year_stratified_48_plus_2_v1"
+                else ARRIVAL_SELECTION_METHOD_ID
+            )
         )
     )
     provenance_extra: dict[str, Any] = {
         "counts": {"study_sites": EXPECTED_STUDY_SITE_COUNT, "arrivals": len(arrivals)},
         "public_analysis_label_policy": {"A": "A 區分析域"},
+        "forcing_years": [int(year) for year in config.inputs.years],
+        "observation_years": (
+            [int(year) for year in selection_config.observation_years]
+            if selection_config is not None and selection_config.observation_years is not None
+            else [int(year) for year in config.inputs.years]
+        ),
+        "arrival_selection_policy": observation_policy,
     }
+    if selection_config is not None:
+        provenance_extra["arrival_selection_contract"] = {
+            "policy": observation_policy,
+            "core_count": int(selection_config.core_count),
+            "observation_years": (
+                [int(year) for year in selection_config.observation_years]
+                if selection_config.observation_years is not None
+                else [int(year) for year in config.inputs.years]
+            ),
+            "replicates": (
+                int(selection_config.replicates)
+                if selection_config.replicates is not None
+                else None
+            ),
+            "event_supplement_count": int(selection_config.event_supplement_count),
+        }
+        if observation_policy == "observation_year_stratified_48_plus_2_v1":
+            # manifests loader 會從這個 nested object 重播 forcing／observation 年份、
+            # policy 與 replicate 契約；root 仍保留平坦欄位供舊工具讀取。
+            provenance_extra["arrival_time_selection"] = {
+                "policy": observation_policy,
+                "forcing_years": [int(year) for year in config.inputs.years],
+                "observation_years": (
+                    [int(year) for year in selection_config.observation_years]
+                    if selection_config.observation_years is not None
+                    else [int(year) for year in config.inputs.years]
+                ),
+                "replicates": (
+                    int(selection_config.replicates)
+                    if selection_config.replicates is not None
+                    else None
+                ),
+                "core_count": int(selection_config.core_count),
+                "event_supplement_count": int(selection_config.event_supplement_count),
+            }
     if pilot_selection is not None:
         provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
     if horizon_settings is not None and horizon_settings.is_generic:
@@ -5448,6 +5658,14 @@ def build_input_derivatives(
     # 不在這一步讀取 hvel，避免為選 250 個 arrival 掃描全域四維陣列。
     arrivals_by_site: dict[str, list[ArrivalTime]] = {}
     arrival_contexts: dict[str, _SiteArrivalSelectionContext] = {}
+    arrival_selection = config.arrival_time_selection
+    observation_years = (
+        tuple(int(year) for year in arrival_selection.observation_years)
+        if arrival_selection is not None and arrival_selection.observation_years is not None
+        else None
+    )
+    selection_policy = arrival_selection.policy if arrival_selection is not None else None
+    selection_replicates = arrival_selection.replicates if arrival_selection is not None else None
     sites_by_region: dict[str, list[str]] = {}
     for site in config.study_sites:
         sites_by_region.setdefault(site.analysis_region_id, []).append(site.study_site_id)
@@ -5480,6 +5698,9 @@ def build_input_derivatives(
                 design_version=config.design_version,
                 expected_axis=expected_axis,
                 strict=selection_strict,
+                observation_years=observation_years,
+                replicates=selection_replicates,
+                selection_policy=selection_policy,
             )
             explicit = pilot_arrivals.get(site_id)
             # A 區 exact pair 必須先建立共同 UTC，再各自套用明示 replacement；若在
@@ -6898,6 +7119,40 @@ def _release_support_evidence(
     return evidence
 
 
+def _arrival_selection_release_binding(config: ProjectConfig) -> dict[str, Any]:
+    """建立 release binding 使用的 arrival 母體身分快照。
+
+    ``inputs.years`` 是 common input 必須讀取的完整 forcing 年份；新版
+    ``arrival_time_selection.observation_years`` 則是允許成為 arrival anchor 的年份。
+    這四個欄位與 arrival manifest 的 nested provenance 同步保存，讓每一份 H30/H60/H90
+    release 都能證明沿用同一個 2024–2025 forcing、2025 observation population、policy
+    與 replicate 數，而不是只靠共用 artifact hash 間接推測。舊設定未宣告新版 policy
+    時，沿用兩 forcing 年份、一 replicate 的相容預設；此 fallback 不改變舊 config hash
+    或 selector 行為。
+    """
+
+    forcing_years = [int(year) for year in config.inputs.years]
+    selection = config.arrival_time_selection
+    if selection is None:
+        observation_years = list(forcing_years)
+        policy = ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1
+        replicates = 1
+    else:
+        observation_years = (
+            [int(year) for year in selection.observation_years]
+            if selection.observation_years is not None
+            else list(forcing_years)
+        )
+        policy = selection.policy or ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1
+        replicates = int(selection.replicates)
+    return {
+        "forcing_years": forcing_years,
+        "observation_years": observation_years,
+        "policy": policy,
+        "replicates": replicates,
+    }
+
+
 def create_release_config(
     *,
     config_template_path: str | Path,
@@ -7070,6 +7325,7 @@ def create_release_config(
             }
         )
     _, artifact_index_fp = read_canonical_json(input_root / "artifact_index.json")
+    arrival_selection_binding = _arrival_selection_release_binding(candidate_config)
     rewritten["release_binding"] = {
         "schema_version": (
             BED_RESIDENCE_INPUT_SCHEMA_VERSION
@@ -7084,6 +7340,9 @@ def create_release_config(
         "artifacts": artifact_bindings,
         "approved_only_after_exact_hash_validation": True,
         "backtrack_horizon_binding": support_evidence,
+        # release config 與 common input 必須明示同一份 arrival population；不能只靠
+        # artifact index hash 推測 2024 forcing 與 2025 observation 的分離仍然成立。
+        "arrival_selection_binding": arrival_selection_binding,
     }
     if not blockers and formal:
         rewritten["config_status"] = "approved"
@@ -7139,6 +7398,30 @@ def validate_release_config(
         # 新欄位一旦出現則必須先通過完整 schema，否則不能藉 generated 狀態繞過 gate。
         if support_declared or "backtrack_horizon_binding" in binding:
             errors.append(f"release_config_schema_invalid:{type(exc).__name__}")
+    # 新版 observation population 的四個身分欄位必須在 release binding 直接保存。
+    # 舊 release config 可能沒有這個 nested binding，且仍需可唯讀載入；只有新版
+    # policy 缺少 binding 時 fail closed，避免把不同 observation population 的 release
+    # 誤當成同一份 common input。若 binding 存在，legacy 與新版都做 exact 比對。
+    if release_config is not None:
+        expected_arrival_binding = _arrival_selection_release_binding(release_config)
+        selection = release_config.arrival_time_selection
+        requires_arrival_binding = (
+            selection is not None
+            and selection.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1
+        )
+        raw_arrival_binding = binding.get("arrival_selection_binding")
+        if raw_arrival_binding is None:
+            if requires_arrival_binding:
+                errors.append("release_arrival_selection_binding_missing")
+        elif not isinstance(raw_arrival_binding, Mapping):
+            errors.append("release_arrival_selection_binding_invalid")
+        elif set(raw_arrival_binding) != set(expected_arrival_binding):
+            errors.append("release_arrival_selection_binding_keys_invalid")
+        elif any(
+            raw_arrival_binding[field] != expected_arrival_binding[field]
+            for field in expected_arrival_binding
+        ):
+            errors.append("release_arrival_selection_binding_mismatch")
     if binding.get("source_config_template_sha256") and not _SHA256_RE.fullmatch(
         str(binding["source_config_template_sha256"])
     ):

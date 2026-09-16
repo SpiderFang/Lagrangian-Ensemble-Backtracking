@@ -175,9 +175,19 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 [輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及
 [CLI 參考](docs/operations/cli_reference.md)。
 
-180/90 是待驗證的資料支援契約，不是已完成 SERVER 建置的證據。若已驗收流場資料從
-2024-01-01 才開始，2024 年部分 strata 會因缺少前置資料而嚴格失敗；正式執行前須取得足夠的
-2023 前置流場資料，或另行版本化改變 observation 母體，本次實作不自行縮減研究母體。
+新版母體的 manifest 另外保存 `forcing_years=[2024, 2025]`、
+`observation_years=[2025]`、arrival policy 與每個季節×潮況×相位的兩個
+`replicate_rank`；formal loader 會確認每站 48 個核心 strata 加 2 個事件，且不接受舊兩年份
+population 與新版 policy 混用。2024 只提供 2025 observation 的前置流場資料，不會被誤報為
+arrival anchor。
+
+正式新版 arrival 母體只以 2025 作 observation anchor，流場資料仍完整讀取 2024–2025；
+因此最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，不需要把 2024 早季
+當作 observation strata，也不需另補 2023 前置流場資料。180/90 仍是待驗證的資料支援契約，
+不是已完成 SERVER 或 `inputs-build` 的證據；若實際 accepted product 在 2024-07-05 前仍
+有缺時，strict preflight/build 會 fail closed，不能用最近值、零值或未登錄外插繞過。
+正式執行前須由當次流場清冊與 gap-safe 證據證明這段支援確實存在；本次不宣稱
+已在 SERVER 執行，也不把 design_pending template 稱為 approved release。
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
 
 ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。

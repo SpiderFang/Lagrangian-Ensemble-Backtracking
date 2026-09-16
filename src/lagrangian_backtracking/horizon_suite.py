@@ -34,7 +34,7 @@ from .bed_residence import (
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
 )
-from .config import ProjectConfig
+from .config import ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1, ProjectConfig
 from .input_derivation import (
     ARTIFACT_FILENAMES,
     DERIVED_INPUT_SCHEMA_VERSION,
@@ -122,6 +122,12 @@ _SUITE_MANIFEST_KEYS = frozenset(
         "policy_id",
         "method_id",
         "horizons_days",
+        "forcing_years",
+        "observation_years",
+        "arrival_selection_policy_id",
+        "replicates_per_stratum",
+        "arrival_core_count",
+        "arrival_event_count",
         "selection_support_days",
         "runtime_support_days",
         "backtrack_modes",
@@ -166,9 +172,15 @@ _RELEASE_BINDING_KEYS = frozenset(
         "artifacts",
         "approved_only_after_exact_hash_validation",
         "backtrack_horizon_binding",
+        "arrival_selection_binding",
     }
 )
 """create_release_config 登錄的 release binding 欄位集合。"""
+
+_RELEASE_ARRIVAL_SELECTION_BINDING_KEYS = frozenset(
+    {"forcing_years", "observation_years", "policy", "replicates"}
+)
+"""release 直接保存的 forcing／observation 母體身分欄位。"""
 
 _RELEASE_ARTIFACT_RECORD_KEYS = frozenset(
     {"kind", "sha256", "canonical_sha256", "size_bytes", "path"}
@@ -201,6 +213,85 @@ _BED_RESIDENCE_MODES = (
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
 )
+
+
+def _arrival_population_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """從 source/common/release YAML 重建 forcing 與 observation 母體契約。
+
+    ``inputs.years`` 是 forcing 產品聯集，正式新版則透過根層
+    ``arrival_time_selection`` 把可作 arrival anchor 的 observation 年份縮成
+    ``[2025]``。此 helper 同時相容過渡期的 ``scenarios`` 巢狀 block 與舊兩年份
+    policy，讓 suite validator 能用同一份 canonical payload 比對 source、common、
+    六份 release，而不依賴 YAML 中任意自述的摘要欄位。
+    """
+
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise HorizonSuiteError("config.inputs 必須是 mapping")
+    raw_forcing = inputs.get("years")
+    if not isinstance(raw_forcing, list) or not raw_forcing:
+        raise HorizonSuiteError("config.inputs.years 必須是非空 list")
+    forcing_years: list[int] = []
+    for value in raw_forcing:
+        if isinstance(value, bool) or type(value) is not int:
+            raise HorizonSuiteError("config.inputs.years 必須是非 bool 整數")
+        forcing_years.append(int(value))
+    if len(set(forcing_years)) != len(forcing_years):
+        raise HorizonSuiteError("config.inputs.years 不得重複")
+
+    selection: Any = payload.get("arrival_time_selection")
+    if selection is None:
+        scenarios = payload.get("scenarios")
+        if isinstance(scenarios, Mapping):
+            selection = scenarios.get("arrival_time_selection")
+    if selection is None:
+        selection = {}
+    if not isinstance(selection, Mapping):
+        raise HorizonSuiteError("arrival_time_selection 必須是 mapping")
+    observation_raw = selection.get("observation_years")
+    observation_years = (
+        list(forcing_years)
+        if observation_raw is None
+        else [int(value) for value in observation_raw]
+        if isinstance(observation_raw, list)
+        else None
+    )
+    if not observation_years or len(set(observation_years)) != len(observation_years):
+        raise HorizonSuiteError("arrival_time_selection.observation_years 必須是非空 list")
+    if not set(observation_years).issubset(set(forcing_years)):
+        raise HorizonSuiteError("observation_years 必須是 forcing_years 子集")
+    replicates = selection.get("replicates_per_stratum", selection.get("replicates", 1))
+    if isinstance(replicates, bool) or type(replicates) is not int or replicates < 1:
+        raise HorizonSuiteError("arrival selection replicates 必須是正整數")
+    event_count = selection.get("event_supplement_count", selection.get("event_count", 2))
+    if isinstance(event_count, bool) or type(event_count) is not int or event_count < 0:
+        raise HorizonSuiteError("arrival selection event count 必須是非負整數")
+    expected_core = len(observation_years) * 4 * 2 * 3 * replicates
+    core_count = selection.get("core_count", expected_core)
+    if isinstance(core_count, bool) or type(core_count) is not int or core_count != expected_core:
+        raise HorizonSuiteError("arrival selection core_count 與 observation strata 不一致")
+    policy = selection.get(
+        "policy_id", selection.get("policy", selection.get("selection_policy_id"))
+    )
+    if policy is not None and (not isinstance(policy, str) or not policy.strip()):
+        raise HorizonSuiteError("arrival selection policy 必須是非空字串")
+    enabled = bool(
+        policy is not None
+        or observation_years != forcing_years
+        or replicates != 1
+        or event_count != 2
+    )
+    if enabled and policy is None:
+        raise HorizonSuiteError("新版 observation 母體必須明示 arrival selection policy")
+    effective_policy = policy or ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1
+    return {
+        "forcing_years": forcing_years,
+        "observation_years": observation_years,
+        "arrival_selection_policy_id": effective_policy,
+        "replicates_per_stratum": replicates,
+        "arrival_core_count": core_count,
+        "arrival_event_count": event_count,
+    }
 
 _RELEASE_APPROVAL_KEYS = frozenset(
     {
@@ -740,11 +831,32 @@ def _identity_fingerprints(fingerprints: Mapping[str, Mapping[str, Any]]) -> dic
 
 
 def _release_records(payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    """解析 release binding 的完整 component set，拒絕缺漏與重複 kind。"""
+    """解析 release binding，並核對 component 與 observation 母體身分。
+
+    artifact hash 能證明檔案未變，但不能單獨說明 2024–2025 forcing 中哪些年份可作
+    observation anchor；因此 release 必須另存四欄母體快照，且與 release YAML 的
+    arrival policy 精確一致。這項檢查同時適用新版與 legacy suite，避免產生只有部分
+    release 帶有母體身分的混合拓撲。
+    """
 
     binding = payload.get("release_binding")
     if not isinstance(binding, Mapping) or set(binding) != _RELEASE_BINDING_KEYS:
         raise HorizonSuiteError("release_binding 欄位集合不符")
+    arrival_binding = binding.get("arrival_selection_binding")
+    if (
+        not isinstance(arrival_binding, Mapping)
+        or set(arrival_binding) != _RELEASE_ARRIVAL_SELECTION_BINDING_KEYS
+    ):
+        raise HorizonSuiteError("release_binding.arrival_selection_binding 欄位集合不符")
+    population = _arrival_population_contract(payload)
+    expected_arrival_binding = {
+        "forcing_years": population["forcing_years"],
+        "observation_years": population["observation_years"],
+        "policy": population["arrival_selection_policy_id"],
+        "replicates": population["replicates_per_stratum"],
+    }
+    if dict(arrival_binding) != expected_arrival_binding:
+        raise HorizonSuiteError("release_binding arrival population 與 release config 不一致")
     records = binding.get("artifacts") if isinstance(binding, Mapping) else None
     if not isinstance(records, list):
         raise HorizonSuiteError("release_binding.artifacts 必須是 list")
@@ -1264,6 +1376,27 @@ def _validate_release_registered_metadata(
     if binding.get("approved_only_after_exact_hash_validation") is not True:
         errors.append(f"release_exact_hash_policy_invalid:{days}")
 
+    arrival_binding = binding.get("arrival_selection_binding")
+    if (
+        not isinstance(arrival_binding, Mapping)
+        or set(arrival_binding) != _RELEASE_ARRIVAL_SELECTION_BINDING_KEYS
+    ):
+        errors.append(f"release_arrival_selection_binding_invalid:{days}")
+    else:
+        try:
+            population = _arrival_population_contract(payload)
+        except Exception:
+            errors.append(f"release_arrival_population_invalid:{days}")
+        else:
+            expected_arrival_binding = {
+                "forcing_years": population["forcing_years"],
+                "observation_years": population["observation_years"],
+                "policy": population["arrival_selection_policy_id"],
+                "replicates": population["replicates_per_stratum"],
+            }
+            if dict(arrival_binding) != expected_arrival_binding:
+                errors.append(f"release_arrival_selection_binding_mismatch:{days}")
+
     horizon_binding = binding.get("backtrack_horizon_binding")
     if not isinstance(horizon_binding, Mapping):
         errors.append(f"release_horizon_binding_missing:{days}")
@@ -1386,6 +1519,7 @@ def _validate_suite_contents(
         errors.append("manifest_input_validation_context_invalid")
     source_payload: dict[str, Any] = {}
     common_payload: dict[str, Any] = {}
+    population_contract: dict[str, Any] | None = None
     source_path = suite_root / HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME
     common_path = suite_root / HORIZON_SUITE_COMMON_CONFIG_FILENAME
     try:
@@ -1420,6 +1554,17 @@ def _validate_suite_contents(
         expected_common = _derive_common_payload(source_payload, maximum_horizon)
         if common_payload != expected_common:
             errors.append("common_config_derived_payload_mismatch")
+        population_contract = _arrival_population_contract(common_payload)
+        for field in (
+            "forcing_years",
+            "observation_years",
+            "arrival_selection_policy_id",
+            "replicates_per_stratum",
+            "arrival_core_count",
+            "arrival_event_count",
+        ):
+            if manifest.get(field) != population_contract[field]:
+                errors.append(f"manifest_arrival_population_mismatch:{field}")
         selection_support_days, runtime_support_days, expected_modes = _suite_support_contract(
             common_payload, maximum_horizon
         )
@@ -1647,6 +1792,17 @@ def _validate_suite_contents(
                 f"release {days} 日/{mode_label}",
                 release_relative_path,
             )
+            if population_contract is not None:
+                try:
+                    release_population = _arrival_population_contract(release_payload)
+                    if release_population != population_contract:
+                        errors.append(
+                            f"release_arrival_population_mismatch:{days}:{mode_label}"
+                        )
+                except Exception as exc:
+                    errors.append(
+                        f"release_arrival_population_invalid:{days}:{mode_label}:{type(exc).__name__}"
+                    )
             boundaries = release_payload.get("boundaries")
             inputs = release_payload.get("inputs")
             if not isinstance(boundaries, Mapping) or boundaries.get("max_backtrack_days") != float(days):
@@ -1950,6 +2106,7 @@ def build_horizon_suite(
         HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME,
     )
     common_payload = _derive_common_payload(source_payload, maximum_horizon)
+    population_contract = _arrival_population_contract(common_payload)
     selection_support_days, runtime_support_days, backtrack_modes = _suite_support_contract(
         common_payload, maximum_horizon
     )
@@ -2030,6 +2187,12 @@ def build_horizon_suite(
             "policy_id": HORIZON_SUITE_POLICY_ID,
             "method_id": HORIZON_SUITE_METHOD_ID,
             "horizons_days": list(horizons),
+            "forcing_years": population_contract["forcing_years"],
+            "observation_years": population_contract["observation_years"],
+            "arrival_selection_policy_id": population_contract["arrival_selection_policy_id"],
+            "replicates_per_stratum": population_contract["replicates_per_stratum"],
+            "arrival_core_count": population_contract["arrival_core_count"],
+            "arrival_event_count": population_contract["arrival_event_count"],
             "selection_support_days": selection_support_days,
             "runtime_support_days": runtime_support_days,
             "backtrack_modes": list(backtrack_modes),

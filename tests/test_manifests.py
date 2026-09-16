@@ -23,7 +23,11 @@ from lagrangian_backtracking.bed_residence import (
     apply_bed_residence_sampling,
     sample_bed_residence_age_hours,
 )
-from lagrangian_backtracking.config import ProjectConfig, resolve_flow_domain_id
+from lagrangian_backtracking.config import (
+    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+    ProjectConfig,
+    resolve_flow_domain_id,
+)
 from lagrangian_backtracking.input_horizon import BED_RESIDENCE_INPUT_SCHEMA_VERSION
 from lagrangian_backtracking.manifests import (
     load_arrival_time_manifest,
@@ -57,6 +61,11 @@ def _config(tmp_path: Path, *, with_paths: bool = False) -> ProjectConfig:
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    # 這組測試專門覆蓋舊 manifest 的 2024–2025／單 replicate 行為；正式 example
+    # 現在是 2025 observation template，因此 fixture 必須顯式退回已登錄的舊 v3
+    # design 與未啟用 arrival selection，不能只刪 bed block 後誤把新母體當 legacy。
+    payload["design_version"] = "design_baseline_v3_non_rising_a_v3_local20_20260909"
+    payload.pop("arrival_time_selection", None)
     payload["scenarios"].pop("bed_residence_time", None)
     payload["inputs"].pop("backtrack_support_days", None)
     if with_paths:
@@ -233,41 +242,102 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
 
     design_version = config.design_version
     observations_by_site: dict[str, list[ArrivalTime]] = {site_id: [] for site_id in SITES}
-    for row in _arrival_payload()["records"]:
-        assert isinstance(row, dict)
-        site_id = str(row["study_site_id"])
-        observation_ns = int(row["time_utc_ns"])
-        tide_class = str(row["tide_class"])
-        phase = str(row["phase_or_event"])
-        # 龜山島是貢寮 48+2 UTC 的 paired clone，event identity 也沿用五欄來源政策；
-        # 一般站點 event identity 則由四欄組成，與 production selector 一致。
-        paired_a_clone = site_id == "guishan"
-        identity_fields = (
-            [site_id, str(observation_ns), tide_class, phase, design_version]
-            if paired_a_clone or tide_class != "event"
-            else [site_id, str(observation_ns), phase, design_version]
-        )
-        metadata: dict[str, float | int | str] = {"selection_rank": int(row["metadata"]["selection_rank"])}
-        if paired_a_clone:
-            metadata.update(
-                {
-                    "shared_A_forcing_utc": "true",
-                    "shared_A_forcing_reference_site": "gongliao",
-                    "shared_A_forcing_policy": "gongliao_paired_utc_reference_v1",
-                }
+    season_month = {"DJF": 1, "MAM": 4, "JJA": 7, "SON": 10}
+    selection_policy = ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1
+    for site_id in SITES:
+        index = 0
+        for season, month in season_month.items():
+            for tide_index, tide_class in enumerate(("spring_proxy", "neap_proxy")):
+                for phase_index, phase in enumerate(
+                    ("fastest_rising", "fastest_falling", "slack_proxy")
+                ):
+                    for replicate_rank in range(2):
+                        # 每個 observation stratum 的兩個 UTC 必須不同；日期只作 synthetic
+                        # fixture 的 deterministic tie-break，不代表真實 forcing 選樣結果。
+                        day = 1 + tide_index * 8 + phase_index * 2 + replicate_rank
+                        observation_ns = int(
+                            datetime(2025, month, day, tzinfo=UTC).timestamp()
+                            * 1_000_000_000
+                        )
+                        stratum_id = f"2025/{season}/{tide_class}/{phase}"
+                        fields = [
+                            site_id,
+                            str(observation_ns),
+                            tide_class,
+                            phase,
+                            str(replicate_rank),
+                            selection_policy,
+                            design_version,
+                        ]
+                        metadata: dict[str, float | int | str] = {
+                            "selection_policy": selection_policy,
+                            "observation_year": 2025,
+                            "replicate_rank": replicate_rank,
+                            "replicate_rank_one_based": replicate_rank + 1,
+                            "stratum_id": stratum_id,
+                        }
+                        if site_id == "guishan":
+                            metadata.update(
+                                {
+                                    "shared_A_forcing_utc": "true",
+                                    "shared_A_forcing_reference_site": "gongliao",
+                                    "shared_A_forcing_policy": "gongliao_paired_utc_reference_v1",
+                                }
+                            )
+                        observations_by_site[site_id].append(
+                            ArrivalTime(
+                                arrival_time_id=stable_identifier("arr", fields),
+                                study_site_id=site_id,
+                                time_utc_ns=observation_ns,
+                                year=2025,
+                                season=season,
+                                tide_class=tide_class,
+                                phase_or_event=phase,
+                                metadata=metadata,
+                            )
+                        )
+                        index += 1
+        for event_index, (month, event) in enumerate(
+            ((2, "high_wave_event"), (5, "strong_current_event"))
+        ):
+            observation_ns = int(
+                datetime(2025, month, 20 + event_index, tzinfo=UTC).timestamp()
+                * 1_000_000_000
             )
-        observations_by_site[site_id].append(
-            ArrivalTime(
-                arrival_time_id=stable_identifier("arr", identity_fields),
-                study_site_id=site_id,
-                time_utc_ns=observation_ns,
-                year=int(row["year"]),
-                season=str(row["season"]),
-                tide_class=tide_class,
-                phase_or_event=phase,
-                metadata=metadata,
+            # 龜山島是貢寮 48+2 UTC 的 paired clone，event identity 也沿用五欄來源政策；
+            # 一般站點 event identity 則由四欄組成，與 production selector 一致。
+            paired_a_clone = site_id == "guishan"
+            identity_fields = (
+                [site_id, str(observation_ns), event, selection_policy, design_version]
+                if paired_a_clone
+                else [site_id, str(observation_ns), event, selection_policy, design_version]
             )
-        )
+            metadata = {
+                "selection_policy": selection_policy,
+                "observation_year": 2025,
+                "stratum_id": f"event/{event}",
+            }
+            if paired_a_clone:
+                metadata.update(
+                    {
+                        "shared_A_forcing_utc": "true",
+                        "shared_A_forcing_reference_site": "gongliao",
+                        "shared_A_forcing_policy": "gongliao_paired_utc_reference_v1",
+                    }
+                )
+            observations_by_site[site_id].append(
+                ArrivalTime(
+                    arrival_time_id=stable_identifier("arr", identity_fields),
+                    study_site_id=site_id,
+                    time_utc_ns=observation_ns,
+                    year=2025,
+                    season="DJF" if event == "high_wave_event" else "MAM",
+                    tide_class="event",
+                    phase_or_event=event,
+                    metadata=metadata,
+                )
+            )
+            index += 1
 
     bed = config.scenarios.bed_residence_time
     assert bed is not None
@@ -319,6 +389,14 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
                 "observation_anchor_selection_method_id": (
                     "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
                 ),
+            },
+            "arrival_time_selection": {
+                "forcing_years": [2024, 2025],
+                "observation_years": [2025],
+                "policy_id": ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+                "replicates_per_stratum": 2,
+                "core_count": 48,
+                "event_supplement_count": 2,
             },
         },
         "records": deposition_records,
@@ -660,6 +738,17 @@ def test_bed_residence_formal_loader_recomputes_shared_age_vector_and_paired_a_i
 
     loaded = load_arrival_time_manifest(path, config, formal=True)
     assert len(loaded) == 250
+    assert {
+        datetime.fromtimestamp(
+            int(arrival.metadata["observation_time_utc_ns"]) / 1_000_000_000,
+            tz=UTC,
+        ).year
+        for arrival in loaded
+    } == {2025}
+    assert any(
+        datetime.fromtimestamp(arrival.time_utc_ns / 1_000_000_000, tz=UTC).year == 2024
+        for arrival in loaded
+    )
     assert all(
         arrival.time_utc_ns == arrival.metadata["deposition_time_utc_ns"]
         for arrival in loaded
@@ -690,6 +779,33 @@ def test_bed_residence_formal_loader_recomputes_shared_age_vector_and_paired_a_i
         arrival.metadata["shared_A_forcing_policy"] == "gongliao_paired_utc_reference_v1"
         for arrival in guishan_events
     )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["forcing_years", "observation_years", "policy_id", "replicates_per_stratum"],
+)
+def test_bed_residence_formal_loader_rejects_population_provenance_drift(
+    tmp_path: Path, field: str
+) -> None:
+    """新版 loader 不接受 forcing／observation 母體或 selection policy 被竄改。"""
+
+    config = _bed_config()
+    payload = _bed_arrival_payload(config)
+    selection = payload["provenance"]["arrival_time_selection"]
+    assert isinstance(selection, dict)
+    if field == "forcing_years":
+        selection[field] = [2025]
+    elif field == "observation_years":
+        selection[field] = [2024]
+    elif field == "policy_id":
+        selection[field] = "legacy_two_years_stratified_v1"
+    else:
+        selection[field] = 1
+    path = tmp_path / f"bed-arrival-population-{field}.json"
+    _write_json(path, payload)
+    with pytest.raises(ValueError, match="provenance"):
+        load_arrival_time_manifest(path, config, formal=True)
 
 
 @pytest.mark.parametrize("drift", ["age", "seed", "deposition", "schema"])
@@ -855,6 +971,7 @@ def test_dynamic_initial_condition_resolves_formal_a_domain_and_pilot_base(tmp_p
     assert isinstance(payload, dict)
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     payload["scenarios"].pop("bed_residence_time", None)
+    payload.pop("arrival_time_selection", None)
     payload["inputs"].pop("backtrack_support_days", None)
     payload["scenarios"]["receptor_arrival_initial_condition_manifest"] = None
     payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
@@ -1173,6 +1290,7 @@ def test_geometry_formal_uses_resolved_a_v4_and_pilot_keeps_base_id(tmp_path: Pa
     assert isinstance(payload, dict)
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     payload["scenarios"].pop("bed_residence_time", None)
+    payload.pop("arrival_time_selection", None)
     payload["inputs"].pop("backtrack_support_days", None)
     payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
     payload["domains"][0].pop("runtime_spatial_support_policy", None)

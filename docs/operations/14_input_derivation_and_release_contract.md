@@ -148,6 +148,12 @@ common-input 完成後，suite 由這一份共同母體產生 **六份** release
 arrival/receptor/material/initial-condition/scenario identities 與 artifacts fingerprints 必須一致。
 bed suite 的 `source_schema_version` 對應 1.1.0 arrival/gap schema；legacy suite 則登錄 1.0.0。
 
+新版 suite manifest 另以 exact 欄位保存 `forcing_years=[2024, 2025]`、
+`observation_years=[2025]`、`arrival_selection_policy_id`、
+`replicates_per_stratum=2`、`arrival_core_count=48` 與 `arrival_event_count=2`。validator
+會由 common config 重建這些欄位，並逐 release 比對相同的 observation population；任何把
+2024 observation 混回新版母體、改 policy 或改 replicate 數的 config／manifest 都 fail closed。
+
 suite 目的地必須是全新的不存在目錄，create 不覆寫 template、common-input 或既有
 release。輸出拓撲固定包含：
 
@@ -189,14 +195,14 @@ OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3 schema 1 `nww3_a
 uv run lbt horizon-suite-create \
   --config-template "$FORMAL_CONFIG_TEMPLATE" \
   --backtrack-days 30 60 90 \
-  --destination work/horizon-suite-2024-2025-h30-h60-h90-v1 \
+  --destination work/horizon-suite-2025-observation-h30-h60-h90-v1 \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --ocm-surface-root "$OCM_SURFACE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
   --formal-release
 
 uv run lbt horizon-suite-validate \
-  work/horizon-suite-2024-2025-h30-h60-h90-v1 \
+  work/horizon-suite-2025-observation-h30-h60-h90-v1 \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --ocm-surface-root "$OCM_SURFACE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
@@ -206,11 +212,13 @@ uv run lbt horizon-suite-validate \
 將兩個命令的最後 `--formal-release` 改成 `--pilot` 可建立／驗證 pilot suite；這不會
 放寬 accepted product、gap-safe 或 hash binding，只改變正式 `approved` 狀態閘門。
 
-**目前資料可行性界線：** `configs/lagrangian_backtracking.example.yaml` 是 `design_pending`
-template，不是 approved release。180/90 僅為待驗支援需求，不能推定目前 accepted forcing 已通過。
-若 OCM forcing 實際自 2024-01-01 開始，2024 年早季的 48+2 strata 無法具備完整 180 日前置窗口，
-strict build 必須 fail closed。正式運算前須由 PI 與資料證據裁定取得足夠的 2023 前置 forcing，或
-版本化調整 observation 母體；本契約不自行擴充年份或縮減原母體，也不宣稱已在 SERVER 執行。
+**目前資料可行性界線：** 新版正式 arrival 母體只以 2025 作 observation anchor，forcing 仍保留
+2024–2025 全部支援年份。最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，
+因此不把 2024 早季當作 observation strata，也不需另補 2023 forcing。`configs/lagrangian_backtracking.example.yaml`
+仍是 `design_pending` template，不是 approved release；180/90 是待驗支援契約，不代表目前
+accepted forcing 已通過或已執行 SERVER/input-build。若 2024-07-05 前的實際 accepted product
+仍有缺時，strict preflight/build 必須拒絕，不能以最近值、零值或未登錄外插補足。正式運算前須由
+forcing inventory 與 gap-safe evidence 證明這段支援確實存在。
 
 ## 4. 幾何、受體與 arrival
 

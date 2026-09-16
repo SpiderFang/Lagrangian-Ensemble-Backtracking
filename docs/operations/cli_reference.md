@@ -138,7 +138,7 @@ mode 或 topology tamper。缺少任何必要 180/90 日逐時節點都 fail clo
 uv run lbt horizon-suite-create \
   --config-template "$FORMAL_CONFIG_TEMPLATE" \
   --backtrack-days 30 60 90 \
-  --destination "$LBT_SCRATCH_ROOT/horizon-suite-2024-2025-h30-h60-h90-v1" \
+  --destination "$LBT_SCRATCH_ROOT/horizon-suite-2025-observation-h30-h60-h90-v1" \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --ocm-surface-root "$OCM_SURFACE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
@@ -176,9 +176,13 @@ build、六份 release 的精確步數／日數／mode 與共同 artifact hash�
 bytes 或 canonical UTC axis；正式或移機驗收必須明示三個 roots。不提供外部輸入目錄 override，
 以免破壞 release YAML 的 `../common-input/*` exact path binding。可明示三個 accepted roots：
 
+新版 suite manifest 同時保存 `forcing_years=[2024, 2025]`、`observation_years=[2025]`、
+arrival policy、`replicates_per_stratum=2`、48 個核心 strata 與 2 個事件；loader 不接受
+舊兩年份 observation population 與新版 policy 混用。
+
 ```bash
 uv run lbt horizon-suite-validate \
-  "$LBT_SCRATCH_ROOT/horizon-suite-2024-2025-h30-h60-h90-v1" \
+  "$LBT_SCRATCH_ROOT/horizon-suite-2025-observation-h30-h60-h90-v1" \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --ocm-surface-root "$OCM_SURFACE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
@@ -194,10 +198,13 @@ uv run lbt horizon-suite-validate \
 狀態停止。正式輸入限 OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3 schema
 1 `nww3_analysis`，禁止 raw NetCDF、transfer archive、零值與最近值補齊。
 
-**資料可行性限制：** 範例仍為 `design_pending` template，180/90 是必須驗證的支援契約，不是
-accepted forcing 已通過的聲明，也不是 approved release 或 SERVER 實測。若 OCM forcing 實際從
-2024-01-01 才開始，2024 年早季的 48+2 strata 無法回看完整 180 日，strict build 會拒絕。後續須由
-PI／資料證據決定補足至少 2023 前置 forcing，或另立版本化 observation 母體；本次不自行選擇其中方案。
+**資料可行性限制：** 新版正式 arrival 母體只以 2025 作 observation anchor，forcing 仍保留
+2024–2025。最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，因此不把 2024
+早季當作 observation strata，也不需另補 2023 forcing。範例仍為 `design_pending` template，
+180/90 是必須驗證的支援契約，不是 accepted forcing 已通過的聲明，也不是 approved release 或
+SERVER/input-build 實測；若 2024-07-05 前實際 accepted product 有缺時，strict preflight/build 仍會
+拒絕，不能以最近值、零值或未登錄外插補足。正式運算前須由 forcing inventory 與 gap-safe evidence
+證明支援確實存在。
 
 ### 同一套 legacy generic 輸入產生不同回溯長度（手動模式）
 

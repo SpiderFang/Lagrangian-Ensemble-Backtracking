@@ -47,10 +47,16 @@ EXPECTED_OCA_CATEGORIES_ZH = frozenset(
 )
 
 # 設計版本是整個設定／manifest／checkpoint 身分的一部分，不能讓不同模組自行拼接
-# 版本字串。CURRENT_DESIGN_VERSION 代表本期 A 區 v3/20 km 與沉降基線；v2 只作為
-# 舊設定的相容邊界，並不表示目前範例仍採用 v2。凡是正式或 pilot 設定若使用 v3
-# design，A 區都必須明示對應的 versioned formal_domain_policy；反向也同樣成立。
-CURRENT_DESIGN_VERSION = "design_baseline_v3_non_rising_a_v3_local20_20260909"
+# 版本字串。新的 CURRENT_DESIGN_VERSION 將「2025 observation、2024–2025 forcing」
+# 的選時母體納入設計身分；前一版 v3/20 km 仍列為 legacy，讓既有 config／manifest
+# 可以載入，但不會被誤認為新 observation population。兩個 v3-family 都必須繼續
+# 使用同一個 A 區 v3/local20 空間政策，不能藉版本切換回 expanded domain。
+LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909 = (
+    "design_baseline_v3_non_rising_a_v3_local20_20260909"
+)
+CURRENT_DESIGN_VERSION = (
+    "design_baseline_v3_non_rising_a_v3_local20_observation_2025_20260916"
+)
 LEGACY_DESIGN_VERSION_V2 = "design_baseline_v2_non_rising_oca_proxy"
 # 提供較短的舊版本別名給既有外部工具／測試；兩個名稱代表完全相同的 v2 legacy
 # 字串，實際驗證仍集中在 _validate_design_domain_binding。
@@ -98,6 +104,12 @@ NORTHEAST_V3_LOCAL_SITE_IDS = frozenset({"gongliao", "guishan"})
 # 舊正式輸入採七日缺口安全基線；此值只供相容性查詢，不把所有舊 runtime 或
 # 一日工程試跑改成七日。新欄位未明示時，既有建置／執行驗證仍各自維持原有規則。
 DEFAULT_BACKTRACK_SUPPORT_DAYS = 7
+
+# 新版 arrival policy 的固定識別碼。policy 不只是文件標籤，而是 selector 的分層
+# 數量、observation 年份與 metadata 欄位的資料契約；寫入設定／manifest 後不可由
+# 呼叫端自行改用另一套選時算法。
+ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1 = "observation_year_stratified_48_plus_2_v1"
+ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1 = "two_years_stratified_48_plus_2_v1"
 
 
 def _validate_non_rising_material_contract(settling: Any, *, expected_count: int) -> None:
@@ -401,6 +413,73 @@ class BedResidenceTimeConfig(StrictModel):
         return self
 
 
+class ArrivalTimeSelectionConfig(StrictModel):
+    """到達時次母體的分層、年份範圍與 replicate 契約。
+
+    舊 YAML 已存在 ``core_design``、``core_count`` 等說明欄位，但尚未把
+    observation 年份從 forcing 年份分離；因此新增欄位全部採 optional，只有 YAML
+    明示新版 ``policy`` 時才啟用新版跨欄位 gate。新版正式母體以
+    ``observation_years`` 指定可作為到達錨點的年份，``inputs.years`` 則仍代表實際
+    讀取的 forcing 年份。``replicates=2`` 代表每個「季節 × spring/neap × 相位」
+    stratum 選兩筆不同 UTC，總數固定為 4×2×2×3=48，再加兩個事件。
+
+    ``extra=allow`` 是為了讀取舊版文件型 policy 欄位；本類別只對目前已定案的欄位
+    提供型別與數值驗證，未知欄位不會被拿來改變 selector 行為。未明示新版欄位時，
+    selector 仍使用既有兩年份各四季的 48+2 行為，且 canonical config hash 不會
+    因 Pydantic 補出 None 而漂移。
+    """
+
+    policy: str | None = None
+    core_design: str
+    core_count: StrictInt
+    observation_years: list[StrictInt] | None = None
+    # 舊 typed selection block 沒有新版 replicate 欄位時，對外解析必須仍明確呈現
+    # 「每個兩年份 stratum 一筆」的 legacy 預設；normalized_payload 會依
+    # model_fields_set 移除這個補出的 1，故不改變舊 hash。
+    replicates: StrictInt = 1
+    tidal_phase_proxies: list[str]
+    event_supplement_count: StrictInt
+    event_supplements: list[str]
+    deterministic_tie_break: str
+    northeast_pair_utc_when_coverage_allows: StrictBool
+    decision_status: str
+
+    @model_validator(mode="after")
+    def validate_selection_contract(self) -> ArrivalTimeSelectionConfig:
+        """驗證新版 policy 的固定分層數量，避免設定與 selector 靜默分歧。"""
+
+        if self.core_count < 1:
+            raise ValueError("arrival_time_selection.core_count 必須是正整數")
+        if self.event_supplement_count < 0:
+            raise ValueError("arrival_time_selection.event_supplement_count 不得為負數")
+        if self.observation_years is not None:
+            years = [int(year) for year in self.observation_years]
+            if not years or len(set(years)) != len(years):
+                raise ValueError(
+                    "arrival_time_selection.observation_years 必須是非空且不重複的年份"
+                )
+        if self.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1:
+            if self.core_count != 48:
+                raise ValueError(
+                    "新版 observation arrival policy 的 core_count 必須固定為 48"
+                )
+            if self.event_supplement_count != 2:
+                raise ValueError(
+                    "新版 observation arrival policy 的 event_supplement_count 必須固定為 2"
+                )
+            if self.replicates != 2:
+                raise ValueError(
+                    "新版 observation arrival policy 的 replicates 必須固定為 2"
+                )
+            if self.observation_years is None:
+                raise ValueError(
+                    "新版 observation arrival policy 必須明示 observation_years"
+                )
+        elif self.policy is not None and self.policy != ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1:
+            raise ValueError(f"不支援的 arrival_time_selection.policy：{self.policy!r}")
+        return self
+
+
 class ScenarioConfig(StrictModel):
     """五站完整交叉、member/seed 與可選沉底時間契約。"""
 
@@ -516,6 +595,7 @@ class ProjectConfig(StrictModel):
     integration: IntegrationConfig
     boundaries: BoundaryConfig
     scenarios: ScenarioConfig
+    arrival_time_selection: ArrivalTimeSelectionConfig | None = None
     execution: ExecutionConfig
     forcing: dict[str, Any]
     physics: dict[str, Any]
@@ -610,7 +690,50 @@ class ProjectConfig(StrictModel):
         if self.boundaries.other_site_local_domain_changes_study_site:
             raise ValueError("foreign-local crossing 不得改變 study_site_id")
         self.assert_research_domain_policy()
+        self._validate_arrival_time_selection_contract()
         return self
+
+    def _validate_arrival_time_selection_contract(self) -> None:
+        """驗證 observation 年份是 forcing 子集，並綁定新版設計身分。
+
+        ``inputs.years`` 是 input builder 需要讀取的完整 forcing 聯集；它可以包含
+        為回溯窗口提供前置資料的 2024。新版 selector 只允許
+        ``arrival_time_selection.observation_years`` 中的年份作 arrival anchor，且
+        這些年份必須是 forcing 聯集的非空子集。此 gate 放在 config 層，能在讀取
+        SERVER 大型產品前拒絕把不存在的 observation 年份送入 selector。
+        """
+
+        selection = self.arrival_time_selection
+        if selection is None:
+            # 舊 YAML 未宣告 typed selection block 時，保留舊 selector 的兩年份行為與
+            # canonical hash；輸入 builder 會由實際 forcing 軸依 legacy policy 運作。
+            if self.design_version == CURRENT_DESIGN_VERSION:
+                raise ValueError(
+                    f"{CURRENT_DESIGN_VERSION} 必須明示 arrival_time_selection"
+                )
+            return
+        forcing_years = [int(year) for year in self.inputs.years]
+        if len(set(forcing_years)) != len(forcing_years) or not forcing_years:
+            raise ValueError("inputs.years 必須是非空且不重複的年份")
+        observation_years = selection.observation_years
+        if observation_years is not None:
+            observation_set = {int(year) for year in observation_years}
+            if not observation_set.issubset(set(forcing_years)):
+                raise ValueError(
+                    "arrival_time_selection.observation_years 必須是 inputs.years 的子集"
+                )
+        if selection.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1:
+            if self.design_version != CURRENT_DESIGN_VERSION:
+                raise ValueError(
+                    "新版 observation arrival policy 必須搭配目前 CURRENT_DESIGN_VERSION"
+                )
+            if observation_years is None or not observation_years:
+                raise ValueError("新版 observation arrival policy 必須有 observation_years")
+        elif self.design_version == CURRENT_DESIGN_VERSION:
+            raise ValueError(
+                f"{CURRENT_DESIGN_VERSION} 必須使用 "
+                f"{ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1}"
+            )
 
     @property
     def effective_backtrack_support_days(self) -> int | None:
@@ -700,15 +823,20 @@ class ProjectConfig(StrictModel):
                     f"{CURRENT_DESIGN_VERSION} 必須明示 A 區 formal_domain_policy="
                     f"{FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1}"
                 )
+        elif self.design_version == LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909:
+            if region_a_policy != FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
+                raise ValueError(
+                    f"舊 v3 design 必須搭配 A 區 {FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1}"
+                )
         elif region_a_policy == FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1:
             raise ValueError(
-                f"A 區 {FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1} 只能搭配 "
-                f"{CURRENT_DESIGN_VERSION}"
+                f"A 區 {FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1} 只能搭配 v3-family design"
             )
         elif self.design_version != LEGACY_DESIGN_VERSION_V2:
             raise ValueError(
-                "design_version 必須是目前 CURRENT_DESIGN_VERSION 或已登錄的 v2 legacy："
-                f"{CURRENT_DESIGN_VERSION}、{LEGACY_DESIGN_VERSION_V2}"
+                "design_version 必須是目前 CURRENT_DESIGN_VERSION 或已登錄的 v3/v2 legacy："
+                f"{CURRENT_DESIGN_VERSION}、{LEGACY_DESIGN_VERSION_V3_LOCAL20_20260909}、"
+                f"{LEGACY_DESIGN_VERSION_V2}"
             )
 
         allowed_policies = {
@@ -878,6 +1006,21 @@ class ProjectConfig(StrictModel):
             # 不能改變舊設定的 canonical config hash 或 checkpoint identity。只有 YAML
             # 明示此區塊時才將其納入 payload；明示 null 則仍保留 operator 的停用意圖。
             del scenarios_payload["bed_residence_time"]
+        selection_payload = payload.get("arrival_time_selection")
+        if selection_payload is None and "arrival_time_selection" not in self.model_fields_set:
+            # 舊 YAML 根本沒有 typed selection block 時，Pydantic 的 None default
+            # 不能進入 canonical payload；否則不相關的 schema 擴充會改變舊 run hash。
+            payload.pop("arrival_time_selection", None)
+        elif isinstance(selection_payload, dict) and self.arrival_time_selection is not None:
+            # 舊版兩年份 block 沒有新版 policy 欄位；只有來源 YAML 明示新版欄位時才
+            # 將它們寫入 hash。這同時保留 legacy config 的 canonical bytes，並使新版
+            # observation 年份／replicate policy 成為可稽核的設計邊界。
+            for field_name in ("policy", "observation_years", "replicates"):
+                if (
+                    field_name in selection_payload
+                    and field_name not in self.arrival_time_selection.model_fields_set
+                ):
+                    del selection_payload[field_name]
         execution_payload = payload.get("execution")
         if (
             isinstance(execution_payload, dict)

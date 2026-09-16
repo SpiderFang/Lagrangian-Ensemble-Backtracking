@@ -385,6 +385,11 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
     # 新欄位，避免把原本只涵蓋 2024–2025 的 synthetic source 假裝成通過新 180 日 gate。
     payload["scenarios"].pop("bed_residence_time", None)
     payload["inputs"].pop("backtrack_support_days", None)
+    # 新正式範例的 observation-year policy 不屬於本 fixture 的 legacy 兩年份測試；
+    # 移除新版三個欄位後，ProjectConfig 應保留舊 selector／hash 語意。
+    payload["arrival_time_selection"].pop("policy", None)
+    payload["arrival_time_selection"].pop("observation_years", None)
+    payload["arrival_time_selection"].pop("replicates", None)
     # 這組 coarse 8×10/2×2 mesh 只驗證既有 schema 連接，不能冒充 A 區逐 stage runtime
     # 空間支援的科學驗收；測試明示 legacy policy，並以零受體邊界 inset 保留 synthetic
     # fixture 語意與舊 geometry／scenario identity。正式 A v3 仍鎖定原本的幾何篩選值。
@@ -1901,6 +1906,12 @@ def test_shared_30_day_mother_creates_7_and_30_day_release_configs(
         assert release_payload["boundaries"]["max_backtrack_days"] == float(days)
         assert release_payload["boundaries"]["maximum_step_count"] == steps
         release_binding = release_payload["release_binding"]
+        assert release_binding["arrival_selection_binding"] == {
+            "forcing_years": [2024, 2025],
+            "observation_years": [2024, 2025],
+            "policy": "two_years_stratified_48_plus_2_v1",
+            "replicates": 1,
+        }
         artifact_index, artifact_index_fingerprint = read_canonical_json(
             artifact_directory / "artifact_index.json"
         )
@@ -2683,6 +2694,9 @@ def test_expanded_candidate_without_registered_bbox_fails_closed() -> None:
     # 這是 legacy expanded resolver 的回歸測試；新 v3 policy 不得含 candidate 欄位，
     # 因此 fixture 先明示舊 policy 與候選，再移除 bbox 觸發原本的 fail-closed gate。
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    payload["arrival_time_selection"].pop("policy", None)
+    payload["arrival_time_selection"].pop("observation_years", None)
+    payload["arrival_time_selection"].pop("replicates", None)
     a_domain["formal_domain_policy"] = "expanded_domain_v1"
     a_domain.pop("runtime_spatial_support_policy", None)
     candidate_id = "northeast_taiwan_common_cache_v4_lbt_south_expanded"

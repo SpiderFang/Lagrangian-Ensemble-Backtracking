@@ -1,4 +1,4 @@
-# 本檔固定 design_baseline_v3_non_rising_a_v3_local20_20260909 的科學與工程規則，但仍不是
+# 本檔固定 design_baseline_v3_non_rising_a_v3_local20_observation_2025_20260916 的科學與工程規則，但仍不是
 # 可直接送入正式批次的 release config。v3 依研究主持人意見保留 A 區 v3 forcing source，
 # 將貢寮與龜山島 local domain 定為 20 km、receptor core 定為 12.5 km，並將本期 A 區
 # 35 km／南擴 sensitivity 排除在研究範圍外；十個嚴格負值沉降格點仍指定 iOcean 分類、
@@ -8,7 +8,7 @@
 # 等待研究人員任意選值。正式批次只接受所有 derived gate 均通過的 approved release config。
 schema_version: "0.4.0"
 config_status: design_pending
-design_version: design_baseline_v3_non_rising_a_v3_local20_20260909
+design_version: design_baseline_v3_non_rising_a_v3_local20_observation_2025_20260916
 project_id: lagrangian_ensemble_backtracking
 time_standard: UTC
 
@@ -19,8 +19,9 @@ inputs:
   nww_analysis_root_env: NWW_ANALYSIS_ROOT
   years: [2024, 2025]
   # H90 加最長 90 日沉底年齡需要 180 日 observation 選時包絡；設定值本身不是資料證據。
-  # 本範例仍為 design_pending：若 accepted forcing 從 2024-01-01 才開始，2024 的部分
-  # season strata 不可能具備完整 180 日前置支援，strict input-build 必須拒絕，不可補值。
+  # 新版只在 2025 選 observation anchor，因此最早時次往前 180 日約落在 2024-07-05。
+  # 本範例仍為 design_pending：若 accepted forcing 未涵蓋實際候選所需的完整前置窗口，
+  # strict input-build 必須拒絕，不可補值，也不可把 2024 誤列為 observation strata。
   backtrack_support_days: 180
 
   # 研究團隊已裁決：現有 OCM/NWW 是可取得的全部正式資料，供應者不可考，不能把
@@ -28,7 +29,7 @@ inputs:
   # 全部可得資料」，並完整揭露 observed/reconstructed coverage。
   available_data_contract:
     status: decided
-    population_id: available_2024_2025_v1
+    population_id: available_2024_2025_forcing_2025_observation_v1
     interpretation: complete_formal_result_over_all_available_samples
     provider_followup_required: false
     unknown_provider_metadata_policy: preserve_unknown_and_use_versioned_project_contract
@@ -599,10 +600,13 @@ scenarios:
   seed_policy: sha256_v1_pcg64dxsm
 
 arrival_time_selection:
-  # 48+2 的分層與選取演算法已決定；確切 UTC 只能從 SERVER forcing 與潮位序列
-  # 衍生。三個相位是潮位導數 proxy，不宣稱為現場量測的三維最大漲／退潮流。
-  core_design: two_years_by_four_seasons_by_spring_neap_by_three_tidal_phase_proxies
+  # forcing 仍讀取 2024–2025；新版只在 2025 observation 年份選 anchor。2024 不作
+  # arrival，而是支援最長 180 日的 observation 選時與沉底後 runtime window。
+  policy: observation_year_stratified_48_plus_2_v1
+  core_design: observation_year_by_four_seasons_by_replicate_spring_neap_by_three_tidal_phase_proxies
   core_count: 48
+  observation_years: [2025]
+  replicates: 2
   tidal_phase_proxies: [fastest_rising, fastest_falling, slack]
   event_supplement_count: 2
   event_supplements: [local_high_wave, local_strong_current]

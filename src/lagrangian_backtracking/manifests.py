@@ -754,72 +754,319 @@ def _utc_datetime(time_utc_ns: int, label: str) -> datetime:
         raise ValueError(f"{label} 無法轉成 UTC datetime") from exc
 
 
+@dataclass(frozen=True, slots=True)
+class _ArrivalSelectionContract:
+    """保存 arrival observation 母體的有效欄位，避免 loader 各處自行解讀設定。
+
+    ``inputs.years`` 是實際要讀取的 forcing 年份；``observation_years`` 則是允許
+    作為到達錨點的年份，兩者在新版正式母體刻意分離。``replicates`` 代表每個
+    「季節 × spring/neap × 相位」格要出現的 replicate rank 數，不是 particle
+    member 數。當設定沒有新版 typed selection block 時，回傳 legacy 的兩年、單一
+    replicate 合約，讓舊 manifest 不因新增欄位而改變驗證行為。
+    """
+
+    forcing_years: tuple[int, ...]
+    observation_years: tuple[int, ...]
+    replicates: int
+    event_count: int
+    core_count: int
+    policy_id: str | None
+    enabled: bool
+
+
+def _mapping_field(value: Any, names: Sequence[str], default: Any = None) -> Any:
+    """從 Pydantic model、mapping 或其額外欄位讀取第一個存在的欄位。
+
+    config 的正式欄位名稱目前是 ``policy`` 與 ``replicates``，而外部 manifest
+    契約也可能使用更明確的 ``policy_id`` 與 ``replicates_per_stratum``。此 helper
+    只做名稱相容，不會把未知欄位轉成新的研究政策；真正的數值與集合檢查仍在
+    ``_arrival_selection_contract`` 及下游 strata gate 完成。
+    """
+
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+        return default
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    extra = getattr(value, "model_extra", None)
+    if isinstance(extra, Mapping):
+        for name in names:
+            if name in extra:
+                return extra[name]
+    return default
+
+
+def _arrival_selection_contract(config: ProjectConfig) -> _ArrivalSelectionContract:
+    """解析 config 的 forcing／observation 年份與 48+2 replicate 契約。
+
+    新版 typed model 位於 ``ProjectConfig.arrival_time_selection``；為了讀取過渡期
+    artifact，也接受曾在 ``scenarios`` 下登錄的同名區塊。若沒有該區塊，完全沿用
+    舊的 ``inputs.years`` 兩年份、一 replicate、48+2 行為。新版只在 policy、
+    observation_years 或 replicates 明示變更時啟用嚴格 population provenance gate，
+    因而不會把既有 legacy fixture 誤當成 2025 observation 母體。
+    """
+
+    raw_forcing = getattr(getattr(config, "inputs", None), "years", None)
+    if not isinstance(raw_forcing, (list, tuple)) or not raw_forcing:
+        raise ValueError("arrival selection 必須從 inputs.years 取得非空 forcing 年份")
+    forcing_years: list[int] = []
+    for year in raw_forcing:
+        if isinstance(year, bool) or type(year) is not int:
+            raise ValueError("inputs.years 必須是非 bool 整數年份")
+        forcing_years.append(int(year))
+    if len(set(forcing_years)) != len(forcing_years):
+        raise ValueError("inputs.years 不得含重複年份")
+
+    selection = getattr(config, "arrival_time_selection", None)
+    if selection is None:
+        scenarios = getattr(config, "scenarios", None)
+        selection = getattr(scenarios, "arrival_time_selection", None)
+    if selection is None:
+        return _ArrivalSelectionContract(
+            forcing_years=tuple(forcing_years),
+            observation_years=tuple(forcing_years),
+            replicates=1,
+            event_count=2,
+            core_count=len(forcing_years) * 4 * 2 * 3,
+            policy_id=None,
+            enabled=False,
+        )
+
+    observation_raw = _mapping_field(selection, ("observation_years",), None)
+    observation_years = (
+        tuple(forcing_years)
+        if observation_raw is None
+        else tuple(
+            int(year)
+            for year in observation_raw
+            if not isinstance(year, bool) and type(year) is int
+        )
+    )
+    if not observation_years or len(set(observation_years)) != len(observation_years):
+        raise ValueError("arrival_time_selection.observation_years 必須是非空且不重複整數")
+    if not set(observation_years).issubset(set(forcing_years)):
+        raise ValueError("arrival_time_selection.observation_years 必須是 forcing 年份子集")
+    replicates_raw = _mapping_field(
+        selection, ("replicates_per_stratum", "replicates", "replicate_count"), 1
+    )
+    if isinstance(replicates_raw, bool) or type(replicates_raw) is not int or replicates_raw < 1:
+        raise ValueError("arrival_time_selection replicates 必須是正整數")
+    event_raw = _mapping_field(
+        selection, ("event_supplement_count", "event_count"), 2
+    )
+    if isinstance(event_raw, bool) or type(event_raw) is not int or event_raw < 0:
+        raise ValueError("arrival_time_selection event count 必須是非負整數")
+    core_raw = _mapping_field(selection, ("core_count",), None)
+    expected_core = len(observation_years) * 4 * 2 * 3 * int(replicates_raw)
+    core_count = expected_core if core_raw is None else core_raw
+    if isinstance(core_count, bool) or type(core_count) is not int or core_count != expected_core:
+        raise ValueError(
+            "arrival_time_selection.core_count 與 observation 年份／replicate 分層不一致"
+        )
+    policy = _mapping_field(selection, ("policy_id", "policy", "selection_policy_id"), None)
+    if policy is not None and (not isinstance(policy, str) or not policy.strip()):
+        raise ValueError("arrival_time_selection policy 必須是非空字串")
+    enabled = bool(
+        policy is not None
+        or observation_years != tuple(forcing_years)
+        or int(replicates_raw) != 1
+        or int(event_raw) != 2
+    )
+    if enabled and policy is None:
+        raise ValueError("新版 arrival observation 母體必須明示 policy")
+    return _ArrivalSelectionContract(
+        forcing_years=tuple(forcing_years),
+        observation_years=observation_years,
+        replicates=int(replicates_raw),
+        event_count=int(event_raw),
+        core_count=int(core_count),
+        policy_id=policy,
+        enabled=enabled,
+    )
+
+
+def _canonical_phase_label(value: str) -> str:
+    """將文件中的 slack 簡寫正規化成既有 loader 的 ``slack_proxy`` 標籤。"""
+
+    return "slack_proxy" if value == "slack" else value
+
+
+def _canonical_event_label(value: str) -> str:
+    """將新版文件型事件名稱轉成既有事件統計使用的 canonical 標籤。"""
+
+    return {
+        "local_high_wave": "high_wave_event",
+        "local_strong_current": "strong_current_event",
+    }.get(value, value)
+
+
+def _selection_labels(selection: Any) -> tuple[set[str], set[str]]:
+    """取得 typed selection 宣告的相位／事件標籤，並套用相容別名。"""
+
+    phases_raw = _mapping_field(
+        selection, ("tidal_phase_proxies", "phases"), _ARRIVAL_TIDAL_PHASES
+    )
+    events_raw = _mapping_field(
+        selection, ("event_supplements", "events"), _ARRIVAL_EVENTS
+    )
+    if not isinstance(phases_raw, (list, tuple)) or not isinstance(events_raw, (list, tuple)):
+        raise ValueError("arrival_time_selection 相位／事件標籤必須是序列")
+    phases = {_canonical_phase_label(str(value)) for value in phases_raw}
+    events = {_canonical_event_label(str(value)) for value in events_raw}
+    if phases != set(_ARRIVAL_TIDAL_PHASES) or events != set(_ARRIVAL_EVENTS):
+        raise ValueError("arrival_time_selection 相位／事件集合與正式 48+2 契約不一致")
+    return phases, events
+
+
+def _replicate_rank(metadata: Mapping[str, Any]) -> int | None:
+    """讀取 observation core 的 replicate rank；缺少時回傳 None 供 strict gate 拒絕。"""
+
+    value = _mapping_field(
+        metadata,
+        ("observation_replicate_rank", "replicate_rank", "replicate", "stratum_replicate_rank"),
+        None,
+    )
+    if value is None or isinstance(value, bool) or type(value) is not int:
+        return None
+    return int(value)
+
+
+def _validate_arrival_population_provenance(
+    provenance: Mapping[str, Any], config: ProjectConfig
+) -> None:
+    """驗證新版 arrival manifest 的 forcing／observation 母體與 policy provenance。
+
+    新版產物可以把 population 放在 ``arrival_time_selection``、
+    ``observation_population`` 或根 provenance；這些是同一份資料契約的不同歷史
+    命名，不應因此放寬值的檢查。只要 config 啟用新版 policy，就必須找到 forcing
+    年份、observation 年份、replicate 數與 policy 四項且 exact 相符；legacy config
+    不要求不存在於舊 artifact 的欄位。
+    """
+
+    contract = _arrival_selection_contract(config)
+    if not contract.enabled:
+        return
+    candidates: list[Mapping[str, Any]] = [provenance]
+    for key in (
+        "arrival_time_selection",
+        "arrival_selection",
+        "observation_population",
+        "arrival_observation_population",
+    ):
+        nested = provenance.get(key)
+        if isinstance(nested, Mapping):
+            candidates.insert(0, nested)
+    def find(names: Sequence[str]) -> Any:
+        for candidate in candidates:
+            value = _mapping_field(candidate, names, None)
+            if value is not None:
+                return value
+        return None
+
+    forcing = find(("forcing_years", "input_years", "source_forcing_years"))
+    observation = find(("observation_years", "observation_anchor_years"))
+    policy = find(("policy_id", "policy", "arrival_selection_policy_id", "selection_policy_id"))
+    replicates = find(("replicates_per_stratum", "replicates", "replicate_count"))
+    if forcing is None or observation is None or policy is None or replicates is None:
+        raise ValueError("arrival provenance 缺少 forcing／observation population policy")
+    try:
+        normalized_forcing = tuple(int(year) for year in forcing)
+        normalized_observation = tuple(int(year) for year in observation)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("arrival provenance 年份欄位必須是整數序列") from exc
+    if normalized_forcing != contract.forcing_years:
+        raise ValueError("arrival provenance forcing_years 與 config 不一致")
+    if normalized_observation != contract.observation_years:
+        raise ValueError("arrival provenance observation_years 與 config 不一致")
+    if policy != contract.policy_id:
+        raise ValueError("arrival provenance arrival selection policy 與 config 不一致")
+    if isinstance(replicates, bool) or type(replicates) is not int or replicates != contract.replicates:
+        raise ValueError("arrival provenance replicate 契約與 config 不一致")
+
+
 def _validate_formal_arrival_strata(
     arrivals: tuple[ArrivalTime, ...], config: ProjectConfig
 ) -> None:
-    """逐站驗證正式 48 個潮汐分層與 2 個極端事件都恰有一筆。
+    """逐站驗證 observation 母體的季節、潮況、相位、replicate 與事件分層。
 
-    核心分層完全沿用 ``select_arrival_times`` 的資料語意：設定中的兩個年份，分別交叉
-    北半球氣候季標籤 DJF／MAM／JJA／SON、spring/neap 潮差代理，以及最快漲、最快退與
-    平潮代理，共 48 格。另兩筆必須以 ``tide_class=event`` 登錄在地高波與強流事件。
-    此檢查不以總數取代分層內容，避免重複某一格後仍以 50 筆通過正式輸入閘門。
+    legacy 設定仍檢查 forcing 年份的既有 48+2 交叉；新版設定則只把
+    ``observation_years`` 當 arrival anchor 年份，並要求每個
+    「年份 × 季節 × spring/neap × 相位」格具有設定指定的 replicate rank。這裡
+    驗證的是 observation anchor；bed-residence 的頂層 ``ArrivalTime.year`` 代表
+    deposition 年份，呼叫端會先重建 observation view 再進入本函式。
     """
 
-    years = tuple(config.inputs.years)
-    if (
-        len(years) != 2
-        or len(set(years)) != 2
-        or any(isinstance(year, bool) or not isinstance(year, int) for year in years)
-    ):
-        raise ValueError("arrival formal 必須由 config.inputs.years 提供兩個不同整數年份")
+    contract = _arrival_selection_contract(config)
+    selection = getattr(config, "arrival_time_selection", None)
+    if selection is None:
+        scenarios = getattr(config, "scenarios", None)
+        selection = getattr(scenarios, "arrival_time_selection", None)
+    configured_phases, configured_events = _selection_labels(selection)
     expected_core = {
-        (year, season, tide_class, phase)
-        for year in years
+        (year, season, tide_class, phase, rank)
+        for year in contract.observation_years
         for season in _SEASONS
         for tide_class in _ARRIVAL_TIDE_CLASSES
-        for phase in _ARRIVAL_TIDAL_PHASES
+        for phase in configured_phases
+        for rank in range(contract.replicates)
     }
-    expected_events = set(_ARRIVAL_EVENTS)
+    expected_events = configured_events
     by_site: dict[str, list[ArrivalTime]] = {
         site_id: [] for site_id in _config_sites(config)
     }
     for arrival in arrivals:
         by_site[arrival.study_site_id].append(arrival)
     for site_id, site_arrivals in by_site.items():
-        core_counts: Counter[tuple[int, str, str, str]] = Counter()
+        core_counts: Counter[tuple[int, str, str, str, int]] = Counter()
         event_counts: Counter[str] = Counter()
         for arrival in site_arrivals:
-            if arrival.year not in years:
+            if arrival.year not in contract.observation_years:
                 raise ValueError(
-                    f"arrival formal {site_id} 含 config.inputs.years 以外年份：{arrival.year}"
+                    f"arrival formal {site_id} 含 observation_years 以外年份：{arrival.year}"
                 )
             if arrival.tide_class == "event":
-                if arrival.phase_or_event not in expected_events:
+                event_name = _canonical_event_label(arrival.phase_or_event)
+                if event_name not in expected_events:
                     raise ValueError(
                         f"arrival formal {site_id} 的 event 類別不合法：{arrival.phase_or_event}"
                     )
-                event_counts[arrival.phase_or_event] += 1
+                event_counts[event_name] += 1
                 continue
+            phase_name = _canonical_phase_label(arrival.phase_or_event)
             if (
                 arrival.tide_class not in _ARRIVAL_TIDE_CLASSES
-                or arrival.phase_or_event not in _ARRIVAL_TIDAL_PHASES
+                or phase_name not in configured_phases
             ):
                 raise ValueError(
                     "arrival formal 核心 strata 只接受 spring_proxy/neap_proxy 與三種既定相位"
                 )
+            rank = _replicate_rank(arrival.metadata)
+            if contract.enabled and rank is None:
+                raise ValueError(
+                    f"arrival formal {site_id} 核心 strata 缺少 replicate rank："
+                    f"{arrival.year}/{arrival.season}/{arrival.tide_class}/{phase_name}"
+                )
+            if rank is None:
+                rank = 0
+            if rank not in range(contract.replicates):
+                raise ValueError(f"arrival formal {site_id} replicate rank 超出設定範圍：{rank}")
             core_counts[
                 (
                     arrival.year,
                     arrival.season,
                     arrival.tide_class,
-                    arrival.phase_or_event,
+                    phase_name,
+                    rank,
                 )
             ] += 1
         if set(core_counts) != expected_core or any(count != 1 for count in core_counts.values()):
             missing = len(expected_core - set(core_counts))
             duplicate = sum(count - 1 for count in core_counts.values() if count > 1)
             raise ValueError(
-                f"arrival formal {site_id} 的 48 個核心 strata 不完整或重複："
+                f"arrival formal {site_id} 的 observation 核心 strata 不完整或重複："
                 f"missing={missing}, duplicate={duplicate}"
             )
         if set(event_counts) != expected_events or any(
@@ -859,6 +1106,7 @@ def _validate_bed_residence_arrival_records(
     bed = config.scenarios.bed_residence_time
     if bed is None:
         raise ValueError("bed residence loader 缺少 config.scenarios.bed_residence_time")
+    selection_contract = _arrival_selection_contract(config)
     if bed.backtrack_mode not in {
         BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
         BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
@@ -1010,11 +1258,36 @@ def _validate_bed_residence_arrival_records(
             metadata.get("shared_A_forcing_reference_site") == "gongliao"
             and metadata.get("shared_A_forcing_policy") == "gongliao_paired_utc_reference_v1"
         )
-        if arrival.tide_class == "event" and not is_paired_a_clone:
+        if arrival.tide_class == "event" and is_paired_a_clone and selection_contract.enabled:
+            # 新版 selector 的 A 區 paired clone 將 policy 放進 event identity；舊版
+            # 沒有 policy 時則維持下方固定五欄 hash。分流依 metadata/config 判定，不能
+            # 僅因 tide_class=event 就套用一般四欄 event identity。
             observation_identity_fields = [
                 site_id,
                 str(observation_ns),
                 arrival.phase_or_event,
+                str(selection_contract.policy_id),
+                config.design_version,
+            ]
+        elif arrival.tide_class == "event" and not is_paired_a_clone:
+            observation_identity_fields = [
+                site_id,
+                str(observation_ns),
+                arrival.phase_or_event,
+                *(([selection_contract.policy_id]) if selection_contract.enabled else []),
+                config.design_version,
+            ]
+        elif selection_contract.enabled and arrival.tide_class != "event":
+            rank = _replicate_rank(metadata)
+            if rank is None:
+                raise ValueError(f"arrival[{arrival.arrival_time_id}] observation replicate rank 缺失")
+            observation_identity_fields = [
+                site_id,
+                str(observation_ns),
+                arrival.tide_class,
+                arrival.phase_or_event,
+                str(rank),
+                str(selection_contract.policy_id),
                 config.design_version,
             ]
         else:
@@ -1045,6 +1318,10 @@ def _validate_bed_residence_arrival_records(
             or observation_season != _season_for_observation_month(observation.month)
         ):
             raise ValueError(f"arrival[{arrival.arrival_time_id}] observation 年份／季節 metadata 不符")
+        if observation.year not in selection_contract.observation_years:
+            raise ValueError(
+                f"arrival[{arrival.arrival_time_id}] observation UTC 不在設定 observation_years"
+            )
         if (
             arrival.year != deposition.year
             or arrival.season != _season_for_observation_month(deposition.month)
@@ -1065,6 +1342,12 @@ def _validate_bed_residence_arrival_records(
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence identity 不可重算")
         per_site[site_id].append((observation_ns, observation_id, age_hours))
         per_site_strata[site_id].add(stratum_index)
+        # formal strata validator 需要保留 replicate rank 與 selection metadata；只把
+        # observation UTC 視圖的年份／季節放回 ArrivalTime 顶層，不可誤用 deposition
+        # 年份來驗證新版 2025 observation 母體。
+        observation_metadata = dict(metadata)
+        observation_metadata["observation_year"] = observation_year
+        observation_metadata["observation_season"] = observation_season
         observation_arrivals.append(
             ArrivalTime(
                 arrival_time_id=observation_id,
@@ -1074,7 +1357,7 @@ def _validate_bed_residence_arrival_records(
                 season=observation_season,
                 tide_class=arrival.tide_class,
                 phase_or_event=arrival.phase_or_event,
-                metadata={},
+                metadata=observation_metadata,
             )
         )
 
@@ -1109,6 +1392,7 @@ def _load_arrival_document(
     document = _document(path)
     payload = document.payload
     bed_residence_enabled = config.scenarios.bed_residence_time is not None
+    selection_contract = _arrival_selection_contract(config)
     _, _, provenance = _validate_component_root(
         payload,
         _ARRIVAL_ROOT_KEYS,
@@ -1122,6 +1406,9 @@ def _load_arrival_document(
             else MANIFEST_SCHEMA_VERSION
         ),
     )
+    # 新版 typed selection 會把 forcing 聯集與 observation 子集分開；先在讀取 root
+    # 後驗證 provenance，再進入逐列／逐站 gate，避免只改 rows 而保留舊母體聲稱。
+    _validate_arrival_population_provenance(provenance, config)
     if payload["time_standard"] != "UTC":
         raise ValueError("arrival_time_manifest.time_standard 必須是 UTC")
     _nonempty_string(payload["selection_method_id"], "arrival_time_manifest.selection_method_id")
@@ -1172,6 +1459,11 @@ def _load_arrival_document(
                 )
         elif year != utc.year:
             raise ValueError(f"{label}.year 與 UTC year 不一致：{year} != {utc.year}")
+        elif (
+            selection_contract.enabled
+            and utc.year not in selection_contract.observation_years
+        ):
+            raise ValueError(f"{label}.time_utc_ns 不在設定 observation_years")
         arrivals.append(
             ArrivalTime(
                 arrival_time_id=arrival_id,

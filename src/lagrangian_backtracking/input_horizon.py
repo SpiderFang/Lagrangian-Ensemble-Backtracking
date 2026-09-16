@@ -631,6 +631,38 @@ def _config_expected_period(config: Any) -> tuple[int, int, int]:
     return start, end, count
 
 
+def _config_observation_years(config: Any | None) -> tuple[int, ...] | None:
+    """取得新版 arrival anchor 年份，避免 gap validator 把 forcing 年份當 observation。
+
+    ``inputs.years`` 描述 forcing 產品需要載入的完整聯集；新版 typed selection 位於
+    ``ProjectConfig.arrival_time_selection``，過渡期也可能暫存在 ``scenarios``。若沒有
+    observation block，回傳 ``None`` 以保留 legacy generic 的原有行為；若有 block 但
+    未明示 observation years，則以 forcing years 作為舊政策 fallback。這個 helper 只
+    讀設定，不判定 forcing 內容是否真的存在，實際時間軸仍由下方 coverage 重建。
+    """
+
+    if config is None:
+        return None
+    selection = getattr(config, "arrival_time_selection", None)
+    if selection is None:
+        scenarios = getattr(config, "scenarios", None)
+        selection = getattr(scenarios, "arrival_time_selection", None)
+    if selection is None:
+        return None
+    years = getattr(selection, "observation_years", None)
+    if years is None and isinstance(selection, Mapping):
+        years = selection.get("observation_years")
+    if years is None:
+        inputs = getattr(config, "inputs", None)
+        years = getattr(inputs, "years", None)
+    if not isinstance(years, Sequence) or isinstance(years, (str, bytes, bytearray)):
+        raise HorizonContractError("arrival_time_selection.observation_years 必須是年份序列")
+    result = tuple(int(value) for value in years)
+    if not result or len(set(result)) != len(result):
+        raise HorizonContractError("arrival_time_selection.observation_years 不得為空或重複")
+    return result
+
+
 def validate_generic_gap_payload(
     gap_payload: Mapping[str, Any],
     arrival_payload: Mapping[str, Any],
@@ -803,6 +835,7 @@ def validate_generic_gap_payload(
         errors.append("generic_horizon_arrival_gap_one_to_one_invalid")
 
     configured_site_regions: dict[str, str] = {}
+    observation_years = _config_observation_years(config)
     if config is not None:
         configured_sites = getattr(config, "study_sites", ())
         if isinstance(configured_sites, Sequence):
@@ -842,6 +875,10 @@ def validate_generic_gap_payload(
         except HorizonContractError as exc:
             errors.append(f"generic_horizon_arrival_utc_invalid:{arrival_id}:{exc}")
             continue
+        if observation_years is not None and bed_enabled is False:
+            arrival_year = datetime.fromtimestamp(arrival_ns_int // 1_000_000_000, tz=UTC).year
+            if arrival_year not in observation_years:
+                errors.append(f"generic_horizon_observation_year_invalid:{arrival_id}")
         if (
             gap.get("study_site_id") != site
             or gap.get("analysis_region_id") != region
@@ -950,6 +987,12 @@ def validate_generic_gap_payload(
                     observation_ns,
                     field_name=f"arrival[{arrival_id}].metadata.observation_time_utc_ns",
                 )
+                if observation_years is not None:
+                    observation_year = datetime.fromtimestamp(
+                        observation_time // 1_000_000_000, tz=UTC
+                    ).year
+                    if observation_year not in observation_years:
+                        errors.append(f"generic_horizon_observation_year_invalid:{arrival_id}")
                 if configured_support is None:
                     raise HorizonContractError("bed residence 缺少 selection support")
                 selection_window = build_horizon_window(
