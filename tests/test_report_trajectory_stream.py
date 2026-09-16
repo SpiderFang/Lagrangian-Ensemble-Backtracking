@@ -82,7 +82,7 @@ def _aggregate_spec(*, site_ids: tuple[str, ...] = ("site-a",)) -> AggregateSpec
         bootstrap_replicates=1,
         bootstrap_confidence_level=0.95,
         bootstrap_seed=0,
-        denominator_policy="exclude_data_gap_and_numerical_failure_v1",
+        denominator_policy="exclude_data_gap_numerical_failure_and_pre_window_deposition_v1",
         source_sha256=_HASH,
         canonical_sha256=_HASH,
     )
@@ -324,7 +324,7 @@ def _result(
 
 
 def test_valid_and_failure_members_are_separated_and_terminal_not_sampled_is_counted() -> None:
-    """有效 member 的環境完整性不應混入兩類失敗 member，但失敗 exposure 仍可稽核。"""
+    """有效 member 不混入資料／數值失敗；raw mapping 保留所有具名排除類別。"""
 
     valid_particle = "particle-valid"
     valid = _result(
@@ -401,6 +401,7 @@ def test_valid_and_failure_members_are_separated_and_terminal_not_sampled_is_cou
         "valid": 1,
         "data_gap": 1,
         "numerical_failure": 1,
+        "pre_window_deposition": 0,
     }
     assert row.observation_counts_by_member_status["data_gap"]["invalid"] == 1
 
@@ -670,21 +671,69 @@ def test_event_arrival_is_counted_by_environment_but_excluded_from_selector() ->
 
 
 def test_two_shards_merge_pathway_chunks_without_retaining_old_shard_results() -> None:
-    """兩個 shard 各產生一個 bounded chunk，合併後分母仍與有效 member 完全一致。"""
+    """跨 shard 合併時，pre-window 獨立計數且不進有效 pathway 分母。"""
 
     strata, results = _core_strata_and_results()
+    pre_window_stratum = _stratum(
+        "scenario-pre-window",
+        season="DJF",
+        tide_class="spring_proxy",
+    )
+    pre_window_particle_id = "particle-scenario-pre-window-108"
+    pre_window_result = _result(
+        scenario_id="scenario-pre-window",
+        member_id=108,
+        particle_id=pre_window_particle_id,
+        status=ParticleStatus.PRE_WINDOW_DEPOSITION,
+        observations=[
+            _observation(
+                pre_window_particle_id,
+                0,
+                z_m=-1.0,
+                status=ParticleStatus.PRE_WINDOW_DEPOSITION,
+            )
+        ],
+    )
+    pre_window_result = replace(
+        pre_window_result,
+        final_state=replace(
+            pre_window_result.final_state,
+            time_utc_ns=100,
+            age_seconds=0.0,
+        ),
+        step_count=0,
+    )
     accumulator = TrajectoryReportAccumulator(
         _aggregate_spec(),
         _report_spec(),
-        strata,
+        (*strata, pre_window_stratum),
     )
     accumulator.add_shard(iter(results[:4]))
     assert accumulator.pathway_chunk_count_by_site["site-a"] == 1
-    accumulator.add_shard(iter(results[4:]))
+    accumulator.add_shard(iter((*results[4:], pre_window_result)))
     assert accumulator.pathway_chunk_count_by_site["site-a"] == 2
 
     product = accumulator.finalize()
-    assert product.environment["site-a"].valid_member_count == 8
+    environment_row = product.environment["site-a"]
+    assert environment_row.total_member_count == 9
+    assert environment_row.valid_member_count == 8
+    assert environment_row.data_gap_member_count == 0
+    assert environment_row.numerical_failure_member_count == 0
+    assert environment_row.pre_window_deposition_member_count == 1
+    assert environment_row.member_status_counts == {
+        "valid": 8,
+        ParticleStatus.DATA_GAP.value: 0,
+        ParticleStatus.NUMERICAL_FAILURE.value: 0,
+        ParticleStatus.PRE_WINDOW_DEPOSITION.value: 1,
+    }
+    assert environment_row.observation_counts_by_member_status[
+        ParticleStatus.PRE_WINDOW_DEPOSITION.value
+    ][EnvironmentSampleStatus.NOT_SAMPLED.value] == 1
+    assert environment_row.terminal_not_sampled_count_by_member_status[
+        ParticleStatus.PRE_WINDOW_DEPOSITION.value
+    ] == 0
+    assert product.material[("site-a", "material-a")].valid_member_count == 8
+    assert product.selection.excluded_invalid_member_count_by_site["site-a"] == 1
     assert product.pathway_by_site["site-a"].valid_member_denominator == 8
     assert int(product.pathway_by_site["site-a"].visit_numerator.sum()) == 8
 

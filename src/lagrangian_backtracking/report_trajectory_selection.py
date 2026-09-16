@@ -2,8 +2,9 @@
 
 本模組只為 F03 代表軌跡圖保存可重建的小型軌跡子集，不把入選頻率、雜湊順位或圖面
 案例解讀成絕對來源機率、相對來源權重或因果歸因。候選先沿用報告有效成員分母政策：
-``DATA_GAP`` 與 ``NUMERICAL_FAILURE`` 只累計排除數，尚未終止的 ``ACTIVE`` 結果立即
-失敗；有效成員若不是 ``DJF/MAM/JJA/SON × spring_proxy/neap_proxy`` 核心八層，則視為
+``DATA_GAP`` 與 ``NUMERICAL_FAILURE`` 只累計排除數，研究窗前沉底的
+``PRE_WINDOW_DEPOSITION`` 也累計於相容的排除計數但不視為數值失敗；尚未終止的
+``ACTIVE`` 結果立即失敗。有效成員若不是 ``DJF/MAM/JJA/SON × spring_proxy/neap_proxy`` 核心八層，則視為
 event arrival 排除，不能混入八層配額。
 
 每站的代表軌跡總數 ``K`` 由 exact ``ReportSpec`` 決定，八層各保留 ``K/8`` 筆最小
@@ -335,8 +336,8 @@ class RepresentativeSelection:
     ``(season, tide_class)`` tuple key。每層 selected tuple 長度必須等於
     ``capacity_per_stratum``，並依完整 priority digest 嚴格遞增；eligible count 則保存
     所有通過狀態、identity 與至少兩筆 observation 閘門的核心候選數，不因 top-K 淘汰而
-    減少。兩種 site-level 排除計數分別記錄 event arrival 與資料缺口／數值失敗成員，
-    不會被混入有效分母。
+    減少。兩種 site-level 排除計數分別記錄 event arrival 與非有效成員；後者包含資料
+    缺口、數值失敗及研究窗前沉底，並非單一 failure exposure，也不會混入有效分母。
 
     所有外層與內層 mapping 都會複製後包成 ``MappingProxyType``，trajectory sequence
     複製成 tuple；因此 caller 修改原 dict/list 或嘗試經由結果改值，都不會污染已完成
@@ -534,7 +535,9 @@ class RepresentativeTrajectorySelector:
         """串流處理一筆粒子結果，更新排除計數或單一核心層 top-K。
 
         ``is_valid_report_member`` 先執行 exact ``ParticleResult`` 與終止狀態政策：
-        ``DATA_GAP``／``NUMERICAL_FAILURE`` 只增加 invalid counter；``ACTIVE`` 直接拋錯。
+        ``DATA_GAP``／``NUMERICAL_FAILURE``／``PRE_WINDOW_DEPOSITION`` 只增加相容的 invalid
+        counter；其中 pre-window 是無漂流歷程的獨立排除 outcome，不計為失敗 exposure；
+        ``ACTIVE`` 直接拋錯。
         有效結果的四個 report strata identity 必須是原生非空文字。event arrival 只接受
         核心 season 搭配精確 ``event`` tide，並只增加 event counter；核心 tide 也必須搭配
         核心 season 才能選樣。任何其他 season/tide 標籤都視為分類契約錯誤而 fail closed，

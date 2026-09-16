@@ -159,48 +159,25 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 持續 worker 的快取計數按分片執行增量保存，續跑合併已保存增量，避免共用管理器的累計次數被報告重複相加；常駐位元組等狀態量以樣本最大值呈現。checkpoint 的 `checkpoint_bytes` 表示每次新 generation 的 lifetime logical bytes-written，`checkpoint_active_bytes` 表示目前所有保留 generation、`latest.json` 與 checkpoint 資料檔的已發布普通檔案 `st_size` 邏輯長度加總；它不包含目錄與 NFS 配置空間，不能取代 `du`／`df` 儲存閘門。兩者不可混為同一種容量。歷史缺少計數語意或量測不完整的紀錄須保留限制說明，不能作為精確總量。
 
-回溯日數採通用參數：`inputs.backtrack_support_days` 指定共同輸入要篩選與驗證的正整日上限，`boundaries.max_backtrack_days` 指定本次實際回溯長度。先建置並驗證支援 30 日的共同輸入，即可由 `release-config-create --max-backtrack-days` 產生 7 日、30 日等獨立執行設定，保留同一批到達時刻與情境，不必重跑整套 `inputs-build`。天數不是限定選單；超出既有輸入上限時須另建並驗證較長版本。設定範例、步數預算與來源綁定限制見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)與[CLI 參考](docs/operations/cli_reference.md)。
+未啟用隨機沉底的 legacy generic 流程仍以 `inputs.backtrack_support_days` 作為執行回溯上限。正式範例已登錄 random bed residence：若同一母體涵蓋 H30/H60/H90，`inputs.backtrack_support_days=180` 是 observation 選時包絡（H90 + 最長 90 日沉底年齡），而 `bed_residence_time.runtime_horizon_support_days=90` 與 `boundaries.max_backtrack_days=90` 是沉底後執行支援。不能把 180 誤當作粒子回溯天數；正式 30／60／90 多模式應用 `horizon-suite-create`，一次建母體，不逐 horizon 重跑 `inputs-build`。詳見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)與[CLI 參考](docs/operations/cli_reference.md)。
 
-### 5.1 多個回溯日數的一鍵共同母體
+### 5.1 隨機沉底與一次建立六份回溯設定
 
-若要公平比較 30、60、90 日，使用 `horizon-suite-create` 一次建立共同母體與三份
-release config。suite 先取 `--backtrack-days` 的最大值（此例為 90），由原始 template
-產生 effective `common-config`，精確填入 `inputs.backtrack_support_days: 90`，再以三個
-明示的 accepted product roots 嚴格執行一次 `inputs-build`。只有到達時刻的
-`[arrival - 90 日, arrival]` inclusive UTC 窗口完整 gap-safe 時，該到達時刻才會進入共同
-母體；OCM 缺時不得以零值或最近值補齊。接著 suite 從完全相同的 `common-input` 產生
-30／60／90 日三份 release config，分別設定 `boundaries.max_backtrack_days`，並依
-`ceil(days * 86400 / integration.dt_min_seconds) + 1` 設定
-`boundaries.maximum_step_count`。
+正式範例固定最大沉底年齡 90 日、五站共用 50 個分層隨機整點小時與 seed `20260916`。
+`fixed_calendar_window` 以固定日曆窗扣除沉底年齡；窗前沉底記為
+`pre_window_deposition`，不讀流場資料，也不進來源比例有效分母。
+`full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
 
-```bash
-uv run lbt horizon-suite-create \
-  --config-template "$FORMAL_CONFIG_TEMPLATE" \
-  --backtrack-days 30 60 90 \
-  --destination "$LBT_SCRATCH_ROOT/horizon-suite-2024-2025-h30-h60-h90-v1" \
-  --ocm-native-root "$OCM_NATIVE_ROOT" \
-  --ocm-surface-root "$OCM_SURFACE_ROOT" \
-  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
-  --formal-release
-```
-
-`--formal-release` 也可寫成 `--formal`；工程 pilot 請改用 `--pilot`。formal 仍須通過既有
-A 區 v3/local20 正式閘門，suite 不得繞過；兩種模式都執行完整結構、來源與 SHA-256 檢查，pilot 保留 `generated`／pilot 狀態，不得解讀為正式
-科學結果。建立後以同一批 accepted roots 執行唯讀的 `horizon-suite-validate`；省略三個 roots 時只驗
-artifact closure，不代表重新核對 accepted source bytes／canonical UTC axis；正式／移機驗收必須明示三個 roots（完整命令見 [CLI 參考](docs/operations/cli_reference.md)）。
-suite 目的地必須是不存在的新目錄，既有目的地不會覆寫；任一步驟失敗都不發布成功的 final，並保留失敗的 `.partial-*` 現場，不自動遞迴刪除。
-共享同帳號 SERVER 上，人工清理前先確認 process、目錄擁有者、inode 與 final 狀態，不採用先 `stat` 再 `unlink` 的競態方式，且不得把 `.partial-*` 當成成功。
-輸出包含 `source-template`、effective `common-config`、唯一的 `common-input`、`release-configs`、`validations`（common input 與各 release validator JSON），以及記錄各檔案
-與 artifact hash 的 `horizon-suite-manifest.json` 和相鄰 `.sha256` 綁定檔。suite 只接受原範例文件化的
-`scenarios.receptor_arrival_initial_condition_manifest` placeholder（值為 `manifests/receptor_arrival_initial_condition.json`）；若 template 已綁定
-release／pilot，或其他欄位含非預期 derived path，應拒絕，不會猜測或改寫既有來源。
-三個 horizon 共用 site、receptor、arrival、material、initial-condition、scenario 母體與
-artifact hash，因此差異可歸因於回溯長度設定；這不保證每粒子實際走滿最長日數，粒子仍可
-因海岸、域外、資料缺口或數值狀態停止。正式輸入只接受 OCM schema 3 `ocm_native`、OCM
-schema 3 `ocm_surface` 與 NWW3 schema 1 `nww3_analysis`；raw NetCDF、transfer archive、
-零值填補與最近值補齊都不在 suite 輸入範圍內。完整拓撲、驗證與限制見
+`horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation
+選時包絡為 180 日，沉底後 gap-safe 執行支援為 90 日，再發布兩種模式共六份 release。
+六份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及
+綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見
 [輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及
 [CLI 參考](docs/operations/cli_reference.md)。
+
+180/90 是待驗證的資料支援契約，不是已完成 SERVER 建置的證據。若已驗收流場資料從
+2024-01-01 才開始，2024 年部分 strata 會因缺少前置資料而嚴格失敗；正式執行前須取得足夠的
+2023 前置流場資料，或另行版本化改變 observation 母體，本次實作不自行縮減研究母體。
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建或缺口安全到達視窗，執行流程不臨時外插，不以最近值或零值補資料。
 
 ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。

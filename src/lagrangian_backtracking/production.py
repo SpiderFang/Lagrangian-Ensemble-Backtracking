@@ -216,8 +216,13 @@ def _validate_request(unit: RunUnit, request: ReferenceParticleRequest) -> None:
     expected = (*_unit_identity(unit), unit.scenario.arrival_time_utc_ns)
     if actual != expected:
         raise ValueError(f"request initial_state 與 run unit 不一致：actual={actual}, expected={expected}")
-    if request.initial_state.status != ParticleStatus.ACTIVE:
-        raise ValueError("request initial_state 必須是 ACTIVE")
+    if request.initial_state.status not in {
+        ParticleStatus.ACTIVE,
+        ParticleStatus.PRE_WINDOW_DEPOSITION,
+    }:
+        raise ValueError(
+            "request initial_state 只允許 ACTIVE 或 PRE_WINDOW_DEPOSITION"
+        )
 
 
 class ProductionBatch:

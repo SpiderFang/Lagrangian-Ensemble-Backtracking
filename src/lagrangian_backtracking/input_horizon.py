@@ -1,10 +1,12 @@
 """共同到達時刻回溯母體的時間窗與 coverage 驗證。
 
-本模組只處理「一個 arrival 往前需要多少個逐時資料節點」以及這些節點是否真的存在。
-``inputs.backtrack_support_days`` 是建置共同輸入母體時要證明的正整日上限；
-``boundaries.max_backtrack_days`` 則是某一個 runtime 執行設定實際要求的回溯長度。兩者
-分開保存，才能讓同一套通過 30 日檢查的 arrival／受體／初始條件同時支援 7 日與 30 日
-比較，而不必為每個天數各做一套輸入。
+本模組只處理「一個時間錨點往前需要多少個逐時資料節點」以及這些節點是否真的存在。
+未啟用隨機沉底時，``inputs.backtrack_support_days`` 是共同輸入母體需證明的 runtime
+支援上限；啟用時，該欄位改代表 observation selector 的保守 selection envelope，需至少
+等於 ``runtime_horizon_support_days + maximum_age_days``，而沉底後逐筆驗證只使用
+``scenarios.bed_residence_time.runtime_horizon_support_days``。``boundaries.max_backtrack_days``
+仍表示單一 release 實際要求的回溯長度。這些值分開保存，避免把觀測選時前置包絡誤當成
+粒子的回溯日數，也讓同一套共同母體支援多個 horizon release。
 
 這裡刻意不建立 NumPy 的完整時間軸，也不把 7、30、60 寫成選項。先用 Python 整數檢查
 UTC nanoseconds 的範圍、資料期邊界與預期節點數，再以 lazy ``range`` 逐時檢查；因此
@@ -26,6 +28,12 @@ from typing import Any
 UTC_HOUR_NS = 3_600_000_000_000
 """逐時時間軸的一小時 nanoseconds；所有算術均使用整數避免浮點日期誤差。"""
 
+LEGACY_INPUT_SCHEMA_VERSION = "1.0.0"
+"""未啟用隨機沉底政策的既有輸入文件版本，供舊 artifact 維持精確相容。"""
+
+BED_RESIDENCE_INPUT_SCHEMA_VERSION = "1.1.0"
+"""隨機沉底輸入文件版本，只用於新增沉底中繼資料的 arrival、gap 與 release binding。"""
+
 INT64_MIN = -(1 << 63)
 INT64_MAX = (1 << 63) - 1
 
@@ -34,6 +42,12 @@ GENERIC_HORIZON_POLICY_ID = "observed_hourly_shared_arrival_horizon_v2"
 
 GENERIC_HORIZON_METHOD_ID = "server_v3_ocm_shared_arrival_horizon_v2"
 """共同 hourly arrival 母體的建置方法識別碼。"""
+
+BED_RESIDENCE_HORIZON_POLICY_ID = "observed_hourly_bed_deposition_horizon_v1"
+"""先以觀測錨點篩選、再以沉底時刻核對執行支援窗的版本化政策。"""
+
+BED_RESIDENCE_HORIZON_METHOD_ID = "server_v3_ocm_bed_deposition_horizon_v1"
+"""含隨機沉底時間的逐沉底時刻 gap-safe 支援窗建置方法。"""
 
 LEGACY_HORIZON_POLICY_ID = "7_day_gap_safe_baseline"
 LEGACY_HORIZON_METHOD_ID = "server_v3_ocm_gap_safe_arrival_horizon_v1"
@@ -48,8 +62,10 @@ class HorizonSettings:
     """解析後的 runtime 回溯設定與共同母體政策。
 
     ``requested_days`` 代表目前執行要求，尚未定案時可為 ``None``；只有 ``is_generic=True`` 時，
-    ``support_days`` 才是設定明示的共同母體上限。legacy 設定的 ``support_days`` 保留
-    ``None``，避免把未宣告新欄位的舊 YAML 假裝成已通過 generic 支援驗收。
+    ``support_days`` 才代表設定明示的共同母體支援值。一般 generic 是 runtime support；
+    bed-residence generic 則是 observation selection envelope，真正的沉底後 runtime 上限
+    另存 ``runtime_support_days``。legacy 設定的 ``support_days`` 保留 ``None``，避免把未宣告
+    新欄位的舊 YAML 假裝成已通過 generic 支援驗收。
     """
 
     requested_days: float | None
@@ -57,6 +73,8 @@ class HorizonSettings:
     is_generic: bool
     policy_id: str
     method_id: str
+    runtime_support_days: int | None = None
+    bed_residence_enabled: bool = False
 
     @property
     def selection_days(self) -> float:
@@ -71,6 +89,12 @@ class HorizonSettings:
             return float(self.support_days)
         assert self.requested_days is not None
         return self.requested_days
+
+    @property
+    def selection_support_days(self) -> int | None:
+        """回傳 observation selector 必須完整通過的保守時間包絡日數。"""
+
+        return self.support_days
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +213,9 @@ def resolve_configured_horizon(
             "inputs.backtrack_support_days 明示為 null，代表共同母體尚未定案，不能降級為 legacy"
         )
     requested_raw = getattr(boundaries, "max_backtrack_days", None)
+    scenarios = getattr(config, "scenarios", None)
+    bed_residence = getattr(scenarios, "bed_residence_time", None) if scenarios is not None else None
+    bed_enabled = bed_residence is not None
     if support_raw is None:
         requested = _validate_requested_days(
             legacy_default_days if requested_raw is None else requested_raw,
@@ -200,6 +227,8 @@ def resolve_configured_horizon(
             is_generic=False,
             policy_id=LEGACY_HORIZON_POLICY_ID,
             method_id=LEGACY_HORIZON_METHOD_ID,
+            runtime_support_days=None,
+            bed_residence_enabled=False,
         )
     support = validate_support_days(support_raw)
     requested = (
@@ -210,16 +239,55 @@ def resolve_configured_horizon(
             field_name="boundaries.max_backtrack_days",
         )
     )
-    if requested is not None and requested > float(support):
-        raise HorizonContractError(
-            "boundaries.max_backtrack_days 不得超過 inputs.backtrack_support_days"
-        )
+    runtime_support: int | None
+    policy_id = GENERIC_HORIZON_POLICY_ID
+    method_id = GENERIC_HORIZON_METHOD_ID
+    if bed_enabled:
+        # 含隨機沉底年齡時，inputs 支援窗涵蓋「觀測選時最長回溯期 + 最老沉底年齡」；
+        # 沉底後逐筆實際 gap 檢查只使用 runtime horizon。來源 template 可將 runtime
+        # 支援設為 null，這時沿用已明示 requested horizon，讓 suite 能在產生 common
+        # config 時填入共同 H，而不必增加另一份來源 template。
+        maximum_age = getattr(bed_residence, "maximum_age_days", None)
+        if type(maximum_age) is not int or maximum_age <= 0:
+            raise HorizonContractError("scenarios.bed_residence_time.maximum_age_days 必須是正整數")
+        raw_runtime_support = getattr(bed_residence, "runtime_horizon_support_days", None)
+        if raw_runtime_support is None:
+            runtime_support = (
+                int(requested)
+                if requested is not None and requested.is_integer()
+                else support - maximum_age
+            )
+        else:
+            runtime_support = validate_support_days(
+                raw_runtime_support,
+                field_name="scenarios.bed_residence_time.runtime_horizon_support_days",
+            )
+        if runtime_support <= 0:
+            raise HorizonContractError("bed residence runtime support 必須是正整數日")
+        if support < runtime_support + maximum_age:
+            raise HorizonContractError(
+                "inputs.backtrack_support_days 必須至少等於 runtime horizon + maximum bed age"
+            )
+        if requested is not None and requested > float(runtime_support):
+            raise HorizonContractError(
+                "boundaries.max_backtrack_days 不得超過 bed residence runtime_horizon_support_days"
+            )
+        policy_id = BED_RESIDENCE_HORIZON_POLICY_ID
+        method_id = BED_RESIDENCE_HORIZON_METHOD_ID
+    else:
+        runtime_support = support
+        if requested is not None and requested > float(support):
+            raise HorizonContractError(
+                "boundaries.max_backtrack_days 不得超過 inputs.backtrack_support_days"
+            )
     return HorizonSettings(
         requested_days=requested,
         support_days=support,
         is_generic=True,
-        policy_id=GENERIC_HORIZON_POLICY_ID,
-        method_id=GENERIC_HORIZON_METHOD_ID,
+        policy_id=policy_id,
+        method_id=method_id,
+        runtime_support_days=runtime_support,
+        bed_residence_enabled=bed_enabled,
     )
 
 
@@ -590,10 +658,26 @@ def validate_generic_gap_payload(
         errors.append(f"generic_horizon_config_invalid:{type(exc).__name__}")
         configured_support = requested_days = None
 
+    bed_residence = None
+    if config is not None:
+        scenarios = getattr(config, "scenarios", None)
+        bed_residence = (
+            getattr(scenarios, "bed_residence_time", None) if scenarios is not None else None
+        )
+    bed_enabled = bed_residence is not None
+    expected_schema_version = (
+        BED_RESIDENCE_INPUT_SCHEMA_VERSION
+        if bed_enabled
+        else LEGACY_INPUT_SCHEMA_VERSION
+    )
+    if gap_payload.get("schema_version") != expected_schema_version:
+        errors.append("generic_horizon_schema_version_invalid")
     policy = gap_payload.get("policy")
     method = (gap_payload.get("provenance") or {}).get("method_id")
     root_support = gap_payload.get("support_days")
-    if policy != GENERIC_HORIZON_POLICY_ID or method != GENERIC_HORIZON_METHOD_ID:
+    expected_policy = BED_RESIDENCE_HORIZON_POLICY_ID if bed_enabled else GENERIC_HORIZON_POLICY_ID
+    expected_method = BED_RESIDENCE_HORIZON_METHOD_ID if bed_enabled else GENERIC_HORIZON_METHOD_ID
+    if policy != expected_policy or method != expected_method:
         errors.append("generic_horizon_policy_or_method_invalid")
     try:
         support = validate_support_days(
@@ -603,7 +687,48 @@ def validate_generic_gap_payload(
     except HorizonContractError as exc:
         errors.append(f"generic_horizon_support_invalid:{exc}")
         support = None
-    if configured_support is not None and support != configured_support:
+    runtime_support: int | None = None
+    if bed_enabled:
+        raw_runtime_support = getattr(bed_residence, "runtime_horizon_support_days", None)
+        maximum_age = getattr(bed_residence, "maximum_age_days", None)
+        if raw_runtime_support is None:
+            runtime_support = (
+                int(requested_days)
+                if requested_days is not None and requested_days.is_integer()
+                else (
+                    configured_support - maximum_age
+                    if configured_support is not None and type(maximum_age) is int
+                    else None
+                )
+            )
+        else:
+            try:
+                runtime_support = validate_support_days(
+                    raw_runtime_support,
+                    field_name="scenarios.bed_residence_time.runtime_horizon_support_days",
+                )
+            except HorizonContractError as exc:
+                errors.append(f"generic_horizon_runtime_support_invalid:{exc}")
+        if configured_support is not None and not _strict_json_int_equal(
+            gap_payload.get("selection_support_days"), configured_support
+        ):
+            errors.append("generic_horizon_selection_support_config_mismatch")
+        if runtime_support is not None and support != runtime_support:
+            errors.append("generic_horizon_runtime_support_config_mismatch")
+        if runtime_support is not None and requested_days is not None and requested_days > runtime_support:
+            errors.append("generic_horizon_requested_exceeds_runtime_support")
+        if (
+            configured_support is not None
+            and type(maximum_age) is int
+            and runtime_support is not None
+            and configured_support < runtime_support + maximum_age
+        ):
+            errors.append("generic_horizon_selection_envelope_too_short")
+        if runtime_support is not None and not _strict_json_int_equal(
+            gap_payload.get("runtime_support_days"), runtime_support
+        ):
+            errors.append("generic_horizon_root_runtime_support_mismatch")
+    elif configured_support is not None and support != configured_support:
         errors.append("generic_horizon_support_config_mismatch")
     if requested_days is not None and support is not None and requested_days > float(support):
         errors.append("generic_horizon_requested_exceeds_support")
@@ -808,8 +933,65 @@ def validate_generic_gap_payload(
             errors.append(f"generic_horizon_missing_nodes_mismatch:{arrival_id}")
         if gap.get("crossed_gap") is not coverage.crossed_gap:
             errors.append(f"generic_horizon_crossed_gap_mismatch:{arrival_id}")
-        if gap.get("time_support_policy") != GENERIC_HORIZON_POLICY_ID:
+        expected_record_policy = (
+            BED_RESIDENCE_HORIZON_POLICY_ID if bed_enabled else GENERIC_HORIZON_POLICY_ID
+        )
+        if gap.get("time_support_policy") != expected_record_policy:
             errors.append(f"generic_horizon_record_policy_mismatch:{arrival_id}")
+        if bed_enabled:
+            metadata = arrival.get("metadata")
+            observation_ns = (
+                metadata.get("observation_time_utc_ns")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            try:
+                observation_time = _int64_time(
+                    observation_ns,
+                    field_name=f"arrival[{arrival_id}].metadata.observation_time_utc_ns",
+                )
+                if configured_support is None:
+                    raise HorizonContractError("bed residence 缺少 selection support")
+                selection_window = build_horizon_window(
+                    observation_time,
+                    configured_support,
+                    expected_start_ns=expected_start,
+                    expected_end_ns=expected_end,
+                    context=f"observation[{arrival_id}]",
+                )
+                selection_coverage = compute_horizon_coverage(
+                    selection_window,
+                    expected_start_ns=expected_start,
+                    expected_end_ns=expected_end,
+                    canonical_start_ns=canonical_start,
+                    canonical_end_ns=canonical_end,
+                    canonical_gaps=gap_metadata,
+                )
+                selection_missing = [utc_string(value) for value in selection_coverage.missing_time_ns]
+                if gap.get("observation_time_utc") != utc_string(observation_time):
+                    errors.append(f"generic_horizon_observation_utc_mismatch:{arrival_id}")
+                if gap.get("selection_horizon_start_utc") != utc_string(selection_window.start_time_ns):
+                    errors.append(f"generic_horizon_selection_start_mismatch:{arrival_id}")
+                if not _strict_json_int_equal(gap.get("selection_support_days"), configured_support):
+                    errors.append(f"generic_horizon_selection_record_support_mismatch:{arrival_id}")
+                if gap.get("selection_horizon_end_utc") != utc_string(observation_time):
+                    errors.append(f"generic_horizon_selection_end_mismatch:{arrival_id}")
+                if gap.get("selection_expected_step_count") != selection_window.expected_step_count:
+                    errors.append(f"generic_horizon_selection_expected_steps_mismatch:{arrival_id}")
+                if gap.get("selection_supported_step_count") != selection_coverage.supported_step_count:
+                    errors.append(f"generic_horizon_selection_supported_steps_mismatch:{arrival_id}")
+                if gap.get("selection_missing_utc") != selection_missing:
+                    errors.append(f"generic_horizon_selection_missing_mismatch:{arrival_id}")
+                if gap.get("selection_crossed_gap") is not selection_coverage.crossed_gap:
+                    errors.append(f"generic_horizon_selection_crossed_gap_mismatch:{arrival_id}")
+                if selection_coverage.crossed_gap:
+                    crossed += 1
+                    if strict:
+                        errors.append(f"generic_horizon_selection_crosses_gap:{arrival_id}")
+                    else:
+                        warnings.append(f"generic_horizon_selection_crosses_gap:{arrival_id}")
+            except HorizonContractError as exc:
+                errors.append(f"generic_horizon_selection_window_invalid:{arrival_id}:{exc}")
         if coverage.crossed_gap:
             crossed += 1
             if strict:
@@ -826,6 +1008,8 @@ def validate_generic_gap_payload(
             "policy": policy,
             "method_id": method,
             "support_days": support,
+            "selection_support_days": configured_support if bed_enabled else support,
+            "runtime_support_days": runtime_support if bed_enabled else support,
             "arrival_records_checked": checked,
             "arrival_records_crossing_gap": crossed,
         },
@@ -837,6 +1021,7 @@ validate_shared_horizon_payload = validate_generic_gap_payload
 
 
 __all__ = [
+    "BED_RESIDENCE_INPUT_SCHEMA_VERSION",
     "GENERIC_HORIZON_METHOD_ID",
     "GENERIC_HORIZON_POLICY_ID",
     "HorizonContractError",
@@ -846,6 +1031,7 @@ __all__ = [
     "HorizonWindow",
     "LEGACY_HORIZON_METHOD_ID",
     "LEGACY_HORIZON_POLICY_ID",
+    "LEGACY_INPUT_SCHEMA_VERSION",
     "UTC_HOUR_NS",
     "build_horizon_window",
     "compute_horizon_coverage",

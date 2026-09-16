@@ -1,10 +1,12 @@
-"""建立與驗證共同最長回溯母體的多 horizon 設定集合。
+"""建立與驗證共用一次 input-build 的多 horizon／沉底時間模式設定集合。
 
 本模組提供一個可由 CLI 重建的原子流程：先將未綁定的設定 template 深拷貝成
 ``common-config.yaml``，把最大指定日數寫入共同支援窗，接著只呼叫一次
 ``build_input_derivatives`` 建立 ``common-input``，最後以同一批到達時刻、受體、
-材質與 dynamic initial-condition 產生每個 release YAML。這使 30／60／90 日比較
-共用同一個到達母體，降低大型 OCM／NWW 輸入建置成本。
+材質與 dynamic initial-condition 產生每個 release YAML。bed-residence 設計以
+``最大 horizon + 最大沉底年齡`` 建立 observation 選時包絡，再將同一母體註冊為
+``fixed_calendar_window`` 與 ``full_horizon_from_deposition`` 兩種 release；因此
+30／60／90 日、雙模式共六份 release 不必重跑昂貴的 input-build。
 
 本模組不讀取 raw NetCDF、不以零值或最近值補真正缺口；缺時仍由既有 gap-safe
 validator 與版本化重建政策決定是否可用。共同母體通過只代表輸入與設定契約已通過，
@@ -28,6 +30,10 @@ from typing import Any
 
 import yaml
 
+from .bed_residence import (
+    BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+)
 from .config import ProjectConfig
 from .input_derivation import (
     ARTIFACT_FILENAMES,
@@ -44,9 +50,10 @@ from .input_derivation import (
     validate_release_config,
     write_canonical_json,
 )
+from .input_horizon import BED_RESIDENCE_INPUT_SCHEMA_VERSION
 from .report_release import _call_exclusive_rename, _load_exclusive_rename_backend
 
-HORIZON_SUITE_SCHEMA_VERSION = "1.0.0"
+HORIZON_SUITE_SCHEMA_VERSION = "1.1.0"
 """多 horizon suite 的固定 schema 版本。"""
 
 HORIZON_SUITE_MANIFEST_FILENAME = "horizon-suite-manifest.json"
@@ -67,10 +74,10 @@ HORIZON_SUITE_RELEASE_DIRECTORY = "release-configs"
 HORIZON_SUITE_VALIDATION_DIRECTORY = "validations"
 """input／release validation JSON 的固定子目錄。"""
 
-HORIZON_SUITE_POLICY_ID = "shared_max_horizon_input_one_build_v1"
+HORIZON_SUITE_POLICY_ID = "shared_horizon_and_bed_age_input_one_build_v1"
 """共同母體只建置一次的政策識別碼。"""
 
-HORIZON_SUITE_METHOD_ID = "lbt_horizon_suite_build_v1"
+HORIZON_SUITE_METHOD_ID = "lbt_horizon_suite_build_v2"
 """本建置方法識別碼。"""
 
 _IDENTITY_KINDS = ("arrival", "receptor", "material", "initial_condition")
@@ -116,6 +123,8 @@ _SUITE_MANIFEST_KEYS = frozenset(
         "method_id",
         "horizons_days",
         "selection_support_days",
+        "runtime_support_days",
+        "backtrack_modes",
         "step_count_formula",
         "dt_min_seconds",
         "maximum_step_count_by_horizon",
@@ -136,6 +145,7 @@ _SUITE_MANIFEST_KEYS = frozenset(
 _RELEASE_RECORD_KEYS = frozenset(
     {
         "backtrack_days",
+        "backtrack_mode",
         "maximum_step_count",
         "config_status",
         "config_path",
@@ -176,6 +186,22 @@ _RELEASE_HORIZON_BINDING_KEYS = frozenset(
 )
 """共同支援窗與單一 release horizon 的固定 evidence 欄位。"""
 
+_BED_RELEASE_HORIZON_BINDING_KEYS = _RELEASE_HORIZON_BINDING_KEYS | frozenset(
+    {
+        "selection_support_days",
+        "runtime_support_days",
+        "artifact_selection_support_days",
+        "artifact_runtime_support_days",
+        "backtrack_mode",
+    }
+)
+"""隨機沉底設計將選時包絡與沉底後 runtime 支援分開綁定。"""
+
+_BED_RESIDENCE_MODES = (
+    BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+)
+
 _RELEASE_APPROVAL_KEYS = frozenset(
     {
         "status",
@@ -212,6 +238,44 @@ def normalize_horizons(values: Sequence[Any]) -> tuple[int, ...]:
     if len(set(result)) != len(result):
         raise HorizonSuiteError("backtrack_days 不得重複")
     return tuple(sorted(result))
+
+
+def _bed_residence_settings(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """取得 template/common 中的 bed-residence mapping；缺欄位代表 legacy suite。"""
+
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, Mapping):
+        return None
+    bed = scenarios.get("bed_residence_time")
+    if bed is None:
+        return None
+    if not isinstance(bed, Mapping):
+        raise HorizonSuiteError("scenarios.bed_residence_time 必須是 mapping")
+    return bed
+
+
+def _suite_support_contract(
+    payload: Mapping[str, Any], maximum_horizon: int
+) -> tuple[int, int, tuple[str, ...]]:
+    """計算共同選時包絡、沉底後支援與本 suite 必須發布的模式集合。
+
+    legacy template 的 inputs support 等於最大 horizon，且每個 horizon 只有一份 release。
+    bed-residence template 則把最大隨機沉底年齡加在最長回溯期之前，因此一次 build
+    同時覆蓋兩個模式；runtime support 仍等於最長 release horizon，並固定發布兩種具名模式。
+    """
+
+    bed = _bed_residence_settings(payload)
+    if bed is None:
+        return maximum_horizon, maximum_horizon, ()
+    maximum_age = bed.get("maximum_age_days")
+    if type(maximum_age) is not int or maximum_age <= 0:
+        raise HorizonSuiteError("bed residence maximum_age_days 必須是正整數")
+    modes = bed.get("supported_backtrack_modes")
+    if not isinstance(modes, list) or tuple(modes) != _BED_RESIDENCE_MODES:
+        raise HorizonSuiteError("bed residence supported_backtrack_modes 必須登錄兩種固定模式且順序一致")
+    if bed.get("backtrack_mode") not in _BED_RESIDENCE_MODES:
+        raise HorizonSuiteError("bed residence template backtrack_mode 未登錄")
+    return maximum_horizon + maximum_age, maximum_horizon, _BED_RESIDENCE_MODES
 
 
 def maximum_step_count_for_horizon(days: Any, dt_min_seconds: Any) -> int:
@@ -398,12 +462,15 @@ def _assert_unbound_template(payload: Mapping[str, Any]) -> None:
 
 
 def _read_dt_min_and_validate_common(payload: Mapping[str, Any], maximum_horizon: int) -> float:
-    """驗證 support exact 等於最大 horizon，並回傳有效最小時間步長。"""
+    """驗證 selection/runtime support contract 與最大步數，並回傳有效最小步長。"""
 
     inputs = payload.get("inputs")
     support = inputs.get("backtrack_support_days") if isinstance(inputs, Mapping) else None
-    if type(support) is not int or support != maximum_horizon:
-        raise HorizonSuiteError("inputs.backtrack_support_days 必須明確等於最大 horizon")
+    expected_selection, expected_runtime, _ = _suite_support_contract(payload, maximum_horizon)
+    if type(support) is not int or support != expected_selection:
+        raise HorizonSuiteError(
+            "inputs.backtrack_support_days 必須等於最大 runtime horizon 加最大 bed age"
+        )
     integration = payload.get("integration")
     dt_min = integration.get("dt_min_seconds") if isinstance(integration, Mapping) else None
     if isinstance(dt_min, bool) or not isinstance(dt_min, (int, float)):
@@ -411,8 +478,14 @@ def _read_dt_min_and_validate_common(payload: Mapping[str, Any], maximum_horizon
     dt_min_float = float(dt_min)
     if not math.isfinite(dt_min_float) or dt_min_float <= 0.0:
         raise HorizonSuiteError("integration.dt_min_seconds 必須是有限正數")
-    if not isinstance(payload.get("boundaries"), Mapping):
+    boundaries = payload.get("boundaries")
+    if not isinstance(boundaries, Mapping):
         raise HorizonSuiteError("config.boundaries 必須是 mapping")
+    if boundaries.get("max_backtrack_days") != float(expected_runtime):
+        raise HorizonSuiteError("common boundaries.max_backtrack_days 必須等於 runtime support")
+    bed = _bed_residence_settings(payload)
+    if bed is not None and bed.get("runtime_horizon_support_days") != expected_runtime:
+        raise HorizonSuiteError("bed runtime_horizon_support_days 必須等於最大 horizon")
     return dt_min_float
 
 
@@ -472,9 +545,15 @@ def _derive_common_payload(
         raise HorizonSuiteError("template.inputs／boundaries 必須是 mapping")
     dt_min = integration.get("dt_min_seconds") if isinstance(integration, Mapping) else None
     step_count = maximum_step_count_for_horizon(maximum_horizon, dt_min)
-    inputs["backtrack_support_days"] = maximum_horizon
+    selection_support, runtime_support, _ = _suite_support_contract(payload, maximum_horizon)
+    inputs["backtrack_support_days"] = selection_support
     boundaries["max_backtrack_days"] = float(maximum_horizon)
     boundaries["maximum_step_count"] = step_count
+    bed = _bed_residence_settings(payload)
+    if bed is not None:
+        scenarios = payload["scenarios"]
+        bed_payload = scenarios["bed_residence_time"]
+        bed_payload["runtime_horizon_support_days"] = runtime_support
     _set_common_manifest_references(payload)
     return payload
 
@@ -575,7 +654,15 @@ def _assert_exact_entries(
         _assert_regular_directory(directory / name)
 
 
-def _assert_suite_topology(suite_root: Path, horizons: Sequence[int]) -> None:
+def _release_stem(days: int, mode: str | None) -> str:
+    """建立含天數及可選模式的 release/validation 唯一名稱。"""
+
+    return f"release-{days}d" if mode is None else f"release-{days}d-{mode}"
+
+
+def _assert_suite_topology(
+    suite_root: Path, horizons: Sequence[int], backtrack_modes: Sequence[str]
+) -> None:
     """驗證 suite 根、release、validation 與 common-input 的固定 closure。
 
     固定檔名是為了讓下游 CLI 能以 suite-relative 路徑重建，不允許 caller 透過
@@ -612,7 +699,10 @@ def _assert_suite_topology(suite_root: Path, horizons: Sequence[int]) -> None:
         expected_directories=set(),
         label="common-input",
     )
-    expected_release_files = {f"release-{days}d.yaml" for days in horizons}
+    mode_slots: tuple[str | None, ...] = tuple(backtrack_modes) if backtrack_modes else (None,)
+    expected_release_files = {
+        f"{_release_stem(days, mode)}.yaml" for days in horizons for mode in mode_slots
+    }
     _assert_exact_entries(
         suite_root / HORIZON_SUITE_RELEASE_DIRECTORY,
         expected_files=expected_release_files,
@@ -624,8 +714,9 @@ def _assert_suite_topology(suite_root: Path, horizons: Sequence[int]) -> None:
         "input.json.sha256",
     }
     expected_validation_files.update(
-        f"release-{days}d{suffix}"
+        f"{_release_stem(days, mode)}{suffix}"
         for days in horizons
+        for mode in mode_slots
         for suffix in (".json", ".json.sha256")
     )
     _assert_exact_entries(
@@ -737,10 +828,12 @@ def _derive_expected_release_payload(
     days: int,
     maximum_step_count: int,
     inventory_payload: Mapping[str, Any] | None = None,
+    backtrack_mode: str | None = None,
 ) -> dict[str, Any]:
     """從 common payload 建立單一 release 應有的完整設定 mapping。
 
-    release 只允許三類差異：requested horizon、其 safe step budget，以及
+    release 只允許四類差異：requested horizon、其 safe step budget、已登錄的 bed-residence
+    mode，以及
     ``create_release_config`` 登錄的 status／binding／approval metadata；artifact path
     因 YAML 位置改變而由固定 helper 轉成 ``../common-input``。若 forcing inventory
     含有四區三產品的完整 flow-domain ID，會重用既有 binding 純邏輯預先重建正式欄位；
@@ -759,6 +852,17 @@ def _derive_expected_release_payload(
         raise HorizonSuiteError("common config boundaries 必須是 mapping")
     boundaries["max_backtrack_days"] = float(days)
     boundaries["maximum_step_count"] = maximum_step_count
+    bed = _bed_residence_settings(expected)
+    if bed is None:
+        if backtrack_mode is not None:
+            raise HorizonSuiteError("legacy suite 不允許 backtrack_mode override")
+    else:
+        if backtrack_mode not in _BED_RESIDENCE_MODES:
+            raise HorizonSuiteError("bed-residence release 必須明示合法 backtrack_mode")
+        bed_payload = expected["scenarios"]["bed_residence_time"]
+        if not isinstance(bed_payload, dict):
+            raise HorizonSuiteError("bed residence release config 必須是 mapping")
+        bed_payload["backtrack_mode"] = backtrack_mode
     _set_release_manifest_references(expected)
 
     # 真實 inventory 的 flow-domain 綁定可能需要同步 release 的 formal 欄位。採用
@@ -986,9 +1090,12 @@ def _build_releases(
     partial: Path,
     horizons: tuple[int, ...],
     step_counts: Mapping[int, int],
+    backtrack_modes: tuple[str, ...],
+    selection_support_days: int,
+    runtime_support_days: int,
     formal: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """以同一 common input 逐一產生 release，並核對所有 binding identity。"""
+    """以同一 common input 建立各 horizon×mode release，並核對共同 binding identity。"""
 
     release_dir = partial / HORIZON_SUITE_RELEASE_DIRECTORY
     validation_dir = partial / HORIZON_SUITE_VALIDATION_DIRECTORY
@@ -998,86 +1105,107 @@ def _build_releases(
     reference_bindings: dict[str, Mapping[str, Any]] | None = None
     reference_index_hash: str | None = None
     reference_identity: dict[str, Any] | None = None
+    mode_slots: tuple[str | None, ...] = backtrack_modes if backtrack_modes else (None,)
     for days in horizons:
-        release_path = release_dir / f"release-{days}d.yaml"
-        created = create_release_config(
-            config_template_path=common_config,
-            input_directory=common_input,
-            output_path=release_path,
-            formal=formal,
-            max_backtrack_days=float(days),
-            maximum_step_count=step_counts[days],
-        )
-        release_payload, release_fp, _ = _read_yaml_snapshot(
-            release_path,
-            f"release {days} 日",
-            f"{HORIZON_SUITE_RELEASE_DIRECTORY}/release-{days}d.yaml",
-        )
-        validation = validate_release_config(release_path, input_directory=common_input, formal=formal)
-        if not isinstance(validation, Mapping) or validation.get("valid") is not True:
-            raise HorizonSuiteError(f"release {days} 日 validator 未通過")
-        expected_status = "approved" if formal else "generated"
-        created_status = created.get("config_status") if isinstance(created, Mapping) else None
-        if created_status != expected_status:
-            raise HorizonSuiteError(f"release {days} 日 config_status 不符：{expected_status}")
-        if release_payload.get("config_status") != expected_status:
-            raise HorizonSuiteError(f"release {days} 日 YAML config_status 不符：{expected_status}")
-        approval = release_payload.get("release_approval")
-        if not isinstance(approval, Mapping) or approval.get("status") != expected_status:
-            raise HorizonSuiteError(f"release {days} 日 release_approval.status 不符")
-        boundaries = release_payload.get("boundaries")
-        inputs = release_payload.get("inputs")
-        if not isinstance(boundaries, Mapping) or boundaries.get("max_backtrack_days") != float(days):
-            raise HorizonSuiteError(f"release {days} 日 requested horizon 不符")
-        if boundaries.get("maximum_step_count") != step_counts[days]:
-            raise HorizonSuiteError(f"release {days} 日 maximum_step_count 不符")
-        if not isinstance(inputs, Mapping) or inputs.get("backtrack_support_days") != max(horizons):
-            raise HorizonSuiteError(f"release {days} 日共同 support 不符")
-        bindings = _release_records(release_payload)
-        release_binding = release_payload.get("release_binding")
-        index_hash = (
-            release_binding.get("input_directory_artifact_index_sha256")
-            if isinstance(release_binding, Mapping)
-            else None
-        )
-        identity = _identity_fingerprints(
-            {
-                kind: {
-                    field: bindings[kind].get(field)
-                    for field in ("sha256", "canonical_sha256", "size_bytes")
+        for mode in mode_slots:
+            stem = _release_stem(days, mode)
+            release_path = release_dir / f"{stem}.yaml"
+            created = create_release_config(
+                config_template_path=common_config,
+                input_directory=common_input,
+                output_path=release_path,
+                formal=formal,
+                max_backtrack_days=float(days),
+                maximum_step_count=step_counts[days],
+                backtrack_mode_override=mode,
+            )
+            label = f"release {days} 日/{mode}" if mode is not None else f"release {days} 日"
+            relative_config = f"{HORIZON_SUITE_RELEASE_DIRECTORY}/{stem}.yaml"
+            release_payload, release_fp, _ = _read_yaml_snapshot(
+                release_path, label, relative_config
+            )
+            validation = validate_release_config(
+                release_path, input_directory=common_input, formal=formal
+            )
+            if not isinstance(validation, Mapping) or validation.get("valid") is not True:
+                raise HorizonSuiteError(f"{label} validator 未通過")
+            expected_status = "approved" if formal else "generated"
+            created_status = created.get("config_status") if isinstance(created, Mapping) else None
+            if created_status != expected_status:
+                raise HorizonSuiteError(f"{label} config_status 不符：{expected_status}")
+            if release_payload.get("config_status") != expected_status:
+                raise HorizonSuiteError(f"{label} YAML config_status 不符：{expected_status}")
+            approval = release_payload.get("release_approval")
+            if not isinstance(approval, Mapping) or approval.get("status") != expected_status:
+                raise HorizonSuiteError(f"{label} release_approval.status 不符")
+            boundaries = release_payload.get("boundaries")
+            inputs = release_payload.get("inputs")
+            scenarios = release_payload.get("scenarios")
+            bed = scenarios.get("bed_residence_time") if isinstance(scenarios, Mapping) else None
+            if not isinstance(boundaries, Mapping) or boundaries.get("max_backtrack_days") != float(days):
+                raise HorizonSuiteError(f"{label} requested horizon 不符")
+            if boundaries.get("maximum_step_count") != step_counts[days]:
+                raise HorizonSuiteError(f"{label} maximum_step_count 不符")
+            if (
+                not isinstance(inputs, Mapping)
+                or inputs.get("backtrack_support_days") != selection_support_days
+            ):
+                raise HorizonSuiteError(f"{label} selection support 不符")
+            if mode is None:
+                if bed is not None:
+                    raise HorizonSuiteError("legacy suite release 不得意外加入 bed residence")
+            elif (
+                not isinstance(bed, Mapping)
+                or bed.get("backtrack_mode") != mode
+                or bed.get("runtime_horizon_support_days") != runtime_support_days
+            ):
+                raise HorizonSuiteError(f"{label} bed-residence mode/runtime support 不符")
+            bindings = _release_records(release_payload)
+            release_binding = release_payload.get("release_binding")
+            index_hash = (
+                release_binding.get("input_directory_artifact_index_sha256")
+                if isinstance(release_binding, Mapping)
+                else None
+            )
+            identity = _identity_fingerprints(
+                {
+                    kind: {
+                        field: bindings[kind].get(field)
+                        for field in ("sha256", "canonical_sha256", "size_bytes")
+                    }
+                    for kind in _IDENTITY_KINDS
                 }
-                for kind in _IDENTITY_KINDS
-            }
-        )
-        for kind, filename in ARTIFACT_FILENAMES.items():
-            expected_path = f"../{HORIZON_SUITE_COMMON_INPUT_DIRECTORY}/{filename}"
-            if bindings[kind].get("path") != expected_path:
-                raise HorizonSuiteError(f"release {days} 日 artifact path 不符：{kind}")
-        if reference_bindings is None:
-            reference_bindings = dict(bindings)
-            reference_index_hash = index_hash
-            reference_identity = identity
-        else:
-            for kind in ARTIFACT_FILENAMES:
-                for field in ("path", "sha256", "canonical_sha256", "size_bytes"):
-                    if bindings[kind].get(field) != reference_bindings[kind].get(field):
-                        raise HorizonSuiteError(f"release {days} 日 artifact binding 不一致：{kind}")
-            if index_hash != reference_index_hash or identity != reference_identity:
-                raise HorizonSuiteError(f"release {days} 日共同 identity 不一致")
-        validation_path = validation_dir / f"release-{days}d.json"
-        validation_fp = write_canonical_json(validation_path, dict(validation))
-        records.append(
-            {
-                "backtrack_days": days,
-                "maximum_step_count": step_counts[days],
-                "config_status": release_payload.get("config_status"),
-                "config_path": f"{HORIZON_SUITE_RELEASE_DIRECTORY}/release-{days}d.yaml",
-                "validation_path": f"{HORIZON_SUITE_VALIDATION_DIRECTORY}/release-{days}d.json",
-                "config_fingerprint": release_fp,
-                "validation_fingerprint": validation_fp,
-                "identity_fingerprints": identity,
-            }
-        )
+            )
+            for kind, filename in ARTIFACT_FILENAMES.items():
+                expected_path = f"../{HORIZON_SUITE_COMMON_INPUT_DIRECTORY}/{filename}"
+                if bindings[kind].get("path") != expected_path:
+                    raise HorizonSuiteError(f"{label} artifact path 不符：{kind}")
+            if reference_bindings is None:
+                reference_bindings = dict(bindings)
+                reference_index_hash = index_hash
+                reference_identity = identity
+            else:
+                for kind in ARTIFACT_FILENAMES:
+                    for field in ("path", "sha256", "canonical_sha256", "size_bytes"):
+                        if bindings[kind].get(field) != reference_bindings[kind].get(field):
+                            raise HorizonSuiteError(f"{label} artifact binding 不一致：{kind}")
+                if index_hash != reference_index_hash or identity != reference_identity:
+                    raise HorizonSuiteError(f"{label} 共同 identity 不一致")
+            validation_path = validation_dir / f"{stem}.json"
+            validation_fp = write_canonical_json(validation_path, dict(validation))
+            records.append(
+                {
+                    "backtrack_days": days,
+                    "backtrack_mode": mode,
+                    "maximum_step_count": step_counts[days],
+                    "config_status": release_payload.get("config_status"),
+                    "config_path": relative_config,
+                    "validation_path": f"{HORIZON_SUITE_VALIDATION_DIRECTORY}/{stem}.json",
+                    "config_fingerprint": release_fp,
+                    "validation_fingerprint": validation_fp,
+                    "identity_fingerprints": identity,
+                }
+            )
     if reference_bindings is None or reference_identity is None:
         raise HorizonSuiteError("未建立任何 release")
     return records, {"artifact_index_sha256": reference_index_hash, "identity": reference_identity}
@@ -1094,6 +1222,9 @@ def _validate_release_registered_metadata(
     artifact_index_sha256: str | None,
     artifact_source_config_hash: str | None,
     artifact_support_days: float | None,
+    selection_support_days: int,
+    runtime_support_days: int,
+    backtrack_mode: str | None,
     nonformal_input_summary: Mapping[str, Any] | None,
     formal_input_summary: Mapping[str, Any] | None,
 ) -> list[str]:
@@ -1113,7 +1244,12 @@ def _validate_release_registered_metadata(
         return ["release_binding_missing"]
     if set(binding) != _RELEASE_BINDING_KEYS:
         errors.append(f"release_binding_keys_invalid:{days}")
-    if binding.get("schema_version") != DERIVED_INPUT_SCHEMA_VERSION:
+    expected_binding_schema_version = (
+        BED_RESIDENCE_INPUT_SCHEMA_VERSION
+        if backtrack_mode is not None
+        else DERIVED_INPUT_SCHEMA_VERSION
+    )
+    if binding.get("schema_version") != expected_binding_schema_version:
         errors.append(f"release_binding_schema_invalid:{days}")
     if common_config_fingerprint is None or binding.get("source_config_template_sha256") != (
         common_config_fingerprint.get("sha256")
@@ -1132,19 +1268,27 @@ def _validate_release_registered_metadata(
     if not isinstance(horizon_binding, Mapping):
         errors.append(f"release_horizon_binding_missing:{days}")
     else:
-        if set(horizon_binding) != _RELEASE_HORIZON_BINDING_KEYS:
-            errors.append(f"release_horizon_binding_keys_invalid:{days}")
-        expected_horizon_values = {
+        expected_horizon_values: dict[str, Any] = {
             "source_config_hash": artifact_source_config_hash,
-            "source_backtrack_support_days": (
-                int(artifact_support_days)
-                if artifact_support_days is not None and artifact_support_days.is_integer()
-                else artifact_support_days
-            ),
+            "source_backtrack_support_days": selection_support_days,
             "artifact_backtrack_support_days": artifact_support_days,
             "requested_max_backtrack_days": float(days),
             "requested_maximum_step_count": maximum_step_count,
         }
+        expected_binding_keys = _RELEASE_HORIZON_BINDING_KEYS
+        if backtrack_mode is not None:
+            expected_binding_keys = _BED_RELEASE_HORIZON_BINDING_KEYS
+            expected_horizon_values.update(
+                {
+                    "selection_support_days": selection_support_days,
+                    "runtime_support_days": runtime_support_days,
+                    "artifact_selection_support_days": selection_support_days,
+                    "artifact_runtime_support_days": runtime_support_days,
+                    "backtrack_mode": backtrack_mode,
+                }
+            )
+        if set(horizon_binding) != expected_binding_keys:
+            errors.append(f"release_horizon_binding_keys_invalid:{days}:{backtrack_mode}")
         for field, expected in expected_horizon_values.items():
             if horizon_binding.get(field) != expected:
                 errors.append(f"release_horizon_binding_invalid:{days}:{field}")
@@ -1216,12 +1360,18 @@ def _validate_suite_contents(
         errors.append("manifest_method_invalid")
     if maximum_horizon is not None and manifest.get("horizons_days") != list(horizons):
         errors.append("manifest_horizons_not_canonical")
-    if maximum_horizon is not None and manifest.get("selection_support_days") != maximum_horizon:
-        errors.append("manifest_support_horizon_mismatch")
+    raw_modes = manifest.get("backtrack_modes")
+    if not isinstance(raw_modes, list) or any(not isinstance(mode, str) for mode in raw_modes):
+        manifest_modes: tuple[str, ...] = ()
+        errors.append("manifest_backtrack_modes_invalid")
+    else:
+        manifest_modes = tuple(raw_modes)
+        if len(set(manifest_modes)) != len(manifest_modes) or any(
+            mode not in _BED_RESIDENCE_MODES for mode in manifest_modes
+        ):
+            errors.append("manifest_backtrack_modes_invalid")
     if manifest.get("step_count_formula") != "ceil(days*86400/dt_min_seconds)+1":
         errors.append("manifest_step_formula_invalid")
-    if manifest.get("source_schema_version") != DERIVED_INPUT_SCHEMA_VERSION:
-        errors.append("manifest_source_schema_version_invalid")
     if type(manifest.get("input_build_count")) is not int or manifest.get("input_build_count") != 1:
         errors.append("manifest_input_build_count_invalid")
     if manifest.get("paths") != _expected_suite_paths():
@@ -1234,12 +1384,6 @@ def _validate_suite_contents(
         or dict(input_context) != {"formal": formal, "roots_supplied": True}
     ):
         errors.append("manifest_input_validation_context_invalid")
-    if maximum_horizon is not None:
-        try:
-            _assert_suite_topology(suite_root, horizons)
-        except Exception as exc:
-            errors.append(f"suite_topology_invalid:{type(exc).__name__}")
-
     source_payload: dict[str, Any] = {}
     common_payload: dict[str, Any] = {}
     source_path = suite_root / HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME
@@ -1258,6 +1402,9 @@ def _validate_suite_contents(
         errors.append(f"source_template_invalid:{type(exc).__name__}")
     dt_min: float | None = None
     common_actual_fp: dict[str, Any] | None = None
+    selection_support_days = maximum_horizon
+    runtime_support_days = maximum_horizon
+    expected_modes: tuple[str, ...] = ()
     try:
         common_payload, common_actual_fp, _ = _read_yaml_snapshot(
             common_path,
@@ -1273,6 +1420,26 @@ def _validate_suite_contents(
         expected_common = _derive_common_payload(source_payload, maximum_horizon)
         if common_payload != expected_common:
             errors.append("common_config_derived_payload_mismatch")
+        selection_support_days, runtime_support_days, expected_modes = _suite_support_contract(
+            common_payload, maximum_horizon
+        )
+        expected_source_schema_version = (
+            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if expected_modes
+            else DERIVED_INPUT_SCHEMA_VERSION
+        )
+        if manifest.get("source_schema_version") != expected_source_schema_version:
+            errors.append("manifest_source_schema_version_invalid")
+        if manifest.get("selection_support_days") != selection_support_days:
+            errors.append("manifest_selection_support_mismatch")
+        if manifest.get("runtime_support_days") != runtime_support_days:
+            errors.append("manifest_runtime_support_mismatch")
+        if manifest_modes != expected_modes:
+            errors.append("manifest_backtrack_modes_mismatch")
+        try:
+            _assert_suite_topology(suite_root, horizons, expected_modes)
+        except Exception as exc:
+            errors.append(f"suite_topology_invalid:{type(exc).__name__}")
         manifest_dt = manifest.get("dt_min_seconds")
         if (
             isinstance(manifest_dt, bool)
@@ -1430,38 +1597,55 @@ def _validate_suite_contents(
     else:
         input_evidence_warning = None
 
+    mode_slots: tuple[str | None, ...] = expected_modes if expected_modes else (None,)
+    expected_release_pairs = {(days, mode) for days in horizons for mode in mode_slots}
     releases = manifest.get("releases")
-    if not isinstance(releases, list) or len(releases) != len(horizons):
+    if not isinstance(releases, list) or len(releases) != len(expected_release_pairs):
         errors.append("release_manifest_count_invalid")
         releases = []
-    records_by_days: dict[int, Mapping[str, Any]] = {}
-    expected_record_keys = _RELEASE_RECORD_KEYS
+    records_by_pair: dict[tuple[int, str | None], Mapping[str, Any]] = {}
     for record in releases:
         if not isinstance(record, Mapping) or type(record.get("backtrack_days")) is not int:
             errors.append("release_manifest_record_invalid")
             continue
-        if set(record) != expected_record_keys:
+        if set(record) != _RELEASE_RECORD_KEYS:
             errors.append(f"release_manifest_record_keys_invalid:{record.get('backtrack_days')}")
         days = record["backtrack_days"]
-        if days in records_by_days:
-            errors.append("release_manifest_horizon_duplicate")
-        records_by_days[days] = record
-    if set(records_by_days) != set(horizons):
-        errors.append("release_manifest_horizon_set_mismatch")
+        mode_value = record.get("backtrack_mode")
+        mode = mode_value if isinstance(mode_value, str) else None
+        if mode_value is not None and not isinstance(mode_value, str):
+            errors.append(f"release_manifest_mode_invalid:{days}")
+            continue
+        key = (days, mode)
+        if key not in expected_release_pairs:
+            errors.append(f"release_manifest_unexpected_pair:{days}:{mode}")
+            continue
+        if key in records_by_pair:
+            errors.append(f"release_manifest_pair_duplicate:{days}:{mode}")
+        records_by_pair[key] = record
+    if set(records_by_pair) != expected_release_pairs:
+        errors.append("release_manifest_horizon_mode_set_mismatch")
     reference_binding: dict[str, Mapping[str, Any]] | None = None
     reference_index_hash: str | None = None
-    for days in horizons:
-        record = records_by_days.get(days)
+    for days, mode in sorted(
+        expected_release_pairs,
+        key=lambda pair: (pair[0], "" if pair[1] is None else pair[1]),
+    ):
+        record = records_by_pair.get((days, mode))
+        mode_label = "legacy" if mode is None else mode
         if record is None:
-            errors.append(f"release_manifest_missing:{days}")
+            errors.append(f"release_manifest_missing:{days}:{mode_label}")
             continue
-        release_path = suite_root / HORIZON_SUITE_RELEASE_DIRECTORY / f"release-{days}d.yaml"
-        validation_path = suite_root / HORIZON_SUITE_VALIDATION_DIRECTORY / f"release-{days}d.json"
+        stem = _release_stem(days, mode)
+        release_relative_path = f"{HORIZON_SUITE_RELEASE_DIRECTORY}/{stem}.yaml"
+        validation_relative_path = f"{HORIZON_SUITE_VALIDATION_DIRECTORY}/{stem}.json"
+        release_path = suite_root / release_relative_path
+        validation_path = suite_root / validation_relative_path
         try:
             release_payload, release_actual_fp, _ = _read_yaml_snapshot(
                 release_path,
-                f"release {days} 日",
-                f"{HORIZON_SUITE_RELEASE_DIRECTORY}/release-{days}d.yaml",
+                f"release {days} 日/{mode_label}",
+                release_relative_path,
             )
             boundaries = release_payload.get("boundaries")
             inputs = release_payload.get("inputs")
@@ -1472,8 +1656,26 @@ def _validate_suite_contents(
                 or boundaries.get("maximum_step_count") != maximum_step_count_for_horizon(days, dt_min)
             ):
                 errors.append(f"release_step_count_mismatch:{days}")
-            if not isinstance(inputs, Mapping) or inputs.get("backtrack_support_days") != maximum_horizon:
-                errors.append(f"release_support_mismatch:{days}")
+            if (
+                not isinstance(inputs, Mapping)
+                or inputs.get("backtrack_support_days") != selection_support_days
+            ):
+                errors.append(f"release_selection_support_mismatch:{days}:{mode_label}")
+            release_scenarios = release_payload.get("scenarios")
+            release_bed = (
+                release_scenarios.get("bed_residence_time")
+                if isinstance(release_scenarios, Mapping)
+                else None
+            )
+            if mode is None:
+                if release_bed is not None:
+                    errors.append(f"release_bed_residence_unexpected:{days}")
+            elif (
+                not isinstance(release_bed, Mapping)
+                or release_bed.get("backtrack_mode") != mode
+                or release_bed.get("runtime_horizon_support_days") != runtime_support_days
+            ):
+                errors.append(f"release_bed_residence_mode_mismatch:{days}:{mode_label}")
             expected_record_steps = (
                 maximum_step_count_for_horizon(days, dt_min) if dt_min is not None else None
             )
@@ -1498,9 +1700,11 @@ def _validate_suite_contents(
                     not isinstance(nonformal_replay, Mapping)
                     or nonformal_replay.get("valid") is not True
                 ):
-                    errors.append(f"release_nonformal_replay_failed:{days}")
+                    errors.append(f"release_nonformal_replay_failed:{days}:{mode_label}")
             except Exception as exc:
-                errors.append(f"release_nonformal_replay_exception:{days}:{type(exc).__name__}")
+                errors.append(
+                    f"release_nonformal_replay_exception:{days}:{mode_label}:{type(exc).__name__}"
+                )
             if formal:
                 try:
                     formal_replay = validate_input_derivatives(
@@ -1516,9 +1720,11 @@ def _validate_suite_contents(
                         not isinstance(formal_replay, Mapping)
                         or formal_replay.get("valid") is not True
                     ):
-                        errors.append(f"release_formal_replay_failed:{days}")
+                        errors.append(f"release_formal_replay_failed:{days}:{mode_label}")
                 except Exception as exc:
-                    errors.append(f"release_formal_replay_exception:{days}:{type(exc).__name__}")
+                    errors.append(
+                        f"release_formal_replay_exception:{days}:{mode_label}:{type(exc).__name__}"
+                    )
             errors.extend(
                 _validate_release_registered_metadata(
                     release_payload,
@@ -1534,6 +1740,9 @@ def _validate_suite_contents(
                     ),
                     artifact_source_config_hash=artifact_source_config_hash,
                     artifact_support_days=artifact_support_days,
+                    selection_support_days=selection_support_days,
+                    runtime_support_days=runtime_support_days,
+                    backtrack_mode=mode,
                     nonformal_input_summary=nonformal_input_summary,
                     formal_input_summary=formal_input_summary,
                 )
@@ -1545,18 +1754,21 @@ def _validate_suite_contents(
                         days=days,
                         maximum_step_count=expected_record_steps,
                         inventory_payload=inventory_payload,
+                        backtrack_mode=mode,
                     )
                     if _release_payload_without_registered_fields(
                         release_payload
                     ) != _release_payload_without_registered_fields(expected_release):
-                        errors.append(f"release_derived_payload_mismatch:{days}")
+                        errors.append(f"release_derived_payload_mismatch:{days}:{mode_label}")
                 except Exception as exc:
-                    errors.append(f"release_expected_payload_invalid:{days}:{type(exc).__name__}")
+                    errors.append(
+                        f"release_expected_payload_invalid:{days}:{mode_label}:{type(exc).__name__}"
+                    )
             if release_payload.get("config_status") != expected_status:
-                errors.append(f"release_status_invalid:{days}")
+                errors.append(f"release_status_invalid:{days}:{mode_label}")
             approval = release_payload.get("release_approval")
             if not isinstance(approval, Mapping) or approval.get("status") != expected_status:
-                errors.append(f"release_approval_status_invalid:{days}")
+                errors.append(f"release_approval_status_invalid:{days}:{mode_label}")
             binding = _release_records(release_payload)
             release_binding = release_payload.get("release_binding")
             index_hash = (
@@ -1571,42 +1783,45 @@ def _validate_suite_contents(
                 for kind in ARTIFACT_FILENAMES:
                     for field in ("path", "sha256", "canonical_sha256", "size_bytes"):
                         if binding[kind].get(field) != reference_binding[kind].get(field):
-                            errors.append(f"release_binding_mismatch:{days}:{kind}:{field}")
+                            errors.append(
+                                f"release_binding_mismatch:{days}:{mode_label}:{kind}:{field}"
+                            )
                 if index_hash != reference_index_hash:
-                    errors.append(f"release_artifact_index_mismatch:{days}")
+                    errors.append(f"release_artifact_index_mismatch:{days}:{mode_label}")
             if component_fps:
                 for kind in ARTIFACT_FILENAMES:
                     for field in ("sha256", "canonical_sha256", "size_bytes"):
                         if binding[kind].get(field) != component_fps[kind].get(field):
-                            errors.append(f"release_component_hash_mismatch:{days}:{kind}:{field}")
+                            errors.append(
+                                f"release_component_hash_mismatch:{days}:{mode_label}:{kind}:{field}"
+                            )
             if component_fps and index_hash != component_fps["artifact_index"].get("sha256"):
-                errors.append(f"release_artifact_index_hash_mismatch:{days}")
+                errors.append(f"release_artifact_index_hash_mismatch:{days}:{mode_label}")
             for kind, filename in ARTIFACT_FILENAMES.items():
                 expected_binding_path = f"../{HORIZON_SUITE_COMMON_INPUT_DIRECTORY}/{filename}"
                 if binding[kind].get("path") != expected_binding_path:
-                    errors.append(f"release_binding_path_mismatch:{days}:{kind}")
-            expected_config_path = f"{HORIZON_SUITE_RELEASE_DIRECTORY}/release-{days}d.yaml"
-            if record.get("config_path") != expected_config_path:
-                errors.append(f"release_config_path_mismatch:{days}")
-            if record.get("validation_path") != (
-                f"{HORIZON_SUITE_VALIDATION_DIRECTORY}/release-{days}d.json"
-            ):
-                errors.append(f"release_validation_path_mismatch:{days}")
+                    errors.append(f"release_binding_path_mismatch:{days}:{mode_label}:{kind}")
+            if record.get("backtrack_mode") != mode:
+                errors.append(f"release_record_mode_mismatch:{days}:{mode_label}")
+            if record.get("config_path") != release_relative_path:
+                errors.append(f"release_config_path_mismatch:{days}:{mode_label}")
+            if record.get("validation_path") != validation_relative_path:
+                errors.append(f"release_validation_path_mismatch:{days}:{mode_label}")
             if (
                 type(record.get("maximum_step_count")) is not int
                 or record.get("maximum_step_count") != expected_record_steps
             ):
-                errors.append(f"release_record_step_count_mismatch:{days}")
+                errors.append(f"release_record_step_count_mismatch:{days}:{mode_label}")
             if record.get("config_status") != expected_status:
-                errors.append(f"release_record_status_invalid:{days}")
+                errors.append(f"release_record_status_invalid:{days}:{mode_label}")
             recorded_config = record.get("config_fingerprint")
             if not _fingerprint_matches(recorded_config, release_actual_fp):
-                errors.append(f"release_config_fingerprint_mismatch:{days}")
+                errors.append(f"release_config_fingerprint_mismatch:{days}:{mode_label}")
             release_result = validate_release_config(
                 release_path, input_directory=input_root, formal=formal
             )
             if not isinstance(release_result, Mapping) or release_result.get("valid") is not True:
-                errors.append(f"release_validator_failed:{days}")
+                errors.append(f"release_validator_failed:{days}:{mode_label}")
             identity = _identity_fingerprints(
                 {
                     kind: {
@@ -1617,7 +1832,7 @@ def _validate_suite_contents(
                 }
             )
             if record.get("identity_fingerprints") != identity:
-                errors.append(f"release_record_identity_mismatch:{days}")
+                errors.append(f"release_record_identity_mismatch:{days}:{mode_label}")
             if reference_binding is not None and identity != _identity_fingerprints(
                 {
                     kind: {
@@ -1627,27 +1842,30 @@ def _validate_suite_contents(
                     for kind in _IDENTITY_KINDS
                 }
             ):
-                errors.append(f"release_identity_mismatch:{days}")
+                errors.append(f"release_identity_mismatch:{days}:{mode_label}")
             validation_payload, validation_fp = read_canonical_json(validation_path)
             if validation_payload.get("valid") is not True:
-                errors.append(f"release_validation_not_valid:{days}")
+                errors.append(f"release_validation_not_valid:{days}:{mode_label}")
             if isinstance(release_result, Mapping) and canonical_json_bytes(
                 validation_payload
             ) != canonical_json_bytes(release_result):
-                errors.append(f"release_validation_evidence_mismatch:{days}")
+                errors.append(f"release_validation_evidence_mismatch:{days}:{mode_label}")
             recorded_validation = record.get("validation_fingerprint")
             if not _fingerprint_matches(recorded_validation, validation_fp):
-                errors.append(f"release_validation_fingerprint_mismatch:{days}")
+                errors.append(f"release_validation_fingerprint_mismatch:{days}:{mode_label}")
         except Exception as exc:
-            errors.append(f"release_invalid:{days}:{type(exc).__name__}")
+            errors.append(f"release_invalid:{days}:{mode_label}:{type(exc).__name__}")
     return {
         "valid": not errors,
         "errors": errors,
         "warnings": [input_evidence_warning] if input_evidence_warning else [],
         "summary": {
             "horizons_days": list(horizons),
-            "selection_support_days": maximum_horizon,
-            "release_count": len(horizons),
+            "selection_support_days": selection_support_days,
+            "runtime_support_days": runtime_support_days,
+            "backtrack_modes": list(expected_modes),
+            "release_count": len(expected_release_pairs),
+            "input_build_count": manifest.get("input_build_count"),
             "input_valid": input_result.get("valid") is True
             if isinstance(input_result, Mapping)
             else False,
@@ -1707,14 +1925,17 @@ def build_horizon_suite(
     nww_analysis_root: str | Path,
     formal: bool = True,
 ) -> dict[str, Any]:
-    """以最大 horizon 建立一次 common input，再原子發布多份 release 設定。
+    """以最大選時包絡建立一次 common input，再原子發布 horizon×mode releases。
 
     ``backtrack_days`` 可為任意數量的唯一正整數；函式先排序，並把最大值寫入
-    ``inputs.backtrack_support_days``。來源 template 僅讀取，套件內的 common config
-    是深拷貝；accepted forcing roots 只傳給 builder，不進入 manifest。每個 release
-    使用 ``ceil(days*86400/dt_min_seconds)+1`` 的 safe step budget，並經既有 release
-    validator 驗證。中途任何一步失敗都保留 ``.partial-*`` 供人工稽核，且不發布
-    destination；避免共享 SERVER 上的自動清理競態刪除 foreign data。
+    ``inputs.backtrack_support_days``。對 bed-residence template，selection support 是
+    ``最大 horizon + maximum_age_days``，runtime support 仍是最大 horizon，並為每個
+    horizon 產生兩種合法模式；例如 H30/H60/H90 產生六份 release。來源 template 僅讀取，
+    套件內的 common config 是深拷貝；accepted forcing roots 只傳給 builder，不進入
+    manifest。每個 release 的 step budget 只依 H 計算，即
+    ``ceil(days*86400/dt_min_seconds)+1``；固定日曆模式的成員有效期間由 runtime 個別解析，
+    不縮小全域 budget。中途任何一步失敗都保留 ``.partial-*`` 供人工稽核，且不發布
+    destination；避免共享檔案系統上的自動清理競態刪除其他資料。
     """
 
     horizons = normalize_horizons(backtrack_days)
@@ -1729,6 +1950,9 @@ def build_horizon_suite(
         HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME,
     )
     common_payload = _derive_common_payload(source_payload, maximum_horizon)
+    selection_support_days, runtime_support_days, backtrack_modes = _suite_support_contract(
+        common_payload, maximum_horizon
+    )
     integration = common_payload.get("integration")
     dt_min = integration.get("dt_min_seconds") if isinstance(integration, Mapping) else None
 
@@ -1788,18 +2012,27 @@ def build_horizon_suite(
             partial=partial,
             horizons=horizons,
             step_counts=step_counts,
+            backtrack_modes=backtrack_modes,
+            selection_support_days=selection_support_days,
+            runtime_support_days=runtime_support_days,
             formal=formal,
         )
         manifest: dict[str, Any] = {
             "manifest_kind": "horizon_suite_manifest",
             "schema_version": HORIZON_SUITE_SCHEMA_VERSION,
-            "source_schema_version": DERIVED_INPUT_SCHEMA_VERSION,
+            "source_schema_version": (
+                BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                if backtrack_modes
+                else DERIVED_INPUT_SCHEMA_VERSION
+            ),
             "status": "approved" if formal else "generated",
             "gate_mode": "formal" if formal else "pilot",
             "policy_id": HORIZON_SUITE_POLICY_ID,
             "method_id": HORIZON_SUITE_METHOD_ID,
             "horizons_days": list(horizons),
-            "selection_support_days": maximum_horizon,
+            "selection_support_days": selection_support_days,
+            "runtime_support_days": runtime_support_days,
+            "backtrack_modes": list(backtrack_modes),
             "step_count_formula": "ceil(days*86400/dt_min_seconds)+1",
             "dt_min_seconds": float(dt_min),
             "maximum_step_count_by_horizon": {str(days): step_counts[days] for days in horizons},
@@ -1851,10 +2084,12 @@ def build_horizon_suite(
             "destination": str(destination_path),
             "status": manifest["status"],
             "horizons_days": list(horizons),
-            "selection_support_days": maximum_horizon,
+            "selection_support_days": selection_support_days,
+            "runtime_support_days": runtime_support_days,
+            "backtrack_modes": list(backtrack_modes),
             "maximum_step_count_by_horizon": manifest["maximum_step_count_by_horizon"],
             "common_input_build_count": 1,
-            "release_count": len(horizons),
+            "release_count": len(release_records),
             "validation": validation,
         }
     except Exception:

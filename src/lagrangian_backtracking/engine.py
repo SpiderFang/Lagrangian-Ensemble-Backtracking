@@ -1013,15 +1013,36 @@ def initialize_particle_execution(
 ) -> ParticleExecutionState:
     """驗證並建立一條粒子執行狀態，且立即寫入初始觀測。
 
-    初始狀態必須是 ``ACTIVE``；位置使用公尺、時間使用 UTC 奈秒，第一筆觀測的
-    ``age_seconds`` 直接沿用輸入狀態。這裡不取樣 forcing，也不消耗 RNG，因此從未啟動
-    與從 checkpoint 還原的粒子可以共用同一個單步核心。``next_output_age_seconds`` 從
-    一個完整輸出間隔開始，與原始 while engine 的固定輸出語意一致。
+    一般積分初始狀態必須是 ACTIVE；唯一允許的終止初始狀態是 PRE_WINDOW_DEPOSITION，
+    代表固定日曆研究窗開始前已沉底。後者會立刻保存零年齡終止觀測及同點、fraction=0
+    的 terminal event，且不進入速度、forcing 或亂數步進。位置使用公尺、時間使用 UTC
+    奈秒，第一筆觀測的 age_seconds 沿用輸入狀態。一般 ACTIVE 初始化亦不取樣 forcing
+    或消耗 RNG。next_output_age_seconds 從完整輸出間隔開始，與既有輸出語意一致。
     """
 
     _validate_engine_settings(settings)
-    if initial_state.status != ParticleStatus.ACTIVE:
-        raise ValueError("initial_state 必須是 ACTIVE")
+    if initial_state.status not in {
+        ParticleStatus.ACTIVE,
+        ParticleStatus.PRE_WINDOW_DEPOSITION,
+    }:
+        raise ValueError(
+            "initial_state 只允許 ACTIVE 或 PRE_WINDOW_DEPOSITION"
+        )
+    if initial_state.status == ParticleStatus.PRE_WINDOW_DEPOSITION:
+        if initial_state.age_seconds != 0.0:
+            raise ValueError("PRE_WINDOW_DEPOSITION 的初始 age_seconds 必須為 0")
+        terminal_event = replace(
+            _terminal_event(initial_state, EventType.PRE_WINDOW_DEPOSITION),
+            fraction=0.0,
+        )
+        return ParticleExecutionState(
+            state=initial_state,
+            observations=[_observation(initial_state)],
+            events=[terminal_event],
+            step_count=0,
+            minimum_clamp_count=0,
+            next_output_age_seconds=settings.output_interval_seconds,
+        )
     return ParticleExecutionState(
         state=initial_state,
         observations=[_observation(initial_state)],

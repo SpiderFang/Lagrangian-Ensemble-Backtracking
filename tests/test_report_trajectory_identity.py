@@ -287,16 +287,23 @@ def test_digest_identity_type_and_nonempty_gates(
 
 
 def test_report_member_status_policy() -> None:
-    """ACTIVE 拒絕；兩種失敗排除；其餘每一種終止狀態都有效。"""
+    """ACTIVE 拒絕；兩種計算失敗與 pre-window 均排除；其餘終止狀態有效。"""
 
     with pytest.raises(ValueError):
         is_valid_report_member(_result(ParticleStatus.ACTIVE))
     assert is_valid_report_member(_result(ParticleStatus.DATA_GAP)) is False
     assert is_valid_report_member(_result(ParticleStatus.NUMERICAL_FAILURE)) is False
+    assert is_valid_report_member(_result(ParticleStatus.PRE_WINDOW_DEPOSITION)) is False
     terminal_statuses = tuple(
         status
         for status in ParticleStatus
-        if status not in {ParticleStatus.ACTIVE, ParticleStatus.DATA_GAP, ParticleStatus.NUMERICAL_FAILURE}
+        if status
+        not in {
+            ParticleStatus.ACTIVE,
+            ParticleStatus.DATA_GAP,
+            ParticleStatus.NUMERICAL_FAILURE,
+            ParticleStatus.PRE_WINDOW_DEPOSITION,
+        }
     )
     assert terminal_statuses
     assert all(is_valid_report_member(_result(status)) for status in terminal_statuses)

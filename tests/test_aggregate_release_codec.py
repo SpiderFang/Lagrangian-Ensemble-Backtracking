@@ -291,6 +291,7 @@ _EXPECTED_TABLE_CONTRACTS: dict[
             {"study_site_id": "site-a", "outcome": "forcing_start", "count": 0},
             {"study_site_id": "site-a", "outcome": "max_age", "count": 2},
             {"study_site_id": "site-a", "outcome": "numerical_failure", "count": 0},
+            {"study_site_id": "site-a", "outcome": "pre_window_deposition", "count": 0},
             {"study_site_id": "site-a", "outcome": "surface_regime_exit", "count": 0},
         ),
     ),

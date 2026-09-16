@@ -74,6 +74,7 @@ _TERMINAL_EVENT_TYPE_BY_STATUS: Mapping[ParticleStatus, EventType] = {
     ParticleStatus.DATA_GAP: EventType.DATA_GAP,
     ParticleStatus.MAX_AGE: EventType.MAX_AGE,
     ParticleStatus.NUMERICAL_FAILURE: EventType.NUMERICAL_FAILURE,
+    ParticleStatus.PRE_WINDOW_DEPOSITION: EventType.PRE_WINDOW_DEPOSITION,
 }
 
 # outcome mapping 只能保存已登錄且已終止的 ParticleStatus；把允許集合固定在
@@ -86,13 +87,14 @@ _NON_ACTIVE_PARTICLE_STATUS_VALUES = frozenset(
     if status != ParticleStatus.ACTIVE
 )
 
-# denominator_policy 固定排除這兩類最終失敗成員。它們的 outcome 與 failure
-# grid 仍然是正式診斷資料，但不能把失敗前曾發生的來源、邊界或跨站事件放進
-# 來源 numerator；否則 numerator 與 valid denominator 會來自不同的成員母體。
+# denominator_policy 排除資料／數值失敗，以及固定日曆窗前已沉底的成員。其 outcome
+# 仍保留供診斷，但這些成員不能把來源、邊界或跨站事件放進 numerator；否則 numerator
+# 與 valid denominator 會來自不同的成員母體。pre-window 是研究窗分類，不另記為失敗格。
 _INVALID_MEMBER_STATUSES = frozenset(
     {
         ParticleStatus.DATA_GAP,
         ParticleStatus.NUMERICAL_FAILURE,
+        ParticleStatus.PRE_WINDOW_DEPOSITION,
     }
 )
 
@@ -914,7 +916,8 @@ def _validate_event_aggregate_relationships(
     首次接觸與跨站 unique-member）必須與有效成員 denominator 來自同一母體；
     因此以下關係會額外限制每站、每受體及每個跨站 pair 的 numerator 不得超過
     對應有效成員數。DATA_GAP 與 NUMERICAL_FAILURE grid 是例外的失敗診斷欄位，
-    只與 outcome 守恆，不屬於來源 numerator。
+    只與 outcome 守恆，不屬於來源 numerator；PRE_WINDOW_DEPOSITION 只保留 outcome，
+    不寫入失敗格或來源 numerator。
 
     所有合計都逐一把 NumPy scalar 轉成 Python ``int`` 後累加，或直接累加已驗證
     的 Python ``int``。不可使用 ``np.sum`` 或讓 ``np.int64`` 擔任累加器，因為
@@ -2556,11 +2559,12 @@ def aggregate_result_events(
         RuntimeError: 任一 int64 計數陣列即將溢位時。
 
     Notes:
-        ``AggregateSpec.denominator_policy`` 固定排除最終狀態為 DATA_GAP 或
-        NUMERICAL_FAILURE 的成員。這兩類成員的 outcome 與 failure grid 仍精確
-        保存作為失敗診斷，但其 local／outer、boundary、source-receptor、bed
-        contact 與 cross-site 事件不能累加到來源 numerator；如此 numerator 與
-        valid denominator 才來自同一有效成員母體。這些計數只代表條件式來源足跡
+        ``AggregateSpec.denominator_policy`` 固定排除 DATA_GAP、
+        NUMERICAL_FAILURE 與 PRE_WINDOW_DEPOSITION。前兩類成員的 outcome 與 failure
+        grid 仍精確保存作為失敗診斷；pre-window 成員只記 outcome，表示研究窗內沒有
+        漂流歷程。三類成員的 local／outer、boundary、source-receptor、bed contact
+        與 cross-site 事件不能累加到來源 numerator；如此 numerator 與 valid
+        denominator 才來自同一有效成員母體。這些計數只代表條件式來源足跡
         或相對來源權重，不是絕對來源機率。
 
         本函式只做 raw event/grid/histogram 累加與分母計數，不執行檔案 I/O、
@@ -2666,9 +2670,9 @@ def aggregate_result_events(
             raise RuntimeError("已驗證的 Scenario site/receptor 不在分母拓撲中。")
 
         # valid member 是由最終狀態決定，而不是由某一筆較早事件是否存在決定。
-        # DATA_GAP／NUMERICAL_FAILURE 的 outcome 與 failure grid 仍須保存；但在
-        # 所有事件完成驗證後，它們的來源 numerator 必須全部排除，確保 numerator
-        # 與 denominator_policy 的有效成員母體一致。這裡只建立旗標，不以 early
+        # 三種無效成員的 outcome 都保留；DATA_GAP／NUMERICAL_FAILURE 另外寫入 failure
+        # grid。所有無效成員的來源 numerator 均排除，確保 numerator 與
+        # denominator_policy 的有效成員母體一致。這裡只建立旗標，不以 early
         # continue 跳過後續事件驗證。
         is_valid_member = final_status not in _INVALID_MEMBER_STATUSES
         outcome_by_site[site_id][final_status.value] += 1
@@ -2816,7 +2820,10 @@ def aggregate_result_events(
                     label=f"{grid_field} grid",
                 )
 
-        if final_status in _INVALID_MEMBER_STATUSES:
+        if final_status in {
+            ParticleStatus.DATA_GAP,
+            ParticleStatus.NUMERICAL_FAILURE,
+        }:
             ix = _grid_cell_index(final_state.x_m, x_edges, label="final failure x")
             iy = _grid_cell_index(final_state.y_m, y_edges, label="final failure y")
             grid_field = (

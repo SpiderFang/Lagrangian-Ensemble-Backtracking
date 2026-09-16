@@ -87,6 +87,54 @@ def _settings(**overrides: object) -> EngineSettings:
     return EngineSettings(**values)
 
 
+def test_pre_window_initial_state_is_terminal_without_velocity_or_rng_use() -> None:
+    """pre-window 起點輸出一筆零年齡結果，不呼叫速度、不步進且不消耗亂數。"""
+
+    velocity_calls: list[tuple[float, float, float, int]] = []
+
+    def forbidden_velocity(
+        x_m: float, y_m: float, z_m: float, time_utc_ns: int
+    ) -> VelocitySample:
+        """若 engine 意外對 terminal initial state 取樣，讓測試立即失敗。"""
+
+        velocity_calls.append((x_m, y_m, z_m, time_utc_ns))
+        raise AssertionError("PRE_WINDOW_DEPOSITION 不得取樣 velocity")
+
+    state = replace(_state(), status=ParticleStatus.PRE_WINDOW_DEPOSITION)
+    rng = np.random.Generator(np.random.PCG64DXSM(20260916))
+    initial_rng_state = deepcopy(rng.bit_generator.state)
+    result = run_particle(
+        state,
+        velocity=forbidden_velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=_settings(),
+        rng=rng,
+    )
+
+    assert result.final_state.status is ParticleStatus.PRE_WINDOW_DEPOSITION
+    assert result.step_count == 0
+    assert result.minimum_clamp_count == 0
+    assert len(result.observations) == 1
+    assert result.observations[0].age_seconds == 0.0
+    assert result.observations[0].status is ParticleStatus.PRE_WINDOW_DEPOSITION
+    assert len(result.events) == 1
+    assert result.events[0].event_type is EventType.PRE_WINDOW_DEPOSITION
+    assert result.events[0].time_utc_ns == state.time_utc_ns
+    assert result.events[0].fraction == 0.0
+    assert velocity_calls == []
+    assert rng.bit_generator.state == initial_rng_state
+
+
+def test_engine_rejects_other_terminal_initial_statuses() -> None:
+    """PRE_WINDOW_DEPOSITION 是唯一可直接初始化的終止狀態。"""
+
+    state = replace(_state(), status=ParticleStatus.DATA_GAP)
+    with pytest.raises(ValueError, match="ACTIVE 或 PRE_WINDOW_DEPOSITION"):
+        initialize_particle_execution(state, _settings())
+
+
 def _position_dependent_velocity(
     x_m: float, y_m: float, z_m: float, time_utc_ns: int
 ) -> VelocitySample:

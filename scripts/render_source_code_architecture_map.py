@@ -47,6 +47,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "mesh",
             "receptors",
             "arrival_times",
+            "bed_residence",
             "manifests",
             "input_derivation",
             "input_horizon",
@@ -220,6 +221,21 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "outputs": "ArrivalTime 清單；48 個分層時刻加 2 個事件時刻",
         "entrypoints": ["select_arrival_times"],
         "read_first": "確認到達時刻不是任意等距抽樣，而要避開不可用時間。",
+    },
+    "bed_residence": {
+        "role": "建立可重現的隨機沉底年齡，並解析兩種回溯時間模式",
+        "inputs": "五站 observation 時刻、50 層整點小時抽樣、固定 seed、H30／H60／H90 模式設定",
+        "outputs": "共同沉底年齡向量、deposition UTC、逐粒子積分起訖與 pre-window 終止判定",
+        "entrypoints": [
+            "sample_bed_residence_age_hours",
+            "apply_bed_residence_sampling",
+            "resolve_bed_residence_timing",
+        ],
+        "read_first": (
+            "先分清 observation UTC 與 deposition UTC；五站共用同一組 50 個年齡偏移，"
+            "fixed_calendar_window 可能產生不讀 forcing 的 pre_window_deposition，"
+            "full_horizon_from_deposition 則從沉底日向前走滿指定 horizon。"
+        ),
     },
     "models": {
         "role": "所有模組共用的資料型別與狀態契約",
@@ -1202,6 +1218,10 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "mesh", "target": "input_derivation", "label": "native face support"},
     {"source": "receptors", "target": "input_derivation", "label": "receptor candidates"},
     {"source": "arrival_times", "target": "input_derivation", "label": "arrival selector"},
+    {"source": "arrival_times", "target": "bed_residence", "label": "observation UTC／共同 50 筆"},
+    {"source": "config", "target": "bed_residence", "label": "年齡抽樣與雙模式契約"},
+    {"source": "bed_residence", "target": "input_derivation", "label": "deposition UTC／年齡 provenance"},
+    {"source": "bed_residence", "target": "runtime", "label": "積分期間／pre-window 判定"},
     {"source": "config", "target": "horizon_suite", "label": "未綁定 template／suite 設定"},
     {"source": "input_horizon", "target": "horizon_suite", "label": "最大 horizon／gap-safe 支援"},
     {"source": "input_derivation", "target": "horizon_suite", "label": "單次 common-input build"},

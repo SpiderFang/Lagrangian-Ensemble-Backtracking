@@ -7,6 +7,7 @@ trajectory stream 同步送入環境、材質、代表軌跡與 pathway 四個 b
 正式 pathway 必須由這條 stream 重新計算，因為 aggregate pipeline 的 pathway 可能包含
 ``DATA_GAP``／``NUMERICAL_FAILURE``；本模組只把有效成員交給
 ``stream_pathway_first_passage``，使 pathway numerator 與 valid denominator 來自同一母體。
+``PRE_WINDOW_DEPOSITION`` 另以具名 outcome 保留，不假裝成數值失敗，也不進有效分母。
 每個 shard 的有效 ``ParticleResult`` 只在當前 shard 暫存，建立 chunk 後立即釋放，不保存
 已處理 shard，也不重讀 aggregate pipeline 的 private helper。
 
@@ -72,6 +73,7 @@ _MEMBER_STATUS_KEYS: Final[tuple[str, ...]] = (
     "valid",
     ParticleStatus.DATA_GAP.value,
     ParticleStatus.NUMERICAL_FAILURE.value,
+    ParticleStatus.PRE_WINDOW_DEPOSITION.value,
 )
 _SAMPLE_STATUS_KEYS: Final[tuple[str, ...]] = tuple(
     status.value for status in EnvironmentSampleStatus
@@ -261,9 +263,10 @@ class EnvironmentCompletenessSiteStatistics:
 
     ``valid_member_count`` 是依 ``is_valid_report_member`` 留在報告分母的 member 數；
     ``data_gap_member_count`` 與 ``numerical_failure_member_count`` 是分開保存的失敗
-    exposure，三者加總為 ``total_member_count``。``observation_count`` 及其三個
+    exposure；``pre_window_deposition_member_count`` 是研究窗前已沉底、沒有漂流歷程的
+    獨立排除類別，不計為失敗。四類加總為 ``total_member_count``。``observation_count`` 及其三個
     ``valid_observation_count``／``not_sampled_observation_count``／
-    ``invalid_observation_count`` 只統計有效 report member 的 Observation；失敗 member
+    ``invalid_observation_count`` 只統計有效 report member 的 Observation；其他 member
     的 Observation 狀態仍可由 ``observation_counts_by_member_status`` 查核，但不會污染
     有效分母或垂向 histogram。
 
@@ -281,6 +284,7 @@ class EnvironmentCompletenessSiteStatistics:
     valid_member_count: int
     data_gap_member_count: int
     numerical_failure_member_count: int
+    pre_window_deposition_member_count: int
     observation_count: int
     valid_observation_count: int
     not_sampled_observation_count: int
@@ -311,8 +315,17 @@ class EnvironmentCompletenessSiteStatistics:
             self.numerical_failure_member_count,
             label="numerical_failure_member_count",
         )
-        if total_members != valid_members + data_gap_members + numerical_members:
-            raise ValueError("member raw count 必須由 valid、data_gap、numerical_failure 精確加總")
+        pre_window_members = _require_nonnegative_int(
+            self.pre_window_deposition_member_count,
+            label="pre_window_deposition_member_count",
+        )
+        if total_members != (
+            valid_members + data_gap_members + numerical_members + pre_window_members
+        ):
+            raise ValueError(
+                "member raw count 必須由 valid、data_gap、numerical_failure、"
+                "pre_window_deposition 精確加總"
+            )
 
         observation_count = _require_nonnegative_int(self.observation_count, label="observation_count")
         valid_observations = _require_nonnegative_int(
@@ -342,6 +355,7 @@ class EnvironmentCompletenessSiteStatistics:
             "valid": valid_members,
             ParticleStatus.DATA_GAP.value: data_gap_members,
             ParticleStatus.NUMERICAL_FAILURE.value: numerical_members,
+            ParticleStatus.PRE_WINDOW_DEPOSITION.value: pre_window_members,
         }
         member_counts = _snapshot_flat_counts(
             self.member_status_counts,
@@ -441,6 +455,12 @@ class EnvironmentCompletenessSiteStatistics:
         return self.numerical_failure_member_count
 
     @property
+    def excluded_pre_window_deposition_member_count(self) -> int:
+        """研究窗前沉底成員的排除數；此類結果不是失敗 exposure。"""
+
+        return self.pre_window_deposition_member_count
+
+    @property
     def environment_sample_status_counts(self) -> Mapping[str, int]:
         """回傳只屬於有效 member 的 valid/not_sampled/invalid 唯讀 mapping。"""
 
@@ -466,7 +486,7 @@ class EnvironmentCompletenessSiteStatistics:
 
     @property
     def total_observation_count(self) -> int:
-        """包含失敗 member exposure 的所有 observation raw count。"""
+        """包含有效、資料／數值失敗及 pre-window 類別的所有 observation raw count。"""
 
         return sum(
             sum(member_counts.values())
@@ -578,6 +598,7 @@ class _MutableSiteCounts:
     valid_member_count: int
     data_gap_member_count: int
     numerical_failure_member_count: int
+    pre_window_deposition_member_count: int
     observation_counts_by_member_status: dict[str, dict[str, int]]
     terminal_not_sampled_count_by_member_status: dict[str, int]
     depth_bin_counts: np.ndarray
@@ -596,6 +617,7 @@ def _new_site_counts(bin_count: int) -> _MutableSiteCounts:
         valid_member_count=0,
         data_gap_member_count=0,
         numerical_failure_member_count=0,
+        pre_window_deposition_member_count=0,
         observation_counts_by_member_status={
             member_status: {sample_status: 0 for sample_status in _SAMPLE_STATUS_KEYS}
             for member_status in _MEMBER_STATUS_KEYS
@@ -763,7 +785,7 @@ class EnvironmentCompletenessAccumulator:
 
     @property
     def member_count(self) -> int:
-        """回傳已接受且 identity 唯一的 member 數，包含兩類失敗 member。"""
+        """回傳已接受且 identity 唯一的 member 數，包含失敗與研究窗前沉底類別。"""
 
         return len(self._seen_member_keys)
 
@@ -844,8 +866,8 @@ class EnvironmentCompletenessAccumulator:
             sample_status = observation.environment_sample_status.value
             pending.observation_counts_by_member_status[member_category][sample_status] += 1
             # terminal_not_sampled_count 的正式欄位只描述有效 report member 的終止
-            # observation；失敗 member 的完整 sample status 仍保留在
-            # observation_counts_by_member_status，避免把 failure exposure 誤當成有效
+            # observation；排除 member 的完整 sample status 仍保留在
+            # observation_counts_by_member_status，避免把排除類別誤當成有效
             # member 的垂向／環境完整性分母。這個限制也使 immutable product 的
             # terminal_not_sampled_count 與 terminal mapping 保持精確一致。
             if (
@@ -855,7 +877,7 @@ class EnvironmentCompletenessAccumulator:
             ):
                 pending.terminal_not_sampled_count_by_member_status[member_category] += 1
 
-            # 失敗 member 的 environment context 只作 exposure 診斷；既有 report policy
+            # 非有效 member 的 environment context 只作原始狀態稽核；既有 report policy
             # 已將它們排除，因此只有 valid report member 的 VALID observation 能進 histogram。
             if member_category != "valid" or sample_status != EnvironmentSampleStatus.VALID.value:
                 continue
@@ -900,8 +922,12 @@ class EnvironmentCompletenessAccumulator:
             counts.valid_member_count += 1
         elif member_category == ParticleStatus.DATA_GAP.value:
             counts.data_gap_member_count += 1
-        else:
+        elif member_category == ParticleStatus.NUMERICAL_FAILURE.value:
             counts.numerical_failure_member_count += 1
+        elif member_category == ParticleStatus.PRE_WINDOW_DEPOSITION.value:
+            counts.pre_window_deposition_member_count += 1
+        else:
+            raise RuntimeError(f"未登錄的 member category：{member_category!r}")
         for sample_status in _SAMPLE_STATUS_KEYS:
             counts.observation_counts_by_member_status[member_category][sample_status] += (
                 pending.observation_counts_by_member_status[member_category][sample_status]
@@ -920,10 +946,11 @@ class EnvironmentCompletenessAccumulator:
         """逐一吸收一個 ``ParticleResult``，完成後立即釋放其 payload。
 
         ``is_valid_report_member`` 先判定 final status；``DATA_GAP``／
-        ``NUMERICAL_FAILURE`` 只進入各自的 failure exposure，其他正式終止狀態進入有效
-        member 分母。有效 member 的三種 environment sample status 與 terminal not sampled
-        會逐 observation 累加；只有 VALID context 才計算公尺制 depth／height bins。任一
-        identity 或資料型別錯誤都會令 reducer 永久 failed，且不回傳部分產品。
+        ``NUMERICAL_FAILURE`` 只進入各自的 failure exposure，``PRE_WINDOW_DEPOSITION``
+        保留為獨立非失敗排除類別，其餘正式終止狀態進入有效 member 分母。有效 member
+        的三種 environment sample status 與 terminal not sampled 會逐 observation 累加；
+        只有 VALID context 才計算公尺制 depth／height bins。任一 identity 或資料型別錯誤
+        都會令 reducer 永久 failed，且不回傳部分產品。
         """
 
         self._ensure_open()
@@ -998,6 +1025,9 @@ class EnvironmentCompletenessAccumulator:
                     valid_member_count=counts.valid_member_count,
                     data_gap_member_count=counts.data_gap_member_count,
                     numerical_failure_member_count=counts.numerical_failure_member_count,
+                    pre_window_deposition_member_count=(
+                        counts.pre_window_deposition_member_count
+                    ),
                     observation_count=sum(valid_status_counts.values()),
                     valid_observation_count=valid_status_counts[EnvironmentSampleStatus.VALID.value],
                     not_sampled_observation_count=valid_status_counts[
@@ -1017,6 +1047,9 @@ class EnvironmentCompletenessAccumulator:
                         "valid": counts.valid_member_count,
                         ParticleStatus.DATA_GAP.value: counts.data_gap_member_count,
                         ParticleStatus.NUMERICAL_FAILURE.value: counts.numerical_failure_member_count,
+                        ParticleStatus.PRE_WINDOW_DEPOSITION.value: (
+                            counts.pre_window_deposition_member_count
+                        ),
                     },
                     observation_counts_by_member_status=counts.observation_counts_by_member_status,
                     terminal_not_sampled_count_by_member_status=(
@@ -1067,6 +1100,7 @@ _TRAJECTORY_INVALID_MEMBER_STATUSES: Final[frozenset[ParticleStatus]] = frozense
     {
         ParticleStatus.DATA_GAP,
         ParticleStatus.NUMERICAL_FAILURE,
+        ParticleStatus.PRE_WINDOW_DEPOSITION,
     }
 )
 _GRID_ALIGNMENT_REL_TOLERANCE: Final[float] = 1.0e-9
@@ -1415,9 +1449,10 @@ class TrajectoryReportAccumulator:
 
     ``add_shard`` 是正式更新入口：它只逐次讀取當前 shard，先讓每筆結果同步通過
     selector、environment 與 material reducer，再將該 shard 的有效成員按 site 暫存，呼叫
-    ``stream_pathway_first_passage`` 產生 bounded chunk 後立即釋放暫存。失敗 member
-    （``DATA_GAP``／``NUMERICAL_FAILURE``）永不進 pathway；其早期 observation 仍可留在
-    environment 的 failure exposure 診斷，但不會進有效 pathway numerator 或 denominator。
+    ``stream_pathway_first_passage`` 產生 bounded chunk 後立即釋放暫存。資料／數值失敗
+    （``DATA_GAP``／``NUMERICAL_FAILURE``）與研究窗前沉底
+    （``PRE_WINDOW_DEPOSITION``）都不進 pathway；前者的早期 observation 可留在 failure
+    exposure 診斷，後者則保留為獨立 outcome，不計入有效分母或 failure exposure。
 
     reducer 沒有跨子 reducer 的 rollback。若 selector 已吸收而 environment/material 或
     pathway 後續失敗，parent 會依交易邊界永久標記 ``failed``，不允許 finalize 或再加資料；
@@ -1619,8 +1654,8 @@ class TrajectoryReportAccumulator:
 
         這個 parent gate 先於任何子 reducer 執行，確保 material／arrival／season／tide
         來自同一列 scenario metadata。``bool`` 只依既有有效成員政策表示是否可進 pathway；
-        不是把資料缺口或數值失敗轉成零值，失敗 member 仍由 environment/material reducer
-        保存對應 exposure。
+        不是把資料缺口或數值失敗轉成零值。資料／數值失敗仍由 environment/material reducer
+        保存 exposure；研究窗前沉底另作具名排除類別，不併入 failure exposure。
         """
 
         if type(result) is not ParticleResult:
@@ -1703,8 +1738,8 @@ class TrajectoryReportAccumulator:
 
         正式管線應優先使用 ``add_shard``，讓同一 shard 的有效結果可一次建立 bounded
         pathway chunk；本入口保留給小型串流或互動 caller。資料錯誤會永久關閉 parent，
-        且不回傳任何 partial product。有效成員才會呼叫 pathway；兩類失敗 member 只由
-        environment/material 留存其 exposure，不會進 pathway。
+        且不回傳任何 partial product。有效成員才會呼叫 pathway；資料／數值失敗由
+        environment/material 留存 failure exposure，研究窗前沉底則另列 outcome，不會進 pathway。
         """
 
         self._ensure_open()
@@ -1741,8 +1776,9 @@ class TrajectoryReportAccumulator:
             except Exception as error:
                 raise TypeError("shard 必須是 ParticleResult iterable") from error
 
-            # 只建立當前 shard 的 per-site list；失敗 member 在此處永遠不會被放入 pathway
-            # 暫存，因此後續 stream_pathway_first_passage 看不到它的任何 observation。
+            # 只建立當前 shard 的 per-site list；資料／數值失敗與研究窗前沉底 member
+            # 永遠不會被放入 pathway 暫存，因此後續 stream_pathway_first_passage 看不到
+            # 它們的任何 observation。
             for result in iterator:
                 site_id, valid_member = self._accept_result_to_reducers(result)
                 if valid_member:
@@ -1768,8 +1804,9 @@ class TrajectoryReportAccumulator:
     def finalize(self) -> TrajectoryStreamStatistics:
         """核對 pathway、八層代表選樣與 material/environment closure 後封存組合產品。
 
-        每個 site 必須至少有一個有效 pathway chunk；零有效 site 或只有失敗 member 的
-        shard 不會以空 chunk、aggregate all-member pathway 或 pooled strata 補值。pathway
+        每個 site 必須至少有一個有效 pathway chunk；零有效 site 或只有被排除 member
+        （資料／數值失敗、研究窗前沉底）的 shard 不會以空 chunk、aggregate all-member
+        pathway 或 pooled strata 補值。pathway
         builder 會使用 report spec 的 quantiles／低樣本門檻，並再次核對其輸入粒子數等於
         environment valid member count。任一 gate 失敗都將 parent 永久標成 failed，不建立
         可被誤用的部分組合產品。

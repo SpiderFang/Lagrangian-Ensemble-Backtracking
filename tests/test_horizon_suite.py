@@ -21,22 +21,40 @@ import yaml
 import lagrangian_backtracking.horizon_suite as horizon_suite
 from lagrangian_backtracking.input_derivation import (
     ARTIFACT_FILENAMES,
+    DERIVED_INPUT_SCHEMA_VERSION,
     read_canonical_json,
     write_canonical_json,
 )
+from lagrangian_backtracking.input_horizon import BED_RESIDENCE_INPUT_SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
 
 
 def _write_template(path: Path, *, support_days: int | None = None) -> bytes:
-    """建立帶有效 dt_min 的 template，保留 example 唯一 documented placeholder。"""
+    """建立未啟用 bed-residence 的 legacy template，保留原 suite 相容性測試。"""
+
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
+    payload["integration"]["dt_min_seconds"] = 30.0
+    if support_days is not None:
+        payload["inputs"]["backtrack_support_days"] = support_days
+    rendered = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).encode("utf-8")
+    path.write_bytes(rendered)
+    return rendered
+
+
+def _write_bed_template(path: Path) -> bytes:
+    """建立正式 bed-residence config 樣板，驗證 180 日選時／90 日運算契約。"""
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     payload["integration"]["dt_min_seconds"] = 30.0
-    if support_days is not None:
-        payload["inputs"]["backtrack_support_days"] = support_days
+    payload["inputs"]["backtrack_support_days"] = 180
+    payload["boundaries"]["max_backtrack_days"] = None
+    payload["scenarios"]["bed_residence_time"]["runtime_horizon_support_days"] = None
     rendered = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).encode("utf-8")
     path.write_bytes(rendered)
     return rendered
@@ -92,7 +110,15 @@ def _install_small_suite_doubles(
                 "records": [{"component_kind": kind, "record_id": f"{kind}-0"}],
             }
             if kind == "ocm_gap_safe_arrival_horizon":
+                config_payload = yaml.safe_load(
+                    Path(kwargs["config_path"]).read_text(encoding="utf-8")
+                )
+                bed = config_payload["scenarios"].get("bed_residence_time")
                 payload["max_backtrack_days"] = 90
+                payload["support_days"] = 90
+                if bed is not None:
+                    payload["selection_support_days"] = 180
+                    payload["runtime_support_days"] = 90
             fingerprint = write_canonical_json(destination / filename, payload)
             component_records.append({"kind": kind, **fingerprint})
         index_fingerprint = write_canonical_json(
@@ -141,6 +167,10 @@ def _install_small_suite_doubles(
         assert isinstance(payload, dict)
         payload["boundaries"]["max_backtrack_days"] = float(days)
         payload["boundaries"]["maximum_step_count"] = int(kwargs["maximum_step_count"])
+        mode = kwargs.get("backtrack_mode_override")
+        bed = payload["scenarios"].get("bed_residence_time")
+        if bed is not None and mode is not None:
+            bed["backtrack_mode"] = mode
         horizon_suite._set_release_manifest_references(payload)
         records: list[dict[str, Any]] = []
         for kind, filename in sorted(ARTIFACT_FILENAMES.items()):
@@ -158,7 +188,9 @@ def _install_small_suite_doubles(
         )
         payload["config_status"] = status
         payload["release_binding"] = {
-            "schema_version": "1.0.0",
+            "schema_version": (
+                BED_RESIDENCE_INPUT_SCHEMA_VERSION if bed is not None else "1.0.0"
+            ),
             "source_config_template_sha256": horizon_suite._yaml_fingerprint(
                 template, "common-config.yaml"
             )["sha256"],
@@ -172,12 +204,24 @@ def _install_small_suite_doubles(
                 "source_config_hash": horizon_suite._config_hash_from_payload(
                     yaml.safe_load(template.read_text(encoding="utf-8"))
                 ),
-                "source_backtrack_support_days": 90,
+                "source_backtrack_support_days": payload["inputs"].get(
+                    "backtrack_support_days"
+                ) or 90,
                 "artifact_backtrack_support_days": 90.0,
                 "requested_max_backtrack_days": float(days),
                 "requested_maximum_step_count": int(kwargs["maximum_step_count"]),
             },
         }
+        if bed is not None:
+            payload["release_binding"]["backtrack_horizon_binding"].update(
+                {
+                    "selection_support_days": 180,
+                    "runtime_support_days": 90,
+                    "artifact_selection_support_days": 180,
+                    "artifact_runtime_support_days": 90,
+                    "backtrack_mode": mode,
+                }
+            )
         payload["release_approval"] = {
             "status": status,
             "blockers": [],
@@ -224,7 +268,7 @@ def test_horizon_step_budget_uses_dt_min_and_rejects_invalid_dt() -> None:
 def test_build_horizon_suite_uses_one_common_input_and_emits_identity_closure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """pilot suite 應只建一次 input，三份 release 共用同一 component identity。"""
+    """legacy pilot suite 應只建一次 input，三份 release 共用同一 component identity。"""
 
     calls = _install_small_suite_doubles(monkeypatch)
     template = tmp_path / "template.yaml"
@@ -255,6 +299,7 @@ def test_build_horizon_suite_uses_one_common_input_and_emits_identity_closure(
     manifest, _ = read_canonical_json(destination / "horizon-suite-manifest.json")
     assert manifest["horizons_days"] == [30, 60, 90]
     assert manifest["selection_support_days"] == 90
+    assert manifest["source_schema_version"] == DERIVED_INPUT_SCHEMA_VERSION
     assert manifest["maximum_step_count_by_horizon"] == {
         "30": 86_401,
         "60": 172_801,
@@ -289,6 +334,123 @@ def test_build_horizon_suite_uses_one_common_input_and_emits_identity_closure(
         )
     assert release_identity[0] == release_identity[1] == release_identity[2]
     assert horizon_suite.validate_horizon_suite(destination, formal=False)["valid"] is True
+
+
+def test_bed_suite_builds_one_180_day_selection_mother_and_six_mode_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """90 日最大沉底年齡只增加 selection envelope，不觸發第二次 input-build。"""
+
+    calls = _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "bed-template.yaml"
+    _write_bed_template(template)
+    destination = tmp_path / "bed-suite"
+    result = horizon_suite.build_horizon_suite(
+        template,
+        [90, 30, 60],
+        destination,
+        tmp_path / "ocm",
+        tmp_path / "surface",
+        tmp_path / "nww",
+        formal=False,
+    )
+
+    modes = (
+        "fixed_calendar_window",
+        "full_horizon_from_deposition",
+    )
+    assert result["horizons_days"] == [30, 60, 90]
+    assert result["selection_support_days"] == 180
+    assert result["runtime_support_days"] == 90
+    assert result["backtrack_modes"] == list(modes)
+    assert result["common_input_build_count"] == 1
+    assert result["release_count"] == 6
+    assert len(calls["build"]) == 1
+    assert len(calls["create"]) == 6
+    assert {call["backtrack_mode_override"] for call in calls["create"]} == set(modes)
+
+    common_payload = yaml.safe_load(
+        (destination / "common-config.yaml").read_text(encoding="utf-8")
+    )
+    assert common_payload["inputs"]["backtrack_support_days"] == 180
+    assert common_payload["boundaries"]["max_backtrack_days"] == 90.0
+    assert common_payload["scenarios"]["bed_residence_time"][
+        "runtime_horizon_support_days"
+    ] == 90
+    manifest, manifest_path = _load_manifest(destination)
+    assert manifest["selection_support_days"] == 180
+    assert manifest["runtime_support_days"] == 90
+    assert manifest["source_schema_version"] == BED_RESIDENCE_INPUT_SCHEMA_VERSION
+    assert manifest["backtrack_modes"] == list(modes)
+    assert manifest["input_build_count"] == 1
+    assert len(manifest["releases"]) == 6
+    wrong_source_schema = copy.deepcopy(manifest)
+    wrong_source_schema["source_schema_version"] = DERIVED_INPUT_SCHEMA_VERSION
+    _replace_canonical_json(manifest_path, wrong_source_schema)
+    wrong_schema_result = horizon_suite.validate_horizon_suite(destination, formal=False)
+    assert wrong_schema_result["valid"] is False
+    assert "manifest_source_schema_version_invalid" in wrong_schema_result["errors"]
+    _replace_canonical_json(manifest_path, manifest)
+    identities = []
+    for days in (30, 60, 90):
+        for mode in modes:
+            stem = f"release-{days}d-{mode}"
+            release_path = destination / "release-configs" / f"{stem}.yaml"
+            validation_path = destination / "validations" / f"{stem}.json"
+            assert release_path.is_file()
+            assert validation_path.is_file()
+            validation, _ = read_canonical_json(validation_path)
+            assert validation["valid"] is True
+            release = yaml.safe_load(release_path.read_text(encoding="utf-8"))
+            assert release["scenarios"]["bed_residence_time"]["backtrack_mode"] == mode
+            assert release["inputs"]["backtrack_support_days"] == 180
+            assert release["boundaries"]["max_backtrack_days"] == float(days)
+            horizon_binding = release["release_binding"]["backtrack_horizon_binding"]
+            assert horizon_binding["source_backtrack_support_days"] == 180
+            assert horizon_binding["artifact_backtrack_support_days"] == 90.0
+            assert horizon_binding["selection_support_days"] == 180
+            assert horizon_binding["runtime_support_days"] == 90
+            assert horizon_binding["artifact_selection_support_days"] == 180
+            assert horizon_binding["artifact_runtime_support_days"] == 90
+            assert horizon_binding["backtrack_mode"] == mode
+            identities.append(
+                {
+                    kind: {
+                        field: item[field]
+                        for field in ("sha256", "canonical_sha256", "size_bytes")
+                    }
+                    for kind, item in (
+                        (record["kind"], record)
+                        for record in release["release_binding"]["artifacts"]
+                    )
+                    if kind in {"arrival", "receptor", "material", "initial_condition"}
+                }
+            )
+    assert all(identity == identities[0] for identity in identities[1:])
+    assert horizon_suite.validate_horizon_suite(destination, formal=False)["valid"] is True
+
+    # 即使同步更新 YAML fingerprint 與 manifest sidecar，將 release mode 改成另一個合法
+    # 值也不能通過 common config 的 exact expected-payload 重建。
+    tampered_path = destination / "release-configs" / "release-30d-full_horizon_from_deposition.yaml"
+    tampered = yaml.safe_load(tampered_path.read_text(encoding="utf-8"))
+    tampered["scenarios"]["bed_residence_time"]["backtrack_mode"] = modes[0]
+    tampered_path.write_text(yaml.safe_dump(tampered, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    for record in manifest["releases"]:
+        if record["config_path"] == (
+            "release-configs/release-30d-full_horizon_from_deposition.yaml"
+        ):
+            record["config_fingerprint"] = horizon_suite._yaml_fingerprint(
+                tampered_path,
+                "release-configs/release-30d-full_horizon_from_deposition.yaml",
+            )
+    _replace_canonical_json(manifest_path, manifest)
+    tamper_result = horizon_suite.validate_horizon_suite(destination, formal=False)
+    assert tamper_result["valid"] is False
+    assert any(
+        "release_derived_payload_mismatch" in error
+        or "release_horizon_binding_invalid" in error
+        for error in tamper_result["errors"]
+    )
 
 
 def test_existing_destination_symlink_and_mid_build_failure_are_safe(

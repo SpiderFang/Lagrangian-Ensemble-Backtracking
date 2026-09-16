@@ -244,7 +244,7 @@ def test_repeated_bed_events_count_one_member_and_are_not_required() -> None:
 
 
 def test_invalid_members_are_excluded_and_empty_pairs_keep_none_ratios() -> None:
-    """資料缺口／數值失敗不可進有效分母，未有事件的宣告 pair 保留零分母。"""
+    """資料／數值失敗與 pre-window 均不進有效分母，未有事件 pair 保留零分母。"""
 
     scenarios = _scenarios()
     gear_a = next(
@@ -258,6 +258,18 @@ def test_invalid_members_are_excluded_and_empty_pairs_keep_none_ratios() -> None
                 gear_a,
                 member_id=0,
                 status=ParticleStatus.DATA_GAP,
+                event_types=(EventType.BED_CONTACT,),
+            ),
+            _result(
+                gear_a,
+                member_id=1,
+                status=ParticleStatus.NUMERICAL_FAILURE,
+                event_types=(EventType.BED_CONTACT,),
+            ),
+            _result(
+                gear_a,
+                member_id=2,
+                status=ParticleStatus.PRE_WINDOW_DEPOSITION,
                 event_types=(EventType.BED_CONTACT,),
             ),
         ),

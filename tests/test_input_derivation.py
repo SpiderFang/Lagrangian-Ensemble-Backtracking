@@ -13,7 +13,7 @@ import shutil
 from calendar import monthrange
 from copy import deepcopy
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -380,6 +380,11 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    # 這一大組既有來源 fixture 驗證 legacy selector／runtime 的工程連接；新正式範例
+    # 已啟用 random bed-residence 與 180/90 支援分流，因此在 fixture 中明確移除兩個
+    # 新欄位，避免把原本只涵蓋 2024–2025 的 synthetic source 假裝成通過新 180 日 gate。
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
     # 這組 coarse 8×10/2×2 mesh 只驗證既有 schema 連接，不能冒充 A 區逐 stage runtime
     # 空間支援的科學驗收；測試明示 legacy policy，並以零受體邊界 inset 保留 synthetic
     # fixture 語意與舊 geometry／scenario identity。正式 A v3 仍鎖定原本的幾何篩選值。
@@ -1744,6 +1749,11 @@ def test_inputs_build_validate_and_release_config(
         formal=True,
     )
     assert created["config_status"] == "generated"
+    release_payload = yaml.safe_load(release_path.read_text(encoding="utf-8"))
+    assert (
+        release_payload["release_binding"]["schema_version"]
+        == input_derivation_module.DERIVED_INPUT_SCHEMA_VERSION
+    )
     release_validation = validate_release_config(release_path, input_directory=artifact_directory)
     assert release_validation["valid"] is True, release_validation
     assert validate_release_config(release_path)["valid"] is True
@@ -2744,6 +2754,85 @@ def test_v3_policy_binds_exact_source_and_preserves_runtime_stage_status() -> No
     assert source_bindings["runtime_spatial_support_policy"] == (
         "runtime_stage_fail_closed_no_expansion_v1"
     )
+
+
+def test_bed_residence_input_transformation_replaces_each_site_mapping_before_pair_build() -> None:
+    """input-build 共用轉換 helper 逐站套同一 age vector，並把 mapping 全部換成 deposition UTC。"""
+
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG, formal_release=False)
+    bed = config.scenarios.bed_residence_time
+    assert bed is not None
+    season_by_month = {
+        12: "DJF",
+        1: "DJF",
+        2: "DJF",
+        3: "MAM",
+        4: "MAM",
+        5: "MAM",
+        6: "JJA",
+        7: "JJA",
+        8: "JJA",
+        9: "SON",
+        10: "SON",
+        11: "SON",
+    }
+    observation_by_site: dict[str, list[ArrivalTime]] = {}
+    for site in config.study_sites:
+        site_rows: list[ArrivalTime] = []
+        for index in range(50):
+            observation = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=14 * index)
+            observation_ns = int(observation.timestamp() * 1_000_000_000)
+            site_rows.append(
+                ArrivalTime(
+                    arrival_time_id=stable_identifier(
+                        "arr",
+                        [
+                            site.study_site_id,
+                            str(observation_ns),
+                            "spring_proxy",
+                            "fastest_rising",
+                            config.design_version,
+                        ],
+                    ),
+                    study_site_id=site.study_site_id,
+                    time_utc_ns=observation_ns,
+                    year=observation.year,
+                    season=season_by_month[observation.month],
+                    tide_class="spring_proxy",
+                    phase_or_event="fastest_rising",
+                    metadata={"synthetic_fixture_rank": index},
+                )
+            )
+        observation_by_site[site.study_site_id] = site_rows
+
+    transformed_by_site = input_derivation_module._apply_bed_residence_sampling_by_site(
+        observation_by_site,
+        bed_residence=bed,
+        design_version=config.design_version,
+    )
+    expected_age_vector = input_derivation_module.sample_bed_residence_age_hours(
+        maximum_age_days=bed.maximum_age_days,
+        sample_count=bed.sample_count_per_site,
+        seed=bed.sampling_seed,
+    )
+    assert transformed_by_site is not observation_by_site
+    assert set(transformed_by_site) == {site.study_site_id for site in config.study_sites}
+    for deposition_rows in transformed_by_site.values():
+        assert len(deposition_rows) == 50
+        assert all(row.time_utc_ns == row.metadata["deposition_time_utc_ns"] for row in deposition_rows)
+        ordered = sorted(
+            deposition_rows,
+            key=lambda row: (
+                row.metadata["observation_time_utc_ns"],
+                row.metadata["observation_arrival_time_id"],
+            ),
+        )
+        assert tuple(row.metadata["bed_residence_age_hours"] for row in ordered) == expected_age_vector
+        assert all(
+            row.metadata["observation_time_utc_ns"] - row.time_utc_ns
+            == row.metadata["bed_residence_age_hours"] * 3_600_000_000_000
+            for row in deposition_rows
+        )
 
 
 def test_v3_runtime_support_inventory_and_binding_reject_tamper(

@@ -118,7 +118,7 @@ def _aggregate_spec() -> AggregateSpec:
         bootstrap_replicates=1,
         bootstrap_confidence_level=0.95,
         bootstrap_seed=0,
-        denominator_policy="exclude_data_gap_and_numerical_failure_v1",
+        denominator_policy="exclude_data_gap_numerical_failure_and_pre_window_deposition_v1",
         source_sha256="a" * 64,
         canonical_sha256="b" * 64,
     )

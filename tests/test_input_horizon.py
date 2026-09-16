@@ -17,8 +17,12 @@ import pytest
 
 import lagrangian_backtracking.input_derivation as input_derivation_module
 from lagrangian_backtracking.input_horizon import (
+    BED_RESIDENCE_HORIZON_METHOD_ID,
+    BED_RESIDENCE_HORIZON_POLICY_ID,
+    BED_RESIDENCE_INPUT_SCHEMA_VERSION,
     GENERIC_HORIZON_METHOD_ID,
     GENERIC_HORIZON_POLICY_ID,
+    LEGACY_INPUT_SCHEMA_VERSION,
     HorizonContractError,
     build_horizon_window,
     compute_horizon_coverage,
@@ -116,6 +120,7 @@ def _generic_payloads(*, gap: bool = False) -> tuple[dict, dict, dict]:
         "missing_utc": [utc_string(value) for value in coverage.missing_time_ns],
     }
     gap_payload = {
+        "schema_version": LEGACY_INPUT_SCHEMA_VERSION,
         "policy": GENERIC_HORIZON_POLICY_ID,
         "max_backtrack_days": 7,
         "support_days": 7,
@@ -248,6 +253,160 @@ def test_generic_validator_strict_rejects_real_gap_and_checks_identity() -> None
     gap["records"][0]["study_site_id"] = "other-site"
     identity_result = validate_generic_gap_payload(gap, arrival, inventory, strict=False)
     assert any("site_region_mismatch" in error for error in identity_result.errors)
+
+
+def test_bed_residence_gap_evidence_separates_180_day_selection_from_90_day_runtime() -> None:
+    """觀測選時以 180 日重算，沉底後逐筆運算支援則獨立驗證 90 日。"""
+
+    expected_start = _utc_ns("2024-01-01T00:00:00Z")
+    expected_end = _utc_ns("2025-12-31T23:00:00Z")
+    observation_ns = _utc_ns("2024-10-01T00:00:00Z")
+    deposition_ns = _utc_ns("2024-07-03T00:00:00Z")
+    inventory = {
+        "expected_period": {
+            "start_utc": utc_string(expected_start),
+            "end_utc": utc_string(expected_end),
+            "hourly_step_count": 17_544,
+        },
+        "products": [
+            {
+                "analysis_region_id": "C",
+                "flow_domain_id": "flow-c",
+                "product": "ocm_native",
+                "canonical_time": {
+                    "canonical_time_count": 17_544,
+                    "time_start_utc": utc_string(expected_start),
+                    "time_end_utc": utc_string(expected_end),
+                    "expected_timestep_hours": 1.0,
+                    "gaps": [],
+                },
+            }
+        ],
+    }
+    inputs = SimpleNamespace(
+        backtrack_support_days=180,
+        model_fields_set={"backtrack_support_days"},
+        years=[2024, 2025],
+        time_axis_contract={"expected_timestep_hours": 1.0},
+    )
+    bed = SimpleNamespace(maximum_age_days=90, runtime_horizon_support_days=90)
+    config = SimpleNamespace(
+        inputs=inputs,
+        boundaries=SimpleNamespace(max_backtrack_days=90.0),
+        scenarios=SimpleNamespace(bed_residence_time=bed),
+        study_sites=[SimpleNamespace(study_site_id="houwan", analysis_region_id="C")],
+    )
+    runtime_window = build_horizon_window(
+        deposition_ns,
+        90,
+        expected_start_ns=expected_start,
+        expected_end_ns=expected_end,
+    )
+    runtime_coverage = compute_horizon_coverage(
+        runtime_window,
+        expected_start_ns=expected_start,
+        expected_end_ns=expected_end,
+        canonical_start_ns=expected_start,
+        canonical_end_ns=expected_end,
+    )
+    selection_window = build_horizon_window(
+        observation_ns,
+        180,
+        expected_start_ns=expected_start,
+        expected_end_ns=expected_end,
+    )
+    selection_coverage = compute_horizon_coverage(
+        selection_window,
+        expected_start_ns=expected_start,
+        expected_end_ns=expected_end,
+        canonical_start_ns=expected_start,
+        canonical_end_ns=expected_end,
+    )
+    arrival_payload = {
+        "records": [
+            {
+                "arrival_time_id": "bed-arrival-1",
+                "study_site_id": "houwan",
+                "analysis_region_id": "C",
+                "time_utc_ns": deposition_ns,
+                "metadata": {"observation_time_utc_ns": observation_ns},
+            }
+        ]
+    }
+    gap_row = {
+        "arrival_time_id": "bed-arrival-1",
+        "study_site_id": "houwan",
+        "analysis_region_id": "C",
+        "flow_domain_id": "flow-c",
+        "arrival_time_utc": utc_string(deposition_ns),
+        "horizon_start_utc": utc_string(runtime_window.start_time_ns),
+        "horizon_end_utc": utc_string(deposition_ns),
+        "max_backtrack_days": 90,
+        "support_days": 90,
+        "expected_step_count": runtime_window.expected_step_count,
+        "supported_step_count": runtime_coverage.supported_step_count,
+        "crossed_gap": False,
+        "missing_utc": [],
+        "time_support_policy": BED_RESIDENCE_HORIZON_POLICY_ID,
+        "observation_time_utc": utc_string(observation_ns),
+        "selection_horizon_start_utc": utc_string(selection_window.start_time_ns),
+        "selection_horizon_end_utc": utc_string(observation_ns),
+        "selection_support_days": 180,
+        "selection_expected_step_count": selection_window.expected_step_count,
+        "selection_supported_step_count": selection_coverage.supported_step_count,
+        "selection_crossed_gap": False,
+        "selection_missing_utc": [],
+    }
+    gap_payload = {
+        "schema_version": BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+        "policy": BED_RESIDENCE_HORIZON_POLICY_ID,
+        "max_backtrack_days": 90,
+        "support_days": 90,
+        "selection_support_days": 180,
+        "runtime_support_days": 90,
+        "provenance": {"method_id": BED_RESIDENCE_HORIZON_METHOD_ID},
+        "records": [gap_row],
+    }
+
+    result = validate_generic_gap_payload(
+        gap_payload, arrival_payload, inventory, config=config, strict=True
+    )
+    assert result.valid is True
+    assert result.summary["selection_support_days"] == 180
+    assert result.summary["runtime_support_days"] == 90
+
+    legacy_schema_payload = dict(gap_payload)
+    legacy_schema_payload["schema_version"] = LEGACY_INPUT_SCHEMA_VERSION
+    legacy_schema_result = validate_generic_gap_payload(
+        legacy_schema_payload, arrival_payload, inventory, config=config, strict=True
+    )
+    assert any("schema_version_invalid" in error for error in legacy_schema_result.errors)
+
+    tampered = dict(gap_payload)
+    tampered["selection_support_days"] = 90
+    selection_result = validate_generic_gap_payload(
+        tampered, arrival_payload, inventory, config=config, strict=True
+    )
+    assert selection_result.valid is False
+    assert any("selection_support_config_mismatch" in error for error in selection_result.errors)
+
+    tampered = dict(gap_payload)
+    tampered["runtime_support_days"] = 60
+    runtime_result = validate_generic_gap_payload(
+        tampered, arrival_payload, inventory, config=config, strict=True
+    )
+    assert runtime_result.valid is False
+    assert any("runtime_support" in error for error in runtime_result.errors)
+
+
+def test_gap_schema_version_rejects_bed_version_for_legacy_config() -> None:
+    """舊設定只接受 1.0.0 gap 文件，不能載入 bed-only 1.1.0 欄位集合。"""
+
+    arrival, gap, inventory = _generic_payloads(gap=True)
+    gap["schema_version"] = BED_RESIDENCE_INPUT_SCHEMA_VERSION
+    result = validate_generic_gap_payload(gap, arrival, inventory, strict=True)
+    assert result.valid is False
+    assert any("schema_version_invalid" in error for error in result.errors)
 
 
 def test_resolve_horizon_preserves_legacy_when_support_is_none() -> None:

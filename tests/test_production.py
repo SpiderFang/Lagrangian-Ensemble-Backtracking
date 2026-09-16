@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 
 from shapely.geometry import box
 
@@ -180,6 +181,78 @@ def test_early_stops_compact_and_scatter_to_original_particle_identity() -> None
     assert results[1].final_state.status == ParticleStatus.MAX_AGE
     assert results[2].final_state.status == ParticleStatus.MAX_AGE
     assert batch.particle_batch.to_particle_states() == [result.final_state for result in results]
+
+
+def test_pre_window_production_batch_outputs_terminal_results_without_forcing_or_rng_use() -> None:
+    """ProductionBatch 保留 pre-window terminal 結果，且不呼叫 provider、sweep 或 RNG。"""
+
+    shard = _shard(scenario_count=1, members_per_scenario=2)
+    velocity_calls: list[tuple[float, float, float, int]] = []
+
+    def request_factory(unit) -> ReferenceParticleRequest:
+        """建立可序列化的 terminal request，provider 僅作意外取樣哨兵。"""
+
+        state = ParticleState(
+            particle_id=unit.particle_id,
+            scenario_id=unit.scenario.scenario_id,
+            member_id=unit.member_id,
+            study_site_id=unit.scenario.study_site_id,
+            analysis_region_id=unit.scenario.analysis_region_id,
+            receptor_id=unit.scenario.receptor_id,
+            x_m=0.0,
+            y_m=0.0,
+            z_m=-10.0,
+            time_utc_ns=unit.scenario.arrival_time_utc_ns,
+            status=ParticleStatus.PRE_WINDOW_DEPOSITION,
+        )
+
+        def forbidden_velocity(
+            x_m: float, y_m: float, z_m: float, time_utc_ns: int
+        ) -> VelocitySample:
+            """記錄若 terminal 粒子被誤送進數值取樣。"""
+
+            velocity_calls.append((x_m, y_m, z_m, time_utc_ns))
+            raise AssertionError("pre-window member 不得取樣 forcing")
+
+        return ReferenceParticleRequest(
+            initial_state=state,
+            velocity=forbidden_velocity,
+            boundaries=_boundaries(),
+            behavior_class="sinking",
+            diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+            settings=_settings(),
+        )
+
+    batch = ProductionBatch(
+        shard,
+        master_seed=20260916,
+        request_factory=request_factory,
+        active_chunk_size=1,
+    )
+    rng_states_before = [
+        deepcopy(runtime.rng.bit_generator.state) for runtime in batch.runtimes
+    ]
+    progress = batch.advance()
+    results = batch.results()
+
+    assert progress.terminal is True
+    assert progress.stepped_particle_count == 0
+    assert progress.sweeps_completed == 0
+    assert progress.active_particle_count == 0
+    assert batch.sweep_count == 0
+    assert velocity_calls == []
+    assert [
+        runtime.rng.bit_generator.state for runtime in batch.runtimes
+    ] == rng_states_before
+    assert len(results) == 2
+    assert all(
+        result.final_state.status is ParticleStatus.PRE_WINDOW_DEPOSITION
+        and result.step_count == 0
+        and len(result.observations) == 1
+        and len(result.events) == 1
+        and result.events[0].fraction == 0.0
+        for result in results
+    )
 
 
 def test_hint_tracking_provider_forwards_and_updates_hint_and_keeps_plain_callable() -> None:

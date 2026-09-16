@@ -582,7 +582,7 @@ def _build_boundary_table(
 
 
 def _status_label(status: str) -> str:
-    """提供圖面用中文狀態名稱，保留 ``deposited`` 的 BED_DEPOSITED 標示。"""
+    """提供圖面用穩定狀態標籤，保留沉積與研究窗前沉底的明確名稱。"""
 
     labels = {
         ParticleStatus.FLOW_DOMAIN_EXIT.value: "FLOW_DOMAIN_OPEN_EXIT",
@@ -593,6 +593,7 @@ def _status_label(status: str) -> str:
         ParticleStatus.DATA_GAP.value: "DATA_GAP",
         ParticleStatus.MAX_AGE.value: "MAX_AGE",
         ParticleStatus.NUMERICAL_FAILURE.value: "NUMERICAL_FAILURE",
+        ParticleStatus.PRE_WINDOW_DEPOSITION.value: "PRE_WINDOW_DEPOSITION",
     }
     return labels.get(status, status)
 
@@ -1029,7 +1030,8 @@ def _caption_document(
         "local boundary 分段與弧長 bin 的入口事件，保存 valid denominator與 kind 內相對比例。"
     )
     outcome_description = (
-        "完整列出 BED_DEPOSITED、DATA_GAP、NUMERICAL_FAILURE、outer exit、MAX_AGE 與其他停止狀態。"
+        "完整列出 BED_DEPOSITED、DATA_GAP、NUMERICAL_FAILURE、PRE_WINDOW_DEPOSITION、"
+        "outer exit、MAX_AGE 與其他停止狀態。"
     )
     transfer_limit = (
         "文獻中的 surface／forward／observed-source 或 source release assumptions "

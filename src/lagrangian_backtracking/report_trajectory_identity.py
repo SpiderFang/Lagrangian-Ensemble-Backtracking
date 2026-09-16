@@ -2,7 +2,8 @@
 
 本模組只處理報告層需要的純 Python identity 資料，不讀取檔案、不重新計算軌跡，也不
 把抽出的代表軌跡解讀成絕對來源機率或因果歸因。核心分層固定為四季與兩種潮差代理；
-成員有效性則沿用事件與 pathway 聚合的分母政策，資料缺口及數值失敗不能進入有效報告
+成員有效性則沿用事件與 pathway 聚合的分母政策，資料缺口、數值失敗及固定日曆窗前已沉底的
+成員不能進入有效報告
 成員。完整 identity 包含 ``ParticleState`` 的六個原生欄位，以及 material、arrival、
 season、tide 四個 report strata 欄位；它們與選樣 seed 及版本化 policy 一起寫入排序後的
 緊湊 JSON，再以 UTF-8 計算 SHA-256，讓不同輸入順序不會改變優先序，同時讓任一 identity
@@ -350,9 +351,9 @@ def is_valid_report_member(result: ParticleResult) -> bool:
             顯示標籤。
 
     Returns:
-        ``False`` 僅代表 ``DATA_GAP`` 或 ``NUMERICAL_FAILURE``，因為這兩種結果不能
-        支持有效 pathway、代表軌跡或材料統計；任何其他非 ``ACTIVE`` 的正式終止狀態
-        都回傳 ``True``。
+        False 代表 DATA_GAP、NUMERICAL_FAILURE 或 PRE_WINDOW_DEPOSITION。資料／數值失敗
+        無法支持有效 pathway；PRE_WINDOW_DEPOSITION 則表示研究窗內沒有漂流歷程。其餘
+        非 ACTIVE 的正式終止狀態回傳 True。
 
     Raises:
         TypeError: 外層結果、final state 或 status 不是 exact 資料契約型別。
@@ -371,6 +372,7 @@ def is_valid_report_member(result: ParticleResult) -> bool:
     return status not in {
         ParticleStatus.DATA_GAP,
         ParticleStatus.NUMERICAL_FAILURE,
+        ParticleStatus.PRE_WINDOW_DEPOSITION,
     }
 
 

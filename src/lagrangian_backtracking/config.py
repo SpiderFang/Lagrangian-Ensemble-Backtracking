@@ -22,6 +22,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 
 from .accelerated import PHYSICS_KERNEL_BACKEND_NUMPY_V1
+from .bed_residence import (
+    BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_SAMPLING_POLICY_ID,
+)
 
 # 這組名稱取自海洋保育署 iOcean 海洋廢棄物管理頁於 2026-08-27 顯示的查詢類別。
 # 常數只用來驗證臺灣情境的分類追溯是否完整；該網站的清除重量與件數不含單體物性，
@@ -320,8 +325,84 @@ class StudySiteConfig(StrictModel):
         return self.flow_domain_id
 
 
+class BedResidenceTimeConfig(StrictModel):
+    """五站共用沉底年齡抽樣與回溯模式切換的嚴格契約。
+
+    此區塊只有在 YAML 明示時才啟用；啟用後所有欄位都必須明確提供，且固定為本期已定
+    案的 90 日、每站 50 個整點小時年齡及既有抽樣 policy。支援的兩種 backtrack mode
+    必須同時登錄，實際執行只由 backtrack_mode 選擇一種。runtime_horizon_support_days
+    可在尚未建立 horizon suite 的 template 設為 null；suite 產生的正式設定須填正整數。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    backtrack_mode: Literal[
+        "fixed_calendar_window",
+        "full_horizon_from_deposition",
+    ]
+    supported_backtrack_modes: tuple[
+        Literal["fixed_calendar_window", "full_horizon_from_deposition"], ...
+    ]
+    maximum_age_days: StrictInt
+    sample_count_per_site: StrictInt
+    sampling_policy: Literal["discrete_hourly_stratified_uniform_v1"]
+    sampling_seed: StrictInt
+    shared_age_offsets_across_sites: StrictBool
+    pre_window_policy: Literal[
+        "record_pre_window_deposition_without_transport"
+    ]
+    runtime_horizon_support_days: StrictInt | None
+
+    @model_validator(mode="after")
+    def validate_bed_residence_contract(self) -> BedResidenceTimeConfig:
+        """拒絕任何未經定案的抽樣範圍、模式清單或 pre-window 處置方式。"""
+
+        required_modes = {
+            BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+            BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+        }
+        if len(self.supported_backtrack_modes) != 2 or set(
+            self.supported_backtrack_modes
+        ) != required_modes:
+            raise ValueError(
+                "scenarios.bed_residence_time.supported_backtrack_modes 必須恰含兩種已定案模式"
+            )
+        if self.backtrack_mode not in self.supported_backtrack_modes:
+            raise ValueError(
+                "scenarios.bed_residence_time.backtrack_mode 必須列於 supported_backtrack_modes"
+            )
+        if self.maximum_age_days != 90:
+            raise ValueError(
+                "scenarios.bed_residence_time.maximum_age_days 必須固定為 90"
+            )
+        if self.sample_count_per_site != 50:
+            raise ValueError(
+                "scenarios.bed_residence_time.sample_count_per_site 必須固定為 50"
+            )
+        if self.sampling_policy != BED_RESIDENCE_SAMPLING_POLICY_ID:
+            raise ValueError(
+                "scenarios.bed_residence_time.sampling_policy 不支援；不得靜默採用其他算法"
+            )
+        if self.sampling_seed < 0:
+            raise ValueError(
+                "scenarios.bed_residence_time.sampling_seed 必須是非負嚴格整數"
+            )
+        if self.shared_age_offsets_across_sites is not True:
+            raise ValueError(
+                "scenarios.bed_residence_time.shared_age_offsets_across_sites 必須為 true"
+            )
+        if (
+            self.runtime_horizon_support_days is not None
+            and self.runtime_horizon_support_days < 1
+        ):
+            raise ValueError(
+                "scenarios.bed_residence_time.runtime_horizon_support_days 必須為正整數或 null"
+            )
+        return self
+
+
 class ScenarioConfig(StrictModel):
-    """五站完整交叉與 member/seed 的不可變計數契約。"""
+    """五站完整交叉、member/seed 與可選沉底時間契約。"""
 
     expected_receptor_count_per_site: int
     expected_receptor_count: int
@@ -337,6 +418,7 @@ class ScenarioConfig(StrictModel):
     members_per_scenario: int | None = None
     master_seed: int | None = None
     seed_policy: str | None = None
+    bed_residence_time: BedResidenceTimeConfig | None = None
 
 
 class ExecutionConfig(StrictModel):
@@ -511,6 +593,16 @@ class ProjectConfig(StrictModel):
             or counts.expected_receptor_count != 100
         ):
             raise ValueError("情境契約必須維持每站 10×20×50、A 區 20,000、全案 50,000")
+        bed_residence = counts.bed_residence_time
+        if (
+            bed_residence is not None
+            and bed_residence.sample_count_per_site
+            != counts.expected_arrival_time_count_per_site
+        ):
+            raise ValueError(
+                "scenarios.bed_residence_time.sample_count_per_site 必須等於 "
+                "expected_arrival_time_count_per_site"
+            )
         _validate_non_rising_material_contract(
             self.physics.get("settling"),
             expected_count=counts.expected_material_count,
@@ -776,6 +868,16 @@ class ProjectConfig(StrictModel):
             # 舊 YAML 保留既有 canonical hash；若 YAML 明示 null，欄位仍會留下來，
             # 讓「尚未具備支援證據」的意圖可被追溯。
             del inputs_payload["backtrack_support_days"]
+        scenarios_payload = payload.get("scenarios")
+        if (
+            isinstance(scenarios_payload, dict)
+            and "bed_residence_time" in scenarios_payload
+            and "bed_residence_time" not in self.scenarios.model_fields_set
+        ):
+            # 舊 YAML 未提供沉底年齡模型時，schema 的 optional None 只是型別完整性預設，
+            # 不能改變舊設定的 canonical config hash 或 checkpoint identity。只有 YAML
+            # 明示此區塊時才將其納入 payload；明示 null 則仍保留 operator 的停用意圖。
+            del scenarios_payload["bed_residence_time"]
         execution_payload = payload.get("execution")
         if (
             isinstance(execution_payload, dict)

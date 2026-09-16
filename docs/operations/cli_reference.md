@@ -108,23 +108,31 @@ uv run lbt release-config-validate "$LBT_SCRATCH_ROOT/release-2024-2025.yaml" \
 constant-field fallback。`release-config-create`、`release-config-validate` 只處理
 immutable input binding；它們不啟動粒子運算。
 
-### horizon suite：一次建立共用母體與多個回溯長度
+### horizon suite：一次建立共同母體與六份 mode release
 
-`horizon-suite-create` 將「最長支援窗的共同輸入」與「各回溯長度的執行設定」綁在同一個
-不可覆寫的目的地。`--backtrack-days` 接受一個以上的正整日數，不是固定選單；suite
-先取最大值，再把它精確寫入 effective `common-config` 的
-`inputs.backtrack_support_days`。例如 30、60、90 的 suite 只執行一次 strict
-`inputs-build`，而且只納入 `[arrival - 90 日, arrival]` inclusive UTC 窗口逐時完整且
-gap-safe 的到達時刻。90 日檢查不通過的 arrival 不得進入共同母體，不能先用較短支援窗
-選入後再把設定標成 90 日。OCM 缺時不得以零值或最近值補齊。
+正式範例啟用每站 50 個隨機沉底年齡，最大 90 日，以 `20260916` seed 在 50 個離散小時 strata
+各抽一值；五站共用完全相同的年齡向量。H30/H60/H90 的共同母體需要 180 日 observation
+selection envelope（H90 + 最大年齡 90），而沉底後的逐筆 runtime support 是 90 日。`inputs-build`
+先用觀測 anchor selector 驗 180 日，再轉為 deposition UTC；receptor 與 OCM dynamic initial
+condition 以 deposition UTC 建立。Gap artifact 會分開保存 `selection_support_days=180` 與
+`runtime_support_days=90`，root/per-deposition runtime `max_backtrack_days` 為 90，不能錯誤要求等於
+selection envelope。bed arrival/gap 與 release binding 使用 schema `1.1.0`；legacy generic 保持
+`1.0.0`，validator 拒絕跨模式載入，artifact index／bindings 的自身 schema 不變。
 
-建立後，suite 由完全相同的 `common-input` 產生 30／60／90 三份 release config。各份
-設定的 `boundaries.max_backtrack_days` 是該次執行長度，
-`boundaries.maximum_step_count` 固定依
-`ceil(days * 86400 / integration.dt_min_seconds) + 1` 設定；`dt_min_seconds` 必須是
-common config 中已核定的有限正值。三份 release 的執行設定 hash 可以不同，但
-site／receptor／arrival／material／initial-condition／scenario 母體與 input artifact
-hash 必須相同，才能支援公平的 horizon 比較。
+兩種 config 模式的意思不同：`fixed_calendar_window` 從固定日曆終點回溯 H 日，若隨機沉底早於該窗，
+實際期間為 H 減沉底年齡；`full_horizon_from_deposition` 則以沉底 UTC 為起點，再向前完整回溯 H 日。
+前者的 pre-window 成員會留下 `pre_window_deposition` outcome，不執行 forcing；仍在 total outcome
+分母計數，但不進 valid denominator 或來源 numerator，也不當作資料／數值失敗。這些統計是條件式來源
+足跡／相對來源權重，不是絕對來源機率。
+
+例如 `--backtrack-days 30 60 90` 時，suite 取 Hmax=90，`common-config` 寫
+`inputs.backtrack_support_days: 180`、`bed_residence_time.runtime_horizon_support_days: 90`、
+`boundaries.max_backtrack_days: 90`，使用同一組 accepted roots **只執行一次** strict `inputs-build`。
+接著產生 H30/H60/H90 × `fixed_calendar_window`／`full_horizon_from_deposition` 六份 release config。
+每份 step budget 依該 H 計算 `ceil(H * 86400 / integration.dt_min_seconds) + 1`；mode、selection/runtime
+support 證據都進 release config hash/binding。六個檔名、validation 路徑與 manifest record 帶有 mode；
+共同 input artifacts 與五站母體 fingerprint 必須完全相同，validator 會重建 exact expected payload 並拒絕
+mode 或 topology tamper。缺少任何必要 180/90 日逐時節點都 fail closed；不能降短、補零或用最近值繞過。
 
 ```bash
 uv run lbt horizon-suite-create \
@@ -152,17 +160,18 @@ accepted roots、strict input derivation、完整結構與 hash 驗證；pilot
 ```text
 <suite>/
 ├── source-template.yaml       # 原始 template 保存
-├── common-config.yaml         # 最大支援窗的 effective config
+├── common-config.yaml         # 180 日 observation selection／90 日 runtime support
 ├── common-input/              # 唯一一次 inputs-build 的 immutable artifacts
-├── release-configs/           # 每個 requested horizon 一份 release YAML
-├── validations/               # common input 與各 release validator JSON
+├── release-configs/           # H30/H60/H90 × 兩種 mode，共六份 release YAML
+├── validations/               # common input 與六份 mode-specific release validator JSON
 ├── horizon-suite-manifest.json        # suite 拓撲、模式、日數與所有來源／artifact hash
 └── horizon-suite-manifest.json.sha256 # manifest bytes 的 SHA-256 binding
 ```
 
 `horizon-suite-validate` 是唯讀入口；它固定讀取 suite 內的 `common-input/`，重新核對
 suite 拓撲、source-template 與 common-config 的來源關係、common-input 的 accepted product
-provenance、90 日 gap-safe 根證據、各 release 的精確步數／日數與共同 artifact hash。省略
+provenance、bed suite 的 1.1.0／legacy suite 的 1.0.0 source schema、180/90 gap-safe 證據、一次
+build、六份 release 的精確步數／日數／mode 與共同 artifact hash。省略
 三個 accepted roots 時只驗 suite 內的 artifact closure，不代表重新核對 accepted source
 bytes 或 canonical UTC axis；正式或移機驗收必須明示三個 roots。不提供外部輸入目錄 override，
 以免破壞 release YAML 的 `../common-input/*` exact path binding。可明示三個 accepted roots：
@@ -180,14 +189,21 @@ uv run lbt horizon-suite-validate \
 驗證失敗時回傳非零狀態，且 create 任一步失敗都不發布成功的 final suite；失敗時保留
 `.partial-*` 現場供人工稽核，不自動遞迴刪除。共享同帳號 SERVER 上，操作員清理前必須先
 確認 process、partial 的目錄擁有者、inode 與 final 狀態，不可採用先 `stat` 再 `unlink` 的
-競態方式；`.partial-*` 不能當作成功。即使三份 config 與 manifest 均有效，也只保證共同設計
-母體與執行設定可比較，不保證每粒子走滿 90 日；粒子仍可能因海岸、域外、資料缺口或數值
+競態方式；`.partial-*` 不能當作成功。即使六份 config 與 manifest 均有效，也只保證共同設計
+母體與執行設定可比較，不保證每粒子走滿指定 H；粒子仍可能因海岸、域外、資料缺口或數值
 狀態停止。正式輸入限 OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3 schema
 1 `nww3_analysis`，禁止 raw NetCDF、transfer archive、零值與最近值補齊。
 
-### 同一套輸入產生不同回溯長度（手動模式）
+**資料可行性限制：** 範例仍為 `design_pending` template，180/90 是必須驗證的支援契約，不是
+accepted forcing 已通過的聲明，也不是 approved release 或 SERVER 實測。若 OCM forcing 實際從
+2024-01-01 才開始，2024 年早季的 48+2 strata 無法回看完整 180 日，strict build 會拒絕。後續須由
+PI／資料證據決定補足至少 2023 前置 forcing，或另立版本化 observation 母體；本次不自行選擇其中方案。
 
-在建置用完整 YAML 明示 `inputs.backtrack_support_days`，例如 30，先以此支援窗
+### 同一套 legacy generic 輸入產生不同回溯長度（手動模式）
+
+本節只適用於未啟用 `scenarios.bed_residence_time` 的 legacy generic config。random bed
+residence release 必須保留 mode 與 180/90 evidence，請使用上一節 `horizon-suite-create`，不可
+把兩者混用。在 legacy config 中明示 `inputs.backtrack_support_days`，例如 30，先以此支援窗
 完成上面的 `inputs-build` 與 `inputs-validate`。接著可重用同一目錄產生不同回溯長度；
 以下變數須指向已驗證的共同母體、同一研究版本的完整模板及已核定的步數預算：
 

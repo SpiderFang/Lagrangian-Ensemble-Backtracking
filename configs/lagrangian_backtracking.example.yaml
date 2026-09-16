@@ -18,6 +18,10 @@ inputs:
   ocm_surface_root_env: OCM_SURFACE_ROOT
   nww_analysis_root_env: NWW_ANALYSIS_ROOT
   years: [2024, 2025]
+  # H90 加最長 90 日沉底年齡需要 180 日 observation 選時包絡；設定值本身不是資料證據。
+  # 本範例仍為 design_pending：若 accepted forcing 從 2024-01-01 才開始，2024 的部分
+  # season strata 不可能具備完整 180 日前置支援，strict input-build 必須拒絕，不可補值。
+  backtrack_support_days: 180
 
   # 研究團隊已裁決：現有 OCM/NWW 是可取得的全部正式資料，供應者不可考，不能把
   # provider 補件或 metadata 確認列為 blocker。正式成果名稱必須寫成「2024–2025
@@ -524,6 +528,22 @@ boundaries:
     expanded_domain: [A]
 
 scenarios:
+  # 正式樣板啟用可重現的隨機沉底年齡；horizon-suite 以同一組 50 個年齡套用五站，
+  # 一次建立母體，再為 H30/H60/H90 × 兩種回溯模式登錄六份 release。
+  bed_residence_time:
+    backtrack_mode: fixed_calendar_window
+    supported_backtrack_modes:
+      - fixed_calendar_window
+      - full_horizon_from_deposition
+    maximum_age_days: 90
+    sample_count_per_site: 50
+    sampling_policy: discrete_hourly_stratified_uniform_v1
+    sampling_seed: 20260916
+    shared_age_offsets_across_sites: true
+    pre_window_policy: record_pre_window_deposition_without_transport
+    # horizon-suite 會填入該 suite 最大 H；共同輸入支援窗另為最大 H + maximum_age_days。
+    # template 的 null 代表尚未建立 release，不代表 runtime 可任意超界或資料已通過。
+    runtime_horizon_support_days: null
   receptor_manifest: null
   # 五個站點各以 5 個 deterministic maximin 水平位置 × 4 個垂向層位形成 20 個
   # 三維 receptors；貢寮／龜山島各有完整 20 個，不在 A 區內分配或共用。

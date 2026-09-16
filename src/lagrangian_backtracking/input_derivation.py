@@ -45,6 +45,12 @@ from shapely.geometry import LineString, Point, Polygon, mapping, shape
 from shapely.ops import unary_union
 
 from .arrival_times import select_arrival_times
+from .bed_residence import (
+    BED_RESIDENCE_POLICY_ID,
+    BED_RESIDENCE_SAMPLING_POLICY_ID,
+    apply_bed_residence_sampling,
+    sample_bed_residence_age_hours,
+)
 from .config import (
     FORMAL_DOMAIN_POLICY_EXPANDED_V1,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
@@ -52,6 +58,7 @@ from .config import (
     NORTHEAST_V3_BBOX_LON_LAT,
     NORTHEAST_V3_FLOW_DOMAIN_ID,
     RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1,
+    BedResidenceTimeConfig,
     DomainConfig,
     ProjectConfig,
     StudySiteConfig,
@@ -60,8 +67,12 @@ from .config import (
 )
 from .geometry import DomainProjection, build_anchor_local_domain, densified_bbox_polygon
 from .input_horizon import (
+    BED_RESIDENCE_HORIZON_METHOD_ID,
+    BED_RESIDENCE_HORIZON_POLICY_ID,
+    BED_RESIDENCE_INPUT_SCHEMA_VERSION,
     GENERIC_HORIZON_METHOD_ID,
     GENERIC_HORIZON_POLICY_ID,
+    LEGACY_INPUT_SCHEMA_VERSION,
     HorizonContractError,
     HorizonSettings,
     build_horizon_window,
@@ -88,8 +99,8 @@ from .receptors import (
 from .scenarios import BASELINE_BEHAVIORS, ArrivalTime, Receptor, stable_identifier
 from .time_axis import CanonicalTimeAxis, TimeChunk, canonicalize_time_chunks
 
-DERIVED_INPUT_SCHEMA_VERSION = "1.0.0"
-"""Slice 1 衍生輸入文件的固定 schema 版本。"""
+DERIVED_INPUT_SCHEMA_VERSION = LEGACY_INPUT_SCHEMA_VERSION
+"""未啟用隨機沉底時的 Slice 1 衍生輸入 schema；bed 文件版本另由 input_horizon 定義。"""
 
 DEFAULT_MAX_BACKTRACK_DAYS = 7
 """缺時安全基線的完整 backward horizon；單位為日。"""
@@ -4346,8 +4357,15 @@ def _arrival_payload(
     arrival strata loader 會因 pilot-only 非潮汐標籤明確拒絕升格。
     """
 
+    bed_config = config.scenarios.bed_residence_time
     method_id = (
-        PILOT_ARRIVAL_SELECTION_METHOD_ID if pilot_selection is not None else ARRIVAL_SELECTION_METHOD_ID
+        PILOT_ARRIVAL_SELECTION_METHOD_ID
+        if pilot_selection is not None
+        else (
+            "server_v3_48_strata_plus_two_observation_anchors_then_random_deposition_v1"
+            if bed_config is not None
+            else ARRIVAL_SELECTION_METHOD_ID
+        )
     )
     provenance_extra: dict[str, Any] = {
         "counts": {"study_sites": EXPECTED_STUDY_SITE_COUNT, "arrivals": len(arrivals)},
@@ -4365,9 +4383,34 @@ def _arrival_payload(
             "support_days": horizon_settings.support_days,
             "requested_max_backtrack_days": horizon_settings.requested_days,
         }
+    if bed_config is not None:
+        if horizon_settings is None or not horizon_settings.bed_residence_enabled:
+            raise InputDerivationError("bed residence arrival manifest 缺少共同 horizon 設定")
+        offsets = sample_bed_residence_age_hours(
+            maximum_age_days=bed_config.maximum_age_days,
+            sample_count=bed_config.sample_count_per_site,
+            seed=bed_config.sampling_seed,
+        )
+        provenance_extra["bed_residence_sampling"] = {
+            "policy_id": BED_RESIDENCE_POLICY_ID,
+            "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+            "maximum_age_days": bed_config.maximum_age_days,
+            "sample_count_per_site": bed_config.sample_count_per_site,
+            "sampling_seed": bed_config.sampling_seed,
+            "shared_age_offsets_across_sites": bed_config.shared_age_offsets_across_sites,
+            "age_offsets_hours_sha256": sha256(canonical_json_bytes(list(offsets))).hexdigest(),
+            "selection_support_days": horizon_settings.selection_support_days,
+            "runtime_support_days": horizon_settings.runtime_support_days,
+            "pre_window_policy": bed_config.pre_window_policy,
+            "observation_anchor_selection_method_id": ARRIVAL_SELECTION_METHOD_ID,
+        }
     return {
         "manifest_kind": "arrival_time_manifest",
-        "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
+        "schema_version": (
+            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if bed_config is not None
+            else DERIVED_INPUT_SCHEMA_VERSION
+        ),
         "status": "approved" if strict else "generated",
         "design_version": config.design_version,
         "time_standard": "UTC",
@@ -4414,16 +4457,22 @@ def _gap_safe_payload(
         # gap manifest 自己宣稱的 missing 清單。
         if overrides or pilot_selection is not None:
             raise InputDerivationError("generic shared horizon 不得混入 pilot arrival window")
-        support_days = horizon_settings.support_days
+        support_days = (
+            horizon_settings.runtime_support_days
+            if horizon_settings.bed_residence_enabled
+            else horizon_settings.support_days
+        )
         if support_days is None:
-            raise InputDerivationError("generic shared horizon 缺少正整日 support_days")
+            raise InputDerivationError("generic shared horizon 缺少 runtime 正整日支援")
         if not math.isclose(
-            float(max_backtrack_days),
-            float(support_days),
-            rel_tol=0.0,
-            abs_tol=1.0e-12,
+            float(max_backtrack_days), float(support_days), rel_tol=0.0, abs_tol=1.0e-12
         ):
-            raise InputDerivationError("generic shared horizon 的 max_backtrack_days 必須等於 support_days")
+            raise InputDerivationError(
+                "generic shared horizon 的 max_backtrack_days 必須等於 runtime support_days"
+            )
+        selection_support_days = horizon_settings.selection_support_days
+        if selection_support_days is None:
+            raise InputDerivationError("generic shared horizon 缺少 selection support")
         expected_start_ns = int(expected_axis[0])
         expected_end_ns = int(expected_axis[-1])
         site_region = {site.study_site_id: site.analysis_region_id for site in config.study_sites}
@@ -4450,17 +4499,38 @@ def _gap_safe_payload(
                     canonical_end_ns=int(product.canonical.time_utc_ns[-1]),
                     canonical_gaps=product.canonical.gaps,
                 )
+                selection_window = None
+                selection_coverage = None
+                if horizon_settings.bed_residence_enabled:
+                    observation_ns = arrival.metadata.get("observation_time_utc_ns")
+                    selection_window = build_horizon_window(
+                        observation_ns,
+                        selection_support_days,
+                        expected_start_ns=expected_start_ns,
+                        expected_end_ns=expected_end_ns,
+                        context=f"observation[{arrival.arrival_time_id}]",
+                    )
+                    selection_coverage = compute_horizon_coverage(
+                        selection_window,
+                        expected_start_ns=expected_start_ns,
+                        expected_end_ns=expected_end_ns,
+                        canonical_start_ns=int(product.canonical.time_utc_ns[0]),
+                        canonical_end_ns=int(product.canonical.time_utc_ns[-1]),
+                        canonical_gaps=product.canonical.gaps,
+                    )
             except (HorizonContractError, IndexError, ValueError) as exc:
                 raise InputDerivationError(
                     f"generic shared horizon 無法建立 {arrival.arrival_time_id} 的 support window：{exc}"
                 ) from exc
-            if coverage.crossed_gap and strict:
+            if (
+                coverage.crossed_gap
+                or (selection_coverage is not None and selection_coverage.crossed_gap)
+            ) and strict:
                 raise InputDerivationError(
-                    f"generic shared horizon 遇到未支援節點：{arrival.arrival_time_id}"
+                    f"generic shared/runtime horizon 遇到未支援節點：{arrival.arrival_time_id}"
                 )
             missing = coverage.missing_time_ns
-            records.append(
-                {
+            record = {
                     "arrival_time_id": arrival.arrival_time_id,
                     "study_site_id": arrival.study_site_id,
                     "analysis_region_id": region,
@@ -4474,26 +4544,65 @@ def _gap_safe_payload(
                     "supported_step_count": coverage.supported_step_count,
                     "crossed_gap": coverage.crossed_gap,
                     "missing_utc": [_utc_string(value) for value in missing],
-                    "time_support_policy": GENERIC_HORIZON_POLICY_ID,
+                    "time_support_policy": (
+                        BED_RESIDENCE_HORIZON_POLICY_ID
+                        if horizon_settings.bed_residence_enabled
+                        else GENERIC_HORIZON_POLICY_ID
+                    ),
                 }
-            )
+            if horizon_settings.bed_residence_enabled:
+                assert selection_window is not None and selection_coverage is not None
+                record.update(
+                    {
+                        "observation_time_utc": _utc_string(selection_window.arrival_time_ns),
+                        "selection_horizon_start_utc": _utc_string(selection_window.start_time_ns),
+                        "selection_horizon_end_utc": _utc_string(selection_window.end_time_ns),
+                        "selection_support_days": int(selection_support_days),
+                        "selection_expected_step_count": selection_window.expected_step_count,
+                        "selection_supported_step_count": selection_coverage.supported_step_count,
+                        "selection_crossed_gap": selection_coverage.crossed_gap,
+                        "selection_missing_utc": [
+                            _utc_string(value) for value in selection_coverage.missing_time_ns
+                        ],
+                    }
+                )
+            records.append(record)
+        crossed_any = any(
+            item["crossed_gap"]
+            or item.get("selection_crossed_gap", False)
+            for item in records
+        )
         status = (
             "generated"
-            if any(item["crossed_gap"] for item in records)
+            if crossed_any
             else ("approved" if strict else "generated")
         )
-        return {
+        policy_id = (
+            BED_RESIDENCE_HORIZON_POLICY_ID
+            if horizon_settings.bed_residence_enabled
+            else GENERIC_HORIZON_POLICY_ID
+        )
+        method_id = (
+            BED_RESIDENCE_HORIZON_METHOD_ID
+            if horizon_settings.bed_residence_enabled
+            else GENERIC_HORIZON_METHOD_ID
+        )
+        root_payload: dict[str, Any] = {
             "manifest_kind": "ocm_gap_safe_arrival_horizon_manifest",
-            "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
+            "schema_version": (
+                BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                if horizon_settings.bed_residence_enabled
+                else DERIVED_INPUT_SCHEMA_VERSION
+            ),
             "status": status,
             "design_version": config.design_version,
             "time_standard": "UTC",
-            "policy": GENERIC_HORIZON_POLICY_ID,
+            "policy": policy_id,
             "max_backtrack_days": int(support_days),
             "support_days": int(support_days),
             "requested_max_backtrack_days": horizon_settings.requested_days,
             "provenance": _provenance(
-                method_id=GENERIC_HORIZON_METHOD_ID,
+                method_id=method_id,
                 source_hashes=source_hashes,
                 expected_time_count=int(expected_axis.size),
                 support_days=int(support_days),
@@ -4502,6 +4611,19 @@ def _gap_safe_payload(
             ),
             "records": records,
         }
+        if horizon_settings.bed_residence_enabled:
+            root_payload["selection_support_days"] = int(selection_support_days)
+            root_payload["runtime_support_days"] = int(support_days)
+            root_payload["provenance"].update(
+                {
+                    "selection_support_days": int(selection_support_days),
+                    "runtime_support_days": int(support_days),
+                    "selection_anchor": "observation_time_utc_ns",
+                    "runtime_anchor": "deposition_time_utc_ns",
+                    "age_sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+                }
+            )
+        return root_payload
 
     def horizon_steps_for(value: float) -> int:
         """把日數轉成正整數逐時步數，拒絕半日或非有限輸入。"""
@@ -5077,6 +5199,46 @@ def _resolve_flow_product_id(config: ProjectConfig, region: str, root: Path, *, 
     return expected
 
 
+def _apply_bed_residence_sampling_by_site(
+    arrivals_by_site: Mapping[str, Sequence[ArrivalTime]],
+    *,
+    bed_residence: BedResidenceTimeConfig,
+    design_version: str,
+) -> dict[str, list[ArrivalTime]]:
+    """把五站 observation anchors 轉為 deposition UTC，回傳供後續 builder 共用的新 mapping。
+
+    每個 mapping value 必須是一站恰好 50 筆的 ArrivalTime；此函式只在 A 區 paired UTC
+    已完成後呼叫。抽樣器只產生一次共用的 50 個整點小時 age vector，再依站點逐一套用，
+    因而保留各站 identity 並讓同一 observation 時序使用同一組沉底年齡。回傳值會取代
+    builder 後續使用的 arrivals_by_site，故 receptor 選點、dynamic OCM 初始條件、arrival
+    manifest 與 gap evidence 都以沉底時刻為 runtime 起點；本函式不宣稱 forcing 已通過
+    180/90 日 window，該證據仍由 selector 和 gap validator 建立。
+    """
+
+    age_offsets = sample_bed_residence_age_hours(
+        maximum_age_days=bed_residence.maximum_age_days,
+        sample_count=bed_residence.sample_count_per_site,
+        seed=bed_residence.sampling_seed,
+    )
+    transformed: dict[str, list[ArrivalTime]] = {}
+    for site_id in sorted(arrivals_by_site):
+        site_arrivals = tuple(arrivals_by_site[site_id])
+        if any(arrival.study_site_id != site_id for arrival in site_arrivals):
+            raise InputDerivationError(
+                f"bed-residence site mapping key mismatch: {site_id}"
+            )
+        transformed[site_id] = list(
+            apply_bed_residence_sampling(
+                site_arrivals,
+                age_hours=age_offsets,
+                sampling_seed=bed_residence.sampling_seed,
+                maximum_age_days=bed_residence.maximum_age_days,
+                design_version=design_version,
+            )
+        )
+    return transformed
+
+
 def build_input_derivatives(
     *,
     config_path: str | Path,
@@ -5124,6 +5286,15 @@ def build_input_derivatives(
     if horizon_settings.is_generic and pilot_arrivals:
         raise InputDerivationError(
             "generic shared horizon 不得同時使用 pilot_arrival_utc；請以同一母體選取 arrival"
+        )
+    bed_residence = config.scenarios.bed_residence_time
+    if bed_residence is not None and not horizon_settings.bed_residence_enabled:
+        raise InputDerivationError(
+            "bed residence config 必須明示 inputs.backtrack_support_days 才能建立共同包絡"
+        )
+    if bed_residence is not None and pilot_arrivals:
+        raise InputDerivationError(
+            "random bed-residence formal population 不得混入 explicit pilot arrival replacement"
         )
     # 先在任何 forcing root 讀取前鎖定研究範圍與 source binding；新 v3 policy 可用
     # ``formal=False, strict=True`` 產生準備性 geometry/input，但不能因目錄中另有 v4
@@ -5369,6 +5540,29 @@ def build_input_derivatives(
     all_arrivals = tuple(item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site])
     if len(all_arrivals) != EXPECTED_ARRIVAL_COUNT:
         raise InputDerivationError(f"arrival 應有 250 筆，實際 {len(all_arrivals)}")
+    if bed_residence is not None:
+        # 五站先各完成 50 筆 observation-anchor selector，A 區的 paired UTC 也已定案；
+        # 現在才依單一 seed 產生共用的 50 個整點沉底年齡，並把 runtime 起點轉為沉底 UTC。
+        # 這個位置刻意早於 receptor 與 receptor×arrival dynamic 初始條件建置，使後續
+        # OCM/NWW 驗證、實際水深與初始粒子時刻都引用同一個沉底時次。
+        try:
+            # helper 逐站傳入一樣的年齡向量，並以回傳 mapping 完整取代 observation
+            # rows；後續 receptor/dynamic、arrival manifest 與 gap gate 因而共同使用
+            # deposition UTC，不會只有 all_arrivals 改了、站點 mapping 卻仍留觀測時刻。
+            arrivals_by_site = _apply_bed_residence_sampling_by_site(
+                arrivals_by_site,
+                bed_residence=bed_residence,
+                design_version=config.design_version,
+            )
+            all_arrivals = tuple(
+                item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site]
+            )
+        except Exception as exc:
+            raise InputDerivationError(
+                f"random bed-residence observation-to-deposition transformation failed: {type(exc).__name__}"
+            ) from exc
+        if len(all_arrivals) != EXPECTED_ARRIVAL_COUNT:
+            raise InputDerivationError("bed-residence 轉換不得改變正式 250 筆 arrival 母體")
     pilot_selection = _pilot_selection_summary(all_arrivals)
     if pilot_selection is None:
         pilot_horizon_overrides: dict[str, float] = {}
@@ -5433,7 +5627,11 @@ def build_input_derivatives(
         native_mesh_bindings=native_mesh_bindings,
         vertical_support_cache=vertical_support_cache,
     )
-    max_days = horizon_settings.selection_days
+    max_days = (
+        float(horizon_settings.runtime_support_days)
+        if horizon_settings.bed_residence_enabled and horizon_settings.runtime_support_days is not None
+        else horizon_settings.selection_days
+    )
     gap_payload = _gap_safe_payload(
         config=config,
         ocm_by_region=ocm_by_region,
@@ -6603,17 +6801,16 @@ def _release_support_evidence(
     input_root: Path,
     *,
     source_config: ProjectConfig,
+    release_config: ProjectConfig,
     requested_days: float | None,
 ) -> dict[str, Any]:
     """讀取小型 release artifact 證據，確認母體 hash 與支援窗沒有被偷換。
 
-    這個檢查只讀 ``artifact_index.json`` 與 gap-safe component，
-    不開啟 OCM/NWW 大型陣列。明示 ``backtrack_support_days`` 時，artifact index
-    必須保留可格式驗證的來源 config hash，且 gap 根節點必須與該支援窗 exact 相同；
-    實際 component／每筆 arrival 的完整性仍交由共用 ``validate_input_derivatives``
-    驗證。因此「YAML 宣告 30 日」不能單獨取代 30 日母體證據。未明示新欄位的舊
-    設定沿用原有寬鬆流程；回傳摘要只會寫入 release binding，供之後 validator 再次
-    比對，不會修改任何來源檔案。
+    這個檢查只讀 ``artifact_index.json`` 與 gap-safe component，不開啟 OCM/NWW 大型陣列。
+    一般共同母體要求 gap root 與 selection support 相同；bed-residence 母體則明確分開
+    observation selection envelope 與逐沉底時刻 runtime support。實際 component／每筆
+    arrival 的完整性仍交由共用 validator 驗證。未明示新版欄位的 legacy config 保留舊契約；
+    回傳摘要只寫入 release binding，不修改來源檔案。
     """
 
     index, _ = read_canonical_json(input_root / "artifact_index.json")
@@ -6637,17 +6834,43 @@ def _release_support_evidence(
         raise InputDerivationError("gap-safe artifact max_backtrack_days 必須是有限正數")
 
     support_days = source_config.inputs.backtrack_support_days if support_declared else None
-    if support_days is not None and not math.isclose(
-        root_days, float(support_days), rel_tol=0.0, abs_tol=1e-12
-    ):
-        raise InputDerivationError("gap-safe artifact 的母體支援日數與 source config 宣告不一致")
-    if support_declared and requested_days is not None and requested_days > root_days:
-        raise InputDerivationError("release config requested max_backtrack_days 超過 gap-safe 母體支援窗")
+    bed = release_config.scenarios.bed_residence_time
+    if bed is None:
+        if support_days is not None and not math.isclose(
+            root_days, float(support_days), rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise InputDerivationError("gap-safe artifact 的母體支援日數與 source config 宣告不一致")
+        if support_declared and requested_days is not None and requested_days > root_days:
+            raise InputDerivationError("release config requested max_backtrack_days 超過 gap-safe 母體支援窗")
+    else:
+        runtime_days = bed.runtime_horizon_support_days
+        if runtime_days is None:
+            runtime_days = (
+                int(requested_days)
+                if requested_days is not None and requested_days.is_integer()
+                else None
+            )
+        artifact_selection = gap.get("selection_support_days")
+        artifact_runtime = gap.get("runtime_support_days")
+        if (
+            support_days is None
+            or type(artifact_selection) is not int
+            or artifact_selection != support_days
+            or type(runtime_days) is not int
+            or type(artifact_runtime) is not int
+            or artifact_runtime != runtime_days
+            or not math.isclose(root_days, float(runtime_days), rel_tol=0.0, abs_tol=1e-12)
+        ):
+            raise InputDerivationError(
+                "bed-residence gap artifact 的 selection/runtime support 與共同 config 不一致"
+            )
+        if requested_days is not None and requested_days > runtime_days:
+            raise InputDerivationError("release requested horizon 超過 bed-residence runtime support")
 
     records = gap.get("records")
     if not isinstance(records, list) or not records:
         raise InputDerivationError("gap-safe artifact 缺少 arrival records，不能證明母體支援窗")
-    return {
+    evidence = {
         # 這裡保存 artifact 建置時的來源 hash；它是 provenance，不要求等於後續
         # 補齊 dt／members／step 等執行參數後的 release config hash。
         "source_config_hash": source_hash,
@@ -6655,6 +6878,24 @@ def _release_support_evidence(
         "artifact_backtrack_support_days": root_days,
         "requested_max_backtrack_days": requested_days,
     }
+    if bed is not None:
+        runtime_days = bed.runtime_horizon_support_days
+        if runtime_days is None:
+            runtime_days = (
+                int(requested_days)
+                if requested_days is not None and requested_days.is_integer()
+                else None
+            )
+        evidence.update(
+            {
+                "selection_support_days": support_days,
+                "runtime_support_days": runtime_days,
+                "artifact_selection_support_days": gap.get("selection_support_days"),
+                "artifact_runtime_support_days": gap.get("runtime_support_days"),
+                "backtrack_mode": bed.backtrack_mode,
+            }
+        )
+    return evidence
 
 
 def create_release_config(
@@ -6665,6 +6906,7 @@ def create_release_config(
     formal: bool = True,
     max_backtrack_days: float | None = None,
     maximum_step_count: int | None = None,
+    backtrack_mode_override: str | None = None,
 ) -> dict[str, Any]:
     """由範例設定建立新的 release config，並以 exact artifact hash 寫入 binding。
 
@@ -6709,6 +6951,23 @@ def create_release_config(
     config_payload = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     if not isinstance(config_payload, dict):
         raise ValueError("config template root 必須是 mapping")
+    source_bed = source_config.scenarios.bed_residence_time
+    if backtrack_mode_override is not None:
+        if source_bed is None:
+            raise ValueError("backtrack_mode_override 只適用於 bed-residence config")
+        if backtrack_mode_override not in source_bed.supported_backtrack_modes:
+            raise ValueError("backtrack_mode_override 不在 supported_backtrack_modes")
+        scenarios_payload = config_payload.get("scenarios")
+        bed_payload = (
+            scenarios_payload.get("bed_residence_time")
+            if isinstance(scenarios_payload, dict)
+            else None
+        )
+        if not isinstance(bed_payload, dict):
+            raise ValueError("config template 缺少 scenarios.bed_residence_time mapping")
+        bed_payload["backtrack_mode"] = backtrack_mode_override
+    elif source_bed is not None:
+        backtrack_mode_override = source_bed.backtrack_mode
     if normalized_max_days is not None or normalized_max_steps is not None:
         boundaries = config_payload.get("boundaries")
         if not isinstance(boundaries, dict):
@@ -6746,6 +7005,7 @@ def create_release_config(
     support_evidence = _release_support_evidence(
         input_root,
         source_config=source_config,
+        release_config=candidate_config,
         requested_days=None if requested_days is None else float(requested_days),
     )
     support_evidence["requested_maximum_step_count"] = candidate_config.boundaries.maximum_step_count
@@ -6811,7 +7071,11 @@ def create_release_config(
         )
     _, artifact_index_fp = read_canonical_json(input_root / "artifact_index.json")
     rewritten["release_binding"] = {
-        "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
+        "schema_version": (
+            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if source_bed is not None
+            else DERIVED_INPUT_SCHEMA_VERSION
+        ),
         "source_config_template_sha256": _sha256_file(template_path),
         # 這個 hash 取自 artifact 建置時的 source binding，代表母體 provenance；7 日
         # 與 30 日輸出可各自擁有不同 config hash，但不能把母體 hash 改寫成 target hash。
@@ -6947,8 +7211,9 @@ def validate_release_config(
                         raise ValueError("artifact support 非有限數")
                     support_days = release_config.inputs.backtrack_support_days
                     requested_days = release_config.boundaries.max_backtrack_days
-                    if support_days is not None:
-                        if not math.isclose(
+                    bed_config = release_config.scenarios.bed_residence_time
+                    if bed_config is None:
+                        if support_days is not None and not math.isclose(
                             float(artifact_support),
                             float(support_days),
                             rel_tol=0.0,
@@ -6957,6 +7222,28 @@ def validate_release_config(
                             errors.append("release_support_evidence_mismatch")
                         if requested_days is not None and float(requested_days) > float(artifact_support):
                             errors.append("release_requested_horizon_exceeds_artifact_support")
+                    else:
+                        runtime_days = bed_config.runtime_horizon_support_days
+                        if runtime_days is None:
+                            runtime_days = (
+                                int(requested_days)
+                                if requested_days is not None and float(requested_days).is_integer()
+                                else None
+                            )
+                        if (
+                            support_days is None
+                            or gap_payload.get("selection_support_days") != support_days
+                            or gap_payload.get("runtime_support_days") != runtime_days
+                            or runtime_days is None
+                            or not math.isclose(
+                                float(artifact_support), float(runtime_days), rel_tol=0.0, abs_tol=1e-12
+                            )
+                        ):
+                            errors.append("release_bed_residence_support_evidence_mismatch")
+                        if requested_days is not None and (
+                            runtime_days is None or float(requested_days) > float(runtime_days)
+                        ):
+                            errors.append("release_requested_horizon_exceeds_runtime_support")
                 except Exception as exc:
                     errors.append(f"release_support_evidence_invalid:{type(exc).__name__}")
             if isinstance(horizon_binding, Mapping) and release_config is not None:
@@ -6987,9 +7274,52 @@ def validate_release_config(
                 bound_support = horizon_binding.get("source_backtrack_support_days")
                 if bound_support != expected_support:
                     errors.append("release_support_binding_mismatch")
+                bed_config = release_config.scenarios.bed_residence_time
+                expected_horizon_binding_keys = {
+                    "source_config_hash",
+                    "source_backtrack_support_days",
+                    "artifact_backtrack_support_days",
+                    "requested_max_backtrack_days",
+                    "requested_maximum_step_count",
+                }
+                if bed_config is not None:
+                    expected_horizon_binding_keys.update(
+                        {
+                            "selection_support_days",
+                            "runtime_support_days",
+                            "artifact_selection_support_days",
+                            "artifact_runtime_support_days",
+                            "backtrack_mode",
+                        }
+                    )
+                if set(horizon_binding) != expected_horizon_binding_keys:
+                    errors.append("release_horizon_binding_keys_invalid")
                 expected_step_count = release_config.boundaries.maximum_step_count
                 if horizon_binding.get("requested_maximum_step_count") != expected_step_count:
                     errors.append("release_step_count_binding_mismatch")
+                if bed_config is not None:
+                    runtime_days = bed_config.runtime_horizon_support_days
+                    requested_value = release_config.boundaries.max_backtrack_days
+                    if (
+                        runtime_days is None
+                        and requested_value is not None
+                        and float(requested_value).is_integer()
+                    ):
+                        runtime_days = int(requested_value)
+                    expected_bed_values = {
+                        "selection_support_days": release_config.inputs.backtrack_support_days,
+                        "runtime_support_days": runtime_days,
+                        "artifact_selection_support_days": (
+                            gap_payload.get("selection_support_days") if gap_payload is not None else None
+                        ),
+                        "artifact_runtime_support_days": (
+                            gap_payload.get("runtime_support_days") if gap_payload is not None else None
+                        ),
+                        "backtrack_mode": bed_config.backtrack_mode,
+                    }
+                    for field, expected in expected_bed_values.items():
+                        if horizon_binding.get(field) != expected:
+                            errors.append(f"release_bed_residence_binding_mismatch:{field}")
                 if "artifact_backtrack_support_days" not in horizon_binding:
                     errors.append("release_artifact_support_binding_missing")
                 else:
@@ -7011,7 +7341,18 @@ def validate_release_config(
                             errors.append("release_artifact_support_binding_mismatch")
                     except (TypeError, ValueError):
                         errors.append("release_artifact_support_binding_mismatch")
-            if binding.get("schema_version") != DERIVED_INPUT_SCHEMA_VERSION:
+            raw_scenarios = payload.get("scenarios")
+            raw_bed_residence = (
+                raw_scenarios.get("bed_residence_time")
+                if isinstance(raw_scenarios, Mapping)
+                else None
+            )
+            expected_binding_schema_version = (
+                BED_RESIDENCE_INPUT_SCHEMA_VERSION
+                if raw_bed_residence is not None
+                else DERIVED_INPUT_SCHEMA_VERSION
+            )
+            if binding.get("schema_version") != expected_binding_schema_version:
                 errors.append("release_binding_schema_version_invalid")
             if binding.get("approved_only_after_exact_hash_validation") is not True:
                 errors.append("release_binding_exact_hash_policy_invalid")

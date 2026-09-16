@@ -3,7 +3,8 @@
 本模組只處理已通過 aggregate release 驗證的計數與分母，不讀取檔案、不重新開啟
 trajectory shard，也不從圖面或缺列推測資料。停止結果沿用事件聚合保存的
 ``ParticleStatus`` 非 ``ACTIVE`` 狀態；``DATA_GAP`` 與 ``NUMERICAL_FAILURE`` 只
-保留在 outcome／failure exposure 診斷，絕不進入有效成員分母。
+保留在 outcome／failure exposure 診斷，``PRE_WINDOW_DEPOSITION`` 則只保留 outcome；
+三者都不進入有效成員分母，且 pre-window 不會被誤列為資料或數值失敗。
 
 跨站矩陣的方向固定為 ``source_study_site_id → target_study_site_id``，矩陣軸不是
 空間 ``(y_cell, x_cell)`` 軸，因此另以 site ID tuple 保存 axis label。矩陣對角線
@@ -333,10 +334,11 @@ class OutcomeStatistics:
     會保留事件聚合的 ``(y_cell, x_cell)`` 空間診斷；它們的總和必須分別等於
     DATA_GAP／NUMERICAL_FAILURE raw count，不能當成有效來源格網。
     ``valid_member_denominator_by_site`` 必須等於
-    ``total - DATA_GAP - NUMERICAL_FAILURE``。這個 cross-field gate 確保失敗成員
-    只留在 outcome/failure exposure 診斷，不會進入後續條件式來源母體。失敗曝光
-    也使用 total 分母，與有效來源比例的分母語意明確分離。這些結果只能描述條件式
-    來源足跡／相對來源權重，不是絕對來源機率或因果歸因。
+    ``total - DATA_GAP - NUMERICAL_FAILURE - PRE_WINDOW_DEPOSITION``。這個 cross-field
+    gate 確保三種被排除成員都不進後續條件式來源母體；前兩者保留 failure exposure，
+    pre-window 只保留 outcome，不算資料或數值失敗。失敗曝光仍使用 total 分母，與
+    有效來源比例的分母語意明確分離。這些結果只能描述條件式來源足跡／相對來源權重，
+    不是絕對來源機率或因果歸因。
     """
 
     site_ids: tuple[str, ...]
@@ -374,6 +376,7 @@ class OutcomeStatistics:
                 site_id: totals[site_id]
                 - outcomes[site_id][ParticleStatus.DATA_GAP.value]
                 - outcomes[site_id][ParticleStatus.NUMERICAL_FAILURE.value]
+                - outcomes[site_id][ParticleStatus.PRE_WINDOW_DEPOSITION.value]
                 for site_id in site_ids
             }
         else:
@@ -415,10 +418,12 @@ class OutcomeStatistics:
                 )
             gap = site_outcomes[ParticleStatus.DATA_GAP.value]
             numerical = site_outcomes[ParticleStatus.NUMERICAL_FAILURE.value]
-            expected_valid = total - gap - numerical
+            pre_window = site_outcomes[ParticleStatus.PRE_WINDOW_DEPOSITION.value]
+            expected_valid = total - gap - numerical - pre_window
             if valid[site_id] != expected_valid:
                 raise ValueError(
-                    f"site {site_id!r} 的 valid denominator 必須排除 DATA_GAP／NUMERICAL_FAILURE"
+                    f"site {site_id!r} 的 valid denominator 必須排除 DATA_GAP、"
+                    "NUMERICAL_FAILURE 與 PRE_WINDOW_DEPOSITION"
                 )
             if data_gap_grid and int(sum(int(element) for element in data_gap_grid[site_id].flat)) != gap:
                 raise ValueError(
@@ -528,7 +533,7 @@ class OutcomeStatistics:
 
     @property
     def valid_member_count_by_site(self) -> Mapping[str, int]:
-        """有效成員數的簡短欄位別名；資料缺口／數值失敗已排除。"""
+        """有效成員數的簡短欄位別名；資料缺口、數值失敗與 pre-window 已排除。"""
 
         return self.valid_member_denominator_by_site
 
@@ -967,8 +972,8 @@ def build_outcome_statistics(
         total_member_denominator_by_site: 純 mapping 入口的每站 total member 分母。
             ``total_member_count_by_site`` 是相同欄位的明示別名，兩者不可同時提供。
         valid_member_denominator_by_site: 純 mapping 入口的有效成員分母；若省略，
-            只依明確的 DATA_GAP／NUMERICAL_FAILURE raw count 建立預期值。payload
-            入口一定重用 aggregate 已保存的 valid denominator，並重新核對失敗排除。
+            依 DATA_GAP、NUMERICAL_FAILURE 與 PRE_WINDOW_DEPOSITION raw count 建立預期值。
+            payload 入口一定重用 aggregate 已保存的 valid denominator，並重新核對三類排除。
         minimum_count: ``CountRatio`` 使用的正整數 raw numerator 低樣本門檻。
 
     Returns:

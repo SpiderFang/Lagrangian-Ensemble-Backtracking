@@ -68,7 +68,11 @@ class SampleQC(IntFlag):
 
 
 class ParticleStatus(StrEnum):
-    """粒子生命週期狀態；停止原因不以布林值壓縮。"""
+    """粒子生命週期狀態；停止原因不以布林值壓縮。
+
+    PRE_WINDOW_DEPOSITION 表示抽樣沉底時刻早於固定日曆研究窗，因此沒有可積分的漂流
+    期間；它是可追溯的研究窗分類，不是資料缺漏或數值失敗。
+    """
 
     ACTIVE = "active"
     FLOW_DOMAIN_EXIT = "flow_domain_open_exit"
@@ -79,6 +83,7 @@ class ParticleStatus(StrEnum):
     DATA_GAP = "data_gap"
     MAX_AGE = "max_age"
     NUMERICAL_FAILURE = "numerical_failure"
+    PRE_WINDOW_DEPOSITION = "pre_window_deposition"
 
 
 class EventType(StrEnum):
@@ -87,6 +92,7 @@ class EventType(StrEnum):
     ``OTHER_SITE_*`` 是非終止診斷，絕不可改變原始 ``study_site_id``；B-D 的 local
     與 flow domain 重合時，實作只寫一筆 ``FLOW_DOMAIN_OPEN_EXIT``，並在事件屬性
     保存同時具有 local-first-exit 語意，避免同一次 crossing 重複計數。
+    PRE_WINDOW_DEPOSITION 是零步終止事件，fraction=0 表示它與初始沉底狀態同點。
     """
 
     LOCAL_DOMAIN_FIRST_EXIT = "local_domain_first_exit"
@@ -102,6 +108,7 @@ class EventType(StrEnum):
     MAX_AGE = "max_age"
     FORCING_START = "forcing_start"
     NUMERICAL_FAILURE = "numerical_failure"
+    PRE_WINDOW_DEPOSITION = "pre_window_deposition"
 
 
 class VelocitySampleStatus(StrEnum):

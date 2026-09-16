@@ -8,7 +8,8 @@ domain 中心投影成公尺，避免把經緯度直接拿去做距離、邊界�
 
 material manifest 為相容既有 ``lbt behavior-manifest`` 的 schema 2.0.0；該格式沒有
 共同 provenance object，因此保留原本的分類來源、速度來源及校準範圍三欄。receptor、
-arrival-time 與三種幾何文件則採本模組定義的 schema 1.0.0，所有 root 都必須含完整
+legacy arrival-time 與三種幾何文件採 schema 1.0.0；新增沉底時間 metadata 的 arrival
+採獨立 schema 1.1.0，loader 依 config 模式拒絕跨版本載入。所有 root 都必須含完整
 provenance。情境清單仍以 tuple 保存，50,000 個基礎情境只由既有 deterministic
 cross-product builder 產生，不另建 NumPy object array。
 """
@@ -31,9 +32,21 @@ from shapely.geometry import LineString, MultiLineString, Polygon, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
+from .bed_residence import (
+    BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_POLICY_ID,
+    BED_RESIDENCE_SAMPLING_METHOD_ID,
+    BED_RESIDENCE_SAMPLING_POLICY_ID,
+    sample_bed_residence_age_hours,
+)
 from .boundaries import BoundaryGeometry
 from .config import ProjectConfig, resolve_flow_domain_id
 from .geometry import DomainProjection
+from .input_horizon import (
+    BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+    LEGACY_INPUT_SCHEMA_VERSION,
+)
 from .scenarios import (
     ArrivalTime,
     Behavior,
@@ -46,7 +59,7 @@ from .scenarios import (
     validate_non_rising_behaviors,
 )
 
-MANIFEST_SCHEMA_VERSION = "1.0.0"
+MANIFEST_SCHEMA_VERSION = LEGACY_INPUT_SCHEMA_VERSION
 """本模組新增 manifest 的固定 schema 版本；material CLI 的 ``2.0.0`` 另行相容。"""
 
 _MATERIAL_SCHEMA_VERSION = "2.0.0"
@@ -56,6 +69,9 @@ _SEASONS = frozenset({"DJF", "MAM", "JJA", "SON"})
 _ARRIVAL_TIDE_CLASSES = ("spring_proxy", "neap_proxy")
 _ARRIVAL_TIDAL_PHASES = ("fastest_rising", "fastest_falling", "slack_proxy")
 _ARRIVAL_EVENTS = ("high_wave_event", "strong_current_event")
+_BED_RESIDENCE_ARRIVAL_SELECTION_METHOD_ID = (
+    "server_v3_48_strata_plus_two_observation_anchors_then_random_deposition_v1"
+)
 _MANIFEST_STATUSES = frozenset({"approved", "pilot", "generated"})
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -605,14 +621,20 @@ def _validate_component_root(
     config: ProjectConfig,
     formal: bool,
     require_coordinate_reference: bool = True,
+    expected_schema_version: str = MANIFEST_SCHEMA_VERSION,
 ) -> tuple[str, str, dict[str, Any]]:
-    """驗證 receptor/arrival/geometry 共用的 root 版本、status、設計與 provenance。"""
+    """驗證 component root 版本、status、設計與 provenance。
+
+    一般 component 維持既有 1.0.0；隨機沉底 arrival 由呼叫端要求 1.1.0，避免新舊
+    row metadata 欄位集合交叉載入。其餘 receptor、geometry 與 initial-condition 文件
+    不因 bed-residence 功能而改 schema。
+    """
 
     _expect_exact_keys(payload, expected_keys, f"{kind} manifest root")
     if payload["manifest_kind"] != kind:
         raise ValueError(f"manifest_kind 必須是 {kind}")
-    if payload["schema_version"] != MANIFEST_SCHEMA_VERSION:
-        raise ValueError(f"{kind} schema_version 必須是 {MANIFEST_SCHEMA_VERSION}")
+    if payload["schema_version"] != expected_schema_version:
+        raise ValueError(f"{kind} schema_version 必須是 {expected_schema_version}")
     status = _status(payload["status"], f"{kind}.status", formal=formal)
     design = _design_version(payload, config, kind)
     if require_coordinate_reference and payload["coordinate_reference"] != _WGS84:
@@ -808,25 +830,312 @@ def _validate_formal_arrival_strata(
             )
 
 
+def _season_for_observation_month(month: int) -> str:
+    """依原 observation UTC 月份回傳既有北半球氣候季標籤。"""
+
+    if month in {12, 1, 2}:
+        return "DJF"
+    if month in {3, 4, 5}:
+        return "MAM"
+    if month in {6, 7, 8}:
+        return "JJA"
+    return "SON"
+
+
+def _validate_bed_residence_arrival_records(
+    arrivals: tuple[ArrivalTime, ...],
+    provenance: Mapping[str, Any],
+    config: ProjectConfig,
+) -> tuple[ArrivalTime, ...]:
+    """重算每站共用的抽樣年齡，並回傳原觀測錨點供 48+2 分層驗證。
+
+    arrival record 的 ``time_utc_ns`` 是粒子正式起算的沉底時刻；潮汐、季節與事件分層
+    則必須可追溯回沉底前選出的 observation anchor。metadata 同時保存兩個 UTC 與
+    age/stratum/seed/policy，這個 loader 依 config seed 重新抽出完整 age vector，逐站
+    檢查相同 50 個分層、沉底時間差與 A 區 paired observation UTC。因而人工改一個 age、
+    seed、observation 或 deposition 時刻，即使重簽 JSON hash 仍會在此被拒絕。
+    """
+
+    bed = config.scenarios.bed_residence_time
+    if bed is None:
+        raise ValueError("bed residence loader 缺少 config.scenarios.bed_residence_time")
+    if bed.backtrack_mode not in {
+        BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+        BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    }:
+        raise ValueError("bed residence backtrack_mode 未登錄")
+    if bed.backtrack_mode not in bed.supported_backtrack_modes:
+        raise ValueError("bed residence backtrack_mode 不在 supported_backtrack_modes")
+    if bed.shared_age_offsets_across_sites is not True:
+        raise ValueError("正式五站設計必須共用同一 50-age vector")
+    offsets = sample_bed_residence_age_hours(
+        maximum_age_days=bed.maximum_age_days,
+        sample_count=bed.sample_count_per_site,
+        seed=bed.sampling_seed,
+    )
+    if len(offsets) != bed.sample_count_per_site:
+        raise ValueError("重算的 bed residence age vector 長度與設定不一致")
+    age_vector_hash = sha256(
+        json.dumps(list(offsets), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    expected_provenance = {
+        "policy_id": BED_RESIDENCE_POLICY_ID,
+        "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+        "maximum_age_days": bed.maximum_age_days,
+        "sample_count_per_site": bed.sample_count_per_site,
+        "sampling_seed": bed.sampling_seed,
+        "shared_age_offsets_across_sites": True,
+        "age_offsets_hours_sha256": age_vector_hash,
+    }
+    sampling_provenance = provenance.get("bed_residence_sampling")
+    if not isinstance(sampling_provenance, Mapping) or any(
+        sampling_provenance.get(field) != expected for field, expected in expected_provenance.items()
+    ):
+        raise ValueError("arrival provenance 的 bed-residence sampling 不可由設定 seed 重現")
+    if provenance.get("method_id") != _BED_RESIDENCE_ARRIVAL_SELECTION_METHOD_ID:
+        raise ValueError("arrival provenance 未登錄 bed residence observation selector")
+    if sampling_provenance.get("observation_anchor_selection_method_id") != (
+        "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
+    ):
+        raise ValueError("arrival provenance 缺少既有 48+2 observation selector 識別碼")
+    selection_support = config.inputs.backtrack_support_days
+    runtime_support = bed.runtime_horizon_support_days
+    if runtime_support is None:
+        requested = config.boundaries.max_backtrack_days
+        runtime_support = int(requested) if requested is not None and float(requested).is_integer() else None
+    if (
+        selection_support is None
+        or sampling_provenance.get("selection_support_days") != selection_support
+        or sampling_provenance.get("runtime_support_days") != runtime_support
+        or sampling_provenance.get("pre_window_policy") != bed.pre_window_policy
+    ):
+        raise ValueError("arrival provenance 的 selection/runtime support 與 config 不一致")
+
+    expected_site_ids = set(_config_sites(config))
+    # ``stratum_index`` 標記年齡落在哪個抽樣分層，不是觀測到達列在抽樣向量中的位置；
+    # 因此各站的向量核對必須另按原 observation UTC 與原始 ID 排序。
+    per_site: dict[str, list[tuple[int, str, int]]] = {
+        site_id: [] for site_id in expected_site_ids
+    }
+    per_site_strata: dict[str, set[int]] = {
+        site_id: set() for site_id in expected_site_ids
+    }
+    observation_ids: dict[str, set[str]] = {site_id: set() for site_id in expected_site_ids}
+    observation_arrivals: list[ArrivalTime] = []
+    hour_ns = 3_600_000_000_000
+    design_hash = sha256(config.design_version.encode("utf-8")).hexdigest()
+    for arrival in arrivals:
+        metadata = arrival.metadata
+        site_id = arrival.study_site_id
+        if site_id not in per_site:
+            raise ValueError(f"bed residence arrival 出現未設定站點：{site_id}")
+        observation_ns = _integer(
+            metadata.get("observation_time_utc_ns"),
+            f"arrival[{arrival.arrival_time_id}].metadata.observation_time_utc_ns",
+        )
+        deposition_ns = _integer(
+            metadata.get("deposition_time_utc_ns"),
+            f"arrival[{arrival.arrival_time_id}].metadata.deposition_time_utc_ns",
+        )
+        age_hours = _integer(
+            metadata.get("bed_residence_age_hours"),
+            f"arrival[{arrival.arrival_time_id}].metadata.bed_residence_age_hours",
+        )
+        stratum_index = _integer(
+            metadata.get("bed_residence_stratum_index"),
+            f"arrival[{arrival.arrival_time_id}].metadata.bed_residence_stratum_index",
+        )
+        sampling_seed = _integer(
+            metadata.get("bed_residence_sampling_seed"),
+            f"arrival[{arrival.arrival_time_id}].metadata.bed_residence_sampling_seed",
+        )
+        if metadata.get("bed_residence_policy_id") != BED_RESIDENCE_POLICY_ID:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence policy 不符")
+        if metadata.get("bed_residence_sampling_policy_id") != BED_RESIDENCE_SAMPLING_POLICY_ID:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence sampling policy 不符")
+        if metadata.get("bed_residence_sampling_method_id") != BED_RESIDENCE_SAMPLING_METHOD_ID:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence sampling method 不符")
+        if sampling_seed != bed.sampling_seed:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence seed 與 config 不一致")
+        if metadata.get("bed_residence_maximum_age_days") != bed.maximum_age_days:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence 最大年齡與 config 不一致")
+        if metadata.get("bed_residence_design_version") != config.design_version:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence design version 不一致")
+        if metadata.get("bed_residence_design_hash") != design_hash:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence design hash 不一致")
+        if not 0 <= age_hours <= bed.maximum_age_days * 24:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence age 超出設定上限")
+        if not 0 <= stratum_index < bed.sample_count_per_site:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence stratum index 無效")
+        if stratum_index in per_site_strata[site_id]:
+            raise ValueError(f"{site_id} bed residence stratum 重複：{stratum_index}")
+        # 使用與 bed_residence 抽樣器相同的整數切分公式，檢查 stratum_index 確實是
+        # 該 age_hours 所屬的分層；它不代表 age_offsets 向量的位置，兩者不可互換。
+        total_hour_count = bed.maximum_age_days * 24 + 1
+        stratum_start = (stratum_index * total_hour_count) // bed.sample_count_per_site
+        stratum_stop = ((stratum_index + 1) * total_hour_count) // bed.sample_count_per_site
+        if not stratum_start <= age_hours < stratum_stop:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] age 不在標示的抽樣分層")
+        if deposition_ns != arrival.time_utc_ns or deposition_ns != observation_ns - age_hours * hour_ns:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] observation/deposition UTC 關係不一致")
+        observation_utc_text = _nonempty_string(
+            metadata.get("observation_time_utc"),
+            f"arrival[{arrival.arrival_time_id}].metadata.observation_time_utc",
+        )
+        deposition_utc_text = _nonempty_string(
+            metadata.get("deposition_time_utc"),
+            f"arrival[{arrival.arrival_time_id}].metadata.deposition_time_utc",
+        )
+        expected_observation_text = (
+            _utc_datetime(observation_ns, "observation_time_utc_ns")
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        expected_deposition_text = _utc_datetime(deposition_ns, "deposition_time_utc_ns").isoformat().replace(
+            "+00:00", "Z"
+        )
+        if (
+            observation_utc_text != expected_observation_text
+            or deposition_utc_text != expected_deposition_text
+        ):
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] UTC 字串與 nanoseconds 不一致")
+        observation_id = _nonempty_string(
+            metadata.get("observation_arrival_time_id"),
+            f"arrival[{arrival.arrival_time_id}].metadata.observation_arrival_time_id",
+        )
+        # 一般 event selector 的 ID 使用 event 名稱四欄；A 區龜山 paired clone 則刻意
+        # 以潮汐類別與 phase 保留來源站位的 paired identity，包含兩筆 event 也使用五欄。
+        # 必須依 clone provenance 判斷，不能只看 tide_class == "event"。
+        is_paired_a_clone = (
+            metadata.get("shared_A_forcing_reference_site") == "gongliao"
+            and metadata.get("shared_A_forcing_policy") == "gongliao_paired_utc_reference_v1"
+        )
+        if arrival.tide_class == "event" and not is_paired_a_clone:
+            observation_identity_fields = [
+                site_id,
+                str(observation_ns),
+                arrival.phase_or_event,
+                config.design_version,
+            ]
+        else:
+            observation_identity_fields = [
+                site_id,
+                str(observation_ns),
+                arrival.tide_class,
+                arrival.phase_or_event,
+                config.design_version,
+            ]
+        if observation_id != stable_identifier("arr", observation_identity_fields):
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] observation arrival identity 不可重算")
+        if observation_id in observation_ids[site_id]:
+            raise ValueError(f"{site_id} observation_arrival_time_id 重複：{observation_id}")
+        observation_ids[site_id].add(observation_id)
+        observation = _utc_datetime(observation_ns, "observation_time_utc_ns")
+        observation_year = _integer(
+            metadata.get("observation_year"),
+            f"arrival[{arrival.arrival_time_id}].metadata.observation_year",
+        )
+        observation_season = _nonempty_string(
+            metadata.get("observation_season"),
+            f"arrival[{arrival.arrival_time_id}].metadata.observation_season",
+        )
+        deposition = _utc_datetime(deposition_ns, "deposition_time_utc_ns")
+        if (
+            observation_year != observation.year
+            or observation_season != _season_for_observation_month(observation.month)
+        ):
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] observation 年份／季節 metadata 不符")
+        if (
+            arrival.year != deposition.year
+            or arrival.season != _season_for_observation_month(deposition.month)
+        ):
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] 頂層年份／季節未依 deposition UTC 重算")
+        expected_arrival_id = stable_identifier(
+            "arrival_bed",
+            [
+                observation_id,
+                str(deposition_ns),
+                BED_RESIDENCE_POLICY_ID,
+                BED_RESIDENCE_SAMPLING_POLICY_ID,
+                str(bed.sampling_seed),
+                design_hash,
+            ],
+        )
+        if arrival.arrival_time_id != expected_arrival_id:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence identity 不可重算")
+        per_site[site_id].append((observation_ns, observation_id, age_hours))
+        per_site_strata[site_id].add(stratum_index)
+        observation_arrivals.append(
+            ArrivalTime(
+                arrival_time_id=observation_id,
+                study_site_id=site_id,
+                time_utc_ns=observation_ns,
+                year=observation_year,
+                season=observation_season,
+                tide_class=arrival.tide_class,
+                phase_or_event=arrival.phase_or_event,
+                metadata={},
+            )
+        )
+
+    expected_strata = set(range(bed.sample_count_per_site))
+    for site_id, indexed in per_site.items():
+        if per_site_strata[site_id] != expected_strata:
+            raise ValueError(
+                f"{site_id} bed residence strata 不完整："
+                f"{len(per_site_strata[site_id])}/{len(expected_strata)}"
+            )
+        ordered = sorted(indexed, key=lambda item: (item[0], item[1]))
+        actual_offsets = tuple(item[2] for item in ordered)
+        if actual_offsets != offsets:
+            raise ValueError(f"{site_id} age vector 與其他站點或 seed 抽樣結果不一致")
+    if {"gongliao", "guishan"} <= expected_site_ids:
+        paired_gongliao = sorted(per_site["gongliao"], key=lambda item: (item[0], item[1]))
+        paired_guishan = sorted(per_site["guishan"], key=lambda item: (item[0], item[1]))
+        if [item[0] for item in paired_gongliao] != [item[0] for item in paired_guishan]:
+            raise ValueError("A 區 paired observation UTC 不一致")
+    return tuple(observation_arrivals)
+
+
 def _load_arrival_document(
     path: str | Path, config: ProjectConfig, *, formal: bool
 ) -> tuple[tuple[ArrivalTime, ...], _ManifestDocument]:
-    """讀取 arrival-time schema 1.0.0 並驗證 UTC 年份與站點內唯一時刻。"""
+    """依設定讀取 legacy 1.0.0 或 bed-residence 1.1.0 arrival 文件。
+
+    schema 版本與 config 模式必須一對一，避免把只含 observation UTC 的舊列誤當成
+    deposition 起點，或讓 legacy runtime 意外載入含沉底轉換的 row metadata。
+    """
 
     document = _document(path)
     payload = document.payload
-    _validate_component_root(
+    bed_residence_enabled = config.scenarios.bed_residence_time is not None
+    _, _, provenance = _validate_component_root(
         payload,
         _ARRIVAL_ROOT_KEYS,
         kind="arrival_time_manifest",
         config=config,
         formal=formal,
         require_coordinate_reference=False,
+        expected_schema_version=(
+            BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if bed_residence_enabled
+            else MANIFEST_SCHEMA_VERSION
+        ),
     )
     if payload["time_standard"] != "UTC":
         raise ValueError("arrival_time_manifest.time_standard 必須是 UTC")
     _nonempty_string(payload["selection_method_id"], "arrival_time_manifest.selection_method_id")
     rows = _records(payload["records"], "arrival.records")
+    if (
+        bed_residence_enabled
+        and payload["selection_method_id"] != _BED_RESIDENCE_ARRIVAL_SELECTION_METHOD_ID
+    ):
+        raise ValueError("bed residence arrival_time_manifest.selection_method_id 不符")
+    if (
+        not bed_residence_enabled
+        and payload["selection_method_id"] == _BED_RESIDENCE_ARRIVAL_SELECTION_METHOD_ID
+    ):
+        raise ValueError("legacy config 不得載入 bed residence arrival manifest")
     arrivals: list[ArrivalTime] = []
     ids: set[str] = set()
     site_times: set[tuple[str, int]] = set()
@@ -845,11 +1154,24 @@ def _load_arrival_document(
             raise ValueError(f"同一 study_site 的 UTC 必須唯一：{site.study_site_id}/{time_ns}")
         site_times.add((site.study_site_id, time_ns))
         year = _integer(row["year"], f"{label}.year")
-        if year != utc.year:
-            raise ValueError(f"{label}.year 與 UTC year 不一致：{year} != {utc.year}")
         season = _nonempty_string(row["season"], f"{label}.season")
         if season not in _SEASONS:
             raise ValueError(f"{label}.season 不合法：{sorted(_SEASONS)}")
+        metadata = _metadata(row["metadata"], f"{label}.metadata")
+        if bed_residence_enabled:
+            deposition_ns = _integer(
+                metadata.get("deposition_time_utc_ns"),
+                f"{label}.metadata.deposition_time_utc_ns",
+            )
+            deposition_utc = _utc_datetime(deposition_ns, f"{label}.metadata.deposition_time_utc_ns")
+            if time_ns != deposition_ns:
+                raise ValueError(f"{label}.time_utc_ns 必須等於 metadata deposition UTC")
+            if year != deposition_utc.year or season != _season_for_observation_month(deposition_utc.month):
+                raise ValueError(
+                    f"{label}.year／season 與 deposition UTC 不一致：{year}/{season}"
+                )
+        elif year != utc.year:
+            raise ValueError(f"{label}.year 與 UTC year 不一致：{year} != {utc.year}")
         arrivals.append(
             ArrivalTime(
                 arrival_time_id=arrival_id,
@@ -859,13 +1181,22 @@ def _load_arrival_document(
                 season=season,
                 tide_class=_nonempty_string(row["tide_class"], f"{label}.tide_class"),
                 phase_or_event=_nonempty_string(row["phase_or_event"], f"{label}.phase_or_event"),
-                metadata=_metadata(row["metadata"], f"{label}.metadata"),
+                metadata=metadata,
             )
         )
         counts[site.study_site_id] += 1
     site_ids = set(counts)
     if formal:
         _validate_formal_counts(site_ids, counts, config, per_site=50, total=250, label="arrival")
+    if bed_residence_enabled:
+        observation_arrivals = _validate_bed_residence_arrival_records(
+            tuple(arrivals), provenance, config
+        )
+        if formal:
+            # bed-residence arrival 的執行 UTC 已轉為沉底時刻；正式 48+2 統計仍以 metadata
+            # 可重建的 observation anchor 分層，避免沉底年齡跨季或跨年改寫原始選時設計。
+            _validate_formal_arrival_strata(observation_arrivals, config)
+    elif formal:
         _validate_formal_arrival_strata(tuple(arrivals), config)
     else:
         _validate_pilot_sites(site_ids, config, "arrival")
@@ -1856,6 +2187,7 @@ def load_boundary_geometries(
 
 
 __all__ = [
+    "BED_RESIDENCE_INPUT_SCHEMA_VERSION",
     "BoundaryGeometryBundle",
     "MANIFEST_SCHEMA_VERSION",
     "ScenarioInputs",

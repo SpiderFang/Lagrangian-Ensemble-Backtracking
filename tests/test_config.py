@@ -31,10 +31,38 @@ def _payload() -> dict:
     return value
 
 
+def _legacy_example_payload() -> dict:
+    """由正式範例明確建立未啟用隨機沉底與共同支援窗的舊相容 fixture。"""
+
+    payload = deepcopy(_payload())
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
+    return payload
+
+
+def _bed_residence_block() -> dict:
+    """建立完整的新沉底時間區塊，讓 schema 測試只修改一個契約欄位。"""
+
+    return {
+        "backtrack_mode": "fixed_calendar_window",
+        "supported_backtrack_modes": [
+            "fixed_calendar_window",
+            "full_horizon_from_deposition",
+        ],
+        "maximum_age_days": 90,
+        "sample_count_per_site": 50,
+        "sampling_policy": "discrete_hourly_stratified_uniform_v1",
+        "sampling_seed": 20260916,
+        "shared_age_offsets_across_sites": True,
+        "pre_window_policy": "record_pre_window_deposition_without_transport",
+        "runtime_horizon_support_days": 90,
+    }
+
+
 def _legacy_hash_payload() -> dict:
     """由現行範例還原未含 policy 的舊設定快照，避免測試依賴 git 指令。"""
 
-    payload = deepcopy(_payload())
+    payload = _legacy_example_payload()
     payload["config_status"] = "design_baseline_example"
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
     a_domain = payload["domains"][0]
@@ -70,7 +98,7 @@ def _legacy_hash_payload() -> dict:
 
 
 def test_example_config_has_fixed_scientific_counts() -> None:
-    """範例設定必須保留 4 domains、5 sites 與全案 50,000 基礎情境。"""
+    """正式母體範例保留固定研究計數並啟用 180/90/50 沉底契約。"""
 
     config = load_config(EXAMPLE_CONFIG)
     assert len(config.domains) == 4
@@ -81,6 +109,17 @@ def test_example_config_has_fixed_scientific_counts() -> None:
     assert config.execution.checkpoint_interval_sweeps is None
     assert config.execution.active_chunk_size is None
     assert config.execution.max_resident_forcing_months == 2
+    bed = config.normalized_payload()["scenarios"]["bed_residence_time"]
+    assert bed["backtrack_mode"] == "fixed_calendar_window"
+    assert bed["supported_backtrack_modes"] == [
+        "fixed_calendar_window",
+        "full_horizon_from_deposition",
+    ]
+    assert bed["maximum_age_days"] == 90
+    assert bed["sample_count_per_site"] == 50
+    assert bed["sampling_seed"] == 20260916
+    assert bed["runtime_horizon_support_days"] is None
+    assert config.inputs.backtrack_support_days == 180
 
 
 def test_receptor_candidate_domain_policy_is_versioned_and_core_aware() -> None:
@@ -149,18 +188,66 @@ def test_config_hash_is_independent_of_mapping_order() -> None:
     assert first.config_hash() == second.config_hash()
 
 
-def test_omitted_backtrack_support_keeps_current_example_hash() -> None:
-    """舊的回溯支援 optional 欄位不入 hash；明示 v3 runtime policy 另形成新 hash。"""
+def test_bed_residence_config_is_typed_complete_and_enters_hash() -> None:
+    """明示沉底模型時完整保留 mode、抽樣設定與 runtime 支援窗於 canonical payload。"""
 
-    config = ProjectConfig.model_validate(_payload())
+    payload = _payload()
+    payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    config = ProjectConfig.model_validate(payload)
+    normalized = config.normalized_payload()["scenarios"]["bed_residence_time"]
+    assert normalized["backtrack_mode"] == "fixed_calendar_window"
+    assert set(normalized["supported_backtrack_modes"]) == {
+        "fixed_calendar_window",
+        "full_horizon_from_deposition",
+    }
+    assert normalized["maximum_age_days"] == 90
+    assert normalized["sample_count_per_site"] == config.scenarios.expected_arrival_time_count_per_site
+    assert normalized["runtime_horizon_support_days"] == 90
+    assert config.inputs.backtrack_support_days == 180
+    assert config.config_hash() != ProjectConfig.model_validate(_legacy_example_payload()).config_hash()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backtrack_mode", "1"),
+        ("supported_backtrack_modes", ["fixed_calendar_window"]),
+        ("maximum_age_days", 89),
+        ("sample_count_per_site", 49),
+        ("sampling_policy", "unregistered_policy"),
+        ("sampling_seed", True),
+        ("sampling_seed", -1),
+        ("shared_age_offsets_across_sites", False),
+        ("pre_window_policy", "drop_member"),
+        ("runtime_horizon_support_days", 0),
+    ],
+)
+def test_bed_residence_config_rejects_unregistered_contract_values(
+    field: str, value: object
+) -> None:
+    """新區塊逐欄 fail closed，避免錯誤值落入 extra 欄位或靜默轉型。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block[field] = value
+    payload["scenarios"]["bed_residence_time"] = block
+    with pytest.raises(ValueError):
+        ProjectConfig.model_validate(payload)
+
+
+def test_omitted_backtrack_support_keeps_legacy_hash() -> None:
+    """明確移除新欄位的舊 fixture 維持歷史 hash 與 normalized payload 語意。"""
+
+    config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
     assert "backtrack_support_days" not in config.normalized_payload()["inputs"]
+    assert "bed_residence_time" not in config.normalized_payload()["scenarios"]
 
 
 def test_omitted_ocm_interpolation_backend_keeps_numpy_and_current_hash() -> None:
     """舊 YAML 省略 OCM backend 時走 NumPy，且不得因預設欄位改變 canonical hash。"""
 
-    config = ProjectConfig.model_validate(_payload())
+    config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.ocm_interpolation_backend == "numpy_v1"
     assert "ocm_interpolation_backend" not in config.normalized_payload()["execution"]
     assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
@@ -169,7 +256,7 @@ def test_omitted_ocm_interpolation_backend_keeps_numpy_and_current_hash() -> Non
 def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
     """舊 YAML 未帶 CPU 核心選項時仍用 NumPy，且 config hash 維持凍結值。"""
 
-    config = ProjectConfig.model_validate(_payload())
+    config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.physics_kernel_backend == "numpy_v1"
     assert "physics_kernel_backend" not in config.normalized_payload()["execution"]
     assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"

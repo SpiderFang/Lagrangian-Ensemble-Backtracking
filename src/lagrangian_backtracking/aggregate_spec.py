@@ -102,9 +102,12 @@ _SITE_BOUNDARY_SEGMENT_KEYS = frozenset({"local", "outer"})
 # 不接受任意自訂層級，以確保不同 run 的區域權重具有可比性。
 _HDR_LEVELS = (0.5, 0.75, 0.9)
 
-# 此政策名稱同時是資料缺口與數值失敗的分母處理契約；它不是可自由延伸
-# 的描述文字，因為下游統計結果必須能由名稱唯一決定。
-_DENOMINATOR_POLICY = "exclude_data_gap_and_numerical_failure_v1"
+# 此政策名稱明示排除資料缺口、數值失敗及固定日曆窗前已沉底的成員。沉底時間
+# 新契約只接受此具名 policy；舊規格名稱不會被靜默解讀成含有 pre-window 排除，
+# 因而保留清楚的正式分母版本邊界。
+_DENOMINATOR_POLICY = (
+    "exclude_data_gap_numerical_failure_and_pre_window_deposition_v1"
+)
 
 # 網格寬高與網格尺寸的商必須接近正整數。相對與絕對容差都固定為規格
 # 要求的 1e-9，避免呼叫端使用不同容差造成同一設定可載入性不一致。
@@ -411,7 +414,9 @@ class AggregateSpec:
 
     `hdr_levels` 固定為 0.5、0.75、0.9；bootstrap replicate 數必須是
     正整數，信賴水準介於 0 與 1 之間，seed 是 0 到 2^128-1 的整數。
-    `denominator_policy` 固定為排除資料缺口與數值失敗的版本化政策。這些
+    `denominator_policy` 固定為排除資料缺口、數值失敗及固定日曆研究窗前已沉底
+    成員的版本化政策。舊版只排除前兩類的 policy 會 fail closed，不可套用到新
+    pre-window outcome。這些
     設定只支援「條件式來源足跡」或「相對來源權重」的可重現彙整，不把
     結果提升為未經先驗、似然與觀測驗證的絕對來源機率或因果歸因。
 

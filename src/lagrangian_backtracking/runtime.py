@@ -48,6 +48,7 @@ from typing import Any
 import pyarrow.parquet as pq
 from shapely.geometry import Point
 
+from .bed_residence import BedResidenceTiming, resolve_bed_residence_timing
 from .config import (
     OCM_INTERPOLATION_BACKEND_NUMBA_V1,
     ProjectConfig,
@@ -64,7 +65,7 @@ from .manifests import (
     load_scenario_inputs,
     resolve_manifest_path,
 )
-from .models import ParticleState
+from .models import ParticleState, ParticleStatus, VelocitySample
 from .pilot_selection import (
     apply_scenario_selection,
     build_full_scenario_selection,
@@ -85,6 +86,20 @@ from .run_control import (
 from .run_validation import validate_run
 from .runner import ReferenceParticleRequest, RunUnit, scenario_execution_sort_key
 from .scenarios import validate_baseline_coverage
+
+
+def _forbidden_pre_window_velocity(
+    x_m: float, y_m: float, z_m: float, time_utc_ns: int
+) -> VelocitySample:
+    """讓 pre-window request 保持可序列化，但若錯誤路徑取樣便立即暴露。
+
+    固定日曆窗前已沉底的成員沒有研究窗內漂流期間，runtime 不應為它開啟 forcing
+    manager 或建立真實 velocity provider。這個 sentinel 只填滿既有 request 型別；
+    terminal initialization 會在任何 velocity call 前短路，故它不代表缺值補零。
+    """
+
+    del x_m, y_m, z_m, time_utc_ns
+    raise RuntimeError("PRE_WINDOW_DEPOSITION request 不得取樣 velocity 或 forcing")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2125,6 +2140,19 @@ class RuntimeRequestFactory:
             minimum=0.0,
             allow_zero=False,
         )
+        self._bed_residence_config = config.scenarios.bed_residence_time
+        if self._bed_residence_config is not None:
+            support_days = self._bed_residence_config.runtime_horizon_support_days
+            if support_days is None:
+                raise ValueError(
+                    "bed_residence_time template 的 runtime_horizon_support_days 為 null，"
+                    "不可直接建立 runtime"
+                )
+            if self._max_backtrack_days > support_days:
+                raise ValueError(
+                    "boundaries.max_backtrack_days 超出 bed_residence_time "
+                    "runtime_horizon_support_days"
+                )
         self._maximum_step_count = _positive_integer(
             config.boundaries.maximum_step_count,
             label="boundaries.maximum_step_count",
@@ -2267,13 +2295,61 @@ class RuntimeRequestFactory:
 
         # 回溯上限與正式 gap-safe 共用精度有界的天／秒／奈秒轉換；只修正可往返的浮點
         # 表示，不偷改到達時間。先建立設定，讓不合法次奈秒或溢位在 forcing manager 前停止。
-        settings = self._build_settings(scenario.arrival_time_utc_ns)
+        bed_timing: BedResidenceTiming | None = None
+        if self._bed_residence_config is not None:
+            residence = self._bed_residence_config
+            bed_timing = resolve_bed_residence_timing(
+                arrival,
+                backtrack_mode=residence.backtrack_mode,
+                requested_horizon_days=self._max_backtrack_days,
+                maximum_age_days=residence.maximum_age_days,
+                sampling_seed=residence.sampling_seed,
+            )
+        settings = self._build_settings(
+            scenario.arrival_time_utc_ns,
+            bed_timing=bed_timing,
+        )
 
         geometry = self._geometries.get(scenario.study_site_id)
         projection = self._projections.get(scenario.study_site_id)
         if geometry is None or projection is None:
             raise ValueError(f"study_site 缺少已驗證 geometry/projection：{scenario.study_site_id}")
 
+        if bed_timing is not None and bed_timing.pre_window_deposition:
+            # pre-window 不開 forcing manager，但 request 仍需帶有與正式 receptor 一致的
+            # 公尺制起點。先完成幾何 gate，避免 terminal outcome 掩蓋無效 receptor。
+            projected_x, projected_y = projection.project(receptor.lon, receptor.lat)
+            x_m = float(projected_x)
+            y_m = float(projected_y)
+            point = Point(x_m, y_m)
+            if not geometry.own_local_domain.covers(point) or not geometry.flow_domain.covers(point):
+                raise ValueError("receptor 投影點必須同時被 own_local_domain 與 flow_domain covers")
+            initial_state = ParticleState(
+                particle_id=unit.particle_id,
+                scenario_id=scenario.scenario_id,
+                member_id=unit.member_id,
+                study_site_id=scenario.study_site_id,
+                analysis_region_id=scenario.analysis_region_id,
+                receptor_id=scenario.receptor_id,
+                x_m=x_m,
+                y_m=y_m,
+                z_m=pair.z_m_positive_up,
+                time_utc_ns=scenario.arrival_time_utc_ns,
+                status=ParticleStatus.PRE_WINDOW_DEPOSITION,
+            )
+            # 研究窗前已沉底的成員只保存合法 terminal request；不開 forcing manager、
+            # 不定位 forcing mesh、不建立 velocity provider，也不建立空間擴散 provider。
+            return ReferenceParticleRequest(
+                initial_state=initial_state,
+                velocity=_forbidden_pre_window_velocity,
+                boundaries=geometry,
+                behavior_class=material.behavior_class,
+                diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+                settings=settings,
+            )
+
+        # ACTIVE legacy 路徑維持原有順序：先建立／取得 manager，再做投影、幾何與 mesh
+        # face provenance 驗證。如此不改變既有 active request 的副作用與錯誤時序。
         manager = self._managers.get(flow_id)
         if manager is None:
             manager = ForcingWindowManager.from_roots(
@@ -2326,6 +2402,7 @@ class RuntimeRequestFactory:
             z_m=pair.z_m_positive_up,
             time_utc_ns=scenario.arrival_time_utc_ns,
         )
+
         if self._experiment_case_spec.diffusion_kind == "constant":
             # 常數 reference 必須維持既有三方向係數與 validate 行為，讓 no-Stokes 與
             # finite-depth-stokes 的數值輸入不受新增敏感度案例影響。
@@ -2350,15 +2427,32 @@ class RuntimeRequestFactory:
             settings=settings,
         )
 
-    def _build_settings(self, arrival_time_utc_ns: int) -> EngineSettings:
-        """以共用有界轉換建立秒制引擎設定，最早 UTC 以整數奈秒相減。
+    def _build_settings(
+        self,
+        arrival_time_utc_ns: int,
+        *,
+        bed_timing: BedResidenceTiming | None = None,
+    ) -> EngineSettings:
+        """建立秒制引擎設定；沉底模式使用 resolver 的有效期間與 UTC 起點。
 
-        來源 arrival 不重算；拒絕不能精確還原的次奈秒上限及最早時間超出有號 64 位範圍。
-        此函式在建立 forcing manager 前呼叫，不改步長、種子、亂數或取樣策略。
+        legacy config 未啟用沉底時間時沿用舊 arrival 減 H 行為。新契約則直接使用已核對
+        的整數奈秒 resolver 結果；pre-window request 仍以原本正 H 填入引擎設定，讓設定
+        schema 保持有效，而 terminal initial state 會保證不執行任何積分步。
         """
 
-        max_backtrack_seconds, horizon_ns = _backtrack_horizon(self._max_backtrack_days)
-        earliest_ns = arrival_time_utc_ns - horizon_ns
+        if bed_timing is None:
+            max_backtrack_seconds, horizon_ns = _backtrack_horizon(
+                self._max_backtrack_days
+            )
+            earliest_ns = arrival_time_utc_ns - horizon_ns
+        else:
+            earliest_ns = bed_timing.earliest_forcing_time_utc_ns
+            if bed_timing.pre_window_deposition:
+                max_backtrack_seconds, _ = _backtrack_horizon(
+                    self._max_backtrack_days
+                )
+            else:
+                max_backtrack_seconds = bed_timing.effective_horizon_seconds
         if not -(1 << 63) <= earliest_ns < (1 << 63):
             raise ValueError("earliest_forcing_time_utc_ns 超出有號 64 位整數範圍")
         return EngineSettings(

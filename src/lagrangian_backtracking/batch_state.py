@@ -36,6 +36,7 @@ _STATUS_CODE_PAIRS: tuple[tuple[ParticleStatus, int], ...] = (
     (ParticleStatus.DATA_GAP, 6),
     (ParticleStatus.MAX_AGE, 7),
     (ParticleStatus.NUMERICAL_FAILURE, 8),
+    (ParticleStatus.PRE_WINDOW_DEPOSITION, 9),
 )
 
 # MappingProxyType 只禁止呼叫端改寫對照表；數值對照本身仍是明確列出的固定契約。

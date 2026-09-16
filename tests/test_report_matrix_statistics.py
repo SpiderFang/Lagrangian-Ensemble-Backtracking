@@ -27,13 +27,16 @@ _OUTCOME_KEYS = tuple(
 )
 
 
-def _outcomes(*, maximum: int, data_gap: int, numerical: int, total: int) -> dict[str, int]:
+def _outcomes(
+    *, maximum: int, data_gap: int, numerical: int, total: int, pre_window: int = 0
+) -> dict[str, int]:
     """建立完整的非 ACTIVE 停止狀態拓撲，未指定狀態維持明確的零計數。"""
 
     counts = {key: 0 for key in _OUTCOME_KEYS}
     counts[ParticleStatus.MAX_AGE.value] = maximum
     counts[ParticleStatus.DATA_GAP.value] = data_gap
     counts[ParticleStatus.NUMERICAL_FAILURE.value] = numerical
+    counts[ParticleStatus.PRE_WINDOW_DEPOSITION.value] = pre_window
     assert sum(counts.values()) == total
     return counts
 
@@ -85,6 +88,35 @@ def test_outcome_statistics_preserve_raw_counts_ratios_and_failure_exposure() ->
     assert gap.ratio == 1 / 3
     assert gap.status is EstimateStatus.low_count
     assert product.failure_exposure_by_site["site-a"][ParticleStatus.NUMERICAL_FAILURE.value].ratio == 0.0
+
+
+def test_pre_window_is_excluded_from_valid_denominator_but_not_failure_exposure() -> None:
+    """pre-window outcome 留在 total 統計，排除 valid 分母但不冒充 failure exposure。"""
+
+    product = build_outcome_statistics(
+        {
+            "site-a": _outcomes(
+                maximum=2,
+                data_gap=1,
+                numerical=1,
+                pre_window=2,
+                total=6,
+            )
+        },
+        {"site-a": 6},
+    )
+
+    assert product.valid_member_denominator_by_site["site-a"] == 2
+    pre_window = product.outcome_ratios_by_site["site-a"][
+        ParticleStatus.PRE_WINDOW_DEPOSITION.value
+    ]
+    assert pre_window.raw_numerator == 2
+    assert pre_window.raw_denominator == 6
+    assert pre_window.ratio == 1 / 3
+    assert set(product.failure_exposure_by_site["site-a"]) == {
+        ParticleStatus.DATA_GAP.value,
+        ParticleStatus.NUMERICAL_FAILURE.value,
+    }
 
 
 def test_connectivity_keeps_direction_and_separates_visit_fraction_from_event_share() -> None:

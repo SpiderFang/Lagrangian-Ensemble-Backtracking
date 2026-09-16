@@ -88,10 +88,18 @@ def _replace_canonical_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _write_source_config(path: Path) -> ProjectConfig:
-    """由專案 example 建立保留五站／50k 設計的 release-like source YAML。"""
+    """由專案 example 建立保留五站／50k 設計的 legacy pilot source YAML。
+
+    本檔驗證既有工程 pilot builder；它使用 schema 1.0 到達時刻與 gap evidence，沒有
+    observation／deposition 雙時間欄位。因此測試來源須明示移除新版隨機沉底契約，避免
+    把不相容的 1.1 輸入語意偽裝成可執行 pilot。新版雙模式流程另由 horizon suite 與
+    runtime 專屬測試覆蓋。
+    """
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
     # 測試刻意保留完整 design contract，只補上 release validator 需要存在的 binding
     # root；實際 artifact hash gate 由該 validator 的專屬測試覆蓋。
     payload["release_binding"] = {"schema_version": DERIVED_INPUT_SCHEMA_VERSION}

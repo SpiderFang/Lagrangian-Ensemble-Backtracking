@@ -6,6 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,16 @@ import yaml
 from shapely.geometry import LineString, box, mapping
 
 from lagrangian_backtracking.arrival_times import select_arrival_times
+from lagrangian_backtracking.bed_residence import (
+    BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_POLICY_ID,
+    BED_RESIDENCE_SAMPLING_POLICY_ID,
+    apply_bed_residence_sampling,
+    sample_bed_residence_age_hours,
+)
 from lagrangian_backtracking.config import ProjectConfig, resolve_flow_domain_id
+from lagrangian_backtracking.input_horizon import BED_RESIDENCE_INPUT_SCHEMA_VERSION
 from lagrangian_backtracking.manifests import (
     load_arrival_time_manifest,
     load_boundary_geometries,
@@ -24,7 +34,12 @@ from lagrangian_backtracking.manifests import (
     load_scenario_inputs,
     resolve_manifest_path,
 )
-from lagrangian_backtracking.scenarios import BASELINE_BEHAVIORS, ArrivalTime, Receptor
+from lagrangian_backtracking.scenarios import (
+    BASELINE_BEHAVIORS,
+    ArrivalTime,
+    Receptor,
+    stable_identifier,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
@@ -38,10 +53,12 @@ SITES = {
 
 
 def _config(tmp_path: Path, *, with_paths: bool = False) -> ProjectConfig:
-    """建立與範例相同科學計數的 config；manifest 路徑可切換成 temp 相對路徑。"""
+    """建立明確未啟用新沉底政策的 legacy fixture，供既有 manifest 測試使用。"""
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
     if with_paths:
         payload["scenarios"]["material_manifest"] = "material.json"
         payload["scenarios"]["receptor_manifest"] = "receptor.json"
@@ -54,6 +71,25 @@ def _config(tmp_path: Path, *, with_paths: bool = False) -> ProjectConfig:
         payload["geometry"]["open_boundary_manifest"] = "open.json"
     else:
         payload["scenarios"]["receptor_arrival_initial_condition_manifest"] = None
+    return ProjectConfig.model_validate(payload)
+
+
+def _bed_config() -> ProjectConfig:
+    """建立五站正式沉底 loader 測試設定，分離 180 日選時與 90 日運算支援。"""
+
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    payload["inputs"]["backtrack_support_days"] = 180
+    payload["scenarios"]["bed_residence_time"].update(
+        {
+            "backtrack_mode": BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+            "supported_backtrack_modes": [
+                BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+                BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+            ],
+            "runtime_horizon_support_days": 90,
+        }
+    )
     return ProjectConfig.model_validate(payload)
 
 
@@ -189,6 +225,103 @@ def _arrival_payload(*, per_site: int = 50, wrong_year: bool = False) -> dict[st
         "selection_method_id": "synthetic_arrival_fixture_v1",
         "provenance": _provenance(),
         "records": records,
+    }
+
+
+def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
+    """以 48+2 observation anchor fixture 建立可由 formal bed loader 重算的母體。"""
+
+    design_version = config.design_version
+    observations_by_site: dict[str, list[ArrivalTime]] = {site_id: [] for site_id in SITES}
+    for row in _arrival_payload()["records"]:
+        assert isinstance(row, dict)
+        site_id = str(row["study_site_id"])
+        observation_ns = int(row["time_utc_ns"])
+        tide_class = str(row["tide_class"])
+        phase = str(row["phase_or_event"])
+        # 龜山島是貢寮 48+2 UTC 的 paired clone，event identity 也沿用五欄來源政策；
+        # 一般站點 event identity 則由四欄組成，與 production selector 一致。
+        paired_a_clone = site_id == "guishan"
+        identity_fields = (
+            [site_id, str(observation_ns), tide_class, phase, design_version]
+            if paired_a_clone or tide_class != "event"
+            else [site_id, str(observation_ns), phase, design_version]
+        )
+        metadata: dict[str, float | int | str] = {"selection_rank": int(row["metadata"]["selection_rank"])}
+        if paired_a_clone:
+            metadata.update(
+                {
+                    "shared_A_forcing_utc": "true",
+                    "shared_A_forcing_reference_site": "gongliao",
+                    "shared_A_forcing_policy": "gongliao_paired_utc_reference_v1",
+                }
+            )
+        observations_by_site[site_id].append(
+            ArrivalTime(
+                arrival_time_id=stable_identifier("arr", identity_fields),
+                study_site_id=site_id,
+                time_utc_ns=observation_ns,
+                year=int(row["year"]),
+                season=str(row["season"]),
+                tide_class=tide_class,
+                phase_or_event=phase,
+                metadata=metadata,
+            )
+        )
+
+    bed = config.scenarios.bed_residence_time
+    assert bed is not None
+    offsets = sample_bed_residence_age_hours(
+        maximum_age_days=bed.maximum_age_days,
+        sample_count=bed.sample_count_per_site,
+        seed=bed.sampling_seed,
+    )
+    deposition_records = [
+        asdict(arrival)
+        for site_id in sorted(observations_by_site)
+        for arrival in apply_bed_residence_sampling(
+            observations_by_site[site_id],
+            age_hours=offsets,
+            sampling_seed=bed.sampling_seed,
+            maximum_age_days=bed.maximum_age_days,
+            design_version=design_version,
+        )
+    ]
+    age_vector_hash = sha256(
+        json.dumps(list(offsets), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "manifest_kind": "arrival_time_manifest",
+        "schema_version": BED_RESIDENCE_INPUT_SCHEMA_VERSION,
+        "status": "approved",
+        "design_version": design_version,
+        "time_standard": "UTC",
+        "selection_method_id": (
+            "server_v3_48_strata_plus_two_observation_anchors_then_random_deposition_v1"
+        ),
+        "provenance": {
+            "method_id": (
+                "server_v3_48_strata_plus_two_observation_anchors_then_random_deposition_v1"
+            ),
+            "created_at_utc": "2026-09-16T00:00:00Z",
+            "source_hashes": {"synthetic_input": "a" * 64},
+            "bed_residence_sampling": {
+                "policy_id": BED_RESIDENCE_POLICY_ID,
+                "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+                "maximum_age_days": bed.maximum_age_days,
+                "sample_count_per_site": bed.sample_count_per_site,
+                "sampling_seed": bed.sampling_seed,
+                "shared_age_offsets_across_sites": True,
+                "age_offsets_hours_sha256": age_vector_hash,
+                "selection_support_days": 180,
+                "runtime_support_days": 90,
+                "pre_window_policy": bed.pre_window_policy,
+                "observation_anchor_selection_method_id": (
+                    "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
+                ),
+            },
+        },
+        "records": deposition_records,
     }
 
 
@@ -515,6 +648,90 @@ def test_select_arrival_times_output_passes_manifest_loader(tmp_path: Path) -> N
     assert {item.season for item in loaded} == {"DJF", "MAM", "JJA", "SON"}
 
 
+def test_bed_residence_formal_loader_recomputes_shared_age_vector_and_paired_a_ids(
+    tmp_path: Path,
+) -> None:
+    """正式 loader 依 seed 重算五站 50-age，並接受龜山 paired event 五欄 identity。"""
+
+    config = _bed_config()
+    payload = _bed_arrival_payload(config)
+    path = tmp_path / "bed-arrival.json"
+    _write_json(path, payload)
+
+    loaded = load_arrival_time_manifest(path, config, formal=True)
+    assert len(loaded) == 250
+    assert all(
+        arrival.time_utc_ns == arrival.metadata["deposition_time_utc_ns"]
+        for arrival in loaded
+    )
+    for site_id in SITES:
+        site_records = [arrival for arrival in loaded if arrival.study_site_id == site_id]
+        ordered = sorted(
+            site_records,
+            key=lambda item: (
+                item.metadata["observation_time_utc_ns"],
+                item.metadata["observation_arrival_time_id"],
+            ),
+        )
+        assert tuple(item.metadata["bed_residence_age_hours"] for item in ordered) == (
+            sample_bed_residence_age_hours(
+                maximum_age_days=90,
+                sample_count=50,
+                seed=20260916,
+            )
+        )
+    guishan_events = [
+        arrival
+        for arrival in loaded
+        if arrival.study_site_id == "guishan" and arrival.tide_class == "event"
+    ]
+    assert len(guishan_events) == 2
+    assert all(
+        arrival.metadata["shared_A_forcing_policy"] == "gongliao_paired_utc_reference_v1"
+        for arrival in guishan_events
+    )
+
+
+@pytest.mark.parametrize("drift", ["age", "seed", "deposition", "schema"])
+def test_bed_residence_formal_loader_rejects_age_seed_and_deposition_drift(
+    tmp_path: Path, drift: str
+) -> None:
+    """即使 JSON 重新產生，loader 仍拒絕抽樣 seed、age 或觀測／沉底差異漂移。"""
+
+    config = _bed_config()
+    payload = _bed_arrival_payload(config)
+    first = payload["records"][0]
+    if drift == "age":
+        first["metadata"]["bed_residence_age_hours"] += 1
+    elif drift == "seed":
+        first["metadata"]["bed_residence_sampling_seed"] += 1
+    elif drift == "schema":
+        payload["schema_version"] = "1.0.0"
+    else:
+        shifted_deposition_ns = first["metadata"]["deposition_time_utc_ns"] + 3_600_000_000_000
+        first["metadata"]["deposition_time_utc_ns"] = shifted_deposition_ns
+        first["metadata"]["deposition_time_utc"] = (
+            datetime.fromtimestamp(shifted_deposition_ns / 1_000_000_000, tz=UTC)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        first["time_utc_ns"] = shifted_deposition_ns
+    path = tmp_path / f"bed-arrival-{drift}.json"
+    _write_json(path, payload)
+    with pytest.raises(ValueError):
+        load_arrival_time_manifest(path, config, formal=True)
+
+
+def test_legacy_config_rejects_bed_residence_arrival_schema(tmp_path: Path) -> None:
+    """legacy config 僅接受 1.0.0 arrival，不得讀取 bed-only schema 1.1.0。"""
+
+    payload = _bed_arrival_payload(_bed_config())
+    path = tmp_path / "bed-arrival-cross-load.json"
+    _write_json(path, payload)
+    with pytest.raises(ValueError, match="schema_version"):
+        load_arrival_time_manifest(path, _config(tmp_path), formal=True)
+
+
 @pytest.mark.parametrize("mutation", ["duplicate_core", "duplicate_event"])
 def test_arrival_formal_strata_fail_fast(tmp_path: Path, mutation: str) -> None:
     """總數仍為 250 時，重複核心格或事件也不得穿過 48+2 formal gate。"""
@@ -637,8 +854,11 @@ def test_dynamic_initial_condition_resolves_formal_a_domain_and_pilot_base(tmp_p
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
     payload["scenarios"]["receptor_arrival_initial_condition_manifest"] = None
     payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
+    payload["domains"][0].pop("runtime_spatial_support_policy", None)
     payload["domains"][0]["formal_release_flow_domain_id"] = (
         "northeast_taiwan_common_cache_v4_lbt_south_expanded"
     )
@@ -952,7 +1172,10 @@ def test_geometry_formal_uses_resolved_a_v4_and_pilot_keeps_base_id(tmp_path: Pa
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     payload["design_version"] = "design_baseline_v2_non_rising_oca_proxy"
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
     payload["domains"][0]["formal_domain_policy"] = "expanded_domain_v1"
+    payload["domains"][0].pop("runtime_spatial_support_policy", None)
     payload["domains"][0]["formal_release_flow_domain_id"] = formal_flow
     payload["domains"][0]["formal_release_domain_status"] = "approved"
     payload["domains"][0]["expanded_domain_candidate_id"] = formal_flow

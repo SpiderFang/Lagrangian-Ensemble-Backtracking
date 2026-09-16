@@ -45,7 +45,7 @@ _ROOT_KEYS = {
     "denominator_policy",
 }
 _HASH_KEYS = {"source_sha256", "canonical_sha256"}
-_DENOMINATOR_POLICY = "exclude_data_gap_and_numerical_failure_v1"
+_DENOMINATOR_POLICY = "exclude_data_gap_numerical_failure_and_pre_window_deposition_v1"
 
 
 def _valid_payload() -> dict[str, Any]:
@@ -1295,7 +1295,17 @@ def test_bootstrap_boundary_values_are_accepted(tmp_path: Path, field: str, valu
     assert getattr(spec, field) == value
 
 
-@pytest.mark.parametrize("policy", ["include_all", "", "exclude_data_gap", True, ["exclude"]])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "include_all",
+        "",
+        "exclude_data_gap",
+        "exclude_data_gap_and_numerical_failure_v1",
+        True,
+        ["exclude"],
+    ],
+)
 def test_denominator_policy_must_equal_fixed_policy(tmp_path: Path, policy: Any) -> None:
     """分母政策是跨產品的固定版本識別，不可由輸入檔改成其他文字或型別。"""
 

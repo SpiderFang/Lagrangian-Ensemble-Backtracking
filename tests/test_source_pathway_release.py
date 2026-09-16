@@ -25,6 +25,7 @@ import pytest
 import lagrangian_backtracking.cli as cli_module
 import lagrangian_backtracking.report_font as report_font
 import lagrangian_backtracking.source_pathway_release as source_pathway_module
+from lagrangian_backtracking.models import ParticleStatus
 
 
 def _load_statistics_fixture_module() -> ModuleType:
@@ -159,6 +160,15 @@ def test_png_wall_clock_gate_only_reads_text_metadata_keywords() -> None:
     dated = signature + _png_chunk(b"tEXt", b"Date\x002026-09-08") + _png_chunk(b"IEND", b"")
     with pytest.raises(ValueError, match="wall-clock date metadata"):
         source_pathway_module._assert_no_wall_clock_metadata(dated, file_format="png")
+
+
+def test_pre_window_outcome_has_explicit_release_status_label() -> None:
+    """outcome sidecar 與圖軸不可把 pre-window 狀態退回小寫 enum raw value。"""
+
+    assert (
+        source_pathway_module._status_label(ParticleStatus.PRE_WINDOW_DEPOSITION.value)
+        == "PRE_WINDOW_DEPOSITION"
+    )
 
 
 def test_build_validate_sidecars_and_figures_round_trip(

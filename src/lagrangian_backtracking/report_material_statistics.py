@@ -3,9 +3,10 @@
 本模組是報告層的純計算邊界：它不讀取檔案、不修改 ``ParticleResult``，也不把
 iOcean 清除統計或主管的定性關注轉成速度、數量權重或來源先驗。呼叫端提供已通過
 資料契約的 scenario strata 與一條只遍歷一次的 ``ParticleResult`` iterable；模組依
-``study_site_id × material_id`` 建立固定拓撲，排除 ``DATA_GAP``／
-``NUMERICAL_FAILURE`` 後，統計每個有效系集成員是否曾發生海床接觸，以及是否為沉積
-終止結果。
+``study_site_id × material_id`` 建立固定拓撲，排除 ``DATA_GAP``、
+``NUMERICAL_FAILURE`` 與 ``PRE_WINDOW_DEPOSITION`` 後，統計每個有效系集成員是否曾發生
+海床接觸，以及是否為沉積終止結果。pre-window 是沒有研究窗內漂流歷程，不屬於資料或
+數值失敗 exposure。
 
 事件資料的物理語意如下：``BED_CONTACT`` 是可重複出現的海床接觸診斷，
 ``DEPOSITED`` 是終止沉積事件。第一項統計只保留每個 member 的布林結果，故同一成員
@@ -51,6 +52,7 @@ _INVALID_MEMBER_STATUSES: Final[frozenset[ParticleStatus]] = frozenset(
     {
         ParticleStatus.DATA_GAP,
         ParticleStatus.NUMERICAL_FAILURE,
+        ParticleStatus.PRE_WINDOW_DEPOSITION,
     }
 )
 _BED_EVENT_TYPES: Final[frozenset[EventType]] = frozenset(
@@ -220,8 +222,9 @@ def _resolve_group_ids(
 class MaterialStatistics:
     """一個 ``study_site_id × material_id`` 的 immutable member-level 統計列。
 
-    ``valid_member_denominator`` 是依既有報告政策排除資料缺口／數值失敗後的有效成員
-    數。``first_bed_contact_member_count`` 是曾出現至少一筆 ``BED_CONTACT`` 或
+    ``valid_member_denominator`` 是依報告政策排除資料缺口、數值失敗與研究窗前沉底成員後
+    的有效成員數；最後一類只代表沒有研究窗內漂流歷程，不計為 failure exposure。
+    ``first_bed_contact_member_count`` 是曾出現至少一筆 ``BED_CONTACT`` 或
     ``DEPOSITED`` 的不同 member 數；``deposited_member_count`` 則是終止狀態或事件
     證明已沉積的不同 member 數。兩個 fraction 都以有效分母計算，零分母時為 ``None``。
     repeated contact 只影響「是否曾接觸」的布林判定，不是此基線產品的必要欄位。
@@ -492,7 +495,7 @@ class MaterialStatisticsAccumulator:
 
     @property
     def member_count(self) -> int:
-        """回傳已接受的 logical member 數，包含有效與失敗 member。"""
+        """回傳已接受的 logical member 數，包含有效、失敗及 pre-window 排除成員。"""
 
         return len(self._seen_member_keys)
 
@@ -629,8 +632,9 @@ class MaterialStatisticsAccumulator:
         """驗證並立即吸收一個 member 的結果，遇到錯誤後永久關閉 reducer。
 
         分母與兩個 numerator 都是 member-level 計數：同一 member 的多個 bed events
-        只產生一個布林判定。``DATA_GAP``／``NUMERICAL_FAILURE`` 只留下在外部輸入中
-        已存在的 identity，不進入任何有效材質列；其餘終止狀態才增加有效分母。
+        只產生一個布林判定。``DATA_GAP``、``NUMERICAL_FAILURE`` 與
+        ``PRE_WINDOW_DEPOSITION`` 只留下在外部輸入中已存在的 identity，不進入任何有效
+        材質列；pre-window 不算資料／數值失敗 exposure，其餘終止狀態才增加有效分母。
         """
 
         self._ensure_open()

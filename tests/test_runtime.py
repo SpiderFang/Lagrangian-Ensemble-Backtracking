@@ -17,11 +17,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from shapely.geometry import box
 
 import lagrangian_backtracking.runtime as runtime
+from lagrangian_backtracking.bed_residence import (
+    BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_POLICY_ID,
+    BED_RESIDENCE_SAMPLING_METHOD_ID,
+    BED_RESIDENCE_SAMPLING_POLICY_ID,
+)
 from lagrangian_backtracking.boundaries import BoundaryGeometry
-from lagrangian_backtracking.config import ProjectConfig, load_config
+from lagrangian_backtracking.config import BedResidenceTimeConfig, ProjectConfig
 from lagrangian_backtracking.diffusion import DiffusionCoefficients, SmagorinskySettings
 from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.manifests import BoundaryGeometryBundle, ScenarioInputs
@@ -49,6 +57,10 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
 SITE_ID = "gongliao"
 ARRIVAL_TIME_NS = int(datetime(2025, 1, 15, tzinfo=UTC).timestamp()) * 1_000_000_000
+_BED_RESIDENCE_SEED = 20260916
+_BED_RESIDENCE_MAX_AGE_DAYS = 90
+_HOUR_NS = 3_600_000_000_000
+_DAY_NS = 86_400_000_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +194,13 @@ class _UninspectablePath:
 
 
 def _configured_project_config() -> ProjectConfig:
-    """由範例 YAML 載入真正 ProjectConfig，再以 model_copy 注入 B1b scalar。"""
+    """由正式範例建立明確 legacy runtime fixture，再注入 B1b scalar。"""
 
-    config = load_config(EXAMPLE_CONFIG)
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    payload["scenarios"].pop("bed_residence_time", None)
+    payload["inputs"].pop("backtrack_support_days", None)
+    config = ProjectConfig.model_validate(payload)
     integration = config.integration.model_copy(
         update={
             "dt_min_seconds": 1.0,
@@ -369,6 +385,114 @@ def _scenario_inputs(
         design_version=scenarios[0].design_version,
         initial_conditions=(pair,),
     )
+
+
+def _bed_residence_release_fixture(
+    data: dict[str, Any],
+    *,
+    age_hours: int,
+    backtrack_mode: str,
+) -> dict[str, Any]:
+    """建立具有正式 runtime support window 的單筆沉底到達測試資料。
+
+    此 fixture 以 2025-10-31 作觀測錨點，依整數小時減去沉底年齡建立 deposition UTC，
+    並重建 arrival、dynamic pair 與 Scenario 的同一個 arrival identity。metadata 完整
+    提供 runtime resolver 會核對的政策、方法、seed、年齡分層及兩個 UTC 表示；不讀取
+    forcing，也不代表 50 筆正式母體或真實 OCM／NWW3 產品。
+    """
+
+    if type(age_hours) is not int or age_hours < 0:
+        raise ValueError("測試 age_hours 必須是非負原生整數")
+    observation_ns = int(
+        datetime(2025, 10, 31, tzinfo=UTC).timestamp()
+    ) * 1_000_000_000
+    deposition_ns = observation_ns - age_hours * _HOUR_NS
+
+    def utc_text(time_ns: int) -> str:
+        """以測試所需精度建立帶 Z 的 UTC 字串。"""
+
+        seconds, nanoseconds = divmod(time_ns, 1_000_000_000)
+        stamp = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=seconds)
+        fraction = f".{nanoseconds:09d}" if nanoseconds else ""
+        return f"{stamp:%Y-%m-%dT%H:%M:%S}{fraction}Z"
+
+    total_hours = _BED_RESIDENCE_MAX_AGE_DAYS * 24 + 1
+    stratum_index = next(
+        index
+        for index in range(50)
+        if index * total_hours // 50 <= age_hours < (index + 1) * total_hours // 50
+    )
+    original_arrival = data["arrival"]
+    arrival_id = f"{original_arrival.arrival_time_id}-bed-{age_hours}"
+    metadata = {
+        "observation_time_utc_ns": observation_ns,
+        "observation_time_utc": utc_text(observation_ns),
+        "deposition_time_utc_ns": deposition_ns,
+        "deposition_time_utc": utc_text(deposition_ns),
+        "bed_residence_age_hours": age_hours,
+        "bed_residence_stratum_index": stratum_index,
+        "bed_residence_policy_id": BED_RESIDENCE_POLICY_ID,
+        "bed_residence_sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+        "bed_residence_sampling_method_id": BED_RESIDENCE_SAMPLING_METHOD_ID,
+        "bed_residence_sampling_seed": _BED_RESIDENCE_SEED,
+        "bed_residence_maximum_age_days": _BED_RESIDENCE_MAX_AGE_DAYS,
+        "observation_arrival_time_id": original_arrival.arrival_time_id,
+    }
+    arrival = replace(
+        original_arrival,
+        arrival_time_id=arrival_id,
+        time_utc_ns=deposition_ns,
+        season="SON",
+        metadata=metadata,
+    )
+    pair = replace(
+        data["pair"],
+        arrival_time_id=arrival_id,
+        time_utc_ns=deposition_ns,
+    )
+    scenario = replace(
+        data["scenario"],
+        arrival_time_id=arrival_id,
+        arrival_time_utc_ns=deposition_ns,
+    )
+    inputs = replace(
+        data["inputs"],
+        arrival_times=(arrival,),
+        scenarios=(scenario,),
+        initial_conditions=(pair,),
+        initial_conditions_by_pair={},
+    )
+    residence = BedResidenceTimeConfig(
+        backtrack_mode=backtrack_mode,
+        supported_backtrack_modes=(
+            BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+            BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+        ),
+        maximum_age_days=_BED_RESIDENCE_MAX_AGE_DAYS,
+        sample_count_per_site=50,
+        sampling_policy=BED_RESIDENCE_SAMPLING_POLICY_ID,
+        sampling_seed=_BED_RESIDENCE_SEED,
+        shared_age_offsets_across_sites=True,
+        pre_window_policy="record_pre_window_deposition_without_transport",
+        runtime_horizon_support_days=90,
+    )
+    scenarios = data["config"].scenarios.model_copy(
+        update={"bed_residence_time": residence}
+    )
+    boundaries = data["config"].boundaries.model_copy(
+        update={"max_backtrack_days": 30.0}
+    )
+    config = data["config"].model_copy(
+        update={"scenarios": scenarios, "boundaries": boundaries}
+    )
+    return {
+        **data,
+        "config": config,
+        "arrival": arrival,
+        "pair": pair,
+        "scenario": scenario,
+        "inputs": inputs,
+    }
 
 
 def _geometry_bundle(receptor: Receptor) -> BoundaryGeometryBundle:
@@ -591,6 +715,70 @@ def test_valid_no_stokes_is_lazy_shared_and_uses_dynamic_pair(
         data["scenario"].arrival_time_utc_ns - 7 * 86400 * 1_000_000_000
     )
     assert first.settings.maximum_minimum_clamps == 100
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_horizon_days"),
+    [
+        (BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW, 16),
+        (BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION, 30),
+    ],
+)
+def test_bed_residence_runtime_uses_release_support_and_resolved_forcing_window(
+    runtime_fixture: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_horizon_days: int,
+) -> None:
+    """正式 support=90 的 factory 依沉底 metadata 計算兩種 H=30 回溯窗。"""
+
+    data = _bed_residence_release_fixture(
+        runtime_fixture,
+        age_hours=14 * 24,
+        backtrack_mode=mode,
+    )
+    calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
+    factory = _factory(data, tmp_path)
+
+    request = factory(_unit(data["scenario"]))
+
+    expected_seconds = expected_horizon_days * 86_400.0
+    assert request.initial_state.status.value == "active"
+    assert request.initial_state.time_utc_ns == data["arrival"].time_utc_ns
+    assert request.settings.max_backtrack_seconds == expected_seconds
+    assert request.settings.earliest_forcing_time_utc_ns == (
+        data["arrival"].time_utc_ns - expected_horizon_days * _DAY_NS
+    )
+    assert len(calls) == 1
+    assert data["config"].scenarios.bed_residence_time.runtime_horizon_support_days == 90
+
+
+def test_bed_residence_runtime_pre_window_skips_manager_creation(
+    runtime_fixture: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """沉底早於 H=30 固定研究窗時建立 terminal request，但不建立 forcing manager。"""
+
+    data = _bed_residence_release_fixture(
+        runtime_fixture,
+        age_hours=31 * 24,
+        backtrack_mode=BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    )
+    calls, managers = _patch_from_roots(monkeypatch, _matching_location(data))
+    factory = _factory(data, tmp_path)
+
+    request = factory(_unit(data["scenario"]))
+
+    assert request.initial_state.status.value == "pre_window_deposition"
+    assert request.initial_state.time_utc_ns == data["arrival"].time_utc_ns
+    assert request.settings.max_backtrack_seconds == 30 * 86_400.0
+    assert request.settings.earliest_forcing_time_utc_ns == data["arrival"].time_utc_ns
+    assert calls == []
+    assert managers == []
+    assert factory.resource_stats()["manager_count"] == 0
+    assert request.diffusion == DiffusionCoefficients(0.0, 0.0, 0.0)
 
 
 def test_numba_ocm_backend_is_forwarded_only_to_ocm_kernel_switch(
@@ -1347,7 +1535,8 @@ def _formal_config(data: dict[str, Any], *, gap_safe: bool = False) -> ProjectCo
     """把小型 runtime fixture 補成 formal loader 可接受的設定 snapshot。
 
     這是 legacy expanded-domain runtime fixture：只把第一個 domain 換成 expanded formal
-    ID，並填入正式 gate 所需的 manifest、diffusion、時間與部署決策；scenario／geometry
+    ID，同時移除僅屬 v3 policy 的 runtime spatial-support 設定，並填入正式 gate 所需的
+    manifest、diffusion、時間與部署決策；scenario／geometry
     loader 仍由 monkeypatch 提供一筆小 fixture，避免建立 50,000 情境或讀取真實 forcing。
     新 v3/20 km policy 的 formal gate 另由設定測試證明即使欄位填滿仍會阻擋。
     """
@@ -1368,6 +1557,7 @@ def _formal_config(data: dict[str, Any], *, gap_safe: bool = False) -> ProjectCo
     domains[0] = domains[0].model_copy(
         update={
             "formal_domain_policy": "expanded_domain_v1",
+            "runtime_spatial_support_policy": None,
             "formal_release_flow_domain_id": "northeast_taiwan_common_cache_v4_lbt_south_expanded",
             "formal_release_domain_status": "approved",
             "expanded_domain_candidate_id": "northeast_taiwan_common_cache_v4_lbt_south_expanded",
