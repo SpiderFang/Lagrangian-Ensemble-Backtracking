@@ -138,7 +138,15 @@ mode 或 topology tamper。legacy suite 缺少必要 180/90 日逐時節點時 f
 gap-censored suite 則完整列舉缺時，runtime 在第一個向後缺口產生 `data_gap` 並截尾，但仍拒絕
 deposition 起點缺資料、manifest 漂移或不完整 policy；任何模式都不能補零、用最近值或未登錄外插繞過。
 
+本版命令的 source template 固定為
+`configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml`；它已具體化
+Kh/Kz、時間步長、M=10、seed、Numba backend、分片與 checkpoint scalar，但仍保留
+由 suite 依 H 寫入的支援日數、release horizon 與步數 placeholder。不要把
+`configs/lagrangian_backtracking.example.yaml` 當成正式 template。
+
 ```bash
+export FORMAL_CONFIG_TEMPLATE="configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml"
+
 uv run lbt horizon-suite-create \
   --config-template "$FORMAL_CONFIG_TEMPLATE" \
   --backtrack-days 30 60 90 \

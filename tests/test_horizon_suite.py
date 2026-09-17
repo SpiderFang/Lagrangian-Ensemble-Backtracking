@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 import lagrangian_backtracking.horizon_suite as horizon_suite
+from lagrangian_backtracking.config import load_config
 from lagrangian_backtracking.input_derivation import (
     ARTIFACT_FILENAMES,
     DERIVED_INPUT_SCHEMA_VERSION,
@@ -32,6 +33,43 @@ from lagrangian_backtracking.input_horizon import (
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CONFIG = ROOT / "configs" / "lagrangian_backtracking.example.yaml"
+FORMAL_CONFIG_TEMPLATE = ROOT / "configs" / "lagrangian_backtracking.formal_h30_h60_h90_m10.yaml"
+
+_FORMAL_TEMPLATE_SCALAR_PATHS: tuple[tuple[str, ...], ...] = (
+    ("physics", "horizontal_diffusion", "constant_kh_m2ps"),
+    ("physics", "vertical_diffusion", "constant_kz_m2ps"),
+    ("integration", "output_interval_seconds"),
+    ("integration", "dt_min_seconds"),
+    ("integration", "dt_max_seconds"),
+    ("scenarios", "members_per_scenario"),
+    ("scenarios", "master_seed"),
+    ("execution", "ocm_interpolation_backend"),
+    ("execution", "physics_kernel_backend"),
+    ("execution", "shard_scenario_count"),
+    ("execution", "checkpoint_interval_sweeps"),
+    ("execution", "active_chunk_size"),
+)
+
+
+def _without_formal_template_scalars(payload: dict[str, Any]) -> dict[str, Any]:
+    """移除 concrete template 核定 scalar，供科學結構等價測試比較。
+
+    formal template 與 example 必須共用同一份四域、五站、受體、arrival、材質與
+    runtime 科學契約；唯一允許差異是這一批已核定的執行 scalar，以及 formal template
+    必須明示的兩個 Numba backend。測試先深拷貝 mapping，再移除這些路徑，不會修改
+    pytest 讀入的原始 YAML，也不會把 horizon-suite 產生的 release 欄位誤列為 template
+    結構的一部分。
+    """
+
+    result = copy.deepcopy(payload)
+    for path in _FORMAL_TEMPLATE_SCALAR_PATHS:
+        section: dict[str, Any] = result
+        for key in path[:-1]:
+            child = section.get(key)
+            assert isinstance(child, dict), f"template path 不是 mapping：{path}"
+            section = child
+        section.pop(path[-1], None)
+    return result
 
 
 def _write_template(path: Path, *, support_days: int | None = None) -> bytes:
@@ -297,6 +335,95 @@ def test_horizon_step_budget_uses_dt_min_and_rejects_invalid_dt() -> None:
     for invalid_dt in (0, -1, float("nan"), True, "30"):
         with pytest.raises(horizon_suite.HorizonSuiteError):
             horizon_suite.maximum_step_count_for_horizon(30, invalid_dt)
+
+
+def test_formal_horizon_template_concretizes_only_approved_scalars() -> None:
+    """正式 horizon template 只具體化已核定 scalar，其他科學結構須與 example 相同。
+
+    本測試不讀取 OCM／NWW 大型資料；它檢查即將交給 ``horizon-suite-create`` 的
+    source template 是否仍保留四域五站、random 受體、90 日沉底年齡與兩種模式，並
+    防止操作員把 H30/H60/H90 的 release-specific horizon、manifest 或 maximum step
+    count 直接手填進 source。example 的 null placeholder 也在此明確保留，避免未來
+    維護時把兩種檔案的用途混為一談。
+    """
+
+    example_text = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+    formal_text = FORMAL_CONFIG_TEMPLATE.read_text(encoding="utf-8")
+    example = yaml.safe_load(example_text)
+    formal = yaml.safe_load(formal_text)
+    assert isinstance(example, dict)
+    assert isinstance(formal, dict)
+
+    expected_scalars = {
+        ("physics", "horizontal_diffusion", "constant_kh_m2ps"): 0.4429482105965188,
+        ("physics", "vertical_diffusion", "constant_kz_m2ps"): 0.0013526236792521886,
+        ("integration", "output_interval_seconds"): 300,
+        ("integration", "dt_min_seconds"): 0.1,
+        ("integration", "dt_max_seconds"): 30,
+        ("scenarios", "members_per_scenario"): 10,
+        ("scenarios", "master_seed"): 20260916,
+        ("execution", "ocm_interpolation_backend"): "numba_ocm_v1",
+        ("execution", "physics_kernel_backend"): "numba_cpu_v1",
+        ("execution", "shard_scenario_count"): 100,
+        ("execution", "checkpoint_interval_sweeps"): 10000,
+        ("execution", "active_chunk_size"): 100,
+    }
+    for path, expected in expected_scalars.items():
+        formal_value: Any = formal
+        example_value: Any = example
+        for key in path:
+            assert isinstance(formal_value, dict)
+            formal_value = formal_value[key]
+            example_value = example_value.get(key)
+        assert formal_value == expected
+        # execution backend 是 formal source 必須新增的 explicit binding；其餘核定
+        # scalar 在 example 內仍刻意是 null，讓這個差異也能被測試清楚表達。
+        if path not in {
+            ("execution", "ocm_interpolation_backend"),
+            ("execution", "physics_kernel_backend"),
+        }:
+            assert example_value is None
+
+    assert _without_formal_template_scalars(formal) == _without_formal_template_scalars(
+        example
+    )
+    assert formal["inputs"]["backtrack_support_days"] == 180
+    assert formal["boundaries"]["max_backtrack_days"] is None
+    assert formal["boundaries"]["maximum_step_count"] is None
+    bed = formal["scenarios"]["bed_residence_time"]
+    assert bed["maximum_age_days"] == 90
+    assert bed["sampling_seed"] == 20260916
+    assert bed["runtime_horizon_support_days"] is None
+    assert example["integration"]["dt_min_seconds"] is None
+    assert example["scenarios"]["members_per_scenario"] is None
+    assert "ded8463" in formal_text
+    assert "horizon-suite-create --backtrack-days 30 60 90 --formal-release" in formal_text
+    assert "不是已完成科學驗證" in formal_text
+    assert "example.yaml 仍保留 null placeholder" in formal_text
+
+
+def test_formal_horizon_template_reaches_safe_scalar_validation_without_large_data() -> None:
+    """concrete template 可通過 schema／suite scalar gate，且不因 dt_min placeholder 停止。"""
+
+    config = load_config(FORMAL_CONFIG_TEMPLATE, formal_release=False)
+    assert config.execution.ocm_interpolation_backend == "numba_ocm_v1"
+    assert config.execution.physics_kernel_backend == "numba_cpu_v1"
+    payload = yaml.safe_load(FORMAL_CONFIG_TEMPLATE.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+
+    # 這是 horizon-suite 在讀取 source 後、接觸 forcing root 前的最深 scalar 邊界：
+    # common payload 只會改寫 suite 支援日數／步數／相對 manifest，完全不觸碰大型資料。
+    common = horizon_suite._derive_common_payload(payload, 90)
+    assert horizon_suite._read_dt_min_and_validate_common(common, 90) == 0.1
+    assert common["inputs"]["backtrack_support_days"] == 180
+    assert common["boundaries"]["max_backtrack_days"] == 90.0
+    assert common["boundaries"]["maximum_step_count"] == 77760001
+    assert {
+        days: horizon_suite.maximum_step_count_for_horizon(days, common["integration"]["dt_min_seconds"])
+        for days in (30, 60, 90)
+    } == {30: 25920001, 60: 51840001, 90: 77760001}
+    # config hash 也在資料讀取前完成，確保正式 common-input source identity 可固定。
+    assert len(horizon_suite._config_hash_from_payload(common)) == 64
 
 
 def test_build_horizon_suite_uses_one_common_input_and_emits_identity_closure(

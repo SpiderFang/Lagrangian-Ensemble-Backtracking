@@ -18,8 +18,23 @@ CLI 參數優先使用明示的 root；未明示時，只讀 config 指定的環
 inventory 使用 `$OCM_NATIVE_ROOT/<flow_domain_id>/...`、`$OCM_SURFACE_ROOT/<flow_domain_id>/...`
 與 `$NWW_ANALYSIS_ROOT/<flow_domain_id>/...` 等 lexical token。
 
-下列命令中的 `$FORMAL_CONFIG_TEMPLATE` 必須指向實際存在且未綁定 release／pilot 的 YAML
-template；不可改用已產生的 release config、`common-config.yaml` 或其他已有 derived path 的設定。
+本版 H30/H60/H90、M=10 的 concrete source template 是
+`configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml`；可先以
+`export FORMAL_CONFIG_TEMPLATE="configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml"`
+固定命令輸入。下列命令中的 `$FORMAL_CONFIG_TEMPLATE` 必須指向實際存在且未綁定
+release／pilot 的 YAML template；不可改用已產生的 release config、`common-config.yaml`
+或其他已有 derived path 的設定。`configs/lagrangian_backtracking.example.yaml` 仍是
+null placeholder，不能直接送入正式批次。
+
+source template 只預填已核定 scalar；其餘 H30/H60/H90 的 suite 欄位由一次
+`horizon-suite-create` 產生：
+
+| 區段 | 核定值 |
+|---|---|
+| `physics` | `constant_kh_m2ps=0.4429482105965188`；`constant_kz_m2ps=0.0013526236792521886` |
+| `integration` | `output_interval_seconds=300`；`dt_min_seconds=0.1`；`dt_max_seconds=30` |
+| `scenarios` | `members_per_scenario=10`；`master_seed=20260916` |
+| `execution` | `ocm_interpolation_backend=numba_ocm_v1`；`physics_kernel_backend=numba_cpu_v1`；`shard_scenario_count=100`；`checkpoint_interval_sweeps=10000`；`active_chunk_size=100` |
 
 accepted-product fingerprint 對小型且直接影響資料契約的 `grid/metadata.json`、
 `months/*/metadata.json` 與 `months/*/time_utc_ns.npy` 保存實際 SHA-256；大型 required

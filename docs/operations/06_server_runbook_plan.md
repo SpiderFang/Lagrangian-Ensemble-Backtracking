@@ -240,8 +240,23 @@ uv run lbt benchmark-report "$WORKSPACE" \
 core，且不納入 35 km sensitivity。A 區不再等待共同兩格 forcing margin；正式設定改以
 `runtime_stage_fail_closed_no_expansion_v1` 在每個 RK4 階段驗證實際 OCM native／NWW
 analysis 支援，無支援就保存 `data_gap`／對應品質狀態並停止，不補值或切成 current-only。
-但 repository 仍沒有可直接使用的四區五站正式 release config，因此不要把 example config
-改名後執行 formal，也不要把 A 區 1 天／20 情境或 B 區 pilot 當成正式替代品。
+repository 現已提供可交給 horizon-suite 的 concrete source template
+`configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml`；它仍不是 approved release，
+不要把 `lagrangian_backtracking.example.yaml` 改名後執行 formal，也不要把 A 區 1 天／20
+情境或 B 區 pilot 當成正式替代品。資料與正式 gate 全部解鎖後，H30/H60/H90 只建立一次共同
+輸入並產生六份 release：
+
+```bash
+export FORMAL_CONFIG_TEMPLATE="$LBT_PROJECT_ROOT/configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml"
+uv run lbt horizon-suite-create \
+  --config-template "$FORMAL_CONFIG_TEMPLATE" \
+  --backtrack-days 30 60 90 \
+  --destination "$LBT_OUTPUT_ROOT/horizon-suites/h30-h60-h90-m10-v1" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+```
 
 正式執行至少要先具備：已核准且可重建的完整輸入成果、正式設定、逐階段 forcing 支援契約、
 完整情境與 seed 綁定、checkpoint／隨機數延續驗證、效能證據與科學驗證。缺一項就停止。

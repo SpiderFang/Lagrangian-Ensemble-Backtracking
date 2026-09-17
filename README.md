@@ -160,7 +160,24 @@ current design 的 horizon-suite release 會同時寫入 `inputs.ocm_gap_safe_ar
 
 ### 5.1 隨機沉底與一次建立六份回溯設定
 
-正式範例固定最大沉底年齡 90 日、五站共用 50 個分層隨機整點小時與 seed `20260916`。`fixed_calendar_window` 以固定日曆窗扣除沉底年齡；窗前沉底記為 `pre_window_deposition`，不讀流場資料，也不進來源比例有效分母；`full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
+正式 H30/H60/H90、M=10 的 common-input source template 為
+[`configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml`](configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml)。它
+固定最大沉底年齡 90 日、五站共用 50 個分層隨機整點小時與 seed `20260916`；只供
+`horizon-suite-create --backtrack-days 30 60 90 --formal-release` 一次建立共同母體，
+不是已完成科學驗證的 approved release。`configs/lagrangian_backtracking.example.yaml`
+仍保留 null placeholder，不能直接執行正式批次。`fixed_calendar_window` 以固定日曆窗扣除沉底年齡；
+窗前沉底記為 `pre_window_deposition`，不讀流場資料，也不進來源比例有效分母；
+`full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
+
+template 只把下列已核定的執行 scalar 具體化，H30/H60/H90 的支援日數、release horizon 與步數由
+horizon-suite 產生：
+
+| 區段 | 核定 scalar |
+|---|---|
+| `physics` | `constant_kh_m2ps=0.4429482105965188`；`constant_kz_m2ps=0.0013526236792521886` |
+| `integration` | `output_interval_seconds=300`；`dt_min_seconds=0.1`；`dt_max_seconds=30` |
+| `scenarios` | `members_per_scenario=10`；`master_seed=20260916` |
+| `execution` | `ocm_interpolation_backend=numba_ocm_v1`；`physics_kernel_backend=numba_cpu_v1`；`shard_scenario_count=100`；`checkpoint_interval_sweeps=10000`；`active_chunk_size=100` |
 
 `horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation 選時包絡為 180 日，沉底後 gap-censored 執行支援上限為 90 日，再發布兩種模式共六份 release。六份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及[CLI 參考](docs/operations/cli_reference.md)。
 
