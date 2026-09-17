@@ -165,6 +165,15 @@ common-input 完成後，suite 由這一份共同母體產生 **六份** release
 arrival/receptor/material/initial-condition/scenario identities 與 artifacts fingerprints 必須一致。
 bed suite 的 `source_schema_version` 對應 1.1.0 arrival/gap schema；legacy suite 則登錄 1.0.0。
 
+對目前 design 且 `inputs.time_axis_contract.reconstruction_policy` 為
+`approved_ocm_hybrid_reconstruction_v1` 的 release，`inputs.ocm_gap_safe_arrival_manifest`
+與 `inputs.ocm_gap_reconstruction_manifest` 會 exact 指向同一份
+`../common-input/ocm_gap_safe_arrival.json`。這份 immutable common-input 檔案是
+schema／artifact closure 與 runtime 支援契約的共同證據；四區重建 patch 的實際 domain
+manifest 與 root index 仍由外部 `OCM_RECONSTRUCTION_ROOT` 提供，不能把 NFS root 或 root
+index 路徑寫進 release YAML。legacy 或未啟用核准 reconstruction policy 的 release
+維持只有既有 `ocm_gap_safe_arrival_manifest` binding，不因 suite 建置而新增欄位。
+
 新版 suite manifest 另以 exact 欄位保存 `forcing_years=[2024, 2025]`、
 `observation_years=[2025]`、`arrival_selection_policy_id`、
 `replicates_per_stratum=2`、`arrival_core_count=48` 與 `arrival_event_count=2`。validator

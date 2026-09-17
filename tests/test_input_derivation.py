@@ -1763,6 +1763,10 @@ def test_inputs_build_validate_and_release_config(
     )
     assert created["config_status"] == "generated"
     release_payload = yaml.safe_load(release_path.read_text(encoding="utf-8"))
+    # synthetic fixture 明示 legacy v2 design，即使沿用目前範例的 time-axis 欄位，也
+    # 不得因 release rewriter 而新增 reconstruction binding；這保留舊 release 的
+    # schema／hash 語意，並由下方 validator regression assertion 確認可讀。
+    assert release_payload["inputs"].get("ocm_gap_reconstruction_manifest") is None
     assert (
         release_payload["release_binding"]["schema_version"]
         == input_derivation_module.DERIVED_INPUT_SCHEMA_VERSION
@@ -1793,6 +1797,62 @@ def test_inputs_build_validate_and_release_config(
     cli_payload = yaml.safe_load(cli_release_path.read_text(encoding="utf-8"))
     assert cli_payload["boundaries"]["max_backtrack_days"] == 7.0
     assert cli_payload["boundaries"]["maximum_step_count"] == 2016
+
+
+def test_current_reconstruction_release_binds_safe_manifest_twice_only_for_approved_policy(
+    tmp_path: Path,
+) -> None:
+    """current reconstruction release 的兩個欄位必須共用 immutable 支援證據。
+
+    這裡只測試 release rewriter 的純 mapping 契約，避免為了確認相對路徑而重建大型
+    synthetic OCM/NWW fixture。current design 加上 approved policy 時，runtime 選用的
+    reconstruction manifest 與 schema／closure 使用的 gap-safe manifest 必須 exact 相同；
+    legacy design 或未登錄 reconstruction policy 則只能保留原本的 safe 欄位。
+    """
+
+    template = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(template, dict)
+    output = tmp_path / "release-configs" / "release.yaml"
+    input_directory = tmp_path / "common-input"
+
+    current = input_derivation_module._replace_manifest_references(
+        template,
+        config_output=output,
+        input_directory=input_directory,
+    )
+    expected_manifest = "../common-input/ocm_gap_safe_arrival.json"
+    assert current["inputs"]["ocm_gap_safe_arrival_manifest"] == expected_manifest
+    assert current["inputs"]["ocm_gap_reconstruction_manifest"] == expected_manifest
+    formal_candidate = deepcopy(current)
+    formal_candidate["config_status"] = "approved"
+    try:
+        ProjectConfig.model_validate(formal_candidate).assert_formal_release_ready()
+    except ValueError as exc:
+        # example 仍故意缺少 members／物理與執行參數的正式核定值；但新增 binding
+        # 後不得再以「缺少 OCM reconstruction 或 gap-safe manifest」阻擋 ready gate。
+        assert "OCM approved reconstruction 或 gap-safe arrival/horizon manifest 尚未產出" not in str(exc)
+
+    legacy = deepcopy(template)
+    legacy["design_version"] = "design_baseline_v3_non_rising_a_v3_local20_20260909"
+    legacy["inputs"].pop("ocm_gap_reconstruction_manifest", None)
+    legacy_result = input_derivation_module._replace_manifest_references(
+        legacy,
+        config_output=output,
+        input_directory=input_directory,
+    )
+    assert legacy_result["inputs"]["ocm_gap_safe_arrival_manifest"] == expected_manifest
+    assert "ocm_gap_reconstruction_manifest" not in legacy_result["inputs"]
+
+    non_reconstruction = deepcopy(template)
+    non_reconstruction["inputs"]["time_axis_contract"].pop("reconstruction_policy")
+    non_reconstruction["inputs"].pop("ocm_gap_reconstruction_manifest", None)
+    non_reconstruction_result = input_derivation_module._replace_manifest_references(
+        non_reconstruction,
+        config_output=output,
+        input_directory=input_directory,
+    )
+    assert non_reconstruction_result["inputs"]["ocm_gap_safe_arrival_manifest"] == expected_manifest
+    assert "ocm_gap_reconstruction_manifest" not in non_reconstruction_result["inputs"]
 
 
 def test_release_config_cli_forwards_optional_horizon_overrides(

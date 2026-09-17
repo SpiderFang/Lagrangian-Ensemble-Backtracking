@@ -58,6 +58,7 @@ from .bed_residence import (
 from .config import (
     ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1,
     ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+    CURRENT_DESIGN_VERSION,
     FORMAL_DOMAIN_POLICY_EXPANDED_V1,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
     FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION,
@@ -72,6 +73,7 @@ from .config import (
     resolve_flow_domain_id,
 )
 from .gap_policy import (
+    APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID,
     EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
     OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
@@ -7588,7 +7590,15 @@ def validate_input_derivatives(
 def _replace_manifest_references(
     payload: dict[str, Any], *, config_output: Path, input_directory: Path
 ) -> dict[str, Any]:
-    """把範例 config 的 derived path 改成相對於新 config 的 immutable component path。"""
+    """把範例 config 的 derived path 改成相對於新 config 的 immutable component path。
+
+    目前正式設計若明示已核准的 OCM 混合重建政策，``ocm_gap_safe_arrival.json``
+    同時是 input-build 產出的不可變支援證據；因此 release config 必須把它綁到
+    ``ocm_gap_safe_arrival_manifest`` 與 ``ocm_gap_reconstruction_manifest`` 兩個欄位。
+    後者只告訴 runtime 應採用重建支援契約，實際重建 patch 的 root index 仍由
+    ``OCM_RECONSTRUCTION_ROOT`` 在執行環境注入，不能把外部 root 路徑寫進 config。
+    legacy 或未核准重建的設定不新增第二個 binding，以保留既有 schema／hash 語意。
+    """
 
     result = json.loads(json.dumps(payload, ensure_ascii=False))
     relative_directory = os.path.relpath(input_directory, config_output.parent)
@@ -7596,7 +7606,12 @@ def _replace_manifest_references(
     paths = {
         kind: (relative_directory / filename).as_posix() for kind, filename in ARTIFACT_FILENAMES.items()
     }
-    result.setdefault("inputs", {})["ocm_gap_safe_arrival_manifest"] = paths["ocm_gap_safe_arrival_horizon"]
+    inputs = result.setdefault("inputs", {})
+    inputs["ocm_gap_safe_arrival_manifest"] = paths["ocm_gap_safe_arrival_horizon"]
+    if _approved_reconstruction_release_binding_enabled(result):
+        # reconstruction 與 gap-safe 兩欄位刻意共用同一份 immutable common-input 檔案；
+        # reconstruction root index 不在此欄位內，仍由 runtime 的外部 root gate 驗證。
+        inputs["ocm_gap_reconstruction_manifest"] = paths["ocm_gap_safe_arrival_horizon"]
     result.setdefault("inputs", {})["nww_full_hourly_analysis_manifest"] = paths["nww_full_hourly"]
     result.setdefault("scenarios", {})["material_manifest"] = paths["material"]
     result.setdefault("scenarios", {})["receptor_manifest"] = paths["receptor"]
@@ -7611,6 +7626,26 @@ def _replace_manifest_references(
     result.setdefault("geometry", {})["receptor_manifest"] = paths["receptor"]
     result["inputs"]["derived_input_artifact_index"] = (relative_directory / "artifact_index.json").as_posix()
     return result
+
+
+def _approved_reconstruction_release_binding_enabled(payload: Mapping[str, Any]) -> bool:
+    """判斷 release 是否必須登錄 OCM reconstruction manifest binding。
+
+    只有目前正式 design 與設定內明示的核准重建 policy 同時成立時才啟用；這個
+    fail-closed 條件避免 legacy config 因沿用目前範例的欄位結構而意外取得新的
+    runtime binding。函式只讀取 YAML mapping，不推測缺少的欄位，也不驗證外部
+    reconstruction root；root index 的存在與 checksum 由 runtime／preflight 另行驗證。
+    """
+
+    inputs = payload.get("inputs")
+    if payload.get("design_version") != CURRENT_DESIGN_VERSION or not isinstance(inputs, Mapping):
+        return False
+    time_axis_contract = inputs.get("time_axis_contract")
+    return (
+        isinstance(time_axis_contract, Mapping)
+        and time_axis_contract.get("reconstruction_policy")
+        == APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID
+    )
 
 
 def _flow_domain_ids_from_inventory(inventory: Mapping[str, Any]) -> dict[str, str]:
@@ -8639,6 +8674,16 @@ def validate_release_config(
                     "geometry.open_boundary_manifest": "open_boundary",
                     "geometry.receptor_manifest": "receptor",
                 }
+                if _approved_reconstruction_release_binding_enabled(payload):
+                    # current reconstruction release 必須將 runtime 選用的欄位也 exact
+                    # 綁到同一份 common-input 支援證據；未啟用該 policy 的 legacy
+                    # config 不加入這個檢查，保留舊 release 的欄位集合與相容性。
+                    config_references["inputs.ocm_gap_reconstruction_manifest"] = (
+                        payload.get("inputs", {}).get("ocm_gap_reconstruction_manifest")
+                    )
+                    reference_to_kind[
+                        "inputs.ocm_gap_reconstruction_manifest"
+                    ] = "ocm_gap_safe_arrival_horizon"
                 for label, value in config_references.items():
                     kind = reference_to_kind[label]
                     if value != expected_paths.get(kind):

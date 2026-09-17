@@ -153,6 +153,13 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 OCM 重建建置器只讀上游 schema 3 cache，並在另一個 NFS 目錄發布缺失 UTC rows；不改寫原始月份。它只重建具雙側 exact support 的 419 個內部缺時；`2024-01-01 00:00 UTC` 因沒有左側支援，維持流場起始邊界。月份陣列、逐列方法來源、局部不可用格點、來源與網格 fingerprint、設定及 SHA-256 都記錄在 patch manifest；執行階段僅在 config 明示核准 reconstruction policy 且 manifest/root 完整綁定時掛載，未登錄缺口仍回傳 `data_gap`。四區一次建置與 `--resume` 命令見[全部可得資料與時間重建](docs/operations/10_available_data_time_reconstruction_and_a_expansion.md#45-四區稀疏-patch-建置操作)。
 
+current design 的 horizon-suite release 會同時寫入 `inputs.ocm_gap_safe_arrival_manifest` 與
+`inputs.ocm_gap_reconstruction_manifest`，兩者故意指向同一份
+`common-input/ocm_gap_safe_arrival.json`：前者供 schema／artifact closure 驗證，後者是
+runtime 採用核准重建支援契約的 immutable common-input 證據。實際四區重建 patch 的
+domain manifest／root index 仍位於外部 `OCM_RECONSTRUCTION_ROOT`，不會被寫入 release
+config；legacy 或未啟用核准 reconstruction policy 的設定不會新增第二個 binding。
+
 本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
 效能改善以[正式完整母體效能工作線](docs/operations/16_performance_improvement_tracks.md)推進。首批提供 `run-worker` 接續執行同 run 的指定分片並重用流場管理器、正常步首速度樣本重用，以及 OCM 表面資料的少量格點取值；使用方法見[CLI 參考](docs/operations/cli_reference.md)。未來各區正式完整母體使用 `run-formal-parallel`：固定數量的長壽命 worker 依固定 run plan 確定分組，每個程序以單一 `run-worker` 連續執行自己的 shard 群，重用同程序流場管理器與已編譯 dispatcher。完整完成仍須全 shard lifecycle、child exit 與 `validate-run --require-complete` 同時通過；不做舊／新版倍率 A/B 比較，也不把局部試跑當完整成果。實際正式執行仍須先通過版本化輸入、乾淨 deployment provenance、SERVER NFS 儲存檢查與科學驗證；runner 還會即時核對本次 `scratch_root` 的 NFS source，避免誤用其他掛載點的 PASS 快照。設定可明示 `execution.physics_kernel_backend: numpy_v1` 或 `numba_cpu_v1`，OCM 內層插值另可明示 `execution.ocm_interpolation_backend: numpy_v1` 或 `numba_ocm_v1`。後端版本會進入設定與 run 身分；省略欄位的舊設定仍沿用 NumPy。Numba dispatcher 目前使用 `cache=False`，每個正式 worker 會在自己程序內呼叫 `warmup_numba_backend()` 一次，編譯結果只留在該程序記憶體，不能宣稱跨程序磁碟 cache 重用。若設定了 Numba backend，`NUMBA_CACHE_DIR` 仍必須明示為通過儲存檢查的 scratch 子目錄，並在匯入加速模組前設定；這是安全路徑契約，不代表目前核心會寫入 `.nbc`／`.nbi`。
