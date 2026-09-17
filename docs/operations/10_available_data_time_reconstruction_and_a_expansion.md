@@ -160,6 +160,9 @@ python scripts/build_ocm_reconstruction.py \
   --flow-id lienchiang_common_cache_v3
 ```
 
+`houwan_nmmba_cache_v3` 是 C 區 forcing 產品的歷史固定 ID，不是現行研究站點名稱；
+目前 C 站點在 config／manifest 中使用 `study_site_id=nanwan`、顯示名稱「南灣」。
+
 背景 log 逐行輸出 JSON，依 `flow_start`、`gap_start`、`gap_complete`、
 `month_published`、`flow_complete` 與 `root_index_published` 判讀進度。若程序在完整 domain
 發布後中斷，可用相同參數加 `--resume`；程式只沿用已通過 manifest、sidecar 與全部 array

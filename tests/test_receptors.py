@@ -11,6 +11,7 @@ from lagrangian_backtracking.receptors import (
     build_vertical_targets,
     prepare_horizontal_receptor_candidates,
     select_horizontal_receptors,
+    select_horizontal_receptors_from_coordinates,
     select_horizontal_receptors_from_pool,
 )
 
@@ -155,6 +156,73 @@ def test_pool_selection_fails_closed_when_exclusion_leaves_fewer_than_five() -> 
     )
     with pytest.raises(ValueError, match="候選不足"):
         select_horizontal_receptors_from_pool(pool, count=5, excluded_face_indices=(0,))
+
+
+def test_fixed_coordinates_preserve_declared_order_and_mesh_faces() -> None:
+    """固定點 selector 應逐點映射同一 mesh，且不以 maximin 改變宣告順序。"""
+
+    mesh = _five_face_mesh()
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="hsinchu",
+        mesh=mesh,
+        candidate_polygon_metric=box(-10.0, -10.0, 200.0, 10.0),
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=np.zeros((50, 5)),
+    )
+    coordinates_lonlat = [
+        (float(pool.candidate_lon[index]), float(pool.candidate_lat[index]))
+        for index in (3, 0, 4, 1, 2)
+    ]
+    coordinates_xy = [
+        tuple(float(value) for value in pool.candidate_xy_m[index])
+        for index in (3, 0, 4, 1, 2)
+    ]
+    selected = select_horizontal_receptors_from_coordinates(
+        pool,
+        coordinates_lonlat=coordinates_lonlat,
+        coordinates_xy=coordinates_xy,
+    )
+    assert [item.source_face_local_index for item in selected] == [3, 0, 4, 1, 2]
+
+
+@pytest.mark.parametrize(
+    "coordinates_factory",
+    [
+        lambda pool: [
+            tuple(float(value) for value in pool.candidate_xy_m[index])
+            for index in (0, 0, 2, 3, 4)
+        ],
+        lambda pool: [
+            tuple(float(value) for value in pool.candidate_xy_m[index])
+            for index in (0, 1, 2, 3, 4)
+        ],
+    ],
+    ids=["duplicate-face", "tampered-distance"],
+)
+def test_fixed_coordinates_fail_closed_on_duplicate_or_tamper(coordinates_factory) -> None:
+    """固定點重複映射或座標偏離候選 face 時必須停止，不得 fallback。"""
+
+    mesh = _five_face_mesh()
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="hsinchu",
+        mesh=mesh,
+        candidate_polygon_metric=box(-10.0, -10.0, 200.0, 10.0),
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=np.zeros((50, 5)),
+    )
+    coordinates_lonlat = [
+        (float(pool.candidate_lon[index]), float(pool.candidate_lat[index]))
+        for index in range(5)
+    ]
+    coordinates_xy = coordinates_factory(pool)
+    if coordinates_xy == [tuple(float(value) for value in pool.candidate_xy_m[index]) for index in range(5)]:
+        coordinates_xy[1] = (coordinates_xy[1][0] + 2.0, coordinates_xy[1][1])
+    with pytest.raises(ValueError, match="固定受體"):
+        select_horizontal_receptors_from_coordinates(
+            pool,
+            coordinates_lonlat=coordinates_lonlat,
+            coordinates_xy=coordinates_xy,
+        )
 
 
 def test_vertical_targets_are_positive_up_and_distinct() -> None:

@@ -245,8 +245,10 @@ def _complete_exact_records() -> tuple[tuple[Scenario, ...], tuple[Receptor, ...
 
     receptors = []
     arrivals = []
+    # 合成完整來源跟隨現行正式站點契約；C 區使用 nanwan，避免共用 fixture
+    # 以歷史 houwan site ID 觸發 current config 的 flow-domain 查找失敗。
     for site, region in (
-        ("gongliao", "A"), ("guishan", "A"), ("hsinchu", "B"), ("houwan", "C"), ("lienchiang", "D"),
+        ("gongliao", "A"), ("guishan", "A"), ("hsinchu", "B"), ("nanwan", "C"), ("lienchiang", "D"),
     ):
         for horizontal in range(5):
             for vertical in range(4):

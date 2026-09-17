@@ -287,7 +287,8 @@ uv run lbt inputs-build \
   --pilot-arrival-utc guishan=2024-01-02T01:00:00Z
 ```
 
-其餘區域只把 `--pilot-arrival-utc` 的站點鍵換成 `houwan` 或 `lienchiang`。builder 會逐筆驗證
+其餘區域只把 `--pilot-arrival-utc` 的站點鍵換成 `nanwan` 或 `lienchiang`；`houwan` 僅供歷史唯讀
+artifact，current config 不接受。builder 會逐筆驗證
 `2024-01-01T01:00:00Z` 至 `2024-01-02T01:00:00Z` inclusive 的 25 個 exact-hour 節點
 是否同時存在於 OCM native、OCM surface、NWW3 analysis，並重做 NWW metric location 四角
 static／dynamic 支援與 OCM native gap-safe gate；缺任何一小時即 fail closed，不使用

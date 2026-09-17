@@ -348,12 +348,25 @@ def build_scenarios(
 
 
 def validate_baseline_coverage(scenarios: Sequence[Scenario]) -> dict[str, int]:
-    """確認五站各 10,000 個、A 區 20,000 個、全案 50,000 個基礎情境。"""
+    """確認五站各 10,000 個、A 區 20,000 個、全案 50,000 個基礎情境。
+
+    現行 ``CURRENT_DESIGN_VERSION`` 的 C 區正式站點是 ``nanwan``；若整批情境仍
+    使用已登錄 legacy design，則暫時接受歷史 ``houwan`` 集合，供唯讀結果與相容
+    工具驗證。這個分流讓歷史 artifact 不被改寫，同時使目前正式設計無法悄悄把
+    houwan 混入南灣母體。
+    """
 
     counts: dict[str, int] = {}
     for scenario in scenarios:
         counts[scenario.study_site_id] = counts.get(scenario.study_site_id, 0) + 1
-    expected_sites = {"gongliao", "guishan", "hsinchu", "houwan", "lienchiang"}
+    # 這裡不能反向 import config，因為 config 會載入 bed-residence，而 bed-residence
+    # 又依賴 Scenario 型別。以實際 C 區 site ID 判斷目前／歷史集合即可：正式 current
+    # builder 一定含 nanwan；只有完全沒有 nanwan 的舊 artifact 才可保留 houwan。
+    expected_sites = (
+        {"gongliao", "guishan", "hsinchu", "nanwan", "lienchiang"}
+        if "nanwan" in counts
+        else {"gongliao", "guishan", "hsinchu", "houwan", "lienchiang"}
+    )
     if set(counts) != expected_sites or any(value != 10_000 for value in counts.values()):
         raise ValueError(f"baseline coverage 不符：{counts}")
     if counts["gongliao"] + counts["guishan"] != 20_000 or len(scenarios) != 50_000:

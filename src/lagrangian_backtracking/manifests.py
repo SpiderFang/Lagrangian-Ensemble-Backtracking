@@ -43,7 +43,14 @@ from .bed_residence import (
     sample_bed_residence_age_hours,
 )
 from .boundaries import BoundaryGeometry
-from .config import ProjectConfig, resolve_flow_domain_id
+from .config import (
+    CURRENT_DESIGN_VERSION,
+    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT,
+    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID,
+    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256,
+    ProjectConfig,
+    resolve_flow_domain_id,
+)
 from .gap_policy import (
     EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
     GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
@@ -737,12 +744,120 @@ def _load_receptor_document(
             )
         )
         counts[site.study_site_id] += 1
+    _validate_fixed_horizontal_receptor_manifest(receptors, config, formal=formal)
     site_ids = set(counts)
     if formal:
         _validate_formal_counts(site_ids, counts, config, per_site=20, total=100, label="receptor")
     else:
         _validate_pilot_sites(site_ids, config, "receptor")
     return tuple(receptors), document
+
+
+def _validate_fixed_horizontal_receptor_manifest(
+    receptors: Sequence[Receptor], config: ProjectConfig, *, formal: bool
+) -> None:
+    """驗證固定水平受體 manifest 沒有被改成另一組座標或 face。
+
+    現行 B 區設定保存的是 24 小時工程試跑核定的五個 WGS84 水平位置與來源 manifest
+    SHA-256；正式 receptor manifest 必須每個位置展開四個垂向 receptor，並在四列中
+    重複相同的 source-face local/global index。manifest 的頂層 ``lon``／``lat`` 是
+    accepted OCM face 中心，固定點的 exact WGS84 宣告座標則另存於 row metadata，
+    因為兩者可能相差一個 mesh face 內的公尺制距離；loader 會核對後者，不把 mesh
+    中心誤當成原始宣告值。此 loader 只驗證 JSON 內已保存的座標與 provenance，無法
+    取代 input-build 對 OCM accepted mesh 的實際 persistent-wet gate；後者若失敗會在
+    建置階段 fail closed。歷史設定未宣告固定點時維持舊 loader 行為。
+    """
+
+    if not formal or config.design_version != CURRENT_DESIGN_VERSION:
+        return
+    sites_by_id = {site.study_site_id: site for site in config.study_sites}
+    for site_id, site in sites_by_id.items():
+        coordinates = site.horizontal_receptor_coordinates
+        if coordinates is None:
+            continue
+        rows = [item for item in receptors if item.study_site_id == site_id]
+        if len(rows) != len(coordinates) * 4:
+            raise ValueError(f"{site_id} 固定水平受體 manifest 必須展開為 20 筆")
+        by_order: dict[int, list[Receptor]] = {}
+        for row in rows:
+            metadata = row.metadata
+            order = metadata.get("fixed_horizontal_coordinate_order")
+            if isinstance(order, bool) or not isinstance(order, int) or not 0 <= order < len(coordinates):
+                raise ValueError(f"{site_id} receptor 固定座標順序 metadata 無效")
+            if metadata.get("fixed_horizontal_source_manifest_sha256") != (
+                site.horizontal_receptor_source_manifest_sha256
+            ):
+                raise ValueError(f"{site_id} receptor 固定座標來源 manifest hash 不一致")
+            by_order.setdefault(order, []).append(row)
+        if set(by_order) != set(range(len(coordinates))) or any(
+            len(group) != 4 for group in by_order.values()
+        ):
+            raise ValueError(f"{site_id} receptor 固定水平座標順序或垂向展開不完整")
+        seen_local_faces: set[int] = set()
+        seen_global_faces: set[int] = set()
+        for order, coordinate in enumerate(coordinates):
+            expected_lon, expected_lat = (float(value) for value in coordinate)
+            group = by_order[order]
+            if any(
+                not isinstance(row.metadata.get("fixed_horizontal_declared_lon"), (int, float))
+                or isinstance(row.metadata.get("fixed_horizontal_declared_lon"), bool)
+                or not isinstance(row.metadata.get("fixed_horizontal_declared_lat"), (int, float))
+                or isinstance(row.metadata.get("fixed_horizontal_declared_lat"), bool)
+                or not math.isclose(
+                    float(row.metadata["fixed_horizontal_declared_lon"]),
+                    expected_lon,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                or not math.isclose(
+                    float(row.metadata["fixed_horizontal_declared_lat"]),
+                    expected_lat,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                for row in group
+            ):
+                raise ValueError(
+                    f"{site_id} receptor 第 {order + 1} 點宣告座標 metadata 與 config 不一致"
+                )
+            local_values = [row.metadata.get("source_face_local_index") for row in group]
+            global_values = [row.metadata.get("source_face_global_index") for row in group]
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (*local_values, *global_values)
+            ):
+                raise ValueError(f"{site_id} receptor 第 {order + 1} 點 OCM face metadata 無效")
+            local_faces = set(local_values)
+            global_faces = set(global_values)
+            if len(local_faces) != 1 or len(global_faces) != 1:
+                raise ValueError(f"{site_id} receptor 第 {order + 1} 點未綁定單一 OCM face")
+            local_face = next(iter(local_faces))
+            global_face = next(iter(global_faces))
+            if local_face in seen_local_faces or global_face in seen_global_faces:
+                raise ValueError(f"{site_id} 固定水平受體不可共用同一 OCM face")
+            seen_local_faces.add(local_face)
+            seen_global_faces.add(global_face)
+    # 常數是為了讓此 validator 在 config 之外也能清楚表達目前 B 的固定來源；若
+    # config 由 current example 載入，這裡再檢查 exact policy/hash，避免欄位存在但
+    # 被替換為另一份未核定的工程來源。
+    hsinchu = sites_by_id.get("hsinchu")
+    if hsinchu is not None and hsinchu.horizontal_receptor_coordinates is not None:
+        actual_coordinates = tuple(
+            tuple(float(value) for value in coordinate)
+            for coordinate in hsinchu.horizontal_receptor_coordinates
+        )
+        if actual_coordinates != HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT:
+            raise ValueError("hsinchu 固定水平受體座標不符合核定清單")
+        if (
+            hsinchu.horizontal_receptor_source_manifest_sha256
+            != HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256
+        ):
+            raise ValueError("hsinchu 固定水平受體來源 hash 不符合核定值")
+        if (
+            hsinchu.horizontal_receptor_selection_policy
+            != HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID
+        ):
+            raise ValueError("hsinchu 固定水平受體 policy 不符合核定值")
 
 
 def load_receptor_manifest(

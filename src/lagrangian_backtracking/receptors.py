@@ -8,7 +8,7 @@ arrival times 都是 wet，且與 candidate boundary 保留核定 margin；maxim
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -241,6 +241,108 @@ def select_horizontal_receptors_from_pool(
                 lat=float(candidate_lat[index]),
                 source_face_local_index=int(candidate_local_indices[index]),
                 source_face_global_index=int(candidate_global_indices[index]),
+                anchor_snap_distance_m=snap_distance,
+            )
+        )
+    return selected
+
+
+def select_horizontal_receptors_from_coordinates(
+    pool: HorizontalReceptorCandidatePool,
+    *,
+    coordinates_lonlat: Sequence[tuple[float, float]],
+    coordinates_xy: Sequence[tuple[float, float]],
+    tolerance_m: float = 1.0,
+) -> list[HorizontalReceptor]:
+    """依已核定的 WGS84 順序逐點映射 persistent-wet 原生 OCM face。
+
+    ``coordinates_lonlat`` 是研究者已核定的資料交換座標，``coordinates_xy`` 是同一批
+    座標依 flow-domain 的固定公尺制投影所得的位置；兩者只用來尋找 face，不會取代
+    OCM 的垂向、NWW 或 arrival 支援檢查。``pool`` 已先完成 candidate polygon、邊界
+    margin 與所有 arrival 的 persistent-wet 篩選，因此每個宣告點都必須在該 immutable
+    pool 中找到唯一 source face。此函式保留宣告順序，拒絕重複 face、超過公尺制公差
+    或不在候選池的座標；它不會退回 maximin、最近值或其他未核定位置。
+
+    Args:
+        pool: 同一份 OCM 原生 mesh 建立的 persistent-wet candidate pool。
+        coordinates_lonlat: 五個固定水平受體的 WGS84 經度／緯度，順序不可改變。
+        coordinates_xy: 上述座標在相同 flow-domain projection 下的公尺制位置。
+        tolerance_m: 宣告座標與 source-face 中心允許的公尺制差異；必須為有限正數。
+
+    Returns:
+        依宣告順序排列的五個 ``HorizontalReceptor``，其 lon/lat 與 source face
+        provenance 取自原生 mesh，而非由輸入座標臨時插值。
+
+    Raises:
+        ValueError: 固定點數量、投影座標、匹配公差或唯一 face 契約不成立時。
+    """
+
+    if not isinstance(tolerance_m, (int, float)) or isinstance(tolerance_m, bool):
+        raise ValueError("固定水平受體 tolerance_m 必須是數值")
+    tolerance = float(tolerance_m)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("固定水平受體 tolerance_m 必須是有限正數")
+    if len(coordinates_lonlat) != len(coordinates_xy) or len(coordinates_lonlat) != 5:
+        raise ValueError("固定水平受體必須恰有順序一致的五個 lon/lat 與公尺制座標")
+    declared_lonlat = np.asarray(coordinates_lonlat, dtype=np.float64)
+    declared_xy = np.asarray(coordinates_xy, dtype=np.float64)
+    if declared_lonlat.shape != (5, 2) or declared_xy.shape != (5, 2):
+        raise ValueError("固定水平受體座標必須是 (5, 2) 數值陣列")
+    if not np.all(np.isfinite(declared_lonlat)) or not np.all(np.isfinite(declared_xy)):
+        raise ValueError("固定水平受體座標不可含非有限值")
+    if np.any(declared_lonlat[:, 0] < -180.0) or np.any(declared_lonlat[:, 0] > 180.0):
+        raise ValueError("固定水平受體經度超出 WGS84 bounds")
+    if np.any(declared_lonlat[:, 1] < -90.0) or np.any(declared_lonlat[:, 1] > 90.0):
+        raise ValueError("固定水平受體緯度超出 WGS84 bounds")
+
+    candidate_xy = np.asarray(pool.candidate_xy_m, dtype=np.float64)
+    if candidate_xy.ndim != 2 or candidate_xy.shape[1] != 2:
+        raise ValueError("candidate pool 公尺制座標形狀不符")
+    selected: list[HorizontalReceptor] = []
+    used_faces: set[int] = set()
+    anchor = np.asarray(pool.anchor_xy, dtype=np.float64)
+    for order, (_lonlat, target_xy) in enumerate(zip(declared_lonlat, declared_xy, strict=True)):
+        distances = np.linalg.norm(candidate_xy - target_xy, axis=1)
+        if distances.size == 0:
+            raise ValueError(f"{pool.study_site_id} 固定受體候選池為空")
+        candidate_position = int(np.argmin(distances))
+        distance_m = float(distances[candidate_position])
+        if distance_m > tolerance:
+            raise ValueError(
+                f"{pool.study_site_id} 固定受體第 {order + 1} 點無法映射到同一 OCM mesh face："
+                f"distance={distance_m:.6f} m > tolerance={tolerance:.6f} m"
+            )
+        local_index = int(pool.candidate_face_local_indices[candidate_position])
+        if local_index in used_faces:
+            raise ValueError(
+                f"{pool.study_site_id} 固定受體第 {order + 1} 點與既有點映射到重複 OCM face："
+                f"{local_index}"
+            )
+        used_faces.add(local_index)
+        x_m, y_m = candidate_xy[candidate_position]
+        snap_distance = (
+            float(np.linalg.norm(candidate_xy[candidate_position] - anchor))
+            if order == 0
+            else None
+        )
+        selected.append(
+            HorizontalReceptor(
+                horizontal_receptor_id=stable_identifier(
+                    "hr",
+                    [
+                        pool.study_site_id,
+                        str(int(pool.candidate_face_global_indices[candidate_position])),
+                        f"{x_m:.6f}",
+                        f"{y_m:.6f}",
+                    ],
+                ),
+                study_site_id=pool.study_site_id,
+                x_m=float(x_m),
+                y_m=float(y_m),
+                lon=float(pool.candidate_lon[candidate_position]),
+                lat=float(pool.candidate_lat[candidate_position]),
+                source_face_local_index=local_index,
+                source_face_global_index=int(pool.candidate_face_global_indices[candidate_position]),
                 anchor_snap_distance_m=snap_distance,
             )
         )

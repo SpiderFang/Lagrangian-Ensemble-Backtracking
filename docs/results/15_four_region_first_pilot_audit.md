@@ -1,5 +1,10 @@
 # ABCD 四區第一次工程試跑稽核
 
+> 本文件保留歷史 pilot 的原始數值與 `houwan` site 識別碼，僅供唯讀追溯；C 區現行
+> 正式研究站已改為 `study_site_id=nanwan`／「南灣」，並沿用相同的
+> `houwan_nmmba_cache_v3` forcing 產品。這項 current contract 已取代本文件的站點
+> 命名，不改寫歷史 artifact。
+
 ## 稽核範圍與判讀層級
 
 本紀錄整理 A、B、C、D 四區第一次 24 小時沉降粒子工程試跑的可核對數值、設定差異與

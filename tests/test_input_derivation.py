@@ -414,6 +414,18 @@ def synthetic_input_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
     # 不再宣告的三套 forcing 共同格網 margin 不同。本 fixture 只隔離 receptor/dynamic
     # 的 schema 連接，不變更 production v3 設定。
     for site in payload["study_sites"]:
+        # 這組低解析度 synthetic mesh 只覆蓋 legacy selector／runtime 連接，無法精確
+        # 重現正式 B 五點 manifest，也不承擔 A 龜山島 priority geometry 的驗收；移除
+        # 兩者讓測試不會把 coarse fixture 誤當成正式 accepted mesh。
+        for field in (
+            "horizontal_receptor_coordinates",
+            "horizontal_receptor_source_manifest_sha256",
+            "horizontal_receptor_selection_policy",
+            "horizontal_receptor_coordinate_tolerance_m",
+            "receptor_priority_polygon",
+            "receptor_priority_selection",
+        ):
+            site.pop(field, None)
         if site["analysis_region_id"] == "A":
             site["formal_release_flow_domain_id"] = None
             site["local_domain_baseline_radius_m"] = 25000
@@ -1298,7 +1310,7 @@ def test_receptor_nww_reselection_prepares_one_pool_per_site_and_caches_support(
         formal=False,
     )
 
-    expected_sites = {"gongliao", "guishan", "hsinchu", "houwan", "lienchiang"}
+    expected_sites = {"gongliao", "guishan", "hsinchu", "nanwan", "lienchiang"}
     assert sorted(nww_cache_loads) == [
         "houwan_nmmba_cache_v3",
         "hsinchu_cache_v3",
@@ -2358,7 +2370,8 @@ def test_explicit_pilot_registry_accepts_each_bcd_single_site(site_id: str) -> N
     )
     assert tuple(parsed) == (site_id,)
     explicit = parsed[site_id]
-    assert explicit.selection_scope == f"{site_id}_only"
+    expected_scope = "houwan_legacy_only" if site_id == "houwan" else f"{site_id}_only"
+    assert explicit.selection_scope == expected_scope
     assert input_derivation_module._explicit_pilot_window_times(explicit).size == 25
 
 
@@ -2562,22 +2575,46 @@ def test_receptor_candidate_without_core_preserves_legacy_selection() -> None:
     )
 
 
-def test_houwan_candidate_regions_keep_registered_geometry_and_2plus3_quota() -> None:
-    """C 區候選 helper 應保留兩個 GeoJSON 子區，並對錯誤配額 fail closed。"""
+def test_current_nanwan_has_no_legacy_houwan_candidate_regions() -> None:
+    """現行南灣 site 不得再載入歷史後灣紅框 2+3 候選設定。"""
 
     config = input_derivation_module.load_config(EXAMPLE_CONFIG)
-    houwan = next(site for site in config.study_sites if site.study_site_id == "houwan")
-    specs = input_derivation_module._candidate_region_specs(houwan)
-    assert [spec.region_id for spec in specs] == ["c_west_coast", "c_south_tip"]
-    assert [spec.allocation_count for spec in specs] == [2, 3]
-    assert all(spec.geometry_lonlat.is_valid and spec.geometry_lonlat.area > 0.0 for spec in specs)
+    nanwan = next(site for site in config.study_sites if site.study_site_id == "nanwan")
+    assert input_derivation_module._candidate_region_specs(nanwan) == ()
+    assert nanwan.receptor_candidate_regions is None
+    assert nanwan.receptor_candidate_selection is None
+    assert nanwan.receptor_candidate_regions_provenance is None
 
-    regions = deepcopy(houwan.receptor_candidate_regions)
-    assert regions is not None
-    regions[0]["allocation_count"] = 1
-    invalid_houwan = houwan.model_copy(update={"receptor_candidate_regions": regions})
-    with pytest.raises(InputDerivationError, match="配額總數"):
-        input_derivation_module._candidate_region_specs(invalid_houwan)
+
+def test_guishan_priority_polygon_is_core_scoped_and_can_fallback() -> None:
+    """龜山島 priority polygon 只在既有 core 內取交集，無交集時回報 core fallback。"""
+
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG)
+    guishan = next(site for site in config.study_sites if site.study_site_id == "guishan")
+    projection = DomainProjection(122.05, 25.05)
+    # 這個公尺制方框代表已由 local/static-ocean 與 12.5 km core 求得的合法候選區；
+    # helper 只應在此範圍內裁切 priority，不得把走廊當成新的 flow/local domain。
+    covering_core = box(-100_000.0, -100_000.0, 100_000.0, 100_000.0)
+    priority, coordinates = input_derivation_module._receptor_priority_polygon_metric(
+        site=guishan,
+        projection=projection,
+        core_polygon_metric=covering_core,
+    )
+    assert priority is not None
+    assert priority.is_valid and priority.area > 0.0
+    assert coordinates == tuple(guishan.receptor_priority_polygon or ())
+    assert priority.within(covering_core)
+
+    # 走廊完全落在 core 外時不能以最近點或凸包補足；None 由 caller 解讀為同一
+    # core pool fallback，原始 WGS84 頂點仍回傳以保存 provenance。
+    empty_core = box(-10.0, -10.0, 10.0, 10.0)
+    fallback, fallback_coordinates = input_derivation_module._receptor_priority_polygon_metric(
+        site=guishan,
+        projection=projection,
+        core_polygon_metric=empty_core,
+    )
+    assert fallback is None
+    assert fallback_coordinates == coordinates
 
 
 def test_source_inventory_uses_structural_fingerprint_for_large_npy(

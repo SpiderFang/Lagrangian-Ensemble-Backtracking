@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
+from shapely.geometry import Polygon
 
 from .accelerated import PHYSICS_KERNEL_BACKEND_NUMPY_V1
 from .bed_residence import (
@@ -112,6 +113,77 @@ PhysicsKernelBackend = Literal["numpy_v1", "numba_cpu_v1"]
 NORTHEAST_V3_FLOW_DOMAIN_ID = "northeast_taiwan_common_cache_v3"
 NORTHEAST_V3_BBOX_LON_LAT = (121.306315, 122.793685, 24.600844, 25.499156)
 NORTHEAST_V3_LOCAL_SITE_IDS = frozenset({"gongliao", "guishan"})
+
+# 四個 forcing domain 的空間範圍由相鄰的 OCM-SVD-Analysis 正式契約提供。這裡再
+# 以不可變常數保存一份輸入閘門，原因是 LBT 只能重用同一套 OCM/NWW 網格，不能因
+# 研究站名稱變更而自行平移或縮放 bbox。座標順序固定為
+# ``(經度最小值、經度最大值、緯度最小值、緯度最大值)``，所有物理計算仍會在各域
+# 的公尺制投影座標進行。
+FORMAL_FLOW_DOMAIN_BBOXES_LON_LAT = {
+    "A": NORTHEAST_V3_BBOX_LON_LAT,
+    "B": (119.70812, 121.19188, 24.300844, 25.199156),
+    "C": (120.16671, 121.62, 21.550844, 22.449156),
+    "D": (119.19912, 120.70088, 25.750844, 26.649156),
+}
+FORMAL_FLOW_DOMAIN_IDS_BY_REGION = {
+    "A": "northeast_taiwan_common_cache_v3",
+    "B": "hsinchu_cache_v3",
+    "C": "houwan_nmmba_cache_v3",
+    "D": "lienchiang_common_cache_v3",
+}
+
+# 現行正式母體以南灣為 C 區研究站；``houwan`` 只會出現在明確標示的歷史／唯讀
+# artifact。將 site ID 集中定義，可讓 config、scenario coverage 與後續 validator
+# 使用相同的五站集合，避免 C 區只改中文名稱卻遺留舊站點識別碼。
+CURRENT_FORMAL_STUDY_SITE_IDS = frozenset(
+    {"gongliao", "guishan", "hsinchu", "nanwan", "lienchiang"}
+)
+LEGACY_FORMAL_STUDY_SITE_IDS = frozenset(
+    {"gongliao", "guishan", "hsinchu", "houwan", "lienchiang"}
+)
+
+# 正式圖面核對後固定的研究站 anchor。這些數值是 WGS84 資料交換座標；受體核心的
+# 公尺距離與 mesh 定位仍由 input derivation 依 flow-domain projection 驗證。A 區
+# 貢寮 anchor 特別保留核對圖的高精度值，不沿用舊版約略位置。
+FORMAL_STUDY_SITE_ANCHORS_LON_LAT = {
+    "gongliao": (121.9223889, 25.0964444),
+    "guishan": (121.951606, 24.843127),
+    "hsinchu": (120.45, 24.75),
+    "nanwan": (120.763161, 21.946577),
+    "lienchiang": (119.95, 26.2),
+}
+
+# 新竹 24 小時工程試跑已核定的五個水平受體順序與來源 manifest 摘要。正式母體
+# 必須逐點在同一份 OCM 原生 mesh 尋找 persistent-wet face，不得重新以 maximin
+# 抽出另一組候選；來源 manifest 不放進 Git，但其 SHA-256 會和座標順序一併寫入
+# canonical config 與 receptor provenance。
+HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT = (
+    (120.32880147298177, 24.730445861816406),
+    (120.39448547363281, 24.85012690226237),
+    (120.45531717936198, 24.75184504191081),
+    (120.47039794921875, 24.640532811482746),
+    (120.57318623860677, 24.753894170125324),
+)
+HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256 = (
+    "f625c3cbaf339220994e14926c5a2bd65974ec40706e0d81c0fa3f7404128055"
+)
+HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID = (
+    "hsinchu_24h_pilot_fixed_horizontal_manifest_coordinates_v1"
+)
+
+# 龜山島受體選點採「soft priority」而非第二個研究域：這個 WGS84 polygon 只在已由
+# anchor 及 12.5 km core、local/flow geometry 與 persistent-wet 篩出的候選中提供優先
+# 順序。若走廊內有效 face 不足五個，input-build 必須退回同一個 12.5 km core，不能
+# 擴大 local/domain、改寫 forcing bbox 或用走廊取代後續 NWW/OCM 垂向支援 gate。
+GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT = (
+    (121.78, 24.79),
+    (121.91, 24.76),
+    (121.94, 24.80),
+    (121.94, 24.90),
+    (121.82, 24.92),
+    (121.76, 24.87),
+)
+GUISHAN_SOFT_PRIORITY_POLICY_ID = "guishan_soft_priority_corridor_core_fallback_v1"
 
 # 舊正式輸入採七日缺口安全基線；此值只供相容性查詢，不把所有舊 runtime 或
 # 一日工程試跑改成七日。新欄位未明示時，既有建置／執行驗證仍各自維持原有規則。
@@ -301,11 +373,22 @@ class StudySiteConfig(StrictModel):
     local_domain_baseline_radius_m: float | None = None
     local_domain_sensitivity_radii_m: list[float] = Field(default_factory=list)
     local_domain_policy: str | None = None
-    # C 區研究者明示的候選子區以 GeoJSON mapping 保存，讓紅框數位化座標、2+3
-    # 配額、選點 policy 與來源影像 provenance 進入 normalized config hash。這些欄位
-    # 只限制 receptor 候選，不代表 OCM/NWW forcing 支援；實際 input derivation 仍須
-    # 與 approved flow/local geometry 交集，並通過 static ocean、persistent wet/dry、
-    # NWW 四角及垂向 zcor gate。未設定時保留其他站點的原有 local/flow selector。
+    # 某些站點的水平受體已由研究者透過上一輪工程試跑核定。若有明示座標，正式
+    # input-build 必須依此順序逐點映射到同一份原生 OCM mesh；這些欄位不是把受體
+    # 當成 forcing domain，也不繞過 persistent-wet、50 個 arrival 與垂向支援 gate。
+    horizontal_receptor_coordinates: list[tuple[float, float]] | None = None
+    horizontal_receptor_source_manifest_sha256: str | None = None
+    horizontal_receptor_selection_policy: str | None = None
+    horizontal_receptor_coordinate_tolerance_m: float | None = None
+    # 龜山島走廊是受體候選的 soft priority polygon，不是新的 local/flow domain。它
+    # 只會在 core∩local 的 persistent-wet pool 中優先選點；不足五點時回到同一 core
+    # pool，且兩條路徑都必須通過 NWW exact-hour 與 OCM 垂向支援檢查。
+    receptor_priority_polygon: list[tuple[float, float]] | None = None
+    receptor_priority_selection: dict[str, Any] | None = None
+    # 舊後灣 pilot 曾以 GeoJSON 紅框保存 2+3 候選、選點 policy 與影像 provenance。
+    # 欄位保留給歷史唯讀 loader，現行南灣正式設定不可再填入；未設定時沿用一般
+    # core/local selector，並由 input derivation 逐站執行 static ocean、persistent
+    # wet/dry、NWW 四角與垂向 zcor gate。
     receptor_candidate_regions: list[dict[str, Any]] | None = None
     receptor_candidate_selection: dict[str, Any] | None = None
     receptor_candidate_regions_provenance: dict[str, Any] | None = None
@@ -337,6 +420,129 @@ class StudySiteConfig(StrictModel):
         radius = float(self.receptor_core_radius_m)
         if not math.isfinite(radius) or radius <= 0.0:
             raise ValueError(f"{self.study_site_id} 的 receptor_core_radius_m 必須是有限正數")
+        return self
+
+    @model_validator(mode="after")
+    def validate_fixed_horizontal_receptors(self) -> StudySiteConfig:
+        """驗證固定水平受體的座標、順序摘要與公尺制匹配公差。
+
+        固定受體座標來自已核定的外部工程 manifest，並不代表這些點一定能在另一個
+        OCM mesh 上使用。因此 schema 只先檢查座標數量、WGS84 範圍、來源 SHA-256
+        格式與公尺制匹配公差；實際是否為同一 source face、是否 persistent-wet 以及
+        是否通過所有 arrival 的 OCM/NWW 支援，仍由 input derivation 在讀取 accepted
+        products 後逐點驗證。未提供固定座標的舊設定維持原本 deterministic maximin。
+        """
+
+        coordinates = self.horizontal_receptor_coordinates
+        if coordinates is None:
+            if any(
+                value is not None
+                for value in (
+                    self.horizontal_receptor_source_manifest_sha256,
+                    self.horizontal_receptor_selection_policy,
+                    self.horizontal_receptor_coordinate_tolerance_m,
+                )
+            ):
+                raise ValueError(
+                    f"{self.study_site_id} 固定水平受體欄位必須和 horizontal_receptor_coordinates 一起明示"
+                )
+            return self
+        if self.receptor_priority_polygon is not None or self.receptor_priority_selection is not None:
+            # 固定點與 priority 都是「如何選出五個水平 face」的互斥契約；若同時
+            # 存在，selector 無法判定應以宣告座標還是走廊偏好為準，容易把 B 區
+            # 已核定位置悄悄換成另一組。因此在 schema 層直接拒絕，而非讓 builder
+            # 依欄位順序產生難以追溯的結果。
+            raise ValueError(
+                f"{self.study_site_id} 固定水平受體不得同時設定 receptor priority polygon"
+            )
+        if len(coordinates) != 5:
+            raise ValueError(
+                f"{self.study_site_id}.horizontal_receptor_coordinates 必須恰有 5 個水平位置"
+            )
+        for index, coordinate in enumerate(coordinates):
+            if len(coordinate) != 2 or not all(math.isfinite(float(value)) for value in coordinate):
+                raise ValueError(
+                    f"{self.study_site_id}.horizontal_receptor_coordinates[{index}] 必須是有限 lon/lat"
+                )
+            lon, lat = (float(value) for value in coordinate)
+            if not -180.0 <= lon <= 180.0 or not -90.0 <= lat <= 90.0:
+                raise ValueError(
+                    f"{self.study_site_id}.horizontal_receptor_coordinates[{index}] 超出 WGS84 bounds"
+                )
+        source_hash = self.horizontal_receptor_source_manifest_sha256
+        if source_hash is not None:
+            if not isinstance(source_hash, str) or len(source_hash) != 64:
+                raise ValueError(
+                    f"{self.study_site_id}.horizontal_receptor_source_manifest_sha256 必須是 64 位 SHA-256"
+                )
+            try:
+                int(source_hash, 16)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{self.study_site_id}.horizontal_receptor_source_manifest_sha256 必須是十六進位字串"
+                ) from exc
+            if source_hash.lower() != source_hash:
+                raise ValueError(
+                    f"{self.study_site_id}.horizontal_receptor_source_manifest_sha256 必須使用小寫"
+                )
+        tolerance = self.horizontal_receptor_coordinate_tolerance_m
+        if tolerance is not None and (
+            not math.isfinite(float(tolerance)) or float(tolerance) <= 0.0
+        ):
+            raise ValueError(
+                f"{self.study_site_id}.horizontal_receptor_coordinate_tolerance_m 必須是有限正數"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_receptor_priority_polygon(self) -> StudySiteConfig:
+        """驗證 soft-priority 候選走廊的 WGS84 幾何與 policy 綁定。
+
+        priority polygon 只描述在既有 12.5 km receptor core 內的選點偏好，不是 forcing
+        domain、local boundary 或資料支援範圍。schema 層先拒絕退化、自交與超出 WGS84
+        的座標；實際與 core/local polygon 的交集、persistent-wet face 數量與 forcing
+        支援仍由 input derivation 逐站計算。沒有 polygon 時不能單獨留下 selection
+        policy，避免設定看似啟用優先走廊卻沒有幾何可追溯。
+        """
+
+        polygon = self.receptor_priority_polygon
+        policy = self.receptor_priority_selection
+        if polygon is None:
+            if policy is not None:
+                raise ValueError(
+                    f"{self.study_site_id} receptor_priority_selection 必須和 polygon 一起明示"
+                )
+            return self
+        if len(polygon) < 3:
+            raise ValueError(
+                f"{self.study_site_id}.receptor_priority_polygon 至少需要三個頂點"
+            )
+        values: list[tuple[float, float]] = []
+        for index, coordinate in enumerate(polygon):
+            if len(coordinate) != 2:
+                raise ValueError(
+                    f"{self.study_site_id}.receptor_priority_polygon[{index}] 必須是 lon/lat"
+                )
+            lon, lat = (float(value) for value in coordinate)
+            if not math.isfinite(lon) or not math.isfinite(lat):
+                raise ValueError(
+                    f"{self.study_site_id}.receptor_priority_polygon[{index}] 必須是有限數值"
+                )
+            if not -180.0 <= lon <= 180.0 or not -90.0 <= lat <= 90.0:
+                raise ValueError(
+                    f"{self.study_site_id}.receptor_priority_polygon[{index}] 超出 WGS84 bounds"
+                )
+            values.append((lon, lat))
+        polygon_geometry = Polygon(values)
+        if polygon_geometry.is_empty or not polygon_geometry.is_valid or polygon_geometry.area <= 0.0:
+            raise ValueError(
+                f"{self.study_site_id}.receptor_priority_polygon 必須是有效、非退化 Polygon"
+            )
+        if policy is not None:
+            if policy.get("policy_id") != GUISHAN_SOFT_PRIORITY_POLICY_ID:
+                raise ValueError("receptor_priority_selection.policy_id 未登錄")
+            if policy.get("fallback") != "same_core_pool":
+                raise ValueError("receptor_priority_selection.fallback 必須是 same_core_pool")
         return self
 
     def resolved_flow_domain_id(self, *, formal: bool = False) -> str:
@@ -672,6 +878,30 @@ class ProjectConfig(StrictModel):
             raise ValueError("flow_domain_id 與 analysis_region_id 必須唯一")
         if len(set(site_ids)) != len(site_ids):
             raise ValueError("study_site_id 必須唯一")
+        if self.design_version == CURRENT_DESIGN_VERSION:
+            # 現行正式母體的四區 bbox 是 OCM-SVD-Analysis 的上游空間契約。C 區
+            # 改為南灣研究站只會改變 site 層 anchor，不得把 houwan forcing domain
+            # 平移成另一個 nanwan bbox；任何一個區域不符便在讀取大型產品前停止。
+            expected_bboxes = FORMAL_FLOW_DOMAIN_BBOXES_LON_LAT
+            for domain in self.domains:
+                expected_bbox = expected_bboxes.get(domain.analysis_region_id)
+                actual_bbox = tuple(float(value) for value in domain.bbox_lon_lat)
+                if expected_bbox is None or actual_bbox != expected_bbox:
+                    raise ValueError(
+                        f"{domain.analysis_region_id} flow-domain bbox 必須 exact 沿用 OCM-SVD-Analysis"
+                    )
+                expected_flow_id = FORMAL_FLOW_DOMAIN_IDS_BY_REGION[domain.analysis_region_id]
+                if domain.flow_domain_id != expected_flow_id:
+                    raise ValueError(
+                        f"{domain.analysis_region_id} flow-domain ID 必須是 exact v3／{expected_flow_id}"
+                    )
+        if self.design_version == CURRENT_DESIGN_VERSION and set(site_ids) != set(
+            CURRENT_FORMAL_STUDY_SITE_IDS
+        ):
+            raise ValueError(
+                "目前正式設計的 study_site_id 必須恰含 gongliao、guishan、hsinchu、nanwan、lienchiang；"
+                "A 區必須恰含 gongliao 與 guishan"
+            )
         domain_by_region = {item.analysis_region_id: item.flow_domain_id for item in self.domains}
         formal_domain_by_region = {
             item.analysis_region_id: item.formal_release_flow_domain_id for item in self.domains
@@ -685,6 +915,56 @@ class ProjectConfig(StrictModel):
                 and site.formal_release_flow_domain_id != formal_domain
             ):
                 raise ValueError(f"{site.study_site_id} 的 formal flow domain 與 region 設定不一致")
+        if self.design_version == CURRENT_DESIGN_VERSION:
+            sites_by_id = {site.study_site_id: site for site in self.study_sites}
+            for site_id, expected_anchor in FORMAL_STUDY_SITE_ANCHORS_LON_LAT.items():
+                site = sites_by_id[site_id]
+                actual_anchor = (
+                    tuple(float(value) for value in site.anchor_lonlat)
+                    if site.anchor_lonlat is not None
+                    else None
+                )
+                if actual_anchor != expected_anchor:
+                    raise ValueError(f"{site_id} anchor 必須 exact 沿用四區五站核對圖")
+            nanwan = sites_by_id["nanwan"]
+            if nanwan.study_site_name_zh != "南灣":
+                raise ValueError("C 區目前 study_site_name_zh 必須是南灣")
+            if nanwan.analysis_region_id != "C" or nanwan.flow_domain_id != "houwan_nmmba_cache_v3":
+                raise ValueError("南灣必須位於 C 區並沿用 houwan_nmmba_cache_v3 forcing")
+            if any(
+                value is not None
+                for value in (
+                    nanwan.receptor_candidate_regions,
+                    nanwan.receptor_candidate_selection,
+                    nanwan.receptor_candidate_regions_provenance,
+                )
+            ):
+                raise ValueError("現行南灣正式設定不得保留後灣紅框 2+3 候選或其 provenance")
+            hsinchu = sites_by_id["hsinchu"]
+            if (
+                tuple(hsinchu.horizontal_receptor_coordinates or ())
+                != HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT
+            ):
+                raise ValueError("B 區必須沿用已核定的五個水平受體順序與座標")
+            if hsinchu.horizontal_receptor_source_manifest_sha256 != (
+                HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256
+            ):
+                raise ValueError("B 區固定水平受體來源 manifest SHA-256 不符")
+            if hsinchu.horizontal_receptor_selection_policy != (
+                HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID
+            ):
+                raise ValueError("B 區固定水平受體 policy 不符")
+            guishan = sites_by_id["guishan"]
+            actual_priority_polygon = tuple(
+                tuple(float(value) for value in coordinate)
+                for coordinate in (guishan.receptor_priority_polygon or ())
+            )
+            if actual_priority_polygon != GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT:
+                raise ValueError("龜山島 soft priority polygon 必須 exact 沿用核對契約")
+            if guishan.receptor_priority_selection is None or guishan.receptor_priority_selection.get(
+                "policy_id"
+            ) != GUISHAN_SOFT_PRIORITY_POLICY_ID:
+                raise ValueError("龜山島 receptor priority policy 不符")
         northeast = {site.study_site_id: site for site in self.study_sites if site.analysis_region_id == "A"}
         if set(northeast) != {"gongliao", "guishan"}:
             raise ValueError("A 區必須恰含獨立的 gongliao 與 guishan 站點")
@@ -1248,6 +1528,12 @@ class ProjectConfig(StrictModel):
                 "receptor_candidate_regions",
                 "receptor_candidate_selection",
                 "receptor_candidate_regions_provenance",
+                "horizontal_receptor_coordinates",
+                "horizontal_receptor_source_manifest_sha256",
+                "horizontal_receptor_selection_policy",
+                "horizontal_receptor_coordinate_tolerance_m",
+                "receptor_priority_polygon",
+                "receptor_priority_selection",
             )
             for site, site_payload in zip(self.study_sites, site_payloads, strict=False):
                 if not isinstance(site_payload, dict):

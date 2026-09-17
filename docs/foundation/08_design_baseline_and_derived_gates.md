@@ -31,7 +31,7 @@
 |---|---|---|---|
 | A | `northeast_taiwan_common_cache_v3` | `[121.306315, 122.793685, 24.600844, 25.499156]` | `[122.05, 25.05]` |
 | B | `hsinchu_cache_v3` | `[119.70812, 121.19188, 24.300844, 25.199156]` | `[120.45, 24.75]` |
-| C | `houwan_nmmba_cache_v3` | `[120.16671, 121.62, 21.550844, 22.449156]` | `[120.893355, 22.0]` |
+| C | `houwan_nmmba_cache_v3` | `[120.16671, 121.62, 21.550844, 22.449156]` | forcing domain 歷史中心 `[120.893355, 22.0]`；研究站 anchor 為南灣 `[120.763161, 21.946577]` |
 | D | `lienchiang_common_cache_v3` | `[119.19912, 120.70088, 25.750844, 26.649156]` | `[119.95, 26.2]` |
 
 四個 flow domains 是 forcing 支撐與最外層停止邊界。不得為貢寮與龜山島複製兩份相同 A 區 OCM/NWW 資料，兩站點只在情境、local domain、受體與成果分層上分開。兩站使用同一個 A 區 outer boundary：逆向軌跡離開自己的 local domain 後仍沿同一套 A 區水動力場積分，只有首次穿越共用 A 區 open boundary 才觸發 `flow_domain_open_exit`。此設計刻意保留兩地水動力互通性，避免用任意站點分界截斷可能的共享傳輸走廊。
@@ -40,14 +40,19 @@
 
 | `study_site_id` | 中文名稱 | region | logical local_domain_id | 幾何政策 | anchor |
 |---|---|---|---|---|---|
-| `gongliao` | 貢寮 | A | `gongliao_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.92807, 25.11245]` |
+| `gongliao` | 貢寮 | A | `gongliao_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.9223889, 25.0964444]` |
 | `guishan` | 龜山島西側 | A | `guishan_west_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.951606, 24.843127]` |
 | `hsinchu` | 新竹外海 | B | `hsinchu_flow_domain_v1` | local domain 與 flow domain 相同；受體候選為 `[120.45,24.75]` 半徑 12.5 km 核心與既有 local 候選區的交集 | `[120.45, 24.75]` |
-| `houwan` | 後灣海生館 | C | `houwan_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |
+| `nanwan` | 南灣 | C | `houwan_flow_domain_v1` | local domain 與 flow domain 相同；forcing ID 保留歷史 houwan 名稱 | `[120.763161, 21.946577]` |
 | `lienchiang` | 連江 | D | `lienchiang_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |
 
-貢寮、龜山島與新竹均明示半徑 12.5 km 的 `receptor_core_v1`，五個水平受體位置只在
-各自核心圓與既有 local／static-ocean 候選區的交集內選取。貢寮與龜山島本期另以半徑 20 km
+`houwan`／後灣海生館僅是歷史 pilot 與唯讀 artifact 的 site ID；現行正式設定必須使用
+`nanwan`／南灣，不能因 forcing 產品仍叫 `houwan_nmmba_cache_v3` 而回寫舊 site。
+
+貢寮、龜山島、新竹、南灣與連江均明示半徑 12.5 km 的 `receptor_core_v1`，五個水平受體位置只在
+各自核心圓與既有 local／static-ocean 候選區的交集內選取。新竹五點依核定 manifest 順序逐點
+映射同一 persistent-wet OCM face；龜山島另在核心候選中優先採用核定 soft-priority 走廊，
+不足五點時回到同一核心候選。兩條路徑均須通過 OCM／NWW forcing 與垂向支援 gate。貢寮與龜山島本期另以半徑 20 km
 local domain 辨識正向移入關注海域的入口方向；新竹的 local domain 仍與
 `hsinchu_cache_v3` flow domain 相同，核心圓只限制受體候選，不改變 flow/local 邊界。
 本期 20 km local domain 與 12.5 km receptor core 是新的 geometry／design identity；表中
@@ -123,9 +128,8 @@ scenario_id = hash(
 
 ### 5.2 水平位置
 
-1. 貢寮、龜山島與新竹的候選集合限於各自明示 anchor 半徑 12.5 km `receptor_core_v1`
-   與既有 local／static-ocean 候選區的交集；後灣與連江等未明示核心的站點則限於各自
-   local/flow domain。所有候選均須具有效 OCM triangle、非陸地且可支援全部 50 個到達
+1. 貢寮、龜山島、新竹、南灣與連江的候選集合限於各自明示 anchor 半徑 12.5 km
+   `receptor_core_v1` 與既有 local／static-ocean 候選區的交集；所有候選均須具有效 OCM triangle、非陸地且可支援全部 50 個到達
    時間的 persistent-wet 節點或三角形中心。此 persistent-wet 條件只篩受體，不改變固定
    local-domain polygon。
 2. 貢寮、龜山島與新竹均以各自明示 anchor 作 deterministic maximin 的第一點排序依據，
@@ -135,9 +139,16 @@ scenario_id = hash(
    上限宣稱為已執行條件。這不要與 arrival NWW metric proxy 的「最大兩倍實際 NWW
    grid scale」政策混同。新竹 anchor 固定為已登錄的 `[120.45, 24.75]`。
 3. 其餘四點以固定 seed 的 metric-space maximin 演算法依序選取，使最小點間距最大；並以 `lon, lat, source_face_id` 作 tie-break，確保重跑結果相同。
-4. 後灣與連江以 flow-domain center 的最近有效海洋位置作第一點，再使用相同 maximin 規則
-   選四點；新竹雖與 B 區 flow center 重合，仍依設定明示的 anchor 與核心候選區執行。
+4. 南灣與連江以各自 anchor 的最近有效海洋位置作第一點，再使用相同 maximin 規則選四點；
+   新竹雖與 B 區 flow center 重合，仍依固定五點 manifest 順序逐點映射，不重新抽樣。
 5. 候選點距海岸、無效 triangle 或 flow-domain 外界至少一個局地代表網格尺度；若此限制使候選不足，先降低為半個尺度並記錄 QC，不以陸地最近鄰補值。
+
+新竹固定水平受體的五點順序與來源摘要由 `config.py` 的
+`HSINCHU_FIXED_HORIZONTAL_RECEPTOR_*` 契約保存；輸入建置必須驗證每一點對應同一份
+OCM mesh 的唯一 persistent-wet face，任一座標、順序、來源 hash 或 50 個 arrival
+forcing gate 不符即 fail closed。龜山島的 `receptor_priority_polygon` 頂點為
+`[[121.78,24.79],[121.91,24.76],[121.94,24.80],[121.94,24.90],[121.82,24.92],[121.76,24.87]]`；
+它只作 soft priority，不能取代 12.5 km core、local/flow 邊界或 OCM／NWW 支援檢查。
 
 ### 5.3 垂向層位
 
@@ -246,7 +257,7 @@ intra-tidal phases:
 | `max_age` | 到先導試驗核定的最大回溯日數即 censor 並停止 | 防止封閉流線無限計算 |
 | `numerical_failure` | NaN、定位失敗、步數上限或 CFL 無法滿足時停止 | 與物理停止原因分離 |
 
-新竹、後灣與連江的 local domain 與 flow domain 相同，因此 `local_domain_first_exit` 與 `flow_domain_open_exit` 是同一 crossing，只寫一列具雙重語意的事件，避免重複計數。
+新竹、南灣與連江的 local domain 與 flow domain 相同，因此 `local_domain_first_exit` 與 `flow_domain_open_exit` 是同一 crossing，只寫一列具雙重語意的事件，避免重複計數。
 
 ## 9. 仍需計算、但不需使用者再確認的衍生閘門
 

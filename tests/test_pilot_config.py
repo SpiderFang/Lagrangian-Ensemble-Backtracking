@@ -224,7 +224,11 @@ def test_builder_fractional_day_config_constructs_actual_runtime_request(
     assert config.pilot_execution_binding["execution_scalar_snapshot"]["max_backtrack_days"] == days
     data = {**runtime_fixture, "config": config}
     calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
-    factory = _factory(data, tmp_path)
+    # current design 的 approved reconstruction manifest 已綁定發布設定；即使 no-Stokes
+    # 測試不會讀取重建陣列，仍須提供既有 root 才符合 runtime 的輸入身分 gate。
+    reconstruction_root = tmp_path / "ocm-reconstruction"
+    reconstruction_root.mkdir()
+    factory = _factory(data, tmp_path, ocm_reconstruction_root=reconstruction_root)
     unit = _unit(data["scenario"], member_id=0)
     original_seed = unit.seed
     request = factory(unit)

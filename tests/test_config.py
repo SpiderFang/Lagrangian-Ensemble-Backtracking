@@ -12,6 +12,11 @@ import yaml
 from lagrangian_backtracking.config import (
     CURRENT_DESIGN_VERSION,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
+    GUISHAN_SOFT_PRIORITY_POLICY_ID,
+    GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT,
+    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT,
+    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID,
+    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256,
     LEGACY_DESIGN_VERSION_V2,
     ProjectConfig,
     load_config,
@@ -35,6 +40,105 @@ def _legacy_example_payload() -> dict:
     """由正式範例明確建立未啟用隨機沉底與共同支援窗的舊相容 fixture。"""
 
     payload = deepcopy(_payload())
+    # 現行 C 站點已改為南灣；legacy fixture 必須明確還原舊後灣 site，才能測試
+    # 舊 artifact 的相容載入，而不是把 current site 名稱誤當成歷史契約。
+    nanwan = next(site for site in payload["study_sites"] if site["study_site_id"] == "nanwan")
+    nanwan["study_site_id"] = "houwan"
+    nanwan["study_site_name_zh"] = "後灣海生館"
+    nanwan["anchor_lonlat"] = [120.893355, 22.0]
+    payload["domains"][2]["analysis_region_name_zh"] = "後灣海域"
+    # 這個 fixture 必須重現歷史 v3 YAML 的位元組語意，才能讓既有 canonical hash
+    # 測試繼續保護舊 artifact。紅框候選只在這個 legacy fixture 出現；現行南灣
+    # 正式設定刻意不再載入這些 2+3 子區。
+    nanwan.update(
+        {
+            "receptor_candidate_selection": {
+                "policy_id": "houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1",
+                "require_each_region": True,
+                "total_horizontal_count": 5,
+                "distance_coordinate_system": "local_azimuthal_equidistant_m",
+                "boundary_policy": "approved_C_flow_local_intersection_plus_persistent_wet_margin",
+            },
+            "receptor_candidate_regions_provenance": {
+                "source_artifact": "horizontal_overview.png",
+                "source_sha256": "0c28a19f9707f5d4717799b4936bb99195a868b76aec1322c21c725192132beb",
+                "image_width_px": 1236,
+                "image_height_px": 832,
+                "plot_bbox_pixels_xy": [65, 46, 1180, 789],
+                "plot_bbox_lon_lat": [120.16671, 121.62, 21.550844, 22.449156],
+                "digitization_method": "manual_red_frame_vertex_trace_v1",
+            },
+            "receptor_candidate_regions": [
+                {
+                    "region_id": "c_west_coast",
+                    "name_zh": "屏東西南沿岸紅框",
+                    "allocation_count": 2,
+                    "coordinate_reference": "EPSG:4326",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [120.67242885, 22.13359822],
+                                [120.62941668, 22.12876208],
+                                [120.60465210, 22.09128204],
+                                [120.58770791, 22.03203939],
+                                [120.58119091, 21.97158771],
+                                [120.58249431, 21.93652573],
+                                [120.59683170, 21.91718120],
+                                [120.64636087, 21.90025472],
+                                [120.66591186, 21.93652573],
+                                [120.68024925, 21.98246901],
+                                [120.70240703, 22.02720326],
+                                [120.70501383, 22.05742910],
+                                [120.69328324, 22.09490914],
+                                [120.67242885, 22.13359822],
+                            ]
+                        ],
+                    },
+                },
+                {
+                    "region_id": "c_south_tip",
+                    "name_zh": "恆春半島南端近岸紅框",
+                    "allocation_count": 3,
+                    "coordinate_reference": "EPSG:4326",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [120.71153083, 21.94619800],
+                                [120.77018378, 21.95345220],
+                                [120.82883674, 21.95345220],
+                                [120.86663532, 21.93773477],
+                                [120.89531010, 21.91597216],
+                                [120.91616448, 21.88816439],
+                                [120.92007468, 21.86035661],
+                                [120.87706251, 21.84584821],
+                                [120.83796054, 21.83617594],
+                                [120.77409398, 21.83496691],
+                                [120.72065462, 21.84463918],
+                                [120.68546284, 21.86640178],
+                                [120.67633905, 21.89300052],
+                                [120.67894585, 21.92080830],
+                                [120.71153083, 21.94619800],
+                            ]
+                        ],
+                    },
+                },
+            ],
+        }
+    )
+    # 舊 A anchor 也是 frozen v3 hash 的一部分；現行正式核對圖才改成高精度 anchor。
+    payload["study_sites"][0]["anchor_lonlat"] = [121.92807, 25.11245]
+    for site in payload["study_sites"]:
+        for field in (
+            "horizontal_receptor_coordinates",
+            "horizontal_receptor_source_manifest_sha256",
+            "horizontal_receptor_selection_policy",
+            "horizontal_receptor_coordinate_tolerance_m",
+            "receptor_priority_polygon",
+            "receptor_priority_selection",
+        ):
+            site.pop(field, None)
     # 範例 YAML 現在屬於 gap-censored 新版；legacy fixture 必須明確移除新增的
     # time-axis policy，才能驗證「未宣告新欄位的舊 hash 不漂移」，而不是把新版
     # 語意誤當成舊設定的一部分。
@@ -108,6 +212,15 @@ def _legacy_hash_payload() -> dict:
             # 測試才是在比對原始 v2 canonical hash，而不是把新站點設定誤算進 legacy。
             site.pop("anchor_lonlat", None)
             site.pop("receptor_core_radius_m", None)
+        for field in (
+            "horizontal_receptor_coordinates",
+            "horizontal_receptor_source_manifest_sha256",
+            "horizontal_receptor_selection_policy",
+            "horizontal_receptor_coordinate_tolerance_m",
+            "receptor_priority_polygon",
+            "receptor_priority_selection",
+        ):
+            site.pop(field, None)
         site.pop("receptor_candidate_regions", None)
         site.pop("receptor_candidate_selection", None)
         site.pop("receptor_candidate_regions_provenance", None)
@@ -171,18 +284,82 @@ def test_example_material_table_matches_runtime_baseline() -> None:
     assert payload["physics"]["settling"]["material_classes"] == [asdict(item) for item in BASELINE_BEHAVIORS]
 
 
-def test_example_registers_c_and_d_receptor_anchors_and_c_red_frame_quota() -> None:
-    """目前試跑回寫的 C／D 受體 anchor、核心與 C 區 2+3 配額必須進入設定。"""
+def test_example_registers_current_c_nanwan_and_d_receptor_anchors() -> None:
+    """現行範例固定南灣／D anchor，且 C 不得殘留後灣 2+3 候選。"""
 
     config = load_config(EXAMPLE_CONFIG)
     sites = {site.study_site_id: site for site in config.study_sites}
     assert config.design_version == CURRENT_DESIGN_VERSION
-    assert sites["houwan"].anchor_lonlat == (120.893355, 22.0)
-    assert sites["houwan"].receptor_core_radius_m == 12_500
+    assert set(sites) == {"gongliao", "guishan", "hsinchu", "nanwan", "lienchiang"}
+    assert sites["nanwan"].anchor_lonlat == (120.763161, 21.946577)
+    assert sites["nanwan"].receptor_core_radius_m == 12_500
+    assert sites["nanwan"].receptor_candidate_regions is None
+    assert sites["nanwan"].receptor_candidate_selection is None
+    assert sites["nanwan"].receptor_candidate_regions_provenance is None
     assert sites["lienchiang"].anchor_lonlat == (119.95, 26.2)
     assert sites["lienchiang"].receptor_core_radius_m == 12_500
-    assert sites["houwan"].receptor_candidate_selection["total_horizontal_count"] == 5
-    assert [item["allocation_count"] for item in sites["houwan"].receptor_candidate_regions] == [2, 3]
+    assert (
+        tuple(sites["hsinchu"].horizontal_receptor_coordinates)
+        == HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT
+    )
+    assert sites["hsinchu"].horizontal_receptor_source_manifest_sha256 == (
+        HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256
+    )
+    assert sites["hsinchu"].horizontal_receptor_selection_policy == (
+        HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID
+    )
+    assert tuple(sites["guishan"].receptor_priority_polygon or ()) == (
+        GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT
+    )
+    assert sites["guishan"].receptor_priority_selection == {
+        "policy_id": GUISHAN_SOFT_PRIORITY_POLICY_ID,
+        "fallback": "same_core_pool",
+        "total_horizontal_count": 5,
+        "coordinate_reference": "EPSG:4326",
+    }
+
+
+def test_current_design_rejects_legacy_houwan_site() -> None:
+    """current formal design 不得以 houwan 取代南灣，即使 forcing ID 相同。"""
+
+    payload = _payload()
+    nanwan = next(site for site in payload["study_sites"] if site["study_site_id"] == "nanwan")
+    nanwan["study_site_id"] = "houwan"
+    nanwan["study_site_name_zh"] = "後灣海生館"
+    with pytest.raises(ValueError, match="study_site_id"):
+        ProjectConfig.model_validate(payload)
+
+
+def test_current_design_rejects_shifted_flow_domain_bbox() -> None:
+    """current 四區 bbox 必須沿用 OCM-SVD-Analysis，不能採用平移南灣候選框。"""
+
+    payload = _payload()
+    payload["domains"][2]["bbox_lon_lat"] = [
+        120.036516,
+        121.489806,
+        21.497421,
+        22.395733,
+    ]
+    with pytest.raises(ValueError, match="bbox 必須 exact"):
+        ProjectConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("horizontal_receptor_coordinates", [[120.0, 24.0]] * 4),
+        ("horizontal_receptor_source_manifest_sha256", "0" * 64),
+        ("horizontal_receptor_selection_policy", "other_policy"),
+    ],
+)
+def test_current_hsinchu_fixed_receptor_contract_is_immutable(field: str, value: object) -> None:
+    """B 區固定受體清單、來源 hash 與 policy 任一被改寫都必須 fail closed。"""
+
+    payload = _payload()
+    hsinchu = next(site for site in payload["study_sites"] if site["study_site_id"] == "hsinchu")
+    hsinchu[field] = value
+    with pytest.raises(ValueError, match="B 區|hsinchu|固定水平受體"):
+        ProjectConfig.model_validate(payload)
 
 
 def test_design_version_and_a_policy_binding_is_bidirectional() -> None:

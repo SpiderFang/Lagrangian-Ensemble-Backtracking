@@ -70,7 +70,7 @@
 
 附檔先寫「針對每一處開放海域」執行高達 1,000 組情境，緊接著在同一工項下定義 10 種速度、20 個 receptor locations 與 50 個 arrival times。其自然作用域是每一獨立研究站點，因此 `10 × 20 × 50 = 10,000` 是每站點矩陣。使用者另裁決貢寮與龜山島雖共用 forcing，情境須各自完整建立，正式契約如下：
 
-- 貢寮、龜山島、新竹、後灣與連江各有 10 種非上浮海廢材質／形狀代理、20 個受體與 50 個到達時間的完整交叉，每站點 `scenario_count` 恰為 10,000。
+- 貢寮、龜山島、新竹、南灣與連江各有 10 種非上浮海廢材質／形狀代理、20 個受體與 50 個到達時間的完整交叉，每站點 `scenario_count` 恰為 10,000。
 - 五站點共 100 個 receptors，A 區兩站合計 20,000 個基礎情境，全案合計 `5 × 10,000 = 50,000`；「四區合計 20 個、每區 5 個」及「A 區兩站共用 20 個」均已撤銷。
 - 第 `s` 個情境的獨立隨機實現數記為 `M_s`，因此全案單一 experiment case 的總軌跡數為 `sum(M_s)`；只有所有情境採相同 `M` 時，才等於 `50,000 × M`，每站點則為 `10,000 × M`。
 - `M` 並非附檔指定值。確定性案例為 `M=1`；隨機擴散或 forcing／初始條件擾動時，正式 `M` 由 exit ranking、HDR、travel-time 等統計量的收斂曲線決定。
@@ -110,10 +110,10 @@
 
 | region | 經度範圍（°E） | 緯度範圍（°N） | 獨立站點 | forcing domain |
 |---|---:|---:|---|---|
-| A 東北角海域 | 121.306315–122.793685 | 本期沿用 v3 南界 24.600844 | 貢寮、龜山島 | `northeast_taiwan_common_cache_v3`；本期 `formal_domain_policy=v3_local20km_20260909_v1`，12.5 km receptor core、20 km local domain；南向擴張為歷史候選 |
-| B 新竹外海 | 119.70-121.19 | 24.30-25.19 | 新竹 | `hsinchu_cache_v3` |
-| C 後灣海域 | 120.16-121.62 | 21.55-22.44 | 後灣海生館周邊 | `houwan_nmmba_cache_v3` |
-| D 連江海域 | 119.19-120.70 | 25.75-26.64 | 分析範圍整合南竿、北竿 | `lienchiang_common_cache_v3` |
+| A 東北角海域 | 121.306315–122.793685 | 24.600844–25.499156 | 貢寮、龜山島 | `northeast_taiwan_common_cache_v3`；本期 `formal_domain_policy=v3_local20km_20260909_v1`，12.5 km receptor core、20 km local domain；南向擴張為歷史候選 |
+| B 新竹外海 | 119.70812–121.19188 | 24.300844–25.199156 | 新竹 | `hsinchu_cache_v3` |
+| C 南灣海域 | 120.16671-121.62 | 21.550844-22.449156 | 南灣（`study_site_id=nanwan`） | `houwan_nmmba_cache_v3`；forcing ID 保留歷史 houwan 名稱 |
+| D 連江海域 | 119.19912–120.70088 | 25.750844–26.649156 | 分析範圍整合南竿、北竿 | `lienchiang_common_cache_v3` |
 
 四個 forcing domains 供五站點使用：A 區包含貢寮與龜山島兩套各 20 個 receptors，其餘 B-D 各一套 20 個，全案共 100 個。2026-09-09 裁決本期 A 區不南擴，兩站以 anchor-centered 12.5 km receptor core 與 20 km local domain 建立新 geometry／design identity；兩站共用同一 A 區 forcing cache 與 outer boundary，以保留相近海域的共同水動力影響。自身 local crossing 是主要入口事件，穿越另一站 local domain 則為不終止的方向性連通診斷，所有 ID、狀態與分母仍按原始站點分開。
 

@@ -31,14 +31,16 @@
 | 貢寮 | A | 使用 `northeast_taiwan_common_cache_v3` 與 `formal_domain_policy=v3_local20km_20260909_v1`；12.5 km 受體核心、20 km 局部區域，與龜山島共用最外層停止邊界；正式運算沿用不擴張的逐階段資料支援嚴格檢查 |
 | 龜山島西側 | A | 使用同一 v3 A 區海流資料與範圍規範；12.5 km 受體核心、20 km 局部區域，局部區域、受體與統計維持獨立 |
 | 新竹外海 | B | 使用 `hsinchu_cache_v3` 流場區域；local domain 仍等於 flow domain，水平受體候選限於 `[120.45, 24.75]` 半徑 12.5 km 核心；24 小時展示 pilot 入口與參數見[紀錄](docs/results/14_hsinchu_2024-01-01_24h_pilot_parameter_record.md) |
-| 後灣海生館 | C | 使用 C 流場區域 |
+| 南灣 | C | 使用 `houwan_nmmba_cache_v3` C 區流場；`forcing` 產品 ID 保留歷史名稱，現行 study site 為 `nanwan` |
 | 連江 | D | 使用 D 流場區域 |
+
+現行五站 anchor（WGS84，經度／緯度）固定為：貢寮 `[121.9223889,25.0964444]`、龜山島 `[121.951606,24.843127]`、新竹 `[120.45,24.75]`、南灣 `[120.763161,21.946577]`、連江 `[119.95,26.2]`。其中 B 區五個水平受體另依核定 manifest 順序逐點映射同一 OCM mesh；C 區只改研究站 anchor 與名稱，不改 `houwan_nmmba_cache_v3` 的 `forcing bbox`。
 
 每站完整基礎設計是 `10 種材質／形狀 × 20 個三維受體 × 50 個到達時間 = 10,000` 個情境；若每個情境都採相同的成員數 `M`，五站執行量才可寫成 `50,000×M`。各情境成員數不同時，總量應寫成 `Σ M_s`；`M` 是隨機成員數，不是額外情境因子。實驗案例（例如 `no_stokes` 或擴散敏感度）另行編號。
 
 所有本專案沉降速度均為負值、物理方向以向上為正；不允許上升物性，也不對完全沉沒物體加入風壓效應。缺少密度、阻力、再懸浮參數時，不宣稱已完成沉積—再懸浮動力。
 
-貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。本期 A 區不南擴，沿用 `northeast_taiwan_common_cache_v3` 的 bbox `[121.306315,122.793685,24.600844,25.499156]`，以 anchor 半徑 12.5 km 的受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`，最外層停止邊界維持原 A 區設定。原先 25 km 基準、35 km 敏感度與南向擴張屬歷史規劃，移出本期；不自行加入 15 km 或 23 km case。舊 25 km 幾何、manifest、shard 與 hash 不沿用，必須依新規範重建。A 區正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`，沿用工程試跑已採用的逐四階 Runge-Kutta 法（RK4）階段資料支援嚴格檢查：OCM 或 NWW3 在實際查詢位置／時間無有效支援時立即停止，保留 `data_gap` 等原始狀態，不以零值、最近值或擴張資料域補齊。既有 24 小時、20 情境產物只屬 DEMO；正式 30 天仍須由完整四區五站 `inputs-build` 重新建立 100 個受體、250 個到達時刻、5,000 個初始配對及其逐筆 gap-safe 時間證據。舊 `formal_domain_policy=expanded_domain_v1` 只保留舊設定相容讀取，不是本期 A 範圍。
+貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。本期 A 區不南擴，沿用 `northeast_taiwan_common_cache_v3` 的 bbox `[121.306315,122.793685,24.600844,25.499156]`，以 anchor 半徑 12.5 km 的受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`，最外層停止邊界維持原 A 區設定。龜山島另有核定的 soft-priority 走廊；它只在同一 12.5 km core 的 persistent-wet 候選中優先選點，不足五點時回到同一 core，且不取代 OCM／NWW 支援閘門。原先 25 km 基準、35 km 敏感度與南向擴張屬歷史規劃，移出本期；不自行加入 15 km 或 23 km case。舊 25 km 幾何、manifest、shard 與 hash 不沿用，必須依新規範重建。A 區正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`，沿用工程試跑已採用的逐四階 Runge-Kutta 法（RK4）階段資料支援嚴格檢查：OCM 或 NWW3 在實際查詢位置／時間無有效支援時立即停止，保留 `data_gap` 等原始狀態，不以零值、最近值或擴張資料域補齊。既有 24 小時、20 情境產物只屬 DEMO；正式 30 天仍須由完整四區五站 `inputs-build` 重新建立 100 個受體、250 個到達時刻、5,000 個初始配對及其逐筆 gap-safe 時間證據。舊 `formal_domain_policy=expanded_domain_v1` 只保留舊設定相容讀取，不是本期 A 範圍。
 
 每個受體×到達配對的實際初始深度來自到達 UTC 的已驗證動態紀錄；不以模板深度代替所有到達時間。投影座標、公尺距離、步長限制、統計網格與軌跡計算使用公尺制座標，圖面可將公尺座標轉為經緯度顯示，但經緯度不進入粒子物理運算。
 
@@ -55,18 +57,7 @@
 
 受體×到達配對的實際深度與三維初始條件來自到達 UTC 的 OCM 原生動態紀錄；OCM surface 只負責到達時間篩選，不代表配對的來源深度或三維流場資料。
 
-月份目錄只是產品分割與延遲載入的索引；執行階段會依每個 OCM／NWW3 產品實際的
-`time_utc_ns`，在必要時從相鄰月份尋找 before／after 時間端點。相鄰月份的時間軸連續且
-未超過產品允許的最大時間間隔時，才進行合法時間內插；真正的時間缺口仍回傳
-`TIME_GAP`，不以零值、最近值或外插補齊。OCM 與 NWW3 會各自依自身時間軸選取端點，
-因此同一查詢時刻可以使用不同月份的 OCM／NWW3 原始資料，並在保留原始物理欄位後完成
-Stokes 合成。正式運算設定的 `execution.max_resident_forcing_months` 應設定至少為
-`2`（對應 manager constructor 的 `max_resident_months=2`），讓跨月兩端可常駐並避免
-每個邊界 stage 反覆重載月份；設定為 `1` 仍維持數值正確性，但只適合記憶體受限的測試
-或低頻取樣，可能產生月界 I/O thrash。
-同月安全查詢會直接沿用 `CombinedMonthForcing`；暖機後 cache stats 的每次普通
-no-Stokes sample 只增加一次 OCM hit，Stokes sample 再增加一次 NWW hit。跨月、月尾
-或可能有 halo duplicate 的查詢才會記錄必要的 endpoint 探查命中。
+月份目錄只是產品分割與延遲載入的索引；執行階段會依每個 OCM／NWW3 產品實際的 `time_utc_ns`，在必要時從相鄰月份尋找 before／after 時間端點。相鄰月份時間軸連續且未超過產品允許的最大時間間隔時，才進行合法時間內插；真正的時間缺口仍回傳 `TIME_GAP`，不以零值、最近值或外插補齊。OCM 與 NWW3 各依自身時間軸選取端點，因此同一查詢時刻可使用不同月份的原始資料，並在保留物理欄位後完成 Stokes 合成。正式運算設定的 `execution.max_resident_forcing_months` 應至少為 `2`（對應 manager constructor 的 `max_resident_months=2`），讓跨月兩端常駐並避免邊界 stage 反覆重載；設定為 `1` 仍維持數值正確性，但只適合記憶體受限測試或低頻取樣，可能產生月界 I/O thrash。同月安全查詢直接沿用 `CombinedMonthForcing`；暖機後 cache stats 的普通 no-Stokes sample 只增加一次 OCM hit，Stokes sample 再增加一次 NWW hit，跨月、月尾或可能有 halo duplicate 時才記錄必要的 endpoint 探查命中。
 
 OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾住 query z；針對移動海面，若固定 z 在某一個 before／after 端點高於該端點最高有限 `zcor`，端點可使用最高有效層的速度、垂向速度與 Kz，表示 OCM 最上層控制體的 surface hold。這不是任意最近值外插，也不把 top `zcor` 當成物理海面。所有海面上界查詢共用 `models.py` 的 `SURFACE_BOUNDARY_TOLERANCE_M = 5e-6 m`：只有 `z - eta` 不超過 5 微米時才先夾回 query-time `eta`，讓 endpoint top-layer 支援與 Stokes profile 使用同一表面；超過此尺度仍回傳 `VERTICAL_UNSUPPORTED`／保留原有失敗 QC。這個 5 微米尺度是為涵蓋 checkpoint-8 最大約 `3.367686e-6 m` 的海面邊界定位數值殘差（含浮點與積分／內插）而設，遠小於 OCM 垂向物理層距，並非可任意放大的物理緩衝。海床與「海床高於海面」的既有 1 微米幾何契約維持不變；乾點、缺值、域外與時間缺口也不因海面容差取得通行權。Smagorinsky 水平 current 取樣共用同一端點支援與 query-time 幾何範圍檢查。此為工程取樣政策與單元測試契約，不代表已完成真實資料的科學驗證。
 
@@ -153,20 +144,9 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 OCM 重建建置器只讀上游 schema 3 cache，並在另一個 NFS 目錄發布缺失 UTC rows；不改寫原始月份。它只重建具雙側 exact support 的 419 個內部缺時；`2024-01-01 00:00 UTC` 因沒有左側支援，維持流場起始邊界。月份陣列、逐列方法來源、局部不可用格點、來源與網格 fingerprint、設定及 SHA-256 都記錄在 patch manifest；執行階段僅在 config 明示核准 reconstruction policy 且 manifest/root 完整綁定時掛載，未登錄缺口仍回傳 `data_gap`。四區一次建置與 `--resume` 命令見[全部可得資料與時間重建](docs/operations/10_available_data_time_reconstruction_and_a_expansion.md#45-四區稀疏-patch-建置操作)。
 
-current design 的 horizon-suite release 會同時寫入 `inputs.ocm_gap_safe_arrival_manifest` 與
-`inputs.ocm_gap_reconstruction_manifest`，兩者故意指向同一份
-`common-input/ocm_gap_safe_arrival.json`：前者供 schema／artifact closure 驗證，後者是
-runtime 採用核准重建支援契約的 immutable common-input 證據。實際四區重建 patch 的
-domain manifest／root index 仍位於外部 `OCM_RECONSTRUCTION_ROOT`，不會被寫入 release
-config；legacy 或未啟用核准 reconstruction policy 的設定不會新增第二個 binding。
+current design 的 horizon-suite release 會同時寫入 `inputs.ocm_gap_safe_arrival_manifest` 與 `inputs.ocm_gap_reconstruction_manifest`，兩者故意指向同一份 `common-input/ocm_gap_safe_arrival.json`：前者供 schema／artifact closure 驗證，後者是執行階段採用核准重建支援契約的不可變 common-input 證據。實際四區重建 patch 的 domain manifest／root index 仍位於外部 `OCM_RECONSTRUCTION_ROOT`，不會被寫入 release config；legacy 或未啟用核准 reconstruction policy 的設定不會新增第二個綁定。
 
-正式 release 若 template 的 `forcing.ocm.wetdry_semantics_decision_status` 仍為
-`derived_pending_server_preflight`，只有 current design 在正式
-`validate_input_derivatives(..., formal=True)` 通過，且 dynamic initial-condition
-manifest 的每一列都確認 `wetdry_elem_value=0`、
-`wetdry_semantics_id=schism_wetdry_elem_0_wet_1_dry` 時，才會衍生為 `approved`。
-release approval 會保存方法識別碼、列數、相對 artifact reference 與 raw/canonical
-SHA-256；legacy、其他 pending 狀態或 evidence 不一致時維持 fail closed。
+正式 release 若 template 的 `forcing.ocm.wetdry_semantics_decision_status` 仍為 `derived_pending_server_preflight`，只有 current design 在正式 `validate_input_derivatives(..., formal=True)` 通過，且 dynamic initial-condition manifest 每列確認 `wetdry_elem_value=0`、`wetdry_semantics_id=schism_wetdry_elem_0_wet_1_dry` 時，才衍生為 `approved`。release approval 會保存方法識別碼、列數、相對 artifact reference 與 raw/canonical SHA-256；legacy、其他 pending 狀態或證據不一致時維持 fail closed。
 
 本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
@@ -180,57 +160,22 @@ SHA-256；legacy、其他 pending 狀態或 evidence 不一致時維持 fail clo
 
 ### 5.1 隨機沉底與一次建立六份回溯設定
 
-正式範例固定最大沉底年齡 90 日、五站共用 50 個分層隨機整點小時與 seed `20260916`。
-`fixed_calendar_window` 以固定日曆窗扣除沉底年齡；窗前沉底記為
-`pre_window_deposition`，不讀流場資料，也不進來源比例有效分母。
-`full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
+正式範例固定最大沉底年齡 90 日、五站共用 50 個分層隨機整點小時與 seed `20260916`。`fixed_calendar_window` 以固定日曆窗扣除沉底年齡；窗前沉底記為 `pre_window_deposition`，不讀流場資料，也不進來源比例有效分母；`full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
 
-`horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation
-選時包絡為 180 日，沉底後 gap-censored 執行支援上限為 90 日，再發布兩種模式共六份 release。
-六份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及
-綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見
-[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及
-[CLI 參考](docs/operations/cli_reference.md)。
+`horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation 選時包絡為 180 日，沉底後 gap-censored 執行支援上限為 90 日，再發布兩種模式共六份 release。六份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及[CLI 參考](docs/operations/cli_reference.md)。
 
-若建立過程中留下 exact preserved `.partial-*`，可使用 `horizon-suite-resume`。它會唯讀
-核對 source-template、common-config、artifact closure、來源 config hash 與三個 forcing
-root，在新的 owned partial 重建六份 release；不修改原 partial，且 manifest 仍記錄
-`input_build_count=1` 與不含絕對路徑的 recovery source fingerprint。destination 必須不存在，
-日數必須與 common config／preserved manifest 一致；此命令絕不再次呼叫 `inputs-build`。
+若建立過程中留下 exact preserved `.partial-*`，可使用 `horizon-suite-resume`。它會唯讀核對 source-template、common-config、artifact closure、來源 config hash 與三個流場根目錄，在新的 owned partial 重建六份 release；不修改原 partial，且 manifest 仍記錄 `input_build_count=1` 與不含絕對路徑的 recovery source fingerprint。destination 必須不存在，日數必須與 common config／preserved manifest 一致；此命令絕不再次呼叫 `inputs-build`。
 
-新版母體的 manifest 另外保存 `forcing_years=[2024, 2025]`、
-`observation_years=[2025]`、arrival policy 與每個季節×潮況×相位的兩個
-`replicate_rank`；formal loader 會確認每站 48 個核心 strata 加 2 個事件，且不接受舊兩年份
-population 與新版 policy 混用。2024 只提供 2025 observation 的前置流場資料，不會被誤報為
-arrival anchor。
+新版母體的 manifest 另外保存 `forcing_years=[2024, 2025]`、`observation_years=[2025]`、arrival policy 與每個季節×潮況×相位的兩個 `replicate_rank`；formal loader 會確認每站 48 個核心 strata 加 2 個事件，且不接受舊兩年份 population 與新版 policy 混用。2024 只提供 2025 observation 的前置流場資料，不會被誤報為 arrival anchor。
 
-正式新版 arrival 母體只以 2025 作 observation anchor，流場資料仍完整讀取 2024–2025；
-因此最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，不需要把 2024 早季
-當作 observation strata，也不需另補 2023 前置流場資料。180/90 仍是待驗證的資料支援契約，
-不是已完成 SERVER 或 `inputs-build` 的證據；若實際 accepted product 在 2024-07-05 前仍
-有缺時，legacy strict preflight/build 會 fail closed；明示
-`observed_gap_censored_stop_at_first_gap_v1` 的 bed-residence build 則保留缺口清單並
-依第一缺口截尾契約產生 `data_gap` 可稽核紀錄。兩者都不能用最近值、零值或未登錄外插繞過。
-正式執行前須由當次流場清冊與對應 gap-safe／gap-censored 證據完成驗證；本次不宣稱
-已在 SERVER 執行，也不把 design_pending template 稱為 approved release。
+正式新版 arrival 母體只以 2025 作 observation anchor，流場資料仍完整讀取 2024–2025；因此最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，不需要把 2024 早季當作 observation strata，也不需另補 2023 前置流場資料。180/90 仍是待驗證的資料支援契約，不是已完成 SERVER 或 `inputs-build` 的證據；若 accepted product 在 2024-07-05 前仍有缺時，legacy strict preflight/build 會 fail closed；明示 `observed_gap_censored_stop_at_first_gap_v1` 的 bed-residence build 則保留缺口清單並依第一缺口截尾契約產生 `data_gap` 可稽核紀錄。兩者都不能用最近值、零值或未登錄外插繞過。正式執行前須由當次流場清冊與對應 gap-safe／gap-censored 證據完成驗證；本次不宣稱已在 SERVER 執行，也不把 design_pending template 稱為 approved release。
 
-Suite 發布優先使用同一 parent 目錄的 native exclusive rename；只有檔案系統明確回報不支援
-時，才使用 `nfs_two_phase_copy_v1`。fallback 先以 parent dirfd 的不可覆寫 `mkdir` 保留
-destination basename，再以 no-follow 普通檔／目錄白名單複製、逐檔與目錄 `fsync`，最後建立
-不可覆寫的 `horizon-suite-publication.json` 及 sidecar。marker 綁定 manifest fingerprint、
-策略識別碼／版本與發布方法，不記錄絕對路徑；無 marker 的 reserved destination 一律不算
-正式成果，必須人工選新 destination 或明確清理。
+Suite 發布優先使用同一 parent 目錄的 native exclusive rename；只有檔案系統明確回報不支援時，才使用 `nfs_two_phase_copy_v1`。fallback 先以 parent dirfd 的不可覆寫 `mkdir` 保留 destination basename，再以 no-follow 普通檔／目錄白名單複製、逐檔與目錄 `fsync`，最後建立不可覆寫的 `horizon-suite-publication.json` 及 sidecar。marker 綁定 manifest fingerprint、策略識別碼／版本與發布方法，不記錄絕對路徑；無 marker 的 reserved destination 一律不算正式成果，必須人工選新 destination 或明確清理。
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建、legacy 缺口安全到達視窗，或本期版本化的第一缺口截尾政策，執行流程不臨時外插，不以最近值或零值補資料。
 
-ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。
-四區的明示 pilot registry 共用 `2024-01-02T01:00:00Z`、24 小時回溯與 25 個逐時節點；A
-區必須同時選貢寮與龜山島，B／C／D 則各自選單站。既有試跑仍須以
-`pilot-matrix-validate` 檢查共同設定；目前 A 使用 `no_stokes`，B／C／D 使用
-`finite_depth_stokes`，因此不能把它們宣稱為同設定比較或正式研究結果。
+ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。四區的明示 pilot registry 共用 `2024-01-02T01:00:00Z`、24 小時回溯與 25 個逐時節點；A 區必須同時選貢寮與龜山島，B／C／D 則各自選單站。既有試跑仍須以 `pilot-matrix-validate` 檢查共同設定；目前 A 使用 `no_stokes`，B／C／D 使用 `finite_depth_stokes`，因此不能把它們宣稱為同設定比較或正式研究結果。
 
-在 NFS 上，preview／figure 的 `.complete` 只表示該成果目錄已通過逐檔位元組、manifest、程式
-指紋與儲存閘門綁定，可供成果 reader 讀取；它不表示粒子 run 完成。run 的生命週期仍以
-`run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
+在 NFS 上，preview／figure 的 `.complete` 只表示該成果目錄已通過逐檔位元組、manifest、程式指紋與儲存閘門綁定，可供成果 reader 讀取；它不表示粒子 run 完成。run 的生命週期仍以 `run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
 
 ## 6. 文件導覽
 

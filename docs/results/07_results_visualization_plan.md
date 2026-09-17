@@ -50,7 +50,7 @@
 
 ### F01 研究範圍、forcing 與受體設計圖
 
-- A-D 四個 forcing domains 與貢寮、龜山島、新竹、後灣、連江五個獨立站點；每站 20／全案 100 個 receptors、受體深度／HAB、開放邊界段、海岸與水深均須呈現。A 區 panel 必須明示貢寮與龜山島共用 forcing 與 outer boundary，但保留各自的 `study_site_id`、local domain 與受體集合。
+- A-D 四個 forcing domains 與貢寮、龜山島、新竹、南灣、連江五個獨立站點；每站 20／全案 100 個 receptors、受體深度／HAB、開放邊界段、海岸與水深均須呈現。A 區 panel 必須明示貢寮與龜山島共用 forcing 與 outer boundary，但保留各自的 `study_site_id`、local domain 與受體集合。C 區現行站點識別碼為 `nanwan`，forcing 產品仍沿用歷史固定 ID `houwan_nmmba_cache_v3`；歷史 `houwan` 結果只作唯讀對照。
 - 貢寮／龜山島 panel 疊加 12.5 km receptor core、20 km current-policy local domain；兩個 local domains 的重疊區照實繪出，不以裁切或透明度處理暗示互斥。本期不繪製 A 的 35 km sensitivity，也不自行加入 15 km／23 km outlines。
 - 現行 `northeast_taiwan_common_cache_v3` 以原始 bbox 與 `formal_domain_policy=v3_local20km_20260909_v1` 標示；圖說列出 domain ID、bbox、OCM/NWW 共同有效遮罩與 20 km local domain 至 outer boundary 的最小公尺距離。歷史 v4 南向擴張只可在 provenance 註記中標為 deferred，不作本期 formal domain。
 - inset 顯示台灣周邊相對位置；局部圖以各 domain 的 metric CRS 呈現。

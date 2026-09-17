@@ -62,6 +62,7 @@ from .config import (
     FORMAL_DOMAIN_POLICY_EXPANDED_V1,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
     FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION,
+    GUISHAN_SOFT_PRIORITY_POLICY_ID,
     NORTHEAST_V3_BBOX_LON_LAT,
     NORTHEAST_V3_FLOW_DOMAIN_ID,
     RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1,
@@ -107,9 +108,11 @@ from .manifests import (
 from .mesh import NativeMesh
 from .preflight import PreflightReport, run_preflight
 from .receptors import (
+    HorizontalReceptorCandidatePool,
     VerticalTarget,
     build_vertical_targets,
     prepare_horizontal_receptor_candidates,
+    select_horizontal_receptors_from_coordinates,
     select_horizontal_receptors_from_pool,
 )
 from .scenarios import BASELINE_BEHAVIORS, ArrivalTime, Receptor, stable_identifier
@@ -408,9 +411,9 @@ PILOT_ARRIVAL_SELECTION_METHOD_ID = (
     "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_explicit_pilot_window_v1"
 )
 
-# C 區紅框候選是研究者明示的兩個近岸子區，不得再退回舊版 12.5 km 圓形核心。
-# policy 只描述選點契約；實際 EPSG:4326 座標由 pilot config 的
-# ``receptor_candidate_regions`` 保存，並在 input derivation 時重新投影及驗證。
+# 舊 C 區紅框候選是歷史後灣 pilot 的兩個近岸子區；現行南灣正式站已撤銷這套
+# 2+3 選點。保留識別碼只為唯讀載入歷史 artifact，不得由 current config 或新的
+# common-input builder 啟用；若現行站點沒有固定座標，才回到一般 core/local selector。
 RED_FRAME_CANDIDATE_POLICY_ID = "houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1"
 RED_FRAME_CANDIDATE_CONFIG_KEY = "receptor_candidate_regions"
 RED_FRAME_SELECTION_CONFIG_KEY = "receptor_candidate_selection"
@@ -430,10 +433,17 @@ PILOT_EXPLICIT_REGISTRY: dict[tuple[str, ...], dict[str, Any]] = {
         "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
         "selection_scope": "hsinchu_only",
     },
+    ("nanwan",): {
+        "analysis_region_id": "C",
+        "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
+        "selection_scope": "nanwan_only",
+    },
+    # houwan 僅供歷史／唯讀 pilot loader 使用；current formal config 由 config schema
+    # 拒絕這個 site ID，因此不會把舊後灣時次帶入南灣母體。
     ("houwan",): {
         "analysis_region_id": "C",
         "policy_id": PILOT_EXPLICIT_WINDOW_POLICY_ID,
-        "selection_scope": "houwan_only",
+        "selection_scope": "houwan_legacy_only",
     },
     ("lienchiang",): {
         "analysis_region_id": "D",
@@ -3999,6 +4009,60 @@ def _receptor_candidate_polygon_metric(
     return clipped
 
 
+def _receptor_priority_polygon_metric(
+    *,
+    site: StudySiteConfig,
+    projection: DomainProjection,
+    core_polygon_metric: Polygon,
+) -> tuple[Polygon | None, tuple[tuple[float, float], ...]]:
+    """建立既有 receptor core 內的 soft-priority 走廊交集。
+
+    龜山島 priority polygon 是研究者對候選空間的偏好，不是第二個 local domain，也
+    不是 forcing 支援範圍。這個 helper 先將設定中的 EPSG:4326 頂點投影到與 core
+    相同的公尺座標，再求 ``priority ∩ core``；空交集代表走廊內沒有候選，caller 應
+    使用同一個 core pool，而不是以 convex hull、最近點或擴大 bbox 補值。回傳原始
+    WGS84 頂點讓 provenance 能保留設定契約，實際 persistent-wet／forcing gate 則由
+    後續 candidate pool 與 face_support 完成。
+    """
+
+    raw_polygon = site.receptor_priority_polygon
+    if raw_polygon is None:
+        raw_extra = (site.model_extra or {}).get("receptor_priority_polygon")
+        if isinstance(raw_extra, Sequence) and not isinstance(raw_extra, (str, bytes)):
+            raw_polygon = raw_extra
+    if raw_polygon is None:
+        return None, ()
+    coordinates: tuple[tuple[float, float], ...]
+    try:
+        coordinates = tuple(
+            (float(coordinate[0]), float(coordinate[1])) for coordinate in raw_polygon
+        )
+    except (IndexError, TypeError, ValueError) as exc:
+        raise InputDerivationError(f"{site.study_site_id} priority polygon 座標無法解析") from exc
+    if len(coordinates) < 3 or any(
+        not math.isfinite(value) for coordinate in coordinates for value in coordinate
+    ):
+        raise InputDerivationError(f"{site.study_site_id} priority polygon 必須是有效有限座標")
+    geometry_lonlat = Polygon(coordinates)
+    if (
+        geometry_lonlat.is_empty
+        or not geometry_lonlat.is_valid
+        or geometry_lonlat.area <= 0.0
+    ):
+        raise InputDerivationError(f"{site.study_site_id} priority polygon 必須是有效 Polygon")
+    priority_metric = projection.project_geometry(geometry_lonlat)
+    if not isinstance(priority_metric, Polygon) or not priority_metric.is_valid:
+        raise InputDerivationError(f"{site.study_site_id} priority polygon 投影後無效")
+    clipped = priority_metric.intersection(core_polygon_metric)
+    if clipped.is_empty:
+        return None, coordinates
+    if not isinstance(clipped, Polygon) or not clipped.is_valid or clipped.area <= 0.0:
+        raise InputDerivationError(
+            f"{site.study_site_id} priority polygon 與 receptor core 交集不是有效 Polygon"
+        )
+    return clipped, coordinates
+
+
 def _receptor_payload(
     *,
     config: ProjectConfig,
@@ -4038,6 +4102,12 @@ def _receptor_payload(
     NWW 垂向支撐檢查。紅框只代表受體候選選擇的數位化來源與空間限制，不代表 OCM
     或 NWW forcing 支援；所有 forcing、靜態海域、持續濕點與垂向遮罩 gate 仍必須
     通過，且選出的 face 會在 metadata 與 provenance 保留其 ``candidate_region_id``。
+
+    若站點設定 ``receptor_priority_polygon``，它只會在既有 12.5 km core 的
+    persistent-wet pool 中優先嘗試；走廊有效候選不足五點，或走廊候選經 NWW／OCM
+    支援淘汰後無法完成五點時，才回到同一份 core pool。priority 與 fallback 都不會
+    改變 local/flow geometry，也不會削弱 50 個 arrival 的 forcing gate；最終選擇
+    範圍、候選計數與 fallback 原因會保留在 site-level provenance。
     """
 
     site_by_id = {site.study_site_id: site for site in config.study_sites}
@@ -4049,6 +4119,13 @@ def _receptor_payload(
     # 只有明示紅框候選的站點才會填入這份索引；它同時供 receptor metadata 與
     # provenance 使用，讓每個最終 face 能回溯到指定的研究子區，而不是靠座標事後猜測。
     candidate_region_selection_by_site: dict[str, dict[str, Any]] = {}
+    # soft-priority 走廊與 core fallback 的選點摘要；priority 不是新的區域邊界，故
+    # 只記錄候選篩選範圍與 fallback 證據，不建立另一套 forcing 或 local manifest。
+    priority_selection_by_site: dict[str, dict[str, Any]] = {}
+    # 固定水平受體的 provenance 另存為 site-level mapping。它與紅框候選是兩種互斥
+    # 的選點契約：固定座標保留外部 manifest hash、宣告順序及實際 source face，不能
+    # 在 build 後被誤讀成一般 maximin 結果或被其他站點共用。
+    fixed_horizontal_selection_by_site: dict[str, dict[str, Any]] = {}
     # build_input_derivatives 會把每個 analysis region 的 cache 傳進來；直接使用此
     # internal helper 的小型 caller 若未提供 mapping，才保留 lazy 建立的相容行為。
     shared_nww_runtime_caches = dict(nww_runtime_caches or {})
@@ -4373,7 +4450,9 @@ def _receptor_payload(
                 ),
             )
         else:
-            candidate_pool = prepare_horizontal_receptor_candidates(
+            # 先建立完整的 core pool；soft-priority 走廊只會從這個既有 core 候選範圍
+            # 再縮小，故永遠不會藉 priority polygon 擴張 local/flow domain。
+            core_candidate_pool = prepare_horizontal_receptor_candidates(
                 study_site_id=site_id,
                 mesh=mesh,
                 candidate_polygon_metric=candidate_metric,
@@ -4382,43 +4461,201 @@ def _receptor_payload(
                 boundary_margin_m=margin,
                 wet_value=0.0,
             )
-            candidate_count = int(candidate_pool.candidate_face_local_indices.size)
-            # 任一候選的任一 arrival NWW 或垂向支撐失敗，就以 source face local index
-            # 加入本站 persistent blacklist，再用完全相同的 deterministic pool selector
-            # 重選。每次至少排除一個 face，故重選輪次有限且不會回到已知壞 face。
-            for _attempt in range(candidate_count + 1):
-                try:
-                    horizontal = select_horizontal_receptors_from_pool(
-                        candidate_pool,
-                        count=5,
-                        excluded_face_indices=blacklisted_faces,
+            candidate_pool = core_candidate_pool
+            candidate_count = int(core_candidate_pool.candidate_face_local_indices.size)
+            priority_pool: HorizontalReceptorCandidatePool | None = None
+            priority_coordinates: tuple[tuple[float, float], ...] = ()
+            priority_fallback_reason: str | None = None
+            if site.receptor_priority_polygon is not None:
+                priority_metric, priority_coordinates = _receptor_priority_polygon_metric(
+                    site=site,
+                    projection=projection,
+                    core_polygon_metric=candidate_metric,
+                )
+                if priority_metric is None:
+                    priority_fallback_reason = "priority polygon 與既有 receptor core 沒有有效交集"
+                else:
+                    priority_pool = prepare_horizontal_receptor_candidates(
+                        # pool 的 study_site_id 必須維持正式站點身分；priority 只改變
+                        # 候選範圍，不可讓 horizontal receptor ID 產生虛構的子站點。
+                        study_site_id=site_id,
+                        mesh=mesh,
+                        candidate_polygon_metric=priority_metric,
+                        anchor_xy=anchor_xy,
+                        wetdry_at_arrivals=wetdry,
+                        boundary_margin_m=margin,
+                        wet_value=0.0,
                     )
-                except ValueError as exc:
+                    priority_count = int(priority_pool.candidate_face_local_indices.size)
+                    if priority_count >= 5:
+                        candidate_pool = priority_pool
+                        candidate_count = priority_count
+                    else:
+                        priority_fallback_reason = (
+                            "priority persistent-wet/margin 候選不足五點："
+                            f"{priority_count} < 5"
+                        )
+            fixed_coordinates = site.horizontal_receptor_coordinates
+            if fixed_coordinates is not None:
+                # 固定受體必須由相同 OCM mesh 的五個 persistent-wet face 逐點對應；
+                # 一旦某點不在候選池，或 50 個 arrival 的 OCM/NWW 支援失敗，直接
+                # fail closed。此分支刻意不執行 maximin blacklist fallback，避免把
+                # 已核定的 B 區五點靜默換成另一組位置。
+                try:
+                    declared_xy = [
+                        tuple(float(value) for value in projection.project(*coordinate))
+                        for coordinate in fixed_coordinates
+                    ]
+                    horizontal = select_horizontal_receptors_from_coordinates(
+                        candidate_pool,
+                        coordinates_lonlat=[
+                            tuple(float(value) for value in coordinate)
+                            for coordinate in fixed_coordinates
+                        ],
+                        coordinates_xy=declared_xy,
+                        tolerance_m=float(site.horizontal_receptor_coordinate_tolerance_m or 1.0),
+                    )
+                except (TypeError, ValueError) as exc:
                     raise InputDerivationError(
-                        f"{site_id} 垂向支撐淘汰後 persistent-wet 候選不足：{exc}"
+                        f"{site_id} 固定水平受體無法逐點映射到 persistent-wet OCM mesh：{exc}"
                     ) from exc
-                failed_faces = []
-                for horizontal_item in horizontal:
-                    face_index = int(horizontal_item.source_face_local_index)
+                for order, horizontal_item in enumerate(horizontal):
                     try:
                         support = face_support(horizontal_item)
                     except InputDerivationError as exc:
-                        # 將 combined gate 的失敗也快取；下一輪若 deterministic maximin
-                        # 仍因其他 face 淘汰而碰到同一個 face，不能重做相同的 NWW／OCM I/O。
-                        face_support_cache[face_index] = None
-                        face_support_errors[face_index] = str(exc)
-                        failed_faces.append(face_index)
-                    else:
-                        face_support_cache[face_index] = support
-                        template_supports[face_index] = support
-                if not failed_faces:
-                    break
-                for face_index in sorted(set(failed_faces)):
-                    blacklisted_faces.add(face_index)
+                        raise InputDerivationError(
+                            f"{site_id} 固定水平受體第 {order + 1} 點未通過 50 個 arrival forcing gate：{exc}"
+                        ) from exc
+                    face_index = int(horizontal_item.source_face_local_index)
+                    face_support_cache[face_index] = support
+                    template_supports[face_index] = support
+                fixed_horizontal_selection_by_site[site_id] = {
+                    "selection_policy": site.horizontal_receptor_selection_policy,
+                    "source_manifest_sha256": site.horizontal_receptor_source_manifest_sha256,
+                    "coordinate_tolerance_m": float(
+                        site.horizontal_receptor_coordinate_tolerance_m or 1.0
+                    ),
+                    "declared_coordinates_lonlat": [
+                        [float(value) for value in coordinate] for coordinate in fixed_coordinates
+                    ],
+                    "mapped_source_face_local_indices": [
+                        int(item.source_face_local_index) for item in horizontal
+                    ],
+                    "mapped_source_face_global_indices": [
+                        int(item.source_face_global_index) for item in horizontal
+                    ],
+                }
             else:
-                raise InputDerivationError(f"{site_id} 垂向支撐重選超過有限迭代次數")
+                def select_supported_from_pool(
+                    pool: HorizontalReceptorCandidatePool,
+                    *,
+                    scope_label: str,
+                    _blacklisted_faces: set[int] = blacklisted_faces,
+                    _face_support: Any = face_support,
+                    _face_support_cache: dict[int, _FaceVerticalSupport | None] = face_support_cache,
+                    _face_support_errors: dict[int, str] = face_support_errors,
+                    _template_supports: dict[int, _FaceVerticalSupport] = template_supports,
+                    _site_id: str = site_id,
+                ) -> list[Any]:
+                    """在指定候選池中完成 maximin 與逐 face 支援 gate。
 
-        for horizontal_item in horizontal:
+                    priority 與 core fallback 共用這段流程，確保兩者都使用同一個
+                    persistent-wet、NWW exact-hour、OCM 垂向支撐與 blacklist 規則。若
+                    priority 候選因 forcing gate 淘汰不足，caller 才能安全退回原 core；
+                    任何 core 仍不足的情況則直接 fail closed，不以未登錄位置補足。
+                    """
+
+                    available_count = int(pool.candidate_face_local_indices.size)
+                    for _attempt in range(available_count + 1):
+                        try:
+                            selected_pool = select_horizontal_receptors_from_pool(
+                                pool,
+                                count=5,
+                                excluded_face_indices=_blacklisted_faces,
+                            )
+                        except ValueError as exc:
+                            raise InputDerivationError(
+                                f"{_site_id}/{scope_label} 垂向支撐淘汰後 persistent-wet 候選不足：{exc}"
+                            ) from exc
+                        failed_faces: list[int] = []
+                        for horizontal_item in selected_pool:
+                            face_index = int(horizontal_item.source_face_local_index)
+                            try:
+                                support = _face_support(horizontal_item)
+                            except InputDerivationError as exc:
+                                # 將 combined gate 的失敗快取；下一輪或 core fallback
+                                # 再遇到相同 face 時，不重做 NWW／OCM I/O。
+                                _face_support_cache[face_index] = None
+                                _face_support_errors[face_index] = str(exc)
+                                failed_faces.append(face_index)
+                            else:
+                                _face_support_cache[face_index] = support
+                                _template_supports[face_index] = support
+                        if not failed_faces:
+                            return selected_pool
+                        for face_index in sorted(set(failed_faces)):
+                            _blacklisted_faces.add(face_index)
+                    raise InputDerivationError(
+                        f"{_site_id}/{scope_label} 垂向支撐重選超過有限迭代次數"
+                    )
+
+                # priority 候選池若存在，先以它嘗試；只有 priority 的有效 face 或
+                # forcing 支援不足時才使用同一 core pool。所有 fallback 原因與最後
+                # selected face 都寫入 provenance，便於之後區分「優先走廊」與「core」。
+                pool_options: list[tuple[str, HorizontalReceptorCandidatePool]] = []
+                if priority_pool is not None and priority_pool is candidate_pool:
+                    pool_options.append(("priority", priority_pool))
+                    pool_options.append(("core_fallback", core_candidate_pool))
+                else:
+                    pool_options.append(("core", core_candidate_pool))
+                selection_scope = pool_options[-1][0]
+                for option_index, (scope_label, selected_pool) in enumerate(pool_options):
+                    try:
+                        horizontal = select_supported_from_pool(
+                            selected_pool,
+                            scope_label=scope_label,
+                        )
+                    except InputDerivationError as exc:
+                        # 只有 priority 是可替代的偏好範圍；core 仍不足時必須維持
+                        # fail-closed，不能把 fallback 再擴成 flow domain。
+                        if scope_label == "priority" and option_index + 1 < len(pool_options):
+                            priority_fallback_reason = str(exc)
+                            continue
+                        raise
+                    selection_scope = scope_label
+                    break
+                if site.receptor_priority_polygon is not None:
+                    priority_selection_by_site[site_id] = {
+                        "policy_id": (
+                            site.receptor_priority_selection or {}
+                        ).get("policy_id", GUISHAN_SOFT_PRIORITY_POLICY_ID),
+                        "selection_scope": selection_scope,
+                        "fallback_reason": priority_fallback_reason,
+                        "priority_polygon_lonlat": [
+                            [float(value) for value in coordinate]
+                            for coordinate in priority_coordinates
+                        ],
+                        "priority_candidate_face_count_persistent_wet_margin": (
+                            int(priority_pool.candidate_face_local_indices.size)
+                            if priority_pool is not None
+                            else 0
+                        ),
+                        "core_candidate_face_count_persistent_wet_margin": int(
+                            core_candidate_pool.candidate_face_local_indices.size
+                        ),
+                        "selected_face_local_indices": [
+                            int(item.source_face_local_index) for item in horizontal
+                        ],
+                        "selected_face_global_indices": [
+                            int(item.source_face_global_index) for item in horizontal
+                        ],
+                        "selected_positions_lonlat": [
+                            {"lon": float(item.lon), "lat": float(item.lat)}
+                            for item in horizontal
+                        ],
+                    }
+
+        for horizontal_order, horizontal_item in enumerate(horizontal):
             face_index = int(horizontal_item.source_face_local_index)
             support = template_supports.get(face_index)
             if support is None or face_index in blacklisted_faces:
@@ -4445,6 +4682,27 @@ def _receptor_payload(
                 candidate_region_id = region_id_by_face.get(face_index)
                 if candidate_region_id is not None:
                     metadata["candidate_region_id"] = candidate_region_id
+                if site.horizontal_receptor_coordinates is not None:
+                    # 這個 index 綁定固定座標的宣告順序；它只作資料追溯，實際
+                    # runtime 仍使用 receptor×arrival 的 OCM-derived 初始條件。
+                    metadata["fixed_horizontal_coordinate_order"] = int(horizontal_order)
+                    metadata["fixed_horizontal_source_manifest_sha256"] = (
+                        site.horizontal_receptor_source_manifest_sha256 or ""
+                    )
+                    # receptor 的頂層 lon/lat 是同一個 accepted OCM face 的 mesh 中心，
+                    # 供 runtime 穩定定位 source face；宣告點可能只是該 face 內的工程
+                    # 座標，兩者不應混為一談。把原始宣告座標逐列保存，讓 manifest
+                    # validator 能同時核對「輸入座標 exact」與「runtime face provenance」。
+                    declared_coordinate = site.horizontal_receptor_coordinates[horizontal_order]
+                    metadata["fixed_horizontal_declared_lon"] = float(declared_coordinate[0])
+                    metadata["fixed_horizontal_declared_lat"] = float(declared_coordinate[1])
+                priority_record = priority_selection_by_site.get(site_id)
+                if priority_record is not None:
+                    # 每個垂向 row 也帶上 site-level priority/fallback 範圍，讓下游在
+                    # 不讀取完整 provenance 的情況下仍能分辨受體是否來自走廊或 core。
+                    metadata["receptor_priority_selection_scope"] = str(
+                        priority_record["selection_scope"]
+                    )
                 receptors.append(
                     Receptor(
                         receptor_id=receptor_id,
@@ -4460,11 +4718,18 @@ def _receptor_payload(
                 rows.append(asdict(receptors[-1]))
     if len(receptors) != EXPECTED_RECEPTOR_COUNT:
         raise InputDerivationError(f"receptor 應有 100 筆，實際 {len(receptors)}")
-    receptor_method_id = (
-        "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_red_frame_regions_v1"
-        if candidate_region_selection_by_site
-        else "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_core_intersection_v3"
-    )
+    if candidate_region_selection_by_site:
+        receptor_method_id = (
+            "server_v3_persistent_wet_face_maximin_5x4_ocm_nww_runtime_support_red_frame_regions_v1"
+        )
+    elif priority_selection_by_site:
+        receptor_method_id = (
+            "server_v3_persistent_wet_face_soft_priority_or_core_fallback_5x4_ocm_nww_runtime_support_v1"
+        )
+    else:
+        receptor_method_id = (
+            "server_v3_persistent_wet_face_fixed_manifest_or_maximin_5x4_ocm_nww_runtime_support_v1"
+        )
     provenance = _provenance(
         method_id=receptor_method_id,
         source_hashes=source_hashes,
@@ -4476,6 +4741,14 @@ def _receptor_payload(
         # blacklist 與最終 source face；JSON validator 會再檢查 hash closure，這裡不保存
         # 大型 mesh 或逐時 wetdry 陣列。
         provenance["candidate_regions_by_site"] = candidate_region_selection_by_site
+    if fixed_horizontal_selection_by_site:
+        # 固定點來源 hash 與實際 mesh face mapping 必須進 component provenance，讓
+        # 後續 formal validator 能區分「沿用五點」與「重新抽樣」兩種設計。
+        provenance["fixed_horizontal_receptors_by_site"] = fixed_horizontal_selection_by_site
+    if priority_selection_by_site:
+        # priority polygon 不會改變正式四區 geometry；此 site-level record 只保存
+        # 候選池大小、fallback 原因與最終 face，供重建／稽核確認選點偏好沒有越界。
+        provenance["priority_receptors_by_site"] = priority_selection_by_site
     payload = {
         "manifest_kind": "receptor_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -6287,7 +6560,8 @@ def build_input_derivatives(
     5,000 dynamic pairs，且 NWW manifest 必須證明完整 17,544 小時。
 
     ``pilot_arrival_utc`` 是唯一版本化的 pilot-only 明示入口。B、C、D 各接受一個
-    已登錄站點鍵（分別為 ``hsinchu``、``houwan``、``lienchiang``），A 只能以
+    已登錄站點鍵（分別為 ``hsinchu``、``nanwan``、``lienchiang``；``houwan`` 僅供
+    歷史唯讀 artifact），A 只能以
     ``{"gongliao": ..., "guishan": ...}`` 的 exact pair 方式提交；本次登錄值固定為
     ``2024-01-02T01:00:00Z``，並由同一版本化窗口產生 24 小時、含首尾共 25 個節點。
     它在任何 source 或 destination I/O 前拒絕 ``formal=True``；非正式 build 則先驗證

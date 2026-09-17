@@ -325,7 +325,7 @@ known-source 驗證。
 
 ## 7. 情境與 ensemble
 
-貢寮、龜山島、新竹、後灣與連江五個研究站點各自採三因子完整交叉，不再保留每站 1,000 分層抽樣、四區共用 20 個 receptors 或 A 區兩站共用 20 個 receptors 的選項：
+貢寮、龜山島、新竹、南灣與連江五個研究站點各自採三因子完整交叉，不再保留每站 1,000 分層抽樣、四區共用 20 個 receptors 或 A 區兩站共用 20 個 receptors 的選項：
 
 \[
 N_{\mathrm{base,site}}=N_{\mathrm{material}}N_{\mathrm{receptor,site}}N_{\mathrm{arrival}}

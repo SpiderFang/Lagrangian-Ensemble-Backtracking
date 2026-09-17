@@ -572,10 +572,16 @@ def _factory(
     *,
     case_id: str = "no_stokes",
     nww_root: str | Path | object | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
     geometries: BoundaryGeometryBundle | None = None,
     run_kind: str = "pilot",
 ) -> runtime.RuntimeRequestFactory:
-    """用 ordinary OCM root 建立 pilot/formal factory；manager 由各測試 monkeypatch。"""
+    """用 ordinary OCM root 建立 pilot/formal factory；manager 由各測試 monkeypatch。
+
+    新版 current design 綁定 approved OCM 重建 manifest 時，呼叫端必須明示一個既有
+    的重建產品根目錄；測試只有在驗證這條新版路徑時才傳入此參數，避免把一般 legacy
+    fixture 的 lazy root 行為改成隱含建立或探查重建資料。
+    """
 
     ocm_root = tmp_path / "ocm-native"
     ocm_root.mkdir(exist_ok=True)
@@ -585,6 +591,7 @@ def _factory(
         geometries=geometries or data["geometries"],
         ocm_native_root=ocm_root,
         nww_analysis_root=nww_root,
+        ocm_reconstruction_root=ocm_reconstruction_root,
         experiment_case_id=case_id,
         run_kind=run_kind,
     )

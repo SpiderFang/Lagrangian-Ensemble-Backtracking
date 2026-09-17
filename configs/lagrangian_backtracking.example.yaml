@@ -3,7 +3,7 @@
 # 將貢寮與龜山島 local domain 定為 20 km、receptor core 定為 12.5 km，並將本期 A 區
 # 35 km／南擴 sensitivity 排除在研究範圍外；十個嚴格負值沉降格點仍指定 iOcean 分類、
 # 代表材質、形狀、適用條件及證據等級。
-# local-domain polygon、受體座標、50 個 UTC、M、擴散係數與 SERVER 路徑必須依已決定的
+# local-domain polygon、50 個 UTC、M、擴散係數與 SERVER 路徑必須依已決定的
 # 演算法由實際網格、forcing 與先導試驗衍生；null 表示「尚未產出衍生 manifest」，不是
 # 等待研究人員任意選值。正式批次只接受所有 derived gate 均通過的 approved release config。
 schema_version: "0.4.0"
@@ -153,7 +153,9 @@ domains:
     bbox_lon_lat: [119.70812, 121.19188, 24.300844, 25.199156]
     metric_crs_policy: local_azimuthal_equidistant
   - analysis_region_id: C
-    analysis_region_name_zh: 後灣海域
+    # C 區 forcing 邊界仍沿用 OCM-SVD-Analysis 的 houwan domain；南灣只屬於 site
+    # 層的研究焦點，不能把這個不可變上游產品 ID 或 bbox 平移成 nanwan domain。
+    analysis_region_name_zh: 南灣海域
     flow_domain_id: houwan_nmmba_cache_v3
     center_lonlat: [120.893355, 22.0]
     bbox_lon_lat: [120.16671, 121.62, 21.550844, 22.449156]
@@ -177,7 +179,7 @@ study_sites:
     analysis_region_id: A
     flow_domain_id: northeast_taiwan_common_cache_v3
     formal_release_flow_domain_id: northeast_taiwan_common_cache_v3
-    anchor_lonlat: [121.92807, 25.11245]
+    anchor_lonlat: [121.9223889, 25.0964444]
     receptor_core_radius_m: 12500
     local_domain_baseline_radius_m: 20000
     local_domain_sensitivity_radii_m: []
@@ -198,6 +200,20 @@ study_sites:
     geometry_generator: anchor_centered_azimuthal_equidistant_buffer_intersect_static_ocm_ocean_polygon
     local_domain_overlap_policy: allowed_preserve_site_identity
     legacy_candidate_bbox_lon_lat_provenance_only: [121.81, 121.97, 24.76, 24.92]
+    # 龜山島走廊只是 12.5 km core 內的 soft priority；persistent-wet 候選不足五點
+    # 時回到相同 core，不擴張 local/flow domain，也不跳過逐時 forcing 支援 gate。
+    receptor_priority_polygon:
+      - [121.78, 24.79]
+      - [121.91, 24.76]
+      - [121.94, 24.80]
+      - [121.94, 24.90]
+      - [121.82, 24.92]
+      - [121.76, 24.87]
+    receptor_priority_selection:
+      policy_id: guishan_soft_priority_corridor_core_fallback_v1
+      fallback: same_core_pool
+      total_horizontal_count: 5
+      coordinate_reference: EPSG:4326
   - study_site_id: hsinchu
     study_site_name_zh: 新竹外海
     analysis_region_id: B
@@ -208,77 +224,29 @@ study_sites:
     receptor_core_radius_m: 12500
     anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
     local_domain_policy: same_as_flow_domain
-  - study_site_id: houwan
-    study_site_name_zh: 後灣海生館
+    # 這五個水平位置是已核定的 24 小時工程試跑受體。正式建置只允許把它們逐點
+    # 映射到同一 OCM mesh 的 persistent-wet face，並仍執行 50 個 arrival 與垂向
+    # 支援 gate；不可再用 maximin 另抽一組點。
+    horizontal_receptor_coordinates:
+      - [120.32880147298177, 24.730445861816406]
+      - [120.39448547363281, 24.85012690226237]
+      - [120.45531717936198, 24.75184504191081]
+      - [120.47039794921875, 24.640532811482746]
+      - [120.57318623860677, 24.753894170125324]
+    horizontal_receptor_source_manifest_sha256: f625c3cbaf339220994e14926c5a2bd65974ec40706e0d81c0fa3f7404128055
+    horizontal_receptor_selection_policy: hsinchu_24h_pilot_fixed_horizontal_manifest_coordinates_v1
+    horizontal_receptor_coordinate_tolerance_m: 1.0
+  - study_site_id: nanwan
+    study_site_name_zh: 南灣
     analysis_region_id: C
     flow_domain_id: houwan_nmmba_cache_v3
-    # C 區受體 anchor 與 12.5 km core 是位置候選的初始範圍；紅框子區另以兩個
-    # receptor_candidate_regions 明示西岸／南端配額。紅框只限制受體選點，不能取代
-    # OCM static ocean、persistent wet/dry、NWW 四角或垂向 zcor 支援檢查。
-    anchor_lonlat: [120.893355, 22.0]
+    # C 區外框與 forcing 產品 ID 維持歷史 houwan domain；研究者核定的南灣 anchor
+    # 只決定本研究站的 12.5 km receptor core。先前後灣西岸／南端紅框 2+3 選點契約
+    # 已撤銷，不能再把它們帶入現行 common-input 或 provenance。
+    anchor_lonlat: [120.763161, 21.946577]
     receptor_core_radius_m: 12500
     anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
     local_domain_policy: same_as_flow_domain
-    receptor_candidate_selection:
-      policy_id: houwan_red_frame_two_subregions_anchor_first_maximin_2plus3_v1
-      require_each_region: true
-      total_horizontal_count: 5
-      distance_coordinate_system: local_azimuthal_equidistant_m
-      boundary_policy: approved_C_flow_local_intersection_plus_persistent_wet_margin
-    # 座標由研究者提供的 overview 手繪紅框數位化而來；影像 hash 與像素範圍讓
-    # polygon 可以由同一附件重建。這是候選區 provenance，不是 forcing 支援證據。
-    receptor_candidate_regions_provenance:
-      source_artifact: horizontal_overview.png
-      source_sha256: 0c28a19f9707f5d4717799b4936bb99195a868b76aec1322c21c725192132beb
-      image_width_px: 1236
-      image_height_px: 832
-      plot_bbox_pixels_xy: [65, 46, 1180, 789]
-      plot_bbox_lon_lat: [120.16671, 121.62, 21.550844, 22.449156]
-      digitization_method: manual_red_frame_vertex_trace_v1
-    receptor_candidate_regions:
-      - region_id: c_west_coast
-        name_zh: 屏東西南沿岸紅框
-        allocation_count: 2
-        coordinate_reference: EPSG:4326
-        geometry:
-          type: Polygon
-          coordinates:
-            - - [120.67242885, 22.13359822]
-              - [120.62941668, 22.12876208]
-              - [120.60465210, 22.09128204]
-              - [120.58770791, 22.03203939]
-              - [120.58119091, 21.97158771]
-              - [120.58249431, 21.93652573]
-              - [120.59683170, 21.91718120]
-              - [120.64636087, 21.90025472]
-              - [120.66591186, 21.93652573]
-              - [120.68024925, 21.98246901]
-              - [120.70240703, 22.02720326]
-              - [120.70501383, 22.05742910]
-              - [120.69328324, 22.09490914]
-              - [120.67242885, 22.13359822]
-      - region_id: c_south_tip
-        name_zh: 恆春半島南端近岸紅框
-        allocation_count: 3
-        coordinate_reference: EPSG:4326
-        geometry:
-          type: Polygon
-          coordinates:
-            - - [120.71153083, 21.94619800]
-              - [120.77018378, 21.95345220]
-              - [120.82883674, 21.95345220]
-              - [120.86663532, 21.93773477]
-              - [120.89531010, 21.91597216]
-              - [120.91616448, 21.88816439]
-              - [120.92007468, 21.86035661]
-              - [120.87706251, 21.84584821]
-              - [120.83796054, 21.83617594]
-              - [120.77409398, 21.83496691]
-              - [120.72065462, 21.84463918]
-              - [120.68546284, 21.86640178]
-              - [120.67633905, 21.89300052]
-              - [120.67894585, 21.92080830]
-              - [120.71153083, 21.94619800]
   - study_site_id: lienchiang
     study_site_name_zh: 連江
     analysis_region_id: D

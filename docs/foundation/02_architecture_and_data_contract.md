@@ -96,7 +96,7 @@ grid；重採樣不提升有效物理解析度，圖說與 metadata 必須保留
 |---|---|
 | `northeast_taiwan_common_cache_v3` | 龜山島與貢寮等東北台灣受體 |
 | `hsinchu_cache_v3` | 新竹外海受體 |
-| `houwan_nmmba_cache_v3` | 後灣／海生館受體 |
+| `houwan_nmmba_cache_v3` | C 區南灣受體；forcing ID 保留歷史 houwan 名稱，舊 `houwan` site 只供 historical loader |
 | `lienchiang_common_cache_v3` | 北竿、南竿與連江島群受體 |
 
 每個 domain 由 WGS84 polygon 與一個局地 metric CRS 組成。建議以 domain 中心建立 Azimuthal Equidistant CRS，避免連江 domain 跨 UTM zone 邊界時出現不必要的分區。正式 CRS 保存 PROJJSON/WKT、中心、轉換版本與 round-trip 誤差。
@@ -247,9 +247,12 @@ OCM 與 NWW3 缺值政策分開：
 
 每站點 20 個受體由 5 個水平位置 × 4 個垂向層位產生。貢寮、龜山島與新竹的水平候選
 各限於明示 anchor 半徑 12.5 km 的 receptor core，再與既有 local／static-ocean 候選區
-求交；後灣與連江等未明示核心的站點則保留原本的 flow/local 候選區。所有半徑均在站點
+求交；南灣與連江則以各自 anchor 的 12.5 km core 限制候選。所有半徑均在站點
 所屬 flow domain 的 AEQD 公尺投影計算，不以經緯度差近似距離。第一點由 anchor 或
 flow-domain center snap 至 persistent-wet mesh，其餘使用固定 tie-break 的 metric maximin。
+新竹五個水平位置另以核定 manifest 座標逐點映射同一原生 OCM mesh，保留宣告順序與來源
+SHA-256，不得重新 maximin；龜山島的核定 priority polygon 只在 12.5 km core 內優先，
+persistent-wet 候選不足五點時回到同一 core，兩條路徑均不得略過 forcing 支援 gate。
 垂向模板目標為海面下 `0.10H`、`0.40H`、`0.70H` 與最低有效 OCM layer 中心；每個
 arrival 的正式實際 z 必須改由 dynamic pair manifest 的 OCM `eta`／`zcor`／`wetdry` 計算與驗證。
 

@@ -36,6 +36,7 @@ from lagrangian_backtracking.gap_policy import (
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
 )
 from lagrangian_backtracking.manifests import (
+    _validate_fixed_horizontal_receptor_manifest,
     load_arrival_time_manifest,
     load_boundary_geometries,
     load_material_manifest,
@@ -57,7 +58,7 @@ SITES = {
     "gongliao": ("A", "northeast_taiwan_common_cache_v3"),
     "guishan": ("A", "northeast_taiwan_common_cache_v3"),
     "hsinchu": ("B", "hsinchu_cache_v3"),
-    "houwan": ("C", "houwan_nmmba_cache_v3"),
+    "nanwan": ("C", "houwan_nmmba_cache_v3"),
     "lienchiang": ("D", "lienchiang_common_cache_v3"),
 }
 
@@ -67,6 +68,19 @@ def _config(tmp_path: Path, *, with_paths: bool = False) -> ProjectConfig:
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    # 本函式覆蓋舊版 component schema，但站點鍵仍沿用 current contract 的 nanwan；
+    # 只有明確的歷史 artifact 測試才應另建 houwan-only fixture，避免把合法 current
+    # site 與舊名稱混用而讓 loader 斷言失焦。
+    for field in (
+        "horizontal_receptor_coordinates",
+        "horizontal_receptor_source_manifest_sha256",
+        "horizontal_receptor_selection_policy",
+        "horizontal_receptor_coordinate_tolerance_m",
+        "receptor_priority_polygon",
+        "receptor_priority_selection",
+    ):
+        for site in payload["study_sites"]:
+            site.pop(field, None)
     # 這組測試專門覆蓋舊 manifest 的 2024–2025／單 replicate 行為；正式 example
     # 現在是 2025 observation template，因此 fixture 必須顯式退回已登錄的舊 v3
     # design 與未啟用 arrival selection，不能只刪 bed block 後誤把新母體當 legacy。
@@ -94,6 +108,8 @@ def _bed_config() -> ProjectConfig:
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    # 這裡保留 current nanwan 與 B／龜山島的受體契約，因為 bed-residence fixture
+    # 需以現行 gap-censored 設計載入，不能再退回歷史 houwan site 集合。
     payload["inputs"]["backtrack_support_days"] = 180
     payload["scenarios"]["bed_residence_time"].update(
         {
@@ -626,7 +642,7 @@ def _geometry_payloads(
         "gongliao": (121.7, 122.15, 24.9, 25.3),
         "guishan": (121.7, 122.15, 24.7, 24.95),
         "hsinchu": domain_bounds["B"],
-        "houwan": domain_bounds["C"],
+        "nanwan": domain_bounds["C"],
         "lienchiang": domain_bounds["D"],
     }
     for site_id, (region, _) in SITES.items():
@@ -987,6 +1003,76 @@ def test_receptor_nonfinite_coordinate_fails_fast(tmp_path: Path) -> None:
     _write_json(path, payload)
     with pytest.raises(ValueError, match="非有限常數"):
         load_receptor_manifest(path, _config(tmp_path))
+
+
+def test_current_hsinchu_fixed_manifest_keeps_declared_coordinates_and_unique_faces() -> None:
+    """current B manifest 必須分開保存 exact 宣告點與 mesh face 中心，且五面不重複。"""
+
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    config = ProjectConfig.model_validate(payload)
+    site = next(item for item in config.study_sites if item.study_site_id == "hsinchu")
+    assert site.horizontal_receptor_coordinates is not None
+    assert site.horizontal_receptor_source_manifest_sha256 is not None
+    receptors: list[Receptor] = []
+    for order, coordinate in enumerate(site.horizontal_receptor_coordinates):
+        for vertical_index in range(4):
+            receptors.append(
+                Receptor(
+                    receptor_id=f"hsinchu-fixed-{order}-{vertical_index}",
+                    study_site_id="hsinchu",
+                    analysis_region_id="B",
+                    # 頂層座標模擬 accepted OCM face 中心；exact 工程宣告點另在 metadata。
+                    lon=120.4 + order * 0.01,
+                    lat=24.7 + order * 0.01,
+                    z_m_positive_up=-5.0 - vertical_index,
+                    vertical_id=f"z{vertical_index}",
+                    metadata={
+                        "fixed_horizontal_coordinate_order": order,
+                        "fixed_horizontal_source_manifest_sha256": (
+                            site.horizontal_receptor_source_manifest_sha256
+                        ),
+                        "fixed_horizontal_declared_lon": float(coordinate[0]),
+                        "fixed_horizontal_declared_lat": float(coordinate[1]),
+                        "source_face_local_index": order,
+                        "source_face_global_index": order + 1000,
+                    },
+                )
+            )
+
+    _validate_fixed_horizontal_receptor_manifest(receptors, config, formal=True)
+    tampered = list(receptors)
+    tampered_metadata = dict(tampered[0].metadata)
+    tampered_metadata["fixed_horizontal_declared_lon"] += 0.001
+    tampered[0] = Receptor(
+        receptor_id=tampered[0].receptor_id,
+        study_site_id=tampered[0].study_site_id,
+        analysis_region_id=tampered[0].analysis_region_id,
+        lon=tampered[0].lon,
+        lat=tampered[0].lat,
+        z_m_positive_up=tampered[0].z_m_positive_up,
+        vertical_id=tampered[0].vertical_id,
+        metadata=tampered_metadata,
+    )
+    with pytest.raises(ValueError, match="宣告座標 metadata"):
+        _validate_fixed_horizontal_receptor_manifest(tampered, config, formal=True)
+
+    duplicate_face = list(receptors)
+    for index in range(4, 8):
+        duplicate_metadata = dict(duplicate_face[index].metadata)
+        duplicate_metadata["source_face_local_index"] = 0
+        duplicate_face[index] = Receptor(
+            receptor_id=duplicate_face[index].receptor_id,
+            study_site_id=duplicate_face[index].study_site_id,
+            analysis_region_id=duplicate_face[index].analysis_region_id,
+            lon=duplicate_face[index].lon,
+            lat=duplicate_face[index].lat,
+            z_m_positive_up=duplicate_face[index].z_m_positive_up,
+            vertical_id=duplicate_face[index].vertical_id,
+            metadata=duplicate_metadata,
+        )
+    with pytest.raises(ValueError, match="不可共用同一 OCM face"):
+        _validate_fixed_horizontal_receptor_manifest(duplicate_face, config, formal=True)
 
 
 def test_full_scenario_inputs_are_deterministic_and_hash_bound(tmp_path: Path) -> None:
