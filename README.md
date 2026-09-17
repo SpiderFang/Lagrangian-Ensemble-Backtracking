@@ -213,6 +213,13 @@ arrival anchor。
 依第一缺口截尾契約產生 `data_gap` 可稽核紀錄。兩者都不能用最近值、零值或未登錄外插繞過。
 正式執行前須由當次流場清冊與對應 gap-safe／gap-censored 證據完成驗證；本次不宣稱
 已在 SERVER 執行，也不把 design_pending template 稱為 approved release。
+
+Suite 發布優先使用同一 parent 目錄的 native exclusive rename；只有檔案系統明確回報不支援
+時，才使用 `nfs_two_phase_copy_v1`。fallback 先以 parent dirfd 的不可覆寫 `mkdir` 保留
+destination basename，再以 no-follow 普通檔／目錄白名單複製、逐檔與目錄 `fsync`，最後建立
+不可覆寫的 `horizon-suite-publication.json` 及 sidecar。marker 綁定 manifest fingerprint、
+策略識別碼／版本與發布方法，不記錄絕對路徑；無 marker 的 reserved destination 一律不算
+正式成果，必須人工選新 destination 或明確清理。
 正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建、legacy 缺口安全到達視窗，或本期版本化的第一缺口截尾政策，執行流程不臨時外插，不以最近值或零值補資料。
 
 ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。

@@ -1019,6 +1019,181 @@ def test_publish_race_preserves_existing_destination_and_partial_identity_swap(
     assert (replacement_path / "sentinel").read_text(encoding="utf-8") == "replacement"
 
 
+def test_nfs_unsupported_fallback_publishes_marker_and_preserves_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """native unsupported 時以兩階段複製發布，原 partial inode／bytes 不變。"""
+
+    _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "template.yaml"
+    _write_template(template, support_days=90)
+    destination = tmp_path / "nfs-suite"
+    source_snapshot: dict[str, tuple[int, bytes | None]] = {}
+
+    def snapshot_tree(root: Path) -> dict[str, tuple[int, bytes | None]]:
+        snapshot: dict[str, tuple[int, bytes | None]] = {}
+        for entry in sorted(root.rglob("*")):
+            relative = str(entry.relative_to(root))
+            status = entry.lstat()
+            snapshot[relative] = (
+                status.st_ino,
+                entry.read_bytes() if entry.is_file() else None,
+            )
+        return snapshot
+
+    def unsupported(
+        rename_function: Any,
+        *,
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+        rename_flags: int,
+    ) -> None:
+        del rename_function, parent_descriptor, destination_name, rename_flags
+        partial = tmp_path / source_name
+        source_snapshot.update(snapshot_tree(partial))
+        raise horizon_suite._ReportReleaseAtomicRenameUnsupported("simulated NFS")
+
+    monkeypatch.setattr(horizon_suite, "_call_exclusive_rename", unsupported)
+    horizon_suite.build_horizon_suite(
+        template,
+        [30],
+        destination,
+        tmp_path / "o",
+        tmp_path / "s",
+        tmp_path / "n",
+        False,
+    )
+    partials = list(tmp_path.glob(".nfs-suite.partial-*"))
+    assert len(partials) == 1
+    assert snapshot_tree(partials[0]) == source_snapshot
+    marker, _ = read_canonical_json(
+        destination / horizon_suite.HORIZON_SUITE_PUBLICATION_MARKER_FILENAME
+    )
+    assert marker["publication_method"] == horizon_suite.HORIZON_SUITE_NFS_PUBLICATION_METHOD
+    assert horizon_suite.validate_horizon_suite(destination, formal=False)["valid"] is True
+
+
+def test_nfs_fallback_collision_keeps_existing_destination_and_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NFS reservation 遇 collision 時 fail closed，不覆寫既有內容。"""
+
+    _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "template.yaml"
+    _write_template(template, support_days=90)
+    destination = tmp_path / "nfs-collision"
+
+    def unsupported_and_collide(
+        rename_function: Any,
+        *,
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+        rename_flags: int,
+    ) -> None:
+        del rename_function, parent_descriptor, source_name, rename_flags
+        destination.mkdir()
+        (destination / "sentinel").write_text("keep", encoding="utf-8")
+        raise horizon_suite._ReportReleaseAtomicRenameUnsupported("simulated NFS")
+
+    monkeypatch.setattr(horizon_suite, "_call_exclusive_rename", unsupported_and_collide)
+    with pytest.raises(FileExistsError):
+        horizon_suite.build_horizon_suite(
+            template,
+            [30],
+            destination,
+            tmp_path / "o",
+            tmp_path / "s",
+            tmp_path / "n",
+            False,
+        )
+    assert (destination / "sentinel").read_text(encoding="utf-8") == "keep"
+    assert not (destination / horizon_suite.HORIZON_SUITE_PUBLICATION_MARKER_FILENAME).exists()
+    assert len(list(tmp_path.glob(".nfs-collision.partial-*"))) == 1
+
+
+def test_nfs_fallback_interruption_leaves_unpublished_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """複製中斷保留 reserved destination，但無 marker 時公開 validator 必須失敗。"""
+
+    _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "template.yaml"
+    _write_template(template, support_days=90)
+    destination = tmp_path / "nfs-interrupted"
+
+    def unsupported(
+        rename_function: Any,
+        *,
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+        rename_flags: int,
+    ) -> None:
+        del rename_function, parent_descriptor, source_name, destination_name, rename_flags
+        raise horizon_suite._ReportReleaseAtomicRenameUnsupported("simulated NFS")
+
+    def interrupt(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("simulated copy interruption")
+
+    monkeypatch.setattr(horizon_suite, "_call_exclusive_rename", unsupported)
+    monkeypatch.setattr(horizon_suite, "_copy_directory_fd_tree", interrupt)
+    with pytest.raises(RuntimeError, match="simulated copy interruption"):
+        horizon_suite.build_horizon_suite(
+            template,
+            [30],
+            destination,
+            tmp_path / "o",
+            tmp_path / "s",
+            tmp_path / "n",
+            False,
+        )
+    assert destination.is_dir()
+    assert not (destination / horizon_suite.HORIZON_SUITE_PUBLICATION_MARKER_FILENAME).exists()
+    assert horizon_suite.validate_horizon_suite(destination, formal=False)["valid"] is False
+    assert len(list(tmp_path.glob(".nfs-interrupted.partial-*"))) == 1
+
+
+def test_nfs_fallback_rejects_source_symlink_or_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """native unsupported 後 source 出現 symlink／竄改時不得保留可發布 destination。"""
+
+    _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "template.yaml"
+    _write_template(template, support_days=90)
+    destination = tmp_path / "nfs-tampered"
+
+    def unsupported_and_tamper(
+        rename_function: Any,
+        *,
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+        rename_flags: int,
+    ) -> None:
+        del rename_function, parent_descriptor, destination_name, rename_flags
+        partial = tmp_path / source_name
+        (partial / "unexpected-link").symlink_to(partial / "common-config.yaml")
+        raise horizon_suite._ReportReleaseAtomicRenameUnsupported("simulated NFS")
+
+    monkeypatch.setattr(horizon_suite, "_call_exclusive_rename", unsupported_and_tamper)
+    with pytest.raises(horizon_suite.HorizonSuiteError):
+        horizon_suite.build_horizon_suite(
+            template,
+            [30],
+            destination,
+            tmp_path / "o",
+            tmp_path / "s",
+            tmp_path / "n",
+            False,
+        )
+    assert not destination.exists()
+    assert len(list(tmp_path.glob(".nfs-tampered.partial-*"))) == 1
+
+
 def test_publish_fsync_failure_keeps_final_and_downstream_raise_is_json_safe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

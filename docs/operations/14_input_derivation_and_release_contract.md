@@ -191,7 +191,9 @@ release。輸出拓撲固定包含：
 ├── release-configs/           # H30/H60/H90 × 兩種 mode，共六份 release config
 ├── validations/               # common input 與六份 mode-specific release validator JSON
 ├── horizon-suite-manifest.json        # suite 模式、日數、拓撲、來源與 artifact hash
-└── horizon-suite-manifest.json.sha256 # manifest 位元組的 SHA-256 binding
+├── horizon-suite-manifest.json.sha256 # manifest 位元組的 SHA-256 binding
+├── horizon-suite-publication.json     # immutable 發布完成 marker
+└── horizon-suite-publication.json.sha256 # marker 位元組的 SHA-256 binding
 ```
 
 `source-template.yaml` 仍保存 caller 原始檔案；suite 只允許原範例所文件化的
@@ -205,12 +207,25 @@ approved gate，且仍須通過既有 A 區 v3/local20 formal gate；`--pilot` �
 清理前必須先確認相關 process、partial 的目錄擁有者、inode 與 final 狀態，不可採用先 `stat` 再
 `unlink` 的競態方式；`.partial-*` 不得當作成功發布。
 
+發布優先使用同一 parent 目錄的 native exclusive rename。若檔案系統明確回報不支援該
+拒覆寫原子操作，才使用 `nfs_two_phase_copy_v1`：先以 parent dirfd 的不可覆寫 `mkdir`
+保留 destination basename，再以 no-follow、普通檔／目錄白名單複製完整 suite，逐檔與目錄
+`fsync`，最後不可覆寫建立 publication marker。marker 只綁定 manifest 的 bytes／canonical
+fingerprint、策略識別碼／版本與 native 或 NFS 方法，不含任何絕對路徑；碰撞、symlink、特殊
+檔案、竄改或複製中斷都 fail closed。reserved destination 若沒有 marker，公開 validator 一律
+拒絕，且中斷現場不自動刪除，必須人工選新 destination 或明確清理。
+
 `lbt horizon-suite-validate` 固定讀取 suite 內的 `common-input/`，並可明示三個 accepted roots。
 省略 roots 時只驗 suite 內 artifact closure，不代表重新核對 accepted source bytes 或 canonical UTC
 axis；正式或移機驗收必須明示三個 roots。唯讀 validator 會重建 expected payload，核對
 selection_support=180/runtime_support=90、一次 build、完整六份 H×mode topology、各 release 日數／
 步數／mode、支援 binding、共同 identities 與 artifact hash；不能只相信 manifest 自述。六份 config
 hash 因 H 與 mode 不同而不同，共同母體及 artifacts 必須完全一致。
+公開 validator 另要求 `horizon-suite-publication.json` 及其 sidecar，並核對 marker 的
+manifest fingerprint、schema、publication policy／version 與方法。新 schema 不允許無 marker
+的目錄以正式或 pilot CLI 通過；未發布 partial 只由 builder 透過私有 gate 驗證。
+artifact／release 的 legacy schema 相容性不會放寬本 suite schema `1.1.0` 的發布契約；
+舊 suite 若沒有 marker，必須重新發布或走明示 recovery，不得直接視為成功。
 
 這個流程只保證可稽核的設計母體與設定綁定，不是每粒子的固定存活時間。粒子仍可因海岸、域外、
 資料缺口或數值狀態停止，不能把六份設定都通過解讀為每粒子實際走滿 H。正式 accepted inputs 限

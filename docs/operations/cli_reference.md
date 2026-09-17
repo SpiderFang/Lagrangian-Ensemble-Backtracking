@@ -169,7 +169,9 @@ accepted roots、strict input derivation、完整結構與 hash 驗證；pilot
 ├── release-configs/           # H30/H60/H90 × 兩種 mode，共六份 release YAML
 ├── validations/               # common input 與六份 mode-specific release validator JSON
 ├── horizon-suite-manifest.json        # suite 拓撲、模式、日數與所有來源／artifact hash
-└── horizon-suite-manifest.json.sha256 # manifest bytes 的 SHA-256 binding
+├── horizon-suite-manifest.json.sha256 # manifest bytes 的 SHA-256 binding
+├── horizon-suite-publication.json     # immutable 發布完成 marker
+└── horizon-suite-publication.json.sha256 # marker bytes 的 SHA-256 binding
 ```
 
 `horizon-suite-validate` 是唯讀入口；它固定讀取 suite 內的 `common-input/`，重新核對
@@ -201,6 +203,14 @@ uv run lbt horizon-suite-validate \
 母體與執行設定可比較，不保證每粒子走滿指定 H；粒子仍可能因海岸、域外、資料缺口或數值
 狀態停止。正式輸入限 OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3 schema
 1 `nww3_analysis`，禁止 raw NetCDF、transfer archive、零值與最近值補齊。
+
+發布優先使用 native exclusive rename；只有 backend 明確回報不支援時，才使用
+`nfs_two_phase_copy_v1`。fallback 先以 parent dirfd 的不可覆寫 `mkdir` 保留 destination，
+再以 no-follow 普通檔／目錄白名單複製並 `fsync`，最後不可覆寫建立 publication marker。
+marker 綁定 manifest fingerprint、策略／版本與方法，不記錄絕對路徑；沒有 marker 的
+reserved destination 由公開 validator 拒絕，操作員須選新 destination 或明確清理。
+既有 artifact／release 的 legacy schema 相容性仍由各自 schema validator 處理；本
+`horizon-suite` schema `1.1.0` 的公開成功契約新增 marker，不能以舊目錄缺 marker 取代。
 
 **資料可行性限制：** 新版正式 arrival 母體只以 2025 作 observation anchor，forcing 仍保留
 2024–2025。最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，因此不把 2024

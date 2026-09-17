@@ -11,6 +11,10 @@
 本模組不讀取 raw NetCDF、不以零值或最近值補真正缺口；缺時仍由既有 gap-safe
 validator 與版本化重建政策決定是否可用。共同母體通過只代表輸入與設定契約已通過，
 不保證每一粒子都能在物理邊界與資料支援下走滿所要求的 horizon。
+
+suite 對外成功的最後提交點是固定 publication marker；native exclusive rename 不可用時，
+只在 backend 明確回報 unsupported 的 NFS 兩階段複製才會建立該 marker。未含 marker 的
+partial／reserved destination 僅供本模組 private gate 稽核，不能由公開 validator 當成成功。
 """
 
 from __future__ import annotations
@@ -64,7 +68,11 @@ from .input_horizon import (
     BED_RESIDENCE_INPUT_SCHEMA_VERSION,
     GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
 )
-from .report_release import _call_exclusive_rename, _load_exclusive_rename_backend
+from .report_release import (
+    _call_exclusive_rename,
+    _load_exclusive_rename_backend,
+    _ReportReleaseAtomicRenameUnsupported,
+)
 
 HORIZON_SUITE_SCHEMA_VERSION = "1.1.0"
 """多 horizon suite 的固定 schema 版本。"""
@@ -86,6 +94,28 @@ HORIZON_SUITE_RELEASE_DIRECTORY = "release-configs"
 
 HORIZON_SUITE_VALIDATION_DIRECTORY = "validations"
 """input／release validation JSON 的固定子目錄。"""
+
+HORIZON_SUITE_PUBLICATION_MARKER_FILENAME = "horizon-suite-publication.json"
+"""正式 suite 根目錄的不可變發布完成標記檔名。"""
+
+HORIZON_SUITE_PUBLICATION_POLICY_ID = "exclusive_native_or_nfs_two_phase_copy"
+"""發布策略識別碼；只允許 native exclusive rename 或受控 NFS fallback。"""
+
+HORIZON_SUITE_PUBLICATION_POLICY_VERSION = "1.0.0"
+"""發布策略版本；marker 以此版本綁定寫入與驗證語意。"""
+
+HORIZON_SUITE_NATIVE_PUBLICATION_METHOD = "native_exclusive_rename_v1"
+"""同一 parent 目錄內以 native exclusive rename 完成的發布方法。"""
+
+HORIZON_SUITE_NFS_PUBLICATION_METHOD = "nfs_two_phase_copy_v1"
+"""NFS 不支援 exclusive rename 時使用的保留目錄、複製、marker 兩階段方法。"""
+
+_ALLOWED_PUBLICATION_METHODS = frozenset(
+    {
+        HORIZON_SUITE_NATIVE_PUBLICATION_METHOD,
+        HORIZON_SUITE_NFS_PUBLICATION_METHOD,
+    }
+)
 
 HORIZON_SUITE_POLICY_ID = "shared_horizon_and_bed_age_input_one_build_v1"
 """共同母體只建置一次的政策識別碼。"""
@@ -862,13 +892,20 @@ def _release_stem(days: int, mode: str | None) -> str:
 
 
 def _assert_suite_topology(
-    suite_root: Path, horizons: Sequence[int], backtrack_modes: Sequence[str]
+    suite_root: Path,
+    horizons: Sequence[int],
+    backtrack_modes: Sequence[str],
+    *,
+    publication_marker_required: bool = True,
 ) -> None:
     """驗證 suite 根、release、validation 與 common-input 的固定 closure。
 
     固定檔名是為了讓下游 CLI 能以 suite-relative 路徑重建，不允許 caller 透過
     manifest 新增任意 input 或 release。十個 component 以及 artifact index／closure
     的 sidecar 都必須存在，檔案內容的 hash 仍由後續 canonical reader 再驗證。
+    公開 validator 要求發布完成 marker；只有 builder 在 marker 尚未寫入的 private
+    partial gate 才能明示 ``publication_marker_required=False``，避免未完成目錄被
+    外部 CLI 當成正式 suite。
     """
 
     root_files = {
@@ -877,6 +914,13 @@ def _assert_suite_topology(
         HORIZON_SUITE_MANIFEST_FILENAME,
         f"{HORIZON_SUITE_MANIFEST_FILENAME}.sha256",
     }
+    if publication_marker_required:
+        root_files.update(
+            {
+                HORIZON_SUITE_PUBLICATION_MARKER_FILENAME,
+                f"{HORIZON_SUITE_PUBLICATION_MARKER_FILENAME}.sha256",
+            }
+        )
     root_directories = {
         HORIZON_SUITE_COMMON_INPUT_DIRECTORY,
         HORIZON_SUITE_RELEASE_DIRECTORY,
@@ -1244,12 +1288,517 @@ def _fsync_directory(
         raise HorizonSuiteError("fsync 後 parent identity 已改變")
 
 
+def _publication_fingerprint(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
+    """擷取 marker 可公開保存的 manifest fingerprint，不帶入絕對路徑。"""
+
+    fields = ("sha256", "canonical_sha256", "size_bytes")
+    if any(field not in fingerprint for field in fields):
+        raise HorizonSuiteError("manifest fingerprint 欄位不完整")
+    return {field: fingerprint[field] for field in fields}
+
+
+def _publication_marker_payload(
+    manifest_fingerprint: Mapping[str, Any], publication_method: str
+) -> dict[str, Any]:
+    """組裝固定欄位的 suite publication marker。"""
+
+    if publication_method not in _ALLOWED_PUBLICATION_METHODS:
+        raise HorizonSuiteError("未知的 suite publication method")
+    return {
+        "marker_kind": "horizon_suite_publication_commit",
+        "schema_version": HORIZON_SUITE_SCHEMA_VERSION,
+        "publication_policy_id": HORIZON_SUITE_PUBLICATION_POLICY_ID,
+        "publication_policy_version": HORIZON_SUITE_PUBLICATION_POLICY_VERSION,
+        "publication_method": publication_method,
+        "manifest_fingerprint": _publication_fingerprint(manifest_fingerprint),
+    }
+
+
+def _write_no_replace_at(directory_descriptor: int, name: str, data: bytes) -> None:
+    """以 directory fd 寫入不可覆寫的普通檔案並同步檔案 descriptor。
+
+    NFS fallback 的 destination 是先保留、後複製的空目錄；因此 marker 與 sidecar
+    不能沿用 path-based ``os.replace``。這裡以 ``O_EXCL``／``O_NOFOLLOW`` 把「檔名
+    尚不存在」與建立檔案合併，任何既有 node、symbolic link 或中途寫入失敗都保留
+    現場並 fail closed。
+    """
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise HorizonSuiteError("平台缺少安全 no-follow file flag")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(name, flags, 0o644, dir_fd=directory_descriptor)
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise OSError("publication marker 寫入沒有前進")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_publication_marker(
+    destination: Path,
+    publication_method: str,
+    parent_identity: tuple[int, int],
+    destination_identity: tuple[int, int],
+) -> None:
+    """在已固定的 destination inode 上原子建立 publication marker 與 sidecar。
+
+    marker 是正式 validator 的完成提交點：manifest 已先寫入且通過 private partial
+    gate，這裡再以 parent／destination dirfd 核對 inode，建立不可覆寫的 marker 與
+    SHA-256 sidecar，並同步 destination／parent 目錄。payload 僅保存 bytes fingerprint
+    與發布策略，不保存任何 destination、partial 或 forcing root 絕對路徑。
+    """
+
+    if publication_method not in _ALLOWED_PUBLICATION_METHODS:
+        raise HorizonSuiteError("未知的 suite publication method")
+    _assert_no_symlink_components(destination, allow_missing_leaf=False)
+    manifest_payload, manifest_fingerprint = read_canonical_json(
+        destination / HORIZON_SUITE_MANIFEST_FILENAME
+    )
+    if manifest_payload.get("schema_version") != HORIZON_SUITE_SCHEMA_VERSION:
+        raise HorizonSuiteError("publication marker 的 manifest schema 不符")
+    marker_payload = _publication_marker_payload(manifest_fingerprint, publication_method)
+    marker_bytes = (
+        json.dumps(
+            marker_payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    marker_binding = {
+        "algorithm": "sha256",
+        "canonical_sha256": sha256(canonical_json_bytes(marker_payload)).hexdigest(),
+        "sha256": sha256(marker_bytes).hexdigest(),
+        "size_bytes": len(marker_bytes),
+    }
+    binding_bytes = (
+        json.dumps(
+            marker_binding,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    parent_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    lock_acquired = False
+    try:
+        parent_descriptor = os.open(destination.parent, _directory_open_flags())
+        parent_status = os.fstat(parent_descriptor)
+        actual_parent = (parent_status.st_dev, parent_status.st_ino)
+        if not stat.S_ISDIR(parent_status.st_mode) or actual_parent != parent_identity:
+            raise HorizonSuiteError("publication marker parent identity 已改變")
+        _lock_directory(parent_descriptor)
+        lock_acquired = True
+        destination_descriptor = os.open(
+            destination.name,
+            _directory_open_flags(),
+            dir_fd=parent_descriptor,
+        )
+        destination_status = os.fstat(destination_descriptor)
+        actual_destination = (destination_status.st_dev, destination_status.st_ino)
+        if (
+            not stat.S_ISDIR(destination_status.st_mode)
+            or actual_destination != destination_identity
+        ):
+            raise HorizonSuiteError("publication marker destination identity 已改變")
+        _write_no_replace_at(
+            destination_descriptor,
+            HORIZON_SUITE_PUBLICATION_MARKER_FILENAME,
+            marker_bytes,
+        )
+        _write_no_replace_at(
+            destination_descriptor,
+            f"{HORIZON_SUITE_PUBLICATION_MARKER_FILENAME}.sha256",
+            binding_bytes,
+        )
+        os.fsync(destination_descriptor)
+        final_destination = os.fstat(destination_descriptor)
+        if (final_destination.st_dev, final_destination.st_ino) != destination_identity:
+            raise HorizonSuiteError("publication marker 後 destination identity 已改變")
+        os.fsync(parent_descriptor)
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        if lock_acquired and parent_descriptor is not None:
+            _unlock_directory(parent_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+
+
+def _validate_publication_marker(
+    suite_root: Path, manifest_fingerprint: Mapping[str, Any]
+) -> list[str]:
+    """驗證正式 suite 的 immutable publication marker 與 manifest fingerprint。"""
+
+    errors: list[str] = []
+    marker_path = suite_root / HORIZON_SUITE_PUBLICATION_MARKER_FILENAME
+    try:
+        marker, _ = read_canonical_json(marker_path)
+    except Exception as exc:
+        return [f"publication_marker_invalid:{type(exc).__name__}"]
+    expected_keys = {
+        "marker_kind",
+        "schema_version",
+        "publication_policy_id",
+        "publication_policy_version",
+        "publication_method",
+        "manifest_fingerprint",
+    }
+    if set(marker) != expected_keys:
+        errors.append("publication_marker_key_set_invalid")
+    if marker.get("marker_kind") != "horizon_suite_publication_commit":
+        errors.append("publication_marker_kind_invalid")
+    if marker.get("schema_version") != HORIZON_SUITE_SCHEMA_VERSION:
+        errors.append("publication_marker_schema_version_invalid")
+    if marker.get("publication_policy_id") != HORIZON_SUITE_PUBLICATION_POLICY_ID:
+        errors.append("publication_marker_policy_invalid")
+    if marker.get("publication_policy_version") != HORIZON_SUITE_PUBLICATION_POLICY_VERSION:
+        errors.append("publication_marker_policy_version_invalid")
+    if marker.get("publication_method") not in _ALLOWED_PUBLICATION_METHODS:
+        errors.append("publication_marker_method_invalid")
+    try:
+        if marker.get("manifest_fingerprint") != _publication_fingerprint(manifest_fingerprint):
+            errors.append("publication_marker_manifest_fingerprint_mismatch")
+    except Exception:
+        errors.append("publication_marker_manifest_fingerprint_invalid")
+    return errors
+
+
+def _suite_copy_layout(partial: Path) -> dict[str, tuple[set[str], set[str]]]:
+    """從 partial manifest 推導 NFS fallback 唯一允許複製的檔案拓撲。"""
+
+    manifest, _ = read_canonical_json(partial / HORIZON_SUITE_MANIFEST_FILENAME)
+    horizons = normalize_horizons(manifest.get("horizons_days"))
+    raw_modes = manifest.get("backtrack_modes")
+    if not isinstance(raw_modes, list) or any(not isinstance(mode, str) for mode in raw_modes):
+        raise HorizonSuiteError("partial manifest backtrack_modes 不合法")
+    backtrack_modes = tuple(raw_modes)
+    _assert_suite_topology(
+        partial,
+        horizons,
+        backtrack_modes,
+        publication_marker_required=False,
+    )
+    common_files = set(ARTIFACT_FILENAMES.values()) | _COMMON_INPUT_EXTRA_FILENAMES
+    common_files.update(f"{filename}.sha256" for filename in tuple(common_files))
+    mode_slots: tuple[str | None, ...] = backtrack_modes if backtrack_modes else (None,)
+    release_files = {
+        f"{_release_stem(days, mode)}.yaml" for days in horizons for mode in mode_slots
+    }
+    validation_files = {"input.json", "input.json.sha256"}
+    validation_files.update(
+        f"{_release_stem(days, mode)}{suffix}"
+        for days in horizons
+        for mode in mode_slots
+        for suffix in (".json", ".json.sha256")
+    )
+    return {
+        "": (
+            {
+                HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME,
+                HORIZON_SUITE_COMMON_CONFIG_FILENAME,
+                HORIZON_SUITE_MANIFEST_FILENAME,
+                f"{HORIZON_SUITE_MANIFEST_FILENAME}.sha256",
+            },
+            {
+                HORIZON_SUITE_COMMON_INPUT_DIRECTORY,
+                HORIZON_SUITE_RELEASE_DIRECTORY,
+                HORIZON_SUITE_VALIDATION_DIRECTORY,
+            },
+        ),
+        HORIZON_SUITE_COMMON_INPUT_DIRECTORY: (common_files, set()),
+        HORIZON_SUITE_RELEASE_DIRECTORY: (release_files, set()),
+        HORIZON_SUITE_VALIDATION_DIRECTORY: (validation_files, set()),
+    }
+
+
+def _assert_nfs_source_immutable(partial: Path) -> None:
+    """在 NFS 保留 destination 前重驗 partial 的 manifest／sidecar closure。
+
+    native rename 只搬移已通過 private validator 的目錄；NFS fallback 會逐檔複製，
+    因此必須再確認 source 沒有在兩個 gate 之間被竄改。此檢查不讀 forcing root，只
+    比對 suite 已保存的 YAML、canonical JSON、component 與 validation fingerprints。
+    """
+
+    manifest, _ = read_canonical_json(partial / HORIZON_SUITE_MANIFEST_FILENAME)
+    source_payload, source_fingerprint, _ = _read_yaml_snapshot(
+        partial / HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME,
+        "NFS fallback source template",
+        HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME,
+    )
+    _assert_unbound_template(source_payload)
+    if not _fingerprint_matches(manifest.get("source_template_fingerprint"), source_fingerprint):
+        raise HorizonSuiteError("NFS fallback source template fingerprint 已改變")
+    common_payload, common_fingerprint, _ = _read_yaml_snapshot(
+        partial / HORIZON_SUITE_COMMON_CONFIG_FILENAME,
+        "NFS fallback common config",
+        HORIZON_SUITE_COMMON_CONFIG_FILENAME,
+    )
+    if not _fingerprint_matches(manifest.get("common_config_fingerprint"), common_fingerprint):
+        raise HorizonSuiteError("NFS fallback common config fingerprint 已改變")
+    input_root = partial / HORIZON_SUITE_COMMON_INPUT_DIRECTORY
+    artifact_errors, _, _ = _validate_artifact_directory(input_root)
+    if artifact_errors:
+        raise HorizonSuiteError("NFS fallback common-input closure 已改變")
+    component_fingerprints = _component_fingerprints(input_root)
+    _validate_artifact_closure(input_root, component_fingerprints)
+    if manifest.get("common_artifact_index_fingerprint") != component_fingerprints["artifact_index"]:
+        raise HorizonSuiteError("NFS fallback artifact index fingerprint 已改變")
+    recorded_components = manifest.get("common_artifact_fingerprints")
+    if recorded_components != {
+        kind: component_fingerprints[kind] for kind in sorted(ARTIFACT_FILENAMES)
+    }:
+        raise HorizonSuiteError("NFS fallback component fingerprint 已改變")
+    validation_root = partial / HORIZON_SUITE_VALIDATION_DIRECTORY
+    input_validation, input_validation_fingerprint = read_canonical_json(
+        validation_root / "input.json"
+    )
+    if input_validation.get("valid") is not True or not _fingerprint_matches(
+        manifest.get("input_validation_fingerprint"), input_validation_fingerprint
+    ):
+        raise HorizonSuiteError("NFS fallback input validation evidence 已改變")
+    releases = manifest.get("releases")
+    if not isinstance(releases, list):
+        raise HorizonSuiteError("NFS fallback release manifest 不合法")
+    horizons = normalize_horizons(manifest.get("horizons_days"))
+    raw_modes = manifest.get("backtrack_modes")
+    if not isinstance(raw_modes, list) or any(not isinstance(mode, str) for mode in raw_modes):
+        raise HorizonSuiteError("NFS fallback manifest modes 不合法")
+    mode_slots: tuple[str | None, ...] = tuple(raw_modes) if raw_modes else (None,)
+    expected_release_paths = {
+        (
+            f"{HORIZON_SUITE_RELEASE_DIRECTORY}/{_release_stem(days, mode)}.yaml",
+            f"{HORIZON_SUITE_VALIDATION_DIRECTORY}/{_release_stem(days, mode)}.json",
+        )
+        for days in horizons
+        for mode in mode_slots
+    }
+    for record in releases:
+        if not isinstance(record, Mapping):
+            raise HorizonSuiteError("NFS fallback release record 不合法")
+        release_relative = record.get("config_path")
+        validation_relative = record.get("validation_path")
+        if not isinstance(release_relative, str) or not isinstance(validation_relative, str):
+            raise HorizonSuiteError("NFS fallback release path 不合法")
+        if (release_relative, validation_relative) not in expected_release_paths:
+            raise HorizonSuiteError("NFS fallback release path 不在固定白名單")
+        _, release_fingerprint, _ = _read_yaml_snapshot(
+            partial / release_relative,
+            "NFS fallback release",
+            release_relative,
+        )
+        if not _fingerprint_matches(record.get("config_fingerprint"), release_fingerprint):
+            raise HorizonSuiteError("NFS fallback release fingerprint 已改變")
+        _, validation_fingerprint = read_canonical_json(partial / validation_relative)
+        if not _fingerprint_matches(
+            record.get("validation_fingerprint"), validation_fingerprint
+        ):
+            raise HorizonSuiteError("NFS fallback release validation fingerprint 已改變")
+    del common_payload
+
+
+def _copy_file_no_follow(
+    source_directory: int, destination_directory: int, name: str
+) -> None:
+    """以兩個 dirfd 複製單一普通檔案，拒絕 symlink、覆寫與內容競態。"""
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise HorizonSuiteError("平台缺少安全 no-follow file flag")
+    source_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    try:
+        source_descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=source_directory,
+        )
+        source_initial = os.fstat(source_descriptor)
+        if not stat.S_ISREG(source_initial.st_mode):
+            raise HorizonSuiteError("NFS fallback 只允許複製普通檔案")
+        destination_descriptor = os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            stat.S_IMODE(source_initial.st_mode) & 0o777,
+            dir_fd=destination_directory,
+        )
+        digest = sha256()
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_descriptor, chunk[offset:])
+                if written <= 0:
+                    raise OSError("NFS fallback file copy 沒有前進")
+                offset += written
+        os.fsync(destination_descriptor)
+        source_after = os.fstat(source_descriptor)
+        if (
+            (source_after.st_dev, source_after.st_ino) != (source_initial.st_dev, source_initial.st_ino)
+            or source_after.st_size != source_initial.st_size
+            or source_after.st_mtime_ns != source_initial.st_mtime_ns
+            or source_after.st_ctime_ns != source_initial.st_ctime_ns
+        ):
+            raise HorizonSuiteError("NFS fallback source file 在複製期間改變")
+        # 再讀一次 source，確認即使 metadata 沒有變化也沒有內容競態。
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        second_digest = sha256()
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            second_digest.update(chunk)
+        if second_digest.digest() != digest.digest():
+            raise HorizonSuiteError("NFS fallback source file checksum 在複製期間改變")
+        os.lseek(destination_descriptor, 0, os.SEEK_SET)
+        destination_digest = sha256()
+        while True:
+            chunk = os.read(destination_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            destination_digest.update(chunk)
+        if destination_digest.digest() != digest.digest():
+            raise HorizonSuiteError("NFS fallback destination file checksum 不符")
+        destination_status = os.fstat(destination_descriptor)
+        if destination_status.st_size != source_after.st_size:
+            raise HorizonSuiteError("NFS fallback destination file size 不符")
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+
+
+def _copy_directory_fd_tree(
+    source_directory: int,
+    destination_directory: int,
+    relative_name: str,
+    layout: Mapping[str, tuple[set[str], set[str]]],
+) -> None:
+    """依固定白名單遞迴複製 partial，所有檔案與目錄均以 no-follow dirfd 操作。"""
+
+    expected_files, expected_directories = layout[relative_name]
+    try:
+        actual = set(os.listdir(source_directory))
+    except OSError as exc:
+        raise HorizonSuiteError("NFS fallback source directory 無法列舉") from exc
+    expected = expected_files | expected_directories
+    if actual != expected:
+        raise HorizonSuiteError(
+            f"NFS fallback source topology 不符：missing={sorted(expected - actual)},"
+            f"extra={sorted(actual - expected)}"
+        )
+    for name in sorted(expected_files):
+        status = os.stat(name, dir_fd=source_directory, follow_symlinks=False)
+        if not stat.S_ISREG(status.st_mode):
+            raise HorizonSuiteError("NFS fallback 禁止 symlink 或特殊檔案")
+        _copy_file_no_follow(source_directory, destination_directory, name)
+    for name in sorted(expected_directories):
+        source_status = os.stat(name, dir_fd=source_directory, follow_symlinks=False)
+        if not stat.S_ISDIR(source_status.st_mode):
+            raise HorizonSuiteError("NFS fallback 只允許普通目錄")
+        os.mkdir(name, 0o755, dir_fd=destination_directory)
+        source_child = os.open(name, _directory_open_flags(), dir_fd=source_directory)
+        destination_child = os.open(name, _directory_open_flags(), dir_fd=destination_directory)
+        try:
+            child_name = name if not relative_name else f"{relative_name}/{name}"
+            _copy_directory_fd_tree(source_child, destination_child, child_name, layout)
+            os.fsync(destination_child)
+        finally:
+            os.close(destination_child)
+            os.close(source_child)
+
+
+def _publish_partial_nfs_two_phase(
+    partial: Path,
+    destination: Path,
+    parent_descriptor: int,
+    parent_identity: tuple[int, int],
+    partial_descriptor: int,
+    partial_identity: tuple[int, int],
+) -> tuple[str, tuple[int, int]]:
+    """NFS fallback：保留 destination basename 後，以白名單複製完整 partial。
+
+    fallback 只由明確的 ``_ReportReleaseAtomicRenameUnsupported`` 觸發。先在已鎖定
+    parent dirfd 以 ``mkdir`` 不可覆寫地保留 basename，再以 no-follow、普通檔／目錄
+    白名單複製；任何中斷都保留無 marker 的 reserved destination，原 partial 不修改。
+    """
+
+    layout = _suite_copy_layout(partial)
+    _assert_tree_has_no_symlink_or_special_file(partial)
+    _assert_nfs_source_immutable(partial)
+    source_status = os.fstat(partial_descriptor)
+    if (
+        not stat.S_ISDIR(source_status.st_mode)
+        or (source_status.st_dev, source_status.st_ino) != partial_identity
+    ):
+        raise HorizonSuiteError("NFS fallback source partial identity 已改變")
+    current_parent = os.fstat(parent_descriptor)
+    if (
+        not stat.S_ISDIR(current_parent.st_mode)
+        or (current_parent.st_dev, current_parent.st_ino) != parent_identity
+    ):
+        raise HorizonSuiteError("NFS fallback parent identity 已改變")
+    try:
+        os.mkdir(destination.name, 0o755, dir_fd=parent_descriptor)
+    except FileExistsError as exc:
+        raise FileExistsError("horizon suite destination 已存在") from exc
+    os.fsync(parent_descriptor)
+    destination_descriptor: int | None = None
+    try:
+        destination_descriptor = os.open(
+            destination.name,
+            _directory_open_flags(),
+            dir_fd=parent_descriptor,
+        )
+        destination_status = os.fstat(destination_descriptor)
+        destination_identity = (destination_status.st_dev, destination_status.st_ino)
+        if not stat.S_ISDIR(destination_status.st_mode):
+            raise HorizonSuiteError("NFS fallback destination 不是普通目錄")
+        _copy_directory_fd_tree(partial_descriptor, destination_descriptor, "", layout)
+        os.fsync(destination_descriptor)
+        after_source = os.fstat(partial_descriptor)
+        if (after_source.st_dev, after_source.st_ino) != partial_identity:
+            raise HorizonSuiteError("NFS fallback source partial identity 在複製後改變")
+        after_destination = os.fstat(destination_descriptor)
+        if (after_destination.st_dev, after_destination.st_ino) != destination_identity:
+            raise HorizonSuiteError("NFS fallback destination identity 在複製後改變")
+        copied_manifest, _ = read_canonical_json(
+            destination / HORIZON_SUITE_MANIFEST_FILENAME
+        )
+        _assert_suite_topology(
+            destination,
+            normalize_horizons(copied_manifest["horizons_days"]),
+            tuple(copied_manifest["backtrack_modes"]),
+            publication_marker_required=False,
+        )
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+    os.fsync(parent_descriptor)
+    return HORIZON_SUITE_NFS_PUBLICATION_METHOD, destination_identity
+
+
 def _publish_partial(
     partial: Path,
     destination: Path,
     parent_identity: tuple[int, int],
     partial_identity: tuple[int, int],
-) -> None:
+) -> tuple[str, tuple[int, int]]:
     """以同一組 parent／partial dirfd 做 exclusive rename，封閉 basename race。
 
     ``report_release`` 的 native backend 仍負責 ``renameat2(RENAME_NOREPLACE)``／
@@ -1291,15 +1840,26 @@ def _publish_partial(
 
         # 這裡直接使用 report_release 相同的 native exclusive backend，但所有五個
         # renameat 參數中的 directory 皆來自已驗證的同一個 dirfd；不重新解析 parent
-        # 或 partial 的絕對路徑。
-        rename_function, rename_flags = _load_exclusive_rename_backend()
-        _call_exclusive_rename(
-            rename_function,
-            parent_descriptor=parent_descriptor,
-            source_name=partial.name,
-            destination_name=destination.name,
-            rename_flags=rename_flags,
-        )
+        # 或 partial 的絕對路徑。只有 backend 明確回報「不支援」時才進入 NFS fallback；
+        # collision、ABI 失敗及其他 OSError 絕不以一般 rename 或 unchecked mv 取代。
+        try:
+            rename_function, rename_flags = _load_exclusive_rename_backend()
+            _call_exclusive_rename(
+                rename_function,
+                parent_descriptor=parent_descriptor,
+                source_name=partial.name,
+                destination_name=destination.name,
+                rename_flags=rename_flags,
+            )
+        except _ReportReleaseAtomicRenameUnsupported:
+            return _publish_partial_nfs_two_phase(
+                partial,
+                destination,
+                parent_descriptor,
+                actual_parent,
+                partial_descriptor,
+                actual_partial,
+            )
         destination_descriptor = os.open(
             destination.name,
             _directory_open_flags(),
@@ -1312,6 +1872,7 @@ def _publish_partial(
                 raise HorizonSuiteError("rename 後 destination identity 不符")
         finally:
             os.close(destination_descriptor)
+        return HORIZON_SUITE_NATIVE_PUBLICATION_METHOD, destination_identity
     except FileExistsError as exc:
         # native exclusive backend 的 collision 保留 FileExistsError，讓 caller 知道
         # final 是既有成果；不對該 node 做任何 cleanup。
@@ -1323,6 +1884,32 @@ def _publish_partial(
             _unlock_directory(parent_descriptor)
         if parent_descriptor is not None:
             os.close(parent_descriptor)
+
+
+def _normalise_publication_result(
+    result: object, partial_identity: tuple[int, int]
+) -> tuple[str, tuple[int, int]]:
+    """將內部 publish hook 統一成 method／destination inode 結果。
+
+    舊有測試或受控部署 hook 可能只回傳 ``None``；這只代表 native hook 已完成，並
+    不放寬正式 marker gate。真正的 production ``_publish_partial`` 一律回傳兩項
+    tuple，fallback 的新 destination inode 也因此會被後續 marker writer 固定核對。
+    """
+
+    if isinstance(result, tuple) and len(result) == 2:
+        method, identity = result
+        if (
+            isinstance(method, str)
+            and method in _ALLOWED_PUBLICATION_METHODS
+            and isinstance(identity, tuple)
+            and len(identity) == 2
+            and all(type(item) is int for item in identity)
+        ):
+            return method, identity
+        raise HorizonSuiteError("publish hook 回傳的 publication identity 不合法")
+    # 相容既有 native-only test hook；marker writer 仍會重新開啟並驗證 destination。
+    return HORIZON_SUITE_NATIVE_PUBLICATION_METHOD, partial_identity
+
 
 def _write_yaml(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     """以固定 UTF-8 YAML 格式原子寫入 mapping 並回傳 fingerprint。"""
@@ -1619,6 +2206,7 @@ def _validate_suite_contents(
     manifest: Mapping[str, Any],
     *,
     formal: bool,
+    publication_marker_required: bool,
     ocm_native_root: str | Path | None,
     ocm_surface_root: str | Path | None,
     nww_analysis_root: str | Path | None,
@@ -1753,7 +2341,12 @@ def _validate_suite_contents(
         if manifest_modes != expected_modes:
             errors.append("manifest_backtrack_modes_mismatch")
         try:
-            _assert_suite_topology(suite_root, horizons, expected_modes)
+            _assert_suite_topology(
+                suite_root,
+                horizons,
+                expected_modes,
+                publication_marker_required=publication_marker_required,
+            )
         except Exception as exc:
             errors.append(f"suite_topology_invalid:{type(exc).__name__}")
         manifest_dt = manifest.get("dt_min_seconds")
@@ -2230,12 +2823,15 @@ def validate_horizon_suite(
     ocm_native_root: str | Path | None = None,
     ocm_surface_root: str | Path | None = None,
     nww_analysis_root: str | Path | None = None,
+    _allow_unpublished_partial: bool = False,
 ) -> dict[str, Any]:
     """唯讀驗證完整 suite；任何缺檔、竄改或 downstream exception 都回 valid=false。
 
     common input 固定位於 suite 的 ``common-input``，不接受外部 input override，避免
     release YAML 的相對 binding 與另一份看似相同但未經同一套 closure 的輸入混用。若
-    需要搬移成果，應連同整個 suite 一起搬移，或重新建立新 suite。
+    需要搬移成果，應連同整個 suite 一起搬移，或重新建立新 suite。公開入口預設要求
+    immutable publication marker；``_allow_unpublished_partial`` 僅供本模組 builder 在
+    marker 尚未寫入的自有 partial 內部 gate 使用，外部 CLI 不得把該模式當成正式成功。
     """
 
     try:
@@ -2248,6 +2844,7 @@ def validate_horizon_suite(
             suite_root,
             manifest,
             formal=formal,
+            publication_marker_required=not _allow_unpublished_partial,
             ocm_native_root=ocm_native_root,
             ocm_surface_root=ocm_surface_root,
             nww_analysis_root=nww_analysis_root,
@@ -2258,6 +2855,11 @@ def validate_horizon_suite(
             "errors": [f"suite_validator_exception:{type(exc).__name__}"],
             "warnings": [],
         }
+    if not _allow_unpublished_partial:
+        marker_errors = _validate_publication_marker(suite_root, manifest_fp)
+        if marker_errors:
+            result.setdefault("errors", []).extend(marker_errors)
+            result["valid"] = False
     result.setdefault("summary", {})["manifest_fingerprint"] = {
         field: manifest_fp[field] for field in ("sha256", "canonical_sha256", "size_bytes")
     }
@@ -2502,6 +3104,7 @@ def build_horizon_suite(
             ocm_native_root=ocm_native_root,
             ocm_surface_root=ocm_surface_root,
             nww_analysis_root=nww_analysis_root,
+            _allow_unpublished_partial=True,
         )
         if validation.get("valid") is not True:
             detail = ";".join(str(item) for item in validation.get("errors", [])[:8])
@@ -2513,17 +3116,33 @@ def build_horizon_suite(
         ):
             _fsync_directory(partial / directory_name)
         _fsync_directory(partial)
-        _publish_partial(partial, destination_path, parent_identity, partial_identity)
-        published = True
+        publication_started = False
+        publication_result = _publish_partial(
+            partial, destination_path, parent_identity, partial_identity
+        )
+        publication_started = True
         try:
-            # rename 後仍須確認 caller path 指向 rename 使用的原 parent inode；若 parent
-            # 已被替換，不能把另一個同名目錄誤報為已耐久同步，也不能宣稱 destination
-            # 仍存在於 caller path。final 已發布時保留成果並以固定語意回報 durability
-            # 未確認。
+            publication_method, destination_identity = _normalise_publication_result(
+                publication_result, partial_identity
+            )
+            _write_publication_marker(
+                destination_path,
+                publication_method,
+                parent_identity,
+                destination_identity,
+            )
+            _fsync_directory(destination_path, expected_identity=destination_identity)
+            # rename／mkdir、所有內容、marker 與 sidecar 都完成後才同步 parent directory。
+            # parent identity 變動時保留成果但不宣稱耐久性已確認。
             _fsync_directory(destination_path.parent, expected_identity=parent_identity)
         except Exception as exc:
-            # rename 已成功，final 已成為對外成果；不能刪除它以掩蓋 parent fsync 未確認。
-            raise RuntimeError("已發布但 durability 未確認") from exc
+            # native rename 或 NFS reserved destination 已經對外佔用 basename；不能刪除
+            # 或覆寫它來掩蓋 marker／durability 失敗。缺 marker 的目錄必由公開 validator
+            # 拒絕，交由操作員依 runbook 選新 destination 或明確清理。
+            if publication_started:
+                raise RuntimeError("已發布但 durability 未確認（publication marker 亦未確認）") from exc
+            raise
+        published = True
         partial = Path()
         return {
             "destination": str(destination_path),
@@ -2535,6 +3154,8 @@ def build_horizon_suite(
             "maximum_step_count_by_horizon": manifest["maximum_step_count_by_horizon"],
             "common_input_build_count": 1,
             "release_count": len(release_records),
+            "publication_method": publication_method,
+            "publication_marker": HORIZON_SUITE_PUBLICATION_MARKER_FILENAME,
             "validation": validation,
         }
     except Exception:
@@ -2760,6 +3381,7 @@ def resume_horizon_suite(
             ocm_native_root=ocm_native_root,
             ocm_surface_root=ocm_surface_root,
             nww_analysis_root=nww_analysis_root,
+            _allow_unpublished_partial=True,
         )
         if validation.get("valid") is not True:
             detail = ";".join(str(item) for item in validation.get("errors", [])[:8])
@@ -2771,9 +3393,28 @@ def resume_horizon_suite(
         ):
             _fsync_directory(partial / directory_name)
         _fsync_directory(partial)
-        _publish_partial(partial, destination_path, parent_identity, partial_identity)
+        publication_started = False
+        publication_result = _publish_partial(
+            partial, destination_path, parent_identity, partial_identity
+        )
+        publication_started = True
+        try:
+            publication_method, destination_identity = _normalise_publication_result(
+                publication_result, partial_identity
+            )
+            _write_publication_marker(
+                destination_path,
+                publication_method,
+                parent_identity,
+                destination_identity,
+            )
+            _fsync_directory(destination_path, expected_identity=destination_identity)
+            _fsync_directory(destination_path.parent, expected_identity=parent_identity)
+        except Exception as exc:
+            if publication_started:
+                raise RuntimeError("已發布但 durability 未確認（publication marker 亦未確認）") from exc
+            raise
         published = True
-        _fsync_directory(destination_path.parent, expected_identity=parent_identity)
         partial = Path()
         return {
             "destination": str(destination_path),
@@ -2786,6 +3427,8 @@ def resume_horizon_suite(
             "common_input_build_count": 1,
             "release_count": len(release_records),
             "recovery_method": manifest["recovery_method"],
+            "publication_method": publication_method,
+            "publication_marker": HORIZON_SUITE_PUBLICATION_MARKER_FILENAME,
             "validation": validation,
         }
     except Exception:
@@ -2799,7 +3442,12 @@ __all__ = [
     "HORIZON_SUITE_COMMON_INPUT_DIRECTORY",
     "HORIZON_SUITE_MANIFEST_FILENAME",
     "HORIZON_SUITE_METHOD_ID",
+    "HORIZON_SUITE_NATIVE_PUBLICATION_METHOD",
+    "HORIZON_SUITE_NFS_PUBLICATION_METHOD",
     "HORIZON_SUITE_POLICY_ID",
+    "HORIZON_SUITE_PUBLICATION_MARKER_FILENAME",
+    "HORIZON_SUITE_PUBLICATION_POLICY_ID",
+    "HORIZON_SUITE_PUBLICATION_POLICY_VERSION",
     "HORIZON_SUITE_RELEASE_DIRECTORY",
     "HORIZON_SUITE_SCHEMA_VERSION",
     "HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME",
