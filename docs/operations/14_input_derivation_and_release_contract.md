@@ -337,13 +337,15 @@ Hs、peak frequency、原始波向必須有限，並使用 runtime 相同的雙�
 的海陸、域外、時間與物理 QC 控制；初始 gate 不保證整條回溯路徑永遠有效。
 
 Arrival 的 NWW metric proxy 使用版本化 policy
-`anchor_first_nearest_runtime_supported_nww_cell_center_v1`：先嘗試站點 anchor，只有同一個
-strict `48+2` selector 失敗才搜尋 local polygon 內的 bilinear cell center。候選距離由該站
-anchor 附近實際 NWW 一維 lon／lat 軸投影後的局地代表格網尺度推導，最大 snap 固定為兩倍，
-再按公尺距離、`y0`、`x0` 穩定排序；static 四角與完整 exact-hour dynamic series 仍逐一 gate，
-不使用最近值、零值或時間外插。每筆 `ArrivalTime.metadata` 保存 `location_kind`、經緯度、
-anchor distance、representative／maximum snap distance、四角 cell index 與 policy ID。這些
-欄位只描述 arrival 分層與事件指標的 NWW metric proxy，不取代 receptor 實際位置，也不取代
+`anchor_first_receptor_core_nearest_strict_runtime_supported_nww_cell_center_v2`：先嘗試站點
+anchor，只有同一個 strict `48+2` selector 失敗才在該站既定
+`receptor_core_radius_m` 內搜尋 local polygon 的 bilinear cell center。候選距離由該站
+anchor 附近實際 NWW 一維 lon／lat 軸投影後的局地代表格網尺度保存，但不再以其固定倍數限制
+搜尋；候選依公尺距離、`y0`、`x0` 穩定排序，並逐一通過 static 四角與完整 exact-hour
+dynamic series gate。不使用最近值、零值或時間外插。每筆 `ArrivalTime.metadata` 保存
+`location_kind`、經緯度、anchor distance、實際 representative／maximum snap distance、
+四角 cell index 與 policy ID；loader 會反驗 maximum snap 等於該站 receptor core。這些欄位
+只描述 arrival 分層與事件指標的 NWW metric proxy，不取代 receptor 實際位置，也不取代
 runtime trajectory 的逐 stage forcing sample。A 區 paired UTC 以貢寮選出的 UTC 為 reference，
 但 clone 前必須用龜山島自己的 OCM elevation/current、NWW metric series 與 gap-safe mask 逐 UTC
 驗證，並重寫龜山島物理 metadata；CLI `inputs-build` 永遠 strict、fail-closed，不啟用 synthetic

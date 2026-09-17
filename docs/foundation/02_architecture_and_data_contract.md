@@ -338,6 +338,15 @@ UTC 不重複。formal 除五站各 50、全案 250 外，每站還必須逐格�
 config 站點的非空子集，不強制補齊 48+2，但所有 season label 仍須使用上述四值。相同 UTC
 可在不同站點各自出現。
 
+現行 formal 的每筆 arrival metadata 另須保存 NWW metric proxy 的完整 binding：
+`metric_location_policy_id` 必須是
+`anchor_first_receptor_core_nearest_strict_runtime_supported_nww_cell_center_v2`，並記錄
+proxy 經緯度、實際代表格網尺度、最大 snap 距離、anchor 距離與 runtime 四角 cell index。
+最大 snap 距離必須等於該站設定的 `receptor_core_radius_m`；它只限制 anchor 失敗後的
+metric cell-center 搜尋，不改變 receptor anchor、flow domain 或 runtime 粒子取樣。歷史
+artifact 可在明確 legacy loader 邊界讀取 v1 的兩格尺度 binding，但 current formal 不得
+以 v1 或缺少 binding 的 arrival 退回舊契約。
+
 #### 7.3.2 Receptor×arrival dynamic initial-condition manifest
 
 正式 `Receptor` 的 `z_m_positive_up` 只代表模板候選深度；實際 runtime 初始深度必須

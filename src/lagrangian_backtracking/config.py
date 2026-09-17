@@ -207,6 +207,19 @@ DEFAULT_BACKTRACK_SUPPORT_DAYS = 7
 ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1 = "observation_year_stratified_48_plus_2_v1"
 ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1 = "two_years_stratified_48_plus_2_v1"
 
+# arrival 的 NWW 波浪指標位置是獨立於實際受體的 metric proxy。現行正式政策先測試
+# 站點 anchor；若該 anchor 無法通過完整 48+2 exact-hour runtime selector，才在同一
+# 站點既定 receptor core 內依公尺投影距離、y0、x0 穩定排序，選第一個完整通過的
+# cell center。這些字串集中在 config，讓 input builder 與 manifest loader 使用同一
+# 個資料契約；舊版的兩格搜尋半徑只供歷史唯讀 artifact，不得回流 current formal。
+NWW_METRIC_LOCATION_LEGACY_POLICY_ID = (
+    "anchor_first_nearest_runtime_supported_nww_cell_center_v1"
+)
+NWW_METRIC_LOCATION_POLICY_ID = (
+    "anchor_first_receptor_core_nearest_strict_runtime_supported_nww_cell_center_v2"
+)
+NWW_METRIC_LOCATION_MAX_GRID_SCALES = 2.0
+
 
 def _validate_non_rising_material_contract(settling: Any, *, expected_count: int) -> None:
     """驗證設定中的十類材質／形狀代理均為嚴格負值且可追溯。

@@ -924,6 +924,7 @@ def test_nww_metric_location_anchor_first_preserves_runtime_cell_binding(
         design_version="metric-test",
         expected_axis=np.arange(50, dtype=np.int64),
         strict=True,
+        maximum_snap_distance_m=20_000.0,
     )
 
     binding = context.metric_binding
@@ -931,9 +932,7 @@ def test_nww_metric_location_anchor_first_preserves_runtime_cell_binding(
     assert binding.anchor_distance_m == 0.0
     assert (binding.cell_x0, binding.cell_x1, binding.cell_y0, binding.cell_y1) == (0, 1, 0, 1)
     assert binding.policy_id == input_derivation_module.NWW_METRIC_LOCATION_POLICY_ID
-    assert binding.maximum_snap_distance_m == pytest.approx(
-        2.0 * binding.representative_grid_scale_m
-    )
+    assert binding.maximum_snap_distance_m == pytest.approx(20_000.0)
     assert len(selected) == 50
     assert all(item.metadata["metric_location_kind"] == "anchor" for item in selected)
     assert all(item.metadata["metric_location_cell_x0"] == 0 for item in selected)
@@ -992,6 +991,7 @@ def test_nww_metric_location_snaps_to_nearest_supported_cell_center_deterministi
             anchor_lon=anchor[0],
             anchor_lat=anchor[1],
         ),
+        maximum_snap_distance_m=40_000.0,
     )
     selected, context = input_derivation_module._select_arrivals_with_nww_metric_location(
         site_id="cell",
@@ -1008,6 +1008,7 @@ def test_nww_metric_location_snaps_to_nearest_supported_cell_center_deterministi
         design_version="metric-test",
         expected_axis=np.arange(50, dtype=np.int64),
         strict=True,
+        maximum_snap_distance_m=40_000.0,
     )
 
     assert candidates == tuple(
@@ -1032,7 +1033,7 @@ def test_nww_metric_location_snaps_to_nearest_supported_cell_center_deterministi
 def test_nww_metric_location_all_candidates_fail_closed_without_synthetic_selector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """anchor 與所有兩格尺度 cell center 都失敗時，必須 fail closed 且不呼叫非 strict fallback。"""
+    """anchor 與該站 core 內所有 cell center 都失敗時，必須 fail closed 且不呼叫 fallback。"""
 
     cache = _metric_location_test_cache()
     strict_calls: list[bool] = []
@@ -1075,6 +1076,7 @@ def test_nww_metric_location_all_candidates_fail_closed_without_synthetic_select
             design_version="metric-test",
             expected_axis=np.arange(50, dtype=np.int64),
             strict=True,
+            maximum_snap_distance_m=40_000.0,
         )
     assert strict_calls
     assert set(strict_calls) == {True}
@@ -1102,8 +1104,107 @@ def test_nww_metric_location_candidates_respect_local_polygon(
             anchor_lon=0.10,
             anchor_lat=0.12,
         ),
+        maximum_snap_distance_m=40_000.0,
     )
     assert candidates == ()
+
+
+def test_nww_metric_location_core_search_reaches_beyond_legacy_two_grid_radius() -> None:
+    """站點 core 半徑應能找到超過舊兩格上限、仍通過幾何 gate 的最近 cell。"""
+
+    # 以約 1 km 的規則 NWW 軸建立一個只在 4.5 km 外有 static-valid cell 的小型
+    # fixture；這可明確區分舊版兩倍代表格網尺度（約 2.1 km）與正式 12.5 km core，
+    # 不依賴任何 Nanwan 固定座標或生產資料。
+    lon_axis = np.asarray(
+        [120.70, 120.71, 120.72, 120.73, 120.74, 120.75, 120.76, 120.77, 120.78],
+        dtype=np.float64,
+    )
+    lat_axis = np.asarray(
+        [21.90, 21.91, 21.92, 21.93, 21.94, 21.95, 21.96, 21.97, 21.98],
+        dtype=np.float64,
+    )
+    static_mask = np.zeros((lat_axis.size, lon_axis.size), dtype=bool)
+    static_mask[5:7, 5:7] = True
+    cache = input_derivation_module._NWWRuntimeCache(
+        lon_axis=lon_axis,
+        lat_axis=lat_axis,
+        static_mask=static_mask,
+        months=(),
+    )
+    projection = input_derivation_module.DomainProjection(120.75, 21.95)
+    anchor = (120.725, 21.925)
+    scale = input_derivation_module._nww_representative_grid_scale_m(
+        cache,
+        projection=projection,
+        anchor_lon=anchor[0],
+        anchor_lat=anchor[1],
+    )
+    local_polygon = input_derivation_module.Polygon(
+        [(120.0, 21.0), (121.0, 21.0), (121.0, 23.0), (120.0, 23.0)]
+    )
+    legacy_candidates = input_derivation_module._nww_metric_location_candidates(
+        cache,
+        projection=projection,
+        anchor_lon=anchor[0],
+        anchor_lat=anchor[1],
+        local_polygon_lonlat=local_polygon,
+        representative_grid_scale_m=scale,
+        maximum_snap_distance_m=2.0 * scale,
+    )
+    core_candidates = input_derivation_module._nww_metric_location_candidates(
+        cache,
+        projection=projection,
+        anchor_lon=anchor[0],
+        anchor_lat=anchor[1],
+        local_polygon_lonlat=local_polygon,
+        representative_grid_scale_m=scale,
+        maximum_snap_distance_m=12_500.0,
+    )
+    assert legacy_candidates == ()
+    assert len(core_candidates) == 1
+    assert core_candidates[0].distance_m > 2.0 * scale
+    assert core_candidates[0].distance_m <= 12_500.0
+    assert core_candidates == tuple(
+        sorted(core_candidates, key=lambda item: (item.distance_m, item.cell_y0, item.cell_x0))
+    )
+
+
+def test_nww_metric_location_binding_uses_explicit_core_radius() -> None:
+    """current v2 binding 接受與 grid scale 無關的 site core，並完整序列化距離證據。"""
+
+    binding = input_derivation_module.NWWMetricLocationBinding(
+        policy_id=input_derivation_module.NWW_METRIC_LOCATION_POLICY_ID,
+        location_kind="cell_center",
+        lon=120.755,
+        lat=21.955,
+        anchor_distance_m=4_543.098,
+        representative_grid_scale_m=1_070.228,
+        maximum_snap_distance_m=12_500.0,
+        cell_x0=5,
+        cell_x1=6,
+        cell_y0=5,
+        cell_y1=6,
+    )
+    metadata = binding.to_metadata()
+    assert metadata["metric_location_maximum_snap_distance_m"] == pytest.approx(12_500.0)
+    assert metadata["metric_location_representative_grid_scale_m"] == pytest.approx(1_070.228)
+    assert metadata["metric_location_cell_x0"] == 5
+    assert metadata["metric_location_cell_y1"] == 6
+
+    with pytest.raises(ValueError, match="超出最大 snap"):
+        input_derivation_module.NWWMetricLocationBinding(
+            policy_id=input_derivation_module.NWW_METRIC_LOCATION_POLICY_ID,
+            location_kind="cell_center",
+            lon=120.755,
+            lat=21.955,
+            anchor_distance_m=12_501.0,
+            representative_grid_scale_m=1_070.228,
+            maximum_snap_distance_m=12_500.0,
+            cell_x0=5,
+            cell_x1=6,
+            cell_y0=5,
+            cell_y1=6,
+        )
 
 
 def test_paired_a_clone_uses_guishan_metrics_and_rejects_shared_utc_gap(
@@ -1749,6 +1850,12 @@ def test_inputs_build_validate_and_release_config(
         }.issubset(record["metadata"])
         for record in arrival_payload["records"]
     )
+    # builder 必須把各站設定的 receptor core 傳入 metric selector；synthetic fixture
+    # 五站均為 12.5 km，故輸出的 arrival binding 不得退回舊兩格代表尺度。
+    assert {
+        record["metadata"]["metric_location_maximum_snap_distance_m"]
+        for record in arrival_payload["records"]
+    } == {12_500.0}
     config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert isinstance(config_payload, dict)
     base_bbox_by_region = {

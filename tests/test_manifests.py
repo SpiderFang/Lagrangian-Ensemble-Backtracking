@@ -27,6 +27,8 @@ from lagrangian_backtracking.bed_residence import (
 from lagrangian_backtracking.config import (
     ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
     HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+    NWW_METRIC_LOCATION_LEGACY_POLICY_ID,
+    NWW_METRIC_LOCATION_POLICY_ID,
     RECEPTOR_SELECTION_SEED_POLICY_ID,
     VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
     ProjectConfig,
@@ -434,6 +436,34 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
             availability_rejection_audit=conditioned.rejection_audit,
         )
     ]
+    # current formal arrival component 也要帶入 input-build 的 NWW metric binding；這個
+    # loader fixture 不讀真實 NWW cache，因此以每站 anchor 的合法 synthetic cell 宣告
+    # 供 metadata／site-core 反驗證使用，並不宣稱此測試資料具備 forcing 科學證據。
+    anchors = {
+        site.study_site_id: site.anchor_lonlat
+        for site in config.study_sites
+        if site.anchor_lonlat is not None
+    }
+    for record in deposition_records:
+        site_id = str(record["study_site_id"])
+        anchor = anchors[site_id]
+        metadata = record["metadata"]
+        assert isinstance(metadata, dict)
+        metadata.update(
+            {
+                "metric_location_policy_id": NWW_METRIC_LOCATION_POLICY_ID,
+                "metric_location_kind": "anchor",
+                "metric_location_lon": float(anchor[0]),
+                "metric_location_lat": float(anchor[1]),
+                "metric_location_anchor_distance_m": 0.0,
+                "metric_location_representative_grid_scale_m": 1_000.0,
+                "metric_location_maximum_snap_distance_m": 12_500.0,
+                "metric_location_cell_x0": 0,
+                "metric_location_cell_x1": 1,
+                "metric_location_cell_y0": 0,
+                "metric_location_cell_y1": 1,
+            }
+        )
     age_vector_hash = sha256(
         json.dumps(list(offsets), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -864,6 +894,26 @@ def test_bed_residence_formal_loader_recomputes_shared_age_vector_and_paired_a_i
         arrival.metadata["shared_A_forcing_policy"] == "gongliao_paired_utc_reference_v1"
         for arrival in guishan_events
     )
+
+
+@pytest.mark.parametrize("mutation", ["core_radius", "legacy_policy"])
+def test_current_formal_arrival_rejects_nww_metric_binding_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    """current formal loader 必須拒絕 site core 漂移與舊 v1 metric policy。"""
+
+    config = _bed_config()
+    payload = _bed_arrival_payload(config)
+    metadata = payload["records"][0]["metadata"]
+    assert isinstance(metadata, dict)
+    if mutation == "core_radius":
+        metadata["metric_location_maximum_snap_distance_m"] = 5_000.0
+    else:
+        metadata["metric_location_policy_id"] = NWW_METRIC_LOCATION_LEGACY_POLICY_ID
+    path = tmp_path / f"bed-arrival-metric-{mutation}.json"
+    _write_json(path, payload)
+    with pytest.raises(ValueError, match="NWW metric location"):
+        load_arrival_time_manifest(path, config, formal=True)
 
 
 @pytest.mark.parametrize(

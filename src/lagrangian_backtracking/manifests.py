@@ -49,6 +49,9 @@ from .config import (
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT,
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID,
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256,
+    NWW_METRIC_LOCATION_LEGACY_POLICY_ID,
+    NWW_METRIC_LOCATION_MAX_GRID_SCALES,
+    NWW_METRIC_LOCATION_POLICY_ID,
     RANDOM_VERTICAL_RECEPTOR_ID_PREFIX,
     RECEPTOR_SELECTION_SEED_POLICY_ID,
     VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
@@ -1360,6 +1363,120 @@ def _validate_arrival_population_provenance(
         raise ValueError("arrival provenance replicate 契約與 config 不一致")
 
 
+_NWW_METRIC_LOCATION_METADATA_KEYS = frozenset(
+    {
+        "metric_location_policy_id",
+        "metric_location_kind",
+        "metric_location_lon",
+        "metric_location_lat",
+        "metric_location_anchor_distance_m",
+        "metric_location_representative_grid_scale_m",
+        "metric_location_maximum_snap_distance_m",
+        "metric_location_cell_x0",
+        "metric_location_cell_x1",
+        "metric_location_cell_y0",
+        "metric_location_cell_y1",
+    }
+)
+"""arrival row 中 NWW metric proxy binding 的完整欄位集合。"""
+
+
+def _validate_nww_metric_location_metadata(
+    metadata: Mapping[str, Any],
+    site: Any,
+    config: ProjectConfig,
+    *,
+    formal: bool,
+    label: str,
+) -> None:
+    """驗證 arrival 的 NWW metric binding 與站點 core 半徑契約。
+
+    現行正式 arrival 必須保存由 input-build 產生的 v2 binding；v2 的最大 snap 距離
+    必須逐站等於設定的 ``receptor_core_radius_m``，而不是舊版「兩倍代表格網尺度」。
+    座標與 cell index 只描述 NWW 雙線性 metric proxy 的 runtime cell，不會被當成實際
+    receptor 或粒子起點。歷史／legacy loader 仍可讀取 v1 binding，但僅在其完整欄位與
+    舊兩格推導關係成立時接受；若 current formal 缺少整組欄位或帶 v1，直接拒絕而不
+    自動降級。
+    """
+
+    present = {key for key in metadata if key.startswith("metric_location_")}
+    if not present:
+        if formal and config.design_version == CURRENT_DESIGN_VERSION:
+            raise ValueError(f"{label} current formal 缺少完整 NWW metric location binding")
+        return
+    if present != _NWW_METRIC_LOCATION_METADATA_KEYS:
+        missing = sorted(_NWW_METRIC_LOCATION_METADATA_KEYS - present)
+        unknown = sorted(present - _NWW_METRIC_LOCATION_METADATA_KEYS)
+        detail: list[str] = []
+        if missing:
+            detail.append(f"缺少={missing}")
+        if unknown:
+            detail.append(f"未知={unknown}")
+        raise ValueError(f"{label} NWW metric location binding 欄位不完整：{'；'.join(detail)}")
+
+    policy = _nonempty_string(metadata["metric_location_policy_id"], f"{label}.metric_location_policy_id")
+    if config.design_version == CURRENT_DESIGN_VERSION:
+        if policy != NWW_METRIC_LOCATION_POLICY_ID:
+            raise ValueError(
+                f"{label} current formal 僅接受 NWW metric location v2 policy：{policy}"
+            )
+    elif policy not in {NWW_METRIC_LOCATION_LEGACY_POLICY_ID, NWW_METRIC_LOCATION_POLICY_ID}:
+        raise ValueError(f"{label} NWW metric location policy 未登錄：{policy}")
+
+    kind = _nonempty_string(metadata["metric_location_kind"], f"{label}.metric_location_kind")
+    if kind not in {"anchor", "cell_center"}:
+        raise ValueError(f"{label}.metric_location_kind 無效")
+    lon = _finite_float(metadata["metric_location_lon"], f"{label}.metric_location_lon")
+    lat = _finite_float(metadata["metric_location_lat"], f"{label}.metric_location_lat")
+    if not -180.0 <= lon <= 180.0 or not -90.0 <= lat <= 90.0:
+        raise ValueError(f"{label} NWW metric location lon/lat 超出 WGS84 bounds")
+    anchor_distance = _finite_float(
+        metadata["metric_location_anchor_distance_m"],
+        f"{label}.metric_location_anchor_distance_m",
+    )
+    grid_scale = _finite_float(
+        metadata["metric_location_representative_grid_scale_m"],
+        f"{label}.metric_location_representative_grid_scale_m",
+    )
+    maximum_snap = _finite_float(
+        metadata["metric_location_maximum_snap_distance_m"],
+        f"{label}.metric_location_maximum_snap_distance_m",
+    )
+    if grid_scale <= 0.0 or maximum_snap <= 0.0:
+        raise ValueError(f"{label} NWW metric location grid scale／maximum snap 必須大於零")
+    if anchor_distance < 0.0 or anchor_distance > maximum_snap + max(1e-9, maximum_snap * 1e-12):
+        raise ValueError(f"{label} NWW metric location anchor distance 超出 maximum snap")
+    if kind == "anchor" and anchor_distance != 0.0:
+        raise ValueError(f"{label} anchor metric location 的 anchor distance 必須為零")
+    if policy == NWW_METRIC_LOCATION_LEGACY_POLICY_ID and not math.isclose(
+        maximum_snap,
+        NWW_METRIC_LOCATION_MAX_GRID_SCALES * grid_scale,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(f"{label} legacy NWW metric location maximum snap 不符合兩格契約")
+    if policy == NWW_METRIC_LOCATION_POLICY_ID and config.design_version == CURRENT_DESIGN_VERSION:
+        site_radius = getattr(site, "receptor_core_radius_m", None)
+        if site_radius is None or not math.isfinite(float(site_radius)) or float(site_radius) <= 0.0:
+            raise ValueError(f"{label} current formal site 缺少有效 receptor core 半徑")
+        if not math.isclose(maximum_snap, float(site_radius), rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                f"{label} NWW metric location maximum snap 與 site receptor core 不一致"
+            )
+    indices = tuple(
+        _integer(metadata[key], f"{label}.{key}")
+        for key in (
+            "metric_location_cell_x0",
+            "metric_location_cell_x1",
+            "metric_location_cell_y0",
+            "metric_location_cell_y1",
+        )
+    )
+    x0, x1, y0, y1 = indices
+    if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0:
+        raise ValueError(f"{label} NWW metric location cell index 無效")
+
+
 def _validate_formal_arrival_strata(
     arrivals: tuple[ArrivalTime, ...], config: ProjectConfig
 ) -> None:
@@ -1953,6 +2070,16 @@ def _load_arrival_document(
         if season not in _SEASONS:
             raise ValueError(f"{label}.season 不合法：{sorted(_SEASONS)}")
         metadata = _metadata(row["metadata"], f"{label}.metadata")
+        # NWW metric proxy 不是 receptor 座標，但 current formal 必須保存其實際格網
+        # scale、core 半徑、anchor 距離與四角 index，讓 arrival selector 的空間位置
+        # 可以被 component loader 重新核對；歷史無此欄位的 artifact 維持相容讀取。
+        _validate_nww_metric_location_metadata(
+            metadata,
+            site,
+            config,
+            formal=formal,
+            label=label,
+        )
         if bed_residence_enabled:
             deposition_ns = _integer(
                 metadata.get("deposition_time_utc_ns"),

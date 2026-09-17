@@ -66,6 +66,9 @@ from .config import (
     HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
     NORTHEAST_V3_BBOX_LON_LAT,
     NORTHEAST_V3_FLOW_DOMAIN_ID,
+    NWW_METRIC_LOCATION_LEGACY_POLICY_ID,
+    NWW_METRIC_LOCATION_MAX_GRID_SCALES,
+    NWW_METRIC_LOCATION_POLICY_ID,
     RECEPTOR_SELECTION_SEED_POLICY_ID,
     RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1,
     VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
@@ -392,9 +395,8 @@ _WETDRY_APPROVAL_ARTIFACT_KEYS = frozenset(
 
 # arrival scalar 的 metric location 不是受體位置，也不是 runtime 粒子取樣位置；它只
 # 是 NWW 雙線性波浪指標在 anchor 無法通過完整 selector 時的可追溯代理位置。最大 snap
-# 距離必須由實際 NWW lon/lat 軸在 anchor 附近投影後推導，不能在此寫死公尺數。
-NWW_METRIC_LOCATION_POLICY_ID = "anchor_first_nearest_runtime_supported_nww_cell_center_v1"
-NWW_METRIC_LOCATION_MAX_GRID_SCALES = 2.0
+# 距離改由呼叫端傳入該站既定 receptor core 半徑；舊版兩格尺度常數只保留給歷史唯讀
+# binding 的相容驗證，正式流程不可再以它限制搜尋範圍。
 ARRIVAL_SELECTION_METHOD_ID = "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
 ARRIVAL_SELECTION_METHOD_OBSERVATION_YEAR_ID = (
     "server_v3_observation_year_48_strata_plus_two_events_gap_safe_nww_metric_location_v1"
@@ -1289,8 +1291,10 @@ class NWWMetricLocationBinding:
     ``cell_x0``／``cell_x1``／``cell_y0``／``cell_y1`` 是與 runtime
     ``searchsorted`` 相同的四角索引，固定代表 ``(y0,x0)、(y0,x1)、(y1,x0)、(y1,x1)``。
     ``representative_grid_scale_m`` 是 anchor 附近實際 NWW lon/lat 軸投影後的局地水平
-    格網尺度中位數，``maximum_snap_distance_m`` 固定等於其兩倍。所有浮點欄位均須有限，
-    所有 cell 索引均須是嚴格遞增的整數，讓每一筆 ArrivalTime metadata 可被重建與驗證。
+    格網尺度中位數；現行 v2 的 ``maximum_snap_distance_m`` 由該站
+    ``receptor_core_radius_m`` 傳入，不再假設為格網尺度的固定倍數。所有浮點欄位均須
+    有限，所有 cell 索引均須是嚴格遞增的整數，讓每一筆 ArrivalTime metadata 可被重建
+    與驗證。
     """
 
     policy_id: str
@@ -1308,7 +1312,10 @@ class NWWMetricLocationBinding:
     def __post_init__(self) -> None:
         """在建立 binding 時拒絕不可重建的 policy、座標、距離或 cell 索引。"""
 
-        if self.policy_id != NWW_METRIC_LOCATION_POLICY_ID:
+        if self.policy_id not in {
+            NWW_METRIC_LOCATION_LEGACY_POLICY_ID,
+            NWW_METRIC_LOCATION_POLICY_ID,
+        }:
             raise ValueError(f"未知 NWW metric location policy：{self.policy_id}")
         if self.location_kind not in {"anchor", "cell_center"}:
             raise ValueError(f"NWW metric location_kind 無效：{self.location_kind}")
@@ -1325,13 +1332,15 @@ class NWWMetricLocationBinding:
             raise ValueError("NWW metric location grid scale 與最大 snap 距離必須大於零")
         if self.anchor_distance_m < 0.0 or self.anchor_distance_m > self.maximum_snap_distance_m + 1e-9:
             raise ValueError("NWW metric location anchor distance 超出最大 snap 距離")
-        if not math.isclose(
+        if self.policy_id == NWW_METRIC_LOCATION_LEGACY_POLICY_ID and not math.isclose(
             self.maximum_snap_distance_m,
             NWW_METRIC_LOCATION_MAX_GRID_SCALES * self.representative_grid_scale_m,
             rel_tol=0.0,
             abs_tol=1e-9,
         ):
-            raise ValueError("NWW metric location maximum snap 距離未依 policy 由 grid scale 推導")
+            # 舊版 artifact 的 binding 仍要維持原本的兩格契約；current v2 則由站點
+            # core 半徑控制，不能讓這個歷史限制意外套用到 Nanwan。
+            raise ValueError("legacy NWW metric location maximum snap 距離未依兩格 grid scale 推導")
         index_values = (self.cell_x0, self.cell_x1, self.cell_y0, self.cell_y1)
         if any(
             isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
@@ -2549,10 +2558,11 @@ def _nww_representative_grid_scale_m(
     """以 anchor 所在 NWW cell 的實際投影邊長推導局地代表格網尺度。
 
     經度方向邊長在 anchor latitude 投影，緯度方向邊長在 anchor longitude 投影；兩者
-    都是實際 NWW 軸相鄰節點的公尺距離，最後取中位數作單一代表尺度。這個尺度只用來
-    定義 metric proxy 的兩格搜尋半徑，不是 OCM mesh 尺度、受體半徑或粒子步長，且不
-    寫死公里常數。anchor 超出 NWW 軸時仍依 runtime 邊界 clamp 使用最近 cell 的軸距離，
-    但候選中心最後仍須通過實際投影距離與 local polygon gate。
+    都是實際 NWW 軸相鄰節點的公尺距離，最後取中位數作單一代表尺度。這個尺度只供
+    manifest 保存實際格網證據，不再決定正式搜尋半徑；正式最大距離由站點既定的
+    ``receptor_core_radius_m`` 明示傳入，避免 anchor 因局地格網稀疏而被兩格常數誤拒。
+    anchor 超出 NWW 軸時仍依 runtime 邊界 clamp 使用最近 cell 的軸距離，但候選中心最後
+    仍須通過實際投影距離與 local polygon gate。
     """
 
     x0, x1 = _nww_runtime_cell_axis_indices(cache.lon_axis, float(anchor_lon))
@@ -2583,7 +2593,7 @@ def _nww_metric_axis_candidate_starts(
     axis_margin = float(maximum_distance_m + representative_grid_scale_m)
     nearby_nodes = np.flatnonzero(np.abs(projected_axis - float(anchor_projected)) <= axis_margin)
     # 若 anchor 落在稀疏軸或軸外，保留 nearest 附近少量 cell 作保守候選；後續仍會以
-    # 真正 cell center 的投影距離再次篩選，因此這裡不會放寬兩格尺度的最終 gate。
+    # 真正 cell center 的投影距離再次篩選，因此這裡不會放寬 caller 明示的 core gate。
     nodes = set(int(value) for value in nearby_nodes)
     nodes.add(nearest)
     starts: set[int] = set()
@@ -2607,19 +2617,31 @@ def _nww_metric_location_candidates(
     anchor_lat: float,
     local_polygon_lonlat: Polygon,
     representative_grid_scale_m: float,
+    maximum_snap_distance_m: float,
 ) -> tuple[_NWWMetricLocationCandidate, ...]:
-    """建立通過 local polygon、static 四角與兩格尺度距離 gate 的 cell-center 候選。
+    """建立通過 local polygon、static 四角與站點 core 距離 gate 的 cell-center 候選。
 
     候選生成先只掃描投影軸附近的小範圍，再對 cell center 做 Shapely 與公尺距離判定；
     因此不會對大型 NWW 規則格網的每一個 cell 先執行 17,544 小時 dynamic sample。
-    回傳排序固定為投影距離、``y0``、``x0``，後續 caller 才按此順序逐個執行完整
-    exact-hour 48+2 selector。
+    ``maximum_snap_distance_m`` 必須是該站設定的 receptor core 半徑，不能由這個 helper
+    自行推導或寫死公里數。回傳排序固定為投影距離、``y0``、``x0``，後續 caller 才按
+    此順序逐個執行完整 exact-hour 48+2 selector。
     """
 
+    representative_grid_scale_m = float(representative_grid_scale_m)
+    maximum_distance_m = float(maximum_snap_distance_m)
+    if (
+        not math.isfinite(representative_grid_scale_m)
+        or representative_grid_scale_m <= 0.0
+        or not math.isfinite(maximum_distance_m)
+        or maximum_distance_m <= 0.0
+    ):
+        raise InputDerivationError(
+            "NWW metric location candidate 的 grid scale 與 maximum snap 距離必須是有限正數"
+        )
     anchor_x_array, anchor_y_array = projection.project(float(anchor_lon), float(anchor_lat))
     anchor_x = float(anchor_x_array)
     anchor_y = float(anchor_y_array)
-    maximum_distance_m = NWW_METRIC_LOCATION_MAX_GRID_SCALES * float(representative_grid_scale_m)
     lon_projected, _ = projection.project(
         cache.lon_axis,
         np.full(cache.lon_axis.shape, float(anchor_lat), dtype=np.float64),
@@ -3343,8 +3365,29 @@ def _nww_metric_location_binding(
     lon: float,
     lat: float,
     representative_grid_scale_m: float,
+    maximum_snap_distance_m: float,
 ) -> NWWMetricLocationBinding:
-    """把已通過 runtime spatial gate 的位置轉成可保存的 metric binding。"""
+    """把已通過 runtime spatial gate 的位置轉成可保存的 metric binding。
+
+    ``maximum_snap_distance_m`` 是 caller 從該站 ``receptor_core_radius_m`` 傳入的正式
+    搜尋上限；binding 會保存它並重新檢查所選 cell 到 anchor 的公尺距離，避免候選
+    helper 與 metadata 在不同上限下產生不一致的宣告。
+    """
+
+    try:
+        maximum_snap_distance_m = float(maximum_snap_distance_m)
+        representative_grid_scale_m = float(representative_grid_scale_m)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InputDerivationError("NWW metric location binding 距離欄位必須是數值") from exc
+    if (
+        not math.isfinite(maximum_snap_distance_m)
+        or maximum_snap_distance_m <= 0.0
+        or not math.isfinite(representative_grid_scale_m)
+        or representative_grid_scale_m <= 0.0
+    ):
+        raise InputDerivationError(
+            "NWW metric location binding 的 grid scale 與 maximum snap 距離必須是有限正數"
+        )
 
     cell_indices = _nww_runtime_cell_indices(cache, lon=lon, lat=lat)
     if cell_indices is None:
@@ -3359,6 +3402,8 @@ def _nww_metric_location_binding(
         anchor_distance_m = float(
             np.hypot(float(location_x) - float(anchor_x), float(location_y) - float(anchor_y))
         )
+    if anchor_distance_m > maximum_snap_distance_m + max(1e-9, maximum_snap_distance_m * 1e-12):
+        raise InputDerivationError("NWW metric location binding 超出該站 receptor core")
     x0, x1, y0, y1 = cell_indices
     return NWWMetricLocationBinding(
         policy_id=NWW_METRIC_LOCATION_POLICY_ID,
@@ -3366,8 +3411,8 @@ def _nww_metric_location_binding(
         lon=float(lon),
         lat=float(lat),
         anchor_distance_m=anchor_distance_m,
-        representative_grid_scale_m=float(representative_grid_scale_m),
-        maximum_snap_distance_m=(NWW_METRIC_LOCATION_MAX_GRID_SCALES * float(representative_grid_scale_m)),
+        representative_grid_scale_m=representative_grid_scale_m,
+        maximum_snap_distance_m=maximum_snap_distance_m,
         cell_x0=x0,
         cell_x1=x1,
         cell_y0=y0,
@@ -3762,14 +3807,17 @@ def _select_arrivals_with_nww_metric_location(
     replicates: int | None = None,
     selection_policy: str | None = None,
     allow_gap_censored_anchor: bool = False,
+    maximum_snap_distance_m: float | None = None,
 ) -> tuple[list[ArrivalTime], _SiteArrivalSelectionContext]:
     """以 anchor-first policy 選出 arrival 並保存 NWW metric location binding。
 
     strict build 先在站點 anchor 執行與 runtime 等價的完整 48+2 selector；只有 selector
     失敗才由實際 NWW lon/lat 軸組成 cell-center 候選。候選先通過 local polygon、四角
-    static mask 與兩格局地尺度距離，再依公尺距離、``y0``、``x0`` 穩定排序，逐個執行
-    同一個 strict selector。所有失敗都在本函式內 fail closed；只有 ``strict=False`` 的
-    內部小型 fixture 才保留既有 anchor synthetic fallback，且不會被 CLI 使用。
+    static mask 與 caller 傳入的 receptor-core 距離，再依公尺距離、``y0``、``x0`` 穩定
+    排序，逐個執行同一個 strict selector。所有失敗都在本函式內 fail closed；只有
+    ``strict=False`` 的內部小型 fixture 才保留既有 anchor synthetic fallback，且不會被
+    CLI 使用。current formal 若未傳入有限正的站點 core 半徑會立即拒絕；只有 legacy
+    compatibility path 才可暫以歷史兩格尺度建立 binding。
 
     ``observation_years``、``replicates`` 與 ``selection_policy`` 會原樣傳給單站
     selector；metric location 的 anchor/cell-center 重試不得把新版 2025-only policy
@@ -3782,6 +3830,22 @@ def _select_arrivals_with_nww_metric_location(
         anchor_lon=anchor_lon,
         anchor_lat=anchor_lat,
     )
+    if maximum_snap_distance_m is None:
+        if design_version == CURRENT_DESIGN_VERSION:
+            raise InputDerivationError(
+                f"{site_id} current formal NWW metric location 必須明示 receptor core 半徑"
+            )
+        maximum_snap_distance_m = (
+            NWW_METRIC_LOCATION_MAX_GRID_SCALES * representative_scale_m
+        )
+    try:
+        maximum_snap_distance_m = float(maximum_snap_distance_m)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InputDerivationError("NWW metric location maximum snap 距離必須是數值") from exc
+    if not math.isfinite(maximum_snap_distance_m) or maximum_snap_distance_m <= 0.0:
+        raise InputDerivationError(
+            f"{site_id} NWW metric location maximum snap 距離必須是有限正數"
+        )
 
     def attempt(
         *,
@@ -3823,6 +3887,7 @@ def _select_arrivals_with_nww_metric_location(
             lon=lon,
             lat=lat,
             representative_grid_scale_m=representative_scale_m,
+            maximum_snap_distance_m=maximum_snap_distance_m,
         )
         context = _SiteArrivalSelectionContext(
             elevation=ocm_elevation,
@@ -3854,6 +3919,7 @@ def _select_arrivals_with_nww_metric_location(
         anchor_lat=anchor_lat,
         local_polygon_lonlat=local_polygon_lonlat,
         representative_grid_scale_m=representative_scale_m,
+        maximum_snap_distance_m=maximum_snap_distance_m,
     )
     for candidate in candidates:
         try:
@@ -7214,6 +7280,15 @@ def build_input_derivatives(
         for site_id in sorted(site_ids):
             site = next(item for item in config.study_sites if item.study_site_id == site_id)
             site_lon, site_lat = site.anchor_lonlat or domain.center_lonlat
+            # NWW metric proxy 的搜尋上限必須沿用同一站點的 receptor core；這是
+            # arrival 指標位置的空間容許範圍，不會改變實際受體抽樣或 runtime 粒子
+            # forcing。current formal 缺少 core 時由 selector 立即 fail closed；legacy
+            # fixture 若未設定則保留歷史兩格相容路徑。
+            maximum_metric_snap_distance_m = (
+                None
+                if site.receptor_core_radius_m is None
+                else float(site.receptor_core_radius_m)
+            )
             surface = products_by_region[region][1]
             elevation, speed = _surface_series_for_location(
                 surface,
@@ -7239,6 +7314,7 @@ def build_input_derivatives(
                 replicates=selection_replicates,
                 selection_policy=selection_policy,
                 allow_gap_censored_anchor=gap_censoring_enabled,
+                maximum_snap_distance_m=maximum_metric_snap_distance_m,
             )
             explicit = pilot_arrivals.get(site_id)
             # A 區 exact pair 必須先建立共同 UTC，再各自套用明示 replacement；若在
