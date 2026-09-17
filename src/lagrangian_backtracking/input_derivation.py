@@ -354,6 +354,29 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _UTC_HOUR_NS = 3_600_000_000_000
 _WETDRY_SEMANTICS_ID = "schism_wetdry_elem_0_wet_1_dry"
+_WETDRY_DERIVED_PENDING_STATUS = "derived_pending_server_preflight"
+_WETDRY_APPROVED_STATUS = "approved"
+_WETDRY_DERIVATION_METHOD_ID = "formal_dynamic_initial_condition_all_wet_v1"
+"""正式 release 將 OCM wet/dry 待核准狀態升為 approved 的唯一方法識別碼。"""
+
+_WETDRY_APPROVAL_KEYS = frozenset(
+    {
+        "method_id",
+        "source_status",
+        "derived_status",
+        "validated_by",
+        "record_count",
+        "wetdry_elem_value",
+        "wetdry_semantics_id",
+        "artifact",
+    }
+)
+"""wet/dry 衍生核准 evidence 的固定欄位集合。"""
+
+_WETDRY_APPROVAL_ARTIFACT_KEYS = frozenset(
+    {"kind", "path", "sha256", "canonical_sha256", "size_bytes"}
+)
+"""wet/dry evidence 中 immutable dynamic initial-condition fingerprint 的欄位。"""
 
 # arrival scalar 的 metric location 不是受體位置，也不是 runtime 粒子取樣位置；它只
 # 是 NWW 雙線性波浪指標在 anchor 無法通過完整 selector 時的可追溯代理位置。最大 snap
@@ -7648,6 +7671,167 @@ def _approved_reconstruction_release_binding_enabled(payload: Mapping[str, Any])
     )
 
 
+def _derive_formal_wetdry_approval(
+    input_root: Path,
+    *,
+    source_config: ProjectConfig,
+    formal_input_validation: Mapping[str, Any] | None,
+    release_payload: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """依正式 dynamic initial-condition validator 結果衍生 wet/dry 核准 evidence。
+
+    範例 template 的 OCM wet/dry 語意在 SERVER preflight 前是
+    ``derived_pending_server_preflight``。只有目前正式 design、正式
+    ``validate_input_derivatives(..., formal=True)`` 已回報 valid，且該 validator
+    所讀取的 dynamic initial-condition artifact 每一列都明示「0=wet」與固定 SCHISM
+    語意時，才可把 release 的決策狀態衍生為 ``approved``。本 helper 再逐列讀取同一
+    immutable JSON 只核對這兩個欄位，並保存 raw/canonical SHA-256 與大小；它不放寬
+    ``load_receptor_arrival_initial_condition_manifest`` 的既有 pair、座標、垂向、
+    count 或來源時間檢查，也不會替 legacy design 或其他 pending 狀態自動核准。
+
+    回傳 ``(evidence, blocker)``：不適用的已核准／非 current design 狀態回傳
+    ``(None, None)``；適用但證據不足時回傳固定 blocker；成功時 evidence 不含任何
+    絕對路徑，只保存 release 內的相對 reference 與 artifact fingerprint。
+    """
+
+    forcing = source_config.forcing
+    ocm_forcing = forcing.get("ocm", {}) if isinstance(forcing, Mapping) else {}
+    source_status = (
+        ocm_forcing.get("wetdry_semantics_decision_status")
+        if isinstance(ocm_forcing, Mapping)
+        else None
+    )
+    if source_config.design_version != CURRENT_DESIGN_VERSION:
+        return None, None
+    if source_status != _WETDRY_DERIVED_PENDING_STATUS:
+        return None, None
+    if not isinstance(formal_input_validation, Mapping) or formal_input_validation.get("valid") is not True:
+        return None, "wetdry_semantics_derivation_requires_formal_input_validation"
+
+    try:
+        dynamic_payload, dynamic_fingerprint = read_canonical_json(
+            input_root / ARTIFACT_FILENAMES["initial_condition"]
+        )
+        records = dynamic_payload.get("records")
+        if not isinstance(records, list) or not records:
+            raise ValueError("dynamic initial-condition records 必須是非空 list")
+        if any(
+            not isinstance(record, Mapping)
+            or type(record.get("wetdry_elem_value")) is not int
+            or record.get("wetdry_elem_value") != 0
+            or record.get("wetdry_semantics_id") != _WETDRY_SEMANTICS_ID
+            for record in records
+        ):
+            raise ValueError("dynamic initial-condition wet/dry semantics 不一致")
+        scenarios = release_payload.get("scenarios")
+        initial_reference = (
+            scenarios.get("receptor_arrival_initial_condition_manifest")
+            if isinstance(scenarios, Mapping)
+            else None
+        )
+        if not isinstance(initial_reference, str) or Path(initial_reference).is_absolute():
+            raise ValueError("dynamic initial-condition release reference 必須是相對路徑")
+    except Exception:
+        return None, "wetdry_semantics_derivation_evidence_invalid"
+
+    artifact = {
+        "kind": "initial_condition",
+        "path": initial_reference,
+        **{
+            field: dynamic_fingerprint[field]
+            for field in ("sha256", "canonical_sha256", "size_bytes")
+        },
+    }
+    evidence = {
+        "method_id": _WETDRY_DERIVATION_METHOD_ID,
+        "source_status": _WETDRY_DERIVED_PENDING_STATUS,
+        "derived_status": _WETDRY_APPROVED_STATUS,
+        "validated_by": "validate_input_derivatives(formal=True)",
+        "record_count": len(records),
+        "wetdry_elem_value": 0,
+        "wetdry_semantics_id": _WETDRY_SEMANTICS_ID,
+        "artifact": artifact,
+    }
+    return evidence, None
+
+
+def _validate_wetdry_derived_approval(
+    payload: Mapping[str, Any],
+    *,
+    approval: Mapping[str, Any] | None,
+    input_root: Path,
+    formal: bool,
+) -> list[str]:
+    """驗證 release 保存的 wet/dry 衍生核准 evidence 與 immutable artifact 一致。
+
+    此 gate 只處理 release 額外保存的 evidence；dynamic manifest 的完整科學與結構
+    驗證仍由 ``validate_input_derivatives`` 及既有 manifest loader 負責。若 pilot、
+    legacy 或不完整 mapping 嘗試宣稱衍生核准，這裡會回傳錯誤而非猜測其來源。
+    """
+
+    if approval is None or "wetdry_semantics_approval" not in approval:
+        return []
+    errors: list[str] = []
+    evidence = approval.get("wetdry_semantics_approval")
+    if not formal:
+        return ["wetdry_derived_approval_requires_formal_gate"]
+    if not isinstance(evidence, Mapping) or set(evidence) != _WETDRY_APPROVAL_KEYS:
+        return ["wetdry_derived_approval_keys_invalid"]
+    if payload.get("design_version") != CURRENT_DESIGN_VERSION:
+        errors.append("wetdry_derived_approval_legacy_design_forbidden")
+    forcing = payload.get("forcing")
+    ocm_forcing = forcing.get("ocm") if isinstance(forcing, Mapping) else None
+    if not isinstance(ocm_forcing, Mapping) or ocm_forcing.get(
+        "wetdry_semantics_decision_status"
+    ) != _WETDRY_APPROVED_STATUS:
+        errors.append("wetdry_derived_approval_release_status_invalid")
+    expected_scalars = {
+        "method_id": _WETDRY_DERIVATION_METHOD_ID,
+        "source_status": _WETDRY_DERIVED_PENDING_STATUS,
+        "derived_status": _WETDRY_APPROVED_STATUS,
+        "validated_by": "validate_input_derivatives(formal=True)",
+        "wetdry_elem_value": 0,
+        "wetdry_semantics_id": _WETDRY_SEMANTICS_ID,
+    }
+    for field, expected in expected_scalars.items():
+        if evidence.get(field) != expected:
+            errors.append(f"wetdry_derived_approval_{field}_invalid")
+    try:
+        dynamic_payload, fingerprint = read_canonical_json(
+            input_root / ARTIFACT_FILENAMES["initial_condition"]
+        )
+        records = dynamic_payload.get("records")
+        if not isinstance(records, list) or not records:
+            raise ValueError("dynamic records 必須是非空 list")
+        if any(
+            not isinstance(record, Mapping)
+            or type(record.get("wetdry_elem_value")) is not int
+            or record.get("wetdry_elem_value") != 0
+            or record.get("wetdry_semantics_id") != _WETDRY_SEMANTICS_ID
+            for record in records
+        ):
+            errors.append("wetdry_derived_approval_record_semantics_invalid")
+        if evidence.get("record_count") != len(records):
+            errors.append("wetdry_derived_approval_record_count_mismatch")
+        artifact = evidence.get("artifact")
+        if not isinstance(artifact, Mapping) or set(artifact) != _WETDRY_APPROVAL_ARTIFACT_KEYS:
+            errors.append("wetdry_derived_approval_artifact_keys_invalid")
+        else:
+            expected_reference = (
+                payload.get("scenarios", {}).get("receptor_arrival_initial_condition_manifest")
+                if isinstance(payload.get("scenarios"), Mapping)
+                else None
+            )
+            if artifact.get("kind") != "initial_condition" or artifact.get("path") != expected_reference:
+                errors.append("wetdry_derived_approval_artifact_reference_invalid")
+            for field in ("sha256", "canonical_sha256", "size_bytes"):
+                if artifact.get(field) != fingerprint.get(field):
+                    errors.append(f"wetdry_derived_approval_artifact_{field}_mismatch")
+    except Exception as exc:
+        errors.append(f"wetdry_derived_approval_artifact_invalid:{type(exc).__name__}")
+    return errors
+
+
 def _flow_domain_ids_from_inventory(inventory: Mapping[str, Any]) -> dict[str, str]:
     """由 forcing inventory 解析每個 region 的唯一三產品 flow-domain ID。
 
@@ -8163,6 +8347,7 @@ def create_release_config(
         raise InputDerivationError("input manifests 未通過 validator，不能建立 release config")
     blockers: list[str] = []
     formal_input_validation: dict[str, Any] | None = None
+    wetdry_semantics_approval: dict[str, Any] | None = None
     if formal:
         # 一般 validator 只確認 artifact 可用；formal validator 另外檢查 approved
         # status、NWW 17,544 小時、gap-safe horizon 與 formal resolver。兩者都通過後，
@@ -8177,6 +8362,26 @@ def create_release_config(
             blockers.extend(
                 f"formal_input_invalid:{item}" for item in formal_input_validation.get("errors", [])
             )
+        # example template 的 wet/dry 狀態不是由 caller 直接填入 approved；只有既有
+        # formal input validator 已完整通過後，才以 dynamic initial-condition 每列的
+        # 固定 SCHISM 語意衍生核准 evidence。此時才改寫記憶體中的 release payload，
+        # 不修改 source template，也不放寬 legacy 或其他 pending 狀態。
+        wetdry_semantics_approval, wetdry_blocker = _derive_formal_wetdry_approval(
+            input_root,
+            source_config=source_config,
+            formal_input_validation=formal_input_validation,
+            release_payload=rewritten,
+        )
+        if wetdry_blocker is not None:
+            blockers.append(wetdry_blocker)
+        elif wetdry_semantics_approval is not None:
+            forcing_payload = rewritten.get("forcing")
+            ocm_payload = forcing_payload.get("ocm") if isinstance(forcing_payload, dict) else None
+            if not isinstance(ocm_payload, dict):
+                blockers.append("wetdry_semantics_derivation_forcing_mapping_invalid")
+                wetdry_semantics_approval = None
+            else:
+                ocm_payload["wetdry_semantics_decision_status"] = _WETDRY_APPROVED_STATUS
     try:
         # formal gate 本身要求 config_status=approved；若直接拿 generated candidate
         # 驗證，狀態欄位會永遠製造一個假 blocker，導致「所有正式條件都已滿足」時仍
@@ -8247,6 +8452,10 @@ def create_release_config(
         ),
         "public_analysis_label_policy": {"A": "A 區分析域"},
     }
+    if wetdry_semantics_approval is not None:
+        # evidence 位於 release approval 而非 source template；它只保存相對 artifact
+        # reference 與 fingerprint，讓正式 validator 能重放同一份 immutable JSON。
+        rewritten["release_approval"]["wetdry_semantics_approval"] = wetdry_semantics_approval
     rendered = yaml.safe_dump(rewritten, allow_unicode=True, sort_keys=False, default_flow_style=False)
     _atomic_write_text(output, rendered)
     return {
@@ -8690,6 +8899,16 @@ def validate_release_config(
                         errors.append(f"config_reference_mismatch:{label}")
         except Exception as exc:
             errors.append(f"input_directory_invalid:{type(exc).__name__}")
+    if input_root is not None:
+        approval = payload.get("release_approval")
+        errors.extend(
+            _validate_wetdry_derived_approval(
+                payload,
+                approval=approval if isinstance(approval, Mapping) else None,
+                input_root=input_root,
+                formal=formal,
+            )
+        )
     if payload.get("config_status") == "approved" and formal:
         try:
             config = load_config(config_path, formal_release=False)

@@ -51,7 +51,7 @@ from .boundaries import BoundaryGeometry
 from .config import load_config
 from .diffusion import DiffusionCoefficients
 from .engine import EngineSettings, run_particle
-from .horizon_suite import build_horizon_suite, validate_horizon_suite
+from .horizon_suite import build_horizon_suite, resume_horizon_suite, validate_horizon_suite
 from .input_derivation import (
     build_input_derivatives,
     create_release_config,
@@ -269,6 +269,42 @@ def _horizon_suite_validate_parser() -> argparse.ArgumentParser:
         dest="formal",
         action="store_false",
         help="以 generated/pilot 狀態驗證 suite",
+    )
+    return parser
+
+
+def _horizon_suite_resume_parser() -> argparse.ArgumentParser:
+    """建立 preserved partial recovery parser。
+
+    recovery 必須由 caller 明示原 partial、全新的 destination、完整 horizon 集合與
+    三套 accepted forcing root；核心會先唯讀驗證 common-input，並保證此命令不再次
+    執行昂貴的 ``inputs-build``。formal／pilot 只切換既有 validator gate，不改變
+    input artifact 或 release 的科學設定。
+    """
+
+    parser = argparse.ArgumentParser(
+        description="從 preserved .partial-* 重建 horizon suite，不重跑 input-build"
+    )
+    parser.add_argument("--partial", required=True, type=Path)
+    parser.add_argument("--backtrack-days", required=True, nargs="+", type=_positive_cli_int)
+    parser.add_argument("--destination", required=True, type=Path)
+    parser.add_argument("--ocm-native-root", required=True, type=Path)
+    parser.add_argument("--ocm-surface-root", required=True, type=Path)
+    parser.add_argument("--nww-analysis-root", required=True, type=Path)
+    parser.set_defaults(formal=True)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--formal-release",
+        "--formal",
+        dest="formal",
+        action="store_true",
+        help="啟用正式 approved gate（預設模式）",
+    )
+    mode_group.add_argument(
+        "--pilot",
+        dest="formal",
+        action="store_false",
+        help="以 generated/pilot 狀態 recovery；仍執行完整 closure/hash 驗證",
     )
     return parser
 
@@ -1158,6 +1194,28 @@ def run_horizon_suite_create(argv: Sequence[str] | None = None) -> int:
         config_template_path=args.config_template,
         backtrack_days=args.backtrack_days,
         destination=args.destination,
+        ocm_native_root=args.ocm_native_root,
+        ocm_surface_root=args.ocm_surface_root,
+        nww_analysis_root=args.nww_analysis_root,
+        formal=args.formal,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def run_horizon_suite_resume(argv: Sequence[str] | None = None) -> int:
+    """由 exact preserved partial 重建 suite，輸出新的 atomic destination 摘要。
+
+    handler 不接受 input directory override，也不自行複製或推導 manifest；所有
+    closure、source hash、formal gate、六份 release 與 exclusive publish 都由核心
+    ``resume_horizon_suite`` 統一處理。原 partial 若失敗，仍保留供稽核。
+    """
+
+    args = _horizon_suite_resume_parser().parse_args(argv)
+    result = resume_horizon_suite(
+        preserved_partial=args.partial,
+        destination=args.destination,
+        backtrack_days=args.backtrack_days,
         ocm_native_root=args.ocm_native_root,
         ocm_surface_root=args.ocm_surface_root,
         nww_analysis_root=args.nww_analysis_root,
@@ -2164,6 +2222,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         add_help=False,
     )
     subparsers.add_parser(
+        "horizon-suite-resume",
+        parents=[_horizon_suite_resume_parser()],
+        add_help=False,
+    )
+    subparsers.add_parser(
         "horizon-suite-validate",
         parents=[_horizon_suite_validate_parser()],
         add_help=False,
@@ -2271,6 +2334,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_release_config_validate(command_argv)
     if parsed.command == "horizon-suite-create":
         return run_horizon_suite_create(command_argv)
+    if parsed.command == "horizon-suite-resume":
+        return run_horizon_suite_resume(command_argv)
     if parsed.command == "horizon-suite-validate":
         return run_horizon_suite_validate(command_argv)
     if parsed.command in {"pilot-calibrate", "pilot-calibration-build"}:

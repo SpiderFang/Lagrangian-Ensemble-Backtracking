@@ -17,7 +17,7 @@
 
 | 類別 | 實際命令 |
 |---|---|
-| 設定／輸入 | `config-check`、`preflight`、`inputs-build`、`inputs-validate`、`release-config-create`、`release-config-validate`、`horizon-suite-create`、`horizon-suite-validate` |
+| 設定／輸入 | `config-check`、`preflight`、`inputs-build`、`inputs-validate`、`release-config-create`、`release-config-validate`、`horizon-suite-create`、`horizon-suite-resume`、`horizon-suite-validate` |
 | pilot | `pilot-calibrate`、`pilot-calibrate-validate`、`pilot-calibration-build`、`pilot-calibration-validate`、`pilot-config-create`、`pilot-config-validate` |
 | 工程驗證 | `behavior-manifest`、`synthetic-smoke`、`validate-shard`、`code-provenance`、`validate-run`、`benchmark-report`、`pilot-matrix-validate` |
 | run lifecycle | `run-create`、`run-shard`、`run-worker`、`run-reconcile` |
@@ -609,3 +609,26 @@ hash 測試位於 `tests/test_source_pathway_release.py`；測試產生的 PNG �
 API 不繞過 config、manifest、QC、source binding 或 formal gate；Python synthetic fixture
 只能驗證工程行為。部署與資料同步遵循[Git 部署與資料同步手冊](git_deployment_and_data_sync.md)，
 本機 Git 與 SERVER data／output／checkpoint 分開管理。
+
+### `horizon-suite-resume`
+
+若 `horizon-suite-create` 在發布前中斷並留下 exact preserved `.partial-*`，可用下列命令
+在新的 destination recovery：
+
+```bash
+uv run lbt horizon-suite-resume \
+  --partial "$LBT_SCRATCH_ROOT/.horizon-suite-2025-observation-h30-h60-h90-v1.partial-<id>" \
+  --backtrack-days 30 60 90 \
+  --destination "$LBT_SCRATCH_ROOT/horizon-suite-2025-observation-h30-h60-h90-v1-recovered" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+```
+
+核心會唯讀重驗 source-template、common-config、common-input closure、source config hash
+與三個 accepted roots，再於新的 owned partial 重建 release／validation／manifest；不修改
+或刪除原 partial，destination 已存在、symlink、tampering 或日數不一致都會拒絕。新的
+manifest 固定保存 `input_build_count=1`、
+`recovery_method=resume_reuse_validated_common_input_v1` 與不含絕對路徑的
+`recovery_source_fingerprint`，此流程不再次呼叫 `inputs-build`。

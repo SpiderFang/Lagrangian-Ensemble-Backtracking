@@ -488,7 +488,9 @@ def test_bed_suite_builds_one_180_day_selection_mother_and_six_mode_releases(
     tampered_path = destination / "release-configs" / "release-30d-full_horizon_from_deposition.yaml"
     tampered = yaml.safe_load(tampered_path.read_text(encoding="utf-8"))
     tampered["scenarios"]["bed_residence_time"]["backtrack_mode"] = modes[0]
-    tampered_path.write_text(yaml.safe_dump(tampered, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tampered_path.write_text(
+        yaml.safe_dump(tampered, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
     for record in manifest["releases"]:
         if record["config_path"] == (
             "release-configs/release-30d-full_horizon_from_deposition.yaml"
@@ -505,6 +507,103 @@ def test_bed_suite_builds_one_180_day_selection_mother_and_six_mode_releases(
         or "release_horizon_binding_invalid" in error
         for error in tamper_result["errors"]
     )
+
+
+def test_resume_horizon_suite_reuses_preserved_partial_without_input_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """recovery 應保留原 partial、重建六份 release，且 input builder 呼叫次數為零。"""
+
+    calls = _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "bed-template.yaml"
+    _write_bed_template(template)
+    initial_destination = tmp_path / "initial-suite"
+    horizon_suite.build_horizon_suite(
+        template,
+        [30, 60, 90],
+        initial_destination,
+        tmp_path / "ocm",
+        tmp_path / "surface",
+        tmp_path / "nww",
+        formal=False,
+    )
+    preserved_partial = tmp_path / ".recovered-suite.partial-preserved"
+    shutil.copytree(initial_destination, preserved_partial)
+    before = {
+        path.relative_to(preserved_partial): path.read_bytes()
+        for path in preserved_partial.rglob("*")
+        if path.is_file()
+    }
+    calls["build"].clear()
+    destination = tmp_path / "recovered-suite"
+
+    result = horizon_suite.resume_horizon_suite(
+        preserved_partial,
+        destination,
+        [90, 30, 60],
+        tmp_path / "ocm",
+        tmp_path / "surface",
+        tmp_path / "nww",
+        formal=False,
+    )
+
+    assert result["recovery_method"] == "resume_reuse_validated_common_input_v1"
+    assert result["release_count"] == 6
+    assert result["common_input_build_count"] == 1
+    assert calls["build"] == []
+    manifest, _ = _load_manifest(destination)
+    assert manifest["input_build_count"] == 1
+    assert manifest["recovery_method"] == "resume_reuse_validated_common_input_v1"
+    assert isinstance(manifest["recovery_source_fingerprint"], dict)
+    assert horizon_suite.validate_horizon_suite(destination, formal=False)["valid"] is True
+    after = {
+        path.relative_to(preserved_partial): path.read_bytes()
+        for path in preserved_partial.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_resume_horizon_suite_rejects_common_config_tampering_before_new_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """recovery 對 common-config 竄改 fail closed，且不建立 destination。"""
+
+    _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "bed-template.yaml"
+    _write_bed_template(template)
+    initial_destination = tmp_path / "initial-suite"
+    horizon_suite.build_horizon_suite(
+        template,
+        [30, 60, 90],
+        initial_destination,
+        tmp_path / "ocm",
+        tmp_path / "surface",
+        tmp_path / "nww",
+        formal=False,
+    )
+    preserved_partial = tmp_path / ".recovered-suite.partial-tampered"
+    shutil.copytree(initial_destination, preserved_partial)
+    common_path = preserved_partial / "common-config.yaml"
+    common_payload = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    assert isinstance(common_payload, dict)
+    common_payload["boundaries"]["maximum_step_count"] = 1
+    common_path.write_text(
+        yaml.safe_dump(common_payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    destination = tmp_path / "recovered-suite"
+
+    with pytest.raises(horizon_suite.HorizonSuiteError, match="common config"):
+        horizon_suite.resume_horizon_suite(
+            preserved_partial,
+            destination,
+            [30, 60, 90],
+            tmp_path / "ocm",
+            tmp_path / "surface",
+            tmp_path / "nww",
+            formal=False,
+        )
+    assert not destination.exists()
 
 
 def test_existing_destination_symlink_and_mid_build_failure_are_safe(

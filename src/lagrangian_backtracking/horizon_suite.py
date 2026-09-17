@@ -21,6 +21,7 @@ import fcntl
 import json
 import math
 import os
+import shutil
 import stat
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -34,7 +35,11 @@ from .bed_residence import (
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
 )
-from .config import ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1, ProjectConfig
+from .config import (
+    ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1,
+    CURRENT_DESIGN_VERSION,
+    ProjectConfig,
+)
 from .input_derivation import (
     ARTIFACT_FILENAMES,
     DENOMINATOR_POLICY_ID,
@@ -46,6 +51,7 @@ from .input_derivation import (
     _assert_regular_directory,
     _assert_regular_file,
     _atomic_write_bytes,
+    _validate_artifact_directory,
     build_input_derivatives,
     canonical_json_bytes,
     create_release_config,
@@ -151,6 +157,8 @@ _SUITE_MANIFEST_KEYS = frozenset(
         "releases",
         "paths",
         "input_build_count",
+        "recovery_method",
+        "recovery_source_fingerprint",
     }
 )
 """根 manifest 的 exact 欄位集合；未登錄欄位不能靠重簽 sidecar 加入。"""
@@ -402,6 +410,9 @@ _RELEASE_APPROVAL_KEYS = frozenset(
     }
 )
 """create_release_config 登錄的 release approval 欄位集合。"""
+
+_WETDRY_RELEASE_APPROVAL_KEY = "wetdry_semantics_approval"
+"""正式 current-design release 的 wet/dry 衍生核准 evidence 欄位名稱。"""
 
 
 class HorizonSuiteError(ValueError):
@@ -1057,6 +1068,7 @@ def _derive_expected_release_payload(
     maximum_step_count: int,
     inventory_payload: Mapping[str, Any] | None = None,
     backtrack_mode: str | None = None,
+    formal: bool = False,
 ) -> dict[str, Any]:
     """從 common payload 建立單一 release 應有的完整設定 mapping。
 
@@ -1092,6 +1104,17 @@ def _derive_expected_release_payload(
             raise HorizonSuiteError("bed residence release config 必須是 mapping")
         bed_payload["backtrack_mode"] = backtrack_mode
     _set_release_manifest_references(expected)
+    if formal and expected.get("design_version") == CURRENT_DESIGN_VERSION:
+        forcing = expected.get("forcing")
+        ocm = forcing.get("ocm") if isinstance(forcing, Mapping) else None
+        if isinstance(ocm, dict) and ocm.get(
+            "wetdry_semantics_decision_status"
+        ) == "derived_pending_server_preflight":
+            # formal create_release_config 只有在既有 validator 已確認 dynamic
+            # initial-condition 全部為 wet 時才會寫入 approved；expected payload 也要
+            # 反映同一個 deterministic promotion，否則 suite validator 會把合法
+            # release 誤判為 common-config 漂移。pilot／legacy 不套用此轉換。
+            ocm["wetdry_semantics_decision_status"] = "approved"
 
     # 真實 inventory 的 flow-domain 綁定可能需要同步 release 的 formal 欄位。採用
     # 既有 input_derivation 純函式會增加對 synthetic double 的依賴，因此以局部 import
@@ -1556,7 +1579,15 @@ def _validate_release_registered_metadata(
     if not isinstance(approval, Mapping):
         errors.append(f"release_approval_missing:{days}")
     else:
-        if set(approval) != _RELEASE_APPROVAL_KEYS:
+        expected_approval_keys = _RELEASE_APPROVAL_KEYS
+        # wet/dry evidence 只在正式 current-design promotion 時出現；pilot、legacy
+        # 與已經具有 confirmed/approved source status 的 release 維持原欄位集合。
+        # 證據內容與 dynamic artifact hash 由 input_derivation validator 另行重放。
+        if _WETDRY_RELEASE_APPROVAL_KEY in approval:
+            expected_approval_keys = _RELEASE_APPROVAL_KEYS | {
+                _WETDRY_RELEASE_APPROVAL_KEY
+            }
+        if set(approval) != expected_approval_keys:
             errors.append(f"release_approval_keys_invalid:{days}")
         if approval.get("status") != expected_status:
             errors.append(f"release_approval_status_invalid:{days}")
@@ -1777,6 +1808,11 @@ def _validate_suite_contents(
     artifact_source_config_hash: str | None = None
     artifact_support_days: float | None = None
     inventory_payload: Mapping[str, Any] | None = None
+    recovery_method = manifest.get("recovery_method")
+    if recovery_method not in {"fresh_build_v1", "resume_reuse_validated_common_input_v1"}:
+        errors.append("manifest_recovery_method_invalid")
+    elif recovery_method == "fresh_build_v1" and manifest.get("recovery_source_fingerprint") is not None:
+        errors.append("manifest_fresh_recovery_source_must_be_null")
     try:
         component_fps = _component_fingerprints(input_root)
         artifact_index_payload, artifact_index_fp = _read_artifact_index(input_root)
@@ -1805,6 +1841,21 @@ def _validate_suite_contents(
                     errors.append(f"common_component_fingerprint_mismatch:{kind}")
         if manifest.get("common_identity_fingerprints") != _identity_fingerprints(component_fps):
             errors.append("common_identity_fingerprints_mismatch")
+        recorded_recovery_source = manifest.get("recovery_source_fingerprint")
+        if recovery_method == "resume_reuse_validated_common_input_v1":
+            expected_recovery_source = _recovery_source_fingerprint(
+                manifest.get("source_template_fingerprint")
+                if isinstance(manifest.get("source_template_fingerprint"), Mapping)
+                else {},
+                manifest.get("common_config_fingerprint")
+                if isinstance(manifest.get("common_config_fingerprint"), Mapping)
+                else {},
+                component_fps,
+            )
+            if recorded_recovery_source != expected_recovery_source:
+                errors.append("manifest_recovery_source_fingerprint_mismatch")
+        elif recovery_method == "fresh_build_v1" and recorded_recovery_source is not None:
+            errors.append("manifest_fresh_recovery_source_must_be_null")
         source_bindings = artifact_index_payload.get("source_bindings")
         expected_config_hash = _config_hash_from_payload(common_payload)
         if isinstance(source_bindings, Mapping) and type(source_bindings.get("config_hash")) is str:
@@ -2051,6 +2102,7 @@ def _validate_suite_contents(
                         maximum_step_count=expected_record_steps,
                         inventory_payload=inventory_payload,
                         backtrack_mode=mode,
+                        formal=formal,
                     )
                     if _release_payload_without_registered_fields(
                         release_payload
@@ -2212,6 +2264,117 @@ def validate_horizon_suite(
     return result
 
 
+def _recovery_source_fingerprint(
+    source_template_fingerprint: Mapping[str, Any],
+    common_config_fingerprint: Mapping[str, Any],
+    component_fingerprints: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    """建立不含絕對路徑的 recovery source fingerprint。
+
+    recovery 只允許重用已驗證的 source-template、common-config 與 common-input；因此
+    manifest 保存三個來源 bytes hash，以及由所有 immutable component fingerprint
+    canonical 化後再雜湊的 closure 摘要。這些欄位足以在不暴露 SERVER 絕對路徑的前提下
+    重現「哪一批來源被重用」的稽核鏈，且不把原 partial 的 basename 當成可信內容。
+    """
+
+    component_snapshot = {
+        kind: {
+            field: component_fingerprints[kind][field]
+            for field in ("sha256", "canonical_sha256", "size_bytes")
+        }
+        for kind in sorted(component_fingerprints)
+    }
+    return {
+        "source_template_sha256": str(source_template_fingerprint["sha256"]),
+        "common_config_sha256": str(common_config_fingerprint["sha256"]),
+        "common_input_artifact_index_sha256": str(
+            component_fingerprints["artifact_index"]["sha256"]
+        ),
+        "common_input_components_sha256": sha256(
+            canonical_json_bytes(component_snapshot)
+        ).hexdigest(),
+    }
+
+
+def _build_suite_manifest(
+    *,
+    source_template_fingerprint: Mapping[str, Any],
+    common_config_fingerprint: Mapping[str, Any],
+    common_payload: Mapping[str, Any],
+    input_validation_fingerprint: Mapping[str, Any],
+    component_fingerprints: Mapping[str, Mapping[str, Any]],
+    release_records: Sequence[Mapping[str, Any]],
+    release_identity: Mapping[str, Any],
+    horizons: tuple[int, ...],
+    population_contract: Mapping[str, Any],
+    selection_support_days: int,
+    runtime_support_days: int,
+    backtrack_modes: tuple[str, ...],
+    dt_min: float,
+    step_counts: Mapping[int, int],
+    formal: bool,
+    recovery_method: str = "fresh_build_v1",
+    recovery_source_fingerprint: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """以同一組 component／release evidence 組裝 suite root manifest。
+
+    fresh build 與 recovery 必須使用完全相同的 schema、topology 與來源綁定；差異只
+    記錄在 ``recovery_method`` 與可稽核 fingerprint。函式不讀取檔案、不產生 input，
+    由 caller 先完成 closure、formal gate 與 release validator 後再寫入 manifest。
+    """
+
+    manifest: dict[str, Any] = {
+        "manifest_kind": "horizon_suite_manifest",
+        "schema_version": HORIZON_SUITE_SCHEMA_VERSION,
+        "source_schema_version": (
+            GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if backtrack_modes and _payload_gap_censoring_contract(common_payload) is not None
+            else BED_RESIDENCE_INPUT_SCHEMA_VERSION
+            if backtrack_modes
+            else DERIVED_INPUT_SCHEMA_VERSION
+        ),
+        "status": "approved" if formal else "generated",
+        "gate_mode": "formal" if formal else "pilot",
+        "policy_id": HORIZON_SUITE_POLICY_ID,
+        "method_id": HORIZON_SUITE_METHOD_ID,
+        "horizons_days": list(horizons),
+        "forcing_years": population_contract["forcing_years"],
+        "observation_years": population_contract["observation_years"],
+        "arrival_selection_policy_id": population_contract["arrival_selection_policy_id"],
+        "replicates_per_stratum": population_contract["replicates_per_stratum"],
+        "arrival_core_count": population_contract["arrival_core_count"],
+        "arrival_event_count": population_contract["arrival_event_count"],
+        "selection_support_days": selection_support_days,
+        "runtime_support_days": runtime_support_days,
+        "backtrack_modes": list(backtrack_modes),
+        "step_count_formula": "ceil(days*86400/dt_min_seconds)+1",
+        "dt_min_seconds": float(dt_min),
+        "maximum_step_count_by_horizon": {str(days): step_counts[days] for days in horizons},
+        "source_template_fingerprint": dict(source_template_fingerprint),
+        "common_config_fingerprint": dict(common_config_fingerprint),
+        "common_artifact_index_fingerprint": dict(component_fingerprints["artifact_index"]),
+        "common_artifact_fingerprints": {
+            kind: dict(component_fingerprints[kind]) for kind in sorted(ARTIFACT_FILENAMES)
+        },
+        "common_identity_fingerprints": release_identity["identity"],
+        "input_validation_fingerprint": dict(input_validation_fingerprint),
+        "input_validation_context": {"formal": formal, "roots_supplied": True},
+        "releases": [dict(record) for record in release_records],
+        "paths": _expected_suite_paths(),
+        "input_build_count": 1,
+        "recovery_method": recovery_method,
+        "recovery_source_fingerprint": (
+            dict(recovery_source_fingerprint) if recovery_source_fingerprint is not None else None
+        ),
+    }
+    gap_contract = _payload_gap_censoring_contract(common_payload)
+    if gap_contract is not None:
+        # 六份 release 共用同一份 gap-censored common input；policy snapshot 放在
+        # suite root，讓後續 validator 不必從任一 release 猜測科學分母語意。
+        manifest.update(gap_contract)
+    return manifest
+
+
 def build_horizon_suite(
     config_template_path: str | Path,
     backtrack_days: Sequence[Any],
@@ -2314,51 +2477,23 @@ def build_horizon_suite(
             runtime_support_days=runtime_support_days,
             formal=formal,
         )
-        manifest: dict[str, Any] = {
-            "manifest_kind": "horizon_suite_manifest",
-            "schema_version": HORIZON_SUITE_SCHEMA_VERSION,
-            "source_schema_version": (
-                GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION
-                if backtrack_modes and _payload_gap_censoring_contract(common_payload) is not None
-                else BED_RESIDENCE_INPUT_SCHEMA_VERSION
-                if backtrack_modes
-                else DERIVED_INPUT_SCHEMA_VERSION
-            ),
-            "status": "approved" if formal else "generated",
-            "gate_mode": "formal" if formal else "pilot",
-            "policy_id": HORIZON_SUITE_POLICY_ID,
-            "method_id": HORIZON_SUITE_METHOD_ID,
-            "horizons_days": list(horizons),
-            "forcing_years": population_contract["forcing_years"],
-            "observation_years": population_contract["observation_years"],
-            "arrival_selection_policy_id": population_contract["arrival_selection_policy_id"],
-            "replicates_per_stratum": population_contract["replicates_per_stratum"],
-            "arrival_core_count": population_contract["arrival_core_count"],
-            "arrival_event_count": population_contract["arrival_event_count"],
-            "selection_support_days": selection_support_days,
-            "runtime_support_days": runtime_support_days,
-            "backtrack_modes": list(backtrack_modes),
-            "step_count_formula": "ceil(days*86400/dt_min_seconds)+1",
-            "dt_min_seconds": float(dt_min),
-            "maximum_step_count_by_horizon": {str(days): step_counts[days] for days in horizons},
-            "source_template_fingerprint": source_fp,
-            "common_config_fingerprint": common_fp,
-            "common_artifact_index_fingerprint": component_fps["artifact_index"],
-            "common_artifact_fingerprints": {
-                kind: component_fps[kind] for kind in sorted(ARTIFACT_FILENAMES)
-            },
-            "common_identity_fingerprints": release_identity["identity"],
-            "input_validation_fingerprint": input_validation_fp,
-            "input_validation_context": {"formal": formal, "roots_supplied": True},
-            "releases": release_records,
-            "paths": _expected_suite_paths(),
-            "input_build_count": 1,
-        }
-        gap_contract = _payload_gap_censoring_contract(common_payload)
-        if gap_contract is not None:
-            # 六份 release 共用同一份 gap-censored common input；policy snapshot 放在
-            # suite root，讓後續 validator 不必從任一 release 猜測科學分母語意。
-            manifest.update(gap_contract)
+        manifest = _build_suite_manifest(
+            source_template_fingerprint=source_fp,
+            common_config_fingerprint=common_fp,
+            common_payload=common_payload,
+            input_validation_fingerprint=input_validation_fp,
+            component_fingerprints=component_fps,
+            release_records=release_records,
+            release_identity=release_identity,
+            horizons=horizons,
+            population_contract=population_contract,
+            selection_support_days=selection_support_days,
+            runtime_support_days=runtime_support_days,
+            backtrack_modes=backtrack_modes,
+            dt_min=float(dt_min),
+            step_counts=step_counts,
+            formal=formal,
+        )
         manifest_path = partial / HORIZON_SUITE_MANIFEST_FILENAME
         write_canonical_json(manifest_path, manifest)
         validation = validate_horizon_suite(
@@ -2408,6 +2543,257 @@ def build_horizon_suite(
         raise
 
 
+def _assert_tree_has_no_symlink_or_special_file(root: Path) -> None:
+    """遞迴確認 recovery source tree 只含普通檔案與目錄。
+
+    ``_assert_no_symlink_components`` 只能保護路徑的父層；partial 內部若藏有
+    symbolic link，直接 ``copytree`` 可能把 caller 未授權的資料帶入新 release。因此
+    recovery 在讀取與複製前逐項使用不追 symlink 的目錄掃描，並拒絕 FIFO、socket 與
+    其他特殊節點。此檢查只讀取 metadata，不改寫原 partial。
+    """
+
+    _assert_regular_directory(root)
+    for entry in os.scandir(root):
+        entry_path = Path(entry.path)
+        if entry.is_symlink():
+            raise HorizonSuiteError("recovery partial 不得包含 symbolic link")
+        if entry.is_dir(follow_symlinks=False):
+            _assert_tree_has_no_symlink_or_special_file(entry_path)
+        elif not entry.is_file(follow_symlinks=False):
+            raise HorizonSuiteError("recovery partial 不得包含特殊檔案")
+
+
+def _assert_recovery_partial_identity(partial: Path, destination: Path) -> None:
+    """確認 caller 指定的是與 destination 同 parent 的 exact preserved partial。
+
+    partial basename 必須符合本模組建立的 ``.<destination>.partial-*`` 形狀；不接受
+    任意目錄、symbolic link 或另一個 parent 下的同名資料，避免 recovery 被用來把
+    未核准來源偷偷搬入新的正式成果。
+    """
+
+    if os.path.abspath(os.fspath(partial.parent)) != os.path.abspath(
+        os.fspath(destination.parent)
+    ):
+        raise HorizonSuiteError("recovery partial 與 destination 必須位於同一 parent")
+    prefix = f".{destination.name}.partial-"
+    if not partial.name.startswith(prefix) or partial.name == prefix:
+        raise HorizonSuiteError("recovery partial basename 不符合 preserved partial 契約")
+    _assert_no_symlink_components(partial, allow_missing_leaf=False)
+    _assert_tree_has_no_symlink_or_special_file(partial)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("不可覆寫既有 horizon suite destination")
+
+
+def _copy_verified_common_input(source: Path, destination: Path) -> None:
+    """複製已通過 closure gate 的 common-input，絕不呼叫 input builder。
+
+    source 已先由 ``_validate_artifact_directory``、component fingerprint 與
+    ``validate_input_derivatives`` 驗證；這裡仍以 ``symlinks=False`` 複製普通檔案，並
+    只把 immutable common-input 帶到新的 owned partial，不複製舊 releases 或 partial
+    manifest。若來源在驗證後遭替換，後續新目錄中的 sidecar／validator 會 fail closed。
+    """
+
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("recovery 新 partial 的 common-input 已存在")
+    shutil.copytree(source, destination, symlinks=False)
+    _assert_tree_has_no_symlink_or_special_file(destination)
+
+
+def resume_horizon_suite(
+    preserved_partial: str | Path,
+    destination: str | Path,
+    backtrack_days: Sequence[Any],
+    ocm_native_root: str | Path,
+    ocm_surface_root: str | Path,
+    nww_analysis_root: str | Path,
+    formal: bool = True,
+) -> dict[str, Any]:
+    """從 exact preserved partial 重建 suite，重用 common-input 且不再次 input-build。
+
+    recovery 先唯讀驗證 source-template、common-config、artifact index／closure、來源
+    config hash 與三套 accepted forcing root；成功後才在 destination parent 建立另一個
+    owned partial，複製已驗證 common-input，重新產生所有 release、validation 與 root
+    manifest，再以既有 exclusive rename 原子發布。原 preserved partial 永不寫入、改名或
+    刪除；destination 已存在、partial 有 symlink／tampering、caller 日數與 common
+    config 不一致、或任何 formal gate 失敗都 fail closed。manifest 固定記錄
+    ``input_build_count=1``、``resume_reuse_validated_common_input_v1`` 與不含絕對路徑的
+    source fingerprint。
+    """
+
+    horizons = normalize_horizons(backtrack_days)
+    maximum_horizon = max(horizons)
+    partial_source = Path(preserved_partial)
+    destination_path = Path(destination)
+    _assert_recovery_partial_identity(partial_source, destination_path)
+
+    source_path = partial_source / HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME
+    common_path = partial_source / HORIZON_SUITE_COMMON_CONFIG_FILENAME
+    common_input_source = partial_source / HORIZON_SUITE_COMMON_INPUT_DIRECTORY
+    source_payload, source_fp, source_bytes = _read_yaml_snapshot(
+        source_path,
+        "recovery source template",
+        HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME,
+    )
+    _assert_unbound_template(source_payload)
+    common_payload, common_fp, common_bytes = _read_yaml_snapshot(
+        common_path,
+        "recovery common config",
+        HORIZON_SUITE_COMMON_CONFIG_FILENAME,
+    )
+    expected_common = _derive_common_payload(source_payload, maximum_horizon)
+    if common_payload != expected_common:
+        raise HorizonSuiteError("recovery common config 與 source template／日數不一致")
+    population_contract = _arrival_population_contract(common_payload)
+    selection_support_days, runtime_support_days, backtrack_modes = _suite_support_contract(
+        common_payload, maximum_horizon
+    )
+    integration = common_payload.get("integration")
+    dt_min = integration.get("dt_min_seconds") if isinstance(integration, Mapping) else None
+    if dt_min is None:
+        raise HorizonSuiteError("recovery common config 缺少 integration.dt_min_seconds")
+    _assert_regular_directory(common_input_source)
+    expected_common_files = {filename for filename in ARTIFACT_FILENAMES.values()}
+    expected_common_files.update(_COMMON_INPUT_EXTRA_FILENAMES)
+    expected_common_files.update(
+        f"{filename}.sha256" for filename in tuple(expected_common_files)
+    )
+    _assert_exact_entries(
+        common_input_source,
+        expected_files=expected_common_files,
+        expected_directories=set(),
+        label="recovery common-input",
+    )
+    input_directory_errors, _, _ = _validate_artifact_directory(common_input_source)
+    if input_directory_errors:
+        raise HorizonSuiteError("recovery common-input artifact directory 未通過")
+    component_fps = _component_fingerprints(common_input_source)
+    artifact_index_payload, _ = _read_artifact_index(common_input_source)
+    _validate_artifact_closure(common_input_source, component_fps)
+    expected_config_hash = _config_hash_from_payload(common_payload)
+    source_bindings = artifact_index_payload.get("source_bindings")
+    if not isinstance(source_bindings, Mapping) or source_bindings.get("config_hash") != expected_config_hash:
+        raise HorizonSuiteError("recovery artifact_index source config hash 不符")
+
+    # 若 preserved partial 已有 manifest，僅核對其日數與 common fingerprint；不採用其中
+    # 的 releases／validation，避免把中斷時殘留或被竄改的 metadata 帶入新發布。
+    old_manifest_path = partial_source / HORIZON_SUITE_MANIFEST_FILENAME
+    if old_manifest_path.exists() or old_manifest_path.is_symlink():
+        old_manifest, _ = read_canonical_json(old_manifest_path)
+        if old_manifest.get("horizons_days") != list(horizons):
+            raise HorizonSuiteError("recovery preserved manifest 日數與 caller 不一致")
+        if old_manifest.get("common_config_fingerprint") != common_fp:
+            raise HorizonSuiteError("recovery preserved manifest common config fingerprint 不符")
+        if old_manifest.get("source_template_fingerprint") != source_fp:
+            raise HorizonSuiteError("recovery preserved manifest source fingerprint 不符")
+        if old_manifest.get("backtrack_modes") != list(backtrack_modes):
+            raise HorizonSuiteError("recovery preserved manifest backtrack mode 不符")
+        if old_manifest.get("selection_support_days") != selection_support_days:
+            raise HorizonSuiteError("recovery preserved manifest selection support 不符")
+        if old_manifest.get("runtime_support_days") != runtime_support_days:
+            raise HorizonSuiteError("recovery preserved manifest runtime support 不符")
+        if old_manifest.get("input_build_count") != 1:
+            raise HorizonSuiteError("recovery preserved manifest input_build_count 不符")
+        if old_manifest.get("common_artifact_index_fingerprint") != component_fps["artifact_index"]:
+            raise HorizonSuiteError("recovery preserved manifest artifact index fingerprint 不符")
+
+    input_validation = validate_input_derivatives(
+        common_input_source,
+        config_path=common_path,
+        formal=formal,
+        ocm_native_root=ocm_native_root,
+        ocm_surface_root=ocm_surface_root,
+        nww_analysis_root=nww_analysis_root,
+    )
+    if not isinstance(input_validation, Mapping) or input_validation.get("valid") is not True:
+        raise HorizonSuiteError("recovery common-input formal validator 未通過")
+
+    partial, parent_identity, partial_identity = _prepare_partial(destination_path)
+    published = False
+    try:
+        _atomic_write_bytes(partial / HORIZON_SUITE_SOURCE_TEMPLATE_FILENAME, source_bytes, suffix=".yaml")
+        _atomic_write_bytes(partial / HORIZON_SUITE_COMMON_CONFIG_FILENAME, common_bytes, suffix=".yaml")
+        _copy_verified_common_input(
+            common_input_source,
+            partial / HORIZON_SUITE_COMMON_INPUT_DIRECTORY,
+        )
+        validation_dir = partial / HORIZON_SUITE_VALIDATION_DIRECTORY
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        input_validation_fp = write_canonical_json(
+            validation_dir / "input.json", dict(input_validation)
+        )
+        step_counts = {days: maximum_step_count_for_horizon(days, dt_min) for days in horizons}
+        release_records, release_identity = _build_releases(
+            common_config=partial / HORIZON_SUITE_COMMON_CONFIG_FILENAME,
+            common_input=partial / HORIZON_SUITE_COMMON_INPUT_DIRECTORY,
+            partial=partial,
+            horizons=horizons,
+            step_counts=step_counts,
+            backtrack_modes=backtrack_modes,
+            selection_support_days=selection_support_days,
+            runtime_support_days=runtime_support_days,
+            formal=formal,
+        )
+        recovery_fingerprint = _recovery_source_fingerprint(source_fp, common_fp, component_fps)
+        manifest = _build_suite_manifest(
+            source_template_fingerprint=source_fp,
+            common_config_fingerprint=common_fp,
+            common_payload=common_payload,
+            input_validation_fingerprint=input_validation_fp,
+            component_fingerprints=component_fps,
+            release_records=release_records,
+            release_identity=release_identity,
+            horizons=horizons,
+            population_contract=population_contract,
+            selection_support_days=selection_support_days,
+            runtime_support_days=runtime_support_days,
+            backtrack_modes=backtrack_modes,
+            dt_min=float(dt_min),
+            step_counts=step_counts,
+            formal=formal,
+            recovery_method="resume_reuse_validated_common_input_v1",
+            recovery_source_fingerprint=recovery_fingerprint,
+        )
+        write_canonical_json(partial / HORIZON_SUITE_MANIFEST_FILENAME, manifest)
+        validation = validate_horizon_suite(
+            partial,
+            formal=formal,
+            ocm_native_root=ocm_native_root,
+            ocm_surface_root=ocm_surface_root,
+            nww_analysis_root=nww_analysis_root,
+        )
+        if validation.get("valid") is not True:
+            detail = ";".join(str(item) for item in validation.get("errors", [])[:8])
+            raise HorizonSuiteError(f"horizon suite recovery validator 未通過：{detail}")
+        for directory_name in (
+            HORIZON_SUITE_COMMON_INPUT_DIRECTORY,
+            HORIZON_SUITE_RELEASE_DIRECTORY,
+            HORIZON_SUITE_VALIDATION_DIRECTORY,
+        ):
+            _fsync_directory(partial / directory_name)
+        _fsync_directory(partial)
+        _publish_partial(partial, destination_path, parent_identity, partial_identity)
+        published = True
+        _fsync_directory(destination_path.parent, expected_identity=parent_identity)
+        partial = Path()
+        return {
+            "destination": str(destination_path),
+            "status": manifest["status"],
+            "horizons_days": list(horizons),
+            "selection_support_days": selection_support_days,
+            "runtime_support_days": runtime_support_days,
+            "backtrack_modes": list(backtrack_modes),
+            "maximum_step_count_by_horizon": manifest["maximum_step_count_by_horizon"],
+            "common_input_build_count": 1,
+            "release_count": len(release_records),
+            "recovery_method": manifest["recovery_method"],
+            "validation": validation,
+        }
+    except Exception:
+        if not published and partial != Path():
+            _cleanup_partial(partial, partial_identity, parent_identity)
+        raise
+
+
 __all__ = [
     "HORIZON_SUITE_COMMON_CONFIG_FILENAME",
     "HORIZON_SUITE_COMMON_INPUT_DIRECTORY",
@@ -2420,6 +2806,7 @@ __all__ = [
     "HORIZON_SUITE_VALIDATION_DIRECTORY",
     "HorizonSuiteError",
     "build_horizon_suite",
+    "resume_horizon_suite",
     "maximum_step_count_for_horizon",
     "normalize_horizons",
     "validate_horizon_suite",

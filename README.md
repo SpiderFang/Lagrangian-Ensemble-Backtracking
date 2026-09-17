@@ -160,6 +160,14 @@ runtime 採用核准重建支援契約的 immutable common-input 證據。實際
 domain manifest／root index 仍位於外部 `OCM_RECONSTRUCTION_ROOT`，不會被寫入 release
 config；legacy 或未啟用核准 reconstruction policy 的設定不會新增第二個 binding。
 
+正式 release 若 template 的 `forcing.ocm.wetdry_semantics_decision_status` 仍為
+`derived_pending_server_preflight`，只有 current design 在正式
+`validate_input_derivatives(..., formal=True)` 通過，且 dynamic initial-condition
+manifest 的每一列都確認 `wetdry_elem_value=0`、
+`wetdry_semantics_id=schism_wetdry_elem_0_wet_1_dry` 時，才會衍生為 `approved`。
+release approval 會保存方法識別碼、列數、相對 artifact reference 與 raw/canonical
+SHA-256；legacy、其他 pending 狀態或 evidence 不一致時維持 fail closed。
+
 本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
 
 效能改善以[正式完整母體效能工作線](docs/operations/16_performance_improvement_tracks.md)推進。首批提供 `run-worker` 接續執行同 run 的指定分片並重用流場管理器、正常步首速度樣本重用，以及 OCM 表面資料的少量格點取值；使用方法見[CLI 參考](docs/operations/cli_reference.md)。未來各區正式完整母體使用 `run-formal-parallel`：固定數量的長壽命 worker 依固定 run plan 確定分組，每個程序以單一 `run-worker` 連續執行自己的 shard 群，重用同程序流場管理器與已編譯 dispatcher。完整完成仍須全 shard lifecycle、child exit 與 `validate-run --require-complete` 同時通過；不做舊／新版倍率 A/B 比較，也不把局部試跑當完整成果。實際正式執行仍須先通過版本化輸入、乾淨 deployment provenance、SERVER NFS 儲存檢查與科學驗證；runner 還會即時核對本次 `scratch_root` 的 NFS source，避免誤用其他掛載點的 PASS 快照。設定可明示 `execution.physics_kernel_backend: numpy_v1` 或 `numba_cpu_v1`，OCM 內層插值另可明示 `execution.ocm_interpolation_backend: numpy_v1` 或 `numba_ocm_v1`。後端版本會進入設定與 run 身分；省略欄位的舊設定仍沿用 NumPy。Numba dispatcher 目前使用 `cache=False`，每個正式 worker 會在自己程序內呼叫 `warmup_numba_backend()` 一次，編譯結果只留在該程序記憶體，不能宣稱跨程序磁碟 cache 重用。若設定了 Numba backend，`NUMBA_CACHE_DIR` 仍必須明示為通過儲存檢查的 scratch 子目錄，並在匯入加速模組前設定；這是安全路徑契約，不代表目前核心會寫入 `.nbc`／`.nbi`。
@@ -183,6 +191,12 @@ config；legacy 或未啟用核准 reconstruction policy 的設定不會新增�
 綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見
 [輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及
 [CLI 參考](docs/operations/cli_reference.md)。
+
+若建立過程中留下 exact preserved `.partial-*`，可使用 `horizon-suite-resume`。它會唯讀
+核對 source-template、common-config、artifact closure、來源 config hash 與三個 forcing
+root，在新的 owned partial 重建六份 release；不修改原 partial，且 manifest 仍記錄
+`input_build_count=1` 與不含絕對路徑的 recovery source fingerprint。destination 必須不存在，
+日數必須與 common config／preserved manifest 一致；此命令絕不再次呼叫 `inputs-build`。
 
 新版母體的 manifest 另外保存 `forcing_years=[2024, 2025]`、
 `observation_years=[2025]`、arrival policy 與每個季節×潮況×相位的兩個

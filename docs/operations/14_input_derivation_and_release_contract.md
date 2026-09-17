@@ -235,6 +235,32 @@ uv run lbt horizon-suite-validate \
   --formal-release
 ```
 
+若建置在發布前中斷而保留 exact `.partial-*`，可在確認原 partial 未被改寫後，以新的
+destination 執行 recovery。recovery 會唯讀重驗 source-template、common-config、common-input
+closure、來源 config hash 與三個 accepted roots，複製已驗證的 common-input，再重建六份
+release、validation 與 manifest；它不呼叫 `inputs-build`，不修改或刪除原 partial，也拒絕
+symlink、tampering、既有 destination 或日數不一致：
+
+```bash
+uv run lbt horizon-suite-resume \
+  --partial "$LBT_SCRATCH_ROOT/.horizon-suite-2025-observation-h30-h60-h90-v1.partial-<id>" \
+  --backtrack-days 30 60 90 \
+  --destination "$LBT_SCRATCH_ROOT/horizon-suite-2025-observation-h30-h60-h90-v1-recovered" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-surface-root "$OCM_SURFACE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --formal-release
+```
+
+recovery manifest 的 `recovery_method` 固定為
+`resume_reuse_validated_common_input_v1`，`input_build_count` 仍為 `1`；
+`recovery_source_fingerprint` 只保存 source-template、common-config、artifact index 與
+component closure 的 hash，不記錄 partial 或 forcing root 的絕對路徑。正式 release 若 wet/dry
+決策仍為 `derived_pending_server_preflight`，只有 formal input validator 已通過且 dynamic
+initial-condition 每列都為 `wetdry_elem_value=0`、
+`wetdry_semantics_id=schism_wetdry_elem_0_wet_1_dry` 時，release approval 才會保存衍生
+`approved` evidence；legacy 或 evidence 錯誤維持 fail closed。
+
 將兩個命令的最後 `--formal-release` 改成 `--pilot` 可建立／驗證 pilot suite；這不會
 放寬 accepted product、gap-safe 或 hash binding，只改變正式 `approved` 狀態閘門。
 

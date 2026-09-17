@@ -1855,6 +1855,84 @@ def test_current_reconstruction_release_binds_safe_manifest_twice_only_for_appro
     assert "ocm_gap_reconstruction_manifest" not in non_reconstruction_result["inputs"]
 
 
+def test_formal_wetdry_pending_status_requires_all_wet_dynamic_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只有 current design 的 formal 全 wet dynamic evidence 才能衍生 approved。"""
+
+    template = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(template, dict)
+    source_config = ProjectConfig.model_validate(template)
+    release_payload = input_derivation_module._replace_manifest_references(
+        deepcopy(template),
+        config_output=tmp_path / "release.yaml",
+        input_directory=tmp_path / "common-input",
+    )
+    dynamic_payload = {
+        "records": [
+            {"wetdry_elem_value": 0, "wetdry_semantics_id": "schism_wetdry_elem_0_wet_1_dry"},
+            {"wetdry_elem_value": 0, "wetdry_semantics_id": "schism_wetdry_elem_0_wet_1_dry"},
+        ]
+    }
+    fingerprint = {
+        "sha256": "a" * 64,
+        "canonical_sha256": "b" * 64,
+        "size_bytes": 123,
+    }
+    monkeypatch.setattr(
+        input_derivation_module,
+        "read_canonical_json",
+        lambda path: (dynamic_payload, {"path": Path(path).name, **fingerprint}),
+    )
+    evidence, blocker = input_derivation_module._derive_formal_wetdry_approval(
+        tmp_path / "common-input",
+        source_config=source_config,
+        formal_input_validation={"valid": True},
+        release_payload=release_payload,
+    )
+    assert blocker is None
+    assert evidence is not None
+    assert evidence["derived_status"] == "approved"
+    assert evidence["record_count"] == 2
+    release_payload["config_status"] = "approved"
+    release_payload["forcing"]["ocm"]["wetdry_semantics_decision_status"] = "approved"
+    release_payload["release_approval"] = {"wetdry_semantics_approval": evidence}
+    assert (
+        input_derivation_module._validate_wetdry_derived_approval(
+            release_payload,
+            approval=release_payload["release_approval"],
+            input_root=tmp_path / "common-input",
+            formal=True,
+        )
+        == []
+    )
+
+    dynamic_payload["records"][1]["wetdry_elem_value"] = 1
+    _, blocker = input_derivation_module._derive_formal_wetdry_approval(
+        tmp_path / "common-input",
+        source_config=source_config,
+        formal_input_validation={"valid": True},
+        release_payload=release_payload,
+    )
+    assert blocker == "wetdry_semantics_derivation_evidence_invalid"
+
+    legacy_payload = deepcopy(template)
+    legacy_payload["design_version"] = "design_baseline_v3_non_rising_a_v3_local20_20260909"
+    legacy_payload.pop("arrival_time_selection", None)
+    legacy_payload["scenarios"].pop("bed_residence_time", None)
+    for field in ("gap_policy", "stop_at_first_gap", "denominator_policy"):
+        legacy_payload["inputs"]["time_axis_contract"].pop(field, None)
+    legacy_config = ProjectConfig.model_validate(legacy_payload)
+    dynamic_payload["records"][1]["wetdry_elem_value"] = 0
+    evidence, blocker = input_derivation_module._derive_formal_wetdry_approval(
+        tmp_path / "common-input",
+        source_config=legacy_config,
+        formal_input_validation={"valid": True},
+        release_payload=release_payload,
+    )
+    assert evidence is None
+    assert blocker is None
+
 def test_release_config_cli_forwards_optional_horizon_overrides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
