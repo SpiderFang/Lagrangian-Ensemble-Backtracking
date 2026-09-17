@@ -281,8 +281,12 @@ def _live_mount_identity(path: Path) -> tuple[str, str]:
     storage gate 快照刻意不保存 SERVER 的絕對路徑，因此 runner 不能只相信一份內容合法但
     可能屬於其他掛載點的舊快照。本函式在每次建立 log／cache 前以 ``findmnt`` 重新查詢
     實際 ``scratch_root``，選取涵蓋該路徑的最深掛載點，並使用和
-    ``scripts/validate_server_storage.py`` 相同的 SHA-256 算法摘要 mount source。回傳值只
-    在目前程序與 gate token 比對，不寫入原始 NFS 主機或 export 名稱。
+    ``scripts/validate_server_storage.py`` 相同的 SHA-256 算法摘要 mount source。若最深
+    target 同時出現 autofs 包裝列與真正的非-autofs 列，只忽略 autofs 包裝層；非-autofs
+    仍必須形成唯一的 ``(fstype, source)`` identity。重複相同 identity 可去重，但不同
+    identity 一律 fail closed，不偏好 NFS、列舉順序或任何字串排序結果。只有 autofs 時
+    照實回傳 autofs，讓後續 NFS gate 明確拒絕。回傳值只在目前程序與 gate token 比對，
+    不寫入原始 NFS 主機或 export 名稱。
     """
 
     try:
@@ -308,7 +312,11 @@ def _live_mount_identity(path: Path) -> tuple[str, str]:
     filesystems = payload.get("filesystems") if isinstance(payload, Mapping) else None
     if not isinstance(filesystems, list) or not filesystems:
         raise ParallelExecutionError("scratch_root 的 findmnt 結果不完整")
-    candidates: list[tuple[int, str, str]] = []
+    try:
+        resolved_path = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ParallelExecutionError("scratch_root 的實際路徑無法解析") from exc
+    candidates: list[tuple[int, Path, str, str]] = []
     for row in filesystems:
         if not isinstance(row, Mapping):
             continue
@@ -319,13 +327,34 @@ def _live_mount_identity(path: Path) -> tuple[str, str]:
             continue
         try:
             resolved_target = Path(target).resolve(strict=False)
-            path.relative_to(resolved_target)
+            resolved_path.relative_to(resolved_target)
         except (OSError, RuntimeError, ValueError):
             continue
-        candidates.append((len(resolved_target.parts), fstype.lower(), source))
+        candidates.append((len(resolved_target.parts), resolved_target, fstype.lower(), source))
     if not candidates:
         raise ParallelExecutionError("scratch_root 沒有可驗證的涵蓋掛載點")
-    _, fstype, source = max(candidates, key=lambda item: item[0])
+    deepest_depth = max(item[0] for item in candidates)
+    deepest_candidates = [item for item in candidates if item[0] == deepest_depth]
+    target_groups: dict[Path, list[tuple[str, str]]] = {}
+    for _, resolved_target, fstype, source in deepest_candidates:
+        target_groups.setdefault(resolved_target, []).append((fstype, source))
+    if len(target_groups) != 1:
+        raise ParallelExecutionError("scratch_root 的最深掛載 target 不唯一")
+    identities = next(iter(target_groups.values()))
+    unique_identities = set(identities)
+    non_autofs = {identity for identity in unique_identities if identity[0] != "autofs"}
+    if non_autofs:
+        if len(non_autofs) != 1:
+            raise ParallelExecutionError(
+                "scratch_root 的最深掛載存在多個不同非-autofs identity"
+            )
+        fstype, source = next(iter(non_autofs))
+    else:
+        # autofs 只有包裝列時不能假裝是 NFS；交給後續 gate 回報非 NFS。若同時有
+        # 不同 autofs source，則連唯一 mount identity 都無法確定，仍須拒絕猜測。
+        if len(unique_identities) != 1:
+            raise ParallelExecutionError("scratch_root 的 autofs identity 不唯一")
+        fstype, source = next(iter(unique_identities))
     return fstype, hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 

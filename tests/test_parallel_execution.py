@@ -204,6 +204,111 @@ def test_live_mount_identity_uses_deepest_covering_mount(
     assert source not in source_token
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_live_mount_identity_ignores_autofs_wrapper_in_either_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reverse: bool
+) -> None:
+    """最深 target 同時有 autofs／NFS 時不受 findmnt 列舉順序影響。"""
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    source = "server.example:/private/export/lbt"
+    rows = [
+        {"fstype": "autofs", "source": "systemd-1", "target": str(tmp_path)},
+        {"fstype": "nfs4", "source": source, "target": str(tmp_path)},
+    ]
+    if reverse:
+        rows.reverse()
+
+    monkeypatch.setattr(
+        parallel.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({"filesystems": rows}), stderr=""
+        ),
+    )
+    fstype, source_token = parallel._live_mount_identity(scratch)
+
+    assert fstype == "nfs4"
+    assert source_token == parallel.hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def test_live_mount_identity_deduplicates_same_non_autofs_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一最深 mount 的重複 NFS 列可去重，不因重複列誤判歧義。"""
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    source = "server.example:/private/export/lbt"
+    payload = {
+        "filesystems": [
+            {"fstype": "nfs4", "source": source, "target": str(tmp_path)},
+            {"fstype": "nfs4", "source": source, "target": str(tmp_path)},
+        ]
+    }
+    monkeypatch.setattr(
+        parallel.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    assert parallel._live_mount_identity(scratch)[0] == "nfs4"
+
+
+def test_live_mount_identity_rejects_ambiguous_non_autofs_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """最深 target 同時有不同非-autofs identity 時不得任選一列。"""
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    payload = {
+        "filesystems": [
+            {"fstype": "nfs4", "source": "server-a:/export", "target": str(tmp_path)},
+            {"fstype": "ext4", "source": "/dev/disk0", "target": str(tmp_path)},
+        ]
+    }
+    monkeypatch.setattr(
+        parallel.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    with pytest.raises(parallel.ParallelExecutionError, match="多個不同非-autofs"):
+        parallel._live_mount_identity(scratch)
+
+
+def test_live_mount_identity_returns_single_autofs_for_later_nfs_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只有 autofs 時保留真實 fstype，交由後續 NFS gate 拒絕。"""
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    source = "systemd-1"
+    payload = {
+        "filesystems": [
+            {"fstype": "autofs", "source": source, "target": str(tmp_path)},
+        ]
+    }
+    monkeypatch.setattr(
+        parallel.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    fstype, source_token = parallel._live_mount_identity(scratch)
+    assert fstype == "autofs"
+    assert source_token == parallel.hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
 def test_storage_root_rejects_gate_from_another_nfs_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

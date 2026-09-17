@@ -363,6 +363,9 @@ uv run python scripts/run_formal_parallel.py \
 沿用同一 workspace、設定、roots、worker count、storage gate 與（如適用）Numba cache。runner
 會在啟動子程序前以 `findmnt` 核對本次 `scratch_root` 的 NFS source token 與 PASS gate 相同；
 若掛載來源已改變即停止，不能沿用舊快照。`auto` 在
+同一個最深 resolved target 若同時回報 autofs 與非-autofs，runner 只採用唯一的非-autofs
+`(fstype, source)`；相同列可去重，不同非-autofs identity 或多個最深 target 直接停止。只有
+autofs 時保留實際 `autofs` 結果，交由後續 NFS gate 拒絕，不能把包裝層誤報為 NFS。
 Linux 可用時為每個長壽命 worker 固定分配允許的 CPU；在其他平台或 cpuset API 不可用時安全不綁定，
 並在 worker summary 記錄 fallback。worker group 按 run plan scenario 順序保持連續，以 plan 中的
 region／arrival month 與表格已有 site／flow-domain 欄位摘要 locality，不會猜欄位，也不改物理設定：

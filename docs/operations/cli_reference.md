@@ -468,6 +468,11 @@ worker 只啟動一次 Python，內部以一個既有 `run-worker` controller �
 `--numba-cache-dir`；純 NumPy backend 可省略。建議透過 repository wrapper 啟動，使 cache
 環境值在本程序第一次匯入科學套件之前設定：
 
+即時 mount parser 先選涵蓋路徑的最深 resolved target；同一 target 若同時有 autofs 包裝層
+與非-autofs 列，只忽略 autofs，並要求剩餘 `(fstype, source)` identity 唯一。相同 identity
+重複列可去重，不同非-autofs identity 或多個最深 target 會 fail closed；若只有 autofs，
+保留 `autofs` 結果讓後續 NFS gate 拒絕，不會把它誤選成 NFS。
+
 ```bash
 uv run python scripts/run_formal_parallel.py \
   "$LBT_OUTPUT_ROOT/runs/$RUN_ID" \
