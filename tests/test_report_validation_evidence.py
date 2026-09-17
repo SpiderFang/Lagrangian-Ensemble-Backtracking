@@ -826,13 +826,18 @@ def test_writer_does_not_delete_replaced_foreign_partial(
     parent.mkdir()
     destination = parent / "validation_evidence.json"
     foreign_bytes = b"foreign-partial-owner"
+    replacement_source = parent / "foreign-replacement.tmp"
+    # replacement source 先與 writer partial 分開建立並保持存在；之後以 os.replace
+    # 原子換名，確保 foreign replacement 使用不同 inode，不依賴檔案系統是否重用
+    # 已刪除 path 的 inode 配置偶然性。
+    replacement_source.write_bytes(foreign_bytes)
     original_loader = evidence_module._load_validation_evidence
 
     def replace_before_load(path: Path) -> ValidationEvidence:
         """將本 writer partial 替換成不同 inode 的 foreign bytes 後交回原 loader。"""
 
         path.unlink()
-        path.write_bytes(foreign_bytes)
+        os.replace(replacement_source, path)
         return original_loader(path)
 
     monkeypatch.setattr(evidence_module, "_load_validation_evidence", replace_before_load)

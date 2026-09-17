@@ -838,6 +838,33 @@ def _cleanup_owned_partial(
         return
 
 
+def _require_owned_partial(
+    partial_path: Path | None,
+    partial_identity: tuple[int, int] | None,
+) -> None:
+    """在 hard-link 發布前再次確認 partial 仍是本 writer 的 ordinary file。
+
+    writer descriptor 會一路保持開啟到 self-validation 完成；因此若外部在 validation
+    期間刪除 partial，原 inode 仍被本 writer 持有，不會在同一個 path 重新建立時被檔案系統
+    立即重用。這裡仍須在建立 final hard-link 前重新讀取 path 的 ``lstat``，確認它不是
+    symbolic link、directory 或 foreign replacement，且 device/inode 與首次 ``fstat`` 完全
+    相同。任何不一致都 fail closed，交由外層只清理仍符合原 identity 的 own partial。
+    """
+
+    if partial_path is None or partial_identity is None:
+        raise OSError("partial ownership is unavailable")
+    try:
+        node = os.lstat(partial_path)
+    except OSError as exc:
+        raise OSError("partial path changed before publish") from exc
+    if (
+        stat.S_ISLNK(node.st_mode)
+        or not stat.S_ISREG(node.st_mode)
+        or (node.st_dev, node.st_ino) != partial_identity
+    ):
+        raise OSError("partial ownership changed before publish")
+
+
 def write_validation_evidence(
     evidence: ValidationEvidence | None = None,
     destination: str | Path | None = None,
@@ -855,14 +882,16 @@ def write_validation_evidence(
     可直接提供 ``run_id``／``metrics``，或提供一份由 constructor 建立的 ``evidence``；
     四個 source path 必須始終由 caller 明示，writer 會重新讀取並推導所有 source hash。
     destination parent 必須已存在且是 ordinary non-symlink directory。writer 先在同父
-    目錄以 UUID 建立 exclusive hidden partial、寫入後 fsync 並用 strict reader 自驗證，
-    再以不覆寫既有 entry 的 atomic hard-link 發布；既有 regular file、directory、symlink、
-    broken symlink 或其他 partial 都不會被覆寫或清理。成功只代表 evidence engineering
-    contract 完整，不代表 synthetic evidence 已成為真實資料科學驗證。
+    目錄以 UUID 建立 exclusive hidden partial；writer descriptor 會保持開啟到 strict reader
+    self-validation 完成，並在 atomic hard-link 發布前重新核對 partial 的 ordinary file
+    與 device/inode ownership。既有 regular file、directory、symlink、broken symlink 或
+    其他 partial 都不會被覆寫或清理。成功只代表 evidence engineering contract 完整，
+    不代表 synthetic evidence 已成為真實資料科學驗證。
     """
 
     partial_path: Path | None = None
     partial_identity: tuple[int, int] | None = None
+    descriptor: int | None = None
     published = False
     try:
         if destination is None:
@@ -922,26 +951,29 @@ def write_validation_evidence(
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o600,
         )
-        try:
-            # partial 一旦由本 writer 建立，就立即保存 device/inode；即使第一個 write
-            # 便失敗，清理流程仍只能刪除這個 writer 自己建立的 ordinary file。
-            partial_status = os.fstat(descriptor)
-            if not stat.S_ISREG(partial_status.st_mode):
-                raise OSError("partial 必須是 ordinary file")
-            partial_identity = (partial_status.st_dev, partial_status.st_ino)
-            remaining = memoryview(payload)
-            while remaining:
-                written = os.write(descriptor, remaining)
-                if written <= 0:
-                    raise OSError("partial write made no progress")
-                remaining = remaining[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        # partial 一旦由本 writer 建立，就立即保存 device/inode；即使第一個 write
+        # 便失敗，清理流程仍只能刪除這個 writer 自己建立的 ordinary file。descriptor
+        # 刻意不在寫入後關閉，直到 self-validation 完成，避免外部 unlink/recreate 同名
+        # partial 時立即重用原 inode，造成 foreign replacement 被誤判為 own partial。
+        partial_status = os.fstat(descriptor)
+        if not stat.S_ISREG(partial_status.st_mode):
+            raise OSError("partial 必須是 ordinary file")
+        partial_identity = (partial_status.st_dev, partial_status.st_ino)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("partial write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
         inspected = _load_validation_evidence(partial_path)
         if inspected.to_dict() != prepared.to_dict():
             raise ValueError("partial self validation snapshot mismatch")
 
+        # self-validation 只證明當時讀到的 bytes；發布前仍須證明 path 沒被換成 foreign
+        # ordinary file 或 symbolic link。原 descriptor 尚未關閉，故 identity 不會因同名
+        # replacement 立即重用；核對失敗時 hard-link 不會建立，也不會清理 foreign path。
+        _require_owned_partial(partial_path, partial_identity)
         # hard-link 建立 final directory entry 是 atomic 且不覆寫既有 entry；與 os.replace
         # 不同，即使另一個 process 在最後 lstat 後搶先建立 final，也只會失敗而不破壞它。
         os.link(partial_path, destination_path, follow_symlinks=False)
@@ -964,6 +996,9 @@ def write_validation_evidence(
         if published:
             raise RuntimeError(_DURABILITY_ERROR) from None
         raise ValueError(_WRITE_ERROR) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _validation_summary(evidence: ValidationEvidence) -> dict[str, object]:
