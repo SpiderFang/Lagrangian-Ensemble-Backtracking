@@ -185,6 +185,18 @@ GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT = (
 )
 GUISHAN_SOFT_PRIORITY_POLICY_ID = "guishan_soft_priority_corridor_core_fallback_v1"
 
+# 現行正式母體的受體選樣契約。水平與垂向分開命名，讓 manifest 能辨識「從哪一個
+# 候選 face 池抽樣」與「在單一 face 的完整水柱內抽哪四個 normalized fraction」；兩者
+# 都由同一個 master seed 經 SHA-256 派生，但每個站點／face 使用獨立 stream。這些
+# token 是資料契約而非實作細節，任何固定座標、maximin 或 10/40/70/near-bed target
+# 都不能冒充目前正式母體的 random policy。
+HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID = (
+    "seeded_uniform_random_without_replacement_v1"
+)
+VERTICAL_RECEPTOR_SELECTION_POLICY_ID = "seeded_uniform_random_open_interval_v1"
+RECEPTOR_SELECTION_SEED_POLICY_ID = "sha256_v1_pcg64dxsm"
+RANDOM_VERTICAL_RECEPTOR_ID_PREFIX = "random_vertical_draw"
+
 # 舊正式輸入採七日缺口安全基線；此值只供相容性查詢，不把所有舊 runtime 或
 # 一日工程試跑改成七日。新欄位未明示時，既有建置／執行驗證仍各自維持原有規則。
 DEFAULT_BACKTRACK_SUPPORT_DAYS = 7
@@ -424,13 +436,15 @@ class StudySiteConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_fixed_horizontal_receptors(self) -> StudySiteConfig:
-        """驗證固定水平受體的座標、順序摘要與公尺制匹配公差。
+        """驗證歷史固定水平受體的座標、順序摘要與公尺制匹配公差。
 
         固定受體座標來自已核定的外部工程 manifest，並不代表這些點一定能在另一個
         OCM mesh 上使用。因此 schema 只先檢查座標數量、WGS84 範圍、來源 SHA-256
         格式與公尺制匹配公差；實際是否為同一 source face、是否 persistent-wet 以及
         是否通過所有 arrival 的 OCM/NWW 支援，仍由 input derivation 在讀取 accepted
-        products 後逐點驗證。未提供固定座標的舊設定維持原本 deterministic maximin。
+        products 後逐點驗證。這些欄位目前只供明確標示的歷史／唯讀 pilot；current
+        formal 會在 ``ProjectConfig.validate_scientific_contract`` 另外拒絕它們。未
+        提供固定座標的舊設定維持原本 deterministic maximin 相容行為。
         """
 
         coordinates = self.horizontal_receptor_coordinates
@@ -715,7 +729,13 @@ class ArrivalTimeSelectionConfig(StrictModel):
 
 
 class ScenarioConfig(StrictModel):
-    """五站完整交叉、member/seed 與可選沉底時間契約。"""
+    """五站完整交叉、member/seed、沉底時間與受體 random policy 契約。
+
+    受體 policy 欄位在舊 YAML 中仍可為 ``None``，以保持歷史 loader 的相容性；現行
+    formal design 則必須明示水平、垂向與 seed policy，避免 extra 欄位拼字錯誤後悄悄
+    回到固定座標或固定水層。``master_seed`` 在設計樣板可先留空，正式 input-build
+    之前的 release gate 會再要求實際整數 seed。
+    """
 
     expected_receptor_count_per_site: int
     expected_receptor_count: int
@@ -731,6 +751,9 @@ class ScenarioConfig(StrictModel):
     members_per_scenario: int | None = None
     master_seed: int | None = None
     seed_policy: str | None = None
+    horizontal_receptor_selection_policy: str | None = None
+    vertical_receptor_selection_policy: str | None = None
+    receptor_selection_seed_policy: str | None = None
     bed_residence_time: BedResidenceTimeConfig | None = None
 
 
@@ -940,20 +963,54 @@ class ProjectConfig(StrictModel):
                 )
             ):
                 raise ValueError("現行南灣正式設定不得保留後灣紅框 2+3 候選或其 provenance")
-            hsinchu = sites_by_id["hsinchu"]
-            if (
-                tuple(hsinchu.horizontal_receptor_coordinates or ())
-                != HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT
+            # 目前正式母體已裁決五站都以 seeded random 建立水平面；固定座標與其
+            # 來源 hash/tolerance 只可留在歷史 24 小時試跑 loader。欄位保留在 schema
+            # 是為了能唯讀讀取舊文件，但一旦進入 current design 就 fail closed，避免
+            # B 區五點被誤當成正式母體或其他站點複製使用。
+            fixed_site_fields = (
+                "horizontal_receptor_coordinates",
+                "horizontal_receptor_source_manifest_sha256",
+                "horizontal_receptor_selection_policy",
+                "horizontal_receptor_coordinate_tolerance_m",
+            )
+            for site in self.study_sites:
+                if any(getattr(site, field_name) is not None for field_name in fixed_site_fields):
+                    raise ValueError(
+                        f"current formal 的 {site.study_site_id} 不得設定固定水平受體；"
+                        "固定五點僅屬歷史 24 小時 pilot"
+                    )
+            expected_receptor_policies = {
+                "horizontal_receptor_selection_policy": (
+                    HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID
+                ),
+                "vertical_receptor_selection_policy": VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
+                "receptor_selection_seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+            }
+            for field_name, expected_policy in expected_receptor_policies.items():
+                actual_policy = getattr(self.scenarios, field_name)
+                if actual_policy != expected_policy:
+                    raise ValueError(
+                        f"scenarios.{field_name} 必須是 current formal random policy "
+                        f"{expected_policy!r}"
+                    )
+            # ``physics.vertical_targets`` 是舊版 10/40/70/near-bed 固定水層設定；即使
+            # 新欄位已明示，也不能讓 extra=allow 把兩套垂向語意同時帶入正式建置。
+            if self.scenarios.model_extra and "vertical_targets" in self.scenarios.model_extra:
+                raise ValueError(
+                    "current formal 不得保留 scenarios.vertical_targets 固定垂向 target；"
+                    "請使用 seeded random open-interval policy"
+                )
+            legacy_selector = (
+                self.scenarios.model_extra.get("horizontal_selector")
+                if self.scenarios.model_extra
+                else None
+            )
+            if isinstance(legacy_selector, str) and (
+                "maximin" in legacy_selector.lower() or "fixed" in legacy_selector.lower()
             ):
-                raise ValueError("B 區必須沿用已核定的五個水平受體順序與座標")
-            if hsinchu.horizontal_receptor_source_manifest_sha256 != (
-                HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256
-            ):
-                raise ValueError("B 區固定水平受體來源 manifest SHA-256 不符")
-            if hsinchu.horizontal_receptor_selection_policy != (
-                HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID
-            ):
-                raise ValueError("B 區固定水平受體 policy 不符")
+                raise ValueError(
+                    "current formal 不得使用 deterministic maximin/fixed horizontal selector"
+                )
             guishan = sites_by_id["guishan"]
             actual_priority_polygon = tuple(
                 tuple(float(value) for value in coordinate)
@@ -1473,6 +1530,17 @@ class ProjectConfig(StrictModel):
                 and "availability_conditioning_policy" not in bed_model.model_fields_set
             ):
                 del bed_payload["availability_conditioning_policy"]
+        if isinstance(scenarios_payload, dict) and self.design_version != CURRENT_DESIGN_VERSION:
+            # random receptor policy 是本期 current formal 的新契約；舊 v2／v3 設定即使
+            # 由新版範例複製後殘留這些 extra key，也不能讓歷史 config hash 改變，或讓
+            # legacy loader 誤以為已完成新的 random receptor release。current 版本則
+            # 保留並由上方 scientific contract 強制 exact policy。
+            for field_name in (
+                "horizontal_receptor_selection_policy",
+                "vertical_receptor_selection_policy",
+                "receptor_selection_seed_policy",
+            ):
+                scenarios_payload.pop(field_name, None)
         selection_payload = payload.get("arrival_time_selection")
         if selection_payload is None and "arrival_time_selection" not in self.model_fields_set:
             # 舊 YAML 根本沒有 typed selection block 時，Pydantic 的 None default

@@ -245,16 +245,20 @@ OCM 與 NWW3 缺值政策分開：
 
 每個 receptor 保存 `receptor_id`、WGS84 geometry、位置誤差、`vertical_reference`、目標水柱比例、模板代表 `z_m_positive_up`、垂向誤差、`study_site_id`、`analysis_region_id`、source face、版本與生成狀態。五站點各有 20 個、全案共 100 個；貢寮與龜山島各自完整保留 20 個，不共享 ID 或在 A 區內分配。此處的 `z_m_positive_up` 只是水平受體與 `vertical_id` 模板的候選代表值，不是所有 arrival UTC 的正式實際深度。
 
-每站點 20 個受體由 5 個水平位置 × 4 個垂向層位產生。貢寮、龜山島與新竹的水平候選
-各限於明示 anchor 半徑 12.5 km 的 receptor core，再與既有 local／static-ocean 候選區
-求交；南灣與連江則以各自 anchor 的 12.5 km core 限制候選。所有半徑均在站點
-所屬 flow domain 的 AEQD 公尺投影計算，不以經緯度差近似距離。第一點由 anchor 或
-flow-domain center snap 至 persistent-wet mesh，其餘使用固定 tie-break 的 metric maximin。
-新竹五個水平位置另以核定 manifest 座標逐點映射同一原生 OCM mesh，保留宣告順序與來源
-SHA-256，不得重新 maximin；龜山島的核定 priority polygon 只在 12.5 km core 內優先，
-persistent-wet 候選不足五點時回到同一 core，兩條路徑均不得略過 forcing 支援 gate。
-垂向模板目標為海面下 `0.10H`、`0.40H`、`0.70H` 與最低有效 OCM layer 中心；每個
-arrival 的正式實際 z 必須改由 dynamic pair manifest 的 OCM `eta`／`zcor`／`wetdry` 計算與驗證。
+每站點 20 個受體由 5 個水平位置 × 4 個垂向 random draw 產生。貢寮、龜山島與新竹的
+水平候選各限於明示 anchor 半徑 12.5 km 的 receptor core，再與既有 local／static-ocean
+候選區求交；南灣與連江則以各自 anchor 的 12.5 km core 限制候選。所有半徑均在站點
+所屬 flow domain 的 AEQD 公尺投影計算，不以經緯度差近似距離。候選池先通過
+static-ocean、50-arrival persistent-wet、core／local 與 forcing 支援閘門，再由
+`seeded_uniform_random_without_replacement_v1` 以站點獨立 stream 無放回抽五個 face；
+龜山島的 priority polygon 只作 soft priority，優先池不足時從同一 core 的剩餘有效池
+random 補足，不擴張任何 domain 或跳過 forcing gate。新竹 24 小時核對圖中的五點只屬
+歷史／位置核對 artifact，不得固定帶入 current formal。
+每一個選定 face 再由獨立 stream 以
+`seeded_uniform_random_open_interval_v1` 從完整有效水柱抽四個互異的
+`random_vertical_draw_0..3` normalized fractions，嚴格位於 `(0,1)`；draw rank 不是
+物理層位。每個 arrival 的正式實際 z 必須改由 dynamic pair manifest 的 OCM
+`eta`／`zcor`／`wetdry` 計算與驗證，所有節點都要有有限雙側 bracket，不得最近層替代或外插。
 
 ### 7.3 Arrival-time manifest
 
@@ -314,6 +318,13 @@ receptor v1 root 固定如下：
 receptor 的經緯度只作 WGS84 交換；`lon/lat` 必須在 bounds 內，`z_m_positive_up` 為
 公尺且可有限，ID 全案唯一，站點與 region 必須和 config 對應。formal 為五站各 20、
 全案 100；pilot 可是 config 站點的非空子集，但每個選中站點必須有 record。
+
+現行 formal 的 20 筆受體並不沿用上述歷史示例中的固定 `vertical_id`：每站五個水平
+face 由 `seeded_uniform_random_without_replacement_v1` 抽樣，每個 face 四筆垂向
+`random_vertical_draw_0..3` 由獨立 stream 在完整水柱 `(0,1)` 抽樣。manifest metadata
+必須保存 draw order、normalized fraction、seed policy、derived seed 與 digest；random
+rank 只代表抽樣 identity，不代表物理層位。新竹 24 小時試跑固定五點只屬歷史位置核對，
+current formal 不接受其座標／來源 hash。
 
 arrival-time v1 root 與 receptor 相似，但固定使用 `manifest_kind: "arrival_time_manifest"`、
 `time_standard: "UTC"`、`selection_method_id`、`provenance` 與 `records`；每筆 record

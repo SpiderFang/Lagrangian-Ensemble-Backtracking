@@ -35,9 +35,9 @@
 
 | ID | 原始要求 | 實作解讀 | 驗收證據 |
 |---|---|---|---|
-| REQ-001 | 完全沉沒於三維水體，含懸浮與底床沉積 | 粒子狀態使用 `z_m_positive_up`；依 2026-08-27 最新裁決，正式基線只含 `sinking` 與 `near_bed`，不含 windage、中性或上浮物性速度 | 垂向取樣、沉降、海面與海床解析測試 |
+| REQ-001 | 完全沉沒於三維水體，含懸浮與底床沉積 | 粒子狀態使用 `z_m_positive_up`；正式基線只含 `sinking` 與完全沉沒的沉降代理，current formal 垂向受體改採每 face 四個 seeded random `(0,1)` draw，不將 random rank 解讀為固定水層 | 垂向取樣、沉降、海面與海床解析測試 |
 | REQ-002 | 原提案列 10 種沉降／上升速度；研究主持人最新要求取消上升並對應海廢材質與形狀 | 由版本化 material manifest 提供 10 個嚴格負值 `settling_velocity_mps`，一對一連結 iOcean 十個項目與代表材質／形狀代理；速度是未校準敏感度格點 | schema 驗證、`w_b < 0` 約束、十個官方分類唯一覆蓋、材質／形狀欄位完整性與沉降解析解 |
-| REQ-003 | 每一海域設定 20 個到達地點，可在任意懸浮深度 | 五個獨立站點各 20 個、全案 100 個 receptors；每站採 5 個 metric maximin 水平位置 × 4 個有效垂向層位，並綁定 `study_site_id` | receptor manifest、五站點幾何圖、每站 20／全案 100 個 ID coverage 表 |
+| REQ-003 | 每一海域設定 20 個到達地點，可在任意懸浮深度 | 五個獨立站點各 20 個、全案 100 個 receptors；current formal 每站採 5 個 seeded random 水平 face × 每 face 4 個有效垂向 random draw，並綁定 `study_site_id` | receptor manifest、五站點幾何圖、每站 20／全案 100 個 ID coverage 表 |
 | REQ-004 | 每一海域 50 個到達時間，涵蓋四季與大／小潮 | 五站點各有 50 個條件；固定採 48 個年份×季節×大／小潮×潮內相位，加 2 個局地高波／強流事件。確切 UTC 由資料決定 | 每站 50 時次 coverage matrix、forcing availability 與可重現選取紀錄 |
 | REQ-005 | 每一海域敘述寫高達 1000 組，但矩陣明列 10×20×50 | 依使用者裁決，每站點採完整交叉 10,000 個基礎情境；五站點合計 50,000，1,000 視為計畫書誤植。每情境 stochastic members `M` 另由收斂測試決定 | 決策 D004、每站 10,000／全案 50,000 列的 coverage 表、member-convergence 曲線與 seed 表 |
 | REQ-006 | 離開關注區域即停止 | 各站離開自身 local domain 時記錄 primary first-exit；貢寮／龜山島本期依 `formal_domain_policy=v3_local20km_20260909_v1` 使用 20 km local domain，事件後繼續至共用 A 區 outer boundary，B-D 因 local 與 flow domain 重合而於同一 crossing 停止。貢寮／龜山島穿越對方 local domain 僅記錄非終止的 cross-site diagnostic event。A 區不擴張 forcing domain，軌跡每個 RK4 stage 遇 OCM／NWW3 無效支援即停止並保留原始狀態。另設海岸、海床、海面 regime、資料起點、最大回溯期、缺口及數值失敗事件 | own-local／foreign-local／outer event table、逐 stage forcing fail-closed 與無隨機數消耗測試、重合邊界去重與步內 crossing 測試、跨站事件不改變粒子狀態測試、停止原因覆蓋 |
@@ -48,7 +48,7 @@
 | REQ-011 | Smagorinsky 水平渦動擴散 | 在公尺投影中由局地速度梯度計算，明定 `Cs`、`Δ`、上下限與梯度修正；與常數 Kh 對照 | 解析剪切場、旋轉不變性、上下限及敏感度 |
 | REQ-012 | 邊界穿越點 KDE | 主產品同時保存原始 exit points、沿邊界弧長的 1D density、投影平面 2D KDE 與 50/75/90% HDR；至少三種 bandwidth | 質量正規化、boundary segment、bandwidth 與 bootstrap CI |
 | REQ-013 | 視覺化主要潛在來源路徑 | 依相關學術研究採「代表軌跡 + 條件式足跡／密度 + 來源—受體矩陣 + 旅行時間分布 + 不確定性／敏感度」的組合；三維結果使用平面圖搭配深度—時間剖面，避免只用易遮蔽的透視 3D 圖 | `docs/results/07_results_visualization_plan.md`、figure registry、caption sidecar、固定比較尺度與圖表驗收清單 |
-| REQ-014 | 依新增簡報照片與長官口頭意見，將沉底漁業用具列為報告優先層 | 保持 `design_baseline_v2_non_rising_oca_proxy` 既有 10 類、數值、情境 ID 與每站 `10×20×50` 不變；正文主要切片優先呈現 `material_id=oca_fishinggear_open_mesh_bundle` × `vertical_id=near_bed`，其他材質／水層完整保留。照片與口頭關注只屬定性、待正式確認，不能推導沉降速度、來源先驗、發生頻率或 repeated-contact 機制 | 來源表之簡報照片、§2.1 邊界說明、`docs/results/07_results_visualization_plan.md`、`docs/foundation/08_design_baseline_and_derived_gates.md`、`report_material_statistics.py` 的 member-level count/fraction 與去重測試 |
+| REQ-014 | 依新增簡報照片與長官口頭意見，將沉底漁業用具列為報告優先層 | 保持既有 10 類、數值、情境 ID 與每站 `10×20×50` 不變；正文可優先呈現 `material_id=oca_fishinggear_open_mesh_bundle`，但 current formal 的垂向切片必須依 `random_vertical_draw_0..3` identity 分層，不能把 random rank 稱為 `near_bed` 或其他物理層。照片與口頭關注只屬定性、待正式確認，不能推導沉降速度、來源先驗、發生頻率或 repeated-contact 機制 | 來源表之簡報照片、§2.1 邊界說明、`docs/results/07_results_visualization_plan.md`、`docs/foundation/08_design_baseline_and_derived_gates.md`、`report_material_statistics.py` 的 member-level count/fraction 與去重測試 |
 
 ### 2.1 沉底漁業用具的新增定性證據與實作邊界
 
@@ -57,7 +57,7 @@
 
 | 證據 | 目前可確認內容 | 不可推導的內容 | 實作裁決 |
 |---|---|---|---|
-| 使用者提供、未納入版本控制的簡報照片（來源表所列） | 簡報文字指出「海底廢棄物中以漁業用具類廢棄物為最大宗」，並以掌握覆網與海廢分布為調查目的 | 件數／重量／面積比例、材質分布、沉降速度、來源先驗與不確定性 | 將 `oca_fishinggear_open_mesh_bundle` × `near_bed` 列為正文主要分析層；保留全十類與四個垂向層位 |
+| 使用者提供、未納入版本控制的簡報照片（來源表所列） | 簡報文字指出「海底廢棄物中以漁業用具類廢棄物為最大宗」，並以掌握覆網與海廢分布為調查目的 | 件數／重量／面積比例、材質分布、沉降速度、來源先驗與不確定性 | 將 `oca_fishinggear_open_mesh_bundle` 列為正文主要分析材質；current formal 保留四個 `random_vertical_draw_0..3`，歷史 `near_bed` 只限 legacy pilot |
 | 主管口頭意見（待正式文件確認） | 沉底漁業用具廢棄物為特別關注對象 | 「特別關注」不等於發生率、速度或因果來源權重 | 提高成果呈現優先序，不修改 v2 速度、情境 ID 或 `10×20×50` 矩陣 |
 
 因此，材質統計只對有效 member 計算首次海床接觸與沉積的 raw count／fraction；資料缺口與數值

@@ -225,10 +225,18 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
     },
     "receptors": {
         "role": "每站 20 個三維受體的可重現選取",
-        "inputs": "濕潤網格面、local domain、垂向層位與品質指標",
-        "outputs": "HorizontalReceptor、VerticalTarget",
-        "entrypoints": ["select_horizontal_receptors", "build_vertical_targets"],
-        "read_first": "先看水平 5 點與垂向 4 層如何形成每站 20 個 receptors。",
+        "inputs": "通過 persistent-wet／forcing gate 的候選 face、local domain、master seed 與水柱支援資料",
+        "outputs": "HorizontalReceptor、RandomVerticalDraw、legacy VerticalTarget",
+        "entrypoints": [
+            "select_horizontal_receptors_random_from_pool",
+            "sample_random_vertical_draws",
+            "build_vertical_targets",
+        ],
+        "read_first": (
+            "先看 current formal 如何以站點獨立 seeded random 無放回抽 5 個水平 face，"
+            "再對每個 face 從完整有效水柱的 (0,1) 開放區間抽 4 個垂向 draw；"
+            "build_vertical_targets 僅供歷史／唯讀相容。"
+        ),
     },
     "arrival_times": {
         "role": "每站 50 個到達時刻的分層選取",

@@ -14,7 +14,9 @@
 
 `study_site_id` 是單一研究站點；`arrival_id` 對應來源 `arrival_time_id`，不是 UTC 字串或
 列索引；`material_id` 是來源材質識別碼。三者都由操作端明示。選中組合必須對該站每個
-來源受體恰好有一筆情境，不缺、不增、不重複。現行 5 水平×4 垂向形成 20 個情境，
+來源受體恰好有一筆情境，不缺、不增、不重複。current formal 的 5 個 seeded random
+水平 face × 4 個 `random_vertical_draw_0..3` 形成 20 個情境；歷史 pilot 可在明示
+legacy manifest 中使用固定受體，
 **粒子數為情境數×M**；來源集合檢查不以寫死的 20 代替受體識別碼比對。
 
 四區第一次共同視窗的輸入入口由版本化 registry 固定管理：貢寮／龜山島必須成對明示，
@@ -132,8 +134,10 @@ legacy 因環境欄位不可用而拒絕此預覽，不改一般讀取器的舊�
 
 輸出固定為三張 PNG、`particles.csv`、`observations.csv`、`summary.json`、繁中
 `README.md` 及 `manifest.json`。水平圖以來源 AEQD 等距方位投影公尺座標呈現總覽與
-每個水平受體局部面板；不推測海岸、不放大位移。深度圖完整保留四垂向，near_bed
-優先，海面 eta、海床 bed、粒子 z 取既存實值、公尺正向上；缺值留空。
+每個水平受體局部面板；不推測海岸、不放大位移。current formal 深度圖依
+`random_vertical_draw_0..3` 與各自的 normalized fraction 完整保留，random rank
+不代表物理水層；歷史 pilot 若在輸入中明示 `near_bed` 才可依舊契約優先呈現。
+海面 eta、海床 bed、粒子 z 取既存實值、公尺正向上；缺值留空。
 觀測列保留 UTC 奈秒及回溯秒數，不重新取樣。全部停止類別（含零計數）、失敗
 `numerical_failure`／`data_gap` 及全部 M 成員均保留；終止位置樣本 n、情境 n 與
 粒子 N 分開列出，有限位置可包含失敗，不等於科學有效樣本。

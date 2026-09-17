@@ -53,7 +53,7 @@ byte size。`artifact_index.json` 綁定十個 component，`artifact_bindings.js
 | `local_geometry` | `local.json` | 五個 study-site local domain |
 | `open_boundary` | `open.json` | flow/local boundary segment 與停止範圍 |
 | `material` | `material.json` | 十類嚴格負值沉降材質／形狀代理 |
-| `receptor` | `receptor.json` | 五站各 5 個水平位置 × 4 個垂向模板，共 100 筆 |
+| `receptor` | `receptor.json` | current formal 五站各 5 個 seeded random 水平 face × 4 個 random vertical draw，共 100 筆；歷史 pilot 可保留固定模板 |
 | `arrival` | `arrival.json` | 五站各 48 個 season×tide stratum 加 2 個事件，共 250 筆 |
 | `initial_condition` | `initial_conditions.json` | 每個同站 receptor×arrival pair 一筆，共 5,000 筆 |
 
@@ -298,13 +298,21 @@ accepted forcing 已通過或已執行 SERVER/input-build。若 2024-07-05 前�
 
 每站水平受體先從 OCM native mesh 建立既有 local／static-ocean 候選區；若站點同時明示
 `anchor_lonlat` 與 `receptor_core_radius_m`，再以該 flow domain 的 AEQD 公尺投影建立核心
-圓並與候選區求交。接著才以 persistent-wet、geometry、anchor-first maximin 選出 5 個
-face，要求所有候選 arrival 均為 wet，並套用 config 的 flow-domain boundary margin；之後才逐一檢查候選 face 的全部 arrival 與四個垂向類別。垂向支撐必須
+圓並與候選區求交。current formal 接著以 persistent-wet、geometry、boundary margin
+建立 immutable face pool，再由 `seeded_uniform_random_without_replacement_v1` 按站點
+獨立 seed 無放回抽出 5 個 face；要求所有候選 arrival 均為 wet，並套用 config 的
+flow-domain boundary margin；之後才逐一檢查候選 face 的全部 arrival 與四個 random 垂向 draw。垂向支撐必須
 由同一 face 的每個 node 各自提供有限 `zcor <= target` 與 `zcor >= target`，不能先對
 陡峭海床的淺／深 node 取中位數後掩蓋某一 node 缺層。任何候選 face 失敗都會在 wetdry
-候選 copy 中 deterministic blacklist，重新執行同一 maximin；不搜尋最近有效 face、不
-放寬 margin，也不以外插補足候選。候選不足時 fail closed。受體 manifest 的
+候選 copy 中 blacklist，依相同版本化 random stream 從剩餘 pool 重抽；不搜尋最近有效
+face、不放寬 margin，也不以外插補足候選。候選不足時 fail closed。受體 manifest 的
 `z_m_positive_up` 仍是第一個 arrival 的模板值，不能冒充全部 arrival 的實際水深。
+
+每個 horizontal face 另以 `seeded_uniform_random_open_interval_v1` 從完整有效水柱抽四個
+互異的 `f∈(0,1)`；`random_vertical_draw_0..3` 只表示 draw order，不是固定物理層位。
+每個 arrival 都必須有有限雙側 `zcor` bracket，actual z 依該時刻 `eta`／bed／zcor
+重算；沒有 bracket 時淘汰 face 或 fail closed，不做最近層替代或外插。新竹 24 小時
+五個固定點只屬歷史位置核對 artifact，不得放入 current formal config。
 
 設定檔的 `scenarios.other_site_receptor_candidate_domain` 以版本化政策
 `site_explicit_core_intersect_local_else_local_or_flow_v1` 保存上述語意：明示核心的站點
@@ -351,14 +359,14 @@ fallback。
 - 由 OCM `zcor` 得到的實際 `z_m_positive_up`、上下 bracket 與 interpolation alpha；
 - receptor／arrival／source flow-domain cross-reference 與 source fingerprint。
 
-垂向 target／bracket 由 receptor template 與 dynamic pair 共用同一個 helper：先以既有
-face median 定義代表性 bed／eta，再移除代表性 `bed <= zcor <= eta` 之外的 layer，沿用
-10%、40%、70% 與 near-bed target。代表性 bracket 必須有嚴格正寬度；每個實際 pair
-仍以當時 UTC 的三／四個 face node 逐一證明雙側有限支撐。禁止海床以下、海面以上、
-單側外插、最近 layer 夾取、remainder renormalization 或把全 NaN 轉成零；若 template
-gate 與 pair 實際 zcor 不一致，dynamic 建置直接失敗。這份 pair manifest 是 material
-共用的初始條件；十種 material 只在 scenario layer 產生
-`material × receptor × arrival` 的 50,000 個情境。
+current formal 的垂向 target／bracket 由 receptor template 與 dynamic pair 共用同一個
+helper：先以 face median 定義代表性 bed／eta，再將每個 face 的四個 seeded random
+normalized fractions 轉成 target；歷史 loader 才沿用 10%、40%、70% 與 near-bed target。
+代表性 bracket 必須有嚴格正寬度；每個實際 pair 仍以當時 UTC 的三／四個 face node 逐一
+證明雙側有限支撐。禁止海床以下、海面以上、單側外插、最近 layer 夾取、remainder
+renormalization 或把全 NaN 轉成零；若 template gate 與 pair 實際 zcor 不一致，dynamic
+建置直接失敗。這份 pair manifest 是 material 共用的初始條件；十種 material 只在
+scenario layer 產生 `material × receptor × arrival` 的 50,000 個情境。
 
 ## 6. A 區公開標籤與 provenance
 
@@ -483,9 +491,12 @@ arrivals、5,000 unique pair records 與每站 1,000 筆；explicit per-site lim
 
 `lbt run-create --run-kind pilot --pilot-scenarios-per-stratum 1` 只在完整且已驗證的
 scenario/receptor manifests 上建立工程 sanity／benchmark 子集。selector 的 exact stratum
-是 `(study_site_id, receptor.vertical_id)`；目前五站、四個垂向層位的完整資料預期選出
-`5×4=20` 筆。這個 20 筆子集不代表正式結果，也不改變正式每站 10,000、全案 50,000
-情境設計；formal run 禁止 selector 並維持完整 coverage。
+仍是 `(study_site_id, receptor.vertical_id)`；current formal 的四個 identity 固定為
+`random_vertical_draw_0..3`，其意義是每一個水平 face 的四次 random draw 順序，而不是
+固定物理層位。目前五站、四個垂向抽樣 identity 的完整資料預期選出 `5×4=20` 筆。這個
+20 筆子集不代表正式結果，也不改變正式每站 10,000、全案 50,000 情境設計；formal run
+禁止 selector 並維持完整 coverage。歷史 pilot 若使用 `near_bed` 或其他固定層位名稱，
+必須在其 legacy／pilot manifest 邊界內解讀，不得回寫 current formal。
 
 run plan schema `2.1.0` 的 `scenario_selection` 保存版本化 ranking policy、完整 source
 scenario count/hash、selected count/hash 與按 site／vertical 排序的 strata。`run-shard` 使用

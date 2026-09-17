@@ -224,18 +224,9 @@ study_sites:
     receptor_core_radius_m: 12500
     anchor_policy: flow_domain_center_snap_to_persistent_wet_mesh
     local_domain_policy: same_as_flow_domain
-    # 這五個水平位置是已核定的 24 小時工程試跑受體。正式建置只允許把它們逐點
-    # 映射到同一 OCM mesh 的 persistent-wet face，並仍執行 50 個 arrival 與垂向
-    # 支援 gate；不可再用 maximin 另抽一組點。
-    horizontal_receptor_coordinates:
-      - [120.32880147298177, 24.730445861816406]
-      - [120.39448547363281, 24.85012690226237]
-      - [120.45531717936198, 24.75184504191081]
-      - [120.47039794921875, 24.640532811482746]
-      - [120.57318623860677, 24.753894170125324]
-    horizontal_receptor_source_manifest_sha256: f625c3cbaf339220994e14926c5a2bd65974ec40706e0d81c0fa3f7404128055
-    horizontal_receptor_selection_policy: hsinchu_24h_pilot_fixed_horizontal_manifest_coordinates_v1
-    horizontal_receptor_coordinate_tolerance_m: 1.0
+    # 正式母體不固定 24 小時試跑的五點；這五點只留在歷史 pilot 文件作位置核對。
+    # input-build 會先建立通過 static-ocean、50 arrival persistent-wet、core/local
+    # 與 forcing 支援 gate 的 face pool，再以站點獨立 seeded random stream 無放回抽五面。
   - study_site_id: nanwan
     study_site_name_zh: 南灣
     analysis_region_id: C
@@ -523,24 +514,23 @@ scenarios:
     # template 的 null 代表尚未建立 release，不代表 runtime 可任意超界或資料已通過。
     runtime_horizon_support_days: null
   receptor_manifest: null
-  # 五個站點各以 5 個 deterministic maximin 水平位置 × 4 個垂向層位形成 20 個
-  # 三維 receptors；貢寮／龜山島各有完整 20 個，不在 A 區內分配或共用。
+  # 五個站點各以 5 個 seeded random 水平 face × 每面 4 個 seeded random 垂向 draw
+  # 形成 20 個三維 receptors；貢寮／龜山島各有完整 20 個，不在 A 區內分配或共用。
   expected_receptor_count_per_site: 20
   expected_receptor_count: 100
   horizontal_receptor_count_per_site: 5
   vertical_receptor_count_per_horizontal_location: 4
-  horizontal_selector: anchor_first_then_deterministic_metric_maximin_on_persistent_wet_mesh
+  horizontal_receptor_selection_policy: seeded_uniform_random_without_replacement_v1
+  vertical_receptor_selection_policy: seeded_uniform_random_open_interval_v1
+  receptor_selection_seed_policy: sha256_v1_pcg64dxsm
   northeast_receptor_candidate_domain: site_receptor_core_12500m
   # 明示 receptor core 的站點使用 core∩local/static-ocean；未明示 core 的站點沿用
   # 原本 local（若未另建 local，則為 flow）候選區。這個 policy 只限制受體候選，
   # 不改寫 local domain 或正式 5 站／20 receptors 契約。
   other_site_receptor_candidate_domain: site_explicit_core_intersect_local_else_local_or_flow_v1
-  vertical_targets:
-    - {vertical_id: upper_water_column, fraction_below_surface: 0.10}
-    - {vertical_id: mid_upper_water_column, fraction_below_surface: 0.40}
-    - {vertical_id: mid_lower_water_column, fraction_below_surface: 0.70}
-    - {vertical_id: near_bed, policy: lowest_valid_ocm_layer_center}
-  receptor_design_decision_status: decided_coordinates_pending_server_mesh
+  # 垂向 fraction 僅是完整有效水柱內的 random draw rank，不代表固定物理層位；實際
+  # z 需在每個 arrival 以 eta、bed 與有限雙側 zcor bracket 重新計算。
+  receptor_design_decision_status: decided_seeded_random_pending_server_mesh
   arrival_time_manifest: null
   # 每個 receptor×arrival 的正式 actual z 必須由 OCM eta/zcor/wetdry 產出；此相對路徑
   # 是下游 loader 的 placeholder，不代表本 example 已有 generator、OCM 讀取或 SERVER 產物。

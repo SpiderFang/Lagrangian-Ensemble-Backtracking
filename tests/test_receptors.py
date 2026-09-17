@@ -1,4 +1,4 @@
-"""persistent-wet maximin 與四垂向 receptor 測試。"""
+"""persistent-wet selector、seeded random receptor 與歷史 helper 測試。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,14 @@ from shapely.geometry import box
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.receptors import (
     build_vertical_targets,
+    derive_receptor_selection_seed,
     prepare_horizontal_receptor_candidates,
+    sample_random_vertical_draws,
     select_horizontal_receptors,
     select_horizontal_receptors_from_coordinates,
     select_horizontal_receptors_from_pool,
+    select_horizontal_receptors_random_from_pool,
+    validate_random_vertical_fractions,
 )
 
 
@@ -156,6 +160,130 @@ def test_pool_selection_fails_closed_when_exclusion_leaves_fewer_than_five() -> 
     )
     with pytest.raises(ValueError, match="候選不足"):
         select_horizontal_receptors_from_pool(pool, count=5, excluded_face_indices=(0,))
+
+
+def test_seeded_random_horizontal_selection_is_reproducible_and_without_replacement() -> None:
+    """正式 random selector 同設定 byte-stable，且五面不重複、不依賴 anchor maximin。"""
+
+    mesh = _five_face_mesh(face_count=10)
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="random-site",
+        mesh=mesh,
+        candidate_polygon_metric=box(-10.0, -10.0, 300.0, 10.0),
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=np.zeros((50, 10)),
+    )
+    first = select_horizontal_receptors_random_from_pool(
+        pool,
+        master_seed=20260917,
+        design_version="formal-random-test-v1",
+    )
+    second = select_horizontal_receptors_random_from_pool(
+        pool,
+        master_seed=20260917,
+        design_version="formal-random-test-v1",
+    )
+    assert first == second
+    assert len({item.source_face_local_index for item in first}) == 5
+    assert all(item.anchor_snap_distance_m is None for item in first)
+
+
+def test_seeded_random_horizontal_seed_and_pool_binding_change_with_inputs() -> None:
+    """不同 master seed／pool 會改變 seed 或 binding，不能只保存固定選點結果。"""
+
+    mesh = _five_face_mesh(face_count=10)
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="random-site",
+        mesh=mesh,
+        candidate_polygon_metric=box(-10.0, -10.0, 300.0, 10.0),
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=np.zeros((50, 10)),
+    )
+    seed_a = derive_receptor_selection_seed(
+        master_seed=1,
+        study_site_id="random-site",
+        design_version="formal-random-test-v1",
+        selection_policy_id="seeded_uniform_random_without_replacement_v1",
+        stream_scope="horizontal:core",
+    )
+    seed_b = derive_receptor_selection_seed(
+        master_seed=2,
+        study_site_id="random-site",
+        design_version="formal-random-test-v1",
+        selection_policy_id="seeded_uniform_random_without_replacement_v1",
+        stream_scope="horizontal:core",
+    )
+    assert seed_a != seed_b
+    first = select_horizontal_receptors_random_from_pool(
+        pool,
+        master_seed=1,
+        design_version="formal-random-test-v1",
+    )
+    second = select_horizontal_receptors_random_from_pool(
+        pool,
+        master_seed=2,
+        design_version="formal-random-test-v1",
+    )
+    assert [item.source_face_global_index for item in first] != [
+        item.source_face_global_index for item in second
+    ]
+
+
+def test_seeded_random_horizontal_selection_fails_on_pool_shortage() -> None:
+    """random pool 少於五面時必須 fail closed，不能以最近面或重複面補足。"""
+
+    mesh = _five_face_mesh(face_count=4)
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id="random-site",
+        mesh=mesh,
+        candidate_polygon_metric=box(-10.0, -10.0, 200.0, 10.0),
+        anchor_xy=(0.0, 0.0),
+        wetdry_at_arrivals=np.zeros((50, 4)),
+    )
+    with pytest.raises(ValueError, match="候選不足"):
+        select_horizontal_receptors_random_from_pool(
+            pool,
+            master_seed=1,
+            design_version="formal-random-test-v1",
+        )
+
+
+def test_random_vertical_draws_are_reproducible_four_unique_open_interval_values() -> None:
+    """每個 face 四個 random fraction 可重建、唯一且嚴格位於 (0,1)。"""
+
+    first = sample_random_vertical_draws(
+        master_seed=20260917,
+        study_site_id="random-site",
+        design_version="formal-random-test-v1",
+        source_face_local_index=3,
+        source_face_global_index=103,
+    )
+    second = sample_random_vertical_draws(
+        master_seed=20260917,
+        study_site_id="random-site",
+        design_version="formal-random-test-v1",
+        source_face_local_index=3,
+        source_face_global_index=103,
+    )
+    assert first == second
+    assert [item.draw_order for item in first] == [0, 1, 2, 3]
+    fractions = [item.normalized_fraction_below_surface for item in first]
+    assert len(set(fractions)) == 4
+    assert all(0.0 < value < 1.0 for value in fractions)
+    assert [item.vertical_id for item in first] == [
+        "random_vertical_draw_0",
+        "random_vertical_draw_1",
+        "random_vertical_draw_2",
+        "random_vertical_draw_3",
+    ]
+
+
+@pytest.mark.parametrize("fractions", [(0.0, 0.2, 0.4, 0.8), (0.1, 0.1, 0.5, 0.9), (0.1, 0.2, np.nan, 0.9)])
+def test_random_vertical_fraction_rejects_endpoint_duplicate_or_nonfinite(fractions) -> None:
+    """manifest／support 共用的 fraction gate 拒絕端點、重複與非有限值。"""
+
+    with pytest.raises(ValueError, match="fraction"):
+        validate_random_vertical_fractions(fractions)
 
 
 def test_fixed_coordinates_preserve_declared_order_and_mesh_faces() -> None:

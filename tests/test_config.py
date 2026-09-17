@@ -14,10 +14,10 @@ from lagrangian_backtracking.config import (
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
     GUISHAN_SOFT_PRIORITY_POLICY_ID,
     GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT,
-    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT,
-    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID,
-    HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256,
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
     LEGACY_DESIGN_VERSION_V2,
+    RECEPTOR_SELECTION_SEED_POLICY_ID,
+    VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
     ProjectConfig,
     load_config,
     resolve_flow_domain_id,
@@ -284,8 +284,8 @@ def test_example_material_table_matches_runtime_baseline() -> None:
     assert payload["physics"]["settling"]["material_classes"] == [asdict(item) for item in BASELINE_BEHAVIORS]
 
 
-def test_example_registers_current_c_nanwan_and_d_receptor_anchors() -> None:
-    """現行範例固定南灣／D anchor，且 C 不得殘留後灣 2+3 候選。"""
+def test_example_registers_current_random_receptor_contract_and_anchors() -> None:
+    """現行範例固定南灣／D anchor，且五站均明示 seeded random 受體契約。"""
 
     config = load_config(EXAMPLE_CONFIG)
     sites = {site.study_site_id: site for site in config.study_sites}
@@ -298,16 +298,23 @@ def test_example_registers_current_c_nanwan_and_d_receptor_anchors() -> None:
     assert sites["nanwan"].receptor_candidate_regions_provenance is None
     assert sites["lienchiang"].anchor_lonlat == (119.95, 26.2)
     assert sites["lienchiang"].receptor_core_radius_m == 12_500
-    assert (
-        tuple(sites["hsinchu"].horizontal_receptor_coordinates)
-        == HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT
+    assert all(
+        getattr(sites[site_id], field_name) is None
+        for site_id in sites
+        for field_name in (
+            "horizontal_receptor_coordinates",
+            "horizontal_receptor_source_manifest_sha256",
+            "horizontal_receptor_selection_policy",
+            "horizontal_receptor_coordinate_tolerance_m",
+        )
     )
-    assert sites["hsinchu"].horizontal_receptor_source_manifest_sha256 == (
-        HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256
+    assert config.scenarios.horizontal_receptor_selection_policy == (
+        HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID
     )
-    assert sites["hsinchu"].horizontal_receptor_selection_policy == (
-        HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID
+    assert config.scenarios.vertical_receptor_selection_policy == (
+        VERTICAL_RECEPTOR_SELECTION_POLICY_ID
     )
+    assert config.scenarios.receptor_selection_seed_policy == RECEPTOR_SELECTION_SEED_POLICY_ID
     assert tuple(sites["guishan"].receptor_priority_polygon or ()) == (
         GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT
     )
@@ -352,8 +359,8 @@ def test_current_design_rejects_shifted_flow_domain_bbox() -> None:
         ("horizontal_receptor_selection_policy", "other_policy"),
     ],
 )
-def test_current_hsinchu_fixed_receptor_contract_is_immutable(field: str, value: object) -> None:
-    """B 區固定受體清單、來源 hash 與 policy 任一被改寫都必須 fail closed。"""
+def test_current_formal_rejects_fixed_receptor_contract(field: str, value: object) -> None:
+    """current formal 任一站點殘留固定座標、來源 hash 或 tolerance 都必須 fail closed。"""
 
     payload = _payload()
     hsinchu = next(site for site in payload["study_sites"] if site["study_site_id"] == "hsinchu")
@@ -448,7 +455,7 @@ def test_omitted_backtrack_support_keeps_legacy_hash() -> None:
     """明確移除新欄位的舊 fixture 維持歷史 hash 與 normalized payload 語意。"""
 
     config = ProjectConfig.model_validate(_legacy_example_payload())
-    assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
+    assert config.config_hash() == "cf9dd4951d01708a69aa516189aa431754900feca65b2787c0ffa3bd36836c3a"
     assert "backtrack_support_days" not in config.normalized_payload()["inputs"]
     assert "bed_residence_time" not in config.normalized_payload()["scenarios"]
 
@@ -459,7 +466,7 @@ def test_omitted_ocm_interpolation_backend_keeps_numpy_and_current_hash() -> Non
     config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.ocm_interpolation_backend == "numpy_v1"
     assert "ocm_interpolation_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
+    assert config.config_hash() == "cf9dd4951d01708a69aa516189aa431754900feca65b2787c0ffa3bd36836c3a"
 
 
 def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
@@ -468,7 +475,7 @@ def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
     config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.physics_kernel_backend == "numpy_v1"
     assert "physics_kernel_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "c38ba2c7b21ab7249b517120f4d5964b87747eb6680c410d03090cc66301b893"
+    assert config.config_hash() == "cf9dd4951d01708a69aa516189aa431754900feca65b2787c0ffa3bd36836c3a"
 
 
 @pytest.mark.parametrize("backend", ["numpy_v1", "numba_cpu_v1"])
@@ -558,7 +565,7 @@ def test_legacy_config_hash_preserves_omitted_policy_semantics() -> None:
 
     config = ProjectConfig.model_validate(_legacy_hash_payload())
     assert config.config_hash() == (
-        "d7151792e1432b919ce46a8f2a40571f7c78977a500d2d2f472cccdbc921d711"
+        "d28846c08e372e9870985dc3c783f621f7360a0220e906c7d56fdb8f0c6215d8"
     )
     assert config.domains[0].formal_domain_policy == "expanded_domain_v1"
     assert "formal_domain_policy" not in config.domains[0].model_fields_set

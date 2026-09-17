@@ -26,6 +26,9 @@ from lagrangian_backtracking.bed_residence import (
 )
 from lagrangian_backtracking.config import (
     ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+    RECEPTOR_SELECTION_SEED_POLICY_ID,
+    VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
     ProjectConfig,
     resolve_flow_domain_id,
 )
@@ -36,7 +39,7 @@ from lagrangian_backtracking.gap_policy import (
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
 )
 from lagrangian_backtracking.manifests import (
-    _validate_fixed_horizontal_receptor_manifest,
+    _validate_current_random_receptor_manifest,
     load_arrival_time_manifest,
     load_boundary_geometries,
     load_material_manifest,
@@ -45,6 +48,7 @@ from lagrangian_backtracking.manifests import (
     load_scenario_inputs,
     resolve_manifest_path,
 )
+from lagrangian_backtracking.receptors import derive_receptor_selection_seed, sample_random_vertical_draws
 from lagrangian_backtracking.scenarios import (
     BASELINE_BEHAVIORS,
     ArrivalTime,
@@ -1005,45 +1009,94 @@ def test_receptor_nonfinite_coordinate_fails_fast(tmp_path: Path) -> None:
         load_receptor_manifest(path, _config(tmp_path))
 
 
-def test_current_hsinchu_fixed_manifest_keeps_declared_coordinates_and_unique_faces() -> None:
-    """current B manifest 必須分開保存 exact 宣告點與 mesh face 中心，且五面不重複。"""
+def test_current_random_manifest_keeps_seeded_vertical_draws_and_rejects_fixed_ids() -> None:
+    """current formal manifest 必須保存五面×四 draw，且拒絕固定 vertical ID。"""
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
+    payload["scenarios"]["master_seed"] = 20260917
     config = ProjectConfig.model_validate(payload)
-    site = next(item for item in config.study_sites if item.study_site_id == "hsinchu")
-    assert site.horizontal_receptor_coordinates is not None
-    assert site.horizontal_receptor_source_manifest_sha256 is not None
     receptors: list[Receptor] = []
-    for order, coordinate in enumerate(site.horizontal_receptor_coordinates):
-        for vertical_index in range(4):
-            receptors.append(
-                Receptor(
-                    receptor_id=f"hsinchu-fixed-{order}-{vertical_index}",
-                    study_site_id="hsinchu",
-                    analysis_region_id="B",
-                    # 頂層座標模擬 accepted OCM face 中心；exact 工程宣告點另在 metadata。
-                    lon=120.4 + order * 0.01,
-                    lat=24.7 + order * 0.01,
-                    z_m_positive_up=-5.0 - vertical_index,
-                    vertical_id=f"z{vertical_index}",
-                    metadata={
-                        "fixed_horizontal_coordinate_order": order,
-                        "fixed_horizontal_source_manifest_sha256": (
-                            site.horizontal_receptor_source_manifest_sha256
-                        ),
-                        "fixed_horizontal_declared_lon": float(coordinate[0]),
-                        "fixed_horizontal_declared_lat": float(coordinate[1]),
-                        "source_face_local_index": order,
-                        "source_face_global_index": order + 1000,
-                    },
-                )
+    random_horizontal: dict[str, object] = {}
+    for site_index, (site_id, (region, _)) in enumerate(sorted(SITES.items())):
+        streams: list[dict[str, object]] = []
+        seed, digest = derive_receptor_selection_seed(
+            master_seed=20260917,
+            study_site_id=site_id,
+            design_version=config.design_version,
+            selection_policy_id=HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+            stream_scope="horizontal:core",
+        )
+        streams.append(
+            {
+                "stream_scope": "horizontal:core",
+                "derived_seed_hex": f"{seed:032x}",
+                "seed_derivation_sha256": digest,
+                "candidate_pool_sha256": "a" * 64,
+            }
+        )
+        random_horizontal[site_id] = {
+            "selection_policy": HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+            "seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+            "master_seed": 20260917,
+            "streams": streams,
+            "selection_scope": "core",
+            "selected_draw_order_local_indices": list(range(site_index * 10, site_index * 10 + 5)),
+            "selected_draw_order_global_indices": list(range(site_index * 100, site_index * 100 + 5)),
+        }
+        for face_order in range(5):
+            local = site_index * 10 + face_order
+            global_index = site_index * 100 + face_order
+            draws = sample_random_vertical_draws(
+                master_seed=20260917,
+                study_site_id=site_id,
+                design_version=config.design_version,
+                source_face_local_index=local,
+                source_face_global_index=global_index,
             )
-
-    _validate_fixed_horizontal_receptor_manifest(receptors, config, formal=True)
+            for draw in draws:
+                receptors.append(
+                    Receptor(
+                        receptor_id=f"{site_id}-{face_order}-{draw.draw_order}",
+                        study_site_id=site_id,
+                        analysis_region_id=region,
+                        lon=120.0 + site_index * 0.1 + face_order * 0.001,
+                        lat=24.0 + face_order * 0.001,
+                        z_m_positive_up=-5.0,
+                        vertical_id=draw.vertical_id,
+                        metadata={
+                            "source_face_local_index": local,
+                            "source_face_global_index": global_index,
+                            "horizontal_selection_policy": HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                            "horizontal_selection_draw_order": face_order,
+                            "vertical_selection_policy": VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
+                            "vertical_selection_seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+                            "vertical_selection_draw_order": draw.draw_order,
+                            "vertical_selection_fraction_below_surface": (
+                                draw.normalized_fraction_below_surface
+                            ),
+                            "vertical_selection_derived_seed_hex": draw.derived_seed_hex,
+                            "vertical_selection_seed_derivation_sha256": draw.seed_derivation_sha256,
+                            "vertical_identity_semantics": "random_draw_rank_not_physical_layer",
+                        },
+                    )
+                )
+    provenance = _provenance()
+    provenance["random_horizontal_receptors_by_site"] = random_horizontal
+    provenance["random_vertical_selection_policy"] = {
+        "selection_policy": VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
+        "seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+        "identity_semantics": "random_draw_rank_not_physical_layer",
+        "draw_count_per_horizontal_face": 4,
+        "normalized_fraction_interval": "(0,1)",
+    }
+    _validate_current_random_receptor_manifest(
+        receptors,
+        config,
+        formal=True,
+        provenance=provenance,
+    )
     tampered = list(receptors)
-    tampered_metadata = dict(tampered[0].metadata)
-    tampered_metadata["fixed_horizontal_declared_lon"] += 0.001
     tampered[0] = Receptor(
         receptor_id=tampered[0].receptor_id,
         study_site_id=tampered[0].study_site_id,
@@ -1051,28 +1104,16 @@ def test_current_hsinchu_fixed_manifest_keeps_declared_coordinates_and_unique_fa
         lon=tampered[0].lon,
         lat=tampered[0].lat,
         z_m_positive_up=tampered[0].z_m_positive_up,
-        vertical_id=tampered[0].vertical_id,
-        metadata=tampered_metadata,
+        vertical_id="near_bed",
+        metadata=tampered[0].metadata,
     )
-    with pytest.raises(ValueError, match="宣告座標 metadata"):
-        _validate_fixed_horizontal_receptor_manifest(tampered, config, formal=True)
-
-    duplicate_face = list(receptors)
-    for index in range(4, 8):
-        duplicate_metadata = dict(duplicate_face[index].metadata)
-        duplicate_metadata["source_face_local_index"] = 0
-        duplicate_face[index] = Receptor(
-            receptor_id=duplicate_face[index].receptor_id,
-            study_site_id=duplicate_face[index].study_site_id,
-            analysis_region_id=duplicate_face[index].analysis_region_id,
-            lon=duplicate_face[index].lon,
-            lat=duplicate_face[index].lat,
-            z_m_positive_up=duplicate_face[index].z_m_positive_up,
-            vertical_id=duplicate_face[index].vertical_id,
-            metadata=duplicate_metadata,
+    with pytest.raises(ValueError, match="固定|vertical ID"):
+        _validate_current_random_receptor_manifest(
+            tampered,
+            config,
+            formal=True,
+            provenance=provenance,
         )
-    with pytest.raises(ValueError, match="不可共用同一 OCM face"):
-        _validate_fixed_horizontal_receptor_manifest(duplicate_face, config, formal=True)
 
 
 def test_full_scenario_inputs_are_deterministic_and_hash_bound(tmp_path: Path) -> None:

@@ -34,7 +34,7 @@
 | 南灣 | C | 使用 `houwan_nmmba_cache_v3` C 區流場；`forcing` 產品 ID 保留歷史名稱，現行 study site 為 `nanwan` |
 | 連江 | D | 使用 D 流場區域 |
 
-現行五站 anchor（WGS84，經度／緯度）固定為：貢寮 `[121.9223889,25.0964444]`、龜山島 `[121.951606,24.843127]`、新竹 `[120.45,24.75]`、南灣 `[120.763161,21.946577]`、連江 `[119.95,26.2]`。其中 B 區五個水平受體另依核定 manifest 順序逐點映射同一 OCM mesh；C 區只改研究站 anchor 與名稱，不改 `houwan_nmmba_cache_v3` 的 `forcing bbox`。
+現行五站 anchor（WGS84，經度／緯度）固定為：貢寮 `[121.9223889,25.0964444]`、龜山島 `[121.951606,24.843127]`、新竹 `[120.45,24.75]`、南灣 `[120.763161,21.946577]`、連江 `[119.95,26.2]`。正式母體五站的水平受體均由各站 persistent-wet/core 候選池以 `seeded_uniform_random_without_replacement_v1` 無放回抽樣；新竹 24 小時試跑的五個固定點只作歷史位置核對，不進 current formal。每個水平 face 再以獨立 stream 依 `seeded_uniform_random_open_interval_v1` 抽四個 `(0,1)` normalized fraction，random rank 不代表物理水層。C 區只改研究站 anchor 與名稱，不改 `houwan_nmmba_cache_v3` 的 `forcing bbox`。
 
 每站完整基礎設計是 `10 種材質／形狀 × 20 個三維受體 × 50 個到達時間 = 10,000` 個情境；若每個情境都採相同的成員數 `M`，五站執行量才可寫成 `50,000×M`。各情境成員數不同時，總量應寫成 `Σ M_s`；`M` 是隨機成員數，不是額外情境因子。實驗案例（例如 `no_stokes` 或擴散敏感度）另行編號。
 

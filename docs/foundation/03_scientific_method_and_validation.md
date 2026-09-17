@@ -349,8 +349,9 @@ N_{\mathrm{base,total}}=5\times N_{\mathrm{base,site}}=50{,}000.
 
 ### 7.1 到達時刻的動態垂向初始條件
 
-100 筆 `Receptor` 是水平位置與 `vertical_id` 的模板，模板中的 `z_m_positive_up` 只作
-候選／代表值；它不能代表同一受體在 50 個 arrival UTC 的實際 z。正式的三維初始條件
+100 筆 `Receptor` 是水平 face 與垂向 draw identity 的模板，模板中的 `z_m_positive_up` 只作
+候選／代表值；current formal 的 `random_vertical_draw_0..3` 是每個 face 的抽樣順序，
+不是物理層位，且不能代表同一受體在 50 個 arrival UTC 的實際 z。正式的三維初始條件
 由每個 receptor×arrival pair 的 OCM `eta`、`zcor`、`wetdry_elem` 與來源 face 摘要提供，
 五站 100 個 receptor 與 250 個 arrival-time 恰形成 5,000 個 pair records。十種 material
 共用這筆 pair 條件，所以物性展開後仍是 50,000 個基礎 scenarios，而不是 50,000 筆
@@ -396,7 +397,8 @@ uv run lbt run-create \
 ```
 
 selector 以每個 `(study_site_id, receptor.vertical_id)` 為 exact stratum，使用版本化
-SHA-256 ranking policy 選取每層 N 筆；在目前五站、四個垂向層位的完整資料中，N=1 預期
+SHA-256 ranking policy 選取每層 N 筆；current formal 的四個 identity 是每個 face 的
+`random_vertical_draw_0..3`，在目前五站、四個 random draw identity 的完整資料中，N=1 預期
 為 `5×4=20` 筆。20 是工程 sanity／benchmark 子集，不是正式結果，也不改寫 50,000
 情境設計。immutable plan 保存 source/selected count、order-independent scenario ID
 hash 與 strata binding；`run-shard` 的 static loader 會以目前完整 manifests 重算 selector

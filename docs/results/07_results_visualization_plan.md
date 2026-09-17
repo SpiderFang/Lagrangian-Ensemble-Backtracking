@@ -116,7 +116,7 @@
 ### F09 材質／形狀代理、沉降、停留與底部接觸
 
 - 10 種非上浮材質／形狀代理按沉降速度排序，以 small multiples 或「速度 × 指標」曲線呈現；圖例同時保留 iOcean 類別與代理形狀，不能只顯示匿名速度。
-- 正文主要 panel 固定先呈現 `material_id=oca_fishinggear_open_mesh_bundle`、`vertical_id=near_bed`；其餘九類與三個較上層受體仍以相同尺度完整保留於比較／補充產品。這是研究注意力排序，不是將漁具數量設定為先驗權重。
+- 正文主要 panel 可固定先呈現 `material_id=oca_fishinggear_open_mesh_bundle`；current formal 的垂向 panel 必須依 `random_vertical_draw_0..3` identity 與 normalized fraction 分層，不得把 random draw rank 命名為 `near_bed` 或其他物理層。其餘九類與所有 random vertical draws 仍以相同尺度完整保留於比較／補充產品。這是研究注意力排序，不是將漁具數量或任一 draw 設定為先驗權重；`near_bed` 僅可出現在歷史／legacy pilot 報告。
 - 各類至少並列首次海床接觸 member count/fraction 與 deposited member count/fraction；`BED_CONTACT` 的多次事件以 member 去重，基線不要求 repeated-contact 欄位。海面接觸只表示亂流擴散造成的反射事件，不得解讀為材料具有上浮速度。
 - 深度分布使用 depth–time heatmap 或 quantile ribbon，明示 z positive-up、深度／HAB 基準及水深變化。
 - 不具再懸浮參數時，圖名只能使用 contact/deposition-under-assumed-policy，不能宣稱完整底床沉積動力。

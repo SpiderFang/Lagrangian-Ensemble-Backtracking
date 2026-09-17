@@ -43,6 +43,7 @@ from lagrangian_backtracking.manifests import load_scenario_inputs
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.receptors import (
     prepare_horizontal_receptor_candidates,
+    sample_random_vertical_draws,
     select_horizontal_receptors_from_pool,
 )
 from lagrangian_backtracking.scenarios import ArrivalTime, Receptor, stable_identifier
@@ -1593,6 +1594,71 @@ def test_face_vertical_support_accepts_common_four_node_column() -> None:
     assert support.bed_z_m_positive_up == -20.0
     assert support.eta_z_m_positive_up == 0.0
     assert all(upper > lower for _vertical_id, lower, upper in support.brackets)
+
+
+def test_face_vertical_support_accepts_random_open_interval_draws() -> None:
+    """current formal 的 random fraction 應由每個 face 的完整水柱建立四個 target。"""
+
+    draws = sample_random_vertical_draws(
+        master_seed=20260917,
+        study_site_id="hsinchu",
+        design_version="formal-random-test-v1",
+        source_face_local_index=3,
+        source_face_global_index=103,
+    )
+    zcor = np.asarray(
+        [
+            [-20.0, -13.333333, -6.666667, 0.0],
+            [-20.0, -13.333333, -6.666667, 0.0],
+            [-20.0, -13.333333, -6.666667, 0.0],
+            [-20.0, -13.333333, -6.666667, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    support = input_derivation_module._build_face_vertical_support(
+        zcor_node_layer=zcor,
+        node_elev_m=np.zeros(4, dtype=np.float64),
+        node_depth_m=np.full(4, 20.0, dtype=np.float64),
+        vertical_draws=draws,
+    )
+    assert [target.vertical_id for target in support.targets] == [
+        "random_vertical_draw_0",
+        "random_vertical_draw_1",
+        "random_vertical_draw_2",
+        "random_vertical_draw_3",
+    ]
+    assert all(0.0 < (target.target_fraction_below_surface or 0.0) < 1.0 for target in support.targets)
+    assert all(upper > lower for _vertical_id, lower, upper in support.brackets)
+
+
+def test_face_vertical_support_random_draw_fails_when_any_bracket_is_missing() -> None:
+    """random target 缺少任一側有限 zcor 時必須停止，不做最近層或外插。"""
+
+    draws = sample_random_vertical_draws(
+        master_seed=20260917,
+        study_site_id="hsinchu",
+        design_version="formal-random-test-v1",
+        source_face_local_index=3,
+        source_face_global_index=103,
+    )
+    zcor = np.asarray(
+        [
+            [-20.0, -13.333333, -6.666667, 0.0],
+            [-20.0, -13.333333, -6.666667, 0.0],
+            [-20.0, -13.333333, -6.666667, 0.0],
+            # 最深的 random draw 約落在 -14 m；此 node 最低 z 改為 -10 m，故
+            # 該 target 缺少 below-side bracket，不能靠其他 node 的中位數補足。
+            [-10.0, -6.666667, -3.333333, -1.0],
+        ],
+        dtype=np.float64,
+    )
+    with pytest.raises(InputDerivationError, match="缺少 target 的雙側有限 zcor 支撐"):
+        input_derivation_module._build_face_vertical_support(
+            zcor_node_layer=zcor,
+            node_elev_m=np.zeros(4, dtype=np.float64),
+            node_depth_m=np.full(4, 20.0, dtype=np.float64),
+            vertical_draws=draws,
+        )
 
 
 @pytest.mark.parametrize(

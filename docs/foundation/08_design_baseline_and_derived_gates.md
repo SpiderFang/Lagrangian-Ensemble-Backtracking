@@ -124,7 +124,7 @@ scenario_id = hash(
 
 ### 5.1 結構
 
-每站點採 **5 個水平位置 × 4 個垂向層位 = 20 個三維 receptors**。這比在三維空間任意散布 20 點更容易檢驗水平與垂向覆蓋，也能以相同設計比較五站點。
+每站點採 **5 個 seeded random 水平 face × 每面 4 個 seeded random 垂向 draw = 20 個三維 receptors**。水平與垂向各自使用獨立、可重現的 PCG64DXSM stream；這保留固定的 20 個受體數量與可稽核順序，但不把某一組工程試跑位置或固定物理層位誤當成正式母體。
 
 ### 5.2 水平位置
 
@@ -132,21 +132,23 @@ scenario_id = hash(
    `receptor_core_v1` 與既有 local／static-ocean 候選區的交集；所有候選均須具有效 OCM triangle、非陸地且可支援全部 50 個到達
    時間的 persistent-wet 節點或三角形中心。此 persistent-wet 條件只篩受體，不改變固定
    local-domain polygon。
-2. 貢寮、龜山島與新竹均以各自明示 anchor 作 deterministic maximin 的第一點排序依據，
-   並在 manifest 保存原始 anchor、實際受體位置及 `anchor_snap_distance_m`。目前
-   `input_derivation.py` 傳入受體 selector 的 policy 會保存實際 snap distance，但沒有把
-   「最多兩個局地代表網格尺度」作為受體 anchor 的 runtime hard gate；因此本版不把該
-   上限宣稱為已執行條件。這不要與 arrival NWW metric proxy 的「最大兩倍實際 NWW
-   grid scale」政策混同。新竹 anchor 固定為已登錄的 `[120.45, 24.75]`。
-3. 其餘四點以固定 seed 的 metric-space maximin 演算法依序選取，使最小點間距最大；並以 `lon, lat, source_face_id` 作 tie-break，確保重跑結果相同。
-4. 南灣與連江以各自 anchor 的最近有效海洋位置作第一點，再使用相同 maximin 規則選四點；
-   新竹雖與 B 區 flow center 重合，仍依固定五點 manifest 順序逐點映射，不重新抽樣。
-5. 候選點距海岸、無效 triangle 或 flow-domain 外界至少一個局地代表網格尺度；若此限制使候選不足，先降低為半個尺度並記錄 QC，不以陸地最近鄰補值。
+2. 每個站點先將 static-ocean、12.5 km core／local、50 個 arrival persistent-wet、
+   boundary margin 與 forcing 支援所需的候選條件寫成 immutable face pool，再依
+   `scenarios.master_seed + study_site_id + design_version + policy` 經 SHA-256 派生
+   PCG64DXSM seed，無放回抽取五個 face。每站 stream 獨立，manifest 保存 draw order、
+   derived seed、seed digest、候選 pool fingerprint 與選中 local/global face；候選少於
+   五面或 forcing／OCM 支援 gate 淘汰後不足時 fail closed，不以 anchor 最近面、maximin
+   或重複 face 補足。
+3. 龜山島的 `receptor_priority_polygon` 仍是 soft priority：優先候選足夠時在走廊
+   pool 中 random 無放回抽取；不足時保留已通過 gate 的 priority random faces，再從
+   同一 core 的剩餘 pool random 補足。priority 不改變 12.5 km core、20 km local、
+   flow-domain 或 forcing gate，也不能取代正式候選池。
+4. 新竹 24 小時試跑的五個固定點與來源 manifest 只屬歷史／位置核對 artifact；current
+   formal config 不得含 `horizontal_receptor_coordinates`、固定來源 hash、tolerance
+   或 fixed/maximin policy。四區正式輸入仍由同一份 OCM mesh 與 50-arrival gate 建立。
+5. 候選點距海岸、無效 triangle 或 flow-domain 外界至少一個局地代表網格尺度；若此限制使候選不足，維持 fail closed，不以陸地最近鄰或未登錄位置補值。
 
-新竹固定水平受體的五點順序與來源摘要由 `config.py` 的
-`HSINCHU_FIXED_HORIZONTAL_RECEPTOR_*` 契約保存；輸入建置必須驗證每一點對應同一份
-OCM mesh 的唯一 persistent-wet face，任一座標、順序、來源 hash 或 50 個 arrival
-forcing gate 不符即 fail closed。龜山島的 `receptor_priority_polygon` 頂點為
+龜山島的 `receptor_priority_polygon` 頂點為
 `[[121.78,24.79],[121.91,24.76],[121.94,24.80],[121.94,24.90],[121.82,24.92],[121.76,24.87]]`；
 它只作 soft priority，不能取代 12.5 km core、local/flow 邊界或 OCM／NWW 支援檢查。
 
@@ -174,18 +176,19 @@ H_r(t_a)  = h_r + eta_r(t_a)
 receptor 在不同到達時間的實際 `z` 可能因潮位而略有變化，manifest 必須逐一保存
 到達時間對應的 `H_r` 與實際層位。
 
-每個水平位置以該到達時間的局地總水深 `H_r(t_a)` 建立四個目標：
+每個水平 face 以獨立的 face stream 從完整有效水柱的開放區間抽四個 normalized
+fraction `f∈(0,1)`，目標為 `z = eta_r(t_a) - f H_r(t_a)`。`draw_order` 與
+`random_vertical_draw_0..3` 只表示可重現的抽樣 identity，不是上層、中層或近床等
+物理層位；實際 z 在每個 arrival 重新依該時刻的 `eta`、bed 與原生 OCM `zcor` 計算。
+每個 face 的四個 fraction 必須有限、互異且嚴格不在端點；manifest 保存 fraction、
+draw order、seed derivation policy 與完整 digest。
 
-- `upper_water_column`：目標 `z = eta_r(t_a) - 0.10H_r(t_a)`；
-- `mid_upper_water_column`：目標 `z = eta_r(t_a) - 0.40H_r(t_a)`；
-- `mid_lower_water_column`：目標 `z = eta_r(t_a) - 0.70H_r(t_a)`；
-- `near_bed`：最低有效 OCM layer 的中心；同時保存實際 height above bed。
-
-上述目標的實際位置必須使用同一到達時間、同一 face 的 `zcor` 做垂向有效性檢查
-與 layer snap；`zcor` 是實際 OCM 物理層座標，不可把固定 layer index 當成固定深度，
+上述目標的實際位置必須使用同一到達時間、同一 face 的 `zcor` 做垂向有效性檢查與
+雙側 bracket；`zcor` 是實際 OCM 物理層座標，不可把固定 layer index 當成固定深度，
 也不可以 `source_depth_m` 取代 `zcor`。不得將粒子放在海面以上、海床以下或只有單側
-支撐的層位。若兩個目標落入同一有效層，選擇相鄰可用層以維持四個不同 receptor；若
-無法形成四個有效層位，該水平位置淘汰並改選下一個 maximin 候選。manifest 必須保存
+支撐的層位。若任一 random target 沒有每個 face node 的有限上下 bracket，該水平
+位置淘汰並由水平 random pool 重新選 face；不選最近 layer、不做外插、不把固定四層
+或 random rank 宣稱為物理層位。manifest 必須保存
 `h_r`、`eta_r(t_a)`、`H_r(t_a)`、目標比例、目標 `z`、snap 後 `zcor` 層位、實際
 `z_m`／HAB、調整原因與所有 50 個到達時間的有效性。
 
@@ -215,7 +218,8 @@ receptor 在不同到達時間的實際 `z` 可能因潮位而略有變化，man
 為最大宗，主管另口頭表示特別關注沉底漁業用具。這兩項目前都只能列為定性、待正式文件確認的
 研究優先項，不能改寫十類代理的速度、出現率或來源先驗。
 
-正文統計固定先讀取 `oca_fishinggear_open_mesh_bundle × near_bed`，並以
+正文統計可優先讀取 `oca_fishinggear_open_mesh_bundle`，current formal 的垂向結果依
+`random_vertical_draw_0..3` identity 與 normalized fraction 分層，並以
 `report_material_statistics.py` 依 `study_site_id × material_id` 產生有效 member 分母、首次
 海床接觸 member 計數／比例及沉積 member 計數／比例。其他九種材質與三個較上層受體不得刪除，
 只是在正文外顯示為同尺度比較。`BED_CONTACT` 若多次發生，按 member 只計一次；

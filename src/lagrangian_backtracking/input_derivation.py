@@ -63,9 +63,12 @@ from .config import (
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
     FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION,
     GUISHAN_SOFT_PRIORITY_POLICY_ID,
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
     NORTHEAST_V3_BBOX_LON_LAT,
     NORTHEAST_V3_FLOW_DOMAIN_ID,
+    RECEPTOR_SELECTION_SEED_POLICY_ID,
     RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1,
+    VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
     BedResidenceTimeConfig,
     DomainConfig,
     ProjectConfig,
@@ -109,11 +112,17 @@ from .mesh import NativeMesh
 from .preflight import PreflightReport, run_preflight
 from .receptors import (
     HorizontalReceptorCandidatePool,
+    RandomVerticalDraw,
     VerticalTarget,
     build_vertical_targets,
+    candidate_pool_fingerprint,
+    derive_receptor_selection_seed,
     prepare_horizontal_receptor_candidates,
+    sample_random_vertical_draws,
     select_horizontal_receptors_from_coordinates,
     select_horizontal_receptors_from_pool,
+    select_horizontal_receptors_random_from_pool,
+    validate_random_vertical_fractions,
 )
 from .scenarios import BASELINE_BEHAVIORS, ArrivalTime, Receptor, stable_identifier
 from .time_axis import CanonicalTimeAxis, TimeChunk, canonicalize_time_chunks
@@ -1392,8 +1401,9 @@ class _FaceVerticalSupport:
     ``zcor_node_layer`` 的資料結構是 ``(face node, vertical layer)``，每一個 node
     都必須能以有限的原生 zcor 同時包住所需 target；這個條件比把多個 node 先取
     中位數更嚴格，能阻止陡峭海床下某一節點被不相容的代表水柱掩蓋。代表性 bed、
-    eta、target 與上下 layer 則沿用既有 face median 與 10/40/70/near-bed 設計，
-    供 receptor template 與 dynamic pair 共用，避免兩條程式路徑各自發明內插契約。
+    eta、target 與上下 layer 則沿用既有 face median；current formal 的 target 來自
+    每個 face 的 random normalized fraction，歷史 loader 才使用 10/40/70/near-bed。
+    兩條程式路徑仍共用同一份支撐結果，避免各自發明內插契約。
 
     屬性中的 layer 與 bracket 都是 immutable tuple；實際 NPY 仍維持 memory-map，
     只把單一 face 的小型代表結果保存於本次函式呼叫的生命週期內。
@@ -1406,7 +1416,7 @@ class _FaceVerticalSupport:
     brackets: tuple[tuple[str, float, float], ...]
 
     def target_for(self, vertical_id: str) -> VerticalTarget:
-        """依固定垂向識別碼取回已通過逐 node 支撐檢查的 target。"""
+        """依垂向 draw identity 取回已通過逐 node 支撐檢查的 target。"""
 
         for target in self.targets:
             if target.vertical_id == vertical_id:
@@ -1427,7 +1437,8 @@ def _build_face_vertical_support(
     zcor_node_layer: np.ndarray,
     node_elev_m: np.ndarray,
     node_depth_m: np.ndarray,
-    vertical_ids: Sequence[str],
+    vertical_ids: Sequence[str] | None = None,
+    vertical_draws: Sequence[RandomVerticalDraw] | None = None,
 ) -> _FaceVerticalSupport:
     """以同一個 fail-closed 規則建立 face 的垂向 target 與代表性 bracket。
 
@@ -1440,13 +1451,15 @@ def _build_face_vertical_support(
     node eta 取中位數；因此中位數不會再觸發 ``nanmedian`` 全 NaN 警告，也絕不以
     零或其他 fallback 取代缺值。
 
-    代表性水柱先把 ``bed <= zcor <= eta`` 以外的 layer 排除，再呼叫既有
-    ``build_vertical_targets`` 產生 10%、40%、70% 及 near-bed 四個固定類別。每一個
-    caller 指定的 target 另外逐一檢查每個 face node：必須存在有限 ``zcor <= target``
-    與有限 ``zcor >= target``；任一 node 缺少任一側支撐就 fail closed。這是 runtime
-    三節點 sampler 所需的共同支撐前置條件，不搜尋最近有效 layer、不夾到海床或海面、
-    不做單側外插，也不改變 vertical class。回傳的 bracket 是代表性水柱中最近的
-    lower／upper layer，且要求 ``upper > lower``，讓 loader 的嚴格不等式能直接成立。
+    代表性水柱先把 ``bed <= zcor <= eta`` 以外的 layer 排除。current formal 由
+    ``vertical_draws`` 將四個 normalized fraction 轉成當前代表水柱的目標；歷史／唯讀
+    caller 若只給 ``vertical_ids``，才呼叫既有 ``build_vertical_targets`` 產生固定
+    10%、40%、70% 及 near-bed 類別。每一個 caller 指定的 target 另外逐一檢查每個
+    face node：必須存在有限 ``zcor <= target`` 與有限 ``zcor >= target``；任一 node
+    缺少任一側支撐就 fail closed。這是 runtime 三節點 sampler 所需的共同支撐前置
+    條件，不搜尋最近有效 layer、不夾到海床或海面、不做單側外插。回傳的 bracket 是
+    代表性水柱中最近的 lower／upper layer，且要求 ``upper > lower``，讓 loader 的
+    嚴格不等式能直接成立。
 
     回傳的 ``_FaceVerticalSupport`` 同時被 receptor template 與 dynamic
     receptor×arrival pair 使用；因此模板通過但某一實際 UTC 垂向支撐改變時，dynamic
@@ -1462,12 +1475,30 @@ def _build_face_vertical_support(
         raise InputDerivationError("OCM face node eta／depth 維度與 zcor node 數不符")
     if node_depth.size != zcor.shape[0]:
         raise InputDerivationError("OCM face node depth 維度與 zcor node 數不符")
-    requested_ids = tuple(str(value) for value in vertical_ids)
-    if not requested_ids or len(set(requested_ids)) != len(requested_ids):
-        raise InputDerivationError("垂向支撐檢查必須指定唯一且非空的 vertical_id")
-    unknown_ids = set(requested_ids).difference(_VERTICAL_TARGET_IDS)
-    if unknown_ids:
-        raise InputDerivationError(f"未知 vertical_id：{sorted(unknown_ids)}")
+    if vertical_draws is not None and vertical_ids is not None:
+        raise InputDerivationError("垂向支撐不可同時指定 random draws 與固定 vertical_ids")
+    if vertical_draws is not None:
+        draws = tuple(vertical_draws)
+        if len(draws) != 4 or any(not isinstance(item, RandomVerticalDraw) for item in draws):
+            raise InputDerivationError("current formal 每個水平 face 必須有四個 random vertical draws")
+        try:
+            fractions = validate_random_vertical_fractions(
+                [item.normalized_fraction_below_surface for item in draws], count=4
+            )
+        except (TypeError, ValueError) as exc:
+            raise InputDerivationError(f"random vertical draw fraction 無效：{exc}") from exc
+        if tuple(item.draw_order for item in draws) != tuple(range(4)):
+            raise InputDerivationError("random vertical draw_order 必須依 0、1、2、3 順序保存")
+        requested_ids = tuple(item.vertical_id for item in draws)
+        if len(set(requested_ids)) != 4:
+            raise InputDerivationError("random vertical_id 必須唯一")
+    else:
+        requested_ids = tuple(str(value) for value in (vertical_ids or ()))
+        if not requested_ids or len(set(requested_ids)) != len(requested_ids):
+            raise InputDerivationError("垂向支撐檢查必須指定唯一且非空的 vertical_id")
+        unknown_ids = set(requested_ids).difference(_VERTICAL_TARGET_IDS)
+        if unknown_ids:
+            raise InputDerivationError(f"未知 vertical_id：{sorted(unknown_ids)}")
 
     if not np.all(np.isfinite(node_eta)):
         raise InputDerivationError("OCM face 每個 node 的 eta 都必須是有限值")
@@ -1494,18 +1525,32 @@ def _build_face_vertical_support(
     if valid_layers.size < 4:
         raise InputDerivationError("OCM face 代表性 water column 的有效 zcor layer 少於四層")
 
-    try:
-        all_targets = tuple(
-            build_vertical_targets(
-                surface_z_m=eta,
-                bed_z_m=bed,
-                valid_layer_z_m=valid_layers,
+    if vertical_draws is not None:
+        # normalized fraction 從瞬時海面往海床方向量測，嚴格開放區間確保 target 不在
+        # 端點；實際是否有 OCM 雙側 layer 仍由下方逐 target／逐 node gate 判定。
+        selected_targets = tuple(
+            VerticalTarget(
+                vertical_id=draw.vertical_id,
+                target_fraction_below_surface=float(fraction),
+                z_m_positive_up=float(eta - fraction * (eta - bed)),
+                height_above_bed_m=float((eta - fraction * (eta - bed)) - bed),
+                bracket_span_m=0.0,
             )
+            for draw, fraction in zip(vertical_draws, fractions, strict=True)
         )
-    except ValueError as exc:
-        raise InputDerivationError(f"OCM face 垂向 target／bracket 無法建立：{exc}") from exc
-    target_by_id = {target.vertical_id: target for target in all_targets}
-    selected_targets = tuple(target_by_id[vertical_id] for vertical_id in requested_ids)
+    else:
+        try:
+            all_targets = tuple(
+                build_vertical_targets(
+                    surface_z_m=eta,
+                    bed_z_m=bed,
+                    valid_layer_z_m=valid_layers,
+                )
+            )
+        except ValueError as exc:
+            raise InputDerivationError(f"OCM face 垂向 target／bracket 無法建立：{exc}") from exc
+        target_by_id = {target.vertical_id: target for target in all_targets}
+        selected_targets = tuple(target_by_id[vertical_id] for vertical_id in requested_ids)
 
     brackets: list[tuple[str, float, float]] = []
     for target in selected_targets:
@@ -1520,6 +1565,22 @@ def _build_face_vertical_support(
                 f"OCM face vertical_id={target.vertical_id} representative bracket 寬度不正"
             )
         brackets.append((target.vertical_id, lower, upper))
+
+        if vertical_draws is not None:
+            # random target 的 bracket 寬度是此 arrival 的實際 OCM layer 支撐，不是
+            # 另一個抽樣參數；回填到 immutable target 供 template／manifest 使用。
+            selected_targets = tuple(
+                candidate
+                if candidate.vertical_id != target.vertical_id
+                else VerticalTarget(
+                    vertical_id=candidate.vertical_id,
+                    target_fraction_below_surface=candidate.target_fraction_below_surface,
+                    z_m_positive_up=candidate.z_m_positive_up,
+                    height_above_bed_m=candidate.height_above_bed_m,
+                    bracket_span_m=float(upper - lower),
+                )
+                for candidate in selected_targets
+            )
 
         # 這個檢查故意逐 node 進行；把 node 先取中位數會將 steep-bed/deep-node 的
         # 無支撐情況遮掉，正是正式三節點 sampler 可能回傳全 NaN 的來源。
@@ -4087,14 +4148,15 @@ def _receptor_payload(
 
     水平候選先以既有 local／static-ocean geometry 建立；若站點同時明示 receptor core
     anchor 與半徑，這裡只把候選 polygon 與同一 AEQD 公尺投影中的核心圓求交，並不改寫
-    local geometry。之後仍由既有 persistent-wet、boundary margin 與 deterministic
-    anchor-first maximin 產生 5 個 face；每一輪只對被選出的少量 face 執行一次 NWW exact-hour
-    四角 support gate，再切取所有 arrival 的 ``(node, layer)`` zcor。NWW cache 由
-    build handler 依 analysis region 建立並與 arrival selector 共用；一個 horizontal
-    face 的四個 vertical receptor 只會共用同一次 50-arrival 判定。任何 NWW 或垂向 gate
-    失敗的 face 會在候選 wetdry copy 中永久
-    blacklist，再重新執行同一 maximin；這使水平選擇保持站點獨立、可重現且有限終止，
-    不會刪除 arrival/receptor/scenario 或以最近有效值補填。
+    local geometry。current formal 先由 persistent-wet、boundary margin 與 forcing
+    支援 gate 定義候選池，再以站點獨立 seeded random stream 無放回抽 5 個 face；歷史
+    loader 才使用 deterministic anchor-first maximin。每一輪只對被選出的少量 face 執行
+    一次 NWW exact-hour 四角 support gate，再切取所有 arrival 的 ``(node, layer)`` zcor。
+    NWW cache 由 build handler 依 analysis region 建立並與 arrival selector 共用；一個
+    horizontal face 的四個 vertical receptor 只會共用同一次 50-arrival 判定。任何 NWW
+    或垂向 gate 失敗的 face 會在候選 wetdry copy 中永久 blacklist，再由同一獨立 random
+    stream 的剩餘候選補選；這使水平選擇保持站點獨立、可重現且有限終止，不會刪除
+    arrival/receptor/scenario 或以最近有效值補填。
 
     若站點設定了 ``receptor_candidate_regions``，候選面會先依每個紅框子區的
     GeoJSON 多邊形與已驗收 local／static-ocean flow polygon 求交，再按
@@ -4122,6 +4184,14 @@ def _receptor_payload(
     # soft-priority 走廊與 core fallback 的選點摘要；priority 不是新的區域邊界，故
     # 只記錄候選篩選範圍與 fallback 證據，不建立另一套 forcing 或 local manifest。
     priority_selection_by_site: dict[str, dict[str, Any]] = {}
+    # current formal 的水平選樣 seed、候選 pool fingerprint 與實際抽樣順序。這些欄位
+    # 是重建契約的一部分：同一設定必須 byte-stable，pool 或 seed 改變時 manifest
+    # 至少會留下可稽核的 binding 差異。
+    random_horizontal_selection_by_site: dict[str, dict[str, Any]] = {}
+    # local face index 只在單一 native mesh 內唯一；A 區兩站可使用同一 mesh、不同
+    # site-specific random stream，因此 cache key 必須同時包含站點與 face，不能讓
+    # 貢寮的垂向 draw 被龜山島誤用。
+    random_vertical_draws_by_face: dict[tuple[str, int], tuple[RandomVerticalDraw, ...]] = {}
     # 固定水平受體的 provenance 另存為 site-level mapping。它與紅框候選是兩種互斥
     # 的選點契約：固定座標保留外部 manifest hash、宣告順序及實際 source face，不能
     # 在 build 後被誤讀成一般 maximin 結果或被其他站點共用。
@@ -4131,7 +4201,7 @@ def _receptor_payload(
     shared_nww_runtime_caches = dict(nww_runtime_caches or {})
     # 同一 flow domain 可能服務兩個站點；pair cache 以 analysis region 作外層 key，
     # 內部再核對實際 source ID。A 區兩站的 wetdry 與 zcor/elev 因而只開檔一次；站點
-    # 本身仍各自使用自己的 arrival、candidate geometry 與 deterministic maximin，不能
+    # 本身仍各自使用自己的 arrival、candidate geometry 與 random stream，不能
     # 因 cache 共用而合併受體選擇。
     pair_caches: dict[str, _OCMPairCache] = dict(ocm_pair_caches or {})
     # 這份 cache 由 build handler 傳入時會延伸到 dynamic 階段；獨立 helper 未傳入時
@@ -4232,6 +4302,45 @@ def _receptor_payload(
         face_support_cache: dict[int, _FaceVerticalSupport | None] = {}
         face_support_errors: dict[int, str] = {}
 
+        def vertical_draws_for_face(
+            horizontal_item: Any,
+            *,
+            site_id: str = site_id,
+        ) -> tuple[RandomVerticalDraw, ...] | None:
+            """取得 current formal face 專屬的四個 random 垂向 draw。
+
+            random draw 在 face 第一次進入 forcing／zcor gate 時建立並快取；之後 50 個
+            arrival 與 dynamic manifest 都使用同一組 fraction，但每個 arrival 仍依
+            自己的 eta、bed、zcor bracket 計算 actual z。legacy config 回傳 ``None``，
+            由下游維持固定垂向 helper 的歷史行為。
+            """
+
+            if config.design_version != CURRENT_DESIGN_VERSION:
+                return None
+            face_index = int(horizontal_item.source_face_local_index)
+            draws = random_vertical_draws_by_face.get((site_id, face_index))
+            if draws is not None:
+                return draws
+            master_seed = config.scenarios.master_seed
+            if master_seed is None:
+                raise InputDerivationError(
+                    "current formal random receptor build 必須先提供 scenarios.master_seed"
+                )
+            try:
+                draws = sample_random_vertical_draws(
+                    master_seed=int(master_seed),
+                    study_site_id=site_id,
+                    design_version=config.design_version,
+                    source_face_local_index=face_index,
+                    source_face_global_index=int(horizontal_item.source_face_global_index),
+                )
+            except (TypeError, ValueError) as exc:
+                raise InputDerivationError(
+                    f"{site_id} face={face_index} random vertical draw 建立失敗：{exc}"
+                ) from exc
+            random_vertical_draws_by_face[(site_id, face_index)] = draws
+            return draws
+
         def face_support(
             horizontal_item: Any,
             *,
@@ -4261,6 +4370,8 @@ def _receptor_payload(
                 if cached_support is None:
                     raise InputDerivationError(face_support_errors[face_index])
                 return cached_support
+
+            vertical_draws = vertical_draws_for_face(horizontal_item)
 
             _nww_hs_by_time, nww_valid_by_time = _nww_exact_hour_samples(
                 nww_cache,
@@ -4319,12 +4430,20 @@ def _receptor_payload(
                         raise InputDerivationError(
                             f"{site_id} receptor face 無法切取 OCM zcor／eta：{arrival.time_utc_ns}"
                         ) from exc
-                    support = _build_face_vertical_support(
-                        zcor_node_layer=zcor_slice,
-                        node_elev_m=eta_values,
-                        node_depth_m=node_depth,
-                        vertical_ids=_VERTICAL_TARGET_IDS,
-                    )
+                    if vertical_draws is None:
+                        support = _build_face_vertical_support(
+                            zcor_node_layer=zcor_slice,
+                            node_elev_m=eta_values,
+                            node_depth_m=node_depth,
+                            vertical_ids=_VERTICAL_TARGET_IDS,
+                        )
+                    else:
+                        support = _build_face_vertical_support(
+                            zcor_node_layer=zcor_slice,
+                            node_elev_m=eta_values,
+                            node_depth_m=node_depth,
+                            vertical_draws=vertical_draws,
+                        )
                     shared_vertical_support_cache[support_key] = support
                 if first_support is None:
                     first_support = support
@@ -4334,7 +4453,9 @@ def _receptor_payload(
 
         # geometry、persistent-wet 與 boundary margin 只在本站（或本站的每一個紅框
         # 子區）建立一次 immutable pool；後續 blacklist rounds 只對 pool 內的公尺制候選
-        # 重跑 maximin，不再逐輪建立 Shapely Point 或掃描全部 source face。紅框分支
+        # 重跑既定 selector，不再逐輪建立 Shapely Point 或掃描全部 source face。current
+        # formal selector 是 random permutation；歷史紅框分支仍為 deterministic maximin。
+        # 紅框分支
         # 對每一個子區獨立配額，禁止跨區借點補足。
         blacklisted_faces: set[int] = set()
         template_supports: dict[int, _FaceVerticalSupport] = {}
@@ -4550,6 +4671,9 @@ def _receptor_payload(
                     pool: HorizontalReceptorCandidatePool,
                     *,
                     scope_label: str,
+                    count: int = 5,
+                    excluded_faces: Iterable[int] = (),
+                    allow_partial: bool = False,
                     _blacklisted_faces: set[int] = blacklisted_faces,
                     _face_support: Any = face_support,
                     _face_support_cache: dict[int, _FaceVerticalSupport | None] = face_support_cache,
@@ -4557,73 +4681,218 @@ def _receptor_payload(
                     _template_supports: dict[int, _FaceVerticalSupport] = template_supports,
                     _site_id: str = site_id,
                 ) -> list[Any]:
-                    """在指定候選池中完成 maximin 與逐 face 支援 gate。
+                    """在指定候選池中完成 random／legacy selector 與支援 gate。
 
-                    priority 與 core fallback 共用這段流程，確保兩者都使用同一個
-                    persistent-wet、NWW exact-hour、OCM 垂向支撐與 blacklist 規則。若
-                    priority 候選因 forcing gate 淘汰不足，caller 才能安全退回原 core；
-                    任何 core 仍不足的情況則直接 fail closed，不以未登錄位置補足。
+                    current formal 先以 random selector 產生整個候選的可重現隨機順序，再
+                    逐面套用 NWW exact-hour 與 OCM 垂向支援 gate；因此 priority 候選不足
+                    時可以保留已通過的 priority faces，再由 core pool random 補足。legacy
+                    config 仍使用 maximin，讓歷史 pilot／唯讀 artifact 不被改寫。此函式
+                    不補造新 face；候選或支援不足會明確 fail closed，``allow_partial``
+                    僅供 priority soft preference 保存已成功的部分結果。
                     """
 
+                    if isinstance(count, (bool, np.bool_)) or not isinstance(count, int) or count < 1:
+                        raise InputDerivationError("水平 random selector count 必須是正整數")
+                    if (
+                        config.design_version == CURRENT_DESIGN_VERSION
+                        and config.scenarios.master_seed is None
+                    ):
+                        raise InputDerivationError(
+                            f"{_site_id} current formal random build 必須先提供 scenarios.master_seed"
+                        )
+                    excluded = {int(value) for value in excluded_faces}
+                    excluded.update(int(value) for value in _blacklisted_faces)
                     available_count = int(pool.candidate_face_local_indices.size)
-                    for _attempt in range(available_count + 1):
+                    if config.design_version == CURRENT_DESIGN_VERSION:
                         try:
-                            selected_pool = select_horizontal_receptors_from_pool(
+                            selected_order = select_horizontal_receptors_random_from_pool(
                                 pool,
-                                count=5,
-                                excluded_face_indices=_blacklisted_faces,
+                                master_seed=int(config.scenarios.master_seed),
+                                design_version=config.design_version,
+                                selection_policy_id=HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                                stream_scope=f"horizontal:{scope_label}",
+                                count=available_count,
+                                excluded_face_indices=excluded,
                             )
-                        except ValueError as exc:
+                        except (TypeError, ValueError) as exc:
                             raise InputDerivationError(
-                                f"{_site_id}/{scope_label} 垂向支撐淘汰後 persistent-wet 候選不足：{exc}"
+                                f"{_site_id}/{scope_label} seeded random 候選不足：{exc}"
                             ) from exc
-                        failed_faces: list[int] = []
-                        for horizontal_item in selected_pool:
-                            face_index = int(horizontal_item.source_face_local_index)
+                    else:
+                        for _attempt in range(available_count + 1):
                             try:
-                                support = _face_support(horizontal_item)
-                            except InputDerivationError as exc:
-                                # 將 combined gate 的失敗快取；下一輪或 core fallback
-                                # 再遇到相同 face 時，不重做 NWW／OCM I/O。
-                                _face_support_cache[face_index] = None
-                                _face_support_errors[face_index] = str(exc)
-                                failed_faces.append(face_index)
-                            else:
-                                _face_support_cache[face_index] = support
-                                _template_supports[face_index] = support
-                        if not failed_faces:
-                            return selected_pool
-                        for face_index in sorted(set(failed_faces)):
+                                selected_pool = select_horizontal_receptors_from_pool(
+                                    pool,
+                                    count=count,
+                                    excluded_face_indices=excluded,
+                                )
+                            except ValueError as exc:
+                                raise InputDerivationError(
+                                    f"{_site_id}/{scope_label} 垂向支撐淘汰後 persistent-wet 候選不足：{exc}"
+                                ) from exc
+                            failed_faces: list[int] = []
+                            selected_supported: list[Any] = []
+                            for horizontal_item in selected_pool:
+                                face_index = int(horizontal_item.source_face_local_index)
+                                try:
+                                    support = _face_support(horizontal_item)
+                                except InputDerivationError as exc:
+                                    _face_support_cache[face_index] = None
+                                    _face_support_errors[face_index] = str(exc)
+                                    failed_faces.append(face_index)
+                                else:
+                                    _face_support_cache[face_index] = support
+                                    _template_supports[face_index] = support
+                                    selected_supported.append(horizontal_item)
+                            if not failed_faces:
+                                return selected_pool
+                            _blacklisted_faces.update(failed_faces)
+                            excluded.update(failed_faces)
+                        raise InputDerivationError(
+                            f"{_site_id}/{scope_label} 垂向支撐重選超過有限迭代次數"
+                        )
+
+                    selected_supported: list[Any] = []
+                    for horizontal_item in selected_order:
+                        face_index = int(horizontal_item.source_face_local_index)
+                        try:
+                            support = _face_support(horizontal_item)
+                        except InputDerivationError as exc:
+                            # 將 combined gate 的失敗快取；下一次 core fallback 或重建
+                            # 再遇到相同 face 時，不重做 NWW／OCM I/O。
+                            _face_support_cache[face_index] = None
+                            _face_support_errors[face_index] = str(exc)
                             _blacklisted_faces.add(face_index)
+                        else:
+                            _face_support_cache[face_index] = support
+                            _template_supports[face_index] = support
+                            selected_supported.append(horizontal_item)
+                            if len(selected_supported) >= count:
+                                return selected_supported
+                    if allow_partial and selected_supported:
+                        return selected_supported
                     raise InputDerivationError(
-                        f"{_site_id}/{scope_label} 垂向支撐重選超過有限迭代次數"
+                        f"{_site_id}/{scope_label} 垂向支撐淘汰後候選不足："
+                        f"需要 {count}，實際 {len(selected_supported)}"
                     )
 
-                # priority 候選池若存在，先以它嘗試；只有 priority 的有效 face 或
-                # forcing 支援不足時才使用同一 core pool。所有 fallback 原因與最後
-                # selected face 都寫入 provenance，便於之後區分「優先走廊」與「core」。
-                pool_options: list[tuple[str, HorizontalReceptorCandidatePool]] = []
-                if priority_pool is not None and priority_pool is candidate_pool:
-                    pool_options.append(("priority", priority_pool))
-                    pool_options.append(("core_fallback", core_candidate_pool))
-                else:
-                    pool_options.append(("core", core_candidate_pool))
-                selection_scope = pool_options[-1][0]
-                for option_index, (scope_label, selected_pool) in enumerate(pool_options):
-                    try:
-                        horizontal = select_supported_from_pool(
-                            selected_pool,
-                            scope_label=scope_label,
-                        )
-                    except InputDerivationError as exc:
-                        # 只有 priority 是可替代的偏好範圍；core 仍不足時必須維持
-                        # fail-closed，不能把 fallback 再擴成 flow domain。
-                        if scope_label == "priority" and option_index + 1 < len(pool_options):
+                # current formal 的 priority 是 soft preference，不是固定座標或第二個
+                # domain：先以 priority pool 的 seeded random 順序取得可用 face；若
+                # persistent-wet／forcing gate 後不足五面，保留已成功的 priority face，
+                # 再從 core pool 排除已選／已失敗 face 後以另一個獨立 scope random 補足。
+                # 非 priority 站點只走 core random；legacy 站點則維持 maximin 相容路徑。
+                selection_scope = "core"
+                priority_selected: list[Any] = []
+                if config.design_version == CURRENT_DESIGN_VERSION and priority_pool is not None:
+                    priority_available = int(priority_pool.candidate_face_local_indices.size)
+                    if priority_available > 0:
+                        try:
+                            priority_selected = select_supported_from_pool(
+                                priority_pool,
+                                scope_label="priority",
+                                count=min(5, priority_available),
+                                allow_partial=True,
+                            )
+                        except InputDerivationError as exc:
+                            # priority 是 soft preference；若沒有任何通過 forcing／zcor
+                            # 的 face，仍可從同一核心 pool random 補足，而不是把整個站點
+                            # 誤判成 core 也不可用。失敗 face 已由 helper 加入 blacklist。
+                            priority_selected = []
                             priority_fallback_reason = str(exc)
-                            continue
-                        raise
-                    selection_scope = scope_label
-                    break
+                    if len(priority_selected) >= 5:
+                        horizontal = priority_selected[:5]
+                        selection_scope = "priority"
+                    else:
+                        needed = 5 - len(priority_selected)
+                        if priority_selected:
+                            priority_fallback_reason = (
+                                "priority forcing／垂向支援有效面不足五點，已由 core random 補足："
+                                f"{len(priority_selected)} < 5"
+                            )
+                        elif priority_fallback_reason is None:
+                            priority_fallback_reason = "priority pool 無可用 face，改由 core random 補足"
+                        selected_faces = {
+                            int(item.source_face_local_index) for item in priority_selected
+                        }
+                        horizontal = list(priority_selected)
+                        core_selected = select_supported_from_pool(
+                            core_candidate_pool,
+                            scope_label="core_fallback",
+                            count=needed,
+                            excluded_faces=selected_faces,
+                        )
+                        horizontal.extend(core_selected)
+                        selection_scope = (
+                            "priority_plus_core_fallback"
+                            if priority_selected
+                            else "core_fallback"
+                        )
+                else:
+                    horizontal = select_supported_from_pool(
+                        candidate_pool,
+                        scope_label="core" if priority_pool is None else "priority",
+                    )
+                    selection_scope = "core" if priority_pool is None else "priority"
+                if config.design_version == CURRENT_DESIGN_VERSION:
+                    master_seed = config.scenarios.master_seed
+                    if master_seed is None:
+                        raise InputDerivationError(
+                            f"{site_id} current formal random horizontal build 缺少 master_seed"
+                        )
+                    # site stream 的 seed material 固定包含站點／版本／policy；priority
+                    # 與 core fallback 的 scope 另存，避免讀者把不同 pool 的抽樣誤當一個
+                    # 全域 RNG 順序。scope 必須與 selector 實際使用的 scope 完全一致，
+                    # 否則 provenance 會指向另一個無法重建的 random stream。
+                    if selection_scope == "priority":
+                        stream_scopes = ["horizontal:priority"]
+                    elif selection_scope == "priority_plus_core_fallback":
+                        stream_scopes = ["horizontal:priority", "horizontal:core_fallback"]
+                    elif selection_scope == "core_fallback":
+                        stream_scopes = ["horizontal:core_fallback"]
+                    else:
+                        stream_scopes = ["horizontal:core"]
+                    stream_records: list[dict[str, Any]] = []
+                    for stream_scope in stream_scopes:
+                        _seed, seed_digest = derive_receptor_selection_seed(
+                            master_seed=int(master_seed),
+                            study_site_id=site_id,
+                            design_version=config.design_version,
+                            selection_policy_id=HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                            stream_scope=stream_scope,
+                        )
+                        stream_records.append(
+                            {
+                                "stream_scope": stream_scope,
+                                "derived_seed_hex": f"{_seed:032x}",
+                                "seed_derivation_sha256": seed_digest,
+                                "candidate_pool_sha256": candidate_pool_fingerprint(
+                                    priority_pool
+                                    if stream_scope.endswith("priority") and priority_pool is not None
+                                    else core_candidate_pool
+                                ),
+                            }
+                        )
+                    random_horizontal_selection_by_site[site_id] = {
+                        "selection_policy": HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                        "seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+                        "master_seed": int(master_seed),
+                        "streams": stream_records,
+                        "selection_scope": selection_scope,
+                        "candidate_face_count_persistent_wet_margin": int(candidate_count),
+                        "priority_candidate_face_count_persistent_wet_margin": (
+                            int(priority_pool.candidate_face_local_indices.size)
+                            if priority_pool is not None
+                            else 0
+                        ),
+                        "selected_draw_order_local_indices": [
+                            int(item.source_face_local_index) for item in horizontal
+                        ],
+                        "selected_draw_order_global_indices": [
+                            int(item.source_face_global_index) for item in horizontal
+                        ],
+                        "priority_selected_count": len(priority_selected),
+                        "core_fallback_selected_count": len(horizontal) - len(priority_selected),
+                    }
                 if site.receptor_priority_polygon is not None:
                     priority_selection_by_site[site_id] = {
                         "policy_id": (
@@ -4653,6 +4922,8 @@ def _receptor_payload(
                             {"lon": float(item.lon), "lat": float(item.lat)}
                             for item in horizontal
                         ],
+                        "priority_selected_count": len(priority_selected),
+                        "core_fallback_selected_count": len(horizontal) - len(priority_selected),
                     }
 
         for horizontal_order, horizontal_item in enumerate(horizontal):
@@ -4660,6 +4931,11 @@ def _receptor_payload(
             support = template_supports.get(face_index)
             if support is None or face_index in blacklisted_faces:
                 raise InputDerivationError(f"{site_id} 最終 receptor face 未通過垂向 gate：{face_index}")
+            vertical_draws = random_vertical_draws_by_face.get((site_id, face_index))
+            if config.design_version == CURRENT_DESIGN_VERSION and vertical_draws is None:
+                raise InputDerivationError(
+                    f"{site_id} current formal face={face_index} 缺少 random vertical provenance"
+                )
             for target in support.targets:
                 receptor_id = stable_identifier(
                     "rec",
@@ -4679,6 +4955,35 @@ def _receptor_payload(
                     else "near_bed_lowest_layer_center",
                     "template_bracket_span_m": target.bracket_span_m,
                 }
+                if config.design_version == CURRENT_DESIGN_VERSION:
+                    # 水平 random 的順序屬於 manifest provenance；逐列再保存 index，讓
+                    # 不讀 root summary 的 downstream 仍能確認這筆 receptor 在該站獨立
+                    # random stream 的 draw order。此 index 不是空間優先序。
+                    metadata.update(
+                        {
+                            "horizontal_selection_policy": HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                            "horizontal_selection_draw_order": int(horizontal_order),
+                        }
+                    )
+                if vertical_draws is not None:
+                    draw = next(
+                        item for item in vertical_draws if item.vertical_id == target.vertical_id
+                    )
+                    # draw order／fraction／seed 都寫在每列，讓只拿 receptor.json 的
+                    # 下游也能重建垂向 identity；fraction 是 random rank，絕非物理層位。
+                    metadata.update(
+                        {
+                            "vertical_selection_policy": VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
+                            "vertical_selection_seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+                            "vertical_selection_draw_order": int(draw.draw_order),
+                            "vertical_selection_fraction_below_surface": float(
+                                draw.normalized_fraction_below_surface
+                            ),
+                            "vertical_selection_derived_seed_hex": draw.derived_seed_hex,
+                            "vertical_selection_seed_derivation_sha256": draw.seed_derivation_sha256,
+                            "vertical_identity_semantics": "random_draw_rank_not_physical_layer",
+                        }
+                    )
                 candidate_region_id = region_id_by_face.get(face_index)
                 if candidate_region_id is not None:
                     metadata["candidate_region_id"] = candidate_region_id
@@ -4724,7 +5029,11 @@ def _receptor_payload(
         )
     elif priority_selection_by_site:
         receptor_method_id = (
-            "server_v3_persistent_wet_face_soft_priority_or_core_fallback_5x4_ocm_nww_runtime_support_v1"
+            "server_v3_persistent_wet_face_seeded_random_soft_priority_or_core_fallback_5x4x4_ocm_nww_runtime_support_v1"
+        )
+    elif random_horizontal_selection_by_site:
+        receptor_method_id = (
+            "server_v3_persistent_wet_face_seeded_random_5x4x4_ocm_nww_runtime_support_v1"
         )
     else:
         receptor_method_id = (
@@ -4749,6 +5058,17 @@ def _receptor_payload(
         # priority polygon 不會改變正式四區 geometry；此 site-level record 只保存
         # 候選池大小、fallback 原因與最終 face，供重建／稽核確認選點偏好沒有越界。
         provenance["priority_receptors_by_site"] = priority_selection_by_site
+    if random_horizontal_selection_by_site:
+        # current formal 只保存小型 seed／pool／draw-order provenance；大型 accepted
+        # mesh 與逐時 wetdry 仍由 source hashes 與上游 artifact index 綁定，不複製進 JSON。
+        provenance["random_horizontal_receptors_by_site"] = random_horizontal_selection_by_site
+        provenance["random_vertical_selection_policy"] = {
+            "selection_policy": VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
+            "seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+            "identity_semantics": "random_draw_rank_not_physical_layer",
+            "draw_count_per_horizontal_face": 4,
+            "normalized_fraction_interval": "(0,1)",
+        }
     payload = {
         "manifest_kind": "receptor_manifest",
         "schema_version": DERIVED_INPUT_SCHEMA_VERSION,
@@ -4787,9 +5107,10 @@ def _dynamic_initial_payload(
     再次開啟同一組月份檔案或重建網格；沒有傳入時則保留獨立 helper 的 lazy 行為。
     時間索引沿用月份排序後的 prefer-last 語意。每列仍保存實際月份、source time index、
     面索引與 observed origin，因而不會把模板 receptor 的 z 值誤當成所有 arrival 共用的
-    固定深度。每個 unique ``(analysis region, site, arrival UTC, face)`` 只以
-    ``_VERTICAL_TARGET_IDS`` 建立一次完整垂向支撐；四個 vertical receptor 後續只取
-    對應 target/bracket。若 receptor gate 與實際 zcor／eta 不一致，仍直接 fail closed。
+    固定深度。current formal 每個 unique ``(analysis region, site, arrival UTC, face)``
+    依 receptor metadata 的四個 random draws 建立一次完整垂向支撐；歷史相容 caller
+    才以 ``_VERTICAL_TARGET_IDS`` 建立固定類別。四個 receptor 後續只取對應
+    target/bracket；若 receptor gate 與實際 zcor／eta 不一致，仍直接 fail closed。
     ``expected_pair_count`` 預設為既有正式流程的 5,000 筆；只有明確傳入時才允許
     工程性小範圍 adapter 使用另一個已驗收的 receptor×arrival 數量，因此不會改變正式
     wrapper 的固定計數。``generation_method_id`` 與 ``provenance_extra`` 讓工程 artifact
@@ -4814,16 +5135,113 @@ def _dynamic_initial_payload(
     for arrival in arrivals:
         arrival_by_site.setdefault(arrival.study_site_id, []).append(arrival)
 
+    # current formal receptor manifest 會把每個 face 的四個 random draw 完整寫入
+    # metadata；dynamic 階段重新驗證 seed／順序／fraction 後再建立每個 arrival 的
+    # actual z。strict=False 的歷史 synthetic fixture 若沒有 random metadata，則保留
+    # 固定垂向 helper 的相容路徑；strict=True 不允許此退回。
+    random_vertical_enabled = config.design_version == CURRENT_DESIGN_VERSION and (
+        strict
+        or any(
+            receptor.metadata.get("vertical_selection_policy") is not None
+            for receptor in receptors
+        )
+    )
+    random_vertical_draws_by_face: dict[tuple[str, int], tuple[RandomVerticalDraw, ...]] = {}
+    if random_vertical_enabled:
+        master_seed = config.scenarios.master_seed
+        if master_seed is None:
+            raise InputDerivationError("current formal dynamic build 缺少 scenarios.master_seed")
+        receptors_by_face: dict[tuple[str, int], list[Receptor]] = {}
+        for receptor in receptors:
+            raw_local = receptor.metadata.get("source_face_local_index")
+            if isinstance(raw_local, bool) or not isinstance(raw_local, int):
+                raise InputDerivationError(
+                    f"random receptor 缺少 source_face_local_index：{receptor.receptor_id}"
+                )
+            receptors_by_face.setdefault((receptor.study_site_id, int(raw_local)), []).append(receptor)
+        for (site_id, local_face), face_receptors in receptors_by_face.items():
+            if len(face_receptors) != 4:
+                raise InputDerivationError(
+                    f"{site_id} face={local_face} random vertical receptor 必須恰有四筆"
+                )
+            first_metadata = face_receptors[0].metadata
+            raw_global = first_metadata.get("source_face_global_index")
+            if isinstance(raw_global, bool) or not isinstance(raw_global, int):
+                raise InputDerivationError(
+                    f"{site_id} face={local_face} 缺少 source_face_global_index"
+                )
+            try:
+                expected_draws = sample_random_vertical_draws(
+                    master_seed=int(master_seed),
+                    study_site_id=site_id,
+                    design_version=config.design_version,
+                    source_face_local_index=local_face,
+                    source_face_global_index=int(raw_global),
+                )
+            except (TypeError, ValueError) as exc:
+                raise InputDerivationError(
+                    f"{site_id} face={local_face} random vertical seed 建立失敗：{exc}"
+                ) from exc
+            by_order: dict[int, Receptor] = {}
+            for receptor in face_receptors:
+                metadata = receptor.metadata
+                required_policy = {
+                    "vertical_selection_policy": VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
+                    "vertical_selection_seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+                    "vertical_identity_semantics": "random_draw_rank_not_physical_layer",
+                }
+                if any(metadata.get(key) != value for key, value in required_policy.items()):
+                    raise InputDerivationError(
+                        f"{site_id} face={local_face} random vertical metadata policy 不一致"
+                    )
+                order = metadata.get("vertical_selection_draw_order")
+                if isinstance(order, bool) or not isinstance(order, int) or not 0 <= order < 4:
+                    raise InputDerivationError(
+                        f"{site_id} face={local_face} random vertical draw_order 無效"
+                    )
+                if order in by_order:
+                    raise InputDerivationError(
+                        f"{site_id} face={local_face} random vertical draw_order 重複"
+                    )
+                by_order[order] = receptor
+            if set(by_order) != set(range(4)):
+                raise InputDerivationError(f"{site_id} face={local_face} random vertical draw 不完整")
+            metadata_draws: list[RandomVerticalDraw] = []
+            for order, expected in enumerate(expected_draws):
+                receptor = by_order[order]
+                metadata = receptor.metadata
+                fraction = metadata.get("vertical_selection_fraction_below_surface")
+                if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                    raise InputDerivationError(
+                        f"{site_id} face={local_face} random vertical fraction 無效"
+                    )
+                if not math.isclose(
+                    float(fraction), expected.normalized_fraction_below_surface,
+                    rel_tol=0.0, abs_tol=0.0,
+                ) or receptor.vertical_id != expected.vertical_id:
+                    raise InputDerivationError(
+                        f"{site_id} face={local_face} random vertical draw 與 seed 不一致"
+                    )
+                if metadata.get("vertical_selection_derived_seed_hex") != expected.derived_seed_hex or (
+                    metadata.get("vertical_selection_seed_derivation_sha256")
+                    != expected.seed_derivation_sha256
+                ):
+                    raise InputDerivationError(
+                        f"{site_id} face={local_face} random vertical seed provenance 不一致"
+                    )
+                metadata_draws.append(expected)
+            random_vertical_draws_by_face[(site_id, local_face)] = tuple(metadata_draws)
+
     # 每個 region 的 tuple 內容依序為 NativeMesh 與帶 flow-domain binding 的 OCM cache。
     # 陣列仍是 mmap view，不會因建立 5,000 rows 把完整四維 forcing 複製進記憶體；
     # cache 的生命週期通常涵蓋同一個 builder call 的 receptor 與 dynamic 階段。
     shared_pair_caches: dict[str, _OCMPairCache] = dict(ocm_pair_caches or {})
     shared_mesh_bindings: dict[str, _NativeMeshBinding] = dict(native_mesh_bindings or {})
     shared_vertical_support_cache = vertical_support_cache if vertical_support_cache is not None else {}
-    # 先按唯一 pair key 收集實際 caller 要求的 vertical 類別。正式 builder 的每個
-    # horizontal face 會有四類，因此仍按固定 ``_VERTICAL_TARGET_IDS`` 順序一次建立
-    # 全部支撐；engineering adapter 可能只保留 near-bed，不能因未要求的類別缺少
-    # 支撐而改變原本的單站相容行為。
+    # 先按唯一 pair key 收集實際 caller 要求的 vertical 類別。current formal 每個
+    # horizontal face 會有四個 random draw，因此按 face 專屬 stream 一次建立全部支撐；
+    # engineering／legacy adapter 可能只保留 near-bed，不能因未要求的類別缺少支撐而
+    # 改變原本的單站相容行為。
     requested_vertical_ids_by_key: dict[tuple[str, str, int, int], set[str]] = {}
     for receptor in receptors:
         site_arrivals = arrival_by_site.get(receptor.study_site_id, ())
@@ -4915,27 +5333,45 @@ def _dynamic_initial_payload(
                 int(arrival.time_utc_ns),
                 int(node_face),
             )
+            face_draws = random_vertical_draws_by_face.get(
+                (receptor.study_site_id, int(node_face))
+            )
+            if random_vertical_enabled and face_draws is None:
+                raise InputDerivationError(
+                    f"dynamic pair 缺少 current formal random vertical draws：{support_key}"
+                )
             pair_support = shared_vertical_support_cache.get(support_key)
             if pair_support is None:
                 # 不能沿用 receptor template 的 z 或只對 face node 先取 median；actual
                 # pair 必須依此 UTC 的每個 node/layer zcor 重新證明 caller 要求的
                 # vertical target 雙側支撐。正式四類支撐一旦建立，四個 receptor 只取
                 # 自己的 target/bracket，不會為每個 vertical class 重複掃描相同資料。
-                requested_vertical_ids = tuple(
-                    vertical_id
-                    for vertical_id in _VERTICAL_TARGET_IDS
-                    if vertical_id in requested_vertical_ids_by_key.get(support_key, set())
-                )
+                if face_draws is not None:
+                    requested_vertical_ids = tuple(item.vertical_id for item in face_draws)
+                else:
+                    requested_vertical_ids = tuple(
+                        vertical_id
+                        for vertical_id in _VERTICAL_TARGET_IDS
+                        if vertical_id in requested_vertical_ids_by_key.get(support_key, set())
+                    )
                 if not requested_vertical_ids:
                     raise InputDerivationError(
                         f"dynamic pair 找不到目前 face／arrival 的 vertical 要求：{support_key}"
                     )
-                pair_support = _build_face_vertical_support(
-                    zcor_node_layer=np.asarray(zcor[local, nodes], dtype=np.float64),
-                    node_elev_m=np.asarray(elev[local, nodes], dtype=np.float64),
-                    node_depth_m=depth_values,
-                    vertical_ids=requested_vertical_ids,
-                )
+                if face_draws is not None:
+                    pair_support = _build_face_vertical_support(
+                        zcor_node_layer=np.asarray(zcor[local, nodes], dtype=np.float64),
+                        node_elev_m=np.asarray(elev[local, nodes], dtype=np.float64),
+                        node_depth_m=depth_values,
+                        vertical_draws=face_draws,
+                    )
+                else:
+                    pair_support = _build_face_vertical_support(
+                        zcor_node_layer=np.asarray(zcor[local, nodes], dtype=np.float64),
+                        node_elev_m=np.asarray(elev[local, nodes], dtype=np.float64),
+                        node_depth_m=depth_values,
+                        vertical_ids=requested_vertical_ids,
+                    )
                 shared_vertical_support_cache[support_key] = pair_support
             target = pair_support.target_for(receptor.vertical_id)
             lower, upper = pair_support.bracket_for(receptor.vertical_id)

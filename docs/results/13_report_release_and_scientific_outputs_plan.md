@@ -215,7 +215,9 @@ season/tide/material 與有效 pathway 累加則由 `report_trajectory_stream.py
    edges 累加，另保存 terminal-unsampled、invalid、underflow 與 overflow 計數。
 5. 材料統計依正式十種 `material_id` 保存有效分母、至少一次 bed contact 的 member numerator、
    deposited member numerator 及兩者比例；不得只以中文顯示名稱作 join key。正文主要列為
-   `oca_fishinggear_open_mesh_bundle × near_bed`，但其他材料／垂向層仍須保留。現行最小純
+   `oca_fishinggear_open_mesh_bundle`，current formal 垂向切片依
+   `random_vertical_draw_0..3` identity 與 normalized fraction 分層，不能把 random rank
+   稱為 `near_bed`；其他材料／垂向 draw 仍須保留。現行最小純
    計算入口為 `MaterialStatisticsAccumulator`／`build_material_statistics`：以一條 iterable
    一次加入 `ParticleResult`，由 scenario strata 解析站點與材質，對同一
    `scenario_id × member_id` 重複輸入 fail-closed；`BED_CONTACT` 與 `DEPOSITED` 事件按
@@ -325,7 +327,7 @@ scientific release；各階段 final 目錄互為 sibling，不覆寫前一階�
 | F06 | source-receptor、cross-site、denominators | row-normalized matrix、raw n、方向性 2×2 A 區診斷 | baseline 正式 run 不得缺 |
 | F07 | boundary/source travel histograms | ECDF/分位數/censoring，秒轉日只在顯示層 | baseline 正式 run 不得缺 |
 | F08 | trajectory stream + season/tide strata | 固定 4×2 small multiples、共同 extent/scale/denominator | strata 不完整即失敗，不做 pooled fallback |
-| F09 | trajectory stream + material/vertical events | 10 類 proxy、`near_bed` 漁具優先 panel、首次 bed contact／assumed deposition、depth–age quantiles | vertical 資料不完整即失敗；定性簡報不得充當數量先驗 |
+| F09 | trajectory stream + material/vertical events | 10 類 proxy、漁具優先 panel、current formal `random_vertical_draw_0..3` 分層、首次 bed contact／assumed deposition、depth–age quantiles | vertical draw metadata 不完整即失敗；random rank 不得宣稱物理層位；定性簡報不得充當數量先驗 |
 | F10 | outcomes、failure grids、inventory timeline | raw count + denominator + failure/reconstruction exposure | 無 provenance 時明示 unavailable 子 panel |
 | F11 | baseline + comparison releases | difference map、HDR overlap、rank/travel/contact 差 | `unavailable_missing_comparison` |
 | F12 | validation evidence | M/dt 收斂、known-source、restart、backend 差異 | `unavailable_missing_validation_evidence` |

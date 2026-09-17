@@ -45,9 +45,13 @@ from .bed_residence import (
 from .boundaries import BoundaryGeometry
 from .config import (
     CURRENT_DESIGN_VERSION,
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT,
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID,
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_SOURCE_SHA256,
+    RANDOM_VERTICAL_RECEPTOR_ID_PREFIX,
+    RECEPTOR_SELECTION_SEED_POLICY_ID,
+    VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
     ProjectConfig,
     resolve_flow_domain_id,
 )
@@ -61,6 +65,11 @@ from .geometry import DomainProjection
 from .input_horizon import (
     BED_RESIDENCE_INPUT_SCHEMA_VERSION,
     LEGACY_INPUT_SCHEMA_VERSION,
+)
+from .receptors import (
+    derive_receptor_selection_seed,
+    sample_random_vertical_draws,
+    validate_random_vertical_fractions,
 )
 from .scenarios import (
     ArrivalTime,
@@ -744,7 +753,15 @@ def _load_receptor_document(
             )
         )
         counts[site.study_site_id] += 1
+    # 固定座標 validator 僅服務歷史 pilot；current formal 改以 random horizontal／vertical
+    # provenance 驗證，兩者不可同時套用，避免舊 24 小時五點被誤升格為正式母體。
     _validate_fixed_horizontal_receptor_manifest(receptors, config, formal=formal)
+    _validate_current_random_receptor_manifest(
+        receptors,
+        config,
+        formal=formal,
+        provenance=payload["provenance"],
+    )
     site_ids = set(counts)
     if formal:
         _validate_formal_counts(site_ids, counts, config, per_site=20, total=100, label="receptor")
@@ -858,6 +875,231 @@ def _validate_fixed_horizontal_receptor_manifest(
             != HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID
         ):
             raise ValueError("hsinchu 固定水平受體 policy 不符合核定值")
+
+
+def _validate_current_random_receptor_manifest(
+    receptors: Sequence[Receptor],
+    config: ProjectConfig,
+    *,
+    formal: bool,
+    provenance: Mapping[str, Any],
+) -> None:
+    """驗證 current formal 的五站 random receptor identity 與 seed provenance。
+
+    水平選樣的候選 pool／seed 摘要在 root provenance 保存；每列 metadata 則保存 face
+    的四個垂向 draw order、normalized fraction 與 seed digest。這裡不重新讀取 OCM，
+    但會重算 seed，拒絕固定 vertical ID、端點／重複 fraction、錯誤 face identity 或
+    被竄改的 draw provenance。實際每個 arrival 的有限雙側 zcor bracket 仍由
+    input-build／dynamic loader 在 accepted OCM 上執行，不能用這個 JSON-only gate 取代。
+    """
+
+    if not formal or config.design_version != CURRENT_DESIGN_VERSION:
+        return
+    expected_sites = {site.study_site_id for site in config.study_sites}
+    by_site: dict[str, list[Receptor]] = {site_id: [] for site_id in expected_sites}
+    for receptor in receptors:
+        if receptor.study_site_id not in by_site:
+            raise ValueError(f"current formal random receptor 出現未知站點：{receptor.study_site_id}")
+        by_site[receptor.study_site_id].append(receptor)
+    master_seed = config.scenarios.master_seed
+    if master_seed is None:
+        raise ValueError("current formal random receptor manifest 需要 scenarios.master_seed")
+    if config.scenarios.horizontal_receptor_selection_policy != HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID:
+        raise ValueError("current formal receptor horizontal random policy 不符")
+    if config.scenarios.vertical_receptor_selection_policy != VERTICAL_RECEPTOR_SELECTION_POLICY_ID:
+        raise ValueError("current formal receptor vertical random policy 不符")
+    if config.scenarios.receptor_selection_seed_policy != RECEPTOR_SELECTION_SEED_POLICY_ID:
+        raise ValueError("current formal receptor seed policy 不符")
+
+    for site_id, site_receptors in by_site.items():
+        if len(site_receptors) != 20:
+            raise ValueError(f"{site_id} current formal random receptor 必須有 20 筆")
+        by_face: dict[tuple[int, int], list[Receptor]] = {}
+        for receptor in site_receptors:
+            metadata = receptor.metadata
+            local = metadata.get("source_face_local_index")
+            global_index = metadata.get("source_face_global_index")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (local, global_index)
+            ):
+                raise ValueError(f"{site_id} random receptor source face metadata 無效")
+            by_face.setdefault((int(local), int(global_index)), []).append(receptor)
+        if len(by_face) != 5 or any(len(group) != 4 for group in by_face.values()):
+            raise ValueError(f"{site_id} current formal 必須是五個 face 各四個 random draws")
+        seen_local: set[int] = set()
+        seen_global: set[int] = set()
+        for (local, global_index), group in by_face.items():
+            if local in seen_local or global_index in seen_global:
+                raise ValueError(f"{site_id} random horizontal face 不可重複")
+            seen_local.add(local)
+            seen_global.add(global_index)
+            try:
+                expected_draws = sample_random_vertical_draws(
+                    master_seed=int(master_seed),
+                    study_site_id=site_id,
+                    design_version=config.design_version,
+                    source_face_local_index=local,
+                    source_face_global_index=global_index,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{site_id} random vertical seed 無法建立：{exc}") from exc
+            by_order: dict[int, Receptor] = {}
+            for receptor in group:
+                metadata = receptor.metadata
+                if metadata.get("vertical_selection_policy") != VERTICAL_RECEPTOR_SELECTION_POLICY_ID:
+                    raise ValueError(f"{site_id} 固定或未知 vertical policy 不得進 current formal")
+                if metadata.get("vertical_selection_seed_policy") != RECEPTOR_SELECTION_SEED_POLICY_ID:
+                    raise ValueError(f"{site_id} random vertical seed policy 不符")
+                if metadata.get("vertical_identity_semantics") != "random_draw_rank_not_physical_layer":
+                    raise ValueError(f"{site_id} random vertical identity semantics 不符")
+                order = metadata.get("vertical_selection_draw_order")
+                if isinstance(order, bool) or not isinstance(order, int) or not 0 <= order < 4:
+                    raise ValueError(f"{site_id} random vertical draw_order 無效")
+                if order in by_order:
+                    raise ValueError(f"{site_id} random vertical draw_order 不可重複")
+                by_order[order] = receptor
+            if set(by_order) != set(range(4)):
+                raise ValueError(f"{site_id} random vertical draw_order 不完整")
+            fractions: list[float] = []
+            for order, expected in enumerate(expected_draws):
+                receptor = by_order[order]
+                metadata = receptor.metadata
+                fraction = metadata.get("vertical_selection_fraction_below_surface")
+                if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                    raise ValueError(f"{site_id} random vertical fraction 無效")
+                fractions.append(float(fraction))
+                if receptor.vertical_id != f"{RANDOM_VERTICAL_RECEPTOR_ID_PREFIX}_{order}":
+                    raise ValueError(
+                        f"{site_id} current formal 不得使用固定 vertical ID：{receptor.vertical_id}"
+                    )
+                if float(fraction) != expected.normalized_fraction_below_surface:
+                    raise ValueError(f"{site_id} random vertical fraction 與 seed 不一致")
+                if metadata.get("vertical_selection_derived_seed_hex") != expected.derived_seed_hex:
+                    raise ValueError(f"{site_id} random vertical derived seed 不一致")
+                if (
+                    metadata.get("vertical_selection_seed_derivation_sha256")
+                    != expected.seed_derivation_sha256
+                ):
+                    raise ValueError(f"{site_id} random vertical seed digest 不一致")
+            try:
+                validate_random_vertical_fractions(fractions, count=4)
+            except ValueError as exc:
+                raise ValueError(f"{site_id} random vertical fraction 不符合開放區間：{exc}") from exc
+
+    # root provenance 必須有每站 horizontal random stream 的摘要；沒有此區塊，即使
+    # row metadata 看似隨機，也無法證明候選 pool、seed 與選樣範圍曾被保存。
+    random_by_site = provenance.get("random_horizontal_receptors_by_site")
+    if not isinstance(random_by_site, Mapping) or set(random_by_site) != expected_sites:
+        raise ValueError(
+            "current formal receptor provenance 必須保存五站 random horizontal streams"
+        )
+    vertical_policy = provenance.get("random_vertical_selection_policy")
+    if not isinstance(vertical_policy, Mapping):
+        raise ValueError("current formal receptor provenance 必須保存 random vertical policy")
+    expected_vertical_policy = {
+        "selection_policy": VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
+        "seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+        "identity_semantics": "random_draw_rank_not_physical_layer",
+        "draw_count_per_horizontal_face": 4,
+        "normalized_fraction_interval": "(0,1)",
+    }
+    if any(vertical_policy.get(key) != value for key, value in expected_vertical_policy.items()):
+        raise ValueError("current formal random vertical policy provenance 不完整或不符")
+    for site_id in sorted(expected_sites):
+        record = random_by_site.get(site_id)
+        if not isinstance(record, Mapping):
+            raise ValueError(f"{site_id} random horizontal provenance 必須是 object")
+        if record.get("selection_policy") != HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID:
+            raise ValueError(f"{site_id} random horizontal selection policy 不符")
+        if record.get("seed_policy") != RECEPTOR_SELECTION_SEED_POLICY_ID:
+            raise ValueError(f"{site_id} random horizontal seed policy 不符")
+        if record.get("master_seed") != int(master_seed):
+            raise ValueError(f"{site_id} random horizontal master_seed 不一致")
+        selected_local = record.get("selected_draw_order_local_indices")
+        selected_global = record.get("selected_draw_order_global_indices")
+        if (
+            not isinstance(selected_local, list)
+            or not isinstance(selected_global, list)
+            or len(selected_local) != 5
+            or len(selected_global) != 5
+            or len(set(selected_local)) != 5
+            or len(set(selected_global)) != 5
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (*selected_local, *selected_global)
+            )
+        ):
+            raise ValueError(f"{site_id} random horizontal selected face provenance 無效")
+        actual_faces = {
+            (
+                int(item.metadata["source_face_local_index"]),
+                int(item.metadata["source_face_global_index"]),
+            )
+            for item in by_site[site_id]
+        }
+        expected_faces = {
+            (int(local), int(global_index))
+            for local, global_index in zip(selected_local, selected_global, strict=True)
+        }
+        if actual_faces != expected_faces:
+            raise ValueError(f"{site_id} random horizontal selected face 與 row metadata 不一致")
+        selected_order_by_face = {
+            (int(local), int(global_index)): order
+            for order, (local, global_index) in enumerate(
+                zip(selected_local, selected_global, strict=True)
+            )
+        }
+        for receptor in by_site[site_id]:
+            metadata = receptor.metadata
+            face_key = (
+                int(metadata["source_face_local_index"]),
+                int(metadata["source_face_global_index"]),
+            )
+            if metadata.get("horizontal_selection_policy") != HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID:
+                raise ValueError(f"{site_id} random horizontal row policy 不符")
+            order = metadata.get("horizontal_selection_draw_order")
+            if isinstance(order, bool) or not isinstance(order, int):
+                raise ValueError(f"{site_id} random horizontal draw order 無效")
+            if order != selected_order_by_face.get(face_key):
+                raise ValueError(f"{site_id} random horizontal draw order 與 face 不一致")
+        streams = record.get("streams")
+        if not isinstance(streams, list) or not streams:
+            raise ValueError(f"{site_id} random horizontal streams 不可為空")
+        selection_scope = record.get("selection_scope")
+        expected_scopes = {
+            "priority": ("horizontal:priority",),
+            "priority_plus_core_fallback": (
+                "horizontal:priority",
+                "horizontal:core_fallback",
+            ),
+            "core_fallback": ("horizontal:core_fallback",),
+            "core": ("horizontal:core",),
+        }.get(selection_scope)
+        if expected_scopes is None or tuple(
+            stream.get("stream_scope") for stream in streams
+        ) != expected_scopes:
+            raise ValueError(f"{site_id} random horizontal stream scope 與 selection_scope 不一致")
+        for stream in streams:
+            if not isinstance(stream, Mapping):
+                raise ValueError(f"{site_id} random horizontal stream provenance 無效")
+            scope = stream.get("stream_scope")
+            if not isinstance(scope, str) or not scope:
+                raise ValueError(f"{site_id} random horizontal stream scope 無效")
+            seed, digest = derive_receptor_selection_seed(
+                master_seed=int(master_seed),
+                study_site_id=site_id,
+                design_version=config.design_version,
+                selection_policy_id=HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                stream_scope=scope,
+            )
+            if stream.get("derived_seed_hex") != f"{seed:032x}" or stream.get(
+                "seed_derivation_sha256"
+            ) != digest:
+                raise ValueError(f"{site_id} random horizontal seed provenance 不一致")
+            pool_digest = stream.get("candidate_pool_sha256")
+            if not isinstance(pool_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", pool_digest):
+                raise ValueError(f"{site_id} random horizontal candidate pool fingerprint 無效")
 
 
 def load_receptor_manifest(
