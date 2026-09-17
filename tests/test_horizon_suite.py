@@ -353,6 +353,12 @@ def test_build_horizon_suite_uses_one_common_input_and_emits_identity_closure(
                 encoding="utf-8"
             )
         )
+        assert payload["inputs"]["ocm_gap_safe_arrival_manifest"] == (
+            "../common-input/ocm_gap_safe_arrival.json"
+        )
+        # legacy template 可保留 schema 的 null 欄位，但不得被 suite rewriter 綁到
+        # common-input；只有 current design＋approved reconstruction policy 才建立路徑。
+        assert payload["inputs"].get("ocm_gap_reconstruction_manifest") is None
         release_identity.append(
             {
                 kind: {
@@ -447,6 +453,12 @@ def test_bed_suite_builds_one_180_day_selection_mother_and_six_mode_releases(
             assert release["scenarios"]["bed_residence_time"]["backtrack_mode"] == mode
             assert release["inputs"]["backtrack_support_days"] == 180
             assert release["boundaries"]["max_backtrack_days"] == float(days)
+            assert release["inputs"]["ocm_gap_safe_arrival_manifest"] == (
+                "../common-input/ocm_gap_safe_arrival.json"
+            )
+            assert release["inputs"]["ocm_gap_reconstruction_manifest"] == (
+                release["inputs"]["ocm_gap_safe_arrival_manifest"]
+            )
             horizon_binding = release["release_binding"]["backtrack_horizon_binding"]
             assert horizon_binding["source_backtrack_support_days"] == 180
             assert horizon_binding["artifact_backtrack_support_days"] == 90.0

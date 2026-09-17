@@ -41,6 +41,7 @@ from .input_derivation import (
     DEPOSITION_AVAILABILITY_POLICY_ID,
     DERIVED_INPUT_SCHEMA_VERSION,
     OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+    _approved_reconstruction_release_binding_enabled,
     _assert_no_symlink_components,
     _assert_regular_directory,
     _assert_regular_file,
@@ -989,8 +990,11 @@ def _set_release_manifest_references(payload: dict[str, Any]) -> None:
     ``create_release_config`` 以 release YAML 所在的 ``release-configs`` 目錄為基準，
     因此同一批 immutable artifact 在 release 中必須寫成 ``../common-input``。這個
     純記憶體轉換和 builder 使用的固定 artifact filename 對齊，供 validator 從
-    ``common-config.yaml`` 重建 expected release payload；不接受 manifest 自述的任意
-    路徑，也不會重讀 raw forcing。
+    ``common-config.yaml`` 重建 expected release payload；目前 design 且明示核准
+    reconstruction policy 時，runtime 所需的 reconstruction manifest 也與
+    schema／closure 使用的 gap-safe manifest exact 指向同一檔案。這裡只綁定
+    common-input 證據，不把外部 reconstruction root index 寫入 release；不接受
+    manifest 自述的任意路徑，也不會重讀 raw forcing。
     """
 
     inputs = payload.get("inputs")
@@ -1007,6 +1011,12 @@ def _set_release_manifest_references(payload: dict[str, Any]) -> None:
     inputs["ocm_gap_safe_arrival_manifest"] = (
         f"{base}/{ARTIFACT_FILENAMES['ocm_gap_safe_arrival_horizon']}"
     )
+    if _approved_reconstruction_release_binding_enabled(payload):
+        # reconstruction 與 gap-safe 欄位故意共用 immutable common-input 支援證據；
+        # 外部 OCM_RECONSTRUCTION_ROOT 只在 runtime／preflight 解析，不進 release YAML。
+        inputs["ocm_gap_reconstruction_manifest"] = (
+            f"{base}/{ARTIFACT_FILENAMES['ocm_gap_safe_arrival_horizon']}"
+        )
     inputs["nww_full_hourly_analysis_manifest"] = (
         f"{base}/{ARTIFACT_FILENAMES['nww_full_hourly']}"
     )
