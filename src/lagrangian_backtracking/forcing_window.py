@@ -10,7 +10,9 @@ OCM 月份陣列；velocity facade 只保存 manager 與小型參數，月份淘
 建立 combined forcing 或觸發 NWW lazy loader。
 
 正式 constructor 只允許讀取已驗收的 ``<root>/<flow_domain_id>/{grid,months/YYYYMM}``
-目錄，不會回讀 raw NetCDF 或用最近月份補值。整個 manager 預期由單一 process 使用，
+目錄，不會回讀 raw NetCDF 或在預設模式用最近月份補值。只有明確開啟
+``continuous_time_fallback`` 時，才會按版本化策略使用已載入產品中的有效時間端點；這不
+代表可跨越空間域、乾面或物理無效資料。整個 manager 預期由單一 process 使用，
 不是 thread-safe；多 process worker 應各自建立一個 manager。cache stats 刻意暴露給
 Phase 3B benchmark，以量測月份 I/O、命中率、淘汰與 resident ndarray bytes。
 """
@@ -33,10 +35,12 @@ import numpy as np
 from .accelerated import validate_physics_kernel_backend
 from .diffusion import DiffusionCoefficients, DiffusionSample, SmagorinskySettings
 from .forcing import (
+    CONTINUOUS_TIME_FALLBACK_STRATEGY_ID,
     CombinedMonthForcing,
     NWWAnalysisMonth,
     OCMNativeMonth,
     OCMReconstructionPatchMonth,
+    _merge_continuous_time_diagnostics,
     _query_z_within_geometric_bounds,
 )
 from .geometry import DomainProjection
@@ -152,6 +156,47 @@ def _month_start_ns(month_id: str) -> int:
     # timestamp 仍在此處計算，讓月初奈秒的例外與原本 ``_month_start_ns`` 完全相同；
     # 快取只重用解析後的 aware datetime，不會改變 datetime 上下界的錯誤契約。
     return int(metadata.month_start_utc.timestamp()) * 1_000_000_000
+
+
+def _discover_month_ids(months_root: Path) -> tuple[str, ...]:
+    """列出產品 root 內可用的 ``YYYYMM`` 月份目錄，不讀取大型 forcing 陣列。
+
+    月份目錄是 production layout 的索引，不代表其中檔案已通過 reader schema 驗證；
+    真正載入仍由既有 OCM／NWW reader 負責。這裡只接受可解析的六位數月份目錄，忽略
+    暫存目錄、checksum 檔與其他非月份項目，並以排序後 tuple 固定 discovery 順序。若
+    root 尚未建立，回傳空 tuple，讓舊有 lazy loader 在實際查詢時保留原本的缺月錯誤。
+    """
+
+    if not months_root.is_dir():
+        return ()
+    month_ids: list[str] = []
+    for child in months_root.iterdir():
+        if not child.is_dir():
+            continue
+        name = child.name
+        try:
+            _validate_month_id(name)
+        except ValueError:
+            continue
+        month_ids.append(name)
+    return tuple(sorted(set(month_ids)))
+
+
+def _load_time_axis_index(path: Path, *, label: str) -> np.ndarray:
+    """以唯讀 memory-map 開啟單月 UTC 軸，供全期最近月份搜尋使用。
+
+    搜尋只需要 ``time_utc_ns.npy``，不應為了判斷查詢月份而載入 hvel、垂向場、mask 或
+    NWW 波浪陣列。軸必須是一維、int64、嚴格遞增；若軸本身損壞，直接上拋而不是把該月
+    靜默當成不可用，避免 fallback 把資料契約錯誤隱藏成時間缺口。
+    """
+
+    try:
+        times = np.load(path, mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} time_utc_ns 無法唯讀載入：{path}") from exc
+    if times.ndim != 1 or times.dtype != np.int64 or np.any(np.diff(times) <= 0):
+        raise ValueError(f"{label} time_utc_ns 必須是一維嚴格遞增 int64：{path}")
+    return times
 
 
 def _cross_month_support_z(
@@ -536,6 +581,8 @@ class _GlobalTimeBracket:
     after: tuple[_MonthEntry, int, int] | None
     alpha: float
     qc: SampleQC
+    fallback_used: bool = False
+    fallback_policy: str | None = None
 
 
 class ManagedForcingProvider(StepStartSampleReuseProvider):
@@ -676,12 +723,23 @@ class ForcingWindowManager:
         reconstruction_manifest_sha256: str | None = None,
         max_resident_months: int = 2,
         physics_kernel_backend: str = "numpy_v1",
+        continuous_time_fallback: bool = False,
+        available_ocm_month_ids: Iterable[str] | None = None,
+        available_nww_month_ids: Iterable[str] | None = None,
+        ocm_time_axis_loader: Callable[[str], np.ndarray | None] | None = None,
+        nww_time_axis_loader: Callable[[str], np.ndarray | None] | None = None,
     ) -> None:
         """建立注入式 manager，測試可用小型 loader，production 則由 ``from_roots`` 建立。
 
         ``physics_kernel_backend`` 固定此 manager 所有材質 provider 共用的數值 primitive
         版本；這樣同月 combined cache 不必在每次 RK stage 依 request 改寫，也不會讓同一
-        run 中有些粒子走不同 Stokes 方程實作。舊 caller 省略時使用 NumPy reference。
+        run 中有些粒子走不同 Stokes 方程實作。``continuous_time_fallback`` 預設關閉，
+        開啟後只放寬 OCM/NWW 純時間缺口與軸外端點選擇，不能把空間、乾面、垂向、波浪
+        物理或非有限值變成有效樣本。舊 caller 省略時使用 NumPy reference。
+        ``available_*_month_ids`` 是 optional 的唯讀月份索引，僅在 fallback 需要跨越
+        連續缺月時協助搜尋全期最近端點；``*_time_axis_loader`` 只應回傳對應月份的小型
+        UTC 軸，不得在此 hook 載入或建立大型 forcing 複本。若未提供索引，注入式 loader
+        維持原本只探查查詢月與相鄰月份的相容行為。
         """
 
         if not isinstance(flow_domain_id, str) or not flow_domain_id.strip():
@@ -709,6 +767,28 @@ class ForcingWindowManager:
         self.reconstruction_manifest_sha256 = reconstruction_manifest_sha256
         self.max_resident_months = max_resident_months
         self.physics_kernel_backend = validate_physics_kernel_backend(physics_kernel_backend)
+        if type(continuous_time_fallback) is not bool:
+            raise TypeError("continuous_time_fallback 必須是 bool")
+        self.continuous_time_fallback = continuous_time_fallback
+        self._available_month_ids: dict[str, tuple[str, ...]] = {
+            "ocm": self._normalize_available_month_ids(
+                available_ocm_month_ids,
+                label="available_ocm_month_ids",
+            ),
+            "nww": self._normalize_available_month_ids(
+                available_nww_month_ids,
+                label="available_nww_month_ids",
+            ),
+        }
+        if ocm_time_axis_loader is not None and not callable(ocm_time_axis_loader):
+            raise TypeError("ocm_time_axis_loader 必須是 callable 或 None")
+        if nww_time_axis_loader is not None and not callable(nww_time_axis_loader):
+            raise TypeError("nww_time_axis_loader 必須是 callable 或 None")
+        self._time_axis_loaders: dict[str, Callable[[str], np.ndarray | None] | None] = {
+            "ocm": ocm_time_axis_loader,
+            "nww": nww_time_axis_loader,
+        }
+        self._time_axis_cache: dict[tuple[str, str], np.ndarray | None] = {}
         self._months: OrderedDict[str, _MonthEntry] = OrderedDict()
         self._ocm_load_count = 0
         self._nww_load_count = 0
@@ -728,6 +808,24 @@ class ForcingWindowManager:
             tuple[tuple[int, ...], str, bytes, tuple[int, ...], str, bytes] | None
         ) = None
 
+    @staticmethod
+    def _normalize_available_month_ids(
+        month_ids: Iterable[str] | None,
+        *,
+        label: str,
+    ) -> tuple[str, ...]:
+        """驗證並排序可用月份索引；不把月份名稱本身當成 forcing 內容。"""
+
+        if month_ids is None:
+            return ()
+        if isinstance(month_ids, (str, bytes)):
+            raise TypeError(f"{label} 必須是月份字串 iterable，不可直接是字串")
+        try:
+            normalized = {_validate_month_id(month_id) for month_id in month_ids}
+        except TypeError as exc:
+            raise TypeError(f"{label} 必須是月份字串 iterable") from exc
+        return tuple(sorted(normalized))
+
     @classmethod
     def from_roots(
         cls,
@@ -740,6 +838,7 @@ class ForcingWindowManager:
         max_resident_months: int = 2,
         use_numba_kernel: bool = False,
         physics_kernel_backend: str = "numpy_v1",
+        continuous_time_fallback: bool = False,
     ) -> ForcingWindowManager:
         """從正式 root layout 建立 manager，且 OCM mesh 只在此處載入一次。
 
@@ -752,7 +851,11 @@ class ForcingWindowManager:
         ``OCMNativeMonth.from_directory`` 的 OCM 內層插值 kernel；
         ``physics_kernel_backend`` 另決定 Stokes、步長、RK4 最後純量更新及 Brownian 位移
         的數值 primitive。月份選擇、NWW 載入、缺值／遮罩、QC 與邊界判定仍由 Python 控制層
-        負責。兩個參數都使用舊 caller 相容預設，不會因省略而切換到 Numba。
+        負責。``continuous_time_fallback`` 只處理時間 axis；啟用時 from-roots 會先掃描
+        已存在的月份目錄，並以各月 ``time_utc_ns.npy`` 的小型唯讀軸索引選出全期最近
+        endpoint，再 lazy 載入最多必要的完整月份。兩個參數都使用舊 caller 相容預設，
+        不會因省略而切換到 Numba；production 的 fallback 月份 discovery 不會複製大型
+        forcing 陣列，也不放寬空間、乾面、垂向或波浪物理 QC。
         """
 
         if type(use_numba_kernel) is not bool:
@@ -765,6 +868,12 @@ class ForcingWindowManager:
         if not grid_dir.is_dir():
             raise FileNotFoundError(f"缺少 OCM flow-domain grid directory：{grid_dir}")
         mesh = NativeMesh.from_directory(grid_dir, projection=projection)
+        available_ocm_month_ids = _discover_month_ids(ocm_domain_root / "months")
+        available_nww_month_ids = (
+            _discover_month_ids(nww_domain_root / "months")
+            if nww_domain_root is not None
+            else ()
+        )
         nww_grid_dir = nww_domain_root / "grid" if nww_domain_root is not None else None
         reconstruction_store = (
             _ReconstructionPatchStore(
@@ -786,6 +895,7 @@ class ForcingWindowManager:
                 month_dir,
                 mesh=mesh,
                 use_numba_kernel=use_numba_kernel,
+                continuous_time_fallback=continuous_time_fallback,
             )
             patch = reconstruction_store.load_month(month_id) if reconstruction_store else None
             if patch is not None:
@@ -802,6 +912,7 @@ class ForcingWindowManager:
                     maximum_time_gap_seconds=observed.maximum_time_gap_ns / 1_000_000_000,
                     wet_value=observed.wet_value,
                     use_numba_kernel=use_numba_kernel,
+                    continuous_time_fallback=continuous_time_fallback,
                     reconstruction_patch=patch,
                 )
             return observed
@@ -816,7 +927,35 @@ class ForcingWindowManager:
                 return None
             if not nww_grid_dir.is_dir():
                 raise FileNotFoundError(f"缺少 NWW flow-domain grid directory：{nww_grid_dir}")
-            return NWWAnalysisMonth.from_directories(nww_grid_dir, month_dir)
+            return NWWAnalysisMonth.from_directories(
+                nww_grid_dir,
+                month_dir,
+                continuous_time_fallback=continuous_time_fallback,
+            )
+
+        def load_ocm_time_axis(month_id: str) -> np.ndarray | None:
+            """只讀取 OCM 單月 UTC 軸，不建立 OCM 大型場物件。"""
+
+            month_dir = ocm_domain_root / "months" / _validate_month_id(month_id)
+            if not month_dir.is_dir():
+                return None
+            path = month_dir / "time_utc_ns.npy"
+            if not path.is_file():
+                raise FileNotFoundError(f"缺少 OCM time_utc_ns：{path}")
+            return _load_time_axis_index(path, label=f"OCM {month_id}")
+
+        def load_nww_time_axis(month_id: str) -> np.ndarray | None:
+            """只讀取 NWW 單月 UTC 軸，不建立 NWW 波浪場物件。"""
+
+            if nww_domain_root is None:
+                return None
+            month_dir = nww_domain_root / "months" / _validate_month_id(month_id)
+            if not month_dir.is_dir():
+                return None
+            path = month_dir / "time_utc_ns.npy"
+            if not path.is_file():
+                raise FileNotFoundError(f"缺少 NWW time_utc_ns：{path}")
+            return _load_time_axis_index(path, label=f"NWW {month_id}")
 
         return cls(
             flow_domain_id=flow_domain_id,
@@ -830,6 +969,11 @@ class ForcingWindowManager:
             ),
             max_resident_months=max_resident_months,
             physics_kernel_backend=backend,
+            continuous_time_fallback=continuous_time_fallback,
+            available_ocm_month_ids=available_ocm_month_ids,
+            available_nww_month_ids=available_nww_month_ids,
+            ocm_time_axis_loader=load_ocm_time_axis,
+            nww_time_axis_loader=load_nww_time_axis,
         )
 
     def _evict_if_needed(self) -> None:
@@ -884,24 +1028,29 @@ class ForcingWindowManager:
             raise ValueError(f"OCM loader month_id 不一致：{result.month_id} != {month_id}")
         if not self._meshes_match(result.mesh, self.mesh):
             raise ValueError(f"OCM loader mesh identity 不一致：{month_id}")
-        if self._reconstruction_loader is not None and result.reconstruction_patch is None:
+        patch = result.reconstruction_patch
+        if self._reconstruction_loader is not None and patch is None:
             patch = self._reconstruction_loader(month_id)
-            if patch is not None:
-                result = OCMNativeMonth(
-                    month_id=result.month_id,
-                    mesh=result.mesh,
-                    time_utc_ns=result._observed_time_utc_ns,
-                    hvel=result.hvel,
-                    vertical_velocity=result.vertical_velocity,
-                    zcor=result.zcor,
-                    elev=result.elev,
-                    wetdry_elem=result.wetdry_elem,
-                    diffusivity=result.diffusivity,
-                    maximum_time_gap_seconds=result.maximum_time_gap_ns / 1_000_000_000,
-                    wet_value=result.wet_value,
-                    use_numba_kernel=result.use_numba_kernel,
-                    reconstruction_patch=patch,
-                )
+        if (
+            patch is not result.reconstruction_patch
+            or result.continuous_time_fallback != self.continuous_time_fallback
+        ):
+            result = OCMNativeMonth(
+                month_id=result.month_id,
+                mesh=result.mesh,
+                time_utc_ns=result._observed_time_utc_ns,
+                hvel=result.hvel,
+                vertical_velocity=result.vertical_velocity,
+                zcor=result.zcor,
+                elev=result.elev,
+                wetdry_elem=result.wetdry_elem,
+                diffusivity=result.diffusivity,
+                maximum_time_gap_seconds=result.maximum_time_gap_ns / 1_000_000_000,
+                wet_value=result.wet_value,
+                use_numba_kernel=result.use_numba_kernel,
+                continuous_time_fallback=self.continuous_time_fallback,
+                reconstruction_patch=patch,
+            )
         self._ocm_load_count += 1
         return result
 
@@ -989,6 +1138,94 @@ class ForcingWindowManager:
             return None if nww is None else nww.time_utc_ns
         raise ValueError(f"未知 forcing source：{source}")
 
+    def _time_axis_for_month(self, source: str, month_id: str) -> np.ndarray | None:
+        """取得一個月份的小型 UTC 軸索引，避免為全期搜尋載入大型 forcing 陣列。"""
+
+        key = (source, month_id)
+        if key in self._time_axis_cache:
+            return self._time_axis_cache[key]
+        loader = self._time_axis_loaders[source]
+        if loader is None:
+            # 注入式 manager 沒有獨立軸 loader 時，沿用既有 loader；測試產品小型且
+            # 由 manager cache 控制生命週期。production from_roots 一定提供上面的
+            # time_utc_ns-only loader，不會走到這個 fallback。
+            entry = self._get_month(month_id)
+            result = self._time_array_for_entry(entry, source=source)
+        else:
+            result = loader(month_id)
+            if result is not None:
+                result = np.asarray(result)
+                if result.ndim != 1 or result.dtype != np.int64 or np.any(np.diff(result) <= 0):
+                    raise ValueError(f"{source} {month_id} time axis 必須是一維嚴格遞增 int64")
+        self._time_axis_cache[key] = result
+        return result
+
+    def _global_candidate_month_ids(self, source: str, target_ns: int) -> tuple[str, ...]:
+        """從已知月份的 UTC 軸找能提供全期最近端點的最小月份集合。
+
+        若產品提供 time-axis-only loader，只讀各月份的 UTC 軸，最後最多選出 exact、
+        before、after 對應的月份；完整 OCM／NWW 陣列仍延後到 `_get_month`。注入式
+        manager 沒有軸 loader 時回傳全部已知月份，讓小型測試 loader 以同一 bracket
+        邏輯驗證連續缺月；未提供月份索引則回空 tuple，維持舊 ±1 月行為。
+        """
+
+        month_ids = self._available_month_ids[source]
+        if not month_ids:
+            return ()
+        loader = self._time_axis_loaders[source]
+        if loader is None:
+            return month_ids
+        exact: list[str] = []
+        latest_before: int | None = None
+        earliest_after: int | None = None
+        before_ids: list[str] = []
+        after_ids: list[str] = []
+        target = int(target_ns)
+        for month_id in month_ids:
+            times = self._time_axis_for_month(source, month_id)
+            if times is None or times.size == 0:
+                continue
+            position = int(np.searchsorted(times, target, side="left"))
+            if position < times.size and int(times[position]) == target:
+                exact.append(month_id)
+                continue
+            if position > 0:
+                timestamp = int(times[position - 1])
+                if latest_before is None or timestamp > latest_before:
+                    latest_before = timestamp
+                    before_ids = [month_id]
+                elif timestamp == latest_before:
+                    before_ids.append(month_id)
+            if position < times.size:
+                timestamp = int(times[position])
+                if earliest_after is None or timestamp < earliest_after:
+                    earliest_after = timestamp
+                    after_ids = [month_id]
+                elif timestamp == earliest_after:
+                    after_ids.append(month_id)
+        if exact:
+            return tuple(sorted(set(exact)))
+        return tuple(sorted(set((*before_ids, *after_ids))))
+
+    @staticmethod
+    def _single_month_fallback_needs_global(
+        forcing: OCMNativeMonth | NWWAnalysisMonth | None,
+        target_ns: int,
+    ) -> bool:
+        """判斷單月長缺口／軸外查詢是否必須再找其他已知月份。"""
+
+        if forcing is None:
+            return True
+        times = forcing.time_utc_ns
+        if times.ndim != 1 or times.size == 0:
+            return True
+        position = int(np.searchsorted(times, target_ns, side="left"))
+        if position < times.size and int(times[position]) == target_ns:
+            return False
+        if position == 0 or position >= times.size:
+            return True
+        return int(times[position] - times[position - 1]) > int(forcing.maximum_time_gap_ns) * 2
+
     def _prepare_time_entries(
         self,
         month_id: str,
@@ -1054,6 +1291,10 @@ class ForcingWindowManager:
         candidate_ids.extend(
             sorted({_validate_month_id(value) for value in required_month_ids})
         )
+        if self.continuous_time_fallback:
+            # 只有 fallback 需要全期搜尋時才加入 known-month index；production index
+            # 先比較各月小型 UTC 軸，避免把所有大型月份 array pin 在 cache 中。
+            candidate_ids.extend(self._global_candidate_month_ids(source, target_ns))
         seen_ids = {item.month_id for item in entries}
         for neighbor_id in candidate_ids:
             if neighbor_id in seen_ids:
@@ -1075,7 +1316,9 @@ class ForcingWindowManager:
         先處理 exact，再處理前後端點；同 UTC duplicate 依月份順序採後者，與
         input/preflight 的 canonical prefer-last 一致。非 exact 時刻若兩端間距超過
         兩端產品中較嚴格的 maximum gap，就回 ``TIME_GAP``；沒有兩側資料則回
-        ``OUTSIDE_TIME_RANGE``。此 helper 絕不建立最近值或跨缺口外插。
+        ``OUTSIDE_TIME_RANGE``。啟用 manager 的 ``continuous_time_fallback`` 後，軸內
+        短缺口使用 before／after 線性內插，較長缺口與軸外查詢使用最近有效 endpoint，
+        等距固定採較早端；其餘空間與物理 QC 完全不在此放寬。
         """
 
         records: list[tuple[_MonthEntry, np.ndarray]] = []
@@ -1113,6 +1356,26 @@ class ForcingWindowManager:
                 SampleQC.OK,
             )
         if not before_candidates or not after_candidates:
+            if self.continuous_time_fallback:
+                candidates = before_candidates + after_candidates
+                if candidates:
+                    nearest_distance = min(abs(item[2] - target_ns) for item in candidates)
+                    nearest_candidates = [
+                        item for item in candidates if abs(item[2] - target_ns) == nearest_distance
+                    ]
+                    earlier = [item for item in nearest_candidates if item[2] <= target_ns]
+                    selected = max(
+                        earlier or nearest_candidates,
+                        key=lambda item: (item[0].month_id, item[1]),
+                    )
+                    return _GlobalTimeBracket(
+                        selected,
+                        selected,
+                        0.0,
+                        SampleQC.OK,
+                        fallback_used=True,
+                        fallback_policy="nearest_valid_temporal_endpoint",
+                    )
             return _GlobalTimeBracket(None, None, 0.0, SampleQC.OUTSIDE_TIME_RANGE)
 
         latest_time = max(item[2] for item in before_candidates)
@@ -1135,6 +1398,29 @@ class ForcingWindowManager:
             if value is not None
         ]
         if not limits or span > min(limits):
+            if self.continuous_time_fallback:
+                limit = min(limits) if limits else 0
+                if limit > 0 and span <= 2 * limit:
+                    alpha = (target_ns - before[2]) / span
+                    return _GlobalTimeBracket(
+                        before,
+                        after,
+                        float(alpha),
+                        SampleQC.OK,
+                        fallback_used=True,
+                        fallback_policy="linear_interpolation",
+                    )
+                before_distance = target_ns - before[2]
+                after_distance = after[2] - target_ns
+                selected = before if before_distance <= after_distance else after
+                return _GlobalTimeBracket(
+                    selected,
+                    selected,
+                    0.0,
+                    SampleQC.OK,
+                    fallback_used=True,
+                    fallback_policy="nearest_valid_temporal_endpoint",
+                )
             return _GlobalTimeBracket(before, after, 0.0, SampleQC.TIME_GAP)
         alpha = (target_ns - before[2]) / span
         return _GlobalTimeBracket(before, after, float(alpha), SampleQC.OK)
@@ -1153,8 +1439,9 @@ class ForcingWindowManager:
         預載相鄰月份。查詢必須嚴格位於首列與末列之間，因為末列可能與下一月重複，月尾
         查詢需由全域 bracket 執行 canonical prefer-last；若末列是下一曆月 halo，靠近
         該末列的最大允許時間間隔也必須交給全域路徑確認相鄰月份。通過此判定只表示
-        「不需跨月找端點」，同月內部仍可能有真正時間缺口，最後交由既有單月 ``sample``
-        回傳 ``TIME_GAP``，不以最近值、零值或外插補齊。
+        「不需跨月找端點」；同月內部若有真正時間缺口，預設由單月 ``sample`` 回傳
+        ``TIME_GAP``，啟用 ``continuous_time_fallback`` 時則由單月策略處理，且不以零
+        值補齊。
 
         參數 ``forcing`` 可是 OCM 或 NWW3 產品；傳入 ``None``、空時間軸或不符合首末
         範圍時回傳 ``False``，讓呼叫端走原本的 lazy 相鄰月份與全域 endpoint 流程。
@@ -1203,16 +1490,30 @@ class ForcingWindowManager:
         可能需要相鄰月份，回傳 ``None`` 交給既有全域 bracket；若 OCM 安全但 NWW 整月
         缺失，則保留原本「單次 NWW loader 後回 ``WAVE_UNSUPPORTED``」的行為。單月
         ``CombinedMonthForcing.sample`` 仍自行判定同月內部缺口、遮罩、垂向支援與物理
-        QC，因此本快取最佳化不會把時間範圍檢查放寬。
+        QC；時間 fallback 開關若已在產品 reader 啟用，單月路徑會沿用該策略，其他
+        gate 不會因此放寬。
         """
 
         entry = self._get_month(month_id)
         if not self._is_same_month_hot_path_safe(month_id, time_utc_ns, entry.ocm):
             return None
         assert entry.ocm is not None
+        if self.continuous_time_fallback and self._single_month_fallback_needs_global(
+            entry.ocm,
+            time_utc_ns,
+        ):
+            # 單月長缺口的最近端點不一定是全期最近端點；交給 global path 依 known
+            # month index 探查連續缺月或更近的另一月份。短缺口仍可留在 hot path。
+            return None
         if include_stokes:
             nww = self._ensure_nww(entry)
             if nww is None:
+                if self.continuous_time_fallback:
+                    # execution-priority 將「整月沒有 NWW 時間列」視為純時間支援缺口，
+                    # 交給全期 known-month index 搜尋其他有效月份。若整個 NWW 產品期
+                    # 都沒有任何有效列，後續 global bracket 仍會回傳原本的波浪不可用／
+                    # 時間範圍失敗；這裡不能先把查詢截斷，否則永遠看不到鄰月 endpoint。
+                    return None
                 current = entry.ocm.sample(
                     x_m,
                     y_m,
@@ -1229,6 +1530,11 @@ class ForcingWindowManager:
                     diagnostics={**current.diagnostics, "nww_month_missing": 1},
                 )
             if not self._is_same_month_hot_path_safe(month_id, time_utc_ns, nww):
+                return None
+            if self.continuous_time_fallback and self._single_month_fallback_needs_global(
+                nww,
+                time_utc_ns,
+            ):
                 return None
         combined = self._combined(
             entry,
@@ -1323,6 +1629,7 @@ class ForcingWindowManager:
         *,
         before_month: str | None = None,
         after_month: str | None = None,
+        diagnostics_extra: Mapping[str, bool | float | int | str] | None = None,
     ) -> VelocitySample:
         """建立跨月時間 bracket 失敗樣本，明確區分缺時與整月不存在。"""
 
@@ -1334,6 +1641,8 @@ class ForcingWindowManager:
             diagnostics["endpoint_month_before"] = before_month
         if after_month is not None:
             diagnostics["endpoint_month_after"] = after_month
+        if diagnostics_extra:
+            diagnostics.update(diagnostics_extra)
         return VelocitySample(
             0.0,
             0.0,
@@ -1346,6 +1655,56 @@ class ForcingWindowManager:
             forcing_month_id=month_id,
             diagnostics=diagnostics,
         )
+
+    def _time_fallback_diagnostics(
+        self,
+        bracket: _GlobalTimeBracket,
+        target_ns: int,
+        *,
+        source: str,
+    ) -> dict[str, bool | float | int | str]:
+        """將 manager 的全域時間 bracket fallback 轉成可寫入 sample 的稽核欄位。
+
+        ``bracket`` 的兩端已是實際 loaded month row；這裡只保存選擇策略、目標 UTC、
+        實際端點與秒級偏移，並以 OCM row diagnostics 保留 observed/reconstructed 來源。
+        這個 helper 不改變 bracket 的數值、空間位置或其他品質旗標。
+        """
+
+        if not bracket.fallback_used or bracket.before is None or bracket.after is None:
+            return {}
+        before_entry, before_index, before_ns = bracket.before
+        after_entry, after_index, after_ns = bracket.after
+        target = int(target_ns)
+        before_distance = abs(int(before_ns) - target)
+        after_distance = abs(int(after_ns) - target)
+        actual_ns = int(before_ns) if before_distance <= after_distance else int(after_ns)
+        if source == "ocm" and before_entry.ocm is not None and after_entry.ocm is not None:
+            before_origin = before_entry.ocm._row_diagnostics(before_index).get(
+                "ocm_time_origin", "observed"
+            )
+            after_origin = after_entry.ocm._row_diagnostics(after_index).get(
+                "ocm_time_origin", "observed"
+            )
+            data_origin = before_origin if before_origin == after_origin else "mixed"
+        else:
+            data_origin = "observed"
+        return {
+            "continuous_time_fallback": 1,
+            "continuous_time_fallback_strategy_id": CONTINUOUS_TIME_FALLBACK_STRATEGY_ID,
+            "continuous_time_fallback_source": source,
+            "continuous_time_fallback_target_utc_ns": target,
+            "continuous_time_fallback_actual_utc_ns": actual_ns,
+            "continuous_time_fallback_offset_seconds": abs(actual_ns - target) / 1_000_000_000.0,
+            "continuous_time_fallback_before_utc_ns": int(before_ns),
+            "continuous_time_fallback_after_utc_ns": int(after_ns),
+            "continuous_time_fallback_before_offset_seconds": (int(before_ns) - target)
+            / 1_000_000_000.0,
+            "continuous_time_fallback_after_offset_seconds": (int(after_ns) - target)
+            / 1_000_000_000.0,
+            "continuous_time_fallback_policy": bracket.fallback_policy
+            or "nearest_valid_temporal_endpoint",
+            "continuous_time_fallback_data_origin": str(data_origin),
+        }
 
     @staticmethod
     def _interpolated_geometry(
@@ -1382,12 +1741,32 @@ class ForcingWindowManager:
     ) -> VelocitySample:
         """組合跨月份 OCM／NWW endpoint，並讓 CombinedForcing 完成 Stokes 合成。"""
 
+        ocm_fallback_diagnostics = self._time_fallback_diagnostics(
+            ocm_bracket, time_utc_ns, source="ocm"
+        )
+        nww_fallback_diagnostics = (
+            self._time_fallback_diagnostics(nww_bracket, time_utc_ns, source="nww")
+            if nww_bracket is not None
+            else {}
+        )
+        fallback_diagnostics = _merge_continuous_time_diagnostics(
+            ocm_fallback_diagnostics,
+            nww_fallback_diagnostics,
+        )
         if ocm_bracket.before is None or ocm_bracket.after is None:
-            return self._invalid_time_bracket_sample(query_month_id, ocm_bracket.qc)
+            return self._invalid_time_bracket_sample(
+                query_month_id,
+                ocm_bracket.qc,
+                diagnostics_extra=fallback_diagnostics,
+            )
         ocm_before_entry, ocm_before_index, _ = ocm_bracket.before
         ocm_after_entry, ocm_after_index, _ = ocm_bracket.after
         if ocm_before_entry.ocm is None or ocm_after_entry.ocm is None:
-            return self._invalid_time_bracket_sample(query_month_id, SampleQC.OUTSIDE_TIME_RANGE)
+            return self._invalid_time_bracket_sample(
+                query_month_id,
+                SampleQC.OUTSIDE_TIME_RANGE,
+                diagnostics_extra=fallback_diagnostics,
+            )
         before_location, before_geometry = ocm_before_entry.ocm.geometry_at_time_index(
             x_m,
             y_m,
@@ -1406,6 +1785,7 @@ class ForcingWindowManager:
                 SampleQC.OUTSIDE_HORIZONTAL_DOMAIN,
                 before_month=ocm_before_entry.month_id,
                 after_month=ocm_after_entry.month_id,
+                diagnostics_extra=fallback_diagnostics,
             )
         if (
             before_location.triangle_id != after_location.triangle_id
@@ -1416,6 +1796,7 @@ class ForcingWindowManager:
                 SampleQC.NUMERICAL_FAILURE,
                 before_month=ocm_before_entry.month_id,
                 after_month=ocm_after_entry.month_id,
+                diagnostics_extra=fallback_diagnostics,
             )
         geometry = self._interpolated_geometry(before_geometry, after_geometry, ocm_bracket.alpha)
         support_z = _cross_month_support_z(z_m, geometry)
@@ -1425,6 +1806,7 @@ class ForcingWindowManager:
                 SampleQC.VERTICAL_UNSUPPORTED,
                 before_month=ocm_before_entry.month_id,
                 after_month=ocm_after_entry.month_id,
+                diagnostics_extra=fallback_diagnostics,
             )
         ocm_before = ocm_before_entry.ocm.sample_at_time_index(
             x_m,
@@ -1496,7 +1878,7 @@ class ForcingWindowManager:
                 include_stokes=include_stokes,
                 physics_kernel_backend=self.physics_kernel_backend,
             )
-            return combined.sample_from_endpoints(
+            result = combined.sample_from_endpoints(
                 x_m=x_m,
                 y_m=y_m,
                 z_m=z_m,
@@ -1513,6 +1895,12 @@ class ForcingWindowManager:
                 endpoint_nww_month_before=nww_before_month,
                 endpoint_nww_month_after=nww_after_month,
             )
+            if fallback_diagnostics:
+                result = replace(
+                    result,
+                    diagnostics={**result.diagnostics, **fallback_diagnostics},
+                )
+            return result
         combined = CombinedMonthForcing(
             ocm=ocm_before_entry.ocm,
             nww=None,
@@ -1534,6 +1922,8 @@ class ForcingWindowManager:
             endpoint_month_after=ocm_after_entry.month_id,
         )
         if not current.valid:
+            if fallback_diagnostics:
+                return replace(current, diagnostics={**current.diagnostics, **fallback_diagnostics})
             return current
         diagnostics = {
             **current.diagnostics,
@@ -1544,7 +1934,7 @@ class ForcingWindowManager:
             current,
             qc=SampleQC.WAVE_UNSUPPORTED if nww_missing else nww_qc,
             components=None,
-            diagnostics=diagnostics,
+            diagnostics={**diagnostics, **fallback_diagnostics},
         )
 
     def sample(
@@ -1562,11 +1952,14 @@ class ForcingWindowManager:
 
         月份目錄只決定 lazy loader 的初始候選；真正時間支援由 OCM（以及啟用 Stokes
         時的 NWW3）各自的 ``time_utc_ns`` 建立。月界 halo 的 exact duplicate 遵守
-        canonical prefer-last；非 exact query 若兩端 span 超過原產品的 maximum gap
-        仍回 ``TIME_GAP``，沒有兩側資料則回 ``OUTSIDE_TIME_RANGE``。跨月 scope 會
+        canonical prefer-last；非 exact query 若兩端 span 超過原產品的 maximum gap，
+        預設仍回 ``TIME_GAP``，沒有兩側資料則回 ``OUTSIDE_TIME_RANGE``；啟用
+        ``continuous_time_fallback`` 時，純時間缺口依版本化策略內插或選最近有效端點。
+        跨月 scope 會
         暫時 pin 兩端，避免 ``max_resident_months=1`` 在第二端載入時淘汰仍在使用的
         第一端；資料陣列、遮罩、垂向支援與 Stokes／沉降物理都由原 endpoint／combined
-        API 保持，不以最近值、零值或合成 total velocity 補洞。
+        API 保持；預設不以最近值、零值或合成 total velocity 補洞，fallback 也不放寬
+        空間、垂向、乾面與波浪物理品質 gate。
         """
 
         month_id = _month_from_utc_ns(time_utc_ns)
@@ -1702,6 +2095,7 @@ class ForcingWindowManager:
         settings: SmagorinskySettings,
         *,
         bracket: _GlobalTimeBracket,
+        target_ns: int,
         query_month_id: str,
         triangle_hint: int | None,
     ) -> DiffusionSample:
@@ -1714,6 +2108,11 @@ class ForcingWindowManager:
         不以零擴散取代缺資料。
         """
 
+        fallback_diagnostics = self._time_fallback_diagnostics(
+            bracket,
+            target_ns,
+            source="ocm",
+        )
         if bracket.before is None or bracket.after is None:
             return self._missing_smagorinsky_sample(
                 query_month_id,
@@ -1749,6 +2148,7 @@ class ForcingWindowManager:
                     "method": "smagorinsky_native_mesh_p1_nodal",
                     "forcing_month_id": query_month_id,
                     "cross_month_endpoint": 1,
+                    **fallback_diagnostics,
                 },
             )
         if (
@@ -1764,6 +2164,7 @@ class ForcingWindowManager:
                     "forcing_month_id": query_month_id,
                     "cross_month_endpoint": 1,
                     "endpoint_identity_mismatch": 1,
+                    **fallback_diagnostics,
                 },
             )
         geometry = self._interpolated_geometry(before_geometry, after_geometry, bracket.alpha)
@@ -1776,6 +2177,7 @@ class ForcingWindowManager:
                     "method": "smagorinsky_native_mesh_p1_nodal",
                     "forcing_month_id": query_month_id,
                     "cross_month_endpoint": 1,
+                    **fallback_diagnostics,
                 },
             )
         support_z = _cross_month_support_z(z_m, geometry)
@@ -1810,6 +2212,7 @@ class ForcingWindowManager:
                     "cross_month_endpoint": 1,
                     "endpoint_month_before": before_entry.month_id,
                     "endpoint_month_after": after_entry.month_id,
+                    **fallback_diagnostics,
                 },
             )
         weight = float(bracket.alpha)
@@ -1866,6 +2269,7 @@ class ForcingWindowManager:
             diagnostics["raw_current_triangle_kh_m2ps"] = float(raw_before) + weight * (
                 float(raw_after) - float(raw_before)
             )
+        diagnostics.update(fallback_diagnostics)
         return DiffusionSample(
             coefficients=DiffusionCoefficients(float(kh), float(kh), settings.constant_kz_m2ps),
             diffusivity_divergence_mps=(float(grad_x), float(grad_y), 0.0),
@@ -1917,8 +2321,10 @@ class ForcingWindowManager:
         manager 仍只在取樣時 lazy 載入當月／相鄰月份，並沿用同一 OCM LRU。單月內部
         查詢維持既有 ``OCMNativeMonth.sample_smagorinsky_diffusion``；跨月時先在各端
         完成 native mesh 的 Kh candidate、floor/cap、nodal area weighting 與 gradient，
-        再依全域 UTC bracket 線性內插。這條路徑不呼叫 NWW 或 Combined forcing；真正
-        的資料缺時仍回 ``TIME_GAP``／``OUTSIDE_TIME_RANGE``，不改用最近月或零擴散。
+        再依全域 UTC bracket 線性內插。這條路徑不呼叫 NWW 或 Combined forcing；預設
+        的資料缺時仍回 ``TIME_GAP``／``OUTSIDE_TIME_RANGE``。啟用
+        ``continuous_time_fallback`` 時，純時間缺口才依同一版本化策略內插或選最近有效
+        時間端點；乾面、垂向、空間域外與非有限值仍回非零 QC，不改用零擴散。
         """
 
         if not isinstance(settings, SmagorinskySettings):
@@ -1973,6 +2379,7 @@ class ForcingWindowManager:
                 z_m,
                 settings,
                 bracket=bracket,
+                target_ns=time_utc_ns,
                 query_month_id=month_id,
                 triangle_hint=triangle_hint,
             )

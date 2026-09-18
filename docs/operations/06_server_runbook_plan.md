@@ -373,7 +373,7 @@ uv run python scripts/run_formal_parallel.py \
 其他 process 重用的編譯快取。記錄它輸出的 `log_session` 與 summary；若檢查失敗，保留
 `numba-warmup.log`。正式 worker 仍會在各自程序內再次預熱一次。
 
-#### 8.4 執行固定 worker 的正式完整母體
+#### 8.4 執行正式完整母體（dynamic queue；static 可相容）
 
 沿用同一 workspace、設定、roots、worker count、storage gate 與（如適用）Numba cache。runner
 會在啟動子程序前以 `findmnt` 核對本次 `scratch_root` 的 NFS source token 與 PASS gate 相同；
@@ -382,8 +382,16 @@ uv run python scripts/run_formal_parallel.py \
 `(fstype, source)`；相同列可去重，不同非-autofs identity 或多個最深 target 直接停止。只有
 autofs 時保留實際 `autofs` 結果，交由後續 NFS gate 拒絕，不能把包裝層誤報為 NFS。
 Linux 可用時為每個長壽命 worker 固定分配允許的 CPU；在其他平台或 cpuset API 不可用時安全不綁定，
-並在 worker summary 記錄 fallback。worker group 按 run plan scenario 順序保持連續，以 plan 中的
-region／arrival month 與表格已有 site／flow-domain 欄位摘要 locality，不會猜欄位，也不改物理設定：
+並在 worker summary 記錄 fallback。dynamic queue 按 run plan scenario 順序保留連續性，並以 plan
+中的 region／arrival month 與表格已有 site／flow-domain 欄位摘要 locality，不會猜欄位，也不改物理設定：
+
+正式執行預設是 parent queue 動態派片；若本次目標是讓粒子跨越純時間缺口仍完成統計，另須
+明示 `--execution-priority`。此開關只影響 forcing 的時間查詢：OCM 採觀測／核准重建合併軸，
+連續缺口、缺月或全期軸外查詢使用全期最近有效端點（等距取較早），短缺口仍可作合法線性
+內插；每次使用都記錄來源、目標／實際 UTC、偏移秒數與策略 ID
+`execution_priority_continuous_time_v1`。它不需重跑既有 `inputs-build`，不修改 common-input、
+release config、seed 或 run plan。乾面、水平域外、垂向／波浪不支援、無效物理、非有限局部場
+與合理邊界終止仍照原規則處理；未指定時維持預設 fail-closed。
 
 ```bash
 PARALLEL_CACHE_ARGS=()
@@ -403,6 +411,7 @@ uv run python scripts/run_formal_parallel.py \
   --ocm-native-root "$OCM_NATIVE_ROOT" \
   --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
   --cpu-affinity auto \
+  --execution-priority \
   "${PARALLEL_CACHE_ARGS[@]}" \
   2>&1 | tee "$LBT_PARALLEL_CONSOLE_LOG"
 RUNNER_EXIT=${PIPESTATUS[0]}
@@ -412,7 +421,8 @@ test "$RUNNER_EXIT" -eq 0
 若不用 Numba backend，應先 `unset LBT_NUMBA_CACHE_DIR`，上方條件展開就不會傳 cache 參數；若
 `auto` 不符合核准的排程政策，可改成 `--cpu-affinity 0,1,2` 等實際 cpuset 內 ID，不能憑機器核心
 總數猜測。需要恢復部分 run 時，僅在下次明確加 `--resume`；不能更換 run ID、seed、config、輸入或
-checkpoint root。worker count 只影響執行分組，不會改 run identity。
+checkpoint root。`worker_count` 代表同時存活的 persistent child／併發上限；它不改 run identity，
+也不表示每個 child 只處理一個固定分組。
 
 #### 8.5 完成條件與失敗處置
 
@@ -423,7 +433,16 @@ PARALLEL_SESSION="$(jq -r '.log_session // empty' "$LBT_PARALLEL_CONSOLE_LOG")"
 test -n "$PARALLEL_SESSION" || { echo "沒有執行摘要；保留 console log 並停止"; exit 2; }
 PARALLEL_SUMMARY="$LBT_PARALLEL_LOG_ROOT/$PARALLEL_SESSION/summary.json"
 test "$(jq -r '.status' "$PARALLEL_SUMMARY")" = COMPLETE
-jq -e '.valid == true and (.worker_records | all(.[]; .exit_code == 0 and .status == "EXITED"))' \
+jq -e '
+  .execution_mode == "dynamic" and
+  .status == "COMPLETE" and
+  .valid == true and
+  (.worker_records | all(.[]; .exit_code == 0)) and
+  (.failed_shard_ids | length == 0) and
+  (.pending_shard_ids | length == 0) and
+  (.inflight_shard_ids | length == 0) and
+  (.stopped_inflight_shard_ids | length == 0)
+' \
   "$PARALLEL_SUMMARY"
 uv run lbt validate-run "$WORKSPACE" \
   --checkpoint-root "$LBT_CHECKPOINT_ROOT" \

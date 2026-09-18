@@ -601,6 +601,301 @@ def test_cross_month_gap_over_maximum_time_gap_remains_time_gap() -> None:
     assert actual.components is None
 
 
+def test_execution_priority_short_gap_interpolates_and_records_temporal_provenance() -> None:
+    """execution-priority 只接續短時間缺口，並保存 target／endpoint 稽核欄位。"""
+
+    times = [_utc_ns("2024-08-01T00:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")]
+    ocm = _ocm_cross_month("202408", times, maximum_time_gap_seconds=3_600.0)
+    manager, _, _ = _manager(
+        {"202408": ocm},
+        continuous_time_fallback=True,
+    )
+    target = _utc_ns("2024-08-01T01:00:00Z")
+    sample = manager.provider(-0.002, include_stokes=False).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+
+    assert sample.valid
+    endpoint_before = ocm.sample(1.0, 1.0, -5.0, times[0], triangle_hint=0)
+    endpoint_after = ocm.sample(1.0, 1.0, -5.0, times[1], triangle_hint=0)
+    assert sample.u_mps == pytest.approx((endpoint_before.u_mps + endpoint_after.u_mps) / 2.0)
+    assert sample.diagnostics["continuous_time_fallback"] == 1
+    assert (
+        sample.diagnostics["continuous_time_fallback_strategy_id"]
+        == "execution_priority_continuous_time_v1"
+    )
+    assert sample.diagnostics["continuous_time_fallback_policy"] == "linear_interpolation"
+    assert sample.diagnostics["continuous_time_fallback_target_utc_ns"] == target
+    assert sample.diagnostics["continuous_time_fallback_before_offset_seconds"] == pytest.approx(-3600.0)
+    assert sample.diagnostics["continuous_time_fallback_after_offset_seconds"] == pytest.approx(3600.0)
+
+
+def test_execution_priority_long_gap_uses_nearest_earlier_endpoint() -> None:
+    """長時間缺口使用 deterministic nearest endpoint，等距時採較早列。"""
+
+    times = [_utc_ns("2024-08-01T00:00:00Z"), _utc_ns("2024-08-01T06:00:00Z")]
+    ocm = _ocm_cross_month("202408", times, maximum_time_gap_seconds=3_600.0)
+    manager, _, _ = _manager(
+        {"202408": ocm},
+        continuous_time_fallback=True,
+    )
+    target = _utc_ns("2024-08-01T03:00:00Z")
+    sample = manager.provider(-0.002, include_stokes=False).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+
+    assert sample.valid
+    endpoint_before = ocm.sample(1.0, 1.0, -5.0, times[0], triangle_hint=0)
+    assert sample.u_mps == pytest.approx(endpoint_before.u_mps)
+    assert sample.diagnostics["continuous_time_fallback_policy"] == "nearest_valid_temporal_endpoint"
+    assert sample.diagnostics["continuous_time_fallback_actual_utc_ns"] == times[0]
+    assert sample.diagnostics["continuous_time_fallback_offset_seconds"] == pytest.approx(10_800.0)
+
+
+def test_execution_priority_axis_outside_uses_nearest_valid_endpoint() -> None:
+    """時間軸前後越界可取最近列，但不影響水平／垂向品質檢查。"""
+
+    month = _ocm_cross_month(
+        "202408",
+        [_utc_ns("2024-08-01T00:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")],
+        maximum_time_gap_seconds=3_600.0,
+    )
+    month.continuous_time_fallback = True
+    before = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-07-31T23:00:00Z"), triangle_hint=0)
+    after = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T03:00:00Z"), triangle_hint=0)
+
+    assert before.valid and after.valid
+    assert before.diagnostics["continuous_time_fallback_actual_utc_ns"] == month.time_utc_ns[0]
+    assert after.diagnostics["continuous_time_fallback_actual_utc_ns"] == month.time_utc_ns[-1]
+
+    vertical = month.sample(1.0, 1.0, 100.0, _utc_ns("2024-08-01T01:00:00Z"), triangle_hint=0)
+    assert vertical.qc == SampleQC.VERTICAL_UNSUPPORTED
+
+    month.wetdry_elem[...] = 1.0
+    dry = month.sample(1.0, 1.0, -5.0, _utc_ns("2024-08-01T01:00:00Z"), triangle_hint=0)
+    assert dry.qc == SampleQC.DRY_FACE
+    outside = month.sample(10_000.0, 10_000.0, -5.0, _utc_ns("2024-08-01T01:00:00Z"))
+    assert outside.qc == SampleQC.OUTSIDE_HORIZONTAL_DOMAIN
+
+
+def test_execution_priority_injected_index_searches_across_consecutive_missing_months() -> None:
+    """注入式 manager 在連續缺月時使用全期最近 OCM endpoint，而非只看 ±1 月。"""
+
+    ocm_by_month = {
+        "202401": _ocm_cross_month(
+            "202401",
+            [_utc_ns("2024-01-01T00:00:00Z"), _utc_ns("2024-01-01T01:00:00Z")],
+            maximum_time_gap_seconds=3_600.0,
+            reference_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        ),
+        "202404": _ocm_cross_month(
+            "202404",
+            [_utc_ns("2024-04-01T00:00:00Z"), _utc_ns("2024-04-01T01:00:00Z")],
+            maximum_time_gap_seconds=3_600.0,
+            reference_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        ),
+        "202406": _ocm_cross_month(
+            "202406",
+            [_utc_ns("2024-06-01T00:00:00Z"), _utc_ns("2024-06-01T01:00:00Z")],
+            maximum_time_gap_seconds=3_600.0,
+            reference_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        ),
+    }
+    known_months = tuple(ocm_by_month)
+    target = _utc_ns("2024-03-01T00:00:00Z")
+    fallback_manager, _, _ = _manager(
+        ocm_by_month,
+        continuous_time_fallback=True,
+        available_ocm_month_ids=known_months,
+    )
+    fallback = fallback_manager.provider(-0.002, include_stokes=False).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+
+    assert fallback.valid
+    assert fallback.forcing_month_id == "202404"
+    assert fallback.diagnostics["continuous_time_fallback_source"] == "ocm"
+    assert fallback.diagnostics["continuous_time_fallback_policy"] == (
+        "nearest_valid_temporal_endpoint"
+    )
+    assert fallback.diagnostics["continuous_time_fallback_actual_utc_ns"] == _utc_ns(
+        "2024-04-01T00:00:00Z"
+    )
+
+    fail_closed_manager, _, _ = _manager(
+        ocm_by_month,
+        continuous_time_fallback=False,
+        available_ocm_month_ids=known_months,
+    )
+    fail_closed = fail_closed_manager.provider(-0.002, include_stokes=False).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+    assert fail_closed.qc == SampleQC.OUTSIDE_TIME_RANGE
+
+
+def test_execution_priority_nww_missing_current_month_uses_known_later_month() -> None:
+    """當月 NWW 缺失時，fallback 應搜尋已知鄰月而非提前回波浪不可用。"""
+
+    reference_ns = _utc_ns("2024-01-01T00:00:00Z")
+    ocm_by_month = {
+        "202403": _ocm_cross_month(
+            "202403",
+            [_utc_ns("2024-03-01T00:00:00Z"), _utc_ns("2024-03-01T01:00:00Z")],
+            maximum_time_gap_seconds=3_600.0,
+            reference_ns=reference_ns,
+        ),
+    }
+    nww_by_month = {
+        "202404": _nww_cross_month(
+            "202404",
+            [_utc_ns("2024-04-01T00:00:00Z"), _utc_ns("2024-04-01T01:00:00Z")],
+            maximum_time_gap_seconds=3_600.0,
+            reference_ns=reference_ns,
+        ),
+    }
+    target = _utc_ns("2024-03-01T00:30:00Z")
+    fallback_manager, _, _ = _manager(
+        ocm_by_month,
+        nww_by_month,
+        continuous_time_fallback=True,
+        available_ocm_month_ids=("202403",),
+        available_nww_month_ids=("202404",),
+    )
+    fallback = fallback_manager.provider(-0.002, include_stokes=True).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+
+    assert fallback.valid
+    assert fallback.components is not None
+    assert fallback.diagnostics["continuous_time_fallback_source"] == "nww"
+    assert fallback.diagnostics["continuous_time_fallback_actual_utc_ns"] == _utc_ns(
+        "2024-04-01T00:00:00Z"
+    )
+
+    strict_manager, _, _ = _manager(
+        ocm_by_month,
+        nww_by_month,
+        continuous_time_fallback=False,
+        available_ocm_month_ids=("202403",),
+        available_nww_month_ids=("202404",),
+    )
+    strict = strict_manager.provider(-0.002, include_stokes=True).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+    assert strict.qc == SampleQC.WAVE_UNSUPPORTED
+
+
+@pytest.mark.parametrize(
+    ("target_text", "expected_actual"),
+    [
+        ("2023-12-01T00:00:00Z", "2024-01-01T00:00:00Z"),
+        ("2024-07-01T00:00:00Z", "2024-06-01T01:00:00Z"),
+    ],
+)
+def test_execution_priority_injected_index_handles_before_and_after_full_period(
+    target_text: str,
+    expected_actual: str,
+) -> None:
+    """查詢早於最早月或晚於最晚月時，fallback 仍選全期最近端點。"""
+
+    ocm_by_month = {
+        "202401": _ocm_cross_month(
+            "202401",
+            [_utc_ns("2024-01-01T00:00:00Z"), _utc_ns("2024-01-01T01:00:00Z")],
+            maximum_time_gap_seconds=3_600.0,
+            reference_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        ),
+        "202406": _ocm_cross_month(
+            "202406",
+            [_utc_ns("2024-06-01T00:00:00Z"), _utc_ns("2024-06-01T01:00:00Z")],
+            maximum_time_gap_seconds=3_600.0,
+            reference_ns=_utc_ns("2024-01-01T00:00:00Z"),
+        ),
+    }
+    fallback_manager, _, _ = _manager(
+        ocm_by_month,
+        continuous_time_fallback=True,
+        available_ocm_month_ids=tuple(ocm_by_month),
+    )
+    target = _utc_ns(target_text)
+    fallback = fallback_manager.provider(-0.002, include_stokes=False).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+    assert fallback.valid
+    assert fallback.diagnostics["continuous_time_fallback_source"] == "ocm"
+    assert fallback.diagnostics["continuous_time_fallback_target_utc_ns"] == target
+    assert fallback.diagnostics["continuous_time_fallback_actual_utc_ns"] == _utc_ns(
+        expected_actual
+    )
+    assert fallback.diagnostics["continuous_time_fallback_offset_seconds"] > 0
+
+    fail_closed_manager, _, _ = _manager(
+        ocm_by_month,
+        continuous_time_fallback=False,
+        available_ocm_month_ids=tuple(ocm_by_month),
+    )
+    fail_closed = fail_closed_manager.provider(-0.002, include_stokes=False).sample(
+        1.0, 1.0, -5.0, target, triangle_hint=0
+    )
+    assert fail_closed.qc == SampleQC.OUTSIDE_TIME_RANGE
+
+
+def test_execution_priority_nww_short_gap_preserves_wave_physics() -> None:
+    """NWW 時間缺口可接續，但四角遮罩與波浪物理仍由原本取樣器檢查。"""
+
+    nww = _nww_cross_month(
+        "202408",
+        [_utc_ns("2024-08-01T00:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")],
+        maximum_time_gap_seconds=3_600.0,
+    )
+    nww.continuous_time_fallback = True
+    target = _utc_ns("2024-08-01T01:00:00Z")
+    sample = nww.sample(121.0, 25.0, target)
+
+    assert sample.valid
+    assert sample.diagnostics["continuous_time_fallback_source"] == "nww"
+    nww.valid_mask_wave[1, 0, 0] = False
+    invalid = nww.sample(121.0, 25.0, target)
+    assert invalid.qc == SampleQC.WAVE_UNSUPPORTED
+
+
+def test_execution_priority_combined_diagnostics_keep_ocm_and_nww_sources() -> None:
+    """同一次 Stokes 取樣同時 fallback 時，不得以後讀取產品覆寫前一產品紀錄。"""
+
+    month_id = "202408"
+    ocm = _ocm_cross_month(
+        month_id,
+        [_utc_ns("2024-08-01T00:00:00Z"), _utc_ns("2024-08-01T02:00:00Z")],
+        maximum_time_gap_seconds=3_600.0,
+    )
+    nww = _nww_cross_month(
+        month_id,
+        [_utc_ns("2024-08-01T00:00:00Z"), _utc_ns("2024-08-01T06:00:00Z")],
+        maximum_time_gap_seconds=3_600.0,
+    )
+    ocm.continuous_time_fallback = True
+    nww.continuous_time_fallback = True
+    target = _utc_ns("2024-08-01T04:00:00Z")
+    result = CombinedMonthForcing(
+        ocm=ocm,
+        nww=nww,
+        projection=DomainProjection(121.0, 25.0),
+        settling_velocity_mps=-0.002,
+        include_stokes=True,
+    ).sample(1.0, 1.0, -5.0, target, triangle_hint=0)
+
+    assert result.valid
+    assert result.diagnostics["continuous_time_fallback_source"] == "ocm+nww"
+    assert (
+        result.diagnostics["continuous_time_fallback_actual_utc_ns_ocm"]
+        == ocm.time_utc_ns[-1]
+    )
+    assert (
+        result.diagnostics["continuous_time_fallback_actual_utc_ns_nww"]
+        == nww.time_utc_ns[-1]
+    )
+
+
 def test_cross_month_nww_invalid_corner_remains_wave_unsupported() -> None:
     """跨月 NWW 任一必要四角失效時仍須回傳 WAVE_UNSUPPORTED，不可補零 Stokes。"""
 
@@ -880,6 +1175,9 @@ def _manager(
     nww_by_month: dict[str, NWWAnalysisMonth] | None = None,
     *,
     max_resident_months: int = 2,
+    continuous_time_fallback: bool = False,
+    available_ocm_month_ids: tuple[str, ...] | None = None,
+    available_nww_month_ids: tuple[str, ...] | None = None,
 ) -> tuple[ForcingWindowManager, Mock, Mock]:
     """建立注入式 manager 並回傳 loader mocks，方便檢查 lazy load 次數。"""
 
@@ -894,6 +1192,9 @@ def _manager(
         ocm_loader=ocm_loader,
         nww_loader=nww_loader,
         max_resident_months=max_resident_months,
+        continuous_time_fallback=continuous_time_fallback,
+        available_ocm_month_ids=available_ocm_month_ids,
+        available_nww_month_ids=available_nww_month_ids,
     )
     return manager, ocm_loader, nww_loader
 

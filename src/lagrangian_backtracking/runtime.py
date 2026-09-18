@@ -2099,6 +2099,7 @@ class RuntimeRequestFactory:
         ocm_reconstruction_root: str | Path | None = None,
         experiment_case_id: str,
         run_kind: str = "pilot",
+        continuous_time_fallback: bool = False,
     ) -> None:
         """驗證 pilot/formal 建立條件並保存不會改寫的 lookup；不開啟 forcing 資料。
 
@@ -2108,12 +2109,17 @@ class RuntimeRequestFactory:
         production alias 或任何缺口／路徑 fallback。NWW root 只有在有限水深 Stokes 案例
         中才會驗證；三個 Smagorinsky case 使用獨立的 OCM-only diffusion facade，但因
         registry 將它們的 velocity 設為 include-Stokes，仍會驗證 NWW root；``no_stokes``
-        則完全忽略傳入的 NWW 參數，連路徑是否存在都不查。
+        則完全忽略傳入的 NWW 參數，連路徑是否存在都不查。``continuous_time_fallback``
+        預設為 ``False``，只在明確啟用時交給 forcing manager 放寬純時間缺口／軸外端點；
+        不會把空間域外、乾面、垂向不支援、波浪物理或非有限樣本轉成有效樣本。
         """
 
         if type(run_kind) is not str or run_kind not in _RUNTIME_RUN_KINDS:
             raise ValueError("run_kind 只允許 pilot 或 formal；未知模式禁止 fallback")
         self._run_kind = run_kind
+        if type(continuous_time_fallback) is not bool:
+            raise TypeError("continuous_time_fallback 必須是 bool")
+        self._continuous_time_fallback = continuous_time_fallback
         case_spec = _experiment_case_spec(experiment_case_id)
         include_stokes = case_spec.include_stokes
         self._experiment_case_id = experiment_case_id
@@ -2435,15 +2441,23 @@ class RuntimeRequestFactory:
         # face provenance 驗證。如此不改變既有 active request 的副作用與錯誤時序。
         manager = self._managers.get(flow_id)
         if manager is None:
+            manager_kwargs: dict[str, object] = {
+                "flow_domain_id": flow_id,
+                "projection": projection,
+                "ocm_root": self._ocm_root,
+                "nww_root": self._nww_root,
+                "reconstruction_root": self._ocm_reconstruction_root,
+                "max_resident_months": self._max_resident_months,
+                "use_numba_kernel": self._ocm_use_numba_kernel,
+                "physics_kernel_backend": self._physics_kernel_backend,
+            }
+            # 保留舊版測試替身與外部相容呼叫端的嚴格具名簽名：預設 False 的新
+            # 參數不必傳入，只有 execution-priority 明確啟用時才加入 kwargs。
+            # 省略與傳入 False 的語意完全相同，且不改變既有 fail-closed 路徑。
+            if self._continuous_time_fallback:
+                manager_kwargs["continuous_time_fallback"] = True
             manager = ForcingWindowManager.from_roots(
-                flow_domain_id=flow_id,
-                projection=projection,
-                ocm_root=self._ocm_root,
-                nww_root=self._nww_root,
-                reconstruction_root=self._ocm_reconstruction_root,
-                max_resident_months=self._max_resident_months,
-                use_numba_kernel=self._ocm_use_numba_kernel,
-                physics_kernel_backend=self._physics_kernel_backend,
+                **manager_kwargs,
             )
             self._managers[flow_id] = manager
 
@@ -2601,6 +2615,7 @@ def _open_run_controller(
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
     expected_run_kind: str | None = None,
+    continuous_time_fallback: bool = False,
 ) -> RunController:
     """依共用 static binding snapshot 開啟 pilot/formal controller；不啟動 shard。
 
@@ -2614,6 +2629,8 @@ def _open_run_controller(
 
     if type(resume) is not bool:
         raise TypeError("resume 必須是 bool")
+    if type(continuous_time_fallback) is not bool:
+        raise TypeError("continuous_time_fallback 必須是 bool")
 
     static_inputs = load_validated_run_static_inputs(
         workspace,
@@ -2642,6 +2659,10 @@ def _open_run_controller(
         "experiment_case_id": experiment_case_id,
         "run_kind": run_kind,
     }
+    # 舊版 RuntimeRequestFactory monkeypatch／constructor 可能採嚴格具名參數；
+    # 預設模式不傳入新選項可維持既有建構呼叫形狀，True 才明示啟用新策略。
+    if continuous_time_fallback:
+        factory_kwargs["continuous_time_fallback"] = True
     if ocm_reconstruction_root is not None:
         factory_kwargs["ocm_reconstruction_root"] = ocm_reconstruction_root
     factory = RuntimeRequestFactory(
@@ -2665,6 +2686,7 @@ def open_run_controller(
     ocm_reconstruction_root: str | Path | None = None,
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
+    continuous_time_fallback: bool = False,
 ) -> RunController:
     """依 immutable run plan 自動開啟 pilot 或 formal ``RunController``。
 
@@ -2681,6 +2703,7 @@ def open_run_controller(
         ocm_reconstruction_root=ocm_reconstruction_root,
         resume=resume,
         checkpoint_root=checkpoint_root,
+        continuous_time_fallback=continuous_time_fallback,
     )
 
 
@@ -2693,6 +2716,7 @@ def open_pilot_run_controller(
     ocm_reconstruction_root: str | Path | None = None,
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
+    continuous_time_fallback: bool = False,
 ) -> RunController:
     """相容既有 API，且只允許開啟 ``run_kind=pilot`` 的 workspace。"""
 
@@ -2705,6 +2729,7 @@ def open_pilot_run_controller(
         resume=resume,
         checkpoint_root=checkpoint_root,
         expected_run_kind="pilot",
+        continuous_time_fallback=continuous_time_fallback,
     )
 
 
@@ -2717,6 +2742,7 @@ def open_formal_run_controller(
     ocm_reconstruction_root: str | Path | None = None,
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
+    continuous_time_fallback: bool = False,
 ) -> RunController:
     """開啟 formal workspace，並拒絕 pilot 或未登錄 run kind。"""
 
@@ -2729,6 +2755,7 @@ def open_formal_run_controller(
         resume=resume,
         checkpoint_root=checkpoint_root,
         expected_run_kind="formal",
+        continuous_time_fallback=continuous_time_fallback,
     )
 
 

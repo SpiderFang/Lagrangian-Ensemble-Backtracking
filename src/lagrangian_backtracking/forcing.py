@@ -2,7 +2,8 @@
 
 海流資料使用海洋模式（OCM）的原始三維網格及時間軸；波浪資料使用 NWW3 分析資料。
 每個讀取器一次只以唯讀方式開啟一個月份，避免把完整兩年資料載入記憶體。跨月時由
-``MonthlyCombinedForcing`` 依世界協調時間（UTC）選取正確月份，絕不借用最近月份資料。
+``MonthlyCombinedForcing`` 依世界協調時間（UTC）選取正確月份；預設不借用最近時間列，
+只有明確啟用 execution-priority 的連續時間 fallback 才會依版本化策略使用有效時間端點。
 海流依序在節點垂向、三角形平面與時間上內插；移動海面造成固定 target z 高於某一
 端點最高 ``zcor`` 時，該端點可明確使用最高有效層的表層控制體值，但最後仍以 query-time
 ``eta``／海床做幾何 gate。若三個支撐節點任一處無法取得雙側支撐或表層控制體必要值、
@@ -16,7 +17,7 @@ Smagorinsky reference 則只使用 OCM native current，在公尺制 triangle sh
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,6 +41,134 @@ from .models import (
     clamp_query_z_to_surface,
 )
 from .stokes import finite_depth_stokes
+
+
+# execution-priority 模式只放寬時間軸支援；水平域、乾面、垂向層位、波浪物理與非有限
+# 數值仍沿用原本的品質閘門。這個穩定識別碼會寫入每次 fallback sample 的 diagnostics，
+# 讓正式輸出可以區分「實際使用連續時間降級」與一般 observed／reconstructed 取樣。
+CONTINUOUS_TIME_FALLBACK_STRATEGY_ID = "execution_priority_continuous_time_v1"
+
+
+def _continuous_time_diagnostics(
+    times_ns: np.ndarray,
+    target_ns: int,
+    before: int,
+    after: int,
+    *,
+    maximum_gap_ns: int,
+    enabled: bool,
+    source: str,
+    data_origin: str | None = None,
+) -> dict[str, bool | float | int | str]:
+    """建立時間 fallback 的可稽核診斷，不改寫任何空間或物理品質旗標。
+
+    ``times_ns`` 是單一 OCM 或 NWW3 產品的 UTC 奈秒軸；``target_ns`` 是粒子目前要查詢
+    的 UTC 奈秒。只有 fallback 真正接手（查詢在軸外，或原本超過產品允許的最大時間間隔）
+    才回傳欄位；正常 exact／合法短時間內插維持既有空 diagnostics。對內插結果，
+    ``actual_utc_ns``／``offset_seconds`` 以距離目標較近的端點表示摘要，並另外保存 before、
+    after 兩端與各自偏移，避免把兩端資料誤縮成一個不存在的時間列。等距時摘要端點採較早
+    的 before，與 deterministic nearest policy 一致。``data_origin`` 僅保存 observed、
+    reconstructed 或 mixed provenance，不會把重建列轉成 observed。
+    """
+
+    if not enabled or times_ns.ndim != 1 or times_ns.size == 0:
+        return {}
+    target = int(target_ns)
+    position = int(np.searchsorted(times_ns, target, side="left"))
+    if position < times_ns.size and int(times_ns[position]) == target:
+        return {}
+    if position == 0:
+        original_before_ns = original_after_ns = int(times_ns[0])
+        outside = True
+    elif position >= times_ns.size:
+        original_before_ns = original_after_ns = int(times_ns[-1])
+        outside = True
+    else:
+        original_before_ns = int(times_ns[position - 1])
+        original_after_ns = int(times_ns[position])
+        outside = False
+    span = original_after_ns - original_before_ns
+    over_gap = span > int(maximum_gap_ns)
+    if not outside and not over_gap:
+        return {}
+    before_ns = int(times_ns[before])
+    after_ns = int(times_ns[after])
+    before_distance = abs(target - before_ns)
+    after_distance = abs(after_ns - target)
+    nearest_ns = before_ns if before_distance <= after_distance else after_ns
+    strategy = (
+        "nearest_valid_temporal_endpoint"
+        if before == after or outside or span > 2 * int(maximum_gap_ns)
+        else "linear_interpolation"
+    )
+    diagnostics: dict[str, bool | float | int | str] = {
+        "continuous_time_fallback": 1,
+        "continuous_time_fallback_strategy_id": CONTINUOUS_TIME_FALLBACK_STRATEGY_ID,
+        "continuous_time_fallback_source": source,
+        "continuous_time_fallback_target_utc_ns": target,
+        "continuous_time_fallback_actual_utc_ns": nearest_ns,
+        "continuous_time_fallback_offset_seconds": abs(nearest_ns - target) / 1_000_000_000.0,
+        "continuous_time_fallback_before_utc_ns": before_ns,
+        "continuous_time_fallback_after_utc_ns": after_ns,
+        "continuous_time_fallback_before_offset_seconds": (before_ns - target) / 1_000_000_000.0,
+        "continuous_time_fallback_after_offset_seconds": (after_ns - target) / 1_000_000_000.0,
+        "continuous_time_fallback_policy": strategy,
+    }
+    if data_origin is not None:
+        diagnostics["continuous_time_fallback_data_origin"] = data_origin
+    return diagnostics
+
+
+def _merge_continuous_time_diagnostics(
+    first: Mapping[str, bool | float | int | str],
+    second: Mapping[str, bool | float | int | str],
+) -> dict[str, bool | float | int | str]:
+    """合併 OCM 與 NWW 的時間 fallback 稽核欄位，避免不同產品互相覆寫。
+
+    同一次 Stokes 取樣可能同時對 OCM 與 NWW 啟用時間 fallback。兩個產品的目標 UTC
+    通常相同，但實際端點、內插策略或 observed／reconstructed 來源可能不同；若直接以
+    dictionary ``update`` 合併，後讀取的 NWW 會抹掉 OCM 的實際使用紀錄。因此共同值保留
+    原欄名，不同值則以來源 suffix（例如 ``_ocm``、``_nww``）並列保存；``source`` 會
+    變成以 ``+`` 串接的來源清單。這只整理 diagnostics，不改變速度、品質旗標或 fallback
+    決策。
+    """
+
+    if not first:
+        return dict(second)
+    if not second:
+        return dict(first)
+    first_has_fallback = "continuous_time_fallback_source" in first
+    second_has_fallback = "continuous_time_fallback_source" in second
+    if not first_has_fallback or not second_has_fallback:
+        # 只有一個產品啟用 fallback 時，另一個 mapping 可能只含一般物理診斷；保留
+        # 原本 update 語意，避免虛構 ``first``／``second`` 來源或改寫非時間欄位。
+        return {**first, **second}
+    first_source = str(first.get("continuous_time_fallback_source", "first"))
+    second_source = str(second.get("continuous_time_fallback_source", "second"))
+    merged: dict[str, bool | float | int | str] = {}
+    # 依輸入 mapping 的插入順序合併，避免 set iteration 讓 JSON diagnostics 順序在
+    # 不同 process 間漂移，進而污染可重現的輸出摘要或 checksum。
+    keys = list(dict.fromkeys((*first.keys(), *second.keys())))
+    for key in keys:
+        first_present = key in first
+        second_present = key in second
+        if first_present and second_present and first[key] == second[key]:
+            merged[key] = first[key]
+            continue
+        if first_present:
+            merged[f"{key}_{first_source}"] = first[key]
+        if second_present:
+            merged[f"{key}_{second_source}"] = second[key]
+    merged["continuous_time_fallback_source"] = "+".join(
+        dict.fromkeys((first_source, second_source))
+    )
+    # strategy id 目前由同一版本化實作提供；若未來產品採不同版本，保留各自
+    # suffix 欄位，上層仍可用 source-specific diagnostics 逐產品稽核。
+    if "continuous_time_fallback_strategy_id" not in merged:
+        merged["continuous_time_fallback_strategy_id"] = (
+            CONTINUOUS_TIME_FALLBACK_STRATEGY_ID
+        )
+    return merged
 
 
 def _vertical_support_indices(
@@ -130,16 +259,37 @@ def _query_z_for_vertical_support(
 
 
 def _time_bracket(
-    times_ns: np.ndarray, target_ns: int, *, maximum_gap_ns: int
+    times_ns: np.ndarray,
+    target_ns: int,
+    *,
+    maximum_gap_ns: int,
+    continuous_time_fallback: bool = False,
 ) -> tuple[int, int, float, SampleQC]:
-    """找出目標時刻前後的資料索引與內插比例，並分開標記各種時間問題。"""
+    """找出目標時刻前後資料索引；可選擇只放寬純時間支援。
 
-    if times_ns.ndim != 1 or times_ns.size < 2:
+    預設仍維持原本 fail-closed 行為。啟用 ``continuous_time_fallback`` 後，單一有效
+    時間列也可作 deterministic endpoint；軸內短缺口（不超過兩倍產品既有最大允許間隔）
+    以 before／after 線性內插，較長缺口與軸外查詢則選最近有效端點，等距取較早端。此
+    helper 只處理時間索引，呼叫端仍必須執行乾面、水平域、垂向、波浪與有限數值 gate。
+    """
+
+    if times_ns.ndim != 1 or times_ns.size == 0:
+        return 0, 0, 0.0, SampleQC.OUTSIDE_TIME_RANGE
+    if times_ns.size == 1:
+        if continuous_time_fallback:
+            return 0, 0, 0.0, SampleQC.OK
         return 0, 0, 0.0, SampleQC.OUTSIDE_TIME_RANGE
     position = int(np.searchsorted(times_ns, target_ns, side="left"))
     if position < times_ns.size and int(times_ns[position]) == target_ns:
         return position, position, 0.0, SampleQC.OK
-    if position == 0 or position >= times_ns.size:
+    if position == 0:
+        if continuous_time_fallback:
+            return 0, 0, 0.0, SampleQC.OK
+        return 0, 0, 0.0, SampleQC.OUTSIDE_TIME_RANGE
+    if position >= times_ns.size:
+        if continuous_time_fallback:
+            last = times_ns.size - 1
+            return last, last, 0.0, SampleQC.OK
         return 0, 0, 0.0, SampleQC.OUTSIDE_TIME_RANGE
     before = position - 1
     after = position
@@ -147,6 +297,16 @@ def _time_bracket(
     if span <= 0:
         return before, after, 0.0, SampleQC.NUMERICAL_FAILURE
     if span > maximum_gap_ns:
+        if continuous_time_fallback:
+            # 小缺口仍保留時間變化；超過兩倍既有允許間隔時，使用最近有效端點，避免
+            # 對長時間空窗假造跨越整段的線性流場。距離相等時固定取較早端。
+            if span <= 2 * maximum_gap_ns:
+                alpha = (target_ns - int(times_ns[before])) / span
+                return before, after, float(alpha), SampleQC.OK
+            before_distance = target_ns - int(times_ns[before])
+            after_distance = int(times_ns[after]) - target_ns
+            nearest = before if before_distance <= after_distance else after
+            return nearest, nearest, 0.0, SampleQC.OK
         return before, after, 0.0, SampleQC.TIME_GAP
     alpha = (target_ns - int(times_ns[before])) / span
     return before, after, float(alpha), SampleQC.OK
@@ -292,7 +452,9 @@ class WaveSample:
     ``sin(direction)``／``cos(direction)`` 加權值，讓跨月份時能先對原始波浪欄位與
     圓向量做時間內插，再轉回角度。這兩個欄位對既有 caller 保持 optional；舊的
     synthetic callback 若只建立五欄 ``WaveSample``，仍維持原本資料格式，但跨月
-    合成會拒絕缺少圓向量的波浪端點，避免用已轉回的角度猜回向量權重。
+    合成會拒絕缺少圓向量的波浪端點，避免用已轉回的角度猜回向量權重。``diagnostics``
+    僅在啟用時間 fallback 時記錄 target／actual UTC、偏移與策略；它不會把波浪遮罩、
+    空間域外或物理失敗轉成有效資料。
     """
 
     significant_wave_height_m: float
@@ -302,6 +464,7 @@ class WaveSample:
     qc: SampleQC = SampleQC.OK
     direction_x: float | None = None
     direction_y: float | None = None
+    diagnostics: dict[str, bool | float | int | str] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
@@ -344,6 +507,7 @@ def _invalid_smagorinsky_sample(
     triangle_id: int | None,
     valid_incident_triangle_count: int = 0,
     excluded_incident_triangle_count: int = 0,
+    diagnostics_extra: Mapping[str, bool | float | int | str] | None = None,
 ) -> DiffusionSample:
     """建立有明確非零 QC 的 Smagorinsky 失敗樣本，不以零 K 偽裝有效結果。
 
@@ -353,23 +517,26 @@ def _invalid_smagorinsky_sample(
     ``qc`` 非零而進入粒子積分。
     """
 
+    diagnostics: dict[str, bool | float | int | str | None] = {
+        "method": _smagorinsky_method_name(),
+        "coefficient_cs": settings.coefficient_cs,
+        "kh_m2ps": None,
+        "d_kh_dx_mps": None,
+        "d_kh_dy_mps": None,
+        "raw_current_triangle_kh_m2ps": None,
+        "floor_hit": False,
+        "cap_hit": False,
+        "valid_incident_triangle_count": int(valid_incident_triangle_count),
+        "excluded_incident_triangle_count": int(excluded_incident_triangle_count),
+        "triangle_id": triangle_id,
+    }
+    if diagnostics_extra:
+        diagnostics.update(diagnostics_extra)
     return DiffusionSample(
         coefficients=DiffusionCoefficients(0.0, 0.0, settings.constant_kz_m2ps),
         diffusivity_divergence_mps=(0.0, 0.0, 0.0),
         qc=qc,
-        diagnostics={
-            "method": _smagorinsky_method_name(),
-            "coefficient_cs": settings.coefficient_cs,
-            "kh_m2ps": None,
-            "d_kh_dx_mps": None,
-            "d_kh_dy_mps": None,
-            "raw_current_triangle_kh_m2ps": None,
-            "floor_hit": False,
-            "cap_hit": False,
-            "valid_incident_triangle_count": int(valid_incident_triangle_count),
-            "excluded_incident_triangle_count": int(excluded_incident_triangle_count),
-            "triangle_id": triangle_id,
-        },
+        diagnostics=diagnostics,
     )
 
 
@@ -398,6 +565,7 @@ class OCMNativeMonth:
         wet_value: float = 0.0,
         use_numba_kernel: bool = False,
         reconstruction_patch: OCMReconstructionPatchMonth | None = None,
+        continuous_time_fallback: bool = False,
     ) -> None:
         """保留唯讀的大型陣列並檢查各欄位的時間、節點與深度維度一致。
 
@@ -405,6 +573,8 @@ class OCMNativeMonth:
         會建立一份小型 merged index，將每一列指向 observed 或 patch 的原始 row。如此
         observed 74 GiB 月檔不會被複製或串接，且 observed endpoint 仍能使用原本的
         Numba kernel；patch endpoint 則走同一套 NumPy 空間／垂向支援與 QC 流程。
+        ``continuous_time_fallback=True`` 只讓純時間缺口或軸外查詢使用短缺口內插、
+        長缺口／軸外最近有效端點；空間、乾面、垂向與非有限數值仍維持原本 fail-closed。
         """
 
         self.month_id = month_id
@@ -421,6 +591,9 @@ class OCMNativeMonth:
         self.wet_value = float(wet_value)
         self.use_numba_kernel = bool(use_numba_kernel)
         self.reconstruction_patch = reconstruction_patch
+        if type(continuous_time_fallback) is not bool:
+            raise TypeError("continuous_time_fallback 必須是 bool")
+        self.continuous_time_fallback = continuous_time_fallback
         expected_tn = (self._observed_time_utc_ns.size, self.mesh.node_xy.shape[0])
         if self.hvel.shape[:2] != expected_tn or self.hvel.ndim != 4 or self.hvel.shape[-1] < 2:
             raise ValueError("hvel shape 必須是 (time,node,layer,component>=2)")
@@ -553,14 +726,16 @@ class OCMNativeMonth:
         *,
         mesh: NativeMesh,
         use_numba_kernel: bool = False,
+        continuous_time_fallback: bool = False,
     ) -> OCMNativeMonth:
         """從月份資料夾以唯讀方式開啟陣列，不允許載入任意序列化物件。
 
         ``use_numba_kernel`` 只切換既有 OCM 端點內插 primitive；月份選擇、時間缺口、
         網格定位、濕乾遮罩、垂向支援與最終品質檢查仍由同一個 Python 控制層執行，
         因此這個參數不會把純 NumPy 參考引擎誤稱為完整 Numba physics backend。預設
-        ``False`` 保留舊 caller 的 NumPy 行為；檔案仍以唯讀 memory-map 開啟，避免
-        建立一份與 SERVER 上游產品相同大小的複本。
+        ``False`` 保留舊 caller 的 NumPy 行為；``continuous_time_fallback`` 只放寬時間
+        支援，預設關閉以保持舊 hash／結果；檔案仍以唯讀 memory-map 開啟，避免建立一份
+        與 SERVER 上游產品相同大小的複本。
         """
 
         if type(use_numba_kernel) is not bool:
@@ -587,6 +762,7 @@ class OCMNativeMonth:
             wetdry_elem=load("wetdry_elem.npy"),
             diffusivity=load("diffusivity.npy"),
             use_numba_kernel=use_numba_kernel,
+            continuous_time_fallback=continuous_time_fallback,
         )
 
     def _vertical_node_sample(
@@ -886,9 +1062,11 @@ class OCMNativeMonth:
         暫設為零。每個時間片內 unique node 的固定 z 取樣由 helper cache，避免同一
         node column 因多個 incident triangle 重複讀取。乾面或 z unsupported 的非目前
         incident triangle 只排除並記數；目前 triangle 在任一必要時間片失效時回傳非零
-        QC，不做最近值、跨 gap 或域外外插。``use_numba_kernel`` 不參與此方法，因為
-        Slice 2B1 的 Smagorinsky reference algorithm 必須在 NumPy 與 Numba velocity
-        switch 下得到相同數值；這不代表已具備正式 runtime 或通過 well-mixed/PDE 驗證。
+        QC。預設不做最近值、跨 gap 或域外外插；啟用 ``continuous_time_fallback`` 時，
+        純時間缺口才依共同策略使用短缺口內插或最近有效端點，其他品質 gate 不變。
+        ``use_numba_kernel`` 不參與此方法，因為 Slice 2B1 的 Smagorinsky reference
+        algorithm 必須在 NumPy 與 Numba velocity switch 下得到相同數值；這不代表已具備
+        正式 runtime 或通過 well-mixed/PDE 驗證。
         """
 
         if not isinstance(settings, SmagorinskySettings):
@@ -905,12 +1083,27 @@ class OCMNativeMonth:
             self.time_utc_ns,
             time_utc_ns,
             maximum_gap_ns=self.maximum_time_gap_ns,
+            continuous_time_fallback=self.continuous_time_fallback,
+        )
+        fallback_diagnostics = _continuous_time_diagnostics(
+            self.time_utc_ns,
+            time_utc_ns,
+            before,
+            after,
+            maximum_gap_ns=self.maximum_time_gap_ns,
+            enabled=self.continuous_time_fallback,
+            source="ocm",
+            data_origin=(
+                self._bracket_diagnostics(before, after).get("ocm_time_origin")
+                or "observed"
+            ) if self.time_utc_ns.size else "observed",
         )
         if time_qc != SampleQC.OK:
             return _invalid_smagorinsky_sample(
                 settings,
                 time_qc,
                 triangle_id=location.triangle_id,
+                diagnostics_extra=fallback_diagnostics,
             )
         # Smagorinsky 共用 endpoint surface hold 時，不能只因兩端都有水平 current
         # 就放寬粒子垂向範圍。先以同一 query-time eta／native bed 建立幾何 gate，
@@ -927,6 +1120,7 @@ class OCMNativeMonth:
                 settings,
                 SampleQC.VERTICAL_UNSUPPORTED,
                 triangle_id=location.triangle_id,
+                diagnostics_extra=fallback_diagnostics,
             )
         support_z_m = _query_z_for_vertical_support(z_m, geometric_bounds)
 
@@ -943,6 +1137,7 @@ class OCMNativeMonth:
                 triangle_id=location.triangle_id,
                 valid_incident_triangle_count=first_valid_count,
                 excluded_incident_triangle_count=first_excluded_count,
+                diagnostics_extra=fallback_diagnostics,
             )
         if after == before:
             second = first
@@ -965,6 +1160,7 @@ class OCMNativeMonth:
                 triangle_id=location.triangle_id,
                 valid_incident_triangle_count=second_valid_count,
                 excluded_incident_triangle_count=second_excluded_count,
+                diagnostics_extra=fallback_diagnostics,
             )
 
         interpolation = float(alpha)
@@ -1008,6 +1204,7 @@ class OCMNativeMonth:
             ),
             "triangle_id": int(location.triangle_id),
         }
+        diagnostics.update(fallback_diagnostics)
         return DiffusionSample(
             coefficients=DiffusionCoefficients(
                 particle_kh,
@@ -1439,10 +1636,36 @@ class OCMNativeMonth:
                 0.0, 0.0, 0.0, np.nan, np.nan, np.nan, np.nan, SampleQC.OUTSIDE_HORIZONTAL_DOMAIN
             )
         before, after, alpha, time_qc = _time_bracket(
-            self.time_utc_ns, time_utc_ns, maximum_gap_ns=self.maximum_time_gap_ns
+            self.time_utc_ns,
+            time_utc_ns,
+            maximum_gap_ns=self.maximum_time_gap_ns,
+            continuous_time_fallback=self.continuous_time_fallback,
+        )
+        fallback_diagnostics = _continuous_time_diagnostics(
+            self.time_utc_ns,
+            time_utc_ns,
+            before,
+            after,
+            maximum_gap_ns=self.maximum_time_gap_ns,
+            enabled=self.continuous_time_fallback,
+            source="ocm",
+            data_origin=(
+                self._bracket_diagnostics(before, after).get("ocm_time_origin")
+                or "observed"
+            ) if self.time_utc_ns.size else "observed",
         )
         if time_qc != SampleQC.OK:
-            return VelocitySample(0.0, 0.0, 0.0, np.nan, np.nan, np.nan, np.nan, time_qc)
+            return VelocitySample(
+                0.0,
+                0.0,
+                0.0,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                time_qc,
+                diagnostics=fallback_diagnostics,
+            )
         # 先保存只依賴 elev 與 native 水深的幾何上下文。若後續速度的垂向夾層失敗，
         # 這些有限值仍可讓 engine 判斷是否為已證明的海面穿越；若幾何本身缺值，
         # helper 會回傳 None，失敗樣本仍以 NaN 表達未知，不會因此取得邊界特權。
@@ -1465,7 +1688,11 @@ class OCMNativeMonth:
                 source_face_id=location.source_face_global_index,
                 triangle_id=location.triangle_id,
                 forcing_month_id=self.month_id,
-                diagnostics={**row_diagnostics, "ocm_reconstruction_qc_invalid": 1},
+                diagnostics={
+                    **row_diagnostics,
+                    **fallback_diagnostics,
+                    "ocm_reconstruction_qc_invalid": 1,
+                },
             )
         before_kind, before_index = self._time_source(before)
         after_kind, after_index = self._time_source(after)
@@ -1535,7 +1762,7 @@ class OCMNativeMonth:
                 source_face_id=location.source_face_global_index,
                 triangle_id=location.triangle_id,
                 forcing_month_id=self.month_id,
-                diagnostics=row_diagnostics,
+                diagnostics={**row_diagnostics, **fallback_diagnostics},
             )
         values = first[0] + alpha * (second[0] - first[0])
         vertical_scale = min(first[2], second[2])
@@ -1555,7 +1782,7 @@ class OCMNativeMonth:
                 source_face_id=location.source_face_global_index,
                 triangle_id=location.triangle_id,
                 forcing_month_id=self.month_id,
-                diagnostics=row_diagnostics,
+                diagnostics={**row_diagnostics, **fallback_diagnostics},
             )
         return VelocitySample(
             u_mps=float(values[0]),
@@ -1568,7 +1795,11 @@ class OCMNativeMonth:
             source_face_id=location.source_face_global_index,
             triangle_id=location.triangle_id,
             forcing_month_id=self.month_id,
-            diagnostics={**row_diagnostics, "kz_m2ps": float(values[3])},
+            diagnostics={
+                **row_diagnostics,
+                **fallback_diagnostics,
+                "kz_m2ps": float(values[3]),
+            },
         )
 
 
@@ -1588,8 +1819,13 @@ class NWWAnalysisMonth:
         valid_mask_wave: np.ndarray,
         qc_flags: np.ndarray,
         maximum_time_gap_seconds: float = 5_400.0,
+        continuous_time_fallback: bool = False,
     ) -> None:
-        """檢查時間、緯度、經度三個軸的資料格式，並保留唯讀大型陣列。"""
+        """檢查時間、緯度、經度三個軸的資料格式，並保留唯讀大型陣列。
+
+        ``continuous_time_fallback`` 預設關閉以保持既有時間缺口／軸外 QC；啟用時只
+        放寬時間列選取，實際四角遮罩、非有限波浪值、水平域外與波浪物理檢查不變。
+        """
 
         self.month_id = month_id
         self.lon = np.asarray(lon)
@@ -1601,6 +1837,9 @@ class NWWAnalysisMonth:
         self.valid_mask_wave = valid_mask_wave
         self.qc_flags = qc_flags
         self.maximum_time_gap_ns = int(round(maximum_time_gap_seconds * 1_000_000_000))
+        if type(continuous_time_fallback) is not bool:
+            raise TypeError("continuous_time_fallback 必須是 bool")
+        self.continuous_time_fallback = continuous_time_fallback
         expected = (self.time_utc_ns.size, self.lat.size, self.lon.size)
         arrays = (
             self.significant_wave_height,
@@ -1621,8 +1860,14 @@ class NWWAnalysisMonth:
             raise ValueError("NWW lon/lat/time 軸必須嚴格遞增")
 
     @classmethod
-    def from_directories(cls, grid_dir: str | Path, month_dir: str | Path) -> NWWAnalysisMonth:
-        """從波浪格網與月份資料夾建立唯讀取樣器。"""
+    def from_directories(
+        cls,
+        grid_dir: str | Path,
+        month_dir: str | Path,
+        *,
+        continuous_time_fallback: bool = False,
+    ) -> NWWAnalysisMonth:
+        """從波浪格網與月份資料夾建立唯讀取樣器，並選擇時間 fallback 政策。"""
 
         grid = Path(grid_dir)
         month = Path(month_dir)
@@ -1645,6 +1890,7 @@ class NWWAnalysisMonth:
             peak_direction_raw_deg=load(month, "peak_direction_raw_deg.npy"),
             valid_mask_wave=load(month, "valid_mask_wave.npy"),
             qc_flags=load(month, "qc_flags.npy"),
+            continuous_time_fallback=continuous_time_fallback,
         )
 
     def _sample_spatial_at_time(self, lon: float, lat: float, time_index: int) -> WaveSample:
@@ -1746,31 +1992,69 @@ class NWWAnalysisMonth:
 
         時間內插先對每個 endpoint 的 ``Hs``、``fp`` 與未正規化方向向量做線性運算，
         再把向量轉回角度。這個順序也供跨月 manager 使用，避免在 0／360 度邊界把
-        已轉成角度的數值直接平均。
+        已轉成角度的數值直接平均。若啟用 ``continuous_time_fallback``，時間軸外或
+        純時間缺口會先選定允許的 endpoint；四角遮罩與波浪物理 gate 仍照常執行。
         """
 
         before, after, alpha, time_qc = _time_bracket(
             self.time_utc_ns,
             time_utc_ns,
             maximum_gap_ns=self.maximum_time_gap_ns,
+            continuous_time_fallback=self.continuous_time_fallback,
+        )
+        fallback_diagnostics = _continuous_time_diagnostics(
+            self.time_utc_ns,
+            time_utc_ns,
+            before,
+            after,
+            maximum_gap_ns=self.maximum_time_gap_ns,
+            enabled=self.continuous_time_fallback,
+            source="nww",
+            data_origin="observed",
         )
         if time_qc != SampleQC.OK:
             return WaveSample(np.nan, np.nan, np.nan, 0, time_qc)
         first = self.sample_at_time_index(lon, lat, before)
         if not first.valid:
-            return first
+            # 時間 fallback 即使最後因 NWW 空間角點、遮罩或非有限值失敗，也要保留
+            # 「實際選過哪個時間端點」的稽核欄位；這些欄位不會把失敗樣本變成有效。
+            return replace(
+                first,
+                diagnostics={**first.diagnostics, **fallback_diagnostics},
+            )
         if after == before:
-            return first
+            return replace(
+                first,
+                diagnostics={**first.diagnostics, **fallback_diagnostics},
+            )
         second = self.sample_at_time_index(lon, lat, after)
         if not second.valid:
             # 舊版逐 endpoint 迴圈在第二端失敗前已累積第一端的 QC flags；保留第二端
             # 的非零 SampleQC，同時把兩端空間四角的原始旗標聯集，避免跨時間失敗時
             # 遺失已讀取 endpoint 的資料品質 provenance。
-            return replace(second, qc_flags=int(first.qc_flags | second.qc_flags))
+            return replace(
+                second,
+                qc_flags=int(first.qc_flags | second.qc_flags),
+                diagnostics={**second.diagnostics, **fallback_diagnostics},
+            )
         if first.direction_x is None or first.direction_y is None:
-            return WaveSample(np.nan, np.nan, np.nan, first.qc_flags, SampleQC.WAVE_UNSUPPORTED)
+            return WaveSample(
+                np.nan,
+                np.nan,
+                np.nan,
+                first.qc_flags,
+                SampleQC.WAVE_UNSUPPORTED,
+                diagnostics=fallback_diagnostics,
+            )
         if second.direction_x is None or second.direction_y is None:
-            return WaveSample(np.nan, np.nan, np.nan, second.qc_flags, SampleQC.WAVE_UNSUPPORTED)
+            return WaveSample(
+                np.nan,
+                np.nan,
+                np.nan,
+                second.qc_flags,
+                SampleQC.WAVE_UNSUPPORTED,
+                diagnostics=fallback_diagnostics,
+            )
         interpolation = float(alpha)
         hs = first.significant_wave_height_m + interpolation * (
             second.significant_wave_height_m - first.significant_wave_height_m
@@ -1790,6 +2074,7 @@ class NWWAnalysisMonth:
                 SampleQC.INVALID_PHYSICS,
                 direction_x=direction_x,
                 direction_y=direction_y,
+                diagnostics=fallback_diagnostics,
             )
         raw_direction = float(np.degrees(np.arctan2(direction_x, direction_y)) % 360.0)
         return WaveSample(
@@ -1800,6 +2085,7 @@ class NWWAnalysisMonth:
             SampleQC.OK,
             direction_x=direction_x,
             direction_y=direction_y,
+            diagnostics=fallback_diagnostics,
         )
 
 
@@ -1879,7 +2165,10 @@ class CombinedMonthForcing:
                     current.source_face_id,
                     current.triangle_id,
                     current.forcing_month_id,
-                    {**diagnostics, "nww_qc_flags": wave.qc_flags},
+                    {
+                        **_merge_continuous_time_diagnostics(diagnostics, wave.diagnostics),
+                        "nww_qc_flags": wave.qc_flags,
+                    },
                 )
             try:
                 stokes = finite_depth_stokes(
@@ -1907,6 +2196,7 @@ class CombinedMonthForcing:
                     diagnostics,
                 )
             stokes_u, stokes_v = stokes.u_mps, stokes.v_mps
+            diagnostics = _merge_continuous_time_diagnostics(diagnostics, wave.diagnostics)
             diagnostics.update(
                 {
                     "stokes_u_mps": stokes_u,

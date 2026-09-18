@@ -580,6 +580,7 @@ def test_formal_parallel_cli_help_and_exception_summary_are_truthful(
     assert "--storage-gate-evidence" in help_text
     assert "--numba-cache-dir" in help_text
     assert "--warmup-only" in help_text
+    assert "--execution-priority" in help_text
 
     def fail_after_unknown_phase(**_: Any) -> Any:
         """模擬無法從通用例外判斷發生在啟動前或摘要階段的 coordinator 錯誤。"""

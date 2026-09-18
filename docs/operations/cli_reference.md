@@ -226,7 +226,52 @@ reserved destination 由公開 validator 拒絕，操作員須選新 destination
 180/90 是必須驗證的支援契約，不是 accepted forcing 已通過的聲明，也不是 approved release 或
 SERVER/input-build 實測；若 2024-07-05 前實際 accepted product 有缺時，legacy strict preflight/build 仍會
 拒絕；新版 gap-censored build 則由 forcing inventory 與 gap-censored evidence 列舉缺口、確認
-起點 exact-hour 可用並固定第一缺口截尾。任何模式都不能以最近值、零值或未登錄外插補足。
+起點 exact-hour 可用並固定第一缺口截尾。任何輸入建置模式都不能以最近值、零值或未登錄外插補足。
+
+### execution-priority：連續時間 forcing（不重跑 `inputs-build`）
+
+`--execution-priority` 是執行階段的明示開關，適用於 `run-shard`、`run-worker` 與
+`run-formal-parallel`。它不重建、不修改既有 `common-input`／release artifact，也不改變
+run plan、seed、粒子身分或 `inputs-build` 次數；因此同一份 horizon suite 可直接供 H30／H60／H90
+及兩種沉底模式使用。未指定時維持 `continuous_time_fallback=false` 的既有 fail-closed
+行為與 hash。
+
+啟用後，OCM 先在觀測與核准重建資料的合併時間軸取樣；連續時間缺口、整月缺失或查詢超出
+全期時間軸時，從全期有效時間列選最近端點，等距固定取較早者；仍有兩側且屬短缺口時採
+合法線性內插。每次 fallback 都在內部 diagnostics 保存來源、目標／實際 UTC、時間偏移秒數
+與 `execution_priority_continuous_time_v1`。這是為了讓 execution-priority 能完成可統計的
+邊界事件分布，不是把缺時資料宣稱為觀測值，也不把內部 provenance 當成對外重建敏感度結果。
+
+此開關只放寬時間查詢：乾面、水平域外、垂向不支援、波浪不支援、無效物理與非有限局部場
+仍會依原契約停止；合理海岸／海面／海床／flow boundary 終止也不變。`run-formal-parallel`
+預設採 dynamic parent queue；`--execution-mode static` 仍可明示舊排程，但不會改變上述 forcing
+語意。範例：
+
+```bash
+uv run lbt run-shard "$WORKSPACE" \
+  --config "$FORMAL_CONFIG" \
+  --shard-id "$SHARD_ID" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --execution-priority
+
+uv run python scripts/run_formal_parallel.py \
+  "$WORKSPACE" \
+  --config "$FORMAL_CONFIG" \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --worker-count "$FORMAL_WORKER_COUNT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --log-root "$LBT_PARALLEL_LOG_ROOT" \
+  --storage-gate-evidence "$LBT_STORAGE_GATE_JSON" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --execution-priority
+```
+
+完成後仍須以 `validate-run --require-complete` 判定整批 lifecycle；fallback diagnostics
+只供專案內部稽核與結果分層，不改變正式輸出對條件式來源足跡／相對來源權重的命名限制。
 
 ### 同一套 legacy generic 輸入產生不同回溯長度（手動模式）
 
@@ -459,15 +504,16 @@ worker 的總計時包含本次 handler 的前置驗證與連續分片執行，�
 樣本最大值，不跨片相加；大型陣列的映射位元組數不是實際 RSS 或 NFS 傳輸量，也不代表
 多程序同時使用量或連續量測峰值。完整基準規範見[效能改善工作線](16_performance_improvement_tracks.md)。
 
-### 正式完整母體的固定 worker 平行執行
+### 正式完整母體的 dynamic worker 平行執行（static 可相容）
 
-`run-formal-parallel` 僅接受 `run_kind=formal`，依 run plan 的全部 shard ID 建立一次
-確定性 worker assignment。scenario index 範圍維持連續，並以 plan 已有的分析區域／UTC 月份
-和 scenario table 已存在的站點／flow-domain 欄位產生 locality 摘要；缺少表格欄位時會在
-assignment JSON 明示 `plan_order_only`，不從 config、路徑或名稱推測 flow domain。每個固定
-worker 只啟動一次 Python，內部以一個既有 `run-worker` controller 依序處理其整組 shard，因而
-可在同程序重用 forcing manager 與 JIT import。assignment 綁定 run ID 和 run-plan SHA-256，
-不寫回 run plan，也不因 worker 完成順序改變 run identity。
+`run-formal-parallel` 僅接受 `run_kind=formal`，預設依 run plan 的全部 shard ID 建立一次
+dynamic parent queue 與 assignment。scenario index 範圍維持連續，並以 plan 已有的分析區域／UTC
+月份和 scenario table 已存在的站點／flow-domain 欄位產生 locality 摘要；缺少表格欄位時會在
+assignment JSON 明示 `plan_order_only`，不從 config、路徑或名稱推測 flow domain。每個 persistent
+worker child 只啟動一次 Python，內部以同一個既有 `run-worker` controller 從中央 queue 連續處理
+多個 shard，因而重用 forcing manager 與 JIT import；worker 完成一片後不退出。assignment 綁定
+run ID 和 run-plan SHA-256，不寫回 run plan，也不因 worker 完成順序改變 run identity。
+若需保留舊固定 contiguous group executor，才明示 `--execution-mode static`。
 
 先準備 caller 明示且已通過 `scripts/validate_server_storage.py` 的 PASS JSON；runner 會再用
 `findmnt` 即時確認本次 `scratch_root` 仍為 NFS 且 mount source token 與該 PASS JSON 相同，
@@ -527,12 +573,13 @@ dispatcher 不落磁碟也不得把其值指向 `/home` 或未驗證 temporary d
 固定 CPU affinity；其他平台或不可用 cpuset 會不綁定並記錄 fallback，不能宣稱已綁定。需要指定
 CPU 時可傳 `--cpu-affinity 0,1,2`，ID 必須屬目前允許 cpuset。`--resume` 只在任何 shard 已有
 執行狀態時明示；全新 run 不加。此入口不提供 sweep budget，因此 worker 必須處理每個分配 shard
-直到完整生命周期狀態。
+直到完整生命周期狀態；`worker_count` 代表同時存活的 persistent child／併發上限，不是每個 child
+固定擁有一組不可變 shard。
 
-只有 CLI 退出 0、summary `status=COMPLETE`、所有 child exit code 為 0、每個 worker summary
-涵蓋分配的全部 shard 且 lifecycle 均為 `COMPLETE`，並且最後的 `validate-run --require-complete`
+只有 CLI 退出 0、summary `status=COMPLETE`、所有 child exit code 為 0、dynamic summary 的
+failed／pending／inflight／stopped-inflight 清單皆為空，且最後的 `validate-run --require-complete`
 回傳 `valid=true`，才算整批完成。summary 同時記錄 whole-machine elapsed、各 child exit、CPU
-affinity 實際狀態、固定分組與獨立 log 名稱。任何 child 失敗即停止後續派發；SIGINT／SIGTERM
+affinity 實際狀態、中央 queue 派發順序與獨立 log 名稱。任何 child 失敗即停止後續派發；SIGINT／SIGTERM
 會轉送至執行器建立的 worker process group，停止後保留 log、已完成 trajectory 與 checkpoint，
 並以非零狀態回報。失敗或中斷不會自動恢復：先保留現場、執行 `run-reconcile` 與唯讀 validator，
 確認原 run ID／config／checkpoint root 後，才由負責人明示 `--resume` 重啟；不得建立同內容的新

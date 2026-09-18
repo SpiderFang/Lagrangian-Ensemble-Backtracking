@@ -535,6 +535,11 @@ def _run_shard_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nww-analysis-root", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--execution-priority",
+        action="store_true",
+        help="啟用連續 forcing fallback；僅將時間缺口轉為可記錄 fallback，不放寬陣列／網格安全檢查",
+    )
     parser.add_argument("--sweep-budget", type=_positive_cli_int)
     return parser
 
@@ -558,20 +563,27 @@ def _run_worker_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nww-analysis-root", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--execution-priority",
+        action="store_true",
+        help="單片 exception/FAILED 隔離並持續執行；由同一 controller 連續服務後續 shard",
+    )
     parser.add_argument("--sweep-budget", type=_positive_cli_int)
     return parser
 
 
 def _run_formal_parallel_parser() -> argparse.ArgumentParser:
-    """建立正式完整母體的固定 worker 平行入口 parser。
+    """建立正式完整母體的 dynamic/static worker 平行入口 parser。
 
     workspace、版本、儲存 gate、log 與 Numba cache 路徑都由操作者明示；worker 數也
-    必須明示，不從主機 CPU 數量或研究設定推算。run plan 決定分片與 checkpoint cadence，
-    本命令不接受科學參數或每片步數上限；``--warmup-only`` 只編譯 JIT，不跑粒子。
+    必須明示，不從主機 CPU 數量或研究設定推算。正式 CLI 預設使用 parent queue
+    動態派片；``--execution-mode static`` 才保留原固定 contiguous group executor。
+    run plan 決定分片與 checkpoint cadence，本命令不接受科學參數或每片步數上限；
+    ``--warmup-only`` 只編譯 JIT，不跑粒子。
     """
 
     parser = argparse.ArgumentParser(
-        description="依 immutable run plan 以固定長壽命 worker 執行正式完整母體"
+        description="依 immutable run plan 以 persistent worker 執行正式完整母體"
     )
     parser.add_argument("workspace", type=Path, help="已建立且通過驗證的 formal run workspace")
     parser.add_argument("--config", required=True, type=Path, help="與 run plan 綁定的正式設定")
@@ -585,7 +597,18 @@ def _run_formal_parallel_parser() -> argparse.ArgumentParser:
         "--worker-count",
         required=True,
         type=_positive_cli_int,
-        help="固定長壽命 worker 數；不得大於 shard 數",
+        help="persistent worker 數；不得大於 shard 數",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=("dynamic", "static"),
+        default="dynamic",
+        help="dynamic 為 parent queue 預設；static 保留原固定分組 executor",
+    )
+    parser.add_argument(
+        "--execution-priority",
+        action="store_true",
+        help="啟用 persistent parent queue、連續時間 fallback 與單片失敗隔離",
     )
     parser.add_argument(
         "--scratch-root",
@@ -640,6 +663,24 @@ def _run_formal_parallel_parser() -> argparse.ArgumentParser:
         "--warmup-only",
         action="store_true",
         help="單次獨立 JIT 編譯檢查，不啟動粒子；正式 Numba worker 仍會各自在程序內預熱",
+    )
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=0.05,
+        help="parent 檢查 child 狀態的輪詢間隔；不得為負數",
+    )
+    parser.add_argument(
+        "--shutdown-grace-seconds",
+        type=float,
+        default=30.0,
+        help="失敗／中斷時 bounded child shutdown 的寬限時間；不得為負數",
+    )
+    parser.add_argument(
+        "--worker-response-timeout-seconds",
+        type=float,
+        default=None,
+        help="可選的單片 IPC response timeout；省略時不以任意時間殺合法長片",
     )
     return parser
 
@@ -974,6 +1015,102 @@ def _root_from_argument_or_env(value: Path | None, env_name: str) -> Path:
     if not raw:
         raise ValueError(f"缺少 --root 參數或環境變數 {env_name}")
     return Path(raw)
+
+
+def open_worker_controller(
+    workspace: str | Path,
+    *,
+    config_path: str | Path,
+    ocm_native_root: str | Path,
+    nww_analysis_root: str | Path | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
+    resume: bool = False,
+    checkpoint_root: str | Path | None = None,
+    continuous_time_fallback: bool = False,
+) -> RunController:
+    """建立一個可連續處理多片的正式 runtime controller。
+
+    這個薄 helper 是 ``run-worker`` 與 dynamic persistent child 共用的 controller
+    setup 邊界。它只轉交既有 ``open_run_controller``；forcing schema、粒子 request、
+    run gate、shard lock、checkpoint、seed 與 QC 仍完全由既有 controller 負責。caller
+    必須先完成 workspace/config/forcing root 的驗證；本函式不偷偷猜測任何路徑，也不會
+    自動執行 shard 或取得 reconcile 的 run-gate exclusive lock。
+    """
+
+    if type(continuous_time_fallback) is not bool:
+        raise TypeError("continuous_time_fallback 必須是 bool")
+    kwargs: dict[str, object] = {
+        "config_path": config_path,
+        "ocm_native_root": ocm_native_root,
+        "nww_analysis_root": nww_analysis_root,
+        "resume": resume,
+        "checkpoint_root": checkpoint_root,
+    }
+    # Optional reconstruction root 在未提供時必須完全省略，而不是傳入
+    # ``None``。這保留既有 controller 與測試替身的關鍵字介面；只有正式
+    # 使用重建流場時才把實際路徑傳入，避免把「未設定」誤寫成一個新的
+    # provenance 欄位。execution-priority 的 fallback 旗標仍獨立處理如下。
+    if ocm_reconstruction_root is not None:
+        kwargs["ocm_reconstruction_root"] = ocm_reconstruction_root
+    # 只有 execution-priority 明確開啟時才傳新參數；舊 controller／測試替身在預設
+    # 路徑仍看到完全相同的 kwargs 拓撲，並保留 fail-closed 的預設 forcing 行為。
+    if continuous_time_fallback:
+        kwargs["continuous_time_fallback"] = True
+    return open_run_controller(workspace, **kwargs)
+
+
+def execute_worker_shard(
+    controller: Any,
+    shard_id: str,
+    *,
+    sweep_budget: int | None = None,
+) -> dict[str, object]:
+    """用既有 controller 執行恰好一片，回傳 JSON-safe 的工程狀態摘要。
+
+    dynamic child 以此 helper 將一個 JSON-line request 對應到一個
+    ``controller.run_shard`` 呼叫；它不重建 controller、不重派其他 shard，也不改變
+    run-control 的 shared run gate／exclusive shard lock 順序。這裡保留既有 duck-typed
+    controller 契約，讓正式 ``RunController`` 與測試中的行為替身都必須提供同一個
+    callable ``run_shard`` 方法。回傳 mapping 只包裝既有 ``RunExecutionSummary``，因此
+    lifecycle、checkpoint、seed、QC 與輸出 validator 的語意仍由核心 controller 定義。
+    """
+
+    if type(shard_id) is not str or not shard_id:
+        raise ValueError("shard_id 必須是非空字串")
+    run_shard = getattr(controller, "run_shard", None)
+    if not callable(run_shard):
+        raise TypeError("controller 必須提供 callable run_shard 方法")
+    return asdict(run_shard(shard_id, sweep_budget=sweep_budget))
+
+
+def reconcile_run_for_resume(
+    workspace: str | Path,
+    *,
+    checkpoint_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """以既有 reconcile 採認 resume 狀態，但禁止在 reconcile 建立粒子 request。
+
+    explicit resume 必須先透過 run-gate exclusive reconcile 修復或採認 checkpoint／output
+    pointer，再由 caller 讀取 progress 決定未完成片。reject factory 是安全邊界：若
+    reconcile 意外要求物理 request，立即失敗；因此這個 helper 不會與 worker shared gate
+    長時間交錯，也不新增 checkpoint schema。
+    """
+
+    def reject_request_factory(unit: object) -> NoReturn:
+        """reconcile 僅採認狀態，不得建立 forcing 或粒子 request。"""
+
+        del unit
+        raise RuntimeError("run-reconcile 不得呼叫 request_factory；reconcile 不做物理計算")
+
+    controller = RunController(
+        workspace,
+        request_factory=reject_request_factory,
+        checkpoint_root=checkpoint_root,
+    )
+    reconciled = controller.reconcile()
+    if not isinstance(reconciled, Mapping):
+        raise ValueError("reconcile 回傳值必須是 progress mapping")
+    return dict(reconciled)
 
 
 def _validate_worker_shard_ids(
@@ -1665,18 +1802,16 @@ def run_shard(argv: Sequence[str] | None = None) -> int:
         args.nww_analysis_root,
         input_config.nww_analysis_root_env,
     )
-    controller_kwargs: dict[str, object] = {
-        "config_path": args.config,
-        "ocm_native_root": ocm_root,
-        "nww_analysis_root": nww_root,
-        "resume": args.resume,
-        "checkpoint_root": args.checkpoint_root,
-    }
-    # legacy fake/config caller 沒有新增欄位時維持既有 kwargs topology；正式設定有
-    # reconstruction root 才把它明確傳入 controller，避免以 None 覆蓋舊 adapter。
-    if reconstruction_root is not None:
-        controller_kwargs["ocm_reconstruction_root"] = reconstruction_root
-    controller = open_run_controller(args.workspace, **controller_kwargs)
+    controller = open_worker_controller(
+        args.workspace,
+        config_path=args.config,
+        ocm_native_root=ocm_root,
+        nww_analysis_root=nww_root,
+        ocm_reconstruction_root=reconstruction_root,
+        resume=args.resume,
+        checkpoint_root=args.checkpoint_root,
+        continuous_time_fallback=args.execution_priority,
+    )
     summary = controller.run_shard(args.shard_id, sweep_budget=args.sweep_budget)
     print(json.dumps(asdict(summary), ensure_ascii=False, sort_keys=True))
     return 0
@@ -1690,7 +1825,9 @@ def run_worker(argv: Sequence[str] | None = None) -> int:
     ``RunController``。之後每片都呼叫同一個 controller 的 ``run_shard``，讓其既有
     RuntimeRequestFactory、流場月份管理器、網格與 lock／checkpoint／provenance gate
     依原契約運作。某片回傳 ``PAUSED`` 即停止後續片；任何例外（包含 lock contention）
-    直接向 caller 傳出，不以跳過或部分成功掩蓋錯誤。
+    直接向 caller 傳出，不以跳過或部分成功掩蓋錯誤。只有明示
+    ``--execution-priority`` 時，才把可隔離的單片例外記為 ``FAILED`` 並繼續後續片；
+    這個入口本身不負責 formal provenance override，正式平行入口才會保存該摘要。
 
     成功時 stdout 只輸出一份 JSON，內含所有實際執行片的 ``RunExecutionSummary``、
     handler 前置時間與整個命令時間。時間從本 handler 開始計算，明確不包含 Python
@@ -1737,16 +1874,16 @@ def run_worker(argv: Sequence[str] | None = None) -> int:
         args.nww_analysis_root,
         input_config.nww_analysis_root_env,
     )
-    controller_kwargs = {
-        "config_path": args.config,
-        "ocm_native_root": ocm_root,
-        "nww_analysis_root": nww_root,
-        "resume": args.resume,
-        "checkpoint_root": args.checkpoint_root,
-    }
-    if reconstruction_root is not None:
-        controller_kwargs["ocm_reconstruction_root"] = reconstruction_root
-    controller = open_run_controller(args.workspace, **controller_kwargs)
+    controller = open_worker_controller(
+        args.workspace,
+        config_path=args.config,
+        ocm_native_root=ocm_root,
+        nww_analysis_root=nww_root,
+        ocm_reconstruction_root=reconstruction_root,
+        resume=args.resume,
+        checkpoint_root=args.checkpoint_root,
+        continuous_time_fallback=args.execution_priority,
+    )
     preflight_wall = time.perf_counter() - started_wall
     preflight_cpu = time.process_time() - started_cpu
 
@@ -1755,9 +1892,32 @@ def run_worker(argv: Sequence[str] | None = None) -> int:
     for shard_id in shard_ids:
         # 每一片共用同一個 controller；run-control 仍會為各 shard 取得自己的 lock，
         # 並以既有 checkpoint／輸出 validator 判定 COMPLETE、PAUSED 或失敗。
-        summary = controller.run_shard(shard_id, sweep_budget=args.sweep_budget)
-        summaries.append(asdict(summary))
-        if summary.lifecycle == "PAUSED":
+        try:
+            summary = execute_worker_shard(
+                controller,
+                shard_id,
+                sweep_budget=args.sweep_budget,
+            )
+        except BaseException as exc:  # noqa: BLE001 - priority mode仍須保留 fatal 邊界
+            if not args.execution_priority:
+                raise
+            # ``run-worker`` 與正式 dynamic child 共用相同的 failure-isolation 分類：
+            # 數值／單片例外可以留下 FAILED 摘要後續跑，但記憶體、訊號、鎖與陣列／網格
+            # 結構錯誤不能把已初始化的 controller 當成仍可安全重用。lazy import 避免
+            # cli 在 dynamic child bootstrap 時與 dynamic_execution 形成模組循環。
+            from .dynamic_execution import _worker_exception_is_fatal
+
+            if _worker_exception_is_fatal(exc):
+                raise
+            summary = {
+                "shard_id": shard_id,
+                "lifecycle": "FAILED",
+                "error_code": "run_shard_exception",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        summaries.append(summary)
+        if summary.get("lifecycle") == "PAUSED":
             paused_shard_id = shard_id
             break
 
@@ -1807,6 +1967,11 @@ def run_formal_parallel(argv: Sequence[str] | None = None) -> int:
             resume=args.resume,
             cpu_affinity=args.cpu_affinity,
             warmup_only=args.warmup_only,
+            execution_mode=args.execution_mode,
+            poll_interval_seconds=args.poll_interval_seconds,
+            shutdown_grace_seconds=args.shutdown_grace_seconds,
+            response_timeout_seconds=args.worker_response_timeout_seconds,
+            execution_priority=args.execution_priority,
         )
     except Exception as exc:  # noqa: BLE001 - CLI 必須以機器可讀失敗狀態 fail closed
         print(
@@ -1845,20 +2010,10 @@ def run_reconcile(argv: Sequence[str] | None = None) -> int:
 
     args = _run_reconcile_parser().parse_args(argv)
 
-    def reject_request_factory(unit: object) -> NoReturn:
-        """reconcile 不得建立粒子 request，因為狀態採認不應做物理計算。"""
-
-        del unit
-        raise RuntimeError("run-reconcile 不得呼叫 request_factory；reconcile 不做物理計算")
-
-    controller = RunController(
+    reconciled = reconcile_run_for_resume(
         args.workspace,
-        request_factory=reject_request_factory,
         checkpoint_root=args.checkpoint_root,
     )
-    reconciled = controller.reconcile()
-    if not isinstance(reconciled, Mapping):
-        raise ValueError("reconcile 回傳值必須是 progress mapping")
     validation = validate_run(
         args.workspace,
         require_complete=False,

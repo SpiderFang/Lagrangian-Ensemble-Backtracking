@@ -104,6 +104,7 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "run_validation",
             "pilot_matrix_validation",
             "parallel_execution",
+            "dynamic_execution",
         ),
     },
     {
@@ -736,6 +737,28 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "scenario index 範圍連續、站點／流域欄位只讀表格既有值，缺少時明示沿用 plan 順序。"
             "Linux affinity 不可用時安全退回並記錄；NFS scratch gate 不通過、cache 未明示或"
             "worker 失敗時停止派發且保留 logs／checkpoint。部分完成不會標為 COMPLETE。"
+        ),
+    },
+    "dynamic_execution": {
+        "role": "execution-priority 的動態 persistent worker queue 與 JSON-line IPC",
+        "inputs": (
+            "已通過 formal workspace／storage gate 的 run context、待派 shard queue、worker 數、"
+            "記憶體與 CPU affinity 設定"
+        ),
+        "outputs": (
+            "持久 child worker 的 shard lifecycle、JSON-line protocol 回覆、worker log、"
+            "resource snapshot 與可驗證的 run progress"
+        ),
+        "entrypoints": [
+            "DynamicShard",
+            "dynamic_worker_child_main",
+            "execute_dynamic_parallel",
+        ],
+        "read_first": (
+            "先確認 parent 只維護尚未派出的 immutable shard queue，child 只在同一 controller"
+            "內連續處理明示 shard；locality 只作優先順序，不可改變 shard 身分、seed、"
+            "checkpoint 或物理呼叫。單片可隔離的 execution-priority 例外會回報 FAILED 並繼續派片，"
+            "結構性、記憶體、鎖與網格錯誤仍停止整批；JSON-line stdout 與診斷 log 分離。"
         ),
     },
     "outputs": {

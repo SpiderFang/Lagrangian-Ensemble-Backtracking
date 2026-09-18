@@ -146,6 +146,48 @@ class WorkerGroup:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class FormalParallelContext:
+    """通過一次 formal preflight 後供 static／dynamic backend 共用的唯讀上下文。
+
+    這個資料結構只保存已驗證的 immutable plan、正式設定、forcing／儲存根與本次
+    執行目錄；它不保存任何粒子陣列，也不持有 run gate。static backend 仍可依 plan
+    建立固定分組，dynamic backend 則只使用 locality 摘要作 parent queue 的軟性排序。
+    ``resume`` 與 ``execution_mode`` 由 coordinator 在所有 validator／provenance gate
+    通過後傳入，避免 dynamic 的 reconcile 在安全閘門之前修改 run-control 狀態。
+    """
+
+    started_wall: float
+    plan: dict[str, Any]
+    config: Any
+    config_path: Path
+    workspace_path: Path
+    project_path: Path
+    checkpoint_path: Path | None
+    ocm_root: Path
+    nww_root: Path | None
+    reconstruction_root: Path | None
+    scenario_locality: dict[str, dict[str, tuple[str, ...]]]
+    locality_columns: tuple[str, ...]
+    static_groups: tuple[WorkerGroup, ...] | None
+    scratch_path: Path
+    log_path: Path
+    prepared_cache: Path | None
+    storage_gate_evidence: Path
+    gate_sha256: str
+    affinity_sets: tuple[tuple[int, ...] | None, ...]
+    affinity_fallbacks: tuple[str | None, ...]
+    run_id: str
+    log_session: Path
+    plan_sha256: str
+    worker_count: int
+    resume: bool
+    cpu_affinity: str
+    warmup_only: bool
+    execution_priority: bool = False
+    provenance_override: dict[str, object] | None = None
+
+
 def canonical_json_bytes(value: object) -> bytes:
     """以 UTF-8、固定 key 順序及緊湊分隔符產生可重現的分組位元組。"""
 
@@ -1139,8 +1181,18 @@ def validate_run_inputs(
     config_path: str | Path,
     project_root: str | Path,
     checkpoint_root: str | Path | None,
-) -> tuple[dict[str, Any], Any, Path, Path, Path | None]:
-    """在任何子程序啟動前驗證 formal workspace、全分片、config 與部署 provenance。"""
+    execution_priority: bool = False,
+) -> tuple[dict[str, Any], Any, Path, Path, Path | None, dict[str, object] | None]:
+    """在任何子程序啟動前驗證 formal workspace、全分片、config 與部署 provenance。
+
+    ``execution_priority`` 只放寬目前主機平台與程式部署指紋的「完全相等」要求；輸入
+    設定 hash、normalized config、陣列／網格拓撲、路徑與 run validator 仍然必須通過。
+    差異不會回寫 immutable ``run_plan.json``，而是回傳一份待寫入本次 NFS log session
+    的 append-only warning，讓跨主機續跑仍可追溯實際 provenance。
+    """
+
+    if type(execution_priority) is not bool:
+        raise ParallelExecutionError("execution_priority 必須是 bool")
 
     workspace_path = _strict_existing_directory(workspace, label="workspace")
     project_path = _strict_existing_directory(project_root, label="project_root")
@@ -1192,14 +1244,45 @@ def validate_run_inputs(
     if not isinstance(expected_provenance, Mapping):
         raise ParallelExecutionError("run plan 缺少 code provenance")
     expected_commit = expected_provenance.get("git_commit")
+    # 正常模式維持既有 formal fail-closed（包含 declared commit／dirty tree gate）；
+    # execution-priority 僅將 provenance 讀成警告，不能因此繞過 source tree 的基本可讀性。
     current_provenance = collect_code_provenance(
         project_path,
-        declared_git_commit=expected_commit,
-        formal=True,
+        declared_git_commit=None if execution_priority else expected_commit,
+        formal=not execution_priority,
     ).to_dict()
-    if current_provenance != dict(expected_provenance):
-        raise ParallelExecutionError("目前乾淨程式部署 provenance 與 run plan 不一致")
-    return plan, config, workspace_path, project_path, checkpoint_path
+    expected_dict = dict(expected_provenance)
+    mismatches = {
+        key: {"expected": expected_dict.get(key), "actual": current_provenance.get(key)}
+        for key in sorted(set(expected_dict) | set(current_provenance))
+        if expected_dict.get(key) != current_provenance.get(key)
+    }
+    override: dict[str, object] | None = None
+    if mismatches:
+        if not execution_priority:
+            raise ParallelExecutionError("目前乾淨程式部署 provenance 與 run plan 不一致")
+        override = {
+            "artifact_type": "formal_execution_priority_provenance_warning",
+            "schema_version": "1.0.0",
+            "policy": "execution_priority_v1",
+            "override_applied": True,
+            "immutable_run_plan_modified": False,
+            "mismatched_fields": mismatches,
+            "expected_provenance": expected_dict,
+            "actual_provenance": current_provenance,
+        }
+    elif execution_priority:
+        override = {
+            "artifact_type": "formal_execution_priority_provenance_warning",
+            "schema_version": "1.0.0",
+            "policy": "execution_priority_v1",
+            "override_applied": False,
+            "immutable_run_plan_modified": False,
+            "mismatched_fields": {},
+            "expected_provenance": expected_dict,
+            "actual_provenance": current_provenance,
+        }
+    return plan, config, workspace_path, project_path, checkpoint_path, override
 
 
 def requires_numba_cache(config: object) -> bool:
@@ -1386,7 +1469,7 @@ def _input_root(
     return _strict_existing_directory(value, label=label)
 
 
-def execute_formal_parallel(
+def _prepare_formal_parallel_context(
     *,
     workspace: str | Path,
     config_path: str | Path,
@@ -1395,50 +1478,74 @@ def execute_formal_parallel(
     scratch_root: str | Path,
     log_root: str | Path,
     storage_gate_evidence: str | Path,
-    checkpoint_root: str | Path | None = None,
-    numba_cache_dir: str | Path | None = None,
-    ocm_native_root: str | Path | None = None,
-    ocm_reconstruction_root: str | Path | None = None,
-    nww_analysis_root: str | Path | None = None,
-    resume: bool = False,
-    cpu_affinity: str = "auto",
-    warmup_only: bool = False,
-    popen_factory: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
-    poll_interval_seconds: float = 0.05,
-    shutdown_grace_seconds: float = 30.0,
-) -> tuple[dict[str, object], int]:
-    """驗證完整正式母體後，按 immutable plan 分組並執行持久 worker。
+    checkpoint_root: str | Path | None,
+    numba_cache_dir: str | Path | None,
+    ocm_native_root: str | Path | None,
+    ocm_reconstruction_root: str | Path | None,
+    nww_analysis_root: str | Path | None,
+    resume: bool,
+    cpu_affinity: str,
+    warmup_only: bool,
+    execution_mode: str,
+    execution_priority: bool,
+) -> FormalParallelContext:
+    """只做一次 static／dynamic 共用的 formal 唯讀 preflight 與執行目錄準備。
 
-    此函式先驗證 workspace／全部 shard／checkpoint、正式設定與乾淨部署 provenance，
-    再檢查實際 forcing 根目錄、NFS gate、log/cache 子路徑與 CPU affinity。任何 preflight
-    失敗都會在建立子程序或新執行目錄之前停止。warmup-only 以獨立 JIT 子程序檢查可編譯性，
-    其記憶體編譯結果不跨程序保留；正式模式每個 Numba worker 會在自身程序內暖機一次，接著
-    僅啟動一次既有 run-worker，並以 run validator 作為唯一 COMPLETE 判定。
+    這裡刻意不建立 worker group，也不啟動 child；兩種 backend 會在同一個已驗證上下文
+    上各自派片。dynamic resume 的 reconcile 只有在 input、config、normalized config、
+    code provenance、forcing root 與 storage gate 都通過後才呼叫，且完成後再次以既有
+    validator／progress reader 確認狀態。static 路徑不改變原本「由 caller 明示 resume
+    後交給 child/controller 處理」的語意。
     """
 
-    started_wall = time.perf_counter()
+    if execution_mode not in {"static", "dynamic"}:
+        raise ParallelExecutionError("execution_mode 只允許 static 或 dynamic")
+    if type(execution_priority) is not bool:
+        raise ParallelExecutionError("execution_priority 必須是 bool")
+    if execution_priority:
+        # execution-priority 的目標是持續消化中央 queue；不允許 caller 同時要求
+        # 舊式固定 contiguous group，避免摘要看似 priority、實際仍有尾端閒置。
+        execution_mode = "dynamic"
     if type(resume) is not bool or type(warmup_only) is not bool:
         raise ParallelExecutionError("resume 與 warmup_only 必須是 bool")
     if isinstance(worker_count, bool) or not isinstance(worker_count, int) or worker_count < 1:
         raise ParallelExecutionError("worker_count 必須是正整數")
 
-    # run validator 先完整掃描 immutable plan、目前狀態、輸出與外部 checkpoint 拓撲；
-    # formal provenance 再要求目前乾淨部署與 plan 完全相同，兩者都在啟動 child 前完成。
-    plan, config, workspace_path, project_path, checkpoint_path = validate_run_inputs(
+    started_wall = time.perf_counter()
+    # 這一步包含 workspace、immutable plan、config hash、normalized config 與正式
+    # code provenance；任何 dynamic reconcile 都必須排在這個唯讀安全邊界之後。
+    validated_inputs = validate_run_inputs(
         workspace=workspace,
         config_path=config_path,
         project_root=project_root,
         checkpoint_root=checkpoint_root,
+        execution_priority=execution_priority,
     )
+    # 保留舊測試／外部 adapter 的五元組回傳相容性；正式實作一定會提供第六項
+    # provenance warning，缺少時只代表本次沒有可寫的 override 摘要。
+    if len(validated_inputs) == 5:
+        plan, config, workspace_path, project_path, checkpoint_path = validated_inputs
+        provenance_override = None
+    elif len(validated_inputs) == 6:
+        (
+            plan,
+            config,
+            workspace_path,
+            project_path,
+            checkpoint_path,
+            provenance_override,
+        ) = validated_inputs
+    else:
+        raise ParallelExecutionError("formal preflight 回傳欄位數不支援")
     if worker_count > len(plan["shards"]):
         raise ParallelExecutionError("worker_count 不可大於 run plan shard 數")
-    # 已完成、暫停或失敗過的任一 shard 都表示本 run 具有執行歷史；必須由操作者明示
-    # resume，避免把部分成果誤當成初次執行而重開 checkpoint／亂數狀態。
+
     progress = load_run_progress(workspace_path)
     progress_shards = progress.get("shards")
-    if not isinstance(progress_shards, Mapping) or set(progress_shards) != {
-        row["shard_id"] for row in plan["shards"]
-    }:
+    plan_ids = {
+        row["shard_id"] for row in plan["shards"] if isinstance(row, Mapping)
+    }
+    if not isinstance(progress_shards, Mapping) or set(progress_shards) != plan_ids:
         raise ParallelExecutionError("run progress 與 immutable plan 的全部 shard ID 不一致")
     if progress.get("run_lifecycle") == "COMPLETE":
         raise ParallelExecutionError("run 已為 COMPLETE；請勿再次啟動同一正式母體")
@@ -1469,14 +1576,18 @@ def execute_formal_parallel(
         required=reconstruction_required,
     )
 
-    # 情境表只讀已存在的站點／流域識別欄位；目前 run plan 固定提供區域與 UTC 到達時刻，
-    # 因而可按原情境順序標示 region/month。缺少表格欄位時不推測，assignment 會記錄 fallback。
+    # locality 只讀既有 scenario table 的識別欄位；dynamic 只把它當作軟性 queue
+    # 偏好，不能改變 immutable shard、scenario、seed 或 checkpoint 邊界。
     scenario_locality, locality_columns = _scenario_table_locality(workspace_path, plan)
-    groups = build_worker_groups(
-        plan,
-        worker_count=worker_count,
-        scenario_locality=scenario_locality,
-        locality_columns=locality_columns,
+    static_groups = (
+        build_worker_groups(
+            plan,
+            worker_count=worker_count,
+            scenario_locality=scenario_locality,
+            locality_columns=locality_columns,
+        )
+        if execution_mode == "static"
+        else None
     )
     cache_value = numba_cache_dir
     if requires_numba_cache(config) and cache_value is None:
@@ -1488,14 +1599,35 @@ def execute_formal_parallel(
             "--warmup-only 僅適用於 run plan 明示 Numba backend 並指定 --numba-cache-dir"
         )
 
-    # storage snapshot 必須證明全部受管根目錄位於同一 NFS source，實際使用的 scratch、
-    # log 與 cache 路徑再逐元件拒絕 symlink；正式 SERVER 不把 cache 寫入 /home 或系統 tmp。
+    # storage gate 是唯讀驗證；在它通過前不建立 log/cache，也不讓 dynamic reconcile
+    # 以外的 mutable artifact 被準備。實際 NFS identity 仍由既有 helper fail closed。
     scratch_path, log_path, cache_path, gate_sha256 = validate_storage_roots(
         scratch_root=scratch_root,
         log_root=log_root,
         numba_cache_dir=cache_value,
         gate_evidence=storage_gate_evidence,
     )
+
+    if execution_mode == "dynamic" and resume:
+        # reconcile 需要 run-gate exclusive；它只採認 checkpoint/output，不會開啟
+        # forcing。此刻所有 input/provenance/storage 唯讀 gate 已完成，避免先 mutate。
+        from .cli import reconcile_run_for_resume
+
+        reconcile_run_for_resume(workspace_path, checkpoint_root=checkpoint_path)
+        validation = validate_run(
+            workspace_path,
+            require_complete=False,
+            checkpoint_root=checkpoint_path,
+        )
+        if not isinstance(validation, Mapping) or validation.get("valid") is not True:
+            raise ParallelExecutionError(
+                "dynamic resume reconcile 後 run validator 未通過："
+                + json.dumps(validation, ensure_ascii=False, sort_keys=True)
+            )
+        progress = load_run_progress(workspace_path)
+        if progress.get("run_lifecycle") == "COMPLETE":
+            raise ParallelExecutionError("reconcile 後 run 已為 COMPLETE；不重新計算")
+
     available_cpus = current_available_cpus()
     affinity_sets = plan_cpu_affinity(
         cpu_affinity,
@@ -1511,8 +1643,7 @@ def execute_formal_parallel(
         for cpu_ids in affinity_sets
     )
 
-    # 只有所有唯讀檢查完成後才建立本批次獨立 log session／cache；NFS 寫入探針亦會在
-    # 子程序啟動前完成。每次執行使用不可碰撞目錄，不覆寫舊摘要或失敗現場。
+    # 到此才建立不可碰撞的 log session／cache 目錄；所有科學輸入與狀態 gate 已完成。
     run_id = plan["run_id"]
     log_session, prepared_cache = prepare_execution_directories(
         scratch_root=scratch_path,
@@ -1522,6 +1653,145 @@ def execute_formal_parallel(
     )
     plan_bytes = (workspace_path / "run_plan.json").read_bytes()
     plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
+    return FormalParallelContext(
+        started_wall=started_wall,
+        plan=plan,
+        config=config,
+        config_path=_strict_regular_file(config_path, label="config"),
+        workspace_path=workspace_path,
+        project_path=project_path,
+        checkpoint_path=checkpoint_path,
+        ocm_root=ocm_root,
+        nww_root=nww_root,
+        reconstruction_root=reconstruction_root,
+        scenario_locality=scenario_locality,
+        locality_columns=tuple(locality_columns),
+        static_groups=static_groups,
+        scratch_path=scratch_path,
+        log_path=log_path,
+        prepared_cache=prepared_cache,
+        storage_gate_evidence=_strict_regular_file(
+            storage_gate_evidence,
+            label="storage gate evidence",
+        ),
+        gate_sha256=gate_sha256,
+        affinity_sets=tuple(affinity_sets),
+        affinity_fallbacks=tuple(affinity_fallbacks),
+        run_id=run_id,
+        log_session=log_session,
+        plan_sha256=plan_sha256,
+        worker_count=worker_count,
+        resume=resume,
+        cpu_affinity=cpu_affinity,
+        warmup_only=warmup_only,
+        execution_priority=execution_priority,
+        provenance_override=provenance_override,
+    )
+
+
+def execute_formal_parallel(
+    *,
+    workspace: str | Path,
+    config_path: str | Path,
+    project_root: str | Path,
+    worker_count: int,
+    scratch_root: str | Path,
+    log_root: str | Path,
+    storage_gate_evidence: str | Path,
+    checkpoint_root: str | Path | None = None,
+    numba_cache_dir: str | Path | None = None,
+    ocm_native_root: str | Path | None = None,
+    ocm_reconstruction_root: str | Path | None = None,
+    nww_analysis_root: str | Path | None = None,
+    resume: bool = False,
+    cpu_affinity: str = "auto",
+    warmup_only: bool = False,
+    popen_factory: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
+    poll_interval_seconds: float = 0.05,
+    shutdown_grace_seconds: float = 30.0,
+    execution_mode: str = "static",
+    response_timeout_seconds: float | None = None,
+    execution_priority: bool = False,
+) -> tuple[dict[str, object], int]:
+    """依選定 backend 驗證完整正式母體並執行 persistent worker。
+
+    ``static`` 保留既有固定 contiguous group executor。``dynamic`` 先由本 coordinator
+    取得同一份 formal preflight context，再交給 dynamic parent queue；因此不在新模組
+    複製 input/provenance/storage gate。任何 backend 都在建立 child 或新執行目錄以前
+    fail closed；只有 dynamic resume 會在所有唯讀 gate 通過後進行既有 reconcile。
+    """
+
+    if execution_mode not in {"static", "dynamic"}:
+        raise ParallelExecutionError("execution_mode 只允許 static 或 dynamic")
+    if type(execution_priority) is not bool:
+        raise ParallelExecutionError("execution_priority 必須是 bool")
+    if execution_priority:
+        execution_mode = "dynamic"
+    context = _prepare_formal_parallel_context(
+        workspace=workspace,
+        config_path=config_path,
+        project_root=project_root,
+        worker_count=worker_count,
+        scratch_root=scratch_root,
+        log_root=log_root,
+        storage_gate_evidence=storage_gate_evidence,
+        checkpoint_root=checkpoint_root,
+        numba_cache_dir=numba_cache_dir,
+        ocm_native_root=ocm_native_root,
+        ocm_reconstruction_root=ocm_reconstruction_root,
+        nww_analysis_root=nww_analysis_root,
+        resume=resume,
+        cpu_affinity=cpu_affinity,
+        warmup_only=warmup_only,
+        execution_mode=execution_mode,
+        execution_priority=execution_priority,
+    )
+    if context.provenance_override is not None:
+        # 這份檔案位於本次不可碰撞的 NFS log session，採原子建立且不回寫 immutable
+        # run plan；它是跨主機續跑時唯一允許的 provenance 差異告警紀錄。
+        atomic_write_json(
+            context.log_session / "execution-priority-provenance.json",
+            context.provenance_override,
+        )
+    if execution_mode == "dynamic":
+        from .dynamic_execution import execute_dynamic_parallel_prepared
+
+        return execute_dynamic_parallel_prepared(
+            context,
+            popen_factory=popen_factory,
+            poll_interval_seconds=poll_interval_seconds,
+            shutdown_grace_seconds=shutdown_grace_seconds,
+            response_timeout_seconds=response_timeout_seconds,
+        )
+
+    # static backend 消費與 dynamic 完全相同的已驗證上下文；其後仍沿用原固定分組與
+    # run-worker executor，不改變 static resume 的 caller 明示語意。
+    started_wall = context.started_wall
+    plan = context.plan
+    config = context.config
+    config_path = context.config_path
+    workspace_path = context.workspace_path
+    project_path = context.project_path
+    checkpoint_path = context.checkpoint_path
+    ocm_root = context.ocm_root
+    nww_root = context.nww_root
+    reconstruction_root = context.reconstruction_root
+    locality_columns = context.locality_columns
+    worker_count = context.worker_count
+    resume = context.resume
+    cpu_affinity = context.cpu_affinity
+    warmup_only = context.warmup_only
+    groups = context.static_groups
+    if groups is None:
+        raise ParallelExecutionError("static backend 缺少共用 preflight 的 worker groups")
+    scratch_path = context.scratch_path
+    prepared_cache = context.prepared_cache
+    gate_sha256 = context.gate_sha256
+    affinity_sets = context.affinity_sets
+    affinity_fallbacks = context.affinity_fallbacks
+    run_id = context.run_id
+    log_session = context.log_session
+    plan_sha256 = context.plan_sha256
     assignment = worker_assignment_document(
         run_id=run_id,
         run_plan_sha256=plan_sha256,
@@ -1641,6 +1911,7 @@ def execute_formal_parallel(
 
 
 __all__ = [
+    "FormalParallelContext",
     "ParallelExecutionError",
     "ParallelExecutionInterrupted",
     "WorkerGroup",

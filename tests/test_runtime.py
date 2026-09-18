@@ -575,6 +575,7 @@ def _factory(
     ocm_reconstruction_root: str | Path | None = None,
     geometries: BoundaryGeometryBundle | None = None,
     run_kind: str = "pilot",
+    continuous_time_fallback: bool = False,
 ) -> runtime.RuntimeRequestFactory:
     """用 ordinary OCM root 建立 pilot/formal factory；manager 由各測試 monkeypatch。
 
@@ -594,6 +595,7 @@ def _factory(
         ocm_reconstruction_root=ocm_reconstruction_root,
         experiment_case_id=case_id,
         run_kind=run_kind,
+        continuous_time_fallback=continuous_time_fallback,
     )
 
 
@@ -725,6 +727,26 @@ def test_valid_no_stokes_is_lazy_shared_and_uses_dynamic_pair(
         data["scenario"].arrival_time_utc_ns - 7 * 86400 * 1_000_000_000
     )
     assert first.settings.maximum_minimum_clamps == 100
+
+
+def test_runtime_forwards_execution_priority_continuous_time_fallback(
+    runtime_fixture: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """runtime factory 只在明示 True 時把時間 fallback 傳給 manager。"""
+
+    data = runtime_fixture
+    calls, _ = _patch_from_roots(monkeypatch, _matching_location(data))
+    factory = _factory(
+        data,
+        tmp_path,
+        nww_root=_UninspectablePath(),
+        continuous_time_fallback=True,
+    )
+
+    factory(_unit(data["scenario"], member_id=1))
+    assert calls[0]["continuous_time_fallback"] is True
 
 
 @pytest.mark.parametrize(
