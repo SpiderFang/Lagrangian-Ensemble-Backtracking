@@ -894,7 +894,8 @@ _FAILURE_DIAGNOSTIC_VERSION = 1
 _FAILURE_STAGES = frozenset({"k1", "k2", "k3", "k4", "step_start", "diffusion", "limits", "unknown"})
 _FAILURE_REASONS = frozenset({
     "invalid_velocity_sample", "invalid_diffusion_sample", "diffusion_evaluation_error",
-    "rk_stage_unrecoverable", "maximum_step_count", "minimum_clamp_limit", "unknown",
+    "rk_stage_unrecoverable", "time_step_evaluation_error", "maximum_step_count",
+    "minimum_clamp_limit", "unknown",
 })
 
 
@@ -1227,7 +1228,12 @@ def advance_particle_once(
     一般海面／海床解析，中間 stage 不產生虛構事件；其他 stage 失敗不使用這個調節。
     終止狀態會立即寫入最後觀測，因此呼叫端可以在每次 sweep 後安全 checkpoint；
     ``on_step`` 只在真正完成數值步時呼叫一次。失敗事件另附版本化的安全診斷，所有
-    boundary recovery 與重試都不在 RK4 stage 中插入隨機擴散。
+    boundary recovery 與重試都不在 RK4 stage 中插入隨機擴散。若 max age 或 forcing
+    起始時刻距離目前 state 小於設定的 ``dt_min_seconds``，該正的 terminal-limited
+    剩餘時間會作為唯一的最後短步，且不增加 ``minimum_clamp_count``；步後會把相應的
+    age 或 UTC 時刻固定回精確終點。``choose_time_step`` 的 TypeError／ValueError 只
+    封裝成目前粒子的 ``NUMERICAL_FAILURE``（``time_step_evaluation_error``、``limits``），
+    不讓單粒子非法尺度中止整個批次，也不攔截 SamplingError 或其他例外。
     """
 
     if execution.terminal:
@@ -1388,31 +1394,73 @@ def advance_particle_once(
                 context=SamplingContext(state.x_m, state.y_m, state.z_m, state.time_utc_ns),
             ),
         )
-    horizontal_speed = float(np.hypot(reference.u_mps, reference.v_mps))
-    decision = choose_time_step(
-        speed_horizontal_mps=horizontal_speed,
-        speed_vertical_mps=abs(reference.w_mps),
-        horizontal_scale_m=reference.horizontal_scale_m,
-        vertical_scale_m=reference.vertical_scale_m,
-        coefficients=diffusion_sample.coefficients,
-        dt_min_seconds=settings.dt_min_seconds,
-        dt_max_seconds=min(settings.dt_max_seconds, remaining_age, seconds_to_start),
-        physics_kernel_backend=settings.physics_kernel_backend,
+    # 先把時間軸上的兩個硬終點（最大回溯年齡與 forcing 起始時刻）合併成有效上限。
+    # 正常情況仍把設定的 ``dt_min_seconds`` 交給 choose_time_step；但若距離終點只剩
+    # 一小段、且這段時間小於設定下限，不能把無法避免的最後短步誤記成一般
+    # ``minimum_clamp``。短步仍需經 choose_time_step 驗證速度尺度與 K 的合法性，之後
+    # 固定採用該終點剩餘時間，確保 RK4、diffusion split 與 RNG 的既有順序完全不變。
+    effective_dt_max_seconds = min(settings.dt_max_seconds, remaining_age, seconds_to_start)
+    terminal_limited_short_step = (
+        effective_dt_max_seconds > 0.0
+        and effective_dt_max_seconds < settings.dt_min_seconds
     )
-    if decision.limiting_reason == "minimum_clamp":
-        execution.minimum_clamp_count += 1
-        if execution.minimum_clamp_count > settings.maximum_minimum_clamps:
-            return _terminate_execution(
+    try:
+        horizontal_speed = float(np.hypot(reference.u_mps, reference.v_mps))
+        decision = choose_time_step(
+            speed_horizontal_mps=horizontal_speed,
+            speed_vertical_mps=abs(reference.w_mps),
+            horizontal_scale_m=reference.horizontal_scale_m,
+            vertical_scale_m=reference.vertical_scale_m,
+            coefficients=diffusion_sample.coefficients,
+            # choose_time_step 的 dt 下限在短終點步暫時收斂到同一個正的終點上限，
+            # 目的只是讓它仍檢查尺度、係數及候選值；引擎隨後會明確採用終點剩餘值，
+            # 並不把該短步當作 minimum clamp 累計。這不改變正常步的設定下限政策。
+            dt_min_seconds=(
+                effective_dt_max_seconds
+                if terminal_limited_short_step
+                else settings.dt_min_seconds
+            ),
+            dt_max_seconds=effective_dt_max_seconds,
+            physics_kernel_backend=settings.physics_kernel_backend,
+        )
+    except (TypeError, ValueError):
+        # 非法尺度、非有限步長或其他 choose_time_step 的輸入驗證錯誤只影響目前粒子。
+        # 將它封裝成既有 numerical-failure event，避免一顆粒子的資料損壞中止整個
+        # shard/coordinator；不捕捉 SamplingError 或其他例外，維持其原本的失敗分類。
+        return _terminate_execution(
+            execution,
+            status=ParticleStatus.NUMERICAL_FAILURE,
+            event_type=EventType.NUMERICAL_FAILURE,
+            environment_context=environment_context,
+            velocity_context=velocity_context,
+            failure_attributes=_failure_attributes(
                 execution,
-                status=ParticleStatus.NUMERICAL_FAILURE,
-                event_type=EventType.NUMERICAL_FAILURE,
-                velocity_context=velocity_context,
-                failure_attributes=_failure_attributes(
-                    execution, settings, reason="minimum_clamp_limit", stage="limits",
-                    attempted_dt_seconds=-decision.seconds,
-                ),
-            )
-    accepted_step_seconds = decision.seconds
+                settings,
+                reason="time_step_evaluation_error",
+                stage="limits",
+                attempted_dt_seconds=-effective_dt_max_seconds,
+            ),
+        )
+    if terminal_limited_short_step:
+        # 這是唯一允許小於設定 dt_min 的情況：時間硬終點比下限更近。即使候選計算
+        # 回報 minimum_clamp，也不能增加 clamp 計數；這一步是為了精確抵達終點，不是
+        # 對一般物理候選值做下限夾制。
+        accepted_step_seconds = effective_dt_max_seconds
+    else:
+        if decision.limiting_reason == "minimum_clamp":
+            execution.minimum_clamp_count += 1
+            if execution.minimum_clamp_count > settings.maximum_minimum_clamps:
+                return _terminate_execution(
+                    execution,
+                    status=ParticleStatus.NUMERICAL_FAILURE,
+                    event_type=EventType.NUMERICAL_FAILURE,
+                    velocity_context=velocity_context,
+                    failure_attributes=_failure_attributes(
+                        execution, settings, reason="minimum_clamp_limit", stage="limits",
+                        attempted_dt_seconds=-decision.seconds,
+                    ),
+                )
+        accepted_step_seconds = decision.seconds
     surface_retry_count = 0
     stage_surface_adjustment_attempted = False
     stage_error: SamplingError | None = None
@@ -1527,6 +1575,19 @@ def advance_particle_once(
         if proposed.status == ParticleStatus.ACTIVE:
             proposed, horizontal_events = resolve_horizontal_boundaries(state, proposed, boundaries)
             execution.events.extend(horizontal_events)
+    if terminal_limited_short_step and proposed.status is ParticleStatus.ACTIVE:
+        # RK4 以浮點秒數累加 age，奈秒時間則以 round 後的整數更新；在只剩小於
+        # dt_min 的終點短步時，將真正的時間硬終點 canonicalize 回設定值，避免一個
+        # 極小的浮點殘差讓下一輪又重新計算，或讓輸出看似越過 max age／forcing start。
+        # 只有空間邊界解析後仍為 ACTIVE 才能套用；若粒子在步內較早碰到海岸、海床或
+        # flow domain，必須保留實際邊界 fraction 與其較早的 terminal 時間。
+        if remaining_age <= seconds_to_start:
+            proposed = replace(proposed, age_seconds=settings.max_backtrack_seconds)
+        if seconds_to_start <= remaining_age:
+            proposed = replace(
+                proposed,
+                time_utc_ns=settings.earliest_forcing_time_utc_ns,
+            )
     execution.state = proposed
     execution.step_count += 1
     if on_step is not None:

@@ -11,6 +11,10 @@ import numpy as np
 import pytest
 from shapely.geometry import box
 
+from lagrangian_backtracking.accelerated import (
+    PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1,
+    PHYSICS_KERNEL_BACKEND_NUMPY_V1,
+)
 from lagrangian_backtracking.boundaries import BoundaryGeometry
 from lagrangian_backtracking.checkpoint import (
     CheckpointBinding,
@@ -229,6 +233,172 @@ def test_stepwise_engine_preserves_all_step_start_stop_events() -> None:
         assert callback_states == []
         assert len(final.observations) == 1
         assert final.observations[-1].status == expected_status
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [PHYSICS_KERNEL_BACKEND_NUMPY_V1, PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1],
+)
+def test_max_age_terminal_short_step_reaches_exact_endpoint_without_clamp(backend: str) -> None:
+    """距離 max age 小於設定下限時，以一次短步精確到齡且不增加 minimum clamp。
+
+    這個案例從 age=2.0 s 開始、只剩 0.25 s，而設定 ``dt_min=1.0 s``。短步仍須
+    消耗一次與正常步相同的三軸 Brownian 抽樣，並讓 RK4 及 diffusion split 完整執行；
+    但短步不是一般物理候選值被下限夾制，所以計數保持為零。最後的 max-age 狀態由
+    下一次步首檢查寫入，且 age 以設定值 canonicalize，避免浮點加法讓粒子在終點外多走
+    一輪。NumPy 與 Numba 只替換純量核心，兩者都應遵守同一終點與亂數契約。
+    """
+
+    initial = _state(age_seconds=2.0)
+    settings = _settings(
+        dt_min_seconds=1.0,
+        dt_max_seconds=2.0,
+        max_backtrack_seconds=2.25,
+        earliest_forcing_time_utc_ns=0,
+        physics_kernel_backend=backend,
+    )
+    rng = np.random.Generator(np.random.PCG64DXSM(20260918))
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(20260918))
+
+    result = run_particle(
+        initial,
+        velocity=_position_dependent_velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=rng,
+    )
+
+    # 一個成功短步各軸仍只取一次 normal(size=3)；步首 max-age 檢查不再取樣。
+    expected_rng.normal(size=3)
+    assert result.final_state.status is ParticleStatus.MAX_AGE
+    assert result.step_count == 1
+    assert result.minimum_clamp_count == 0
+    assert result.final_state.age_seconds == settings.max_backtrack_seconds
+    assert result.final_state.age_seconds <= settings.max_backtrack_seconds
+    assert result.final_state.time_utc_ns == initial.time_utc_ns - 250_000_000
+    assert [event.event_type for event in result.events] == [EventType.MAX_AGE]
+    assert result.observations[-1].status is ParticleStatus.MAX_AGE
+    assert rng.bit_generator.state == expected_rng.bit_generator.state
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [PHYSICS_KERNEL_BACKEND_NUMPY_V1, PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1],
+)
+def test_forcing_start_terminal_short_step_reaches_exact_endpoint_without_clamp(backend: str) -> None:
+    """距離 forcing 起始時刻小於設定下限時，不越過 UTC 邊界且不計 minimum clamp。
+
+    本案例目前時刻距 forcing 起點只有 0.25 s，故 engine 必須完成一次負向 0.25 s
+    步驟，再於下一個步首寫入 ``FORCING_START``。時間用整數奈秒保存，測試要求它正好
+    等於 forcing 起始值；age 則只增加這次已執行的正向回溯秒數，亂數狀態必須與一個
+    正常單步完全相同。這能直接覆蓋正式 H30 終點前常見的 fractional remainder。
+    """
+
+    initial = _state(time_utc_ns=250_000_000)
+    settings = _settings(
+        dt_min_seconds=1.0,
+        dt_max_seconds=2.0,
+        max_backtrack_seconds=5.0,
+        earliest_forcing_time_utc_ns=0,
+        physics_kernel_backend=backend,
+    )
+    rng = np.random.Generator(np.random.PCG64DXSM(20260918))
+    expected_rng = np.random.Generator(np.random.PCG64DXSM(20260918))
+
+    result = run_particle(
+        initial,
+        velocity=_position_dependent_velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=rng,
+    )
+
+    expected_rng.normal(size=3)
+    assert result.final_state.status is ParticleStatus.FORCING_START
+    assert result.step_count == 1
+    assert result.minimum_clamp_count == 0
+    assert result.final_state.time_utc_ns == settings.earliest_forcing_time_utc_ns
+    assert result.final_state.time_utc_ns >= settings.earliest_forcing_time_utc_ns
+    assert result.final_state.age_seconds == 0.25
+    assert result.final_state.age_seconds < settings.max_backtrack_seconds
+    assert [event.event_type for event in result.events] == [EventType.FORCING_START]
+    assert result.observations[-1].status is ParticleStatus.FORCING_START
+    assert rng.bit_generator.state == expected_rng.bit_generator.state
+
+
+@pytest.mark.parametrize(
+    ("scale_name", "horizontal_scale_m", "vertical_scale_m"),
+    [("horizontal", 0.0, 10.0), ("vertical", 100.0, 0.0)],
+)
+@pytest.mark.parametrize(
+    "backend",
+    [PHYSICS_KERNEL_BACKEND_NUMPY_V1, PHYSICS_KERNEL_BACKEND_NUMBA_CPU_V1],
+)
+def test_invalid_time_step_scale_becomes_particle_numerical_failure(
+    scale_name: str,
+    horizontal_scale_m: float,
+    vertical_scale_m: float,
+    backend: str,
+) -> None:
+    """非法水平／垂向尺度只終止該粒子，並保存可稽核的 time-step failure 診斷。
+
+    ``choose_time_step`` 對零尺度會明確拋出 ValueError；這不應再穿透到 shard coordinator。
+    engine 必須在任何 RK4 或 Brownian 亂數前轉成 ``NUMERICAL_FAILURE``，保留原 state、
+    step/clamp 計數與 RNG，並以固定白名單欄位記錄 ``limits`` 階段和失敗原因。兩個物理
+    backend 都在 Python 驗證層走同一個 fail-closed 契約。
+    """
+
+    del scale_name
+
+    def invalid_scale_velocity(
+        x_m: float, y_m: float, z_m: float, time_utc_ns: int
+    ) -> VelocitySample:
+        """回傳速度有效但網格尺度為零的樣本，模擬 time-step input 損壞。"""
+
+        del x_m, y_m, z_m, time_utc_ns
+        return VelocitySample(
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -100.0,
+            horizontal_scale_m,
+            vertical_scale_m,
+        )
+
+    initial = _state()
+    settings = _settings(physics_kernel_backend=backend)
+    execution = initialize_particle_execution(initial, settings)
+    rng = np.random.Generator(np.random.PCG64DXSM(20260918))
+    before_rng = deepcopy(rng.bit_generator.state)
+
+    outcome = advance_particle_once(
+        execution,
+        velocity=invalid_scale_velocity,
+        boundaries=_boundaries(),
+        behavior_class="sinking",
+        diffusion=DiffusionCoefficients(0.0, 0.0, 0.0),
+        settings=settings,
+        rng=rng,
+    )
+
+    assert outcome.terminal and not outcome.stepped
+    assert execution.state == replace(initial, status=ParticleStatus.NUMERICAL_FAILURE)
+    assert execution.step_count == 0
+    assert execution.minimum_clamp_count == 0
+    assert rng.bit_generator.state == before_rng
+    assert [event.event_type for event in execution.events] == [EventType.NUMERICAL_FAILURE]
+    attributes = execution.events[-1].attributes
+    assert attributes["failure_reason"] == "time_step_evaluation_error"
+    assert attributes["failure_stage"] == "limits"
+    assert attributes["attempted_dt_seconds"] == -2.0
+    assert attributes["step_count"] == 0
+    assert attributes["minimum_clamp_count"] == 0
+    _assert_safe_diagnostic(attributes)
 
 
 def test_stepwise_engine_keeps_rk_stage_invalid_boundary_recovery() -> None:
