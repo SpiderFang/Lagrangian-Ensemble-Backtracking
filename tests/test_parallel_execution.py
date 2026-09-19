@@ -569,6 +569,26 @@ def test_preflight_failure_never_calls_child_factory(monkeypatch: pytest.MonkeyP
     assert spawned == []
 
 
+@pytest.mark.parametrize("execution_mode", ["static", "dynamic"])
+def test_deferred_validation_requires_explicit_execution_priority(
+    execution_mode: str,
+) -> None:
+    """延後整批驗收不得由 static 或未授權 dynamic 呼叫單獨開啟。"""
+
+    with pytest.raises(parallel.ParallelExecutionError, match="execution-priority"):
+        parallel.execute_formal_parallel(
+            workspace="/unused/workspace",
+            config_path="/unused/config.yaml",
+            project_root="/unused/project",
+            worker_count=1,
+            scratch_root="/unused/scratch",
+            log_root="/unused/scratch/logs",
+            storage_gate_evidence="/unused/gate.json",
+            execution_mode=execution_mode,
+            defer_full_validation=True,
+        )
+
+
 def test_formal_parallel_cli_help_and_exception_summary_are_truthful(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -581,6 +601,24 @@ def test_formal_parallel_cli_help_and_exception_summary_are_truthful(
     assert "--numba-cache-dir" in help_text
     assert "--warmup-only" in help_text
     assert "--execution-priority" in help_text
+    assert "--defer-full-validation" in help_text
+    assert cli._run_formal_parallel_parser().parse_args(
+        [
+            "/unused/workspace",
+            "--config",
+            "/unused/config.yaml",
+            "--project-root",
+            "/unused/project",
+            "--worker-count",
+            "1",
+            "--scratch-root",
+            "/unused/scratch",
+            "--log-root",
+            "/unused/scratch/logs",
+            "--storage-gate-evidence",
+            "/unused/gate.json",
+        ]
+    ).defer_full_validation is False
 
     def fail_after_unknown_phase(**_: Any) -> Any:
         """模擬無法從通用例外判斷發生在啟動前或摘要階段的 coordinator 錯誤。"""

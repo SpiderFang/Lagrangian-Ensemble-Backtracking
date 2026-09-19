@@ -237,6 +237,15 @@ _FORMAL_FINDING_KEYS = frozenset(field.name for field in fields(Finding))
 _RUNTIME_RUN_KINDS = frozenset({"pilot", "formal"})
 """runtime／CLI 允許的執行模式；synthetic 只屬於 run-control 測試資料，不得進入物理 runtime。"""
 
+_DEFERRED_VALIDATION_PRIVATE_TOKEN = object()
+"""只在 dynamic child 同一程序啟動鏈內傳遞的私有 deferred-validation capability。
+
+``defer_full_validation`` 不是 public ``skip_validation`` 旗標；loader 只有同時取得這個
+不會出現在 CLI、JSON 或 run workspace 的 process-local token，才可切換到啟動繫結
+validator。token 不可跨程序序列化，因而單獨的 run-worker、aggregate 或 report caller
+不能只靠布林值要求 runtime 略過全 run 驗證。
+"""
+
 _PILOT_COMPONENT_HASH_KEYS = (
     "material",
     "receptor",
@@ -1696,6 +1705,8 @@ def load_validated_run_static_inputs(
     checkpoint_root: str | Path | None = None,
     require_complete: bool = False,
     expected_run_kind: str | None = None,
+    defer_full_validation: bool = False,
+    _private_dynamic_bootstrap: object | None = None,
 ) -> ValidatedRunStaticInputs:
     """載入並驗證 controller／aggregate 共用的 run static inputs。
 
@@ -1717,10 +1728,25 @@ def load_validated_run_static_inputs(
     ``RuntimeRequestFactory``、不處理 OCM/NWW root 或 array、不修改 progress/reconcile/
     checkpoint；呼叫成功只代表 static binding 完成，不代表本機 synthetic fixture 是真實
     OCM／NWW 科學成果。
+
+    ``defer_full_validation=True`` 只供 formal dynamic execution-priority 的 private child
+    bootstrap 使用。它改用 ``validate_run_startup`` 啟動繫結檢查，只省略 parent 已明示延後的
+    全 run trajectory／歷代 checkpoint 掃描；其後的 config、component、geometry、scenario、
+    seed、inventory、M、selection 與 static binding 仍全部執行。這不是公開的
+    ``skip_validation`` 旗標，也不能與 ``require_complete=True`` 混用；aggregate/report
+    等完整讀取路徑必須繼續使用完整 validator。
     """
 
     if type(require_complete) is not bool:
         raise TypeError("require_complete 必須是 bool")
+    if type(defer_full_validation) is not bool:
+        raise TypeError("defer_full_validation 必須是 bool")
+    if defer_full_validation and require_complete:
+        raise ValueError("defer_full_validation 不允許 require_complete=True")
+    if defer_full_validation and _private_dynamic_bootstrap is not _DEFERRED_VALIDATION_PRIVATE_TOKEN:
+        raise ValueError(
+            "defer_full_validation 只允許 dynamic child private bootstrap 使用"
+        )
     if expected_run_kind is not None and (
         type(expected_run_kind) is not str or expected_run_kind not in _RUNTIME_RUN_KINDS
     ):
@@ -1743,11 +1769,40 @@ def load_validated_run_static_inputs(
     except ValueError as exc:
         raise ValueError(f"run plan experiment_case_id 未登錄：{experiment_case_id!r}") from exc
 
-    validation = validate_run(
-        root,
-        require_complete=require_complete,
-        checkpoint_root=checkpoint_root,
-    )
+    if defer_full_validation:
+        # 以延遲匯入讓 default public/static API 保持既有 import 與 mock 邊界；啟動繫結
+        # 驗證器缺失時直接拒絕，絕不退回完整 validator 或把任意 mapping 當成功。
+        try:
+            from .run_validation import validate_run_startup
+        except ImportError as exc:
+            raise ValueError(
+                "defer_full_validation 需要 run_validation.validate_run_startup"
+            ) from exc
+        validation = validate_run_startup(
+            root,
+            checkpoint_root=checkpoint_root,
+        )
+        if (
+            not isinstance(validation, Mapping)
+            or validation.get("valid") is not True
+            or validation.get("validation_scope") != "startup_bindings_only"
+            or validation.get("full_validation_deferred") is not True
+        ):
+            raw_errors = validation.get("errors") if isinstance(validation, Mapping) else None
+            error_codes = (
+                [error for error in raw_errors if type(error) is str]
+                if isinstance(raw_errors, list)
+                else []
+            )
+            if not error_codes:
+                error_codes = ["startup_validator_invalid"]
+            raise ValueError("run startup validation failed: " + "; ".join(error_codes))
+    else:
+        validation = validate_run(
+            root,
+            require_complete=require_complete,
+            checkpoint_root=checkpoint_root,
+        )
     if not isinstance(validation, Mapping) or validation.get("valid") is not True:
         raw_errors = validation.get("errors") if isinstance(validation, Mapping) else None
         error_codes = (
@@ -2761,6 +2816,8 @@ def _open_run_controller(
     checkpoint_root: str | Path | None = None,
     expected_run_kind: str | None = None,
     continuous_time_fallback: bool = False,
+    defer_full_validation: bool = False,
+    _private_dynamic_bootstrap: object | None = None,
 ) -> RunController:
     """依共用 static binding snapshot 開啟 pilot/formal controller；不啟動 shard。
 
@@ -2776,13 +2833,31 @@ def _open_run_controller(
         raise TypeError("resume 必須是 bool")
     if type(continuous_time_fallback) is not bool:
         raise TypeError("continuous_time_fallback 必須是 bool")
+    if type(defer_full_validation) is not bool:
+        raise TypeError("defer_full_validation 必須是 bool")
+    if defer_full_validation and _private_dynamic_bootstrap is not _DEFERRED_VALIDATION_PRIVATE_TOKEN:
+        raise ValueError(
+            "defer_full_validation 只允許 dynamic child private bootstrap 使用"
+        )
 
+    static_input_kwargs: dict[str, object] = {
+        "config_path": config_path,
+        "checkpoint_root": checkpoint_root,
+        "require_complete": False,
+        "expected_run_kind": expected_run_kind,
+    }
+    if defer_full_validation:
+        # 新政策只有在同一 process 的 private capability 已經通過後才傳入；default
+        # 呼叫不增加 keyword，維持既有 RuntimeRequestFactory／測試替身的相容邊界。
+        static_input_kwargs.update(
+            {
+                "defer_full_validation": True,
+                "_private_dynamic_bootstrap": _private_dynamic_bootstrap,
+            }
+        )
     static_inputs = load_validated_run_static_inputs(
         workspace,
-        config_path=config_path,
-        checkpoint_root=checkpoint_root,
-        require_complete=False,
-        expected_run_kind=expected_run_kind,
+        **static_input_kwargs,
     )
     plan = static_inputs.plan
     config = static_inputs.config
@@ -2827,6 +2902,10 @@ def _open_run_controller(
     if advection_batcher is not None:
         controller_kwargs["advection_batcher"] = advection_batcher
         controller_kwargs["advection_reporter"] = factory.advection_report
+    if defer_full_validation:
+        # RunController 仍在每片 assigned shard 執行 checkpoint／restore/output/hash／lock
+        # gate；這個 keyword 只改變 parent-level full audit 的時機。
+        controller_kwargs["defer_full_validation"] = True
     return RunController(
         root,
         **controller_kwargs,
@@ -2843,6 +2922,8 @@ def open_run_controller(
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
     continuous_time_fallback: bool = False,
+    defer_full_validation: bool = False,
+    _private_dynamic_bootstrap: object | None = None,
 ) -> RunController:
     """依 immutable run plan 自動開啟 pilot 或 formal ``RunController``。
 
@@ -2851,15 +2932,27 @@ def open_run_controller(
     建立，不會自行執行 shard 或 reconcile。
     """
 
+    if type(defer_full_validation) is not bool:
+        raise TypeError("defer_full_validation 必須是 bool")
+    kwargs: dict[str, object] = {
+        "config_path": config_path,
+        "ocm_native_root": ocm_native_root,
+        "nww_analysis_root": nww_analysis_root,
+        "ocm_reconstruction_root": ocm_reconstruction_root,
+        "resume": resume,
+        "checkpoint_root": checkpoint_root,
+        "continuous_time_fallback": continuous_time_fallback,
+    }
+    if defer_full_validation:
+        kwargs.update(
+            {
+                "defer_full_validation": True,
+                "_private_dynamic_bootstrap": _private_dynamic_bootstrap,
+            }
+        )
     return _open_run_controller(
         workspace,
-        config_path=config_path,
-        ocm_native_root=ocm_native_root,
-        nww_analysis_root=nww_analysis_root,
-        ocm_reconstruction_root=ocm_reconstruction_root,
-        resume=resume,
-        checkpoint_root=checkpoint_root,
-        continuous_time_fallback=continuous_time_fallback,
+        **kwargs,
     )
 
 

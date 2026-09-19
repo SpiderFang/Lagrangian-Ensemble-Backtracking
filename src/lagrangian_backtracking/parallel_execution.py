@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pyarrow.parquet as pq
 
@@ -109,6 +109,34 @@ class ParallelExecutionInterrupted(RuntimeError):
         self.signum = signum
 
 
+def _validate_deferred_mode_options(
+    *,
+    defer_full_validation: bool,
+    execution_mode: str,
+    execution_priority: bool,
+) -> None:
+    """驗證「先運算、後完整驗收」只可由明示的 dynamic priority 模式啟用。
+
+    延後完整驗收會讓 parent 不先掃描所有 trajectory 與歷代 checkpoint，因此必須同時
+    由 caller 明示 ``--execution-priority`` 並使用 dynamic queue；這個雙重條件是使用者
+    授權與記憶體保護的可稽核邊界。預設 ``False`` 時完全不改變既有完整驗證流程，也不把
+    任意 truthy 值當作安全開關。
+    """
+
+    if type(defer_full_validation) is not bool:
+        raise ParallelExecutionError("defer_full_validation 必須是 bool")
+    if type(execution_priority) is not bool:
+        raise ParallelExecutionError("execution_priority 必須是 bool")
+    if type(execution_mode) is not str or execution_mode not in {"static", "dynamic"}:
+        raise ParallelExecutionError("execution_mode 只允許 static 或 dynamic")
+    if defer_full_validation and (
+        not execution_priority or execution_mode != "dynamic"
+    ):
+        raise ParallelExecutionError(
+            "defer_full_validation 只允許與 --execution-priority 的 dynamic 模式搭配"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerGroup:
     """一個 worker 要依序執行的連續 scenario 範圍與穩定 locality 摘要。
@@ -186,6 +214,10 @@ class FormalParallelContext:
     warmup_only: bool
     execution_priority: bool = False
     provenance_override: dict[str, object] | None = None
+    defer_full_validation: bool = False
+    validation_scope: str = "full_run"
+    validation_elapsed_seconds: float | None = None
+    validation_status_file: str | None = None
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -1182,17 +1214,30 @@ def validate_run_inputs(
     project_root: str | Path,
     checkpoint_root: str | Path | None,
     execution_priority: bool = False,
+    defer_full_validation: bool = False,
 ) -> tuple[dict[str, Any], Any, Path, Path, Path | None, dict[str, object] | None]:
-    """在任何子程序啟動前驗證 formal workspace、全分片、config 與部署 provenance。
+    """在任何子程序啟動前驗證 formal workspace、分片繫結、設定與部署 provenance。
 
     ``execution_priority`` 只放寬目前主機平台與程式部署指紋的「完全相等」要求；輸入
     設定 hash、normalized config、陣列／網格拓撲、路徑與 run validator 仍然必須通過。
     差異不會回寫 immutable ``run_plan.json``，而是回傳一份待寫入本次 NFS log session
     的 append-only warning，讓跨主機續跑仍可追溯實際 provenance。
+
+    ``defer_full_validation=True`` 是明示的「先運算、完整驗收後補」政策，只由 dynamic
+    execution-priority parent 使用。此時只呼叫啟動繫結驗證器，保留 immutable
+    run/config/input/scenario/seed/plan-progress/lock 與根目錄安全拓撲 gate；所有 trajectory
+    payload 與歷代 checkpoint 的全 run 掃描延後到運算完成後的獨立 ``validate-run``。此旗標
+    不改變 ``validate_run`` 的 ``valid`` 語意，也不由任意 JSON 欄位取代 validator。
     """
 
     if type(execution_priority) is not bool:
         raise ParallelExecutionError("execution_priority 必須是 bool")
+    if type(defer_full_validation) is not bool:
+        raise ParallelExecutionError("defer_full_validation 必須是 bool")
+    if defer_full_validation and not execution_priority:
+        raise ParallelExecutionError(
+            "defer_full_validation 只允許與 execution_priority 搭配"
+        )
 
     workspace_path = _strict_existing_directory(workspace, label="workspace")
     project_path = _strict_existing_directory(project_root, label="project_root")
@@ -1202,11 +1247,36 @@ def validate_run_inputs(
         if checkpoint_root is not None
         else None
     )
-    validation = validate_run(
-        workspace_path,
-        require_complete=False,
-        checkpoint_root=checkpoint_path,
-    )
+    if defer_full_validation:
+        # 啟動繫結驗證器只做啟動所需的 immutable binding／拓撲檢查；以延遲匯入保持目前
+        # default 模式與舊測試替身的 import／呼叫邊界不變。若此 API 不存在，
+        # 不能偷偷退回完整 validator 或把未知結果當成成功，必須 fail closed。
+        try:
+            from .run_validation import validate_run_startup
+        except ImportError as exc:
+            raise ParallelExecutionError(
+                "defer_full_validation 需要 run_validation.validate_run_startup"
+            ) from exc
+        validation = validate_run_startup(
+            workspace_path,
+            checkpoint_root=checkpoint_path,
+        )
+        if (
+            not isinstance(validation, Mapping)
+            or validation.get("valid") is not True
+            or validation.get("validation_scope") != "startup_bindings_only"
+            or validation.get("full_validation_deferred") is not True
+        ):
+            raise ParallelExecutionError(
+                "run workspace startup validation 未通過或回傳 scope 不符："
+                + json.dumps(validation, ensure_ascii=False, sort_keys=True)
+            )
+    else:
+        validation = validate_run(
+            workspace_path,
+            require_complete=False,
+            checkpoint_root=checkpoint_path,
+        )
     if not isinstance(validation, Mapping) or validation.get("valid") is not True:
         raise ParallelExecutionError(
             "run workspace／checkpoint pre-validation 未通過："
@@ -1488,6 +1558,7 @@ def _prepare_formal_parallel_context(
     warmup_only: bool,
     execution_mode: str,
     execution_priority: bool,
+    defer_full_validation: bool,
 ) -> FormalParallelContext:
     """只做一次 static／dynamic 共用的 formal 唯讀 preflight 與執行目錄準備。
 
@@ -1498,10 +1569,12 @@ def _prepare_formal_parallel_context(
     後交給 child/controller 處理」的語意。
     """
 
-    if execution_mode not in {"static", "dynamic"}:
-        raise ParallelExecutionError("execution_mode 只允許 static 或 dynamic")
-    if type(execution_priority) is not bool:
-        raise ParallelExecutionError("execution_priority 必須是 bool")
+    effective_execution_mode = "dynamic" if execution_priority else execution_mode
+    _validate_deferred_mode_options(
+        defer_full_validation=defer_full_validation,
+        execution_mode=effective_execution_mode,
+        execution_priority=execution_priority,
+    )
     if execution_priority:
         # execution-priority 的目標是持續消化中央 queue；不允許 caller 同時要求
         # 舊式固定 contiguous group，避免摘要看似 priority、實際仍有尾端閒置。
@@ -1514,13 +1587,20 @@ def _prepare_formal_parallel_context(
     started_wall = time.perf_counter()
     # 這一步包含 workspace、immutable plan、config hash、normalized config 與正式
     # code provenance；任何 dynamic reconcile 都必須排在這個唯讀安全邊界之後。
-    validated_inputs = validate_run_inputs(
-        workspace=workspace,
-        config_path=config_path,
-        project_root=project_root,
-        checkpoint_root=checkpoint_root,
-        execution_priority=execution_priority,
-    )
+    validation_started = time.perf_counter()
+    validation_kwargs: dict[str, object] = {
+        "workspace": workspace,
+        "config_path": config_path,
+        "project_root": project_root,
+        "checkpoint_root": checkpoint_root,
+        "execution_priority": execution_priority,
+    }
+    # 預設完整驗證不傳入新 keyword，保持既有外部 adapter／mock 的精確呼叫形狀；只有
+    # caller 明示 deferred policy 時，才把新政策送到 parent startup validator。
+    if defer_full_validation:
+        validation_kwargs["defer_full_validation"] = True
+    validated_inputs = validate_run_inputs(**validation_kwargs)
+    validation_elapsed_seconds = time.perf_counter() - validation_started
     # 保留舊測試／外部 adapter 的五元組回傳相容性；正式實作一定會提供第六項
     # provenance warning，缺少時只代表本次沒有可寫的 override 摘要。
     if len(validated_inputs) == 5:
@@ -1608,7 +1688,7 @@ def _prepare_formal_parallel_context(
         gate_evidence=storage_gate_evidence,
     )
 
-    if execution_mode == "dynamic" and resume:
+    if execution_mode == "dynamic" and resume and not defer_full_validation:
         # reconcile 需要 run-gate exclusive；它只採認 checkpoint/output，不會開啟
         # forcing。此刻所有 input/provenance/storage 唯讀 gate 已完成，避免先 mutate。
         from .cli import reconcile_run_for_resume
@@ -1653,6 +1733,47 @@ def _prepare_formal_parallel_context(
     )
     plan_bytes = (workspace_path / "run_plan.json").read_bytes()
     plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
+    validation_scope = "startup_bindings_only" if defer_full_validation else "full_run"
+    validation_status_file: str | None = None
+    if defer_full_validation:
+        # 這份狀態檔只能存在本次已通過 storage gate 的 log session，不能寫入 run root；
+        # 否則會違反 run validator 的 root allow-list。provenance 取自已通過 gate 的實際
+        # 摘要；若 execution-priority 記錄了差異，優先保存 actual provenance 供回查。
+        provenance_link: Mapping[str, object] = cast(
+            Mapping[str, object],
+            provenance_override.get("actual_provenance")
+            if isinstance(provenance_override, Mapping)
+            and isinstance(provenance_override.get("actual_provenance"), Mapping)
+            else plan.get("code_provenance", {}),
+        )
+        validation_status = {
+            "artifact_type": "formal_parallel_validation_status",
+            "schema_version": "1.0.0",
+            "status": "DEFERRED",
+            "full_validation_deferred": True,
+            "validation_scope": validation_scope,
+            "policy": "defer_full_validation_v1",
+            "run_id": run_id,
+            "run_plan_sha256": plan_sha256,
+            "code_provenance": dict(provenance_link),
+            "provenance_override_recorded": provenance_override is not None,
+            "deferred_checks": [
+                "completed_trajectory_payload_checksums_metadata_and_run_unit_order",
+                "all_shard_checkpoint_generation_headers_checksums_and_full_history_restore",
+                "checkpoint_latest_progress_cross_links_orphans_and_replay",
+                "published_output_progress_cross_links_and_full_run_acceptance",
+            ],
+            "retained_checks": [
+                "startup_immutable_run_config_input_scenario_seed_bindings",
+                "plan_progress_lock_and_run_root_safety_topology",
+                "code_provenance_config_normalized_storage_forcing_and_memory_gates",
+                "assigned_shard_checkpoint_restore_output_hash_and_lock_validation",
+            ],
+            "startup_validation_elapsed_seconds": validation_elapsed_seconds,
+            "created_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        }
+        atomic_write_json(log_session / "validation-status.json", validation_status)
+        validation_status_file = "validation-status.json"
     return FormalParallelContext(
         started_wall=started_wall,
         plan=plan,
@@ -1686,6 +1807,10 @@ def _prepare_formal_parallel_context(
         warmup_only=warmup_only,
         execution_priority=execution_priority,
         provenance_override=provenance_override,
+        defer_full_validation=defer_full_validation,
+        validation_scope=validation_scope,
+        validation_elapsed_seconds=validation_elapsed_seconds,
+        validation_status_file=validation_status_file,
     )
 
 
@@ -1712,19 +1837,24 @@ def execute_formal_parallel(
     execution_mode: str = "static",
     response_timeout_seconds: float | None = None,
     execution_priority: bool = False,
+    defer_full_validation: bool = False,
 ) -> tuple[dict[str, object], int]:
-    """依選定 backend 驗證完整正式母體並執行 persistent worker。
+    """依選定 backend 完成 formal preflight 並執行 persistent worker。
 
     ``static`` 保留既有固定 contiguous group executor。``dynamic`` 先由本 coordinator
     取得同一份 formal preflight context，再交給 dynamic parent queue；因此不在新模組
     複製 input/provenance/storage gate。任何 backend 都在建立 child 或新執行目錄以前
-    fail closed；只有 dynamic resume 會在所有唯讀 gate 通過後進行既有 reconcile。
+    fail closed；預設 dynamic resume 會在所有唯讀 gate 通過後進行既有 reconcile。若明示
+    ``defer_full_validation``，則只延後全 run audit，逐片 controller gate 與起跑繫結仍保留，
+    完成後以 ``COMPUTE_COMPLETE_VALIDATION_DEFERRED`` 表示尚未正式驗收。
     """
 
-    if execution_mode not in {"static", "dynamic"}:
-        raise ParallelExecutionError("execution_mode 只允許 static 或 dynamic")
-    if type(execution_priority) is not bool:
-        raise ParallelExecutionError("execution_priority 必須是 bool")
+    effective_execution_mode = "dynamic" if execution_priority else execution_mode
+    _validate_deferred_mode_options(
+        defer_full_validation=defer_full_validation,
+        execution_mode=effective_execution_mode,
+        execution_priority=execution_priority,
+    )
     if execution_priority:
         execution_mode = "dynamic"
     context = _prepare_formal_parallel_context(
@@ -1745,6 +1875,7 @@ def execute_formal_parallel(
         warmup_only=warmup_only,
         execution_mode=execution_mode,
         execution_priority=execution_priority,
+        defer_full_validation=defer_full_validation,
     )
     if context.provenance_override is not None:
         # 這份檔案位於本次不可碰撞的 NFS log session，採原子建立且不回寫 immutable
@@ -1818,6 +1949,12 @@ def execute_formal_parallel(
                 "run_plan_sha256": plan_sha256,
                 "status": "WARMUP_FAILED",
                 "valid": False,
+                "full_validation_deferred": context.defer_full_validation,
+                "validation_scope": context.validation_scope,
+                "validation_stage": (
+                    "startup_validation" if context.defer_full_validation else "full_validation"
+                ),
+                "validation_stage_elapsed_seconds": context.validation_elapsed_seconds,
                 "whole_machine_elapsed_seconds": time.perf_counter() - started_wall,
                 "storage_gate_sha256": gate_sha256,
                 "worker_assignment": assignment,
@@ -1834,6 +1971,12 @@ def execute_formal_parallel(
             "run_plan_sha256": plan_sha256,
             "status": "WARMUP_CHECKED",
             "valid": True,
+            "full_validation_deferred": context.defer_full_validation,
+            "validation_scope": context.validation_scope,
+            "validation_stage": (
+                "startup_validation" if context.defer_full_validation else "full_validation"
+            ),
+            "validation_stage_elapsed_seconds": context.validation_elapsed_seconds,
             "numba_disk_cache_enabled": False,
             "numba_warmup_scope": "one_off_validation_process",
             "whole_machine_elapsed_seconds": time.perf_counter() - started_wall,
@@ -1892,6 +2035,13 @@ def execute_formal_parallel(
         "run_plan_sha256": plan_sha256,
         "status": status,
         "valid": status == "COMPLETE",
+        "full_validation_deferred": context.defer_full_validation,
+        "validation_scope": context.validation_scope,
+        "validation_stage": (
+            "startup_validation" if context.defer_full_validation else "full_validation"
+        ),
+        "validation_stage_elapsed_seconds": context.validation_elapsed_seconds,
+        "validation_status_file": context.validation_status_file,
         "numba_disk_cache_enabled": False,
         "numba_warmup_scope": (
             "per_worker_process" if requires_numba_cache(config) else "not_applicable"

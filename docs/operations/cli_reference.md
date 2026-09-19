@@ -515,6 +515,47 @@ worker child 只啟動一次 Python，內部以同一個既有 `run-worker` cont
 run ID 和 run-plan SHA-256，不寫回 run plan，也不因 worker 完成順序改變 run identity。
 若需保留舊固定 contiguous group executor，才明示 `--execution-mode static`。
 
+#### 明示延後整批驗收：`--defer-full-validation`
+
+預設流程仍在啟動前執行完整 `validate_run`，dynamic resume 也保留原有 reconcile 與其後的
+唯讀完整 validator。只有執行負責人明示接受待驗收風險時，才可在 `--execution-priority` 命令
+一併使用 `--defer-full-validation`：
+
+```bash
+uv run python scripts/run_formal_parallel.py \
+  "$WORKSPACE" \
+  --config "$FORMAL_CONFIG" \
+  --project-root "$LBT_PROJECT_ROOT" \
+  --worker-count "$FORMAL_WORKER_COUNT" \
+  --scratch-root "$LBT_SCRATCH_ROOT" \
+  --log-root "$LBT_SCRATCH_ROOT/formal-parallel/logs" \
+  --storage-gate-evidence "$LBT_STORAGE_GATE_JSON" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --nww-analysis-root "$NWW_ANALYSIS_ROOT" \
+  --cpu-affinity auto \
+  --execution-priority \
+  --defer-full-validation
+```
+
+此模式只把全 run trajectory payload、歷代 checkpoint history、progress cross-link 與完整
+acceptance 掃描延後；起跑繫結、immutable 文件／拓樸、設定／input／scenario／seed、forcing
+root、storage／memory gate 仍會執行，而且每個 child 的 assigned shard 仍逐片驗證 checkpoint、
+restore、output、hash 與 lock。`validation-status.json` 只寫入本次 log session，不能放入 run
+workspace。完成運算後 summary 的狀態是
+`COMPUTE_COMPLETE_VALIDATION_DEFERRED`，`valid=false`；這不是正式成果，也不會由 coordinator
+自動回報 `COMPLETE`。必須另行使用實際 parser 支援的完整命令：
+
+```bash
+uv run lbt validate-run "$WORKSPACE" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --require-complete
+```
+
+`validate-run` 沒有 deferred／skip 旗標；只有上述獨立命令回傳 `valid=true`，才可進入正式
+聚合、圖表與報告。省略 `--defer-full-validation` 時，原完整驗證、API 與測試替身呼叫形狀
+維持不變。
+
 先準備 caller 明示且已通過 `scripts/validate_server_storage.py` 的 PASS JSON；runner 會再用
 `findmnt` 即時確認本次 `scratch_root` 仍為 NFS 且 mount source token 與該 PASS JSON 相同，
 防止把其他掛載點或過期環境的證據誤用。scratch、log 與 Numba cache 都必須是該 scratch root

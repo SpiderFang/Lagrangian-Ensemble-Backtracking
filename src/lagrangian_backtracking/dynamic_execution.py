@@ -244,6 +244,38 @@ def dynamic_worker_child_main(
     controller_resume: bool | None = None
     worker_id = spec.get("worker_id")
     run_id = spec.get("run_id")
+    execution_priority = spec.get("execution_priority", False)
+    if type(execution_priority) is not bool:
+        _json_line(
+            stdout,
+            _protocol_error_payload(
+                spec=spec,
+                error_code="child_spec_execution_priority_invalid",
+                error="child spec execution_priority 必須是 bool",
+            ),
+        )
+        return 2
+    defer_full_validation = spec.get("defer_full_validation", False)
+    if type(defer_full_validation) is not bool:
+        _json_line(
+            stdout,
+            _protocol_error_payload(
+                spec=spec,
+                error_code="child_spec_defer_full_validation_invalid",
+                error="child spec defer_full_validation 必須是 bool",
+            ),
+        )
+        return 2
+    if defer_full_validation and not execution_priority:
+        _json_line(
+            stdout,
+            _protocol_error_payload(
+                spec=spec,
+                error_code="child_spec_defer_full_validation_requires_priority",
+                error="child spec defer_full_validation 需要 execution_priority=true",
+            ),
+        )
+        return 2
     if type(worker_id) is not str or not worker_id or type(run_id) is not str or not run_id:
         _json_line(
             stdout,
@@ -396,6 +428,17 @@ def dynamic_worker_child_main(
                         }
                         if bool(spec.get("continuous_time_fallback", False)):
                             controller_kwargs["continuous_time_fallback"] = True
+                        # deferred policy 只由 coordinator 的 private dynamic bootstrap 傳入；
+                        # 預設 false 時省略新 keyword，保留 run-worker 與舊 controller mock
+                        # 的原有呼叫形狀。controller 自己仍會在每片保留 assigned shard
+                        # checkpoint／restore／output／hash／lock 驗證。
+                        if defer_full_validation:
+                            from .runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
+
+                            controller_kwargs["_defer_full_validation"] = True
+                            controller_kwargs["_private_dynamic_bootstrap"] = (
+                                _DEFERRED_VALIDATION_PRIVATE_TOKEN
+                            )
                         controller = open_worker_controller(
                             spec["workspace"],
                             **controller_kwargs,
@@ -507,6 +550,7 @@ def execute_dynamic_parallel(
     shutdown_grace_seconds: float = 30.0,
     response_timeout_seconds: float | None = None,
     execution_priority: bool = False,
+    defer_full_validation: bool = False,
 ) -> tuple[dict[str, object], int]:
     """薄包裝既有 formal coordinator，避免在 dynamic module 複製完整 preflight。
 
@@ -539,6 +583,7 @@ def execute_dynamic_parallel(
         execution_mode="dynamic",
         response_timeout_seconds=response_timeout_seconds,
         execution_priority=execution_priority,
+        defer_full_validation=defer_full_validation,
     )
 
 
@@ -732,7 +777,8 @@ def execute_dynamic_parallel_prepared(
     讓同一 persistent controller 接續領取 queue，並對記憶體、訊號、鎖／陣列／網格及
     protocol 結構錯誤停止整批。任何未完成 in-flight shard 都不會被 parent 偷放回 queue；
     只有明示下一次 ``resume`` 且經既有 reconcile／validator 後，才由 progress 決定可再次
-    執行的片。
+    執行的片。若 context 明示延後完整驗收，parent 不呼叫 final full-run validator，
+    而以 ``COMPUTE_COMPLETE_VALIDATION_DEFERRED`` 回報計算完成但仍待獨立驗收。
     """
 
     if poll_interval_seconds < 0 or shutdown_grace_seconds < 0:
@@ -760,6 +806,12 @@ def execute_dynamic_parallel_prepared(
                 "run_plan_sha256": context.plan_sha256,
                 "status": "WARMUP_FAILED",
                 "valid": False,
+                "full_validation_deferred": context.defer_full_validation,
+                "validation_scope": context.validation_scope,
+                "validation_stage": (
+                    "startup_validation" if context.defer_full_validation else "full_validation"
+                ),
+                "validation_stage_elapsed_seconds": context.validation_elapsed_seconds,
                 "error": str(exc),
                 "worker_records": [],
                 "log_session": context.log_session.name,
@@ -775,6 +827,12 @@ def execute_dynamic_parallel_prepared(
             "run_plan_sha256": context.plan_sha256,
             "status": "WARMUP_CHECKED",
             "valid": True,
+            "full_validation_deferred": context.defer_full_validation,
+            "validation_scope": context.validation_scope,
+            "validation_stage": (
+                "startup_validation" if context.defer_full_validation else "full_validation"
+            ),
+            "validation_stage_elapsed_seconds": context.validation_elapsed_seconds,
             "numba_disk_cache_enabled": False,
             "numba_warmup_scope": "one_off_validation_process",
             "warmup_summary": warmup_summary,
@@ -905,6 +963,7 @@ def execute_dynamic_parallel_prepared(
             "warmup_numba_backend": requires_numba_cache(context.config),
             "execution_priority": context.execution_priority,
             "continuous_time_fallback": context.execution_priority,
+            "defer_full_validation": context.defer_full_validation,
         }
         env = os.environ.copy()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1283,7 +1342,13 @@ def execute_dynamic_parallel_prepared(
     all_complete = not pending_ids and not inflight_ids and not failed_ids and stop_reason is None
     status = "INTERRUPTED" if interrupted_signal is not None else "INCOMPLETE"
     exit_code = 130 if interrupted_signal == signal.SIGINT else 143 if interrupted_signal else 2
-    if all_complete:
+    if all_complete and context.defer_full_validation:
+        # 每片 controller 已完成 assigned shard 的輸出／checkpoint／hash／lock gate；但
+        # 此政策明確不把「粒子運算完成」冒充全 run 驗收，完整 validate-run 必須由 operator
+        # 後補執行。保留 exit code 0 僅表示本次計算與逐片發布成功，不代表正式成果已驗收。
+        status = "COMPUTE_COMPLETE_VALIDATION_DEFERRED"
+        exit_code = 0
+    elif all_complete:
         final_validation = validate_run(
             context.workspace_path,
             require_complete=True,
@@ -1317,6 +1382,13 @@ def execute_dynamic_parallel_prepared(
         "run_plan_sha256": context.plan_sha256,
         "status": status,
         "valid": status == "COMPLETE",
+        "full_validation_deferred": context.defer_full_validation,
+        "validation_scope": context.validation_scope,
+        "validation_stage": (
+            "startup_validation" if context.defer_full_validation else "full_validation"
+        ),
+        "validation_stage_elapsed_seconds": context.validation_elapsed_seconds,
+        "validation_status_file": context.validation_status_file,
         "numba_disk_cache_enabled": False,
         "numba_warmup_scope": (
             "per_worker_process" if requires_numba_cache(context.config) else "not_applicable"

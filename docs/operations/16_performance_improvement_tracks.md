@@ -23,6 +23,7 @@
 - `_surface_series_for_location` 先擷取必要的多維座標，再轉為雙精度，保留原始時間／空間支援與數值語意；不縮小正式輸入的母體範圍。
 - `execution.ocm_interpolation_backend` 可明示 `numpy_v1` 或 `numba_ocm_v1`；`execution.physics_kernel_backend` 可明示 `numpy_v1` 或 `numba_cpu_v1`。後者編譯有限水深色散／Stokes 公式、時間步候選、RK4 最後純量組合／時間更新，以及使用既有預抽常態數的擴散位移。Python 仍決定 NWW3／OCM 品質檢查、缺值、邊界、事件、四個 RK4 stage、粒子狀態與每粒子亂數抽樣順序。兩個後端 token 都進入新 run 的設定身分；舊設定省略欄位時仍沿用 NumPy 並維持既有 hash。
 - `run-formal-parallel` 在任何 worker 前驗證完整 formal plan、設定 hash、乾淨程式 provenance、checkpoint、forcing 根與 NFS storage gate；本次實際 `scratch_root` 還會以 `findmnt` 即時核對為同一 NFS source，避免把其他掛載點的 PASS 快照誤用。Numba dispatcher 使用 `cache=False`，每個正式 worker 只在自己的長壽命程序內暖機一次，不宣稱跨程序磁碟快取。
+- 若執行負責人明示 `--execution-priority --defer-full-validation`，parent 只做起跑繫結與其他既有 gate，將全 run trajectory／歷代 checkpoint 的整批掃描留到獨立 `validate-run --require-complete`；每個 assigned shard 的 checkpoint、restore、output、hash 與 lock 驗證仍不可省略。運算完成只產生 `COMPUTE_COMPLETE_VALIDATION_DEFERRED`、`valid=false` 的待驗收摘要，不能進入正式聚合、圖表或研究報告；未帶旗標時仍維持原本啟動前與完成後的完整 validator。
 
 持續 worker 的快取計數以每次分片執行前的計數為基準，記錄本次增加的載入、命中、未命中及淘汰次數；同一分片續跑時才與該分片先前已保存的增量累計。多次 checkpoint 只是同一執行區間的進度快照，不可把這些快照再次相加。`manager_count` 與 `resident_bytes` 為狀態量，分片及報告採已觀測樣本的最大值，不是各 worker 同時使用量的總和，也不是連續量測的整機峰值。歷史未標示計數語意的紀錄不能反推精確增量，須保留可讀性並明示其限制，不能將累計快取次數當成已驗證的全案總量。
 

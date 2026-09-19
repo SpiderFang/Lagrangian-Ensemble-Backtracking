@@ -611,6 +611,14 @@ def _run_formal_parallel_parser() -> argparse.ArgumentParser:
         help="啟用 persistent parent queue、連續時間 fallback 與單片失敗隔離",
     )
     parser.add_argument(
+        "--defer-full-validation",
+        action="store_true",
+        help=(
+            "明示先執行粒子、完成後再以 validate-run 完整驗收；"
+            "只允許 --execution-priority 的 dynamic 模式"
+        ),
+    )
+    parser.add_argument(
         "--scratch-root",
         required=True,
         type=Path,
@@ -1027,6 +1035,8 @@ def open_worker_controller(
     resume: bool = False,
     checkpoint_root: str | Path | None = None,
     continuous_time_fallback: bool = False,
+    _defer_full_validation: bool = False,
+    _private_dynamic_bootstrap: object | None = None,
 ) -> RunController:
     """建立一個可連續處理多片的正式 runtime controller。
 
@@ -1039,6 +1049,8 @@ def open_worker_controller(
 
     if type(continuous_time_fallback) is not bool:
         raise TypeError("continuous_time_fallback 必須是 bool")
+    if type(_defer_full_validation) is not bool:
+        raise TypeError("_defer_full_validation 必須是 bool")
     kwargs: dict[str, object] = {
         "config_path": config_path,
         "ocm_native_root": ocm_native_root,
@@ -1056,6 +1068,17 @@ def open_worker_controller(
     # 路徑仍看到完全相同的 kwargs 拓撲，並保留 fail-closed 的預設 forcing 行為。
     if continuous_time_fallback:
         kwargs["continuous_time_fallback"] = True
+    if _defer_full_validation:
+        # private capability 只能由 dynamic child 轉交；本 helper 不自行建立 token，避免
+        # 一般 caller 只靠 bool 取得 startup-only 驗證路徑。
+        from .runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
+
+        if _private_dynamic_bootstrap is not _DEFERRED_VALIDATION_PRIVATE_TOKEN:
+            raise ValueError(
+                "_defer_full_validation 只允許 dynamic child private bootstrap 使用"
+            )
+        kwargs["defer_full_validation"] = True
+        kwargs["_private_dynamic_bootstrap"] = _private_dynamic_bootstrap
     return open_run_controller(workspace, **kwargs)
 
 
@@ -1972,6 +1995,7 @@ def run_formal_parallel(argv: Sequence[str] | None = None) -> int:
             shutdown_grace_seconds=args.shutdown_grace_seconds,
             response_timeout_seconds=args.worker_response_timeout_seconds,
             execution_priority=args.execution_priority,
+            defer_full_validation=args.defer_full_validation,
         )
     except Exception as exc:  # noqa: BLE001 - CLI 必須以機器可讀失敗狀態 fail closed
         print(
@@ -1986,6 +2010,7 @@ def run_formal_parallel(argv: Sequence[str] | None = None) -> int:
                     # 一般例外可能發生於驗證階段，也可能出現在 child 已結束後的摘要／驗證階段；
                     # 未取得正式執行摘要時不得錯誤宣稱「尚未啟動 child」。
                     "children_started": None,
+                    "full_validation_deferred": bool(args.defer_full_validation),
                 },
                 ensure_ascii=False,
                 sort_keys=True,

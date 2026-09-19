@@ -22,7 +22,7 @@ from lagrangian_backtracking import dynamic_execution as dynamic
 from lagrangian_backtracking.parallel_execution import FormalParallelContext
 
 
-def _spec(*, priority: bool = False) -> dict[str, object]:
+def _spec(*, priority: bool = False, defer: bool = False) -> dict[str, object]:
     """建立只含協定所需欄位的 child spec；不帶任何絕對輸入資料路徑。"""
 
     return {
@@ -34,6 +34,7 @@ def _spec(*, priority: bool = False) -> dict[str, object]:
         "ocm_native_root": "/tmp/lbt-test-ocm",
         "execution_priority": priority,
         "continuous_time_fallback": priority,
+        "defer_full_validation": defer,
     }
 
 
@@ -100,6 +101,76 @@ def test_persistent_child_opens_controller_once_and_runs_multiple_shards(
     assert len(lines) == 3
     assert all(isinstance(json.loads(line), dict) for line in lines)
     assert not [line for line in lines if not line.lstrip().startswith("{")]
+
+
+def test_deferred_child_forwards_private_bootstrap_only_when_priority_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """延後驗收 child 只轉交 private capability，且不把 public skip 旗標送入 controller。"""
+
+    from lagrangian_backtracking.runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
+
+    opened: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli,
+        "open_worker_controller",
+        lambda *_args, **kwargs: opened.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "execute_worker_shard",
+        lambda _controller, shard_id, *, sweep_budget=None: {
+            "shard_id": shard_id,
+            "lifecycle": "COMPLETE",
+        },
+    )
+    shutdown = json.dumps(
+        {
+            "protocol": dynamic.PROTOCOL_NAME,
+            "message_type": "shutdown",
+            "run_id": "dynamic-test-run",
+            "worker_id": "worker-0000",
+        },
+        separators=(",", ":"),
+    )
+
+    code = dynamic.dynamic_worker_child_main(
+        _spec(priority=True, defer=True),
+        io.StringIO(_request("shard-0000", priority=True) + shutdown + "\n"),
+        io.StringIO(),
+        io.StringIO(),
+    )
+
+    assert code == 0
+    assert len(opened) == 1
+    assert opened[0]["_defer_full_validation"] is True
+    assert opened[0]["_private_dynamic_bootstrap"] is _DEFERRED_VALIDATION_PRIVATE_TOKEN
+    assert "defer_full_validation" not in opened[0]
+
+
+def test_deferred_child_rejects_spec_without_execution_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """被竄改的 child spec 不得以 deferred bool 單獨啟用 startup-only 驗證。"""
+
+    opened: list[object] = []
+    monkeypatch.setattr(
+        cli,
+        "open_worker_controller",
+        lambda *_args, **_kwargs: opened.append(object()),
+    )
+    stdout = io.StringIO()
+    code = dynamic.dynamic_worker_child_main(
+        _spec(priority=False, defer=True),
+        io.StringIO(),
+        stdout,
+        io.StringIO(),
+    )
+
+    payload = json.loads(stdout.getvalue())
+    assert code == 2
+    assert payload["error_code"] == "child_spec_defer_full_validation_requires_priority"
+    assert opened == []
 
 
 def test_execution_priority_isolates_one_shard_exception_and_continues(
@@ -386,6 +457,60 @@ def test_parent_queue_reuses_two_persistent_children_and_fills_tail(
     assert len(processes) == 2
     assert sum(len(process.requests) - 1 for process in processes) == 5
     assert sorted(summary["completed_shard_ids"]) == [f"shard-{index:04d}" for index in range(5)]
+
+
+def test_deferred_parent_reports_compute_complete_without_final_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """所有分片完成時 deferred policy 不呼叫全 run validator，也不冒充正式 COMPLETE。"""
+
+    monkeypatch.setattr(
+        dynamic,
+        "load_run_progress",
+        lambda _workspace: {
+            "shards": {
+                f"shard-{index:04d}": {"lifecycle": "PLANNED"} for index in range(5)
+            }
+        },
+    )
+
+    def reject_full_validation(*_args: Any, **_kwargs: Any) -> dict[str, object]:
+        """若 deferred coordinator 仍掃描整批，測試必須立即失敗。"""
+
+        raise AssertionError("deferred parent 不得執行 final validate_run")
+
+    monkeypatch.setattr(dynamic, "validate_run", reject_full_validation)
+    processes: list[_FakePersistentProcess] = []
+
+    def popen(command: list[str], **_kwargs: Any) -> _FakePersistentProcess:
+        process = _FakePersistentProcess(json.loads(command[-1]), failed_once=False)
+        processes.append(process)
+        return process
+
+    context = replace(
+        _context(tmp_path, priority=True),
+        defer_full_validation=True,
+        validation_scope="startup_bindings_only",
+        validation_elapsed_seconds=1.25,
+        validation_status_file="validation-status.json",
+    )
+    summary, code = dynamic.execute_dynamic_parallel_prepared(
+        context,
+        popen_factory=popen,
+        poll_interval_seconds=0,
+        shutdown_grace_seconds=0,
+    )
+
+    assert code == 0
+    assert summary["status"] == "COMPUTE_COMPLETE_VALIDATION_DEFERRED"
+    assert summary["valid"] is False
+    assert summary["final_validation"] is None
+    assert summary["full_validation_deferred"] is True
+    assert summary["validation_scope"] == "startup_bindings_only"
+    assert summary["validation_stage"] == "startup_validation"
+    assert summary["validation_stage_elapsed_seconds"] == 1.25
+    assert summary["validation_status_file"] == "validation-status.json"
+    assert all(process.spec["defer_full_validation"] is True for process in processes)
 
 
 def test_priority_parent_continues_after_nonfatal_worker_error(

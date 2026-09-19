@@ -2594,6 +2594,24 @@ def test_open_generic_and_formal_controller_revalidate_formal_inventory_read_onl
     assert progress_path.read_bytes() == before_progress
 
 
+def test_deferred_static_loader_requires_private_dynamic_bootstrap(tmp_path: Path) -> None:
+    """runtime static loader 不接受 public bool 單獨略過完整驗證，且拒絕完整驗收混用。"""
+
+    with pytest.raises(ValueError, match="private bootstrap"):
+        runtime.load_validated_run_static_inputs(
+            tmp_path,
+            config_path=tmp_path / "config.yaml",
+            defer_full_validation=True,
+        )
+    with pytest.raises(ValueError, match="不允許 require_complete"):
+        runtime.load_validated_run_static_inputs(
+            tmp_path,
+            config_path=tmp_path / "config.yaml",
+            require_complete=True,
+            defer_full_validation=True,
+        )
+
+
 def test_initialize_pilot_run_orchestrates_strict_inputs_and_publishes_valid_workspace(
     runtime_fixture: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

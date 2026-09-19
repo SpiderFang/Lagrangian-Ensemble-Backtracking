@@ -424,6 +424,21 @@ test "$RUNNER_EXIT" -eq 0
 checkpoint root。`worker_count` 代表同時存活的 persistent child／併發上限；它不改 run identity，
 也不表示每個 child 只處理一個固定分組。
 
+若本次操作已取得「先運算、完整驗收後補」的明示授權，可在上述同一命令再加入
+`--defer-full-validation`。它只能與 `--execution-priority` 的 dynamic queue 一起使用；起跑
+繫結、設定／輸入／scenario／seed、forcing root、storage／memory gate，以及每個 assigned
+shard 的 checkpoint、restore、output、hash、lock 檢查仍照做，只延後全 run payload、歷代
+checkpoint history 與 cross-link 的整批驗收。`validation-status.json` 位於本次 log session，
+不在 run workspace。此模式即使所有粒子完成，summary 仍必須是
+`COMPUTE_COMPLETE_VALIDATION_DEFERRED` 且 `valid=false`，不可直接進入聚合、圖表或報告；
+需另行執行下列完整 parser 命令，且只有回傳 `valid=true` 才可記為正式完成：
+
+```bash
+uv run lbt validate-run "$WORKSPACE" \
+  --checkpoint-root "$LBT_CHECKPOINT_ROOT" \
+  --require-complete
+```
+
 #### 8.5 完成條件與失敗處置
 
 取得 CLI 回報的 log session 並核對完整摘要與正式 validator：
