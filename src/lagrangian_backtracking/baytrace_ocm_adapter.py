@@ -2,7 +2,8 @@
 
 本模組是混合生命週期的轉接層：步首位置、三角形提示、boundary 與 diffusion 仍由
 LBT ``ProductionBatch``／engine 管理，這裡只在明確支援的「ManagedForcingProvider、
-OCM-only、有限垂向資料」條件下準備原版 BayTrace 的靜態網格與兩端速度場。真正的
+有效濕支援、有限垂向資料」條件下準備原版 BayTrace 的靜態網格與兩端總速度場。
+波浪啟用時另沿既有NWW3取樣／有限水深公式建立版本化節點場；純流不讀NWW。真正的
 內插與四階 Runge--Kutta（RK4）仍由 ``baytrace_native_cpu.step_native`` 呼叫 PI
 提供的原始 ``batch_interpolate_velocity``／``batch_move_rk4``；本模組不複製原版公式。
 
@@ -26,6 +27,7 @@ import numpy as np
 
 from .baytrace_batch_advection import PreparedBayTraceFrame
 from .baytrace_native_cpu import BayTraceFieldPair, BayTraceGridArrays
+from .baytrace_wave_frame import prepare_finite_depth_node_fields
 from .forcing_window import (
     ManagedForcingProvider,
     _GlobalTimeBracket,
@@ -38,7 +40,7 @@ _SIGMA_TOLERANCE = 1.0e-6
 
 
 class _FramePreparationFallback(Exception):
-    """表示一個預期內的 native gate 失敗；不可讓單一粒子終止整個 batch。"""
+    """內部轉接拒絕訊號；批次層依原QC或工程原因決定取樣錯誤或整片例外。"""
 
     def __init__(self, reason: str, detail: str = "", *, qc: SampleQC | None = None) -> None:
         super().__init__(reason if not detail else f"{reason}: {detail}")
@@ -145,7 +147,10 @@ class _BracketSnapshot:
 
 @dataclass(slots=True)
 class _FrameCacheRecord:
-    """保存可重用 frame 及端點弱引用；不持有已淘汰月份的來源陣列。"""
+    """保存可重用速度場、原三角形波浪QC及端點弱引用，不持有來源月份陣列。
+
+    波浪QC依原三角形編號保存，讓無效支援被排除後仍能回報原原因；純流不配置此陣列。
+    """
 
     frame: PreparedBayTraceFrame
     nbytes: int
@@ -153,6 +158,7 @@ class _FrameCacheRecord:
     after_ref: weakref.ReferenceType[Any]
     metadata: dict[str, Any]
     element_map: np.ndarray
+    wave_triangle_qc: np.ndarray | None = None
 
     def matches(self, before_ocm: Any, after_ocm: Any) -> bool:
         """確認 cache key 對應的來源物件仍是目前 bracket 的兩端。"""
@@ -163,22 +169,25 @@ class _FrameCacheRecord:
 class OCMPreparedFrameResolver:
     """準備可交給原版 BayTrace kernel 的 OCM native frame。
 
-    解析器只接受沿 ``task.velocity.provider`` 逐層 unwrap 後的既有
-    ``ManagedForcingProvider``。``include_stokes=True`` 不會被悄悄當成 OCM-only：
-    它會以 ``stokes_adapter_pending`` 明確拒絕；是否容許legacy由batcher模式決定。
-    本pureflow版本只保留兩端有效濕支援的節點／三角形，無關乾點不污染可算片。
+    解析器只接受直接或單層提示包裝的 ``ManagedForcingProvider``，不拆掉海面鏡射。
+    ``include_stokes=True`` 使用 ``finite_depth_node_fields_v1``：在OCM兩端UTC，
+    以既有NWW3時間選列與有限水深公式準備節點／水層u/v，再加入海流供原版全部RK4
+    stages取用；w只加一次固定沉降。這與舊逐粒子／stage-time取波浪的離散取樣不同，
+    不宣稱變動場軌跡等價。純流完全不讀NWW，無關乾點不污染可算片。
     每個有限 frame
     array cache 以 manager、兩端 OCM object identity、merged row／UTC 及固定沉降值作為
-    key；目前查詢的 ``trat`` 只放回傳 frame 的 scalar，不放進 array key，因此相同兩端
+    key，另區分是否含波浪；目前查詢的 ``trat`` 只放回傳 frame 的 scalar，因此相同兩端
     但不同 UTC 比例不會重建整份 grid／field。它不對大型網格或月檔做 hash。超過單 frame
     記憶體上限、無效垂向列、乾面或相鄰面支援不一致時，會以有限容量 negative cache
     記住理由，避免相同端點每粒子重掃全網格；局部乾面 negative key 另含 element ID。
     fallback 只累計在 report，不逐粒子輸出 warning／print。
 
-    ``max_cached_bytes`` 是 resolver 所持有的grid+field+原triangle映射總上限；建立任何
+    ``max_cached_bytes`` 是常駐grid+field+原triangle映射及波浪QC陣列總上限；建立任何
     大型輸出複本前，先依固定 float64/int64 layout 估算 bytes。通常容量滿時淘汰最舊
     frame，只有單一 frame 本身超過上限才 fallback；negative cache 容量固定為
     ``max_cached_frames``，不會隨粒子數或月份數增長。
+    此上限不是整個程序RSS上限：來源月份與建場暫時陣列另占空間，波浪暫存為
+    節點×水層的線性成本，只在端點快取未命中時準備，不隨粒子數或保存歷史累積。
     """
 
     def __init__(
@@ -201,7 +210,7 @@ class OCMPreparedFrameResolver:
         self.max_cached_frames = max_cached_frames
         self.max_cached_bytes = max_cached_bytes
         self._frame_cache: OrderedDict[tuple[Any, ...], _FrameCacheRecord] = OrderedDict()
-        self._negative_cache: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+        self._negative_cache: OrderedDict[tuple[Any, ...], tuple[str, SampleQC | None]] = OrderedDict()
         self._cached_bytes = 0
         self._last_bracket: _BracketSnapshot | None = None
         self._counters: Counter[str] = Counter()
@@ -213,10 +222,9 @@ class OCMPreparedFrameResolver:
     def __call__(self, task: Any) -> PreparedBayTraceFrame | None:
         """為一個 Q1 ``AdvectionTask`` 解析 frame；不支援時回傳 ``None``。
 
-        這個 callable 的 ``None`` 是明示的 native unsupported 訊號，會由
-        ``NativeBayTraceBatchAdvector`` 交回既有 ``execute_advection_task``，並在其
-        ``fallback_particle_steps`` 計數。此處只負責 resolver 自身可查的理由與 cache
-        統計，不把 legacy fallback 誤標為原版 BayTrace。
+        ``None`` 連同 last_rejection_reason／qc 交給批次執行器：嚴格模式的工程未支援
+        會拋出例外，已知資料問題保留原QC；只有預設相容模式可退回舊核心。這裡不修改
+        粒子狀態，不把拒絕或舊核心成功誤算為原版成功，也不以零波浪填補缺值。
         """
 
         key: tuple[Any, ...] | None = None
@@ -225,9 +233,6 @@ class OCMPreparedFrameResolver:
         self.last_rejection_qc = None
         try:
             managed = self._unwrap_managed_provider(task)
-            if managed.include_stokes:
-                raise _FramePreparationFallback("stokes_adapter_pending")
-
             manager = managed.manager
             target_ns = self._task_time(task)
             element_id = self._task_element_id(task, manager)
@@ -259,11 +264,14 @@ class OCMPreparedFrameResolver:
                 after_ns,
                 settling,
             )
+            # 海流與含波浪總速度不可命中同一frame；來源在manager生命週期內不可變，
+            # NWW精確選列只在端點frame miss執行並記錄，不在每粒子重掃網格。
+            key = (*key, bool(managed.include_stokes))
             negative_reason = self._negative_lookup(key)
             if negative_reason is None:
                 negative_reason = self._negative_lookup((*key, "element", element_id))
             if negative_reason is not None:
-                raise _FramePreparationFallback(negative_reason)
+                raise _FramePreparationFallback(negative_reason[0], qc=negative_reason[1])
 
             record = self._frame_cache.get(key)
             if record is not None:
@@ -289,6 +297,7 @@ class OCMPreparedFrameResolver:
                     ]
                     query_metadata["frame_build_trat"] = record.metadata["frame_build_trat"]
                     self._last_frame_metadata = query_metadata
+                    self._validate_wave_support(manager.mesh, record.wave_triangle_qc, element_id)
                     native_id = self._mapped_element(manager.mesh, record.element_map, element_id)
                     return replace(record.frame, trat=trat, element_id=native_id)
                 # id() 不應在 manager 仍持有 endpoint 時重用；若 entry 已重建，
@@ -319,11 +328,43 @@ class OCMPreparedFrameResolver:
             )
             native_id = self._mapped_element(manager.mesh, element_map, element_id)
             estimated_bytes = self._estimate_frame_bytes(support_mesh, rows["z_before"]) + element_map.nbytes
+            if managed.include_stokes:
+                # 波浪逐原三角形QC也計入常駐上限，供快取命中保留被排除節點的原始原因。
+                estimated_bytes += element_map.nbytes
             if estimated_bytes > self.max_cached_bytes:
                 raise _FramePreparationFallback(
                     "frame_bytes_exceeds_limit",
                     f"estimated={estimated_bytes}, limit={self.max_cached_bytes}",
                 )
+
+            wave_metadata: dict[str, Any] = {}
+            wave_triangle_qc = None
+            if managed.include_stokes:
+                wave = prepare_finite_depth_node_fields(
+                    manager, support_mesh, rows, before_ns, after_ns,
+                    required_month_ids=tuple(sorted({before_entry.month_id, after_entry.month_id})),
+                )
+                wave_metadata = wave.metadata
+                wave_triangle_qc = np.zeros(element_map.size, dtype=np.int64)
+                present = element_map >= 0
+                wave_triangle_qc[present] = np.bitwise_or.reduce(
+                    wave.node_qc[support_mesh.triangle_nodes], axis=1
+                )[element_map[present]]
+                self._validate_wave_support(manager.mesh, wave_triangle_qc, element_id)
+                for index, suffix in enumerate(("before", "after")):
+                    total = rows[f"hvel_{suffix}"].copy()
+                    total[:, :, 0] += wave.east[index]
+                    total[:, :, 1] += wave.north[index]
+                    total[wave.node_qc != 0] = np.nan
+                    rows[f"hvel_{suffix}"] = total
+                # NWW有效範圍可小於OCM；只排除無波浪支援的節點，不讓整張域變成0波浪。
+                support_mesh, rows, wave_map = self._compact_wet_support(
+                    support_mesh, rows, wet_values=(before_ocm.wet_value, after_ocm.wet_value)
+                )
+                present = element_map >= 0
+                element_map[present] = wave_map[element_map[present]]
+                native_id = self._mapped_element(manager.mesh, element_map, element_id)
+                del wave
 
             grid, fields = self._build_grid_and_fields(
                 support_mesh,
@@ -337,6 +378,8 @@ class OCMPreparedFrameResolver:
                 element_id=native_id,
             )
             actual_bytes = self._frame_nbytes(frame) + element_map.nbytes
+            if wave_triangle_qc is not None:
+                actual_bytes += wave_triangle_qc.nbytes
             if actual_bytes > self.max_cached_bytes:
                 # 理論估算與 constructor 後 bytes 不應不同；仍保留第二道 gate，
                 # 以防未來陣列 dtype/layout 契約變更時把大複本留在 cache。
@@ -350,6 +393,7 @@ class OCMPreparedFrameResolver:
             metadata["frame_build_trat"] = float(trat)
             metadata["field_policy"] = "ocm_wet_support_node_fields_v1"
             metadata["include_stokes"] = False
+            metadata.update(wave_metadata)
             metadata["global_triangle_count"] = int(element_map.size)
             metadata["native_triangle_count"] = int(frame.grid.i34.size)
             metadata["native_node_count"] = int(frame.grid.grid_x.size)
@@ -362,6 +406,7 @@ class OCMPreparedFrameResolver:
                     after_ref=weakref.ref(after_ocm),
                     metadata=metadata,
                     element_map=element_map,
+                    wave_triangle_qc=wave_triangle_qc,
                 ),
             )
             self._counters["frame_builds"] += 1
@@ -373,7 +418,7 @@ class OCMPreparedFrameResolver:
                 self.last_rejection_qc = SampleQC.DRY_FACE
             fallback_key = key
             if key is not None and error.reason in {
-                "dry_face", "adjacent_support_mismatch", "invalid_local_support"
+                "dry_face", "adjacent_support_mismatch", "invalid_local_support", "wave_node_support_invalid"
             }:
                 # 這兩個 gate 由目前 element 的 local wet/dry 支援決定，不能把一顆
                 # dry particle 的理由寫成整個 endpoint frame 的 global negative。
@@ -425,8 +470,10 @@ class OCMPreparedFrameResolver:
             "last_rejection_reason": self.last_rejection_reason,
             "last_rejection_qc": int(self.last_rejection_qc) if self.last_rejection_qc is not None else None,
             "cache_warmup_builds": int(self._counters["frame_builds"]),
-            "field_policy": "ocm_wet_support_node_fields_v1",
-            "include_stokes": False,
+            "field_policy": (self._last_frame_metadata or {}).get(
+                "field_policy", "ocm_wet_support_node_fields_v1"
+            ),
+            "include_stokes": (self._last_frame_metadata or {}).get("include_stokes", False),
         }
 
     def _unwrap_managed_provider(self, task: Any) -> ManagedForcingProvider:
@@ -527,8 +574,8 @@ class OCMPreparedFrameResolver:
             float(settling),
         )
 
-    def _negative_lookup(self, key: tuple[Any, ...]) -> str | None:
-        """查 bounded negative cache；命中後只做 counter，不重讀大型 row。"""
+    def _negative_lookup(self, key: tuple[Any, ...]) -> tuple[str, SampleQC | None] | None:
+        """查有限容量拒絕快取，回傳原因及原QC；命中不重讀大型列也不遺失資料類別。"""
 
         reason = self._negative_cache.get(key)
         if reason is None:
@@ -550,7 +597,7 @@ class OCMPreparedFrameResolver:
         self.last_rejection_reason = reason
         self._counters["fallback_calls"] += 1
         if key is not None and key not in self._negative_cache:
-            self._negative_cache[key] = reason
+            self._negative_cache[key] = (reason, self.last_rejection_qc)
             self._counters["negative_cache_stores"] += 1
             while len(self._negative_cache) > self.max_cached_frames:
                 self._negative_cache.popitem(last=False)
@@ -683,12 +730,30 @@ class OCMPreparedFrameResolver:
         native_neighbors = np.full(neighbors.shape, -1, dtype=np.int64)
         present = neighbors >= 0
         native_neighbors[present] = element_map[neighbors[present]]
+        # 子網格每個三角形成為一個面；原四邊形拆分的兩片各複用原面濕旗標。
+        # 此對應讓波浪遮罩再縮減時仍保留正確濕／乾語意，不把舊面索引套到新陣列。
         compact = SimpleNamespace(node_xy=np.asarray(mesh.node_xy)[nodes], source_depth_m=dp[nodes],
                                   triangle_nodes=node_map[triangles[triangle_ids]],
-                                  triangle_neighbors=native_neighbors)
-        compact_rows = {key: value if key.startswith("wet_") else value[nodes]
+                                  triangle_neighbors=native_neighbors,
+                                  triangle_face_local=np.arange(triangle_ids.size))
+        compact_rows = {key: value[face[triangle_ids]] if key.startswith("wet_") else value[nodes]
                         for key, value in rows.items()}
         return compact, compact_rows, element_map
+
+    @staticmethod
+    def _validate_wave_support(mesh: Any, triangle_qc: np.ndarray | None, element_id: int) -> None:
+        """檢查原版可搜尋的一環波浪支援，含快取已排除的三角形；不重讀NWW。
+
+        原三角形順序的QC向量只記小型旗標，不保存波浪全場。已知缺波浪／時間／物理QC
+        必須先於工程索引映射拒絕，避免重試時把相同資料缺值誤標為未支援或數值失敗。
+        """
+        if triangle_qc is None:
+            return
+        neighbors = np.asarray(mesh.triangle_neighbors)[element_id]
+        required = np.r_[element_id, neighbors[neighbors >= 0]]
+        qc = int(np.bitwise_or.reduce(triangle_qc[required]))
+        if qc:
+            raise _FramePreparationFallback("wave_node_support_invalid", qc=SampleQC(qc))
 
     @staticmethod
     def _mapped_element(mesh: Any, element_map: np.ndarray, element_id: int) -> int:

@@ -438,8 +438,8 @@ def test_invalid_vertical_or_depth_is_bounded_negative_cache_and_fallback() -> N
     assert report["negative_cache_entries"] == 1
 
 
-def test_dry_face_and_unsupported_stokes_are_explicit_fallbacks() -> None:
-    """乾面與波浪 provider 都必須保留 legacy fallback 並提供可查理由。"""
+def test_dry_face_preserves_qc_with_current_and_wave() -> None:
+    """純流／流波均先拒絕實際乾面；不因啟用波浪而掩蓋原乾面原因。"""
 
     mesh = _mesh()
     dry = np.zeros((2, 2), dtype=np.float64)
@@ -452,8 +452,8 @@ def test_dry_face_and_unsupported_stokes_are_explicit_fallbacks() -> None:
     assert resolver(_task(current)) is None
     assert resolver(_task(waves, state=_state(particle_id="p1"))) is None
     reasons = resolver.report()["fallback_reasons"]
-    assert reasons["dry_face"] == 1
-    assert reasons["stokes_adapter_pending"] == 1
+    assert reasons["dry_face"] == 2
+    assert resolver.last_rejection_qc == SampleQC.DRY_FACE
 
 
 def test_local_dry_face_does_not_poison_disconnected_wet_element(original_kernels) -> None:
