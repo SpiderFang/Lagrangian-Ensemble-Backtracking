@@ -7,11 +7,8 @@
 from __future__ import annotations
 
 import argparse
-import cProfile
-import faulthandler
 import json
 import os
-import pstats
 import signal
 import subprocess
 import sys
@@ -72,14 +69,16 @@ def worker(args):
 
     以既有私有能力執行啟動繫結驗證，保留不可變輸入、設定、種子與路徑檢核；
     不掃描整批歷史。僅明示檢查點的恢復保留原載入器對該片鏈的驗證，不發布成果。
-    靜態驗證、建構／載入與實際步進分開計時。定時堆疊涵蓋所有階段；只有正常
-    返回才能產生函式累計耗時摘要，逾時則保留標準錯誤的原始堆疊。
+    靜態驗證、建構／載入與實際步進分開計時。由父層py-spy以祖先權限非停止式
+    採樣；不啟用faulthandler或cProfile，避免混用診斷器。不得附加原計算程序。
     """
     sys.path.insert(0, str(args.project_root / 'src'))
     import lagrangian_backtracking.cli as cli
     import lagrangian_backtracking.production as production
     from lagrangian_backtracking.runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
 
+    with (args.output / 'numerical-pid.json').open('x') as stream:
+        json.dump(dict(pid=os.getpid(), ppid=os.getppid(), pgid=os.getpgrp()), stream)
     for module in (cli, production):
         path = Path(module.__file__).resolve()
         if not path.is_relative_to((args.project_root / 'src').resolve()):
@@ -103,28 +102,22 @@ def worker(args):
          from_checkpoint=args.checkpoint is not None)
     advance_start = time.monotonic()
     summarize(batch, 0, advance_start)
-    profiler = cProfile.Profile()
-    profiler.enable()
-    try:
-        for sweep in range(1, args.max_sweeps + 1):
-            if batch.terminal:
-                break
-            batch.advance(1)
-            if sweep % 10 == 0 or batch.terminal:
-                summarize(batch, sweep, advance_start)
-    finally:
-        profiler.disable()
-        with (args.output / 'profile-top.txt').open('x') as stream:
-            pstats.Stats(profiler, stream=stream).sort_stats('cumulative').print_stats(30)
+    for sweep in range(1, args.max_sweeps + 1):
+        if batch.terminal:
+            break
+        batch.advance(1)
+        if sweep % 10 == 0 or batch.terminal:
+            summarize(batch, sweep, advance_start)
     emit('diagnostic_return', elapsed_seconds=time.monotonic() - start,
          native_report=controller.advection_reporter(), formal_result=False)
     return 0
 
 
-def stop_owned(process):
+def stop_owned(process, child_pid=None):
     """硬逾時只清理由 Popen 新建且群組編號等於自身PID的診斷子程序。
 
-    不接受任意PID、不搜尋模型程序；程序若已結束即不送訊號，避免誤觸PID重用。
+    不搜尋模型程序。py-spy正常完成60秒採樣後，可能留下仍在計算的診斷子程序；
+    此時僅接受本次獨立目錄記錄的child_pid，且再次確認它仍在新建群組內。
     """
     if process.poll() is None:
         if os.getpgid(process.pid) != process.pid or process.pid == os.getpgrp():
@@ -132,6 +125,11 @@ def stop_owned(process):
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=15)
+    elif child_pid is not None:
+        with suppress(ProcessLookupError):
+            if os.getpgid(child_pid) != process.pid or process.pid == os.getpgrp():
+                raise RuntimeError("診斷子程序不在自建群組，拒絕清理")
+            os.killpg(process.pid, signal.SIGKILL)
 
 
 def main(argv=None):
@@ -143,6 +141,8 @@ def main(argv=None):
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--shard-id', required=True)
     parser.add_argument('--expected-commit', required=True)
+    parser.add_argument('--py-spy', required=True, type=Path,
+                        help='獨立工具環境的py-spy絕對路徑；只由它啟動新診斷子程序')
     parser.add_argument('--max-sweeps', type=int, default=1000)
     parser.add_argument('--timeout-seconds', type=int, default=150)
     parser.add_argument('--internal-worker', action='store_true', help=argparse.SUPPRESS)
@@ -180,11 +180,18 @@ def main(argv=None):
         path = output / key.lower()
         path.mkdir()
         env[key] = str(path)
-    command = [sys.executable, '-u', str(Path(__file__).resolve()),
-               *(argv if argv is not None else sys.argv[1:]), '--internal-worker']
+    child_command = [sys.executable, '-u', str(Path(__file__).resolve()),
+                     *(argv if argv is not None else sys.argv[1:]), '--internal-worker']
+    # 60秒自動結束採樣以先落盤原始堆疊；外層仍有150秒預設硬上限。
+    # 不使用--pid附加原worker，py-spy是新診斷Python的直接父程序。
+    command = [str(args.py_spy.resolve(strict=True)), 'record', '--nonblocking',
+               '--rate', '5', '--format', 'raw', '--full-filenames', '--duration', '60',
+               '--output', str(output / 'profile.raw'), '--', *child_command]
     evidence = dict(policy='READ_ONLY_IN_MEMORY_DIAGNOSTIC_NOT_RESULTS', actual_commit=actual,
                     diagnostic_startup_bindings_only=True,
                     full_history_validation_not_performed=True, formal_result=False,
+                    profiler='py-spy nonblocking ancestor sampling; no faulthandler/cProfile',
+                    profiling_seconds=60, profiling_rate_hz=5,
                     project_root=str(args.project_root), script_sha256=digest(__file__),
                     plan_sha256=digest(plan_path), run_id=plan['run_id'], shard_id=args.shard_id,
                     checkpoint=str(args.checkpoint) if args.checkpoint else None,
@@ -209,7 +216,9 @@ def main(argv=None):
                 timed_out = True
     finally:
         if process is not None:
-            stop_owned(process)
+            child_path = output / 'numerical-pid.json'
+            child_pid = json.loads(child_path.read_text())['pid'] if child_path.exists() else None
+            stop_owned(process, child_pid=child_pid)
     with (output / 'result.json').open('x') as stream:
         json.dump(dict(timed_out=timed_out, returncode=process.returncode,
                        elapsed_seconds=time.monotonic() - started,
@@ -218,8 +227,4 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    # 在數值套件匯入、靜態驗證及載入前就啟用；不需要附加正在跑的模型程序。
-    if '--internal-worker' in sys.argv:
-        faulthandler.enable()
-        faulthandler.dump_traceback_later(15, repeat=True)
     raise SystemExit(main())

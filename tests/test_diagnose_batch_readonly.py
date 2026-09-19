@@ -125,3 +125,16 @@ def test_cleanup_only_new_process_group(monkeypatch, group, alive, expected):
     else:
         runner.stop_owned(process)
     assert signals == ([(777, signal.SIGKILL)] if expected else [])
+
+
+def test_completed_profiler_cleans_only_owned_child(monkeypatch):
+    """採樣器已退出但診斷Python仍活著時，只清理經群組核對的新子程序。"""
+    signals = []
+    process = SimpleNamespace(pid=777, poll=lambda: 0)
+    monkeypatch.setattr(runner.os, 'getpgid', lambda pid: 777 if pid == 778 else 60859)
+    monkeypatch.setattr(runner.os, 'getpgrp', lambda: 123)
+    monkeypatch.setattr(runner.os, 'killpg', lambda *args: signals.append(args))
+    runner.stop_owned(process, child_pid=778)
+    assert signals == [(777, signal.SIGKILL)]
+    with pytest.raises(RuntimeError):
+        runner.stop_owned(process, child_pid=60869)
