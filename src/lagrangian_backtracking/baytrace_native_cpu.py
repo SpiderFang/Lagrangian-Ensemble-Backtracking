@@ -95,7 +95,11 @@ class BayTraceGridArrays:
     dp: np.ndarray
 
     def __post_init__(self) -> None:
-        """一次性轉成 Numba 可安全讀取的連續陣列並驗證網格契約。"""
+        """轉成連續陣列並批次檢核索引／方向／面積，保留原首個錯誤語意。
+
+        向量運算僅移除逐元素Python迴圈；三角與四邊形每個必要三角形都檢查，
+        不改原始BayTrace核心、有效層、索引界線、有限值或形狀契約。
+        """
 
         i34 = _int_array(self.i34, "i34", 1)
         elnode = _int_array(self.elnode, "elnode", 2)
@@ -135,24 +139,36 @@ class BayTraceGridArrays:
         if np.any((ic3 < -1) | (ic3 >= ne)):
             raise ValueError("ic3 只能使用 -1 或有效元素索引")
 
-        # 只檢查每個元素實際使用的節點；三角形第四欄固定為 -1，避免
-        # 不小心把無效欄位送進原始 kernel 的節點索引運算。
-        for element, node_count in enumerate(i34):
-            used_nodes = elnode[element, :node_count]
-            if np.any(used_nodes < 0) or np.any(used_nodes >= nnode):
+        # 一次建立元素×四欄有效索引遮罩，避免每個面各自呼叫np.any。
+        # 暫時夾限只供安全計算面積；原索引仍完整檢核，從不送修補索引進kernel。
+        used = np.arange(4)[None, :] < i34[:, None]
+        bad_indices = np.any(used & ((elnode < 0) | (elnode >= nnode)), axis=1)
+        if nnode == 0:
+            raise ValueError("elnode[0] 含無效節點索引")
+        safe_nodes = np.clip(elnode, 0, nnode - 1)
+        n0, n1, n2, n3 = safe_nodes.T
+        # 有向面積逐項沿用 _signed_triangle_area 的減、乘、減、除順序，
+        # 四邊形第二三角形仍是[0,2,3]，不以總多邊形面積取代其獨立檢查。
+        first_area = ((grid_x[n0] - grid_x[n2]) * (grid_y[n1] - grid_y[n2])
+                      - (grid_x[n1] - grid_x[n2]) * (grid_y[n0] - grid_y[n2])) / 2.0
+        second_area = ((grid_x[n0] - grid_x[n3]) * (grid_y[n2] - grid_y[n3])
+                       - (grid_x[n2] - grid_x[n3]) * (grid_y[n0] - grid_y[n3])) / 2.0
+        failures = np.select(
+            [bad_indices, (i34 == 3) & (elnode[:, 3] != -1),
+             first_area <= 1.0e-12, (i34 == 4) & (second_area <= 1.0e-12)],
+            [1, 2, 3, 4], default=0)
+        bad_elements = np.flatnonzero(failures)
+        if bad_elements.size:
+            # 必須先找最早元素，再依該元素原檢查順序回報，不能讓後面的
+            # 索引錯誤蓋掉前面元素的面積錯誤。
+            element = int(bad_elements[0])
+            code = failures[element]
+            if code == 1:
                 raise ValueError(f"elnode[{element}] 含無效節點索引")
-            if node_count == 3 and elnode[element, 3] != -1:
+            if code == 2:
                 raise ValueError("三角形 elnode 的未使用第四欄必須是 -1")
-
-            # 原始 _pt_in_poly3 只接受正向且非退化三角形；在 Python 層
-            # 先擋住退化/反向面，避免編譯後才產生難追的錯誤內插。
-            first_area = _signed_triangle_area(grid_x, grid_y, used_nodes[:3])
-            if first_area <= 1.0e-12:
-                raise ValueError(f"元素 {element} 的第一個三角形方向或面積無效")
-            if node_count == 4:
-                second_area = _signed_triangle_area(grid_x, grid_y, used_nodes[[0, 2, 3]])
-                if second_area <= 1.0e-12:
-                    raise ValueError(f"元素 {element} 的第二個三角形方向或面積無效")
+            which = "第一個" if code == 3 else "第二個"
+            raise ValueError(f"元素 {element} 的{which}三角形方向或面積無效")
 
         for name, array in (
             ("grid_x", grid_x),

@@ -862,7 +862,11 @@ class OCMPreparedFrameResolver:
         *,
         settling_velocity_mps: float,
     ) -> tuple[BayTraceGridArrays, BayTraceFieldPair]:
-        """由兩端 row 建立 OCM native grid/field；所有物理軸仍是公尺與 m/s。"""
+        """批次建立兩端OCM節點場，保持原逐節點dtype、底層夾限及所有檢核。
+
+        節點／層遮罩只消除Python小陣列迴圈，不改sigma公式、面積計算或物理量。
+        不同節點同時失敗時仍依原節點順序及檢查順序回傳首個理由。軸為公尺與m/s。
+        """
 
         node_xy = np.asarray(mesh.node_xy)
         dp = np.asarray(mesh.source_depth_m)
@@ -904,71 +908,82 @@ class OCMPreparedFrameResolver:
         if np.any(~np.isfinite(eta_before)) or np.any(~np.isfinite(eta_after)):
             raise _FramePreparationFallback("nonfinite_field")
 
-        kbp = np.empty(nnode, dtype=np.int64)
-        sigma_lcl = np.empty((nvrt, nnode), dtype=np.float64)
-        for node in range(nnode):
-            finite_before = np.flatnonzero(np.isfinite(z_before[node]))
-            finite_after = np.flatnonzero(np.isfinite(z_after[node]))
-            if finite_before.size == 0 or finite_after.size == 0:
-                raise _FramePreparationFallback("invalid_vertical_support")
-            first = int(finite_before[0])
-            if int(finite_after[0]) != first:
-                raise _FramePreparationFallback("vertical_support_mismatch")
-            # first finite layer 是原版 kbp；其下未使用層只在輸出場中重複此
-            # kbp 值，等價於原版 find_vlevel 的 kbp clamp，不以 0 補物理量。
-            if not np.all(np.isfinite(z_before[node, first:])) or not np.all(
-                np.isfinite(z_after[node, first:])
-            ):
-                raise _FramePreparationFallback("invalid_vertical_support")
-            denominator_before = float(dp[node] + eta_before[node])
-            denominator_after = float(dp[node] + eta_after[node])
-            if denominator_before <= 0.0 or denominator_after <= 0.0:
-                raise _FramePreparationFallback("invalid_depth")
-            sigma_before = (z_before[node, first:] - eta_before[node]) / denominator_before
-            sigma_after = (z_after[node, first:] - eta_after[node]) / denominator_after
-            if not np.all(np.isfinite(sigma_before)) or not np.all(np.isfinite(sigma_after)):
-                raise _FramePreparationFallback("invalid_vertical_support")
-            if np.any(np.diff(z_before[node, first:]) < -_SIGMA_TOLERANCE) or np.any(
-                np.diff(z_after[node, first:]) < -_SIGMA_TOLERANCE
-            ):
-                raise _FramePreparationFallback("vertical_nonmonotonic")
-            if np.any(np.diff(sigma_before) < -_SIGMA_TOLERANCE) or np.any(
-                np.diff(sigma_after) < -_SIGMA_TOLERANCE
-            ):
-                raise _FramePreparationFallback("sigma_nonmonotonic")
-            if (
-                np.any(sigma_before < -1.0 - _SIGMA_TOLERANCE)
-                or np.any(sigma_before > _SIGMA_TOLERANCE)
-                or np.any(sigma_after < -1.0 - _SIGMA_TOLERANCE)
-                or np.any(sigma_after > _SIGMA_TOLERANCE)
-            ):
-                raise _FramePreparationFallback("sigma_out_of_range")
-            reconstructed_before = eta_before[node] + sigma_before * denominator_before
-            reconstructed_after = eta_after[node] + sigma_after * denominator_after
-            if not np.allclose(
-                reconstructed_before,
-                z_before[node, first:],
-                rtol=1.0e-6,
-                atol=1.0e-6,
-            ) or not np.allclose(
-                reconstructed_after,
-                z_after[node, first:],
-                rtol=1.0e-6,
-                atol=1.0e-6,
-            ):
-                raise _FramePreparationFallback("zcor_reconstruction_mismatch")
-            kbp[node] = first
-            sigma_lcl[first:, node] = sigma_before
-            sigma_lcl[:first, node] = sigma_before[0]
+        # 各列是一個節點、各欄是一層。一次求首個有效層與有效尾段遮罩，
+        # 但仍保存舊版「節點優先、同節點檢查順序優先」的首個拒絕理由。
+        finite_before = np.isfinite(z_before)
+        finite_after = np.isfinite(z_after)
+        kbp = np.argmax(finite_before, axis=1).astype(np.int64)
+        first_after = np.argmax(finite_after, axis=1)
+        layers = np.arange(nvrt)[None, :]
+        used = layers >= kbp[:, None]
+        failures = np.zeros(nnode, dtype=np.int8)
+        reasons = [
+            ("invalid_vertical_support", ""), ("vertical_support_mismatch", ""),
+            ("invalid_vertical_support", ""), ("invalid_depth", ""),
+            ("invalid_vertical_support", ""), ("vertical_nonmonotonic", ""),
+            ("sigma_nonmonotonic", ""), ("sigma_out_of_range", ""),
+            ("zcor_reconstruction_mismatch", ""), ("nonfinite_field", "hvel_before"),
+            ("nonfinite_field", "hvel_after"), ("nonfinite_field", "vertical_before"),
+            ("nonfinite_field", "vertical_after"),
+        ]
 
-            for values, label in (
-                (hvel_before[node, first:, :2], "hvel_before"),
-                (hvel_after[node, first:, :2], "hvel_after"),
-                (vertical_before[node, first:], "vertical_before"),
-                (vertical_after[node, first:], "vertical_after"),
-            ):
-                if not np.all(np.isfinite(values)):
-                    raise _FramePreparationFallback("nonfinite_field", label)
+        def reject_rows(mask: np.ndarray, code: int) -> None:
+            """只記錄各節點最早失敗的檢查；稍後再依節點順序提出原拒絕原因。"""
+            failures[(failures == 0) & mask] = code
+
+        reject_rows(~finite_before.any(axis=1) | ~finite_after.any(axis=1), 1)
+        reject_rows(first_after != kbp, 2)
+        reject_rows(np.any(used & (~finite_before | ~finite_after), axis=1), 3)
+        # 舊版先做兩個NumPy scalar相加，再轉Python float作弱純量除法。
+        # 分母不可直接保留float64向量，否則float32分子會被升型、改變sigma位元。
+        # 先依原加法dtype算水柱厚度，再轉成「分子 / Python float」的輸出dtype；
+        # 乘回時沿用相同轉型，重建檢查的每一步捨入與舊版相同。
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            depth_before = dp + eta_before
+            depth_after = dp + eta_after
+            reject_rows((depth_before <= 0.0) | (depth_after <= 0.0), 4)
+            numerator_before = z_before - eta_before[:, None]
+            numerator_after = z_after - eta_after[:, None]
+            divisor_before = depth_before.astype((numerator_before[:0] / 1.0).dtype)
+            divisor_after = depth_after.astype((numerator_after[:0] / 1.0).dtype)
+            sigma_before = numerator_before / divisor_before[:, None]
+            sigma_after = numerator_after / divisor_after[:, None]
+            reject_rows(np.any(used & (~np.isfinite(sigma_before)
+                                      | ~np.isfinite(sigma_after)), axis=1), 5)
+            # 差分只檢查首個有效層以上的相鄰層；未使用底層可含NaN，不能誤拒絕。
+            pair_used = used[:, :-1]
+            reject_rows(np.any(pair_used & (
+                (np.diff(z_before, axis=1) < -_SIGMA_TOLERANCE)
+                | (np.diff(z_after, axis=1) < -_SIGMA_TOLERANCE)), axis=1), 6)
+            reject_rows(np.any(pair_used & (
+                (np.diff(sigma_before, axis=1) < -_SIGMA_TOLERANCE)
+                | (np.diff(sigma_after, axis=1) < -_SIGMA_TOLERANCE)), axis=1), 7)
+            reject_rows(np.any(used & (
+                (sigma_before < -1.0 - _SIGMA_TOLERANCE)
+                | (sigma_before > _SIGMA_TOLERANCE)
+                | (sigma_after < -1.0 - _SIGMA_TOLERANCE)
+                | (sigma_after > _SIGMA_TOLERANCE)), axis=1), 8)
+            reconstructed_before = eta_before[:, None] + sigma_before * divisor_before[:, None]
+            reconstructed_after = eta_after[:, None] + sigma_after * divisor_after[:, None]
+            reject_rows(np.any(used & (
+                ~np.isclose(reconstructed_before, z_before, rtol=1.0e-6, atol=1.0e-6)
+                | ~np.isclose(reconstructed_after, z_after, rtol=1.0e-6, atol=1.0e-6)), axis=1), 9)
+        for code, values in enumerate((
+            hvel_before[:, :, :2], hvel_after[:, :, :2], vertical_before, vertical_after,
+        ), start=10):
+            finite = np.isfinite(values)
+            if finite.ndim == 3:
+                finite = np.all(finite, axis=2)
+            reject_rows(np.any(used & ~finite, axis=1), code)
+        invalid_nodes = np.flatnonzero(failures)
+        if invalid_nodes.size:
+            reason, detail = reasons[int(failures[invalid_nodes[0]]) - 1]
+            raise _FramePreparationFallback(reason, detail)
+
+        # 未使用底層重複該節點首個有效值；這是原kbp夾限，不是零值補資料。
+        clamped_layers = np.maximum(layers, kbp[:, None])
+        sigma_lcl = np.asarray(
+            np.take_along_axis(sigma_before, clamped_layers, axis=1).T, dtype=np.float64)
 
         element_nodes = triangle_nodes
         if np.any(element_nodes < 0) or np.any(element_nodes >= nnode):
@@ -982,13 +997,10 @@ class OCMPreparedFrameResolver:
         ic3[:3, :] = neighbors.T.astype(np.int64, copy=False)
 
         def transpose_with_kbp(values: np.ndarray, *, add: float = 0.0) -> np.ndarray:
-            """轉成 BayTrace (layer,node)，並以 kbp clamp 重複未使用底層。"""
+            """批次取首個有效層以上數值，先轉float64再加沉降，保持舊算式順序。"""
 
-            result = np.empty((nvrt, nnode), dtype=np.float64)
-            for node in range(nnode):
-                first = int(kbp[node])
-                result[first:, node] = np.asarray(values[node, first:], dtype=np.float64) + add
-                result[:first, node] = result[first, node]
+            selected = np.take_along_axis(values, clamped_layers, axis=1)
+            result = np.ascontiguousarray((np.asarray(selected, dtype=np.float64) + add).T)
             if not np.all(np.isfinite(result)):
                 raise _FramePreparationFallback("nonfinite_result")
             return result

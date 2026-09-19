@@ -243,6 +243,13 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 ### 有界唯讀步進診斷
 
+OCM原版轉接建場採節點／層批次遮罩與向量化拓樸檢核，保留原sigma算式與
+NumPy弱純量dtype捨入，不更動PI核心、RK4、步長、種子或停止條件。底部未使用層
+仍重複首個有效層，所有有限值／單調／範圍／重建／索引／方向／面積gate保留，
+四邊形第二三角形獨立檢核；不同錯誤同時發生仍回報原節點／元素順序的首個理由。
+`tests/baytrace_scalar_reference.py`保存向量化前逐節點／元素參考，
+由混合float32／float64逐陣列bitwise與拒絕理由測試核對，不能據此宣稱已排除全部效能瓶頸。
+
 `scripts/diagnose_batch_readonly.py` 只在新的獨立程序記憶體中重現指定純流分片，
 不是正式計算或成果。必須明示 `--project-root`、`--expected-commit`、`--workspace`、
 `--config`、`--checkpoint-root`、`--ocm-native-root`、`--ocm-reconstruction-root`、
@@ -262,6 +269,8 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 所有暫存與快取另置診斷目錄、五種執行緒限制均為1；採樣完成或硬逾時只清理診斷自建群組。
 `provenance.json`、`pid.json`、`numerical-pid.json`、`stdout.jsonl`、`stacks.stderr`、
 `profile.raw`、`result.json` 是診斷證據；採樣失敗不得冒稱已定位卡點。
+每10次掃描的摘要另保存cache hits/misses、frame builds/evictions、cached bytes及
+native completed/fallback/group-size程序累計統計；快取容量不因向量化而調整。
 原進度可能由既有worker正常更新，不能把它當成診斷寫入。
 
 ## 8. 方法與不採用範圍

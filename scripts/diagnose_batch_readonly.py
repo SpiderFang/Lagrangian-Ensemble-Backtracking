@@ -52,16 +52,26 @@ def build_batch(controller, shard_id, checkpoint, batch_class):
     return batch_class(**options)
 
 
-def summarize(batch, sweep, started):
-    """只彙總粒子已完成步數、年齡秒及模型時間，不輸出位置或整份軌跡。"""
+def summarize(batch, sweep, started, report=None):
+    """彙總步數／年齡及程序累計快取、原版批次計數，供辨識建場或快取反覆淘汰。
+
+    快取計數是此次診斷程序累計值，不當作正式run進度；不輸出位置或整份軌跡。
+    """
     executions = [runtime.execution for runtime in batch.runtimes]
     steps = [item.step_count for item in executions]
     ages = [item.state.age_seconds for item in executions]
     times = [item.state.time_utc_ns for item in executions]
+    report = report or {}
+    cache = report.get('resolver_report', {})
     emit('advance', sweep=sweep, elapsed_seconds=time.monotonic() - started,
          particle_steps=sum(steps), step_min=min(steps), step_max=max(steps),
          age_seconds_min=min(ages), age_seconds_max=max(ages),
-         model_utc_ns_min=min(times), model_utc_ns_max=max(times), terminal=batch.terminal)
+         model_utc_ns_min=min(times), model_utc_ns_max=max(times), terminal=batch.terminal,
+         cache={key: cache.get(key) for key in (
+             'cache_hits', 'cache_misses', 'frame_builds', 'frame_evictions', 'cached_bytes')},
+         native_completed=report.get('native_completed_particle_steps'),
+         fallback=report.get('fallback_particle_steps'), max_group_size=report.get('max_group_size'),
+         group_size_histogram=report.get('group_size_histogram'))
 
 
 def worker(args):
@@ -101,13 +111,13 @@ def worker(args):
     emit('batch_ready', restore_seconds=time.monotonic() - restore_start,
          from_checkpoint=args.checkpoint is not None)
     advance_start = time.monotonic()
-    summarize(batch, 0, advance_start)
+    summarize(batch, 0, advance_start, controller.advection_reporter())
     for sweep in range(1, args.max_sweeps + 1):
         if batch.terminal:
             break
         batch.advance(1)
         if sweep % 10 == 0 or batch.terminal:
-            summarize(batch, sweep, advance_start)
+            summarize(batch, sweep, advance_start, controller.advection_reporter())
     emit('diagnostic_return', elapsed_seconds=time.monotonic() - start,
          native_report=controller.advection_reporter(), formal_result=False)
     return 0
