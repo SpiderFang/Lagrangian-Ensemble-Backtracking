@@ -18,7 +18,7 @@ from lagrangian_backtracking.baytrace_batch_advection import (
     NativeBayTraceUnsupportedError,
 )
 from lagrangian_backtracking.baytrace_ocm_adapter import OCMPreparedFrameResolver
-from lagrangian_backtracking.baytrace_wave_frame import _node_wave_samples
+from lagrangian_backtracking.baytrace_wave_frame import _node_wave_samples, _stokes_layers
 from lagrangian_backtracking.forcing import NWWAnalysisMonth, OCMReconstructionPatchMonth
 from lagrangian_backtracking.forcing_window import ForcingWindowManager, ManagedForcingProvider
 from lagrangian_backtracking.geometry import DomainProjection
@@ -369,3 +369,83 @@ def test_vertical_reference_uses_endpoint_eta_and_stored_zcor():
     np.testing.assert_allclose(frame.fields.u2[1], 0.1 + expected.u_mps, rtol=2e-12)
     np.testing.assert_allclose(frame.fields.u2[0], frame.fields.u2[1])
     assert frame.grid.kbp.tolist() == [1, 1, 1, 1]
+
+
+@pytest.mark.parametrize("eta_m", [0.1234567, -0.1234567, 1.234567])
+def test_float32_vertical_subtraction_does_not_create_false_bed_violation(eta_m):
+    """單精度來源相減先提升雙精度；精確海床不得因中間捨入變成假越床QC16。
+
+    z=-20、dp=20是同一精確海床，eta則保留原float32數值；不夾值、不改1e-9m容差。
+    三層輸出須與同一已存資料轉float64後呼叫既有公式一致，不能用零漂移通過。
+    """
+    eta = np.asarray([eta_m], dtype=np.float32)
+    z = np.asarray([[-20.0, -10.0, eta[0]]], dtype=np.float32)
+    depth = np.asarray([20.0], dtype=np.float64) + eta
+    u, v, qc = _stokes_layers(
+        np.asarray([2.0]), np.asarray([0.1]), np.asarray([270.0]), z, eta, depth, np.zeros(1, dtype=np.int64)
+    )
+    assert qc.tolist() == [0]
+    for layer in range(3):
+        expected = finite_depth_stokes(
+            significant_wave_height_m=2.0,
+            peak_frequency_hz=0.1,
+            direction_raw_deg=270.0,
+            particle_z_m=float(z[0, layer]),
+            surface_z_m=float(eta[0]),
+            bed_z_m=-20.0,
+        )
+        assert u[0, layer] == pytest.approx(expected.u_mps, rel=2e-12)
+        assert v[0, layer] == pytest.approx(expected.v_mps, abs=1e-15)
+
+
+def test_true_float32_below_bed_remains_rejected():
+    """真實已存zcor越床仍拒絕；計算精度修正不是資料夾值或容差放寬。"""
+    eta = np.asarray([0.1234567], dtype=np.float32)
+    z = np.asarray([[-20.001, -10.0, eta[0]]], dtype=np.float32)
+    _, _, qc = _stokes_layers(
+        np.asarray([2.0]),
+        np.asarray([0.1]),
+        np.asarray([270.0]),
+        z,
+        eta,
+        np.asarray([20.0]) + eta,
+        np.zeros(1, dtype=np.int64),
+    )
+    assert qc.tolist() == [int(SampleQC.VERTICAL_UNSUPPORTED)]
+
+
+def test_float32_ocm_wave_frame_actually_advances_original_batch(original_kernels):
+    """原float32高程資料應真實合批推進，不以拒絕全片或回傳零漂移宣稱精度修好。"""
+    ocean, _, manager = _inputs()
+    ocean.elev = np.full(ocean.elev.shape, 0.1234567, dtype=np.float32)
+    ocean.zcor = ocean.zcor.astype(np.float32)
+    ocean.zcor[:, :, -1] = ocean.elev
+    z_before, eta_before = ocean.zcor.copy(), ocean.elev.copy()
+    provider = _provider(manager)
+    tasks = [
+        _task(provider, state=_state(particle_id=f"float32-{i}", x_m=30.0 + i), dt_seconds=-10.0)
+        for i in range(4)
+    ]
+    runner = NativeBayTraceBatchAdvector(original_kernels, OCMPreparedFrameResolver(), require_native=True)
+    expected = finite_depth_stokes(
+        significant_wave_height_m=2.0,
+        peak_frequency_hz=0.1,
+        direction_raw_deg=270.0,
+        particle_z_m=-10.0,
+        surface_z_m=float(ocean.elev[0, 0]),
+        bed_z_m=-20.0,
+    )
+    for task, result in zip(tasks, runner(tasks), strict=True):
+        assert isinstance(result, ParticleState)
+        # 本修正不改既有原版網格sigma準備；float32層位內插保留來源精度的捨入。
+        # 位移容差用來源epsilon×速度×秒數推導，仍遠小於全量漂移及k1-only差異。
+        displacement = -10.0 * (0.1 + expected.u_mps)
+        tolerance = np.finfo(np.float32).eps * abs(displacement)
+        assert result.x_m - task.state.x_m == pytest.approx(displacement, abs=tolerance, rel=0)
+        assert result.age_seconds == 10.0
+    report = runner.report()
+    assert report["native_completed_particle_steps"] == 4
+    assert report["fallback_particle_steps"] == report["native_rejected_particle_steps"] == 0
+    assert report["group_size_histogram"] == {"4": 1}
+    np.testing.assert_array_equal(ocean.zcor, z_before)
+    np.testing.assert_array_equal(ocean.elev, eta_before)

@@ -43,6 +43,8 @@ def _stokes_layers(hs, fp, direction, z, eta, depth, node_qc):
 
     底部未使用的NaN zcor保持NaN，交給原版kbp語意；其他非有限與超水柱值拒絕。
     海面容差與既有finite_depth_stokes一致，只有容差內殘差可夾到海面。
+    OCM可存float32高程；相減前將兩個操作數提升float64，與dp+eta及原公式使用同一
+    運算精度，避免中間float32捨入捏造海床越界。這不改原高程、不夾床也不改容差。
     """
     east = np.full(z.shape, np.nan)
     north = np.full(z.shape, np.nan)
@@ -53,7 +55,7 @@ def _stokes_layers(hs, fp, direction, z, eta, depth, node_qc):
         for layer in range(z.shape[1]):
             if not np.isfinite(z[node, layer]):
                 continue
-            relative = z[node, layer] - eta[node]
+            relative = np.float64(z[node, layer]) - np.float64(eta[node])
             if (
                 not np.isfinite(depth[node])
                 or depth[node] <= 0
