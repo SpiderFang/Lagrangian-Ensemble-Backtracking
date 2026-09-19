@@ -468,4 +468,68 @@ def test_inactive_is_not_passed_and_nonfinite_native_output_becomes_sampling_err
     assert actual[0].qc == SampleQC.NUMERICAL_FAILURE
     assert actual[0].stage == "native"
     assert actual[1] is inactive
-    assert batcher.native_particle_steps == 1
+    assert batcher.native_particle_steps == 0
+    assert batcher.native_attempted_particle_steps == 1
+    assert batcher.native_rejected_particle_steps == 1
+
+
+def test_strict_native_rejects_without_legacy_and_reports_attempts(original_kernels, monkeypatch):
+    """嚴格模式無frame不呼叫舊核心；成功組保持來源順序且計數只含實際完成。"""
+    import lagrangian_backtracking.baytrace_batch_advection as module
+
+    def forbidden(task):
+        """任何legacy呼叫均表示違反本次native-only部署契約。"""
+        raise AssertionError("strict mode不得呼叫legacy")
+
+    monkeypatch.setattr(module, "_execute_legacy_advection_task", forbidden)
+    frame = _frame(_grid(), _fields(sinking_mps=0.0), element_id=0)
+    batcher = NativeBayTraceBatchAdvector(
+        original_kernels, lambda task: None if task.state.particle_id == "bad" else frame,
+        require_native=True,
+    )
+    results = batcher([_task(_state("p0"), 0.25), _task(_state("p1"), 0.25)])
+    assert [r.particle_id for r in results] == ["p0", "p1"]
+    with pytest.raises(module.NativeBayTraceUnsupportedError, match="frame_unavailable"):
+        batcher([_task(_state("p0"), 0.25), _task(_state("bad"), 0.25)])
+    report = batcher.report()
+    assert report["native_completed_particle_steps"] == report["native_attempted_particle_steps"] == 2
+    assert report["native_rejected_particle_steps"] == 1
+    assert report["fallback_particle_steps"] == 0
+    assert report["group_size_histogram"] == {"2": 1}
+
+
+def test_native_kernel_exception_is_not_success(original_kernels, monkeypatch):
+    """核心拋例外必須保留錯誤且不得預先增加成功計數。"""
+    import lagrangian_backtracking.baytrace_batch_advection as module
+
+    def fail(*args, **kwargs):
+        """模擬原版dispatcher失敗，不嘗試另一物理核心。"""
+        raise RuntimeError("kernel failure")
+
+    monkeypatch.setattr(module, "step_native", fail)
+    frame = _frame(_grid(), _fields(sinking_mps=0.0), element_id=0)
+    batcher = NativeBayTraceBatchAdvector(original_kernels, lambda task: frame, require_native=True)
+    with pytest.raises(RuntimeError, match="kernel failure"):
+        batcher([_task(_state("p0"), 0.25)])
+    assert batcher.native_particle_steps == batcher.fallback_particle_steps == 0
+    assert batcher.native_attempted_particle_steps == batcher.native_rejected_particle_steps == 1
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_require_native_is_strict_bool(original_kernels, value):
+    """部署旗標不可用真假值隱式轉型，避免字串false卻開啟嚴格模式。"""
+    with pytest.raises(TypeError, match="require_native"):
+        NativeBayTraceBatchAdvector(original_kernels, lambda task: None, require_native=value)
+
+
+def test_exact_utc_splits_native_groups_without_changing_identity(original_kernels):
+    """同dt/trat但UTC差1奈秒不可同組；輸出身份、精確UTC與分組counter均保留。"""
+    frame = _frame(_grid(), _fields(sinking_mps=0.0), element_id=0)
+    first = _state("p0")
+    second = replace(_state("p1"), time_utc_ns=first.time_utc_ns + 1)
+    batcher = NativeBayTraceBatchAdvector(original_kernels, lambda task: frame, require_native=True)
+    results = batcher([_task(first, 0.25), _task(second, 0.25)])
+    assert [r.particle_id for r in results] == ["p0", "p1"]
+    assert results[1].time_utc_ns - results[0].time_utc_ns == 1
+    assert batcher.report()["group_size_histogram"] == {"1": 2}
+    assert batcher.native_particle_steps == 2

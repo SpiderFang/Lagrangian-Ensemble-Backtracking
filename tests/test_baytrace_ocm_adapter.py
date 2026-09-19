@@ -433,7 +433,7 @@ def test_invalid_vertical_or_depth_is_bounded_negative_cache_and_fallback() -> N
     assert resolver(_task(provider)) is None
     assert resolver(_task(provider, state=_state(particle_id="p1"))) is None
     report = resolver.report()
-    assert report["fallback_reasons"]["invalid_vertical_support"] == 2
+    assert report["fallback_reasons"]["no_valid_wet_support"] == 2
     assert report["negative_cache_hits"] == 1
     assert report["negative_cache_entries"] == 1
 
@@ -537,3 +537,83 @@ def test_different_mesh_is_explicit_and_does_not_abort_other_task() -> None:
     invalid = resolver(_task(provider, state=_state(particle_id="p1", time_utc_ns=invalid_time)))
     assert invalid is None
     assert resolver.report()["fallback_reasons"]["different_mesh"] == 1
+
+
+@pytest.mark.parametrize("field", ["depth", "eta", "zcor", "hvel", "vertical"])
+def test_unrelated_invalid_nodes_compact_once_and_run_strict_native(original_kernels, monkeypatch, field):
+    """遠端乾／缺節點不否決有效三角形；原hint1映為native0，步後身份仍保留。"""
+    import lagrangian_backtracking.baytrace_batch_advection as batch_module
+
+    mesh = _far_mesh()
+    month = _month(mesh)
+    manager = _manager(mesh, {month.month_id: month})
+    # 先讓既有manager完成mesh binding，再模擬已載入row內的無關缺值；
+    # 不放寬manager本身的輸入產品驗證契約。
+    manager.preload((month.month_id,))
+    if field == "depth":
+        mesh.source_depth_m[:3] = np.nan
+    elif field == "eta":
+        month.elev[:, :3] = np.nan
+    elif field == "zcor":
+        month.zcor[:, :3] = np.nan
+    elif field == "hvel":
+        month.hvel[:, :3] = np.nan
+    else:
+        month.vertical_velocity[:, :3] = np.nan
+    provider = manager.provider(-0.02, False)
+    resolver = OCMPreparedFrameResolver()
+    tasks = [_task(provider, state=_state(particle_id=f"p{i}", x_m=1020, y_m=1020),
+                   sample=_sample(triangle_id=1)) for i in range(4)]
+
+    def forbidden(*args, **kwargs):
+        """纯流不得讀取波浪或以legacy掩蓋轉接失敗。"""
+        raise AssertionError("unexpected NWW/legacy")
+
+    monkeypatch.setattr(manager, "_ensure_nww", forbidden)
+    monkeypatch.setattr(batch_module, "_execute_legacy_advection_task", forbidden)
+    frame = resolver(tasks[0])
+    assert frame is not None and frame.element_id == 0 and frame.grid.grid_x.size == 3
+    batcher = NativeBayTraceBatchAdvector(original_kernels, resolver, require_native=True)
+    results = batcher(tasks)
+    assert all(isinstance(result, ParticleState) for result in results)
+    assert [result.particle_id for result in results] == [f"p{i}" for i in range(4)]
+    assert all(task.step_start_sample.triangle_id == 1 for task in tasks)
+    assert resolver.report()["frame_builds"] == 1
+    assert batcher.report()["group_size_histogram"] == {"4": 1}
+    assert batcher.native_particle_steps == 4 and batcher.fallback_particle_steps == 0
+
+
+def test_strict_capacity_and_surface_wrapper_are_explicit_rejection(original_kernels):
+    """過小記憶體上限及帶鏡射物理的wrapper均拒絕，不假native／退legacy。"""
+    from lagrangian_backtracking.baytrace_batch_advection import NativeBayTraceUnsupportedError
+    from lagrangian_backtracking.integrators import SurfaceStageVelocityProvider
+
+    mesh = _mesh()
+    month = _month(mesh)
+    manager = _manager(mesh, {month.month_id: month})
+    provider = manager.provider(0, False)
+    resolver = OCMPreparedFrameResolver(max_cached_bytes=1)
+    batcher = NativeBayTraceBatchAdvector(original_kernels, resolver, require_native=True)
+    for _ in range(3):
+        with pytest.raises(NativeBayTraceUnsupportedError, match="frame_bytes_exceeds_limit"):
+            batcher([_task(provider)])
+    assert resolver.report()["frame_builds"] == resolver.report()["cached_bytes"] == 0
+    assert resolver.report()["negative_cache_hits"] == 2
+    wrapper = SurfaceStageVelocityProvider(provider, _state(), _sample(), "non_rising")
+    with pytest.raises(NativeBayTraceUnsupportedError, match="surface_stage_wrapper_unsupported"):
+        batcher([_task(wrapper)])
+    assert batcher.fallback_particle_steps == batcher.native_particle_steps == 0
+
+
+@pytest.mark.parametrize("qc", [SampleQC.DRY_FACE, SampleQC.TIME_GAP, SampleQC.WAVE_UNSUPPORTED])
+def test_strict_keeps_known_sample_qc(original_kernels, qc):
+    """真正已有取樣證據的QC原樣保留，不把dry/time/wave變成數值失敗。"""
+    from lagrangian_backtracking.integrators import SamplingError
+    mesh = _mesh()
+    month = _month(mesh)
+    manager = _manager(mesh, {month.month_id: month})
+    resolver = OCMPreparedFrameResolver()
+    batcher = NativeBayTraceBatchAdvector(original_kernels, resolver, require_native=True)
+    result = batcher([_task(manager.provider(0, False), sample=_sample(qc=qc))])[0]
+    assert isinstance(result, SamplingError) and result.qc == qc
+    assert batcher.native_particle_steps == batcher.fallback_particle_steps == 0

@@ -19,6 +19,7 @@ from __future__ import annotations
 import weakref
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -39,10 +40,11 @@ _SIGMA_TOLERANCE = 1.0e-6
 class _FramePreparationFallback(Exception):
     """表示一個預期內的 native gate 失敗；不可讓單一粒子終止整個 batch。"""
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    def __init__(self, reason: str, detail: str = "", *, qc: SampleQC | None = None) -> None:
         super().__init__(reason if not detail else f"{reason}: {detail}")
         self.reason = reason
         self.detail = detail
+        self.qc = qc
 
 
 @dataclass(slots=True)
@@ -150,6 +152,7 @@ class _FrameCacheRecord:
     before_ref: weakref.ReferenceType[Any]
     after_ref: weakref.ReferenceType[Any]
     metadata: dict[str, Any]
+    element_map: np.ndarray
 
     def matches(self, before_ocm: Any, after_ocm: Any) -> bool:
         """確認 cache key 對應的來源物件仍是目前 bracket 的兩端。"""
@@ -162,7 +165,9 @@ class OCMPreparedFrameResolver:
 
     解析器只接受沿 ``task.velocity.provider`` 逐層 unwrap 後的既有
     ``ManagedForcingProvider``。``include_stokes=True`` 不會被悄悄當成 OCM-only：
-    它會以 ``stokes_adapter_pending`` 明確 fallback，保留原 LBT 計算。每個有限 frame
+    它會以 ``stokes_adapter_pending`` 明確拒絕；是否容許legacy由batcher模式決定。
+    本pureflow版本只保留兩端有效濕支援的節點／三角形，無關乾點不污染可算片。
+    每個有限 frame
     array cache 以 manager、兩端 OCM object identity、merged row／UTC 及固定沉降值作為
     key；目前查詢的 ``trat`` 只放回傳 frame 的 scalar，不放進 array key，因此相同兩端
     但不同 UTC 比例不會重建整份 grid／field。它不對大型網格或月檔做 hash。超過單 frame
@@ -170,7 +175,7 @@ class OCMPreparedFrameResolver:
     記住理由，避免相同端點每粒子重掃全網格；局部乾面 negative key 另含 element ID。
     fallback 只累計在 report，不逐粒子輸出 warning／print。
 
-    ``max_cached_bytes`` 是 resolver 所持有的 grid+field frame 陣列總上限；建立任何
+    ``max_cached_bytes`` 是 resolver 所持有的grid+field+原triangle映射總上限；建立任何
     大型輸出複本前，先依固定 float64/int64 layout 估算 bytes。通常容量滿時淘汰最舊
     frame，只有單一 frame 本身超過上限才 fallback；negative cache 容量固定為
     ``max_cached_frames``，不會隨粒子數或月份數增長。
@@ -202,6 +207,8 @@ class OCMPreparedFrameResolver:
         self._counters: Counter[str] = Counter()
         self._fallback_reasons: Counter[str] = Counter()
         self._last_frame_metadata: dict[str, Any] | None = None
+        self.last_rejection_reason: str | None = None
+        self.last_rejection_qc: SampleQC | None = None
 
     def __call__(self, task: Any) -> PreparedBayTraceFrame | None:
         """為一個 Q1 ``AdvectionTask`` 解析 frame；不支援時回傳 ``None``。
@@ -214,6 +221,8 @@ class OCMPreparedFrameResolver:
 
         key: tuple[Any, ...] | None = None
         element_id: int | None = None
+        self.last_rejection_reason = None
+        self.last_rejection_qc = None
         try:
             managed = self._unwrap_managed_provider(task)
             if managed.include_stokes:
@@ -227,6 +236,7 @@ class OCMPreparedFrameResolver:
                 raise _FramePreparationFallback(
                     "ocm_time_bracket_invalid",
                     f"qc={int(bracket.qc)}",
+                    qc=bracket.qc,
                 )
             if bracket.before is None or bracket.after is None:
                 raise _FramePreparationFallback("ocm_time_bracket_missing")
@@ -250,6 +260,8 @@ class OCMPreparedFrameResolver:
                 settling,
             )
             negative_reason = self._negative_lookup(key)
+            if negative_reason is None:
+                negative_reason = self._negative_lookup((*key, "element", element_id))
             if negative_reason is not None:
                 raise _FramePreparationFallback(negative_reason)
 
@@ -270,13 +282,15 @@ class OCMPreparedFrameResolver:
                     self._frame_cache.move_to_end(key)
                     self._counters["cache_hits"] += 1
                     query_metadata = self._frame_metadata(manager, bracket, target_ns)
+                    query_metadata = {**record.metadata, **query_metadata}
                     query_metadata["frame_cache_reused"] = True
                     query_metadata["frame_build_target_utc_ns"] = record.metadata[
                         "frame_build_target_utc_ns"
                     ]
                     query_metadata["frame_build_trat"] = record.metadata["frame_build_trat"]
                     self._last_frame_metadata = query_metadata
-                    return replace(record.frame, trat=trat, element_id=element_id)
+                    native_id = self._mapped_element(manager.mesh, record.element_map, element_id)
+                    return replace(record.frame, trat=trat, element_id=native_id)
                 # id() 不應在 manager 仍持有 endpoint 時重用；若 entry 已重建，
                 # 先移除 stale record，避免同一 integer identity 意外命中舊資料。
                 self._remove_frame(key)
@@ -300,7 +314,11 @@ class OCMPreparedFrameResolver:
                 after_ocm,
                 after_index,
             )
-            estimated_bytes = self._estimate_frame_bytes(manager.mesh, rows["z_before"])
+            support_mesh, rows, element_map = self._compact_wet_support(
+                manager.mesh, rows, wet_values=(before_ocm.wet_value, after_ocm.wet_value)
+            )
+            native_id = self._mapped_element(manager.mesh, element_map, element_id)
+            estimated_bytes = self._estimate_frame_bytes(support_mesh, rows["z_before"]) + element_map.nbytes
             if estimated_bytes > self.max_cached_bytes:
                 raise _FramePreparationFallback(
                     "frame_bytes_exceeds_limit",
@@ -308,7 +326,7 @@ class OCMPreparedFrameResolver:
                 )
 
             grid, fields = self._build_grid_and_fields(
-                manager.mesh,
+                support_mesh,
                 rows,
                 settling_velocity_mps=settling,
             )
@@ -316,9 +334,9 @@ class OCMPreparedFrameResolver:
                 grid=grid,
                 fields=fields,
                 trat=trat,
-                element_id=element_id,
+                element_id=native_id,
             )
-            actual_bytes = self._frame_nbytes(frame)
+            actual_bytes = self._frame_nbytes(frame) + element_map.nbytes
             if actual_bytes > self.max_cached_bytes:
                 # 理論估算與 constructor 後 bytes 不應不同；仍保留第二道 gate，
                 # 以防未來陣列 dtype/layout 契約變更時把大複本留在 cache。
@@ -330,6 +348,11 @@ class OCMPreparedFrameResolver:
             metadata["frame_cache_reused"] = False
             metadata["frame_build_target_utc_ns"] = int(target_ns)
             metadata["frame_build_trat"] = float(trat)
+            metadata["field_policy"] = "ocm_wet_support_node_fields_v1"
+            metadata["include_stokes"] = False
+            metadata["global_triangle_count"] = int(element_map.size)
+            metadata["native_triangle_count"] = int(frame.grid.i34.size)
+            metadata["native_node_count"] = int(frame.grid.grid_x.size)
             self._store_frame(
                 key,
                 _FrameCacheRecord(
@@ -338,14 +361,20 @@ class OCMPreparedFrameResolver:
                     before_ref=weakref.ref(before_ocm),
                     after_ref=weakref.ref(after_ocm),
                     metadata=metadata,
+                    element_map=element_map,
                 ),
             )
             self._counters["frame_builds"] += 1
             self._last_frame_metadata = dict(metadata)
             return frame
         except _FramePreparationFallback as error:
+            self.last_rejection_qc = error.qc
+            if error.reason == "dry_face":
+                self.last_rejection_qc = SampleQC.DRY_FACE
             fallback_key = key
-            if error.reason in {"dry_face", "adjacent_support_mismatch"} and key is not None:
+            if key is not None and error.reason in {
+                "dry_face", "adjacent_support_mismatch", "invalid_local_support"
+            }:
                 # 這兩個 gate 由目前 element 的 local wet/dry 支援決定，不能把一顆
                 # dry particle 的理由寫成整個 endpoint frame 的 global negative。
                 fallback_key = (*key, "element", element_id)
@@ -393,6 +422,11 @@ class OCMPreparedFrameResolver:
             "last_frame_metadata": (
                 dict(self._last_frame_metadata) if self._last_frame_metadata is not None else None
             ),
+            "last_rejection_reason": self.last_rejection_reason,
+            "last_rejection_qc": int(self.last_rejection_qc) if self.last_rejection_qc is not None else None,
+            "cache_warmup_builds": int(self._counters["frame_builds"]),
+            "field_policy": "ocm_wet_support_node_fields_v1",
+            "include_stokes": False,
         }
 
     def _unwrap_managed_provider(self, task: Any) -> ManagedForcingProvider:
@@ -408,6 +442,10 @@ class OCMPreparedFrameResolver:
         if isinstance(current, ManagedForcingProvider):
             return current
         from .production import HintTrackingVelocityProvider
+
+        # SurfaceStageVelocityProvider帶鏡射物理，不能unwrap後假裝是相同速度。
+        if type(current).__name__ == "SurfaceStageVelocityProvider":
+            raise _FramePreparationFallback("surface_stage_wrapper_unsupported")
 
         if isinstance(current, HintTrackingVelocityProvider) and isinstance(
             current.provider, ManagedForcingProvider
@@ -430,7 +468,9 @@ class OCMPreparedFrameResolver:
 
         sample = getattr(task, "step_start_sample", None)
         if sample is None or getattr(sample, "qc", SampleQC.NUMERICAL_FAILURE) != SampleQC.OK:
-            raise _FramePreparationFallback("step_start_sample_invalid")
+            raise _FramePreparationFallback(
+                "step_start_sample_invalid", qc=sample.qc if sample is not None else None
+            )
         value = getattr(sample, "triangle_id", None)
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
             raise _FramePreparationFallback("triangle_hint_invalid")
@@ -507,6 +547,7 @@ class OCMPreparedFrameResolver:
         """累計可查 fallback reason，並在有端點 key 時保存有限 negative entry。"""
 
         self._fallback_reasons[reason] += 1
+        self.last_rejection_reason = reason
         self._counters["fallback_calls"] += 1
         if key is not None and key not in self._negative_cache:
             self._negative_cache[key] = reason
@@ -565,7 +606,10 @@ class OCMPreparedFrameResolver:
         return rows
 
     @staticmethod
-    def _estimate_frame_bytes(mesh: Any, z_before: np.ndarray) -> int:
+    def _estimate_frame_bytes(
+        mesh: Any, z_before: np.ndarray, *, node_count: int | None = None,
+        element_count: int | None = None,
+    ) -> int:
         """在任何大型 output allocation 前估算固定 BayTrace frame bytes。"""
 
         triangle_nodes = np.asarray(mesh.triangle_nodes)
@@ -577,12 +621,87 @@ class OCMPreparedFrameResolver:
         ne = int(triangle_nodes.shape[0])
         if z_before.shape[0] != nnode or nvrt < 2 or ne < 1:
             raise _FramePreparationFallback("frame_shape_invalid")
+        nnode = nnode if node_count is None else node_count
+        ne = ne if element_count is None else element_count
         # BayTrace bridge constructors固定把 grid index與物理場轉成 int64/float64；
         # 這裡用最終 layout估算，不把 float32 input 的小 bytes 誤當成可用預算。
         grid_elements = ne + 4 * ne + 2 * nnode + 4 * ne + nnode + ne + nnode
         grid_floats = nvrt * nnode + nnode
         field_floats = 6 * nvrt * nnode + nnode
         return int((grid_elements + grid_floats + field_floats) * _NATIVE_INT_BYTES)
+
+    def _compact_wet_support(
+        self, mesh: Any, rows: dict[str, np.ndarray], *, wet_values: tuple[float, float],
+    ):
+        """一次建立兩端共同有效濕支援子網格，保留原triangle到native的索引。
+
+        只保留水深、海面、連續有效zcor及該有效層速度皆有限的節點，和兩端都濕且
+        三節點有效的三角形。底部未使用層仍交給原有kbp clamp；無效實際支援不補0。
+        先估計縮減後frame含映射的bytes才複製速度列，避免全網格512MiB gate污染
+        原本可算的局部資料。此快照僅屬本次frame LRU，不永久快取來源驗證結果。
+        """
+        z0, z1 = rows["z_before"], rows["z_after"]
+        nnode = mesh.node_xy.shape[0]
+        if z0.ndim != 2 or z0.shape != z1.shape or z0.shape[0] != nnode:
+            raise _FramePreparationFallback("frame_shape_invalid")
+        f0, f1 = np.isfinite(z0), np.isfinite(z1)
+        first = np.argmax(f0, axis=1)
+        used = np.arange(z0.shape[1])[None, :] >= first[:, None]
+        valid = f0.any(axis=1) & f1.any(axis=1)
+        valid &= (first == np.argmax(f1, axis=1)) & np.all(~used | (f0 & f1), axis=1)
+        dp = np.asarray(mesh.source_depth_m)
+        valid &= np.isfinite(dp) & (dp > 0) & np.all(np.isfinite(mesh.node_xy), axis=1)
+        for suffix in ("before", "after"):
+            eta = rows[f"eta_{suffix}"]
+            depth = dp + eta
+            valid &= np.isfinite(eta) & (depth > 0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                sigma = (rows[f"z_{suffix}"] - eta[:, None]) / depth[:, None]
+            valid &= np.all(~used | (np.isfinite(sigma) & (sigma >= -1 - _SIGMA_TOLERANCE)
+                                     & (sigma <= _SIGMA_TOLERANCE)), axis=1)
+            valid &= np.all(~used[:, :-1] | (np.diff(sigma, axis=1) >= -_SIGMA_TOLERANCE), axis=1)
+            valid &= np.all(~used | np.isfinite(rows[f"vertical_{suffix}"]), axis=1)
+            valid &= np.all(~used | np.all(np.isfinite(rows[f"hvel_{suffix}"][:, :, :2]), axis=2), axis=1)
+        triangles = np.asarray(mesh.triangle_nodes)
+        face = np.asarray(mesh.triangle_face_local)
+        wet = (np.isclose(rows["wet_before"][face], wet_values[0])
+               & np.isclose(rows["wet_after"][face], wet_values[1]))
+        keep = wet & np.all(valid[triangles], axis=1)
+        triangle_ids = np.flatnonzero(keep)
+        if triangle_ids.size == 0:
+            raise _FramePreparationFallback("no_valid_wet_support")
+        nodes = np.unique(triangles[triangle_ids])
+        estimate = self._estimate_frame_bytes(mesh, z0, node_count=nodes.size,
+                                              element_count=triangle_ids.size) + keep.size * 8
+        if estimate > self.max_cached_bytes:
+            raise _FramePreparationFallback("frame_bytes_exceeds_limit")
+        element_map = np.full(triangles.shape[0], -1, dtype=np.int64)
+        element_map[triangle_ids] = np.arange(triangle_ids.size)
+        node_map = np.full(nnode, -1, dtype=np.int64)
+        node_map[nodes] = np.arange(nodes.size)
+        neighbors = np.asarray(mesh.triangle_neighbors)[triangle_ids]
+        native_neighbors = np.full(neighbors.shape, -1, dtype=np.int64)
+        present = neighbors >= 0
+        native_neighbors[present] = element_map[neighbors[present]]
+        compact = SimpleNamespace(node_xy=np.asarray(mesh.node_xy)[nodes], source_depth_m=dp[nodes],
+                                  triangle_nodes=node_map[triangles[triangle_ids]],
+                                  triangle_neighbors=native_neighbors)
+        compact_rows = {key: value if key.startswith("wet_") else value[nodes]
+                        for key, value in rows.items()}
+        return compact, compact_rows, element_map
+
+    @staticmethod
+    def _mapped_element(mesh: Any, element_map: np.ndarray, element_id: int) -> int:
+        """只轉換native hint，不改全域sample/scenario身份；一環無效支援仍拒絕。
+
+        PI stage搜尋使用原hint的一環，因此保守要求此可搜尋範圍皆有有效支援；
+        不把被排除乾面當wet，也不允許原版退回hint掩蓋缺少的鄰接資料。
+        """
+        neighbors = np.asarray(mesh.triangle_neighbors)[element_id]
+        required = np.r_[element_id, neighbors[neighbors >= 0]]
+        if np.any(element_map[required] < 0):
+            raise _FramePreparationFallback("invalid_local_support")
+        return int(element_map[element_id])
 
     @staticmethod
     def _frame_nbytes(frame: PreparedBayTraceFrame) -> int:

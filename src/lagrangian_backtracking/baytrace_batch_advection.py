@@ -5,8 +5,9 @@
 速度場時，本模組只建立該批次的小型粒子陣列，並把整組交給既有
 ``step_native``；因此真正的內插與四階 Runge--Kutta（RK4）公式仍由 PI 提供的
 ``batch_interpolate_velocity``／``batch_move_rk4`` 執行。resolver 回傳 ``None``
-時，明確走既有 LBT ``execute_advection_task`` 的 legacy/reference fallback，
-並以 ``fallback_particle_steps`` 記錄，不能把這條路徑稱為原版 BayTrace。
+時，僅預設相容模式走既有 LBT legacy/reference fallback；``require_native=True``
+必須附理由拒絕，不能轉舊核心。``native_particle_steps`` 僅計完成成功的粒子步數，
+attempted另計核心嘗試，避免非有限或例外被冒稱成功。
 
 這裡只處理確定性平流的一步：不做 OCM 時間列轉接、Stokes 轉接，也不在 Python
 batcher 內另做元素搜尋、海岸／海面／海床 boundary lifecycle 或隨機擴散。原版
@@ -19,6 +20,7 @@ kernel 內部的 stage hint 只先查目前元素與 ``ic3`` 一環鄰居，找�
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -37,6 +39,19 @@ from .models import ParticleState, ParticleStatus, SampleQC
 
 if TYPE_CHECKING:
     from .advection import AdvectionTask
+
+
+class NativeBayTraceUnsupportedError(RuntimeError):
+    """工程未支援的可修復分片失敗；不是粒子物理數值失敗或終止狀態。
+
+    reason為固定診斷識別碼。嚴格模式在任何核心執行前拋出，讓controller保留
+    checkpoint並標記failed shard；不呼叫legacy、不消耗diffusion亂數。
+    """
+
+    def __init__(self, reason: str) -> None:
+        """保存未支援原因供部署檢核，不夾帶路徑或改寫粒子QC。"""
+        self.reason = reason
+        super().__init__(f"native unsupported: {reason}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +116,8 @@ class NativeBayTraceBatchAdvector:
     ``ParticleState`` 或 ``SamplingError``。作用中且有 frame 的 task 依
     ``grid``／``fields`` 物件 identity、精確 ``trat`` 與精確 signed
     ``dt_seconds`` 分組；每組恰好呼叫一次 ``step_native``，不在每粒子重新觸發
-    JIT，也不掃描整個網格。無 frame 的 task 則交給既有 LBT legacy/reference
-    ``execute_advection_task``，以計數器清楚區隔兩條執行路徑。
+    JIT，也不掃描整個網格；UTC亦精確相同才同組。無frame在嚴格模式拒絕，只有
+    預設相容模式交给既有legacy；群組直方圖與嘗試／成功／拒絕計數區分實際路徑。
 
     原生步驟只回傳平流後的位置、UTC 時間與正值 age；identity、status 及
     ``own_local_exit_recorded`` 由原 ``ParticleState`` 保留。負的
@@ -114,15 +129,25 @@ class NativeBayTraceBatchAdvector:
         self,
         kernels: BayTraceCPUKernels,
         frame_resolver: Callable[[AdvectionTask], PreparedBayTraceFrame | None],
+        *,
+        require_native: bool = False,
     ) -> None:
-        """建立 batcher；resolver 的 ``None`` 是明示的 native 未支援訊號。"""
+        """建立批次器；嚴格模式禁止任何未支援任務退回舊核心。
+
+        ``require_native`` 只接受真正布林值，預設False保留歷史參考路徑。
+        True時工程無frame拋NativeBayTraceUnsupportedError；只有已知資料QC回傳
+        原QC的SamplingError，不改步長、身份或隨機數。
+        """
 
         if not isinstance(kernels, BayTraceCPUKernels):
             raise TypeError("kernels 必須是 BayTraceCPUKernels")
         if not callable(frame_resolver):
             raise TypeError("frame_resolver 必須是 callable")
+        if type(require_native) is not bool:
+            raise TypeError("require_native 必須是 bool")
         self.kernels = kernels
         self.frame_resolver = frame_resolver
+        self.require_native = require_native
 
         # 這些公開整數是效能 evidence；它們只記錄實際進入 native／fallback 的
         # 粒子步數，不參與物理計算，也不把 fallback 的工作冒充成原版 kernel。
@@ -130,6 +155,14 @@ class NativeBayTraceBatchAdvector:
         self.native_batch_calls = 0
         self.fallback_particle_steps = 0
         self.max_group_size = 0
+        # 舊native_particle_steps改為成功完成數；attempted包含核心失敗，不能
+        # 因已進入dispatcher就宣稱成功。直方圖記實際送入核心的群組大小。
+        self.native_attempted_particle_steps = 0
+        self.native_rejected_particle_steps = 0
+        self.group_size_histogram: Counter[int] = Counter()
+        self.rejected_reasons: Counter[str] = Counter()
+        self._unsupported_reasons: dict[int, str] = {}
+        self._unsupported_qc: dict[int, SampleQC | None] = {}
 
     def __call__(
         self,
@@ -151,7 +184,7 @@ class NativeBayTraceBatchAdvector:
             return []
 
         prepared: list[_PreparedTask] = []
-        groups: dict[tuple[int, int, float, float], list[_PreparedTask]] = {}
+        groups: dict[tuple[int, int, float, float, int], list[_PreparedTask]] = {}
         fallback: list[_PreparedTask] = []
 
         # 這一輪只讀取並驗證輸入；任何 group 仍尚未執行，確保 scalar/index
@@ -162,10 +195,17 @@ class NativeBayTraceBatchAdvector:
             if record.state.status != ParticleStatus.ACTIVE:
                 continue
             if record.frame is None:
+                if self.require_native and self._unsupported_qc[source_index] is None:
+                    reason = self._unsupported_reasons[source_index]
+                    self.native_rejected_particle_steps += 1
+                    self.rejected_reasons[reason] += 1
+                    self._unsupported_reasons.clear()
+                    self._unsupported_qc.clear()
+                    raise NativeBayTraceUnsupportedError(reason)
                 fallback.append(record)
                 continue
             frame = record.frame
-            key = (id(frame.grid), id(frame.fields), frame.trat, record.dt_seconds)
+            key = (id(frame.grid), id(frame.fields), frame.trat, record.dt_seconds, record.state.time_utc_ns)
             groups.setdefault(key, []).append(record)
 
         results: list[ParticleState | SamplingError | None] = [None] * len(prepared)
@@ -180,7 +220,19 @@ class NativeBayTraceBatchAdvector:
         for group in groups.values():
             self._run_native_group(group, results)
         for record in fallback:
-            self._run_fallback(record, results)
+            if self.require_native:
+                reason = self._unsupported_reasons.pop(record.source_index, "frame_unavailable")
+                self.native_rejected_particle_steps += 1
+                self.rejected_reasons[reason] += 1
+                results[record.source_index] = SamplingError(
+                    f"native_rejected:{reason}", self._unsupported_qc[record.source_index],
+                    context=SamplingContext(x_m=record.state.x_m, y_m=record.state.y_m,
+                                            z_m=record.state.z_m, time_utc_ns=record.state.time_utc_ns),
+                )
+            else:
+                self._run_fallback(record, results)
+        self._unsupported_reasons.clear()
+        self._unsupported_qc.clear()
 
         if any(result is None for result in results):
             raise RuntimeError("batch advection 結果未完整 scatter")
@@ -201,6 +253,13 @@ class NativeBayTraceBatchAdvector:
             "native_batch_calls": int(self.native_batch_calls),
             "fallback_particle_steps": int(self.fallback_particle_steps),
             "max_group_size": int(self.max_group_size),
+            "require_native": self.require_native,
+            "native_attempted_particle_steps": self.native_attempted_particle_steps,
+            "native_completed_particle_steps": self.native_particle_steps,
+            "native_rejected_particle_steps": self.native_rejected_particle_steps,
+            "native_rejected_reasons": dict(self.rejected_reasons),
+            "group_size_histogram": {str(k): v for k, v in sorted(self.group_size_histogram.items())},
+            "counter_semantics": "native_steps_completed_only_v2",
         }
 
     def _prepare_task(self, source_index: int, task: Any) -> _PreparedTask:
@@ -228,6 +287,11 @@ class NativeBayTraceBatchAdvector:
         frame: PreparedBayTraceFrame | None = None
         if state.status == ParticleStatus.ACTIVE:
             frame = self.frame_resolver(task)
+            if frame is None:
+                self._unsupported_reasons[source_index] = str(
+                    getattr(self.frame_resolver, "last_rejection_reason", None) or "frame_unavailable"
+                )
+                self._unsupported_qc[source_index] = getattr(self.frame_resolver, "last_rejection_qc", None)
             if frame is not None and not isinstance(frame, PreparedBayTraceFrame):
                 raise TypeError(
                     f"frame_resolver(tasks[{source_index}]) 必須回傳 PreparedBayTraceFrame 或 None"
@@ -310,20 +374,27 @@ class NativeBayTraceBatchAdvector:
         dt_seconds = group[0].dt_seconds
         ibf = 1 if dt_seconds > 0.0 else -1
         self.native_batch_calls += 1
-        self.native_particle_steps += len(group)
+        self.native_attempted_particle_steps += len(group)
         self.max_group_size = max(self.max_group_size, len(group))
-        step_native(
-            self.kernels,
-            grid,
-            fields,
-            particles,
-            dt_seconds=abs(dt_seconds),
-            trat=frame.trat,
-            ibf=ibf,
-        )
+        self.group_size_histogram[len(group)] += 1
+        try:
+            step_native(
+                self.kernels, grid, fields, particles,
+                dt_seconds=abs(dt_seconds), trat=frame.trat, ibf=ibf,
+            )
+        except Exception:
+            # dispatcher異常不等於成功；保留原例外供上游fail-closed，不偷偷重算。
+            self.native_rejected_particle_steps += len(group)
+            self.rejected_reasons["native_kernel_exception"] += len(group)
+            raise
 
         for local_index, record in enumerate(group):
             result = self._native_result(record, particles, local_index)
+            if isinstance(result, SamplingError):
+                self.native_rejected_particle_steps += 1
+                self.rejected_reasons["native_nonfinite_result"] += 1
+            else:
+                self.native_particle_steps += 1
             results[record.source_index] = result
 
     @staticmethod
@@ -435,4 +506,4 @@ def _numerical_failure(state: ParticleState, *, stage: str) -> SamplingError:
     )
 
 
-__all__ = ["NativeBayTraceBatchAdvector", "PreparedBayTraceFrame"]
+__all__ = ["NativeBayTraceBatchAdvector", "NativeBayTraceUnsupportedError", "PreparedBayTraceFrame"]
