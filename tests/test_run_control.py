@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import multiprocessing
 import shutil
+import time
+from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -161,13 +163,15 @@ def _workspace(
     interval: int = 1,
     run_kind: str = "synthetic",
     provenance: CodeProvenance | None = None,
+    scenarios: tuple[Scenario, ...] | None = None,
+    shard_scenario_count: int = 1,
 ) -> Path:
-    """建立兩情境×兩 member 的 tracked run workspace。"""
+    """預設建立兩情境×兩 member；可明示情境與分片大小供代表規模讀取測試。"""
 
     workspace = initialize_run_workspace(
         parent,
         run_id=run_id,
-        scenarios=(_scenario(0), _scenario(1)),
+        scenarios=scenarios if scenarios is not None else (_scenario(0), _scenario(1)),
         normalized_config={"schema_version": "test", "settings": {"dt": 1.0}},
         config_hash=_CONFIG_HASH,
         input_inventory_file={"source": "synthetic", "files": []},
@@ -182,7 +186,7 @@ def _workspace(
         master_seed=20260819,
         seed_policy="sha256_v1_pcg64dxsm",
         members_per_scenario=2,
-        shard_scenario_count=1,
+        shard_scenario_count=shard_scenario_count,
         checkpoint_interval_sweeps=interval,
         active_chunk_size=2,
         run_kind=run_kind,
@@ -1259,3 +1263,110 @@ def test_publish_before_progress_reconcile_and_complete_output_fail_closed(tmp_p
     manifest.write_text("{bad-json", encoding="utf-8")
     with pytest.raises(ValueError, match="output"):
         RunController(corrupt, request_factory=_request).reconcile()
+
+
+@pytest.mark.parametrize("shard_count", [100, 5000])
+def test_reconcile_snapshot_reads_and_shard_checks_scale_linearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shard_count: int, record_property
+) -> None:
+    """用實際 Parquet、進度及分片目錄驗證讀取成本，不以時間門檻掩蓋環境差異。
+
+    每片十個情境，最大案例為五萬情境／五千片；每片建立空 checkpoint 目錄，讓
+    run topology 確實需要掃描五千個項目。計數包裝仍執行原驗證，不模擬成功結果。
+    連續兩次 reconcile 各自讀取一次快照，逐片 hash、checkpoint 與輸出驗證各 S 次；
+    耗時只記錄本機無狀態採認的控制成本，不代表真資料恢復或 SERVER 效能。
+    """
+
+    scenarios = tuple(
+        replace(_scenario(index), arrival_time_utc_ns=1_700_000_000_000_000_000 + index // 10)
+        for index in range(shard_count * 10)
+    )
+    workspace = _workspace(
+        tmp_path, "linear-reconcile", scenarios=scenarios, shard_scenario_count=10
+    )
+    controller = RunController(workspace, request_factory=_request)
+    assert len(controller.plan["shards"]) == shard_count
+    for row in controller.plan["shards"]:
+        (controller.checkpoint_root / controller.plan["run_id"] / row["shard_id"]).mkdir(
+            parents=True
+        )
+    counts: Counter[str] = Counter()
+
+    def spy(target, name: str, label: str) -> None:
+        """計數但逐字呼叫原方法，保留實際 I/O、契約與失敗行為。"""
+
+        original = getattr(target, name)
+
+        def counted(*args, **kwargs):
+            """回傳原驗證結果；計數不介入資料或狀態。"""
+
+            counts[label] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(target, name, counted)
+
+    spy(pq, "read_table", "scenario_reads")
+    spy(run_control_module, "load_run_progress", "progress_reads")
+    spy(controller, "_validate_checkpoint_run_topology", "topology_scans")
+    spy(run_control_module, "_scenario_hash", "shard_hash_checks")
+    spy(controller, "_checkpoint_parent", "checkpoint_checks")
+    spy(run_control_module, "validate_trajectory_shard", "output_checks")
+    for operation in range(2):
+        counts.clear()
+        started = time.perf_counter()
+        result = controller.reconcile()
+        elapsed = time.perf_counter() - started
+        assert result["run_lifecycle"] == "PLANNED"
+        assert counts == {
+            "scenario_reads": 1,
+            "progress_reads": 1,
+            "topology_scans": 1,
+            "shard_hash_checks": shard_count,
+            "checkpoint_checks": shard_count,
+            "output_checks": shard_count,
+        }
+        record_property(f"reconcile_{operation}_seconds", elapsed)
+        print(f"reconcile shards={shard_count} scenarios={len(scenarios)} "
+              f"operation={operation} seconds={elapsed:.6f} counts={dict(counts)}")
+
+
+def test_reconcile_revalidates_scenario_snapshot_between_operations(tmp_path: Path) -> None:
+    """同一 controller 第二次操作仍須發現情境修改，不沿用先前通過的快照。"""
+
+    workspace = _workspace(tmp_path, "snapshot-mutation")
+    controller = RunController(workspace, request_factory=_request)
+    controller.reconcile()
+    path = workspace / "scenario_table.parquet"
+    table = pq.read_table(path)
+    rows = table.to_pylist()
+    rows[-1]["settling_velocity_mps"] = -0.002
+    pq.write_table(run_control_module.pa.Table.from_pylist(rows, schema=table.schema), path)
+    with pytest.raises(ValueError, match="range/hash"):
+        controller.reconcile()
+
+
+def test_reconcile_revalidates_topology_after_controller_creation(tmp_path: Path) -> None:
+    """排他操作入口仍檢查未知目錄與 symlink，不能信任 constructor 的舊盤點。"""
+
+    workspace = _workspace(tmp_path, "topology-mutation")
+    controller = RunController(workspace, request_factory=_request)
+    controller.reconcile()
+    run_dir = controller.checkpoint_root / controller.plan["run_id"]
+    run_dir.mkdir(parents=True)
+    (run_dir / "unknown-shard").symlink_to(workspace, target_is_directory=True)
+    with pytest.raises(ValueError, match="未知或不安全"):
+        controller.reconcile()
+
+
+def test_checkpoint_scanner_keeps_topology_validation_outside_reconcile(tmp_path: Path) -> None:
+    """一般 scanner 的每次呼叫都重驗 run 目錄，包含只讀 validator 使用的入口。"""
+
+    workspace = _workspace(tmp_path, "scanner-topology")
+    controller = RunController(workspace, request_factory=_request)
+    shard = controller._shard(controller.plan["shards"][0]["shard_id"])
+    assert controller._scan_checkpoint_generations(shard) is None
+    run_dir = controller.checkpoint_root / controller.plan["run_id"]
+    run_dir.mkdir(parents=True)
+    (run_dir / "unknown-shard").mkdir()
+    with pytest.raises(ValueError, match="未知或不安全"):
+        controller._scan_checkpoint_generations(shard)

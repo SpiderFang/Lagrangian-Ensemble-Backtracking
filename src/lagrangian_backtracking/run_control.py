@@ -2022,6 +2022,19 @@ class RunController:
         if row is None:
             raise KeyError(f"未知 shard：{shard_id}")
         scenarios = self._scenario_table()
+        return self._shard_from_scenarios(row, scenarios)
+
+    def _shard_from_scenarios(
+        self, row: Mapping[str, Any], scenarios: tuple[Scenario, ...]
+    ) -> ScenarioShard:
+        """由已驗證情境快照重建分片，逐片保留範圍、雜湊、群組與身分檢查。
+
+        ``row`` 是不可變 run plan 的分片列，``scenarios`` 是本次操作完整讀取並驗證的
+        情境 tuple。exclusive reconcile 可共用同一快照；一般 worker 仍由 ``_shard``
+        每次重新讀表。此函式不保存跨操作快取，也不略過任何分片契約驗證。
+        """
+
+        shard_id = _safe_slug(row["shard_id"], label="shard_id")
         start = int(row["scenario_start_index"])
         stop = int(row["scenario_stop_index"])
         subset = tuple(scenarios[start:stop])
@@ -2192,6 +2205,18 @@ class RunController:
         """
 
         self._validate_checkpoint_run_topology()
+        return self._scan_checkpoint_shard_generations(shard, repair_latest=repair_latest)
+
+    def _scan_checkpoint_shard_generations(
+        self, shard: ScenarioShard, *, repair_latest: bool = False
+    ) -> _CheckpointSelection | None:
+        """完整驗證單一分片的 checkpoint；呼叫端須先驗證本 run 的目錄結構。
+
+        一般 scanner 每次先驗證整個 run；只有持有 exclusive run gate 的 reconcile
+        可在同次操作共用一次 run topology 驗證。分片父目錄各層的 symlink 檢查、各代
+        binding／checksum／順序、重放與孤立世代政策仍在此逐片執行，不保存永久快取。
+        """
+
         parent = self._checkpoint_parent(shard)
         if not parent.exists():
             return None
@@ -3757,16 +3782,25 @@ class RunController:
         validator 通過便標記 COMPLETE；progress 已 COMPLETE 卻找不到合法 output 則
         fail-fast。latest pointer 遺失或落後時可由完整 generations 選最高 sequence，
         但 unknown directory、symlink、partial 或 checksum 損壞一律保留現場並拋錯。
+
+        持排他鎖後完整驗證一次情境表及 run checkpoint 目錄，建立僅供本次操作使用的
+        不可變分片索引；各分片的 hash、binding 與輸出檢查仍全部執行。worker 無法在
+        此期間發布進度，因此讀取端沿用 ``self.progress``；任何採認 mutation 仍經
+        ``_update_progress`` 持 progress 鎖重讀並更新它，避免改變並行寫入契約。
         """
 
-        progress = self._refresh_progress()
-        for shard_row in self.plan["shards"]:
-            shard = self._shard(shard_row["shard_id"])
-            state = progress["shards"][shard.shard_id]
-            selected = self._scan_checkpoint_generations(shard, repair_latest=False)
+        self._refresh_progress()
+        scenarios = self._scenario_table()
+        shards = MappingProxyType({
+            row["shard_id"]: self._shard_from_scenarios(row, scenarios)
+            for row in self.plan["shards"]
+        })
+        self._validate_checkpoint_run_topology()
+        for shard in shards.values():
+            state = self.progress["shards"][shard.shard_id]
+            selected = self._scan_checkpoint_shard_generations(shard, repair_latest=False)
             self._checkpoint_for_progress(shard, state, selected)
-            progress = self._refresh_progress()
-            state = progress["shards"][shard.shard_id]
+            state = self.progress["shards"][shard.shard_id]
             output_token = state.get("output_relative_path")
             output = (
                 _workspace_token(
@@ -3806,7 +3840,7 @@ class RunController:
                 raise ValueError(
                     f"非 RUNNING shard 出現 published output，拒絕 reconcile：{shard.shard_id}"
                 )
-        return self._refresh_progress()
+        return self.progress
 
 
 __all__ = [
