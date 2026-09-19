@@ -85,6 +85,10 @@ DOCUMENT_CATALOG: tuple[tuple[str, str], ...] = (
         "docs/operations/16_performance_improvement_tracks.md",
         "docs/operations/16_performance_improvement_tracks.md",
     ),
+    (
+        "docs/development/baytrace_native_cpu_comparison.md",
+        "docs/development/baytrace_native_cpu_comparison.md",
+    ),
 )
 
 # 只抓取一般 Markdown 連結，不把圖片語法的開頭驚嘆號當成另一個連結；外部 URL
@@ -795,7 +799,7 @@ def test_readme_states_report_boundary_without_claiming_renderer_completion() ->
 
 
 def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> None:
-    """確認文件總入口涵蓋分類與 21 筆 catalog/alias 契約，且本地連結不斷裂。
+    """確認文件總入口涵蓋分類與 22 筆 catalog/alias 契約，且本地連結不斷裂。
 
     這裡檢查的是所有納入掃描範圍的 Markdown 檔案實際連結拓撲，包含跨分類文件、設定檔、
     測試、圖檔與 PDF；不只檢查新加入的閱讀提示，也確認新竹 pilot 與效能改善文件以
@@ -806,7 +810,7 @@ def test_document_index_catalog_and_all_local_markdown_links_are_closed() -> Non
 
     index_path = PROJECT_ROOT / "docs" / "README.md"
     index = index_path.read_text(encoding="utf-8")
-    assert len(DOCUMENT_CATALOG) == 21
+    assert len(DOCUMENT_CATALOG) == 22
     current_catalog_paths = {current_path for current_path, _ in DOCUMENT_CATALOG}
     assert len(current_catalog_paths) == len(DOCUMENT_CATALOG)
     for category in ("foundation/", "operations/", "results/", "development/", "archive/"):

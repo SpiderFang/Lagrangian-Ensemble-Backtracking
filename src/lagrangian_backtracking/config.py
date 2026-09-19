@@ -110,6 +110,17 @@ OcmInterpolationBackend = Literal[
 # 步長候選、RK4 純量組合與擴散位移，後者仍只控制 OCM 網格內插。
 PhysicsKernelBackend = Literal["numpy_v1", "numba_cpu_v1"]
 
+# 平流生命週期後端只決定「確定性 RK4 那一段由誰批次執行」；LBT 的步長、QC、
+# 擴散、亂數、邊界、觀測與 checkpoint 仍由既有 engine／ProductionBatch 管理。預設
+# token 對應既有逐粒子 LBT stage 路徑，並在 canonical payload 省略，以維持舊設定的
+# hash；只有 YAML 明示 BayTrace token 時才允許 runtime 載入原始 CPU artifact。
+ADVECTION_BACKEND_LBT_STAGE_RK4_V1 = "lbt_stage_rk4_v1"
+ADVECTION_BACKEND_BAYTRACE_NATIVE_CPU_V1 = "baytrace_native_cpu_v1"
+AdvectionBackend = Literal[
+    "lbt_stage_rk4_v1",
+    "baytrace_native_cpu_v1",
+]
+
 NORTHEAST_V3_FLOW_DOMAIN_ID = "northeast_taiwan_common_cache_v3"
 NORTHEAST_V3_BBOX_LON_LAT = (121.306315, 122.793685, 24.600844, 25.499156)
 NORTHEAST_V3_LOCAL_SITE_IDS = frozenset({"gongliao", "guishan"})
@@ -780,14 +791,17 @@ class ExecutionConfig(StrictModel):
     kernel；``physics_kernel_backend`` 選擇有限水深 Stokes、步長候選、RK4 最後 scalar
     組合／時間更新與擴散位移的參考或 Numba CPU primitive。後者不改變 Scenario、seed、
     RK4 stage 查詢順序、品質檢查旗標（QC）、事件、邊界、checkpoint 或缺值政策。兩欄
-    未出現在舊 YAML 時分別沿用 NumPy 語意；canonical payload 會省略 Pydantic 補上的預設，
-    維持舊 run 的 config hash。明示任一後端時，版本 token 會進入 hash 供重現與追溯。
+    未出現在舊 YAML 時分別沿用 NumPy 語意；``advection_backend`` 未出現時沿用既有
+    LBT stage RK4 路徑。三欄未出現在舊 YAML 時，canonical payload 都會省略 Pydantic
+    補上的預設，維持舊 run 的 config hash。明示任一後端時，版本 token 會進入 hash
+    供重現與追溯；BayTrace native 只在明示 token 時啟用。
     """
 
     reference_backend: str
     production_backend: str
     ocm_interpolation_backend: OcmInterpolationBackend = OCM_INTERPOLATION_BACKEND_NUMPY_V1
     physics_kernel_backend: PhysicsKernelBackend = PHYSICS_KERNEL_BACKEND_NUMPY_V1
+    advection_backend: AdvectionBackend = ADVECTION_BACKEND_LBT_STAGE_RK4_V1
     shard_scenario_count: int | None = None
     checkpoint_interval_sweeps: int | None = None
     active_chunk_size: int | None = None
@@ -1589,6 +1603,16 @@ class ProjectConfig(StrictModel):
             # 保護既有 run/checkpoint config hash。若 YAML 明示 ``numpy_v1`` 或
             # ``numba_cpu_v1``，則把選擇保存於 canonical payload，形成可稽核的版本邊界。
             del execution_payload["physics_kernel_backend"]
+        if (
+            isinstance(execution_payload, dict)
+            and "advection_backend" in execution_payload
+            and "advection_backend" not in self.execution.model_fields_set
+        ):
+            # 舊 YAML 未提供平流批次後端時固定採既有 LBT stage RK4；省略 Pydantic
+            # 補出的 token 可保護舊 run／checkpoint config hash。只有 YAML 明示
+            # ``lbt_stage_rk4_v1`` 或 ``baytrace_native_cpu_v1`` 時，才把演算法選擇
+            # 寫入 canonical payload，形成可稽核且不可默默切換的 runtime 邊界。
+            del execution_payload["advection_backend"]
         domain_payloads = payload.get("domains")
         if isinstance(domain_payloads, list):
             for domain, domain_payload in zip(self.domains, domain_payloads, strict=False):

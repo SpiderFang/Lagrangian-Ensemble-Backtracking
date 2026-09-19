@@ -210,6 +210,18 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 | SERVER 容量、鎖、執行與發布 | [SERVER 執行手冊](docs/operations/06_server_runbook_plan.md) |
 | 原始碼模組關係與資料流程 | [互動式程式架構圖](docs/source_code_architecture_map.html) |
 
+### BayTrace 原版 CPU 批次（Q4）
+
+只有明示 `execution.advection_backend: baytrace_native_cpu_v1` 才啟用原版 CPU 批次；舊設定維持既有路徑，LBT 的步長、QC、擴散、亂數、邊界、觀測與 checkpoint 生命週期不變。
+
+來源根目錄用 `LBT_BAYTRACE_ROOT`，外部快取用 `NUMBA_CACHE_DIR`；缺少來源或 OCM frame resolver 會明確失敗。啟用方式、限制與詳細測速表見[BayTrace CPU 對照](docs/development/baytrace_native_cpu_comparison.md)。
+
+相關繁中註解檔案：`advection.py`、`engine.py`、`production.py`、`config.py`、`runtime.py`、`run_control.py`；完整分工見上述文件。
+
+最新 synthetic no-Stokes 生命週期測速：`128×16×3` 為 1.500／0.578 秒、`512×16×3` 為 6.194／2.341 秒，最大誤差為 0／`8.88e-16 m`，比較通過，約 2.6 倍。
+
+結果涵蓋完整 `ProductionBatch` 生命週期但不含完整 SERVER I/O／真實流場驗證；NWW Stokes 與未支援形狀仍走既有舊路徑。歷史 direct-core 的 139 倍不可外推為完整執行速度。
+
 ## 7. 開發檢查與交付界線
 
 每次變更送審前至少檢查相關 pytest、Ruff、`git diff --check`、schema／checksum 資料拓撲與文件相對連結。新增模組時同步 architecture-map catalog；架構圖的產生與檢查應使用既有產生器及固定輸出流程。

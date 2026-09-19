@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
 import numpy as np
 
 from .accelerated import validate_physics_kernel_backend
+from .advection import AdvectionTask, execute_advection_task
 from .boundaries import (
     BoundaryGeometry,
     recover_surface_boundary_at_step_start,
@@ -35,7 +36,7 @@ from .integrators import (
     SamplingError,
     SurfaceStageVelocityProvider,
     VelocityProvider,
-    split_rk4_brownian_step,
+    apply_diffusion_step,
     supports_step_start_sample_reuse,
 )
 from .models import (
@@ -1201,7 +1202,69 @@ def _is_proven_surface_stage_crossing(
     )
 
 
-def advance_particle_once(
+def _validate_advection_result(task: AdvectionTask, result: ParticleState) -> ParticleState:
+    """驗證 deterministic batcher 回傳的狀態仍屬同一粒子、同一步時間軸且為有限值。
+
+    batcher 只被授權執行確定性 RK4；它不能交換 particle identity、改寫步長決定的
+    UTC／age、偷偷套用邊界或把非有限座標送入 diffusion／事件流程。這裡在 generator
+    收到 ``send`` 值後立即檢查固定身分、狀態旗標、預期時間與年齡，以及三軸座標與年齡
+    的有限性。通過後才會呼叫既有 ``apply_diffusion_step``，因此錯誤不會污染 observation、
+    checkpoint 或該粒子的 RNG continuation。
+    """
+
+    if not isinstance(result, ParticleState):
+        raise TypeError("advection batcher 必須回傳 ParticleState 或 SamplingError")
+    expected_identity = (
+        task.state.particle_id,
+        task.state.scenario_id,
+        task.state.member_id,
+        task.state.study_site_id,
+        task.state.analysis_region_id,
+        task.state.receptor_id,
+    )
+    actual_identity = (
+        result.particle_id,
+        result.scenario_id,
+        result.member_id,
+        result.study_site_id,
+        result.analysis_region_id,
+        result.receptor_id,
+    )
+    if actual_identity != expected_identity:
+        raise ValueError(
+            "advection batcher 不可交換粒子 identity："
+            f"actual={actual_identity}, expected={expected_identity}"
+        )
+    if result.status is not task.state.status:
+        raise ValueError("advection batcher 不可改寫粒子 status")
+    if result.own_local_exit_recorded is not task.state.own_local_exit_recorded:
+        raise ValueError("advection batcher 不可改寫 own_local_exit_recorded")
+    try:
+        expected_time_utc_ns = task.state.time_utc_ns + int(round(task.dt_seconds * 1_000_000_000))
+        expected_age_seconds = task.state.age_seconds + abs(task.dt_seconds)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("advection task 的時間或年齡無法建立確定性預期") from error
+    if type(result.time_utc_ns) is not int or result.time_utc_ns != expected_time_utc_ns:
+        raise ValueError(
+            "advection batcher 回傳的 time_utc_ns 不符合 task dt："
+            f"actual={result.time_utc_ns!r}, expected={expected_time_utc_ns!r}"
+        )
+    if result.age_seconds != expected_age_seconds:
+        raise ValueError(
+            "advection batcher 回傳的 age_seconds 不符合 task dt："
+            f"actual={result.age_seconds!r}, expected={expected_age_seconds!r}"
+        )
+    finite_values = (result.x_m, result.y_m, result.z_m, result.age_seconds)
+    try:
+        is_finite = all(math.isfinite(float(value)) for value in finite_values)
+    except (TypeError, ValueError, OverflowError):
+        is_finite = False
+    if not is_finite:
+        raise ValueError("advection batcher 不可回傳非有限位置或年齡")
+    return result
+
+
+def advance_particle_steps(
     execution: ParticleExecutionState,
     *,
     velocity: VelocityProvider,
@@ -1211,21 +1274,29 @@ def advance_particle_once(
     settings: EngineSettings,
     rng: np.random.Generator,
     on_step: Callable[[ParticleState], None] | None = None,
-) -> ParticleAdvanceResult:
-    """最多完成原始粒子 while 迴圈的一次迭代，並回傳是否已終止。
+) -> Generator[AdvectionTask, ParticleState, ParticleAdvanceResult]:
+    """最多完成原始粒子 while 迴圈的一次迭代，並將確定性 RK4 暫停交給呼叫端。
 
     每次呼叫先執行原本的步首 max-step、max-age、forcing-start 與速度有效性判定；取得
     有效步首 reference 後，空間擴散 provider 只以同一個公尺制位置、UTC 奈秒與
     ``reference.triangle_id`` 取樣一次。若可前進，則依同一個 ``DiffusionSample`` 完成
-    步長選擇、四階 Runge-Kutta stage、一次 ``+div(K)|dt|`` 加 Brownian operator split、
-    垂向邊界、水平邊界、minimum clamp 計數與輸出觀測順序；固定係數仍走舊版零梯度
-    Brownian 路徑。步驟方向仍由 ``split_rk4_brownian_step`` 收到負秒數決定，位置與尺度
-    使用公尺、年齡使用秒、時間使用 UTC 奈秒。無效擴散樣本在 choose-time-step、RK4
-    與 RNG 之前依既有 QC 終止。已知海面穿越才可在 RNG 前以 ``dt`` 二分重試；若下一次
-    折半會低於 ``dt_min``，只對該完整確定性 RK4 重試套用 stage 海面反射速度包裝器。
-    包裝器僅鏡射 k2--k4 的合法海面查詢，任何重查失敗均 fail closed；成功完成四個 stage
-    後才恰套用一次 Brownian／``+div(K)|dt|`` operator split。最後 proposed position 仍走
-    一般海面／海床解析，中間 stage 不產生虛構事件；其他 stage 失敗不使用這個調節。
+    步長選擇，``yield AdvectionTask`` 暫停在純確定性四階 Runge-Kutta stage；呼叫端以
+    ``send`` 送回同一步的確定性 state 後，本 generator 才呼叫一次既有
+    ``apply_diffusion_step``，再執行垂向邊界、水平邊界、minimum clamp 計數與輸出觀測
+    順序。固定係數仍走舊版零梯度 Brownian 路徑。task 的步驟方向使用負秒數，位置與
+    尺度使用公尺、年齡使用秒、時間使用 UTC 奈秒。無效擴散樣本在 choose-time-step、
+    RK4 與 RNG 之前依既有 QC 終止。已知海面穿越才可在 RNG 前以 ``dt`` 二分重試；若
+    下一次折半會低於 ``dt_min``，只對該完整確定性 RK4 重試套用 stage 海面反射速度包裝器。
+    包裝器僅鏡射 k2--k4 的合法海面查詢，任何重查失敗均 fail closed；成功收到第二個
+    task 的確定性 state 後才再恰套用一次 Brownian／``+div(K)|dt|`` operator split。
+    最後 proposed position 仍走一般海面／海床解析，中間 stage 不產生虛構事件；其他
+    stage 失敗不使用這個調節。
+
+    ``yield`` 收到的 ``ParticleState`` 會先驗證 identity、UTC／age、status 與有限性，
+    不能由 batcher 任意換成另一粒子或另一個步長。若 batcher／單粒子 driver 把
+    ``SamplingError`` 以 ``throw`` 注入，下面原有的 retry、boundary recovery 與失敗診斷
+    會照原順序處理，而且在成功確定性 state 以前不消耗 RNG。
+
     終止狀態會立即寫入最後觀測，因此呼叫端可以在每次 sweep 後安全 checkpoint；
     ``on_step`` 只在真正完成數值步時呼叫一次。失敗事件另附版本化的安全診斷，所有
     boundary recovery 與重試都不在 RK4 stage 中插入隨機擴散。若 max age 或 forcing
@@ -1466,13 +1537,20 @@ def advance_particle_once(
     stage_error: SamplingError | None = None
     while True:
         try:
-            proposed = split_rk4_brownian_step(
-                state,
+            advection_task = AdvectionTask(
+                state=state,
                 dt_seconds=-accepted_step_seconds,
                 velocity=velocity,
+                step_start_sample=step_start_sample,
+                physics_kernel_backend=settings.physics_kernel_backend,
+            )
+            deterministic_state = yield advection_task
+            deterministic_state = _validate_advection_result(advection_task, deterministic_state)
+            proposed = apply_diffusion_step(
+                deterministic_state,
+                dt_seconds=-accepted_step_seconds,
                 coefficients=diffusion_sample,
                 rng=rng,
-                step_start_sample=step_start_sample,
                 physics_kernel_backend=settings.physics_kernel_backend,
             )
             break
@@ -1507,15 +1585,24 @@ def advance_particle_once(
                     behavior_class=behavior_class,
                 )
                 try:
-                    proposed = split_rk4_brownian_step(
-                        state,
+                    adjusted_task = AdvectionTask(
+                        state=state,
                         dt_seconds=-accepted_step_seconds,
                         velocity=adjusted_velocity,
-                        coefficients=diffusion_sample,
-                        rng=rng,
                         # 反射包裝器的階段計數器必須從 k1 開始，且其 k1 可能
                         # 需要重新取得原始邊界樣本；因此不能沿用原速度取樣器的步首樣本。
                         step_start_sample=None,
+                        physics_kernel_backend=settings.physics_kernel_backend,
+                    )
+                    adjusted_deterministic_state = yield adjusted_task
+                    adjusted_deterministic_state = _validate_advection_result(
+                        adjusted_task, adjusted_deterministic_state
+                    )
+                    proposed = apply_diffusion_step(
+                        adjusted_deterministic_state,
+                        dt_seconds=-accepted_step_seconds,
+                        coefficients=diffusion_sample,
+                        rng=rng,
                         physics_kernel_backend=settings.physics_kernel_backend,
                     )
                 except SamplingError as adjusted_error:
@@ -1603,6 +1690,77 @@ def advance_particle_once(
         terminal=proposed.status != ParticleStatus.ACTIVE,
         stepped=True,
         state=proposed,
+    )
+
+
+def _drive_advection_steps(
+    steps: Generator[AdvectionTask, ParticleState, ParticleAdvanceResult],
+) -> ParticleAdvanceResult:
+    """以既有單粒子語意驅動一個 advection generator 到本次 sweep 結束。
+
+    這個 driver 是 legacy ``advance_particle_once`` 的唯一橋接層：每次收到 task 都先
+    交給 deterministic RK4 executor；若 executor 回報 ``SamplingError``，則把同一例外
+    以 ``generator.throw`` 注入 generator，讓原本的折半／海面調整／terminal fallback
+    重新取得控制權。成功的 RK4 state 則以 ``send`` 回傳，擴散與其後的 engine lifecycle
+    仍只在 generator 內執行，避免 wrapper 複製另一份四百行步進邏輯。
+    """
+
+    try:
+        task = next(steps)
+    except StopIteration as stopped:
+        if not isinstance(stopped.value, ParticleAdvanceResult):
+            raise RuntimeError("advance_particle_steps 未回傳 ParticleAdvanceResult") from None
+        return stopped.value
+
+    while True:
+        try:
+            deterministic_state = execute_advection_task(task)
+        except SamplingError as error:
+            try:
+                task = steps.throw(error)
+            except StopIteration as stopped:
+                if not isinstance(stopped.value, ParticleAdvanceResult):
+                    raise RuntimeError("advance_particle_steps 未回傳 ParticleAdvanceResult") from None
+                return stopped.value
+        else:
+            try:
+                task = steps.send(deterministic_state)
+            except StopIteration as stopped:
+                if not isinstance(stopped.value, ParticleAdvanceResult):
+                    raise RuntimeError("advance_particle_steps 未回傳 ParticleAdvanceResult") from None
+                return stopped.value
+
+
+def advance_particle_once(
+    execution: ParticleExecutionState,
+    *,
+    velocity: VelocityProvider,
+    boundaries: BoundaryGeometry,
+    behavior_class: str,
+    diffusion: DiffusionModel,
+    settings: EngineSettings,
+    rng: np.random.Generator,
+    on_step: Callable[[ParticleState], None] | None = None,
+) -> ParticleAdvanceResult:
+    """維持既有單步公開介面，並以 deterministic advection driver 執行一個 sweep。
+
+    舊呼叫者仍只需提供原本的 execution、forcing、邊界、擴散與每粒子 RNG；內部先建立
+    ``advance_particle_steps`` generator，再以既有 ``execute_advection_task`` 執行每個
+    確定性 RK4 task。這個 wrapper 不新增步長、觀測、retry 或 RNG 規則，回傳值與原有
+    ``ParticleAdvanceResult`` 完全相同。
+    """
+
+    return _drive_advection_steps(
+        advance_particle_steps(
+            execution,
+            velocity=velocity,
+            boundaries=boundaries,
+            behavior_class=behavior_class,
+            diffusion=diffusion,
+            settings=settings,
+            rng=rng,
+            on_step=on_step,
+        )
     )
 
 

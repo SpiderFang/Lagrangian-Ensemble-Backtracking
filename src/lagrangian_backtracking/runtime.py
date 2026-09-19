@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, fields
@@ -50,6 +52,8 @@ from shapely.geometry import Point
 
 from .bed_residence import BedResidenceTiming, resolve_bed_residence_timing
 from .config import (
+    ADVECTION_BACKEND_BAYTRACE_NATIVE_CPU_V1,
+    ADVECTION_BACKEND_LBT_STAGE_RK4_V1,
     CURRENT_DESIGN_VERSION,
     OCM_INTERPOLATION_BACKEND_NUMBA_V1,
     ProjectConfig,
@@ -2085,7 +2089,10 @@ class RuntimeRequestFactory:
 
     「來源」在此仍是條件式來源足跡的運算輸入，不是絕對來源機率或因果歸因。factory
     僅組合資料，不替缺失月份、缺失 pair、域外位置或 face provenance 不一致的資料
-    做最近值、零值或其他 fallback。
+    做最近值、零值或其他 fallback。明示 ``baytrace_native_cpu_v1`` 時，factory 只
+    負責載入已指定的原始 CPU artifact、Q3 frame resolver 與 Q2 batcher；LBT engine
+    仍保留步長、QC、擴散、亂數、邊界、觀測與 checkpoint 生命週期。Stokes 或 resolver
+    無法準備的 task 由 batcher 記為 fallback，不會被標成完整原版 BayTrace。
     """
 
     def __init__(
@@ -2304,6 +2311,144 @@ class RuntimeRequestFactory:
         self._diffusion_providers: dict[
             tuple[str, SmagorinskySettings], Any
         ] = {}
+
+        # 這個 callback 只在 config 明示 native token 時建立；舊設定的 None 路徑不
+        # 匯入 BayTrace、不中斷原有 lazy forcing 行為，也不會因 Pydantic default 偷換
+        # 舊 run。Q2 loader 會把 source hash 與外部 cache 路徑封存到 batcher report，
+        # Q3 resolver 則負責判斷每個 task 是否真的有 OCM+沉降 frame。
+        self._advection_backend = config.execution.advection_backend
+        self.advection_batcher: Any | None = None
+        self._advection_resolver: Any | None = None
+        self._advection_source_env: str | None = None
+        self._advection_cache_env: str | None = None
+        if self._advection_backend == ADVECTION_BACKEND_BAYTRACE_NATIVE_CPU_V1:
+            self._initialize_native_advection_backend()
+        elif self._advection_backend != ADVECTION_BACKEND_LBT_STAGE_RK4_V1:
+            # Literal 已先由 config 驗證；這個分支仍保留明確錯誤，避免外部以
+            # model_construct 或替身物件繞過 schema 後靜默退回 legacy。
+            raise ValueError(
+                f"不支援的 execution.advection_backend：{self._advection_backend!r}"
+            )
+
+    def _initialize_native_advection_backend(self) -> None:
+        """依明示環境變數建立原始 BayTrace CPU batcher 與 OCM frame resolver。
+
+        ``LBT_BAYTRACE_ROOT`` 是唯一允許的 BayTrace source root；不從目前工作目錄、
+        Python path 或相鄰資料夾猜 artifact。``NUMBA_CACHE_DIR`` 若有明示便沿用其
+        外部目錄，否則建立獨立 temporary cache，避免 JIT 寫入 source tree。Q3 adapter
+        尚未可用或 source artifact 缺檔時直接拋出帶路徑／依賴名稱的錯誤；這裡不能把
+        未準備的 native backend 假裝成 legacy 或完整原版路徑。
+        """
+
+        source_text = os.environ.get("LBT_BAYTRACE_ROOT")
+        if source_text is None or not source_text.strip():
+            raise RuntimeError(
+                "execution.advection_backend=baytrace_native_cpu_v1 需要明示 "
+                "LBT_BAYTRACE_ROOT（含 baytrace/ 原始 artifact 的唯一路徑）"
+            )
+        source_root = Path(source_text).expanduser()
+        if not source_root.exists():
+            raise FileNotFoundError(
+                "LBT_BAYTRACE_ROOT 不存在，無法啟用 BayTrace native CPU："
+                f" {source_root}"
+            )
+        self._advection_source_env = source_text
+
+        cache_text = os.environ.get("NUMBA_CACHE_DIR")
+        self._advection_cache_env = cache_text if cache_text and cache_text.strip() else None
+        if self._advection_cache_env is None:
+            # cache 必須位於 source 之外；TemporaryDirectory 的生命週期不能由
+            # context manager 提前結束，故以 mkdtemp 交給本 process／factory 持有。
+            cache_dir = Path(tempfile.mkdtemp(prefix="lbt-baytrace-numba-cache-")).resolve()
+        else:
+            cache_dir = Path(self._advection_cache_env).expanduser()
+
+        try:
+            from .baytrace_native_cpu import load_original_cpu
+
+            kernels = load_original_cpu(source_root, cache_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                "無法載入 LBT_BAYTRACE_ROOT 指定的 BayTrace 原始 CPU artifact；"
+                "請確認 baytrace/、geometry.py、vertical.py、random.py 與 "
+                f"batch_interp.py 完整且 cache 不在 source 內：{source_root}"
+            ) from exc
+
+        try:
+            from .baytrace_batch_advection import NativeBayTraceBatchAdvector
+        except ImportError as exc:
+            raise RuntimeError("Q2 NativeBayTraceBatchAdvector 尚未可用，無法啟用 native backend") from exc
+        try:
+            from .baytrace_ocm_adapter import OCMPreparedFrameResolver
+        except ModuleNotFoundError as exc:
+            if exc.name == "lagrangian_backtracking.baytrace_ocm_adapter":
+                raise RuntimeError(
+                    "Q3 OCMPreparedFrameResolver 尚未安裝；native backend 不可假裝啟用，"
+                    "請先提供 baytrace_ocm_adapter.py"
+                ) from exc
+            raise
+        except ImportError as exc:
+            raise RuntimeError(
+                "Q3 baytrace_ocm_adapter 無法載入 OCMPreparedFrameResolver；"
+                "native backend 不可假裝啟用"
+            ) from exc
+
+        try:
+            resolver = OCMPreparedFrameResolver(
+                max_cached_frames=2,
+                max_cached_bytes=512 * 1024 * 1024,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "OCMPreparedFrameResolver 建立失敗；請確認 Q3 adapter 的公開介面與 "
+                "ManagedForcingProvider 綁定契約一致"
+            ) from exc
+        self._advection_resolver = resolver
+        self.advection_batcher = NativeBayTraceBatchAdvector(kernels, resolver)
+
+    def advection_report(self) -> dict[str, Any]:
+        """回傳本 factory／process 的平流後端與 native/fallback execution evidence。
+
+        native counters 是同一 factory instance 生命週期內的累計值；RunController 會在
+        每個 shard invocation 建立 baseline，再把輸出 metadata 標為該 invocation 的
+        delta，避免續跑或跨 shard 把 process counter 冒充整個 run。legacy 回傳只含
+        backend 狀態，不虛構 native 粒子步數、批次數或 resolver 統計。
+        """
+
+        if self.advection_batcher is None:
+            return {
+                "backend": ADVECTION_BACKEND_LBT_STAGE_RK4_V1,
+                "native_enabled": False,
+                "counter_scope": "not_applicable",
+            }
+        report_method = getattr(self.advection_batcher, "report", None)
+        resolver_report_method = getattr(self._advection_resolver, "report", None)
+        if not callable(report_method) or not callable(resolver_report_method):
+            raise RuntimeError("native advection batcher/resolver 缺少必要的 report()")
+        batch_report = report_method()
+        resolver_report = resolver_report_method()
+        if not isinstance(batch_report, Mapping):
+            raise TypeError("NativeBayTraceBatchAdvector.report() 必須回傳 mapping")
+        if not isinstance(resolver_report, Mapping):
+            raise TypeError("OCMPreparedFrameResolver.report() 必須回傳 mapping")
+        result = {
+            "backend": ADVECTION_BACKEND_BAYTRACE_NATIVE_CPU_V1,
+            "native_enabled": True,
+            "counter_scope": "factory_process_cumulative_v1",
+            "source_environment": {
+                "LBT_BAYTRACE_ROOT": self._advection_source_env,
+                "NUMBA_CACHE_DIR": self._advection_cache_env,
+            },
+            "source_root": batch_report.get("source_root"),
+            "cache_dir": batch_report.get("cache_dir"),
+            "source_sha256": deepcopy(batch_report.get("source_sha256", {})),
+            "native_particle_steps": int(batch_report.get("native_particle_steps", 0)),
+            "native_batch_calls": int(batch_report.get("native_batch_calls", 0)),
+            "fallback_particle_steps": int(batch_report.get("fallback_particle_steps", 0)),
+            "max_group_size": int(batch_report.get("max_group_size", 0)),
+            "resolver_report": deepcopy(dict(resolver_report)),
+        }
+        return result
 
     def __call__(self, unit: RunUnit) -> ReferenceParticleRequest:
         """將一個 ``RunUnit`` 轉成可交給 reference engine 的 request。
@@ -2668,12 +2813,23 @@ def _open_run_controller(
     factory = RuntimeRequestFactory(
         **factory_kwargs,
     )
+    controller_kwargs: dict[str, Any] = {
+        "request_factory": factory,
+        "resume": resume,
+        "checkpoint_root": checkpoint_root,
+        "resource_reporter": factory.resource_stats,
+    }
+    # 舊版 RuntimeRequestFactory 可能是沒有 advection_batcher 屬性的 duck-typed 替身，
+    # 而 legacy controller 的既有呼叫契約也不包含兩個新 keyword。只有 factory 明示建立
+    # 原版 CPU batcher 時才加入兩個欄位；這讓舊 caller 仍收到完全相同的 constructor 參數，
+    # 同時避免把 None 寫成一個看似啟用過的新執行狀態。
+    advection_batcher = getattr(factory, "advection_batcher", None)
+    if advection_batcher is not None:
+        controller_kwargs["advection_batcher"] = advection_batcher
+        controller_kwargs["advection_reporter"] = factory.advection_report
     return RunController(
         root,
-        request_factory=factory,
-        resume=resume,
-        checkpoint_root=checkpoint_root,
-        resource_reporter=factory.resource_stats,
+        **controller_kwargs,
     )
 
 

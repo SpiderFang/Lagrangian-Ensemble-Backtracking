@@ -119,6 +119,36 @@ _FORCING_CACHE_STATS_SEMANTICS_V1 = "invocation_delta_v1"
 _FORCING_CACHE_STATS_LEGACY = "legacy_unknown"
 _FORCING_CACHE_STATS_STATUS_KEY = "forcing_cache_stats_status"
 _FORCING_CACHE_STATS_STATUS_UNAVAILABLE = "unavailable_due_to_reporter_error"
+# native advection 的 counters 由 Q2 batcher 累計；只能處理這份已登錄的欄位清單。
+# 不使用欄位名稱 substring 猜測，因為 source metadata 或 resolver 的 gauge 可能碰巧
+# 含有 ``count``、``hits`` 等文字，誤相減會把 process snapshot 偽裝成 invocation delta。
+_ADVECTION_BATCH_COUNTER_KEYS = frozenset(
+    {
+        "native_particle_steps",
+        "native_batch_calls",
+        "fallback_particle_steps",
+    }
+)
+# Q3 resolver report 的事件計數器只存在 ``resolver_report`` 這個已知 mapping 下；其餘
+# 欄位（例如 cached_bytes、容量、source metadata 與 cached frame 描述）都是 gauge 或
+# provenance，必須保留當次 report 的值，不能遞迴猜測或相減。
+_ADVECTION_RESOLVER_COUNTER_KEYS = frozenset(
+    {
+        "cache_hits",
+        "cache_misses",
+        "frame_builds",
+        "frame_evictions",
+        "negative_cache_hits",
+        "negative_cache_stores",
+        "negative_cache_evictions",
+        "bracket_cache_hits",
+        "bracket_queries",
+        "time_fallback_count",
+        "fallback_count",
+    }
+)
+_ADVECTION_RESOLVER_REPORT_KEY = "resolver_report"
+_ADVECTION_FALLBACK_REASONS_KEY = "fallback_reasons"
 _SCENARIO_COLUMNS = (
     "scenario_id",
     "study_site_id",
@@ -1837,10 +1867,14 @@ class RunController:
 
     controller 只實作 CPU/NumPy ``ProductionBatch``；``request_factory`` 由 caller 提供，
     因而可以在測試中注入 constant flow，也可以在後續 3B2 接上實值 OCM/NWW request
-    builder。每次 ``run_shard`` 先取得 run gate shared、再取得 shard exclusive，並在
-    progress mutation 時最後取得 progress exclusive；固定順序是 run gate → shard →
-    progress，可讓不同 shard 並行而不讓 reconcile 與 worker 互撞。checkpoint generation
-    不覆寫，latest pointer 與 progress 則以原子 JSON 替換。
+    builder。若 caller 明示 ``advection_batcher``，它只會被傳入 ProductionBatch 的
+    constructor／from_checkpoint，checkpoint 不保存 callback；``advection_reporter`` 的
+    計數則在每個 shard invocation 以 baseline 轉成 delta，寫到 trajectory metadata 的
+    ``advection_execution``，不會混入既有 forcing cache 統計。每次 ``run_shard`` 先取得
+    run gate shared、再取得 shard exclusive，並在 progress mutation 時最後取得 progress
+    exclusive；固定順序是 run gate → shard → progress，可讓不同 shard 並行而不讓 reconcile
+    與 worker 互撞。checkpoint generation 不覆寫，latest pointer 與 progress 則以原子 JSON
+    替換。
     """
 
     def __init__(
@@ -1851,8 +1885,16 @@ class RunController:
         resume: bool = False,
         checkpoint_root: str | Path | None = None,
         resource_reporter: Callable[[], Mapping[str, Any]] | None = None,
+        advection_batcher: Callable[..., Any] | None = None,
+        advection_reporter: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
-        """載入 plan/progress 並設定 request factory；不會自動開始物理計算。"""
+        """載入 plan/progress 並設定 request factory；不會自動開始物理計算。
+
+        ``advection_batcher`` 只會在建立或恢復 ``ProductionBatch`` 時注入，且 callback
+        本身不寫入 checkpoint；續跑時 caller 必須依當次 execution backend 再次提供。
+        ``advection_reporter`` 只供 trajectory ``run_metadata.advection_execution`` 保存
+        本次 shard invocation 的 evidence，不會混入既有 ``forcing_cache_stats``。
+        """
 
         self.workspace = workspace.path if isinstance(workspace, RunWorkspace) else Path(workspace)
         self.plan = load_run_plan(self.workspace)
@@ -1870,6 +1912,12 @@ class RunController:
         self.output_root = self.workspace / self.plan["output_root"]
         self.failure_root = self.workspace / self.plan["failure_root"]
         self.resource_reporter = resource_reporter
+        if advection_batcher is not None and not callable(advection_batcher):
+            raise TypeError("advection_batcher 必須是 callable 或 None")
+        if advection_reporter is not None and not callable(advection_reporter):
+            raise TypeError("advection_reporter 必須是 callable 或 None")
+        self.advection_batcher = advection_batcher
+        self.advection_reporter = advection_reporter
         if (
             self.checkpoint_root.is_symlink()
             or self.output_root.is_symlink()
@@ -2602,6 +2650,143 @@ class RunController:
             label="resource_reporter",
         )
 
+    def _advection_snapshot(self) -> dict[str, Any] | None:
+        """讀取 native advection reporter 的 process snapshot。
+
+        reporter 由 RuntimeRequestFactory 提供，內容包含 Q2 batcher 的來源 hash、native／
+        fallback 計數與 Q3 resolver report。這裡只要求 mapping 並複製資料；callback 不會
+        被序列化，也不會進入 checkpoint。
+        """
+
+        if self.advection_reporter is None:
+            return None
+        snapshot = self.advection_reporter()
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("advection_reporter 必須回傳 mapping")
+        return deepcopy(dict(snapshot))
+
+    @staticmethod
+    def _advection_integer_delta(
+        current: Any,
+        baseline: Mapping[str, Any],
+        key: str,
+        *,
+        path: str,
+    ) -> Any:
+        """對已登錄的整數事件計數取 invocation delta，其餘型別保留原值。
+
+        只有 report contract 明示為 counter 的欄位才會呼叫本 helper；若 reporter 的
+        型別不完整，保留原值讓上層仍能保存 provenance，而不把未知資料擅自解讀成數值。
+        counter 只能單調增加；process snapshot 倒退代表 reporter／process 邊界已改變，
+        此時直接失敗，避免輸出負的物理或效能事件數。
+        """
+
+        previous = baseline.get(key)
+        if (
+            isinstance(current, int)
+            and not isinstance(current, bool)
+            and isinstance(previous, int)
+            and not isinstance(previous, bool)
+        ):
+            difference = current - previous
+            if difference < 0:
+                raise ValueError(f"advection counter 不得倒退：{path}")
+            return int(difference)
+        return deepcopy(current)
+
+    @staticmethod
+    def _advection_resolver_delta(
+        current: Mapping[str, Any], baseline: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """只處理 Q3 resolver 已登錄的 counters，保留其餘 gauge／metadata。
+
+        ``fallback_reasons`` 是唯一需要再進入一層的 mapping，且 reason value 仍受
+        counter 單調性檢查；其他巢狀資料（包含 frame metadata 與 source metadata）不再
+        遞迴掃描，避免任意同名欄位被錯誤扣除。
+        """
+
+        delta: dict[str, Any] = {}
+        for key, value in current.items():
+            if key in _ADVECTION_RESOLVER_COUNTER_KEYS:
+                delta[key] = RunController._advection_integer_delta(
+                    value,
+                    baseline,
+                    key,
+                    path=f"{_ADVECTION_RESOLVER_REPORT_KEY}.{key}",
+                )
+                continue
+            if key == _ADVECTION_FALLBACK_REASONS_KEY and isinstance(value, Mapping):
+                previous_reasons = baseline.get(key)
+                if not isinstance(previous_reasons, Mapping):
+                    previous_reasons = {}
+                reason_delta: dict[str, Any] = {}
+                for reason, count in value.items():
+                    reason_delta[reason] = RunController._advection_integer_delta(
+                        count,
+                        previous_reasons,
+                        reason,
+                        path=f"{_ADVECTION_RESOLVER_REPORT_KEY}.{key}.{reason}",
+                    )
+                delta[key] = reason_delta
+                continue
+            # cached frames/bytes、容量、frame metadata 與 source provenance 都是當次
+            # report 的 gauge 或描述資料；不可因巢狀名稱相似而套用 counter delta。
+            delta[key] = deepcopy(value)
+        return delta
+
+    @staticmethod
+    def _advection_counter_delta(
+        current: Mapping[str, Any], baseline: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """以固定欄位路徑將 advection process snapshot 轉成 invocation delta。
+
+        Q2 batcher 只在根層使用 ``_ADVECTION_BATCH_COUNTER_KEYS``；Q3 resolver 只在
+        ``resolver_report`` 下使用其專屬清單。source hash、gauge 及未登錄 metadata 一律
+        保留 current 值，不能用任意遞迴或欄位 substring 猜測 counter。
+        """
+
+        delta: dict[str, Any] = {}
+        for key, value in current.items():
+            if key in _ADVECTION_BATCH_COUNTER_KEYS:
+                delta[key] = RunController._advection_integer_delta(
+                    value,
+                    baseline,
+                    key,
+                    path=key,
+                )
+                continue
+            if key == _ADVECTION_RESOLVER_REPORT_KEY and isinstance(value, Mapping):
+                previous_report = baseline.get(key)
+                if not isinstance(previous_report, Mapping):
+                    previous_report = {}
+                delta[key] = RunController._advection_resolver_delta(value, previous_report)
+                continue
+            # 不遞迴任意 mapping；例如 source metadata 中的 ``frame_builds`` 不是
+            # resolver counter，必須原樣保存，避免 provenance 被錯誤扣除。
+            delta[key] = deepcopy(value)
+        return delta
+
+    def _advection_invocation_report(
+        self,
+        baseline: Mapping[str, Any] | None,
+        *,
+        shard_id: str,
+    ) -> dict[str, Any] | None:
+        """建立明示 shard invocation scope 的 advection execution metadata。"""
+
+        if baseline is None or self.advection_reporter is None:
+            return None
+        current = self._advection_snapshot()
+        if current is None:
+            return None
+        report = self._advection_counter_delta(current, baseline)
+        report["counter_scope"] = "shard_invocation_delta_v1"
+        report["invocation"] = {
+            "scope": "single_shard_controller_invocation",
+            "shard_id": shard_id,
+        }
+        return report
+
     def _try_adopt_published_checkpoint(
         self,
         shard: ScenarioShard,
@@ -3063,6 +3248,7 @@ class RunController:
         resource_baseline: dict[str, int] | None = None
         latest_forcing_stats: dict[str, int] | None = None
         resource_stats_unavailable = False
+        advection_baseline: dict[str, Any] | None = None
         # 指向本次尚未完成 progress 發布的預期 generation。只在 generation 已驗證且
         # RUNNING progress 成功更新後清除；若 latest／progress 的後續步驟失敗，外層 error
         # handler 可用它辨認已發布 orphan，而不增加 sequence 造成重寫或覆蓋。
@@ -3088,6 +3274,10 @@ class RunController:
                     key: 0 if key in _FORCING_CACHE_COUNTER_KEYS else resource_baseline[key]
                     for key in _FORCING_CACHE_KEYS
                 }
+            # advection reporter 與 forcing reporter 一樣在 request factory／checkpoint
+            # restore 前取 baseline；因此同一 factory 跨 shard 或 resume 時，輸出只反映
+            # 本次 invocation 的 native/fallback 工作，不會把歷史 counter 冒充全 run。
+            advection_baseline = self._advection_snapshot()
             if selected is not None:
                 batch = ProductionBatch.from_checkpoint(
                     selected.path,
@@ -3097,6 +3287,7 @@ class RunController:
                     request_factory=self.request_factory,
                     expected_binding=self._binding(shard),
                     active_chunk_size=self.plan["active_chunk_size"],
+                    advection_batcher=self.advection_batcher,
                 )
                 checkpoint_sequence = selected.sequence
                 checkpoint_path = selected.path
@@ -3108,6 +3299,7 @@ class RunController:
                     random_stream_id=self.plan.get("random_stream_id"),
                     request_factory=self.request_factory,
                     active_chunk_size=self.plan["active_chunk_size"],
+                    advection_batcher=self.advection_batcher,
                 )
             interval = int(self.plan["checkpoint_interval_sweeps"])
             budget_left = sweep_budget
@@ -3211,6 +3403,10 @@ class RunController:
                 latest_forcing_stats,
                 stats,
             )
+            advection_execution = self._advection_invocation_report(
+                advection_baseline,
+                shard_id=shard_id,
+            )
             resource_metrics = _merge_metrics(
                 self._metrics(
                     started_wall,
@@ -3233,6 +3429,10 @@ class RunController:
                     "code_commit": provenance.get("git_commit"),
                 }
             )
+            if advection_execution is not None:
+                # 這是 trajectory manifest 的 optional execution evidence；strict
+                # forcing_cache_stats 只保存 forcing manager 統計，兩者不可混合。
+                metadata["advection_execution"] = advection_execution
             write_trajectory_shard(output, results, run_metadata=metadata)
             validation = validate_trajectory_shard(
                 output,

@@ -25,7 +25,7 @@
 
 ## 原文件路徑對照
 
-下表保留原本 18 份文件的檔名與原路徑，並登錄 3 份新增的 pilot／稽核及效能規劃文件；新增文件沒有
+下表保留原本 18 份文件的檔名與原路徑，並登錄 4 份新增的 pilot／稽核、效能規劃及 BayTrace 對照文件；新增文件沒有
 待相容的舊根層路徑，因此 current/original 欄位相同。「狀態」只表示閱讀定位，不把工程
 測試通過誤寫成正式科學成果。
 
@@ -33,6 +33,7 @@
 |---|---|---|---|---|
 | 實作狀態與正式驗證邊界 | [implementation_status.md](implementation_status.md) | 集中說明目前程式能力、正式性界線與尚待驗證項目。 | 現行 | `docs/implementation_status.md` |
 | 正式運算及單站試跑效能改善 | [operations/16_performance_improvement_tracks.md](operations/16_performance_improvement_tracks.md) | 規範正式研究優先的加速工作線、結果等價與 30 天回溯驗收。 | 現行 | `docs/operations/16_performance_improvement_tracks.md` |
+| BayTrace 原版 CPU 與生命週期對照 | [development/baytrace_native_cpu_comparison.md](development/baytrace_native_cpu_comparison.md) | 保存 Q2 direct-core 與 Q3 synthetic `ProductionBatch` 對照；結果與正式驗證界線分開記錄。 | 工程對照 | `docs/development/baytrace_native_cpu_comparison.md` |
 | 需求追溯與範圍裁決 | [foundation/01_requirements_traceability.md](foundation/01_requirements_traceability.md) | 將研究需求、使用者裁決與驗收條件對應到可追查的實作。 | 現行 | `docs/01_requirements_traceability.md` |
 | 架構與資料契約 | [foundation/02_architecture_and_data_contract.md](foundation/02_architecture_and_data_contract.md) | 定義上游資料、模組邊界、狀態欄位與輸出拓撲。 | 現行 | `docs/02_architecture_and_data_contract.md` |
 | 科學方法與驗證規格 | [foundation/03_scientific_method_and_validation.md](foundation/03_scientific_method_and_validation.md) | 說明座標、公式、時間積分、擴散與科學驗收方法。 | 現行 | `docs/03_scientific_method_and_validation.md` |

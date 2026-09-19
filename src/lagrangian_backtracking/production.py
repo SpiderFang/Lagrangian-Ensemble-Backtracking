@@ -13,23 +13,25 @@ Brownian、邊界與品質檢查仍直接呼叫同一份 reference engine。
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .advection import AdvectionTask, BatchAdvector
 from .batch_state import PARTICLE_STATUS_TO_CODE, ParticleBatch
 from .engine import (
     ParticleAdvanceResult,
     ParticleExecutionState,
     ParticleResult,
     advance_particle_once,
+    advance_particle_steps,
     finalize_particle_execution,
     initialize_particle_execution,
 )
-from .integrators import VelocityProvider, supports_step_start_sample_reuse
+from .integrators import SamplingError, VelocityProvider, supports_step_start_sample_reuse
 from .models import ParticleState, ParticleStatus, VelocitySample
 from .runner import (
     ReferenceParticleRequest,
@@ -168,6 +170,22 @@ class ProductionParticleRuntime:
         self.triangle_hint = self.velocity.triangle_hint if self.velocity.triangle_hint is not None else -1
 
 
+@dataclass(slots=True)
+class _PendingAdvection:
+    """保留一條 generator 與其目前 task 的 source-order 工作項目。
+
+    ``source_index`` 是原始 ``ProductionBatch`` 的粒子位置，``compacted_index`` 是本次
+    active sweep 的連續陣列位置。兩者同時保存，才能讓 batcher 的批次回傳依原始來源順序
+    送回正確 generator，並把完成 state 寫回同一個 compacted row；retry 只替換 task，
+    不會重新建立 execution、重置 RNG 或改變粒子身分。
+    """
+
+    source_index: int
+    compacted_index: int
+    generator: Generator[AdvectionTask, ParticleState, ParticleAdvanceResult]
+    task: AdvectionTask
+
+
 @dataclass(frozen=True, slots=True)
 class ProductionAdvanceResult:
     """一或多個 sweep 後的批次進度，布林值代表是否全數終止。"""
@@ -230,12 +248,17 @@ class ProductionBatch:
 
     建構時依 ``iter_run_units`` 產生固定順序，``request_factory`` 對每個 unit 恰好呼叫
     一次。每個 sweep 先從 ``ParticleBatch`` 壓縮 ACTIVE 粒子，依 source order 對每一條
-    runtime 最多呼叫一次 ``advance_particle_once``，再把位置、年齡、時間、狀態、local exit
-    與 triangle hint 分散回原始索引；因此 active 粒子提早停止不會造成 identity 錯位。
+    runtime 最多完成一次 ``advance_particle_steps``；預設由既有
+    ``advance_particle_once`` driver 執行，若提供 ``advection_batcher``，則只把每條
+    generator 暫停在確定性 RK4 task，按 ``active_chunk_size`` 批次送出，再依 source order
+    ``send``／``throw`` 回同一條 generator。兩條路徑最後都把位置、年齡、時間、狀態、
+    local exit 與 triangle hint 分散回原始索引；因此 active 粒子提早停止或 RK4 retry
+    都不會造成 identity 錯位。
     ``active_chunk_size`` 只改變一次處理的切片大小，不改變 source order、每條粒子的 RNG
     或物理呼叫次數。``request.diffusion`` 仍原樣交給單步 engine；空間 provider 的
     步首取樣次數與 triangle hint 語意由 engine 集中保證，避免 batch 層複製一份不同的
-    擴散狀態。
+    擴散狀態。``advection_batcher`` 只接管確定性 RK4，callback 參照不寫入 checkpoint；
+    restore 必須由呼叫端再次注入，因而不改既有 checkpoint schema。
     """
 
     def __init__(
@@ -246,6 +269,7 @@ class ProductionBatch:
         random_stream_id: str | None = None,
         request_factory: Callable[[RunUnit], ReferenceParticleRequest],
         active_chunk_size: int | None = None,
+        advection_batcher: BatchAdvector | None = None,
     ) -> None:
         """建立非空批次並一次完成所有 request 建立與初始觀測。
 
@@ -254,7 +278,9 @@ class ProductionBatch:
         identity；因此配對的物理案例不會因共用 RNG 而互相覆寫 ``particle_id``。省略此
         參數時，``iter_run_units`` 會維持既有以 experiment case 導出的 seed。建構後將
         stream ID 留在批次物件上，讓呼叫端在 checkpoint／資源稽核時可追溯實際使用的
-        seed 命名空間。
+        seed 命名空間。``advection_batcher`` 若為 ``None``，維持既有逐粒子 driver；若
+        非 ``None``，只接管已由 engine 決定的 deterministic RK4 task，不接管 diffusion、
+        RNG、邊界、觀測或 checkpoint。callback 本身只存在於記憶體，恢復時必須重新傳入。
         """
 
         if isinstance(master_seed, bool) or not isinstance(master_seed, int):
@@ -270,12 +296,15 @@ class ProductionBatch:
             raise TypeError("active_chunk_size 必須是正整數或 None")
         if active_chunk_size is not None and active_chunk_size < 1:
             raise ValueError("active_chunk_size 必須為正整數或 None")
+        if advection_batcher is not None and not callable(advection_batcher):
+            raise TypeError("advection_batcher 必須是 callable 或 None")
         self.shard = shard
         self.master_seed = master_seed
         # iterator 會在產生第一個 RunUnit 前驗證 stream ID；此處保留原字串，因為它是
         # immutable run plan 的稽核欄位，不應被自動正規化成另一個 operator 未提供的值。
         self.random_stream_id = random_stream_id
         self.active_chunk_size = active_chunk_size
+        self.advection_batcher = advection_batcher
         self.units = tuple(
             iter_run_units(
                 shard,
@@ -396,6 +425,125 @@ class ProductionBatch:
         batch.own_local_exit_recorded[index] = state.own_local_exit_recorded
         batch.triangle_hint[index] = triangle_hint
 
+    @staticmethod
+    def _generator_result(stopped: StopIteration) -> ParticleAdvanceResult:
+        """取出 generator 的單步結果，拒絕不符合 engine 內部契約的終止值。"""
+
+        if not isinstance(stopped.value, ParticleAdvanceResult):
+            raise RuntimeError("advance_particle_steps 未回傳 ParticleAdvanceResult") from None
+        return stopped.value
+
+    def _finish_pending_advection(
+        self,
+        compacted: ParticleBatch,
+        pending: _PendingAdvection,
+        result: ParticleAdvanceResult,
+    ) -> int:
+        """把一條 generator 已完成的原有 engine 結果同步回 runtime 與 compact batch。"""
+
+        runtime = self.runtimes[pending.source_index]
+        runtime.sync_triangle_hint()
+        self._write_state_to_batch(
+            compacted,
+            pending.compacted_index,
+            result.state,
+            runtime.triangle_hint,
+        )
+        return int(result.stepped)
+
+    def _advance_one_sweep_with_batcher(
+        self,
+        compacted: ParticleBatch,
+        source_indices: np.ndarray,
+    ) -> int:
+        """以 generator rendezvous 將本 sweep 的確定性 RK4 工作分批送給 batcher。
+
+        每條 active 粒子先只執行到第一個 ``yield AdvectionTask`` 或直接回傳步首終止
+        結果；因此步長、步首速度、擴散樣本與既有 QC 仍由各自 engine generator 決定。
+        batcher 每次只收到目前 source order 的 task 序列，成功 state 以 ``send`` 回原
+        generator，``SamplingError`` 以 ``throw`` 注入原 generator。若 generator 進入
+        原有 retry，它產生的新 task 會在下一輪以相同 chunk policy 再批次處理；成功後
+        才可能消耗該 runtime 一次 Brownian RNG，故 retry 不會多抽亂數。
+        """
+
+        batcher = self.advection_batcher
+        assert batcher is not None
+        pending: list[_PendingAdvection] = []
+        stepped_count = 0
+
+        # 先依原始來源順序準備所有 active generator。這個階段不呼叫 batcher，讓同一
+        # sweep 的步首決策完整留在 engine；沒有 task 的粒子仍要立即保留原 terminal
+        # observation／event，不能因批次路徑而漏掉 invalid start 或短終點後的停止。
+        for compacted_index, source_index_value in enumerate(source_indices):
+            source_index = int(source_index_value)
+            runtime = self.runtimes[source_index]
+            runtime.velocity.set_triangle_hint(runtime.triangle_hint)
+            generator = advance_particle_steps(
+                runtime.execution,
+                velocity=runtime.velocity,
+                boundaries=runtime.request.boundaries,
+                behavior_class=runtime.request.behavior_class,
+                diffusion=runtime.request.diffusion,
+                settings=runtime.request.settings,
+                rng=runtime.rng,
+            )
+            try:
+                task = next(generator)
+            except StopIteration as stopped:
+                result = self._generator_result(stopped)
+                runtime.sync_triangle_hint()
+                self._write_state_to_batch(
+                    compacted, compacted_index, result.state, runtime.triangle_hint
+                )
+                stepped_count += int(result.stepped)
+            else:
+                if not isinstance(task, AdvectionTask):
+                    raise RuntimeError("advance_particle_steps 必須 yield AdvectionTask")
+                pending.append(
+                    _PendingAdvection(source_index, compacted_index, generator, task)
+                )
+
+        # 每一輪只處理相同 retry 世代的 task；pending 本身維持來源順序，retry task 則
+        # 在整個當前世代完成後依來源順序重新排入，避免某一粒子的重試插隊改變 batcher
+        # 的輸入拓撲。active_chunk_size 僅限制送入 callback 的數量，不改 engine 生命週期。
+        while pending:
+            next_pending: list[_PendingAdvection] = []
+            chunk_size = self.active_chunk_size or len(pending)
+            for chunk_start in range(0, len(pending), chunk_size):
+                chunk = pending[chunk_start : chunk_start + chunk_size]
+                tasks = tuple(item.task for item in chunk)
+                outputs = batcher(tasks)
+                if not isinstance(outputs, Sequence):
+                    raise TypeError("advection_batcher 必須回傳 Sequence")
+                if len(outputs) != len(chunk):
+                    raise ValueError(
+                        "advection_batcher 回傳數量與 task 數量不一致："
+                        f"outputs={len(outputs)}, tasks={len(chunk)}"
+                    )
+                for item, output in zip(chunk, outputs, strict=True):
+                    try:
+                        if isinstance(output, SamplingError):
+                            next_task = item.generator.throw(output)
+                        elif isinstance(output, ParticleState):
+                            next_task = item.generator.send(output)
+                        else:
+                            raise TypeError(
+                                "advection_batcher 每一項必須是 ParticleState 或 SamplingError"
+                            )
+                    except StopIteration as stopped:
+                        stepped_count += self._finish_pending_advection(
+                            compacted,
+                            item,
+                            self._generator_result(stopped),
+                        )
+                    else:
+                        if not isinstance(next_task, AdvectionTask):
+                            raise RuntimeError("advance_particle_steps 必須 yield AdvectionTask")
+                        item.task = next_task
+                        next_pending.append(item)
+            pending = next_pending
+        return stepped_count
+
     def _advance_one_sweep(self) -> ProductionAdvanceResult:
         """依 source order 讓每條 active runtime 最多前進一步。"""
 
@@ -405,26 +553,31 @@ class ProductionBatch:
             return ProductionAdvanceResult(True, 0, 0, 0)
         chunk_size = self.active_chunk_size or int(source_indices.size)
         stepped_count = 0
-        for chunk_start in range(0, int(source_indices.size), chunk_size):
-            chunk_stop = min(chunk_start + chunk_size, int(source_indices.size))
-            chunk = compacted.slice_view(chunk_start, chunk_stop)
-            for local_index, source_index_value in enumerate(source_indices[chunk_start:chunk_stop]):
-                source_index = int(source_index_value)
-                runtime = self.runtimes[source_index]
-                compacted_index = local_index
-                runtime.velocity.set_triangle_hint(runtime.triangle_hint)
-                result: ParticleAdvanceResult = advance_particle_once(
-                    runtime.execution,
-                    velocity=runtime.velocity,
-                    boundaries=runtime.request.boundaries,
-                    behavior_class=runtime.request.behavior_class,
-                    diffusion=runtime.request.diffusion,
-                    settings=runtime.request.settings,
-                    rng=runtime.rng,
-                )
-                runtime.sync_triangle_hint()
-                self._write_state_to_batch(chunk, compacted_index, result.state, runtime.triangle_hint)
-                stepped_count += int(result.stepped)
+        if self.advection_batcher is not None:
+            stepped_count = self._advance_one_sweep_with_batcher(compacted, source_indices)
+        else:
+            # None 路徑刻意保留既有逐粒子 wrapper；它是舊 run 與既有 checkpoint 的預設
+            # 行為，不能因新增 batcher 選項而改變速度查詢、副作用或 RNG 順序。
+            for chunk_start in range(0, int(source_indices.size), chunk_size):
+                chunk_stop = min(chunk_start + chunk_size, int(source_indices.size))
+                chunk = compacted.slice_view(chunk_start, chunk_stop)
+                for local_index, source_index_value in enumerate(source_indices[chunk_start:chunk_stop]):
+                    source_index = int(source_index_value)
+                    runtime = self.runtimes[source_index]
+                    compacted_index = local_index
+                    runtime.velocity.set_triangle_hint(runtime.triangle_hint)
+                    result: ParticleAdvanceResult = advance_particle_once(
+                        runtime.execution,
+                        velocity=runtime.velocity,
+                        boundaries=runtime.request.boundaries,
+                        behavior_class=runtime.request.behavior_class,
+                        diffusion=runtime.request.diffusion,
+                        settings=runtime.request.settings,
+                        rng=runtime.rng,
+                    )
+                    runtime.sync_triangle_hint()
+                    self._write_state_to_batch(chunk, compacted_index, result.state, runtime.triangle_hint)
+                    stepped_count += int(result.stepped)
         self.particle_batch.scatter_dynamic_from(compacted, source_indices)
         self.sweep_count += 1
         self._validate_alignment()
@@ -544,13 +697,16 @@ class ProductionBatch:
         request_factory: Callable[[RunUnit], ReferenceParticleRequest],
         expected_binding: CheckpointBinding,
         active_chunk_size: int | None = None,
+        advection_batcher: BatchAdvector | None = None,
     ) -> ProductionBatch:
         """以同一 shard、seed 命名空間與 request factory 恢復 checkpoint。
 
         checkpoint loader 會先核對 ``expected_binding``；本方法再以同一個
         ``random_stream_id`` 重建 RunUnit。即使 checkpoint 的粒子 identity 本身不包含
         stream ID，controller 仍會在 binding 中保存該值，任何 resume 變更都會在建立
-        外部 request 前 fail-closed，而不以錯誤 seed 靜默續跑。
+        外部 request 前 fail-closed，而不以錯誤 seed 靜默續跑。``advection_batcher``
+        不在 checkpoint 中保存；resume 呼叫者若要繼續 native deterministic path，必須
+        再次注入，省略則回到既有 legacy path。
         """
 
         from .checkpoint import _track_execution_history, load_execution_checkpoint
@@ -568,6 +724,7 @@ class ProductionBatch:
             random_stream_id=random_stream_id,
             request_factory=request_factory,
             active_chunk_size=active_chunk_size,
+            advection_batcher=advection_batcher,
         )
         loaded = load_execution_checkpoint(
             path,
@@ -623,6 +780,7 @@ def run_production_shard(
     random_stream_id: str | None = None,
     request_factory: Callable[[RunUnit], ReferenceParticleRequest],
     active_chunk_size: int | None = None,
+    advection_batcher: BatchAdvector | None = None,
     on_result: Callable[[RunUnit, ParticleResult], None] | None = None,
 ) -> list[ParticleResult]:
     """以 CPU/NumPy active-compacted orchestration 完成一個 scenario shard。
@@ -630,6 +788,8 @@ def run_production_shard(
     ``random_stream_id`` 的語意與 ``ProductionBatch`` 相同：明示時可讓不同物理案例
     對同一 scenario／member 使用相同 seed；未明示時保留舊 experiment-case seed。這裡
     只轉交 seed 命名空間，不改變結果 callback 所收到的 RunUnit identity。
+    ``advection_batcher`` 若未提供則維持逐粒子 legacy path；若提供，只會批次執行
+    deterministic RK4，其他 engine lifecycle 與輸出語意不變。
     """
 
     batch = ProductionBatch(
@@ -638,6 +798,7 @@ def run_production_shard(
         random_stream_id=random_stream_id,
         request_factory=request_factory,
         active_chunk_size=active_chunk_size,
+        advection_batcher=advection_batcher,
     )
     results = batch.complete()
     if on_result is not None:

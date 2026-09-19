@@ -71,6 +71,8 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "integrators",
             "boundaries",
             "engine",
+            "advection",
+            "baytrace_ocm_adapter",
         ),
     },
     {
@@ -83,6 +85,8 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "pilot_selection",
             "runner",
             "batch_state",
+            "baytrace_native_cpu",
+            "baytrace_batch_advection",
             "production",
             "checkpoint",
         ),
@@ -349,6 +353,26 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "這是最接近一條軌跡完整生命週期的模組，串起取樣、積分與邊界。"
         ),
     },
+    "advection": {
+        "role": "確定性平流 task 與單步執行器的共用介面",
+        "inputs": "ParticleState、時間步長、VelocityProvider 與步首速度樣本",
+        "outputs": "AdvectionTask、確定性 RK4 ParticleState 或 SamplingError",
+        "entrypoints": ["AdvectionTask", "BatchAdvector", "execute_advection_task"],
+        "read_first": (
+            "這個薄介面只分離確定性平流與既有 engine 的擴散／邊界／觀測生命週期；"
+            "task 執行本身不抽亂數，也不能取代 engine 的步長品質檢查。"
+        ),
+    },
+    "baytrace_ocm_adapter": {
+        "role": "把支援的 OCM 加定值沉降 task 解析成可重用 BayTrace frame",
+        "inputs": "ManagedForcingProvider、步首 VelocitySample、OCM 時間端點與 bounded cache 設定",
+        "outputs": "PreparedBayTraceFrame 或明示的 legacy fallback reason，以及 cache／時間來源 report",
+        "entrypoints": ["OCMPreparedFrameResolver"],
+        "read_first": (
+            "只對 no-Stokes OCM 加定值沉降建立原版 frame；Stokes 與未支援形狀回傳明示原因，"
+            "不把混合路徑誤標成完整 BayTrace，且 resolver counters 與 gauge 分開保存。"
+        ),
+    },
     "scenarios": {
         "role": "建立 10 × 20 × 50 的基礎情境與成員種子",
         "inputs": (
@@ -405,6 +429,37 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "借鑑 BayTrace ParticleArrays 的 structure-of-arrays 排列；本專案改以 "
             "ParticleState／ParticleStatus 契約保存欄位、狀態碼與 identity-safe scatter，"
             "不直接搬入 BayTrace 資料型別。"
+        ),
+    },
+    "baytrace_native_cpu": {
+        "role": "載入並封裝 PI BayTrace 的原版 CPU kernel 與來源指紋",
+        "inputs": "明示 BayTrace source root、外部快取目錄與 kernel 依賴檔",
+        "outputs": "BayTraceCPUKernels、SoA particle／field arrays、step_native 與 source hashes",
+        "entrypoints": [
+            "BayTraceCPUKernels",
+            "BayTraceGridArrays",
+            "BayTraceFieldPair",
+            "BayTraceParticleArrays",
+            "load_original_cpu",
+            "step_native",
+        ],
+        "read_first": (
+            "這裡只重用已提供的原版確定性 CPU kernel；來源與快取路徑必須由 caller 明示，"
+            "不在此建立另一套平流生命週期或隨機擴散。"
+        ),
+    },
+    "baytrace_batch_advection": {
+        "role": "將 AdvectionTask 分組交給原版 BayTrace CPU，並保留 LBT fallback",
+        "inputs": "AdvectionTask 序列、OCMPreparedFrameResolver 與 BayTraceCPUKernels",
+        "outputs": "依來源順序 scatter 的 ParticleState／SamplingError 與 native／fallback counters",
+        "entrypoints": ["PreparedBayTraceFrame", "NativeBayTraceBatchAdvector"],
+        "read_first": (
+            "batcher 只處理確定性平流一步；active compaction、identity-safe scatter 與未支援"
+            "task 的舊路徑由既有 ProductionBatch／engine 保留，不能在 adapter 內重建生命週期。"
+        ),
+        "baytrace_integration": (
+            "直接呼叫 PI BayTrace CPU batch kernel，僅補上 LBT AdvectionTask 與 frame resolver"
+            "的轉接；原版不支援時明示退回既有 LBT deterministic executor。"
         ),
     },
     "production": {
@@ -1302,11 +1357,19 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "pilot_calibration", "target": "pilot_config", "label": "candidate evidence"},
     {"source": "pilot_config", "target": "runtime", "label": "generated pilot config"},
     {"source": "runtime", "target": "forcing_window", "label": "RuntimeRequestFactory"},
+    {"source": "runtime", "target": "baytrace_batch_advection", "label": "明示原版 CPU 平流"},
+    {"source": "runtime", "target": "baytrace_ocm_adapter", "label": "OCM frame resolver"},
     {"source": "ocm_reconstruction", "target": "forcing_window", "label": "registered sparse patch"},
     {"source": "forcing_window", "target": "run_control", "label": "UTC forcing window"},
     {"source": "run_control", "target": "production", "label": "run controller"},
     {"source": "runner", "target": "production", "label": "RunUnit shard"},
     {"source": "batch_state", "target": "production", "label": "SoA active state"},
+    {"source": "production", "target": "advection", "label": "ProductionBatch deterministic task"},
+    {"source": "advection", "target": "integrators", "label": "確定性 RK4"},
+    {"source": "baytrace_ocm_adapter", "target": "forcing_window", "label": "ManagedForcingProvider frame"},
+    {"source": "baytrace_batch_advection", "target": "baytrace_native_cpu", "label": "原版 CPU kernel"},
+    {"source": "baytrace_batch_advection", "target": "baytrace_ocm_adapter", "label": "prepared OCM frame"},
+    {"source": "baytrace_batch_advection", "target": "advection", "label": "AdvectionTask／legacy fallback"},
     {"source": "production", "target": "engine", "label": "ProductionBatch → shared engine"},
     {"source": "forcing", "target": "engine", "label": "速度樣本"},
     {"source": "stokes", "target": "forcing", "label": "Stokes 漂流"},

@@ -1713,7 +1713,7 @@ def test_missing_or_nonfinite_context_omitted_from_event_and_roundtrips(
 
         raise SamplingError("/not-a-real-path/private", SampleQC.TIME_GAP, context=context)
 
-    monkeypatch.setattr("lagrangian_backtracking.engine.split_rk4_brownian_step", fail_step)
+    monkeypatch.setattr("lagrangian_backtracking.engine.execute_advection_task", fail_step)
     execution = initialize_particle_execution(_state(), _settings())
     rng = np.random.Generator(np.random.PCG64DXSM(12))
     advance_particle_once(
