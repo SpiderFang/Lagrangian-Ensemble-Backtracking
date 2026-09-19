@@ -211,6 +211,8 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 ### BayTrace 原版 CPU 批次（Q4）
 
+固定五站純流100顆展示使用 `scripts/run_current100_subset.py --help`：先由既有 `run-create --run-kind formal --experiment-case no_stokes` 建立新的完整計畫，再把新／來源工作區、設定、forcing、checkpoint、NFS scratch／log／cache、儲存驗證快照及 `--expected-commit` 交給腳本。預設僅準備；經核准加 `--execute` 才以五個持續 `run-worker` 各跑兩片。腳本固定選取 gongliao、guishan、hsinchu、lienchiang、nanwan 各站最早指定鋁材的全部20受體，各站到達UTC與ID記入新log session的 `demo-manifest.json`；不同站不宣稱同時間配對，不改原計畫／seed／dt／H30／沉降／擴散。五項thread限制均為1，MemAvailable低於30GiB或不可觀測時停止，對本次子程序SIGINT等待300秒再有界收尾。`events.jsonl` 記錄PID、CPU累積秒、RSS、步數、checkpoint序列及逐站原版完成證據；工程例外使子集失敗，真實資料QC原樣保留。整機elapsed直接使用單一操作程序時鐘，不能相加worker時間。僅100選取子集可完成，完整50,000情境run仍未完成，不呼叫全量aggregate或以圖宣稱正式成果。
+
 `run-reconcile` 在取得 run 排他鎖後，每次操作只完整讀取一次情境表與進度、驗證一次 checkpoint run 目錄結構，並建立該次操作的不可變分片索引。每個分片的範圍／hash、checkpoint binding／checksum、孤立世代／重放與輸出驗證均保留；採認狀態時仍在 progress 鎖內重讀最新進度。快照不跨操作保存，worker 與只讀 `validate_run` 路徑維持原有驗證。此項改善移除大量分片的重複讀取，不改變數值、seed、設定或 checkpoint／輸出契約；需採認多片狀態時仍有逐次進度發布成本。
 
 明示 `execution.advection_backend: baytrace_native_cpu_v1` 時，runtime 對純流／流波均設定 `require_native=True`。未支援的場資料轉接拋出可恢復工程例外，不能藉粒子數值失敗早停宣稱完成；真實資料 QC 保留原分類。報告分列原版嘗試／成功／拒絕步數、拒絕理由與群組大小直方圖，逐片保存計數增量；僅有正的 native 步數不足以通過驗收，尚須真實推進、零工程拒絕／舊核心補算及原版來源與批次證據。舊後端、步長、擴散、亂數與 checkpoint 契約維持原樣；流波可用性需由對應轉接測試確認。
