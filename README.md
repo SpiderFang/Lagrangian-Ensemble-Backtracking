@@ -219,6 +219,8 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 明示 `execution.advection_backend: baytrace_native_cpu_v1` 時，runtime 對純流／流波均設定 `require_native=True`。未支援的場資料轉接拋出可恢復工程例外，不能藉粒子數值失敗早停宣稱完成；真實資料 QC 保留原分類。報告分列原版嘗試／成功／拒絕步數、拒絕理由與群組大小直方圖，逐片保存計數增量；僅有正的 native 步數不足以通過驗收，尚須真實推進、零工程拒絕／舊核心補算及原版來源與批次證據。舊後端、步長、擴散、亂數與 checkpoint 契約維持原樣；流波可用性需由對應轉接測試確認。
 
+有限水深波浪採 `finite_depth_node_fields_v1`：以既有有限水深公式先在OCM兩端UTC的濕節點／垂向層組成總u/v，再用原版內插及RK4，沉降只加入一次。這與舊粒子／RK4 stage取樣有離散差異，不能宣稱軌跡完全等價；512MiB場快取上限也不是整個程序RSS上限。`scripts/run_native_wave_trial.py --help` 提供新正式H30/M1波浪計畫的單片一次掃描小試，保留原H30／dt／seed、靜態及逐片驗證，並以獨立程序群組與30GiB可用記憶體保護取得可續跑檢查點、來源與原版計數。小試通過不等於完整計算或科學驗收；其操作腳本可放NFS package並保存SHA，數值checkout保持核准commit乾淨不變。
+
 來源根目錄用 `LBT_BAYTRACE_ROOT`，外部快取用 `NUMBA_CACHE_DIR`；缺少來源或 OCM frame resolver 會明確失敗。啟用方式、限制與詳細測速表見[BayTrace CPU 對照](docs/development/baytrace_native_cpu_comparison.md)。
 
 相關繁中註解檔案：`advection.py`、`engine.py`、`production.py`、`config.py`、`runtime.py`、`run_control.py`；完整分工見上述文件。

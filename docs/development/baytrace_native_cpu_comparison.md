@@ -89,8 +89,8 @@ CPU batcher 後，在此 synthetic case 的可重現性與 wall time。
 
 兩組 wall time 的算術比值約為 2.6×。歷史 Q2 direct-core 的 139× 只代表核心對照，
 不能外推成完整 `ProductionBatch`、完整 SERVER I/O 或 full-run throughput；本結果也不
-代表已完成 SERVER／真實 forcing 驗證。NWW Stokes 與其他未支援形狀仍維持既有
-legacy fallback 並計數，混合路徑不能標成完整原版 BayTrace。
+代表已完成 SERVER／真實 forcing 驗證。該歷史版本曾允許 NWW Stokes 與未支援形狀
+退回舊核心並計數；這不是下述目前嚴格原版接線的行為，舊測速不能當作波浪證據。
 
 ## Q4 runtime 接線與解讀邊界
 
@@ -102,12 +102,20 @@ source tree 之外的 temporary directory。實際 source SHA-256、環境值、
 粒子步與 batch 計數，以及 resolver report 會寫入
 `run_metadata.advection_execution`，並標註單次 shard invocation scope。
 
-這條 runtime 路徑只涵蓋 OCM current 加定值沉降的 native frame。NWW Stokes 與其他
-未支援 task 仍由既有 LBT deterministic fallback 處理並計數；混合路徑不可標成完整
-BayTrace。Q4 wiring 不改歷史 comparison evidence，也不表示全部 BayTrace tracker、
-相同速度、full-run throughput 或 SERVER 驗證已完成。上節 Q3 結果是獨立的 synthetic
-完整 `ProductionBatch` 生命週期證據；它不改寫 Q2 歷史 direct-core 對照，也不能外推到
-SERVER／真實 forcing 或 no-Stokes 以外的 native 物理範圍。
+目前此後端對純流與有限水深波浪均使用 `require_native=True`。波浪政策
+`finite_depth_node_fields_v1` 在 OCM 的兩端UTC、有效濕節點及垂向層上，以既有
+有限水深公式計算 NWW3 Stokes 水平速度，先組成總 u/v，再交原版內插及批次 RK4；
+沉降只加一次。這與舊版每個粒子／RK4階段取樣波浪參數的離散方法不同，不能宣稱
+軌跡完全等價；上述純流合成測速也不是此波浪方法的誤差或實機吞吐估計。
+
+工程不支援直接拋出可恢復例外，不改用舊核、不偽裝成粒子數值停止。真實乾點、域外、
+時間等品質狀態仍逐項保存。512MiB場快取上限不是程序RSS上限，月份資料與建場暫存
+另占記憶體。真資料小試使用 `scripts/run_native_wave_trial.py --help`，只對新正式
+H30/M1完整計畫的一個明示分片做一次掃描並保存檢查點，不縮短科學回溯窗；
+控制器仍完成靜態繫結與逐片驗證，外層保留單執行緒、30GiB可用記憶體與SIGINT停等。
+小試紀錄分開保存設定／來源、程式與操作腳本SHA、準備及步進含檢查點時間、原版完成／
+補算計數和群組大小。首次編譯與步進尚未分離時不把整段耗時稱為純核心速度。
+小試通過不等於完整H30計算、波浪科學驗收或獨立驗證完成。
 
 ## Q4 入口與繁中註解檔案
 
