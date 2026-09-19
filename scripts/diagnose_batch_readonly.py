@@ -1,0 +1,216 @@
+"""在獨立程序記憶體重現單片步進；不發布輸出、不寫檢查點或原執行進度。
+
+此入口只供有界診斷，不是正式成果。數值模組必須來自明示的乾淨版本；原種子、
+亂數狀態、流場、步長與原版批次平流器均保留。逾時只終止本入口建立的程序群組。
+"""
+
+from __future__ import annotations
+
+import argparse
+import cProfile
+import faulthandler
+import json
+import os
+import pstats
+import signal
+import subprocess
+import sys
+import time
+from contextlib import suppress
+from dataclasses import asdict
+from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
+
+
+def digest(path):
+    """計算明示小型來源檔的位元組雜湊；不展開整批歷史軌跡。"""
+    return sha256(Path(path).read_bytes()).hexdigest()
+
+
+def emit(stage, **values):
+    """即時輸出階段與世界協調時間，避免卡住時緩衝區吞掉定位證據。"""
+    print(json.dumps(dict(stage=stage, utc=datetime.now(UTC).isoformat(), **values),
+                     ensure_ascii=False), flush=True)
+
+
+def build_batch(controller, shard_id, checkpoint, batch_class):
+    """只建構記憶體批次；續接時由既有載入器驗證指定檢查點及恢復原亂數。
+
+    不使用控制器的 run_shard、restore 或 reconcile，也不取得發布用鎖。
+    平流器不可省略，否則重現會錯誤回到逐粒子舊核心。
+    """
+    shard = controller._shard(shard_id)
+    if controller.advection_batcher is None:
+        raise ValueError("診斷必須注入原執行的批次平流器")
+    binding = controller._binding(shard)
+    options = dict(shard=shard, master_seed=controller.plan['master_seed'],
+                   random_stream_id=controller.plan.get('random_stream_id'),
+                   request_factory=controller.request_factory,
+                   active_chunk_size=controller.plan.get('active_chunk_size'),
+                   advection_batcher=controller.advection_batcher)
+    emit('binding', binding=asdict(binding), checkpoint=str(checkpoint) if checkpoint else None)
+    if checkpoint is not None:
+        return batch_class.from_checkpoint(checkpoint, expected_binding=binding, **options)
+    return batch_class(**options)
+
+
+def summarize(batch, sweep, started):
+    """只彙總粒子已完成步數、年齡秒及模型時間，不輸出位置或整份軌跡。"""
+    executions = [runtime.execution for runtime in batch.runtimes]
+    steps = [item.step_count for item in executions]
+    ages = [item.state.age_seconds for item in executions]
+    times = [item.state.time_utc_ns for item in executions]
+    emit('advance', sweep=sweep, elapsed_seconds=time.monotonic() - started,
+         particle_steps=sum(steps), step_min=min(steps), step_max=max(steps),
+         age_seconds_min=min(ages), age_seconds_max=max(ages),
+         model_utc_ns_min=min(times), model_utc_ns_max=max(times), terminal=batch.terminal)
+
+
+def worker(args):
+    """開啟唯讀控制器並最多逐次推進指定掃描數；結果只留在診斷目錄。
+
+    靜態驗證、建構／載入與實際步進分開計時。定時堆疊涵蓋所有階段；只有正常
+    返回才能產生函式累計耗時摘要，逾時則保留標準錯誤的原始堆疊。
+    """
+    sys.path.insert(0, str(args.project_root / 'src'))
+    import lagrangian_backtracking.cli as cli
+    import lagrangian_backtracking.production as production
+
+    for module in (cli, production):
+        path = Path(module.__file__).resolve()
+        if not path.is_relative_to((args.project_root / 'src').resolve()):
+            raise ValueError("數值模組來源不是明示版本")
+        emit('module_source', module=module.__name__, path=str(path), sha256=digest(path))
+    start = time.monotonic()
+    emit('setup_start')
+    controller = cli.open_worker_controller(
+        args.workspace, config_path=args.config, ocm_native_root=args.ocm_native_root,
+        ocm_reconstruction_root=args.ocm_reconstruction_root,
+        checkpoint_root=args.checkpoint_root, continuous_time_fallback=True)
+    emit('setup_complete', elapsed_seconds=time.monotonic() - start)
+    restore_start = time.monotonic()
+    emit('restore_start' if args.checkpoint else 'initialization_start')
+    batch = build_batch(controller, args.shard_id, args.checkpoint, production.ProductionBatch)
+    emit('batch_ready', restore_seconds=time.monotonic() - restore_start,
+         from_checkpoint=args.checkpoint is not None)
+    advance_start = time.monotonic()
+    summarize(batch, 0, advance_start)
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        for sweep in range(1, args.max_sweeps + 1):
+            if batch.terminal:
+                break
+            batch.advance(1)
+            if sweep % 10 == 0 or batch.terminal:
+                summarize(batch, sweep, advance_start)
+    finally:
+        profiler.disable()
+        with (args.output / 'profile-top.txt').open('x') as stream:
+            pstats.Stats(profiler, stream=stream).sort_stats('cumulative').print_stats(30)
+    emit('diagnostic_return', elapsed_seconds=time.monotonic() - start,
+         native_report=controller.advection_reporter(), formal_result=False)
+    return 0
+
+
+def stop_owned(process):
+    """硬逾時只清理由 Popen 新建且群組編號等於自身PID的診斷子程序。
+
+    不接受任意PID、不搜尋模型程序；程序若已結束即不送訊號，避免誤觸PID重用。
+    """
+    if process.poll() is None:
+        if os.getpgid(process.pid) != process.pid or process.pid == os.getpgrp():
+            raise RuntimeError("診斷程序群組身分不符，拒絕送訊號")
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=15)
+
+
+def main(argv=None):
+    """建立唯一NFS診斷目錄及單一子程序，保存来源證據並限制總時長120–180秒。"""
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ('workspace', 'config', 'project-root', 'checkpoint-root', 'ocm-native-root',
+                 'ocm-reconstruction-root', 'output'):
+        parser.add_argument('--' + name, required=True, type=Path)
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--shard-id', required=True)
+    parser.add_argument('--expected-commit', required=True)
+    parser.add_argument('--max-sweeps', type=int, default=1000)
+    parser.add_argument('--timeout-seconds', type=int, default=150)
+    parser.add_argument('--internal-worker', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if not 1 <= args.max_sweeps <= 1000 or not 120 <= args.timeout_seconds <= 180:
+        raise ValueError("診斷只允許1–1000次掃描及120–180秒硬上限")
+    if args.internal_worker:
+        return worker(args)
+    output = args.output.resolve()
+    # 操作證據不能放進受根目錄白名單約束的原run、檢查點或計算checkout。
+    if not output.is_relative_to(Path('/data/LBT/operations')):
+        raise ValueError("診斷輸出必須在NFS operations下")
+    for protected in (args.workspace, args.checkpoint_root, args.project_root):
+        if output.is_relative_to(protected.resolve()):
+            raise ValueError("不得將診斷輸出放進原執行資料或程式")
+    actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.project_root,
+                                     text=True).strip()
+    dirty = subprocess.check_output(['git', 'status', '--porcelain'], cwd=args.project_root,
+                                    text=True).strip()
+    if actual != args.expected_commit or dirty:
+        raise ValueError("診斷來源必須為核准乾淨版本")
+    plan_path = args.workspace / 'run_plan.json'
+    plan = json.loads(plan_path.read_text())
+    if plan['experiment_case_id'] != 'no_stokes':
+        raise ValueError("本入口限此次純流診斷")
+    if args.checkpoint and not args.checkpoint.resolve().is_relative_to(args.checkpoint_root.resolve()):
+        raise ValueError("檢查點不在明示唯讀根目錄")
+    output.mkdir(parents=True, exist_ok=False)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(args.project_root / 'src'))
+    for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                'NUMEXPR_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+        env[key] = '1'
+    for key in ('TMPDIR', 'TMP', 'TEMP', 'NUMBA_CACHE_DIR', 'MPLCONFIGDIR',
+                'XDG_CACHE_HOME', 'UV_CACHE_DIR'):
+        path = output / key.lower()
+        path.mkdir()
+        env[key] = str(path)
+    command = [sys.executable, '-u', str(Path(__file__).resolve()),
+               *(argv if argv is not None else sys.argv[1:]), '--internal-worker']
+    evidence = dict(policy='READ_ONLY_IN_MEMORY_DIAGNOSTIC_NOT_RESULTS', actual_commit=actual,
+                    project_root=str(args.project_root), script_sha256=digest(__file__),
+                    plan_sha256=digest(plan_path), run_id=plan['run_id'], shard_id=args.shard_id,
+                    checkpoint=str(args.checkpoint) if args.checkpoint else None,
+                    checkpoint_sha256=(digest(args.checkpoint / 'checkpoint.json')
+                                       if args.checkpoint else None),
+                    command=command)
+    with (output / 'provenance.json').open('x') as stream:
+        json.dump(evidence, stream, ensure_ascii=False, indent=2)
+    process = None
+    started = time.monotonic()
+    timed_out = False
+    try:
+        with (output / 'stdout.jsonl').open('x') as stdout, (output / 'stacks.stderr').open('x') as stderr:
+            process = subprocess.Popen(command, cwd=args.project_root, env=env,
+                                       stdout=stdout, stderr=stderr, start_new_session=True)
+            emit('diagnostic_started', pid=process.pid, output=str(output))
+            with (output / 'pid.json').open('x') as stream:
+                json.dump(dict(pid=process.pid, pgid=process.pid), stream)
+            try:
+                process.wait(timeout=args.timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+    finally:
+        if process is not None:
+            stop_owned(process)
+    with (output / 'result.json').open('x') as stream:
+        json.dump(dict(timed_out=timed_out, returncode=process.returncode,
+                       elapsed_seconds=time.monotonic() - started,
+                       plan_sha256_after=digest(plan_path), formal_result=False), stream)
+    return 124 if timed_out else process.returncode
+
+
+if __name__ == '__main__':
+    # 在數值套件匯入、靜態驗證及載入前就啟用；不需要附加正在跑的模型程序。
+    if '--internal-worker' in sys.argv:
+        faulthandler.enable()
+        faulthandler.dump_traceback_later(15, repeat=True)
+    raise SystemExit(main())

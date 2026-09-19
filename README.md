@@ -241,6 +241,22 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 閱讀順序建議是先看本頁的限制，再看資料契約與科學方法，最後依 CLI 參考或 SERVER 執行手冊操作。歷史 audit、Phase／Slice 文件可追溯決策，但不得用其中的舊「下一步」句子推定今天的部署或資料狀態。
 
+### 有界唯讀步進診斷
+
+`scripts/diagnose_batch_readonly.py` 只在新的獨立程序記憶體中重現指定純流分片，
+不是正式計算或成果。必須明示 `--project-root`、`--expected-commit`、`--workspace`、
+`--config`、`--checkpoint-root`、`--ocm-native-root`、`--ocm-reconstruction-root`、
+`--shard-id` 與唯一 `--output`（位於 NFS operations 的診斷目錄）；
+有檢查點時另外明示 `--checkpoint`。使用原版本環境的 Python 啟動獨立腳本，
+不將腳本複製進計算 checkout。原 BayTrace 根目錄由既有 `LBT_BAYTRACE_ROOT` 保留。
+
+最多 `--max-sweeps 1000`，`--timeout-seconds` 限120–180秒；子程序每15秒輸出
+非附加式 Python 堆疊，每10次掃描彙總已完成步數與年齡。保留原種子、檢查點亂數、
+步長、物理及批次平流器，不呼叫控制器執行／恢復／調和流程，也不發布軌跡或新檢查點。
+所有暫存與快取另置診斷目錄、五種執行緒限制均為1；硬逾時只清理診斷自建群組。
+`provenance.json`、`pid.json`、`stdout.jsonl`、`stacks.stderr`、`result.json` 是診斷證據，
+正常返回另有 `profile-top.txt`。原進度可能由既有worker正常更新，不能把它當成診斷寫入。
+
 ## 8. 方法與不採用範圍
 
 1. 本專案沿用 BayTrace 可對應的工程思路：CPU SoA／batch／chunk、每粒子可重現亂數、triangle hint、可暫停 engine 與可驗證 I/O；不承諾整包 tracker output 的格式或物理範圍，也不把 BayTrace 的工程參照當成本案科學驗證。
