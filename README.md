@@ -211,6 +211,8 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 ### BayTrace 原版 CPU 批次（Q4）
 
+純流逐站出圖：`build_completed_subset_preview.py --current100-site SITE` 配合該站兩個 `--shard`，在該站20顆完成後輸出四張PNG，沿用完整單片輸出驗證；站名取目前設定，五站到達UTC分別標示。尚未完成時可用 `build_current100_checkpoint_preview.py --run RUN --checkpoint-root CHECKPOINT --config CONFIG --project-root CODE --site SITE --output NEW_OUTPUT` 讀取該站目前已發布checkpoint，先提供水平／垂向未完成軌跡圖與位置快照。只畫已保存粒子，分母明示已保存數／站20／總選取100；不補線、不縮短H30、不將當前末端或資料QC當成來源認定。圖檔與快照須放在新的成果目錄，不改運算checkout或原run。
+
 固定五站純流100顆展示使用 `scripts/run_current100_subset.py --help`：先由既有 `run-create --run-kind formal --experiment-case no_stokes` 建立新的完整計畫，再把新／來源工作區、設定、forcing、checkpoint、NFS scratch／log／cache、儲存驗證快照及 `--expected-commit` 交給腳本。預設僅準備；經核准加 `--execute` 才以五個持續 `run-worker` 各跑兩片。腳本固定選取 gongliao、guishan、hsinchu、lienchiang、nanwan 各站最早指定鋁材的全部20受體，各站到達UTC與ID記入新log session的 `demo-manifest.json`；不同站不宣稱同時間配對，不改原計畫／seed／dt／H30／沉降／擴散。五項thread限制均為1，MemAvailable低於30GiB或不可觀測時停止，對本次子程序SIGINT等待300秒再有界收尾。`events.jsonl` 記錄PID、CPU累積秒、RSS、步數、checkpoint序列及逐站原版完成證據；工程例外使子集失敗，真實資料QC原樣保留。整機elapsed直接使用單一操作程序時鐘，不能相加worker時間。僅100選取子集可完成，完整50,000情境run仍未完成，不呼叫全量aggregate或以圖宣稱正式成果。
 
 `run-reconcile` 在取得 run 排他鎖後，每次操作只完整讀取一次情境表與進度、驗證一次 checkpoint run 目錄結構，並建立該次操作的不可變分片索引。每個分片的範圍／hash、checkpoint binding／checksum、孤立世代／重放與輸出驗證均保留；採認狀態時仍在 progress 鎖內重讀最新進度。快照不跨操作保存，worker 與只讀 `validate_run` 路徑維持原有驗證。此項改善移除大量分片的重複讀取，不改變數值、seed、設定或 checkpoint／輸出契約；需採認多片狀態時仍有逐次進度發布成本。

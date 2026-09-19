@@ -59,6 +59,31 @@ def test_fixed_selected_groups_are_read_only():
     assert values == before
 
 
+def test_current_site_requires_exact_preselected_completed_pair(monkeypatch):
+    """純流逐站擷取仍要求事前固定兩片；不以其他已完成片替代。"""
+    from dataclasses import make_dataclass
+
+    import test_current100_operator as current_tests
+
+    plan, rows = current_tests.fixture_plan()
+    keys = list(rows[0])
+    record = make_dataclass("PreviewScenario", [(key, object) for key in keys])
+    scenarios = [record(**{key: row.get(key) for key in keys}) for row in rows]
+    shards = [SimpleNamespace(shard_id=s["shard_id"],
+                              scenarios=scenarios[s["scenario_start_index"]:s["scenario_stop_index"]])
+              for s in plan["shards"]]
+    receptors = [SimpleNamespace(receptor_id=s.receptor_id, study_site_id=s.study_site_id)
+                 for s in scenarios[:100]]
+    progress = {"shards": {s.shard_id: {"lifecycle": "COMPLETE"} for s in shards}}
+    selected = preview.select_current_site(plan, scenarios, shards, progress, receptors,
+                                           ["sh-8", "sh-9"], "nanwan")
+    assert len(selected["nanwan"]) == 20
+    progress["shards"]["sh-9"]["lifecycle"] = "RUNNING"
+    with pytest.raises(ValueError):
+        preview.select_current_site(plan, scenarios, shards, progress, receptors,
+                                    ["sh-8", "sh-9"], "nanwan")
+
+
 @pytest.mark.parametrize(
     "damage", ["incomplete", "mixed_site", "mixed_material", "mixed_arrival", "duplicate", "unknown"]
 )

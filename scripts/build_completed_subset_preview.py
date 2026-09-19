@@ -1,4 +1,4 @@
-"""唯讀擷取指定完成分片，製作非正式整批驗收的兩站成果圖。
+"""唯讀擷取指定完成分片，製作非正式整批驗收的站點成果圖。
 
 輸入為原始 formal/full run、同一設定與海岸檔；只驗指定 trajectory 的全部
 checksum、內容與身分，不讀 checkpoint 或 forcing，也不修改 run_kind、選擇模式、
@@ -203,10 +203,33 @@ def panel_counts(particles):
     }
 
 
-def collect_subset(run: Path, config_path: Path, coastline: Path, shard_ids: list[str]):
+def select_current_site(plan, scenarios, shards, progress, receptors, requested_ids, site):
+    """重用100顆操作入口的事前選樣，僅在該站完整兩片已完成時取圖。
+
+    不依完成先後重選時間或受體；其他四站仍可運算，無須等全run完成。
+    """
+    path = Path(__file__).with_name("run_current100_subset.py")
+    spec = importlib.util.spec_from_file_location("current100_selection", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    selected = module.select_shards(plan, [asdict(s) for s in scenarios])
+    if site not in selected or len(requested_ids) != 2 or set(requested_ids) != set(selected[site]):
+        raise ValueError("必須指定固定純流站點的完整兩片")
+    values = [s for sh in shards if sh.shard_id in requested_ids for s in sh.scenarios]
+    expected = {r.receptor_id for r in receptors if r.study_site_id == site}
+    if (len(values) != 20 or len(expected) != 20
+            or {s.receptor_id for s in values} != expected
+            or any(progress["shards"][sid]["lifecycle"] != "COMPLETE" for sid in requested_ids)):
+        raise ValueError("該站尚未完整完成20受體")
+    return {site: values}
+
+
+def collect_subset(
+    run: Path, config_path: Path, coastline: Path, shard_ids: list[str], *, current100_site=None
+):
     """建立小型、可重繪的來源快照，不建立 forcing，也不宣稱全批驗收。
 
-    全run只驗 immutable SHA、計畫／進度與靜態情境／seed繫結；只對指定四片進行
+    全run只驗 immutable SHA、計畫／進度與靜態情境／seed繫結；只對指定完成分片進行
     完整 output validator。原始檔案前後 hash 必須一致；可變 progress 只核對所選列
     未變，不阻止其他 worker 推進未選片。缺失環境值以 null 保存，圖面保留斷線。
     """
@@ -218,9 +241,9 @@ def collect_subset(run: Path, config_path: Path, coastline: Path, shard_ids: lis
         or plan["scenario_selection"]["mode"] != "full"
         or plan["members_per_scenario"] != 1
         or plan["scenario_count"] != 50000
-        or plan["experiment_case_id"] != "finite_depth_stokes"
+        or plan["experiment_case_id"] != ("no_stokes" if current100_site else "finite_depth_stokes")
     ):
-        raise ValueError("本展示只接受50,000情境formal/full/M1有限水深波浪案例")
+        raise ValueError("本展示只接受50,000情境formal/full/M1及明示的純流／有限水深波浪案例")
     initial_paths = [run / "run_plan.json", config_path, coastline, *(run / name for name in plan["files"])]
     before = _snapshot(initial_paths)
     errors = []
@@ -262,7 +285,11 @@ def collect_subset(run: Path, config_path: Path, coastline: Path, shard_ids: lis
         expected_scenarios.get(s.scenario_id) != s for s in scenarios
     ):
         raise ValueError("當前manifest重建情境與run不符")
-    groups = select_completed_groups(scenarios, shards, progress, inputs.receptors, shard_ids)
+    groups = (
+        select_current_site(plan, scenarios, shards, progress, inputs.receptors, shard_ids, current100_site)
+        if current100_site else
+        select_completed_groups(scenarios, shards, progress, inputs.receptors, shard_ids)
+    )
     if config.boundaries.max_backtrack_days != 30 or any(
         s.material_id != "oca_aluminum_crushed_cylinder" or s.settling_velocity_mps != -0.02
         for values in groups.values()
@@ -375,6 +402,10 @@ def collect_subset(run: Path, config_path: Path, coastline: Path, shard_ids: lis
             raise ValueError("圖面域框與正式flow不符")
         polygon = shape(record["geometry"])
         sites[site] = {
+            "study_site_name_zh": next(
+                s.study_site_name_zh for s in config.study_sites if s.study_site_id == site
+            ),
+            "analysis_region_id": records[0]["analysis_region_id"],
             "particles": records,
             "counts": counts,
             "center_lonlat": list(domain.center_lonlat),
@@ -397,12 +428,15 @@ def collect_subset(run: Path, config_path: Path, coastline: Path, shard_ids: lis
         "validation_scope": "selected_complete_outputs_only",
         "full_validation_deferred": True,
         "scope_note": SCOPE_NOTE,
-        "selection_rule": SELECTION_RULE,
+        "selection_rule": (
+            "事前固定五站各最早指定鋁材20受體，僅擷取該站完整兩片；不同站不同UTC"
+            if current100_site else SELECTION_RULE
+        ),
         "run_id": plan["run_id"],
         "run_kind": plan["run_kind"],
         "scenario_selection": plan["scenario_selection"],
         "total_run_scenarios": plan["scenario_count"],
-        "selected_particles": 40,
+        "selected_particles": sum(len(values) for values in groups.values()),
         "members_per_scenario": 1,
         "experiment_case_id": plan["experiment_case_id"],
         "config_hash": plan["config_hash"],
@@ -431,7 +465,7 @@ def _utc(ns):
 
 
 def render_subset(payload, output: Path, project_root: Path):
-    """由已驗證小型快照產生八張PNG，保留每個保存位置與缺值斷線。
+    """由已驗證小型快照每站產生四張PNG，保留每個保存位置與缺值斷線。
 
     重用 BayTrace 的配色、中文字型及排他存圖；另立標題與時間軸，因新設計的四條
     顏色是隨機垂向抽樣序位，不是舊固定物理水層。局部圖使用同一AEQD公尺座標與
@@ -502,14 +536,16 @@ def render_subset(payload, output: Path, project_root: Path):
         age_h = arrival["metadata"]["bed_residence_age_hours"]
         horizons = [p["timing"]["effective_horizon_seconds"] / 3600 for p in particles]
         durations = [p["actual_duration_seconds"] / 3600 for p in particles]
-        heading = f"A區{'貢寮' if site == 'gongliao' else '龜山島'}｜20個已完成沉降粒子"
+        site_label = data.get("study_site_name_zh", site)
+        heading = f"{data.get('analysis_region_id', '')}區{site_label}｜20個已完成沉降粒子"
+        wave_label = "純流，波浪關閉" if payload["experiment_case_id"] == "no_stokes" else "有限水深波浪開啟"
         meta = (
             f"沉底起點 {_utc(arrival['time_utc_ns'])} UTC；"
             f"觀測 {_utc(arrival['metadata']['observation_time_utc_ns'])} UTC\n"
             f"固定日曆窗30天；沉底停留 {age_h} 小時；"
             f"個別可回溯上限 {min(horizons):g}–{max(horizons):g} 小時；"
             f"實際保存軌跡 {min(durations):.2f}–{max(durations):.2f} 小時\n"
-            f"oca_aluminum_crushed_cylinder｜沉降速度 −0.02 m/s｜有限水深波浪開啟｜5水平位置×4垂向抽樣序位"
+            f"oca_aluminum_crushed_cylinder｜沉降速度 −0.02 m/s｜{wave_label}｜5水平位置×4垂向抽樣序位"
         )
         layer_handles = [
             Line2D([], [], color=colors[i], lw=2, label=f"垂向抽樣序位{i + 1}（5粒子）") for i in range(4)
@@ -674,10 +710,15 @@ def main() -> int:
     parser.add_argument("--shard", action="append", required=True)
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--current100-site", choices=("gongliao", "guishan", "hsinchu", "lienchiang", "nanwan")
+    )
     args = parser.parse_args()
     if args.output.exists() or args.output.is_symlink():
         raise FileExistsError("拒絕覆寫既有成果")
-    payload = collect_subset(args.run, args.config, args.coastline, args.shard)
+    payload = collect_subset(
+        args.run, args.config, args.coastline, args.shard, current100_site=args.current100_site
+    )
     args.output.mkdir(parents=True, exist_ok=False)
     _write_json(args.output / "render_inputs.json", payload)
     files = render_subset(payload, args.output, args.project_root)
@@ -698,15 +739,17 @@ def main() -> int:
     with (args.output / "README.md").open("x", encoding="utf-8") as stream:
         stream.write(
             "# M1 部分完成情境展示\n\n" + SCOPE_NOTE + "。\n\n"
-            "來源維持 formal/full；只完整驗證所選四個 COMPLETE output，未做整批 checkpoint／歷史驗收。\n\n"
-            + SELECTION_RULE
-            + "。各站20受體（5水平×4隨機垂向抽樣），共40／全run50,000情境。\n\n"
-            "顏色是抽樣序位，不是固定物理水層。波浪開啟；M=1僅一成員。\n"
+            "來源維持 formal/full；只完整驗證所選 COMPLETE output，未做整批 checkpoint／歷史驗收。\n\n"
+            + payload["selection_rule"]
+            + f"。各站20受體（5水平×4隨機垂向抽樣），本圖{payload['selected_particles']}"
+            "／全run50,000情境。\n\n"
+            + f"案例：{payload['experiment_case_id']}；不同站到達時間各自明示，不宣稱同時配對。\n"
+            "顏色是抽樣序位，不是固定物理水層；M=1僅一成員。\n"
             "固定日曆窗以觀測錨點向前30天；扣除沉底停留後得到個別上限，實際線長由停止狀態決定。\n"
             "只連接所有保存位置，無補值、延長、平滑。海面／海床缺值保留斷線，不讀forcing。\n"
             "幾何工程生成狀態照原始metadata保存，不提升為approved。停止位置不代表污染來源。\n\n"
             "render_inputs.json 保存所有繪圖位置、受體／時間／seed身分與小型來源快照；"
-            "manifest.json保存四片checksum、前後來源SHA與每張圖checksum。\n"
+            "manifest.json保存所選分片checksum、前後來源SHA與每張圖checksum。\n"
         )
     print(json.dumps({"output": str(args.output), "png_count": len(files), "source_unchanged": True}))
     return 0
