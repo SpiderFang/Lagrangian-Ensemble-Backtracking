@@ -125,8 +125,19 @@ _FORCING_CACHE_STATS_STATUS_UNAVAILABLE = "unavailable_due_to_reporter_error"
 _ADVECTION_BATCH_COUNTER_KEYS = frozenset(
     {
         "native_particle_steps",
+        "native_attempted_particle_steps",
+        "native_completed_particle_steps",
+        "native_rejected_particle_steps",
         "native_batch_calls",
         "fallback_particle_steps",
+    }
+)
+# 這兩個根層 mapping 是 batcher 的累計事件計數：不能把第二個 shard 的目前值
+# 直接寫入 invocation metadata，否則同一個 persistent worker 會重複計入前一片。
+_ADVECTION_BATCH_MAPPING_COUNTER_KEYS = frozenset(
+    {
+        "native_rejected_reasons",
+        "group_size_histogram",
     }
 )
 # Q3 resolver report 的事件計數器只存在 ``resolver_report`` 這個已知 mapping 下；其餘
@@ -145,6 +156,7 @@ _ADVECTION_RESOLVER_COUNTER_KEYS = frozenset(
         "bracket_queries",
         "time_fallback_count",
         "fallback_count",
+        "cache_warmup_builds",
     }
 )
 _ADVECTION_RESOLVER_REPORT_KEY = "resolver_report"
@@ -2769,6 +2781,30 @@ class RunController:
         return delta
 
     @staticmethod
+    def _advection_mapping_counter_delta(
+        current: Mapping[str, Any], baseline: Mapping[str, Any], *, path: str
+    ) -> dict[str, Any]:
+        """對已登錄的根層事件 mapping 逐項取 delta，保留未知值而不猜測語意。
+
+        ``native_rejected_reasons`` 與 ``group_size_histogram`` 的 key 會隨資料而變，
+        但其 value 在 batcher 契約中都是 process 生命週期內單調增加的整數計數。
+        只處理這兩個明示路徑；其他 mapping 仍由上層當作 metadata 原樣保存。
+        """
+
+        delta: dict[str, Any] = {}
+        for key, value in current.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                delta[key] = RunController._advection_integer_delta(
+                    value,
+                    baseline,
+                    key,
+                    path=f"{path}.{key}",
+                )
+            else:
+                delta[key] = deepcopy(value)
+        return delta
+
+    @staticmethod
     def _advection_counter_delta(
         current: Mapping[str, Any], baseline: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -2786,6 +2822,16 @@ class RunController:
                     value,
                     baseline,
                     key,
+                    path=key,
+                )
+                continue
+            if key in _ADVECTION_BATCH_MAPPING_COUNTER_KEYS and isinstance(value, Mapping):
+                previous_mapping = baseline.get(key)
+                if not isinstance(previous_mapping, Mapping):
+                    previous_mapping = {}
+                delta[key] = RunController._advection_mapping_counter_delta(
+                    value,
+                    previous_mapping,
                     path=key,
                 )
                 continue

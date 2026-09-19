@@ -2459,7 +2459,14 @@ class RuntimeRequestFactory:
                 "ManagedForcingProvider 綁定契約一致"
             ) from exc
         self._advection_resolver = resolver
-        self.advection_batcher = NativeBayTraceBatchAdvector(kernels, resolver)
+        # 純流與流波均由原版 BayTrace 批次四階 Runge-Kutta 法（RK4）推進。
+        # 未支援的場資料轉接由批次器拋出工程例外，保留可恢復狀態；不可轉成
+        # 粒子數值失敗停止，也不可呼叫舊平流核心補算。資料品質檢查仍保留原分類。
+        self.advection_batcher = NativeBayTraceBatchAdvector(
+            kernels,
+            resolver,
+            require_native=True,
+        )
 
     def advection_report(self) -> dict[str, Any]:
         """回傳本 factory／process 的平流後端與 native/fallback execution evidence。
@@ -2467,7 +2474,9 @@ class RuntimeRequestFactory:
         native counters 是同一 factory instance 生命週期內的累計值；RunController 會在
         每個 shard invocation 建立 baseline，再把輸出 metadata 標為該 invocation 的
         delta，避免續跑或跨 shard 把 process counter 冒充整個 run。legacy 回傳只含
-        backend 狀態，不虛構 native 粒子步數、批次數或 resolver 統計。
+        backend 狀態，不虛構 native 粒子步數、批次數或 resolver 統計。批次器新增的
+        嘗試／完成／拒絕計數、拒絕理由、群組大小直方圖與來源描述均原樣複製，缺少
+        證據時不推測成功；工程拒絕不能視為粒子正常停止或正式驗收通過。
         """
 
         if self.advection_batcher is None:
@@ -2486,7 +2495,10 @@ class RuntimeRequestFactory:
             raise TypeError("NativeBayTraceBatchAdvector.report() 必須回傳 mapping")
         if not isinstance(resolver_report, Mapping):
             raise TypeError("OCMPreparedFrameResolver.report() 必須回傳 mapping")
+        # 複製完整來源證據，僅由 factory 覆寫其負責的後端與程序範圍欄位；
+        # 不替舊版 reporter 補出尚未量測的成功數或嚴格模式宣告。
         result = {
+            **deepcopy(dict(batch_report)),
             "backend": ADVECTION_BACKEND_BAYTRACE_NATIVE_CPU_V1,
             "native_enabled": True,
             "counter_scope": "factory_process_cumulative_v1",

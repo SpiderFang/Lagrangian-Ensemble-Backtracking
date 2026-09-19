@@ -213,7 +213,7 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 `run-reconcile` 在取得 run 排他鎖後，每次操作只完整讀取一次情境表與進度、驗證一次 checkpoint run 目錄結構，並建立該次操作的不可變分片索引。每個分片的範圍／hash、checkpoint binding／checksum、孤立世代／重放與輸出驗證均保留；採認狀態時仍在 progress 鎖內重讀最新進度。快照不跨操作保存，worker 與只讀 `validate_run` 路徑維持原有驗證。此項改善移除大量分片的重複讀取，不改變數值、seed、設定或 checkpoint／輸出契約；需採認多片狀態時仍有逐次進度發布成本。
 
-只有明示 `execution.advection_backend: baytrace_native_cpu_v1` 才啟用原版 CPU 批次；舊設定維持既有路徑，LBT 的步長、QC、擴散、亂數、邊界、觀測與 checkpoint 生命週期不變。
+明示 `execution.advection_backend: baytrace_native_cpu_v1` 時，runtime 對純流／流波均設定 `require_native=True`。未支援的場資料轉接拋出可恢復工程例外，不能藉粒子數值失敗早停宣稱完成；真實資料 QC 保留原分類。報告分列原版嘗試／成功／拒絕步數、拒絕理由與群組大小直方圖，逐片保存計數增量；僅有正的 native 步數不足以通過驗收，尚須真實推進、零工程拒絕／舊核心補算及原版來源與批次證據。舊後端、步長、擴散、亂數與 checkpoint 契約維持原樣；流波可用性需由對應轉接測試確認。
 
 來源根目錄用 `LBT_BAYTRACE_ROOT`，外部快取用 `NUMBA_CACHE_DIR`；缺少來源或 OCM frame resolver 會明確失敗。啟用方式、限制與詳細測速表見[BayTrace CPU 對照](docs/development/baytrace_native_cpu_comparison.md)。
 

@@ -85,15 +85,17 @@ def test_advection_backend_default_preserves_old_hash_and_explicit_token_enters_
     assert explicit.config_hash() != old_hash
 
 
+@pytest.mark.parametrize("experiment_case_id", ["no_stokes", "finite_depth_stokes"])
 def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, experiment_case_id: str
 ) -> None:
-    """factory 明示 native 時建立 batcher，並保存 source/cache env 與實際 hash。"""
+    """純流／流波均強制原版批次器，且如實保留成功與工程拒絕的不同證據。"""
 
     data = _runtime_fixture_data()
     source_root = tmp_path / "baytrace-artifact"
     source_root.mkdir()
     (tmp_path / "ocm-native").mkdir()
+    (tmp_path / "nww-analysis").mkdir()
     monkeypatch.setenv("LBT_BAYTRACE_ROOT", str(source_root))
     monkeypatch.delenv("NUMBA_CACHE_DIR", raising=False)
 
@@ -114,9 +116,10 @@ def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
     class FakeBatcher:
         """只驗證 factory 接上 Q2 介面的最小 batcher。"""
 
-        def __init__(self, kernels: Any, resolver: Any) -> None:
+        def __init__(self, kernels: Any, resolver: Any, *, require_native: bool) -> None:
             self.kernels = kernels
             self.resolver = resolver
+            self.require_native = require_native
 
         def __call__(self, _tasks: Any) -> list[Any]:
             return []
@@ -130,6 +133,13 @@ def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
                 "native_batch_calls": 2,
                 "fallback_particle_steps": 1,
                 "max_group_size": 2,
+                "native_attempted_particle_steps": 4,
+                "native_completed_particle_steps": 3,
+                "native_rejected_particle_steps": 1,
+                "native_rejected_reasons": {"native_kernel_exception": 1},
+                "group_size_histogram": {"2": 2},
+                "counter_semantics": "native_steps_completed_only_v2",
+                "require_native": self.require_native,
             }
 
     def fake_loader(root: Path, cache_dir: Path) -> dict[str, Path]:
@@ -148,11 +158,12 @@ def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
         scenario_inputs=data["inputs"],
         geometries=data["geometries"],
         ocm_native_root=tmp_path / "ocm-native",
-        nww_analysis_root=None,
-        experiment_case_id="no_stokes",
+        nww_analysis_root=tmp_path / "nww-analysis" if experiment_case_id != "no_stokes" else None,
+        experiment_case_id=experiment_case_id,
     )
 
     assert isinstance(factory.advection_batcher, FakeBatcher)
+    assert factory.advection_batcher.require_native is True
     assert FakeResolver.init_kwargs == {
         "max_cached_frames": 2,
         "max_cached_bytes": 512 * 1024 * 1024,
@@ -167,6 +178,12 @@ def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
     assert source_root not in cache_path.parents
     assert report["source_sha256"] == {"geometry": "a" * 64}
     assert report["native_particle_steps"] == 3
+    for key in (
+        "native_attempted_particle_steps", "native_completed_particle_steps",
+        "native_rejected_particle_steps", "native_rejected_reasons",
+        "group_size_histogram", "counter_semantics", "require_native",
+    ):
+        assert report[key] == factory.advection_batcher.report()[key]
     assert report["resolver_report"]["native_frame_count"] == 0
 
 
@@ -270,7 +287,7 @@ def test_open_run_controller_passes_factory_batcher_reporter_and_keeps_time_fall
 def test_runtime_factory_real_source_and_synthetic_ocm_reach_native_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """真實 PI source 加 Q3 synthetic OCM frame 必須產生正的 native particle steps。"""
+    """真實 PI 來源與合成流場須形成多粒子群組並推進，工程拒絕不得當成完成。"""
 
     data = _runtime_fixture_data()
     source_root = Path(
@@ -310,13 +327,29 @@ def test_runtime_factory_real_source_and_synthetic_ocm_reach_native_steps(
     provider = HintTrackingVelocityProvider(managed, triangle_hint=0)
     task = q3_tests._task(provider)
     assert factory.advection_batcher is not None
-    result = factory.advection_batcher([task])[0]
-    assert result.__class__.__name__ == "ParticleState"
+    from dataclasses import replace
+
+    from numba.core.registry import CPUDispatcher
+
+    second_task = replace(task, state=replace(task.state, particle_id="p1"))
+    results = factory.advection_batcher([task, second_task])
+    for result in results:
+        assert result.__class__.__name__ == "ParticleState"
+        assert result.time_utc_ns != task.state.time_utc_ns
+        assert (result.x_m, result.y_m, result.z_m) != (
+            task.state.x_m, task.state.y_m, task.state.z_m
+        )
+    assert isinstance(factory.advection_batcher.kernels.batch_move_rk4, CPUDispatcher)
+    assert factory.advection_batcher.kernels.batch_move_rk4.signatures
 
     report = factory.advection_report()
     assert report["native_particle_steps"] > 0, report
     assert report["native_batch_calls"] > 0
     assert report["fallback_particle_steps"] == 0
+    assert report["native_rejected_particle_steps"] == 0
+    assert report["native_completed_particle_steps"] == 2
+    assert report["native_attempted_particle_steps"] == 2
+    assert report["group_size_histogram"] == {"2": 1}
     assert report["resolver_report"]["frame_builds"] > 0
     assert set(report["source_sha256"]) == {"geometry", "vertical", "random", "batch_interp"}
 
@@ -609,6 +642,52 @@ def test_advection_delta_uses_explicit_paths_for_nonzero_process_baseline() -> N
     regressed["resolver_report"]["frame_builds"] = 6
     with pytest.raises(ValueError, match="resolver_report.frame_builds"):
         RunController._advection_counter_delta(regressed, baseline)
+
+
+def test_native_report_new_counters_are_per_invocation_and_metadata_is_preserved() -> None:
+    """持久 worker 的第二片只保存新事件；拒絕理由與群組大小也需扣除前片累計。"""
+
+    baseline = {
+        "native_attempted_particle_steps": 10,
+        "native_completed_particle_steps": 8,
+        "native_rejected_particle_steps": 2,
+        "native_rejected_reasons": {"native_kernel_exception": 2},
+        "group_size_histogram": {"2": 5},
+        "resolver_report": {"cache_warmup_builds": 3},
+    }
+    current = {
+        "native_attempted_particle_steps": 14,
+        "native_completed_particle_steps": 11,
+        "native_rejected_particle_steps": 3,
+        "native_rejected_reasons": {"native_kernel_exception": 2, "frame_unavailable": 1},
+        "group_size_histogram": {"2": 6, "4": 1},
+        "resolver_report": {
+            "cache_warmup_builds": 4,
+            "field_policy": "ocm_wet_support_node_fields_v1",
+            "last_rejection_reason": "frame_unavailable",
+            "last_rejection_qc": None,
+            "include_stokes": False,
+        },
+        "require_native": True,
+        "counter_semantics": "native_steps_completed_only_v2",
+        "max_group_size": 4,
+        "source_metadata": {"native_attempted_particle_steps": 99},
+    }
+    delta = RunController._advection_counter_delta(current, baseline)
+    assert delta["native_attempted_particle_steps"] == 4
+    assert delta["native_completed_particle_steps"] == 3
+    assert delta["native_rejected_particle_steps"] == 1
+    assert delta["native_rejected_reasons"] == {"native_kernel_exception": 0, "frame_unavailable": 1}
+    assert delta["group_size_histogram"] == {"2": 1, "4": 1}
+    assert delta["resolver_report"] == {**current["resolver_report"], "cache_warmup_builds": 1}
+    for key in ("require_native", "counter_semantics", "max_group_size", "source_metadata"):
+        assert delta[key] == current[key]
+    for key, nested_key in (("native_rejected_reasons", "native_kernel_exception"),
+                            ("group_size_histogram", "2")):
+        regressed = deepcopy(current)
+        regressed[key][nested_key] = 0
+        with pytest.raises(ValueError, match="advection counter 不得倒退"):
+            RunController._advection_counter_delta(regressed, baseline)
 
 
 def test_legacy_controller_output_has_no_fake_native_metadata(tmp_path: Path) -> None:
