@@ -69,6 +69,46 @@ def test_missing_native_rejected():
         runner.build_batch(controller, 'selected', None, object)
 
 
+def test_worker_private_capability_and_native(monkeypatch, tmp_path):
+    """受控重現傳入既有私有能力，後續記憶體批次仍使用同一原版平流器。"""
+    import lagrangian_backtracking.cli as cli
+    import lagrangian_backtracking.production as production
+    from lagrangian_backtracking.runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
+
+    calls = {}
+    native = object()
+    controller = SimpleNamespace(
+        _shard=lambda identifier: identifier, _binding=lambda shard: Binding(),
+        plan=dict(master_seed=17, active_chunk_size=10), request_factory=object(),
+        advection_batcher=native, advection_reporter=lambda: {})
+
+    def open_controller(workspace, **kwargs):
+        """僅記錄控制器開啟契約，不讀寫真實執行目錄。"""
+        calls['open'] = kwargs
+        return controller
+
+    def batch(**kwargs):
+        """提供已終止記憶體狀態，使測試不執行物理或發布資料。"""
+        calls['batch'] = kwargs
+        state = SimpleNamespace(age_seconds=0.0, time_utc_ns=1)
+        execution = SimpleNamespace(step_count=0, state=state)
+        return SimpleNamespace(terminal=True, runtimes=[SimpleNamespace(execution=execution)])
+
+    monkeypatch.setattr(cli, 'open_worker_controller', open_controller)
+    monkeypatch.setattr(production, 'ProductionBatch', batch)
+    monkeypatch.setattr(runner.sys, 'path', list(runner.sys.path))
+    args = SimpleNamespace(project_root=Path(__file__).parents[1], workspace=tmp_path / 'original',
+                           config=tmp_path / 'config', ocm_native_root=tmp_path / 'ocm',
+                           ocm_reconstruction_root=tmp_path / 'patch',
+                           checkpoint_root=tmp_path / 'checkpoint', checkpoint=None,
+                           shard_id='selected', max_sweeps=1, output=tmp_path)
+    assert runner.worker(args) == 0
+    assert calls['open']['_defer_full_validation'] is True
+    assert calls['open']['_private_dynamic_bootstrap'] is _DEFERRED_VALIDATION_PRIVATE_TOKEN
+    assert calls['batch']['advection_batcher'] is native
+    assert not args.workspace.exists()
+
+
 @pytest.mark.parametrize('group,alive,expected', [(777, True, True), (777, False, False),
                                                 (60859, True, False)])
 def test_cleanup_only_new_process_group(monkeypatch, group, alive, expected):

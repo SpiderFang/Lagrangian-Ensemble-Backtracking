@@ -70,12 +70,15 @@ def summarize(batch, sweep, started):
 def worker(args):
     """開啟唯讀控制器並最多逐次推進指定掃描數；結果只留在診斷目錄。
 
+    以既有私有能力執行啟動繫結驗證，保留不可變輸入、設定、種子與路徑檢核；
+    不掃描整批歷史。僅明示檢查點的恢復保留原載入器對該片鏈的驗證，不發布成果。
     靜態驗證、建構／載入與實際步進分開計時。定時堆疊涵蓋所有階段；只有正常
     返回才能產生函式累計耗時摘要，逾時則保留標準錯誤的原始堆疊。
     """
     sys.path.insert(0, str(args.project_root / 'src'))
     import lagrangian_backtracking.cli as cli
     import lagrangian_backtracking.production as production
+    from lagrangian_backtracking.runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
 
     for module in (cli, production):
         path = Path(module.__file__).resolve()
@@ -83,11 +86,15 @@ def worker(args):
             raise ValueError("數值模組來源不是明示版本")
         emit('module_source', module=module.__name__, path=str(path), sha256=digest(path))
     start = time.monotonic()
-    emit('setup_start')
+    emit('setup_start', diagnostic_startup_bindings_only=True,
+         full_history_validation_not_performed=True, formal_result=False)
+    # 此私有能力只限本受控、完全不發布結果的重現；不是新公開略過驗證旗標。
     controller = cli.open_worker_controller(
         args.workspace, config_path=args.config, ocm_native_root=args.ocm_native_root,
         ocm_reconstruction_root=args.ocm_reconstruction_root,
-        checkpoint_root=args.checkpoint_root, continuous_time_fallback=True)
+        checkpoint_root=args.checkpoint_root, continuous_time_fallback=True,
+        _defer_full_validation=True,
+        _private_dynamic_bootstrap=_DEFERRED_VALIDATION_PRIVATE_TOKEN)
     emit('setup_complete', elapsed_seconds=time.monotonic() - start)
     restore_start = time.monotonic()
     emit('restore_start' if args.checkpoint else 'initialization_start')
@@ -176,6 +183,8 @@ def main(argv=None):
     command = [sys.executable, '-u', str(Path(__file__).resolve()),
                *(argv if argv is not None else sys.argv[1:]), '--internal-worker']
     evidence = dict(policy='READ_ONLY_IN_MEMORY_DIAGNOSTIC_NOT_RESULTS', actual_commit=actual,
+                    diagnostic_startup_bindings_only=True,
+                    full_history_validation_not_performed=True, formal_result=False,
                     project_root=str(args.project_root), script_sha256=digest(__file__),
                     plan_sha256=digest(plan_path), run_id=plan['run_id'], shard_id=args.shard_id,
                     checkpoint=str(args.checkpoint) if args.checkpoint else None,

@@ -253,6 +253,10 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 最多 `--max-sweeps 1000`，`--timeout-seconds` 限120–180秒；子程序每15秒輸出
 非附加式 Python 堆疊，每10次掃描彙總已完成步數與年齡。保留原種子、檢查點亂數、
 步長、物理及批次平流器，不呼叫控制器執行／恢復／調和流程，也不發布軌跡或新檢查點。
+受控內部呼叫使用既有私有啟動驗證能力，保留全部不可變繫結與路徑檢核，但不掃全批歷史；
+只有明示檢查點的單片鏈由既有載入器驗證。來源紀錄明示
+`diagnostic_startup_bindings_only=true`、`full_history_validation_not_performed=true`、
+`formal_result=false`；這不是新公開略過驗證介面，不改原worker的驗證政策。
 所有暫存與快取另置診斷目錄、五種執行緒限制均為1；硬逾時只清理診斷自建群組。
 `provenance.json`、`pid.json`、`stdout.jsonl`、`stacks.stderr`、`result.json` 是診斷證據，
 正常返回另有 `profile-top.txt`。原進度可能由既有worker正常更新，不能把它當成診斷寫入。
