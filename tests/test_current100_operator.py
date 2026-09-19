@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import signal
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,6 +67,58 @@ def test_existing_worker_cli_receives_only_two_shards(tmp_path):
     assert command[-4:] == ["--shard-id", "first", "--shard-id", "second"]
     assert "run-worker" in command and "--execution-priority" in command
     assert "run-formal-parallel" not in command and "--nww-analysis-root" not in command
+    assert "--resume" not in command
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_resume_only_forwards_explicit_flag_without_changing_shards(tmp_path, resume):
+    """續跑只多一個既有CLI旗標，仍恰為原兩片，不新增驗證略過介面。"""
+    args = SimpleNamespace(**{key: tmp_path for key in (
+        "project_root", "workspace", "config", "ocm_native_root",
+        "ocm_reconstruction_root", "checkpoint_root")}, resume=resume)
+    command = operator.worker_command(args, ["first", "second"])
+    assert command.count("--resume") == int(resume)
+    assert command.count("--shard-id") == 2
+    assert command[-4:] == ["--shard-id", "first", "--shard-id", "second"]
+    assert "--defer-full-validation" not in command
+
+
+@pytest.mark.parametrize("lifecycle", ["PLANNED", "RUNNING", "PAUSED", "FAILED", "COMPLETE"])
+def test_resume_preserves_selected_progress_without_mutation(lifecycle):
+    """既定十片可保留目前生命週期與耐久步數；核對函式不改計畫或進度。"""
+    plan, rows = fixture_plan()
+    selected = operator.select_shards(plan, rows)
+    progress = {"shards": {s["shard_id"]: dict(lifecycle="PLANNED", particle_steps=0)
+                           for s in plan["shards"]}}
+    progress["shards"]["sh-0"] = dict(lifecycle=lifecycle,
+                                     particle_steps=0 if lifecycle == "PLANNED" else 10000,
+                                     checkpoint_sequence=1)
+    before = deepcopy((plan, progress, selected))
+    operator.validate_subset_progress(plan, progress, selected, resume=True)
+    assert (plan, progress, selected) == before
+    if lifecycle != "PLANNED":
+        with pytest.raises(ValueError, match="未明示續跑"):
+            operator.validate_subset_progress(plan, progress, selected)
+
+
+@pytest.mark.parametrize("damage", ["outside_state", "outside_steps", "missing", "unknown", "non_bool"])
+def test_resume_rejects_expanded_population_or_invalid_state(damage):
+    """其他4,990片不得已有狀態或步數；缺片與非布林續跑值也必須拒絕。"""
+    plan, rows = fixture_plan()
+    selected = operator.select_shards(plan, rows)
+    progress = {"shards": {s["shard_id"]: dict(lifecycle="PLANNED", particle_steps=0)
+                           for s in plan["shards"]}}
+    if damage == "outside_state":
+        progress["shards"]["sh-10"]["lifecycle"] = "RUNNING"
+    elif damage == "outside_steps":
+        progress["shards"]["sh-10"]["particle_steps"] = 1
+    elif damage == "missing":
+        del progress["shards"]["sh-10"]
+    elif damage == "unknown":
+        progress["shards"]["sh-0"]["lifecycle"] = "UNKNOWN"
+    with pytest.raises((ValueError, TypeError)):
+        operator.validate_subset_progress(plan, progress, selected,
+                                          resume=1 if damage == "non_bool" else True)
 
 
 def test_low_memory_stops_only_started_workers_with_existing_safe_helper(tmp_path, monkeypatch):

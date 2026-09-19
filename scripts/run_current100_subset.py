@@ -1,7 +1,8 @@
 """五站各20受體的純流操作入口；只執行完整正式計畫中的十個固定分片。
 
 本腳本不建立或修改run計畫、設定、受體、種子及forcing。操作者先以既有
-run-create建立新的formal/full/no_stokes/M1工作區，再明示路徑與已通過的儲存
+run-create建立新的formal/full/no_stokes/M1工作區；明示--resume才允許接續
+同一個固定子集，不修改原計畫或重設進度。再明示路徑與已通過的儲存
 檢查證據。每站共用一個run-worker程序處理兩片，記憶體不足或任一站失敗時
 對本次子程序送SIGINT並等候300秒保存checkpoint。輸出只稱100顆選取子集，
 整個50,000情境計畫仍未完成；真實資料QC與工程失敗分別保留，不做全批驗收。
@@ -45,7 +46,7 @@ def select_shards(plan, rows):
             or plan.get("members_per_scenario") != 1 or plan.get("scenario_count") != 50000
             or plan.get("scenario_selection", {}).get("mode") != "full"
             or len(rows) != 50000 or len(plan["shards"]) != 5000):
-        raise ValueError("必須是完整50,000情境／5,000片formal/full/no_stokes/M1新計畫")
+        raise ValueError("必須是完整50,000情境／5,000片formal/full/no_stokes/M1計畫")
     selected = {}
     for site, (utc_ns, arrival_id) in SELECTION.items():
         material_rows = [r for r in rows if r["study_site_id"] == site and r["material_id"] == MATERIAL]
@@ -76,6 +77,28 @@ def select_shards(plan, rows):
     return selected
 
 
+def validate_subset_progress(plan, progress, selected, *, resume=False):
+    """唯讀核對續跑範圍；十片以外仍須未啟動，不能以續跑擴大研究母體。
+
+    新跑維持全部PLANNED且零步數；續跑僅允許固定十片已有合法生命週期。
+    此處不採認輸出、不重設步數，也不代替控制器的片鎖、歷代檢查點及輸出驗證。
+    """
+    if type(resume) is not bool:
+        raise TypeError("resume必須是bool")
+    expected = {row["shard_id"] for row in plan["shards"]}
+    chosen = {sid for ids in selected.values() for sid in ids}
+    if (len(chosen) != 10 or not chosen <= expected
+            or set(progress["shards"]) != expected):
+        raise ValueError("固定十片或計畫／進度分片集合不符")
+    for sid, row in progress["shards"].items():
+        untouched = row["lifecycle"] == "PLANNED" and row["particle_steps"] == 0
+        if not resume or sid not in chosen:
+            if not untouched:
+                raise ValueError("未明示續跑或非選取分片已有執行狀態／步數")
+        elif row["lifecycle"] not in {"PLANNED", "RUNNING", "PAUSED", "FAILED", "COMPLETE"}:
+            raise ValueError(f"所選分片生命週期不允許續跑：{sid}")
+
+
 def memory_available():
     """讀取Linux可用記憶體，單位位元組；不可觀測時回傳None供外層停止。"""
     try:
@@ -88,7 +111,10 @@ def memory_available():
 
 
 def worker_command(args, shard_ids):
-    """使用同一Python及明示新程式目錄呼叫既有CLI，不透過shell派片。"""
+    """使用同一Python及明示程式目錄呼叫既有CLI，僅明示續跑才傳--resume。
+
+    不新增驗證略過介面；既有CLI及逐片還原驗證仍照原契約執行。
+    """
     bootstrap = (
         "import sys; sys.path.insert(0,sys.argv.pop(1)); "
         "from lagrangian_backtracking.cli import main; raise SystemExit(main())"
@@ -98,6 +124,11 @@ def worker_command(args, shard_ids):
                "--ocm-native-root", str(args.ocm_native_root),
                "--ocm-reconstruction-root", str(args.ocm_reconstruction_root),
                "--checkpoint-root", str(args.checkpoint_root), "--execution-priority"]
+    resume = getattr(args, "resume", False)
+    if type(resume) is not bool:
+        raise TypeError("resume必須是bool")
+    if resume:
+        command.append("--resume")
     for sid in shard_ids:
         command.extend(("--shard-id", sid))
     return command
@@ -219,7 +250,11 @@ def supervise(args, selected, session, env):
 
 
 def main(argv=None):
-    """先核對新工作區、原來源繫結及NFS，再保存操作manifest；--execute才啟動。"""
+    """核對新跑或明示續跑工作區、來源及NFS；記錄新執行來源但不改原計畫。
+
+    --resume只放行既定十片的歷史狀態，--execute才啟動。所有原有完整驗證
+    保留，不呼叫reconcile；逐片還原／完成輸出採認交由既有控制器。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("workspace", "source-workspace", "config", "project-root", "checkpoint-root",
                  "ocm-native-root", "ocm-reconstruction-root", "scratch-root", "log-root",
@@ -227,6 +262,7 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="接續同一工作區固定十片，不重建計畫")
     args = parser.parse_args(argv)
     args.project_root = args.project_root.resolve(strict=True)
     # 科學套件首次匯入前固定五個thread限制；所有可寫快取沿用操作者提供的新NFS scratch。
@@ -255,12 +291,19 @@ def main(argv=None):
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=args.project_root, text=True)
     if actual != args.expected_commit or dirty:
         raise ValueError("必須使用指定commit的乾淨獨立checkout")
-    # 明確只接受fresh計畫；避免把舊50k工作區帶入任何全run歷史驗證或重新運算。
+    # 來源工作區永遠唯讀；續跑也不能把來源50k當作固定100的執行目標。
     if args.workspace.resolve() == args.source_workspace.resolve():
         raise ValueError("新工作區不可等於唯讀來源")
     initial = load_run_progress(args.workspace)
-    if any(r["lifecycle"] != "PLANNED" or r["particle_steps"] != 0 for r in initial["shards"].values()):
+    if not args.resume and any(
+        r["lifecycle"] != "PLANNED" or r["particle_steps"] != 0 for r in initial["shards"].values()
+    ):
         raise ValueError("此入口只接受未執行的新工作區；續跑須另行明示")
+    # 先核對選片與進度範圍，讓非選取片曾運算的工作區在完整掃描前即被拒絕；
+    # 以下仍以既有validator驗證全部不可變檔與檢查點，不把這項早期檢查當驗收。
+    candidate = load_run_plan(args.workspace)
+    selected = select_shards(candidate, pq.read_table(args.workspace / "scenario_table.parquet").to_pylist())
+    validate_subset_progress(candidate, initial, selected, resume=args.resume)
     plan, config, _, _, _, provenance = validate_run_inputs(
         workspace=args.workspace, config_path=args.config, project_root=args.project_root,
         checkpoint_root=args.checkpoint_root, execution_priority=True)
@@ -274,19 +317,25 @@ def main(argv=None):
             or config.execution.advection_backend != "baytrace_native_cpu_v1"):
         raise ValueError("須保留H30並使用原版批次後端")
     selected = select_shards(plan, pq.read_table(args.workspace / "scenario_table.parquet").to_pylist())
+    validate_subset_progress(plan, load_run_progress(args.workspace), selected, resume=args.resume)
     session, _ = prepare_execution_directories(scratch_root=scratch, log_root=logs,
                                               numba_cache_dir=cache, run_id=plan["run_id"])
     manifest = dict(run_id=plan["run_id"], actual_commit=actual, actual_provenance=provenance,
                     plan_sha256=sha256((args.workspace / "run_plan.json").read_bytes()).hexdigest(),
                     storage_gate_sha256=gate_sha, selected_shards=selected, selection=SELECTION,
                     material=MATERIAL, settling_velocity_mps=-0.02, selected_particles=100,
+                    resume=args.resume, initial_progress_revision=initial["revision"],
+                    initial_selected_progress={sid: initial["shards"][sid]
+                                               for ids in selected.values() for sid in ids},
+                    immutable_run_plan_modified=False,
                     total_run_particles=50000, experiment_case="no_stokes", workers=5,
                     thread_environment={k: env[k] for k in THREAD_ENV}, full_run_complete=False,
                     policy="每站固定最早到達20受體；不同站不同UTC；完整驗收另行執行")
     with (session / "demo-manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2)
     print(json.dumps({"prepared": True, "run_id": plan["run_id"], "log_session": str(session),
-                      "selected_shards": selected, "execute": args.execute}), flush=True)
+                      "selected_shards": selected, "execute": args.execute,
+                      "resume": args.resume}), flush=True)
     return supervise(args, selected, session, env) if args.execute else 0
 
 
