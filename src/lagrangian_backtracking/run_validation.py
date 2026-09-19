@@ -690,6 +690,110 @@ def validate_run(
         return {"valid": False, "errors": errors, "summary": {}}
 
 
+def validate_run_startup(
+    path: str | Path, *, checkpoint_root: str | Path | None = None
+) -> dict[str, Any]:
+    """僅驗證起跑必要繫結；``valid`` 絕不代表完整歷史或已完成輸出通過驗收。
+
+    供使用者明示「先運算、完整驗收後補」的執行模式呼叫。完整保留 run 根目錄與
+    鎖定檔拓樸、plan／progress、所有不可變輸入 SHA-256、情境範圍與 hash、逐粒子
+    seed 身分／導出規則、外置 checkpoint 根與已知分片目錄、輸出根與 failure 安全
+    檢查；不讀取已完成 trajectory payload，也不掃描各片 checkpoint generations。
+    指派分片的完整歷史驗證與亂數恢復仍由 RunController 執行，後續正式整批驗收仍須
+    呼叫原 ``validate_run``。此函式不修復或改寫任何檔案、不建立 forcing 或物理 request。
+
+    輸入時間與位置沿用原資料契約的 UTC 奈秒／公尺，不做單位轉換或科學數值計算。
+    每個回傳分支均明示 ``validation_scope``、``full_validation_deferred`` 及未驗清單
+    ``deferred_checks``；錯誤轉為 JSON-safe 清單，路徑僅用於讀取、不寫入結果。
+    """
+
+    result: dict[str, Any] = {
+        "valid": False,
+        "errors": [],
+        "summary": {},
+        "validation_scope": "startup_bindings_only",
+        "full_validation_deferred": True,
+        "deferred_checks": [
+            "completed_trajectory_payload_checksums_metadata_and_run_unit_order",
+            "all_shard_checkpoint_generation_headers_checksums_and_full_history_restore",
+            "checkpoint_latest_progress_cross_links_orphans_and_replay",
+            "published_output_progress_cross_links_and_full_run_acceptance",
+        ],
+    }
+    errors = result["errors"]
+    root = Path(path)
+    try:
+        if root.is_symlink() or not root.is_dir():
+            errors.append("run root missing/not_directory/symlink")
+            return result
+        allowed_files = {
+            "normalized_config.json", "input_inventory.json", "scenario_table.parquet",
+            "seed_table.parquet", "run_plan.json", "run_progress.json",
+        }
+        allowed_directories = {"shards", "checkpoints", "failures", "locks"}
+        for entry in root.iterdir():
+            if entry.is_symlink() or entry.name not in allowed_files | allowed_directories:
+                errors.append(f"run_root: unknown_or_symlink={entry.name}")
+            elif entry.name in allowed_directories and not entry.is_dir():
+                errors.append(f"run_root: {entry.name}_not_directory")
+            elif entry.name in allowed_files and not entry.is_file():
+                errors.append(f"run_root: {entry.name}_not_regular_file")
+        try:
+            plan = load_run_plan(root)
+            progress = load_run_progress(root)
+            _cross_check_plan_progress(plan, progress)
+        except Exception as exc:  # noqa: BLE001 - 起跑 gate 亦須以 JSON-safe 結果拒絕壞資料
+            errors.append(f"plan_or_progress: invalid:{type(exc).__name__}")
+            return result
+        _validate_lock_topology(root, plan, errors)
+        _validate_run_files(root, plan, errors)
+        scenarios = _load_scenarios(root, plan, errors)
+        try:
+            shards = _build_shards(plan, scenarios)
+        except Exception as exc:  # noqa: BLE001 - 起跑前仍須拒絕情境範圍／群組損壞
+            errors.append(f"shards: invalid:{type(exc).__name__}")
+            shards = ()
+        if shards:
+            _validate_seed_table(root, plan, shards, errors)
+            output_root = root / str(plan["output_root"])
+            expected_ids = {shard.shard_id for shard in shards}
+            if output_root.is_symlink() or not output_root.is_dir():
+                errors.append("outputs: missing_not_directory_or_symlink")
+            else:
+                # 只盤點第一層已知分片普通目錄；目錄內的 payload 留待 assigned shard
+                # 或後續完整驗收，避免在起跑階段展開全 run 的軌跡／歷史。
+                for entry in output_root.iterdir():
+                    if entry.is_symlink() or not entry.is_dir() or entry.name not in expected_ids:
+                        errors.append(f"outputs: unknown_or_symlink={entry.name}")
+            _validate_failure_tree(root, plan, progress, shards, errors)
+            try:
+                def reject_request_factory(unit: Any) -> Any:
+                    """起跑檢查僅讀靜態繫結；任何物理 request 呼叫都屬程式錯誤。"""
+
+                    raise RuntimeError("validate_run_startup 不可呼叫 request_factory")
+
+                # constructor 保留原 lock/checkpoint 根與已知分片目錄驗證；不呼叫
+                # scanner／restore，因此不會讀全 run 的每代 header 或歷史 payload。
+                RunController(root, request_factory=reject_request_factory, checkpoint_root=checkpoint_root)
+            except Exception as exc:  # noqa: BLE001 - 外置根指錯或拓樸不安全須拒絕起跑
+                errors.append(f"checkpoint_root: invalid:{type(exc).__name__}")
+        result["summary"] = {
+            "run_id": plan["run_id"],
+            "run_kind": plan["run_kind"],
+            "run_lifecycle": progress["run_lifecycle"],
+            "scenario_count": plan["scenario_count"],
+            "particle_count": plan["particle_count"],
+            "shard_count": plan["shard_count"],
+            "completed_shard_count": sum(
+                row.get("lifecycle") == "COMPLETE" for row in progress["shards"].values()
+            ),
+        }
+        result["valid"] = not errors
+    except Exception as exc:  # noqa: BLE001 - 不安全磁碟狀態不得被當作起跑成功
+        errors.append(f"startup_validator_exception:{type(exc).__name__}")
+    return result
+
+
 def iter_complete_run_trajectory_shards(
     path: str | Path,
     *,
@@ -1011,4 +1115,5 @@ __all__ = [
     "benchmark_report",
     "iter_complete_run_trajectory_shards",
     "validate_run",
+    "validate_run_startup",
 ]

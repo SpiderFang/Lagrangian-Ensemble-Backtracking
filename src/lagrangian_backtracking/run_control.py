@@ -1887,6 +1887,7 @@ class RunController:
         resource_reporter: Callable[[], Mapping[str, Any]] | None = None,
         advection_batcher: Callable[..., Any] | None = None,
         advection_reporter: Callable[[], Mapping[str, Any]] | None = None,
+        defer_full_validation: bool = False,
     ) -> None:
         """載入 plan/progress 並設定 request factory；不會自動開始物理計算。
 
@@ -1894,8 +1895,16 @@ class RunController:
         本身不寫入 checkpoint；續跑時 caller 必須依當次 execution backend 再次提供。
         ``advection_reporter`` 只供 trajectory ``run_metadata.advection_execution`` 保存
         本次 shard invocation 的 evidence，不會混入既有 ``forcing_cache_stats``。
+
+        ``defer_full_validation`` 必須為 bool；明示 True 僅允許在原 shared run gate 與
+        單片排他鎖內採認 RUNNING 的已發布輸出，供先運算、後整批驗收的流程使用。
+        指派分片的 checkpoint 每代 checksum、完整歷史鏈、身分順序與亂數狀態恢復
+        仍照原路徑驗證；此旗標不改 run plan、物理單位、步長、seed 或輸出格式。
         """
 
+        if type(defer_full_validation) is not bool:
+            raise TypeError("defer_full_validation 必須是 bool")
+        self.defer_full_validation = defer_full_validation
         self.workspace = workspace.path if isinstance(workspace, RunWorkspace) else Path(workspace)
         self.plan = load_run_plan(self.workspace)
         self.progress = load_run_progress(self.workspace)
@@ -3203,6 +3212,10 @@ class RunController:
         shard。checkpoint 只在 ``ProductionBatch.advance`` 正常回傳完整 sweep 結果後發布；
         若中途收到 Ctrl-C，會保留上一個 generation，下一次 resume 重新執行該 interval。
         任何物理例外會先寫 failure artifact，再把原例外重新拋給上層。
+
+        延後整批驗收時，仍先完整掃描及核對本片 checkpoint；若本片已有發布輸出，
+        只在 RUNNING 且完整 payload／metadata／RunUnit 身分驗證通過時直接採認。
+        其他狀態或損壞輸出在標記 RUNNING、request factory 與重新計算之前拒絕。
         """
 
         if sweep_budget is not None and (
@@ -3223,6 +3236,10 @@ class RunController:
         selected = self._scan_checkpoint_generations(shard, repair_latest=False)
         selected = self._checkpoint_for_progress(shard, row, selected)
         row = self._refresh_progress()["shards"][shard_id]
+        if self.defer_full_validation and row["lifecycle"] != "COMPLETE":
+            published = self.output_root / shard_id
+            if published.exists() or published.is_symlink():
+                return self._adopt_deferred_published_shard(shard, row, published)
         if lifecycle == "COMPLETE":
             output = _workspace_token(
                 self.workspace,
@@ -3730,6 +3747,63 @@ class RunController:
                 raise
             self._mark_failed(shard, error, metrics=failure_metrics)
             raise
+
+    def _adopt_deferred_published_shard(
+        self, shard: ScenarioShard, row: Mapping[str, Any], output: Path
+    ) -> RunExecutionSummary:
+        """在既有單片鎖內採認已發布輸出；只用於明示延後整批驗收的 RUNNING 分片。
+
+        呼叫前已完成本片 checkpoint scanner 與 progress 核對。此處完整驗證輸出
+        checksum、軌跡 payload、metadata，並逐列核對由情境、member 與 seed 政策導出
+        的 RunUnit 身分／順序。位置仍為公尺，時間為 UTC 奈秒；不讀其他片的歷史、
+        不建立 forcing、不重算軌跡，也不覆寫既有輸出。採認只透過原 progress 鎖更新。
+        """
+
+        if row["lifecycle"] != "RUNNING":
+            raise ValueError(f"非 RUNNING shard 出現 published output，拒絕採認：{shard.shard_id}")
+        validation = validate_trajectory_shard(
+            output,
+            require_formal_metadata=self.plan["run_kind"] == "formal",
+            strict_run_metadata=self.plan["run_kind"] in {"formal", "pilot"},
+            expected_metadata=self._expected_metadata(shard),
+        )
+        if not validation["valid"]:
+            raise ValueError("已發布的 shard 輸出 invalid：" + ";".join(validation["errors"]))
+        # 完整 payload validator 驗證檔案內部一致性；另外將粒子表繫結回本 run 的
+        # immutable 情境／成員次序，避免別片或重新排序但重新計算 checksum 的輸出冒名。
+        rows = pq.read_table(output / "particle_table.parquet").to_pylist()
+        expected = [
+            {
+                "particle_id": unit.particle_id,
+                "scenario_id": unit.scenario.scenario_id,
+                "member_id": unit.member_id,
+                "study_site_id": unit.scenario.study_site_id,
+                "analysis_region_id": unit.scenario.analysis_region_id,
+                "receptor_id": unit.scenario.receptor_id,
+            }
+            for unit in iter_run_units(
+                shard, master_seed=int(self.plan["master_seed"]),
+                random_stream_id=self.plan.get("random_stream_id"),
+            )
+        ]
+        keys = tuple(expected[0]) if expected else ()
+        if len(rows) != shard.particle_count or [
+            {key: value.get(key) for key in keys} for value in rows
+        ] != expected:
+            raise ValueError(f"已發布輸出 RunUnit identity/order 不符：{shard.shard_id}")
+        metrics = self._published_resource_metrics(validation, row.get("metrics", {}))
+        self._mark_complete(
+            shard, output,
+            sweeps=int(row["sweeps_completed"]), particle_steps=int(row["particle_steps"]),
+            metrics=metrics,
+        )
+        current = self.progress["shards"][shard.shard_id]
+        return RunExecutionSummary(
+            self.plan["run_id"], shard.shard_id, "COMPLETE",
+            shard.scenario_count, shard.particle_count,
+            int(current["sweeps_completed"]), int(current["particle_steps"]),
+            str(current["output_relative_path"]), current["checkpoint_relative_path"],
+        )
 
     def run_all(self, *, sweep_budget: int | None = None) -> tuple[RunExecutionSummary, ...]:
         """依 immutable plan 順序執行全部 shard；已完成 shard 只做驗證。"""
