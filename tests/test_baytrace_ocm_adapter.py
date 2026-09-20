@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -360,6 +360,51 @@ def test_resolver_cache_reuse_and_exact_treatment_key() -> None:
     assert report["cache_hits"] >= 1
     assert report["frame_builds"] == 2
     assert report["cached_frames"] <= 2
+
+
+def test_cache_capacity_interleaved_times_preserves_scientific_bytes_and_qc():
+    """四組時段交錯讀取在兩種容量下逐位元等價；僅建場次數與物件重用不同。
+
+    使用同一非均勻流場、粒子位置、沉降與精確時間順序，不改批次分組邏輯。
+    最後再輸入相同非法垂向資料，核對兩種容量的拒絕理由一致。
+    """
+    mesh = _mesh()
+    times = 1_704_067_200_000_000_000 + np.arange(5, dtype=np.int64) * _HOUR_NS
+    month = _month(mesh, times=times)
+    manager = _manager(mesh, {month.month_id: month})
+    provider = ManagedForcingProvider(manager, settling_velocity_mps=-0.02, include_stokes=False)
+    small = OCMPreparedFrameResolver(max_cached_frames=2, max_cached_bytes=512 * 1024**2)
+    large = OCMPreparedFrameResolver(max_cached_frames=20, max_cached_bytes=4 * 1024**3)
+    for index in [0, 2, 1, 3] * 6:
+        task = _task(provider, state=_state(time_utc_ns=int(times[index] + _HOUR_NS // 2)))
+        a, b = small(task), large(task)
+        assert a is not None and b is not None
+        assert (a.trat, a.element_id) == (b.trat, b.element_id)
+        for first, second in ((a.grid, b.grid), (a.fields, b.fields)):
+            for field in fields(first):
+                x, y = getattr(first, field.name), getattr(second, field.name)
+                if isinstance(x, np.ndarray):
+                    assert x.dtype == y.dtype and x.shape == y.shape
+                    assert x.tobytes() == y.tobytes(), field.name
+                else:
+                    assert x == y
+        metadata = [dict(r.report()['last_frame_metadata']) for r in (small, large)]
+        for item in metadata:
+            item.pop('frame_cache_reused')
+        assert metadata[0] == metadata[1]
+    small_report, large_report = small.report(), large.report()
+    assert small_report['frame_builds'] == small_report['cache_misses'] == 24
+    assert large_report['frame_builds'] == large_report['cache_misses'] == 4
+    assert small_report['frame_evictions'] == 22 and large_report['frame_evictions'] == 0
+    assert small_report['cached_bytes'] <= 512 * 1024**2
+    assert large_report['cached_bytes'] <= 4 * 1024**3
+    bad_z = np.broadcast_to(np.asarray([-20.0, np.nan, 0.0])[None, None, :], (2, 4, 3)).copy()
+    bad = _month(mesh, zcor=bad_z)
+    bad_manager = _manager(mesh, {bad.month_id: bad})
+    bad_provider = ManagedForcingProvider(bad_manager, settling_velocity_mps=-0.02, include_stokes=False)
+    assert small(_task(bad_provider)) is None and large(_task(bad_provider)) is None
+    assert small.report()['fallback_reasons'] == large.report()['fallback_reasons']
+    assert small.last_rejection_qc == large.last_rejection_qc
 
 
 def test_cross_month_bracket_and_missing_month_continuous_fallback_metadata() -> None:

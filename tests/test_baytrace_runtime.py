@@ -27,6 +27,22 @@ from lagrangian_backtracking.run_control import (
 )
 
 
+@pytest.mark.parametrize('frames,byte_limit', [
+    ('20', None), (None, '1024'), ('', '1024'), ('2', ''), ('0', '1024'),
+    ('2', '0'), ('-1', '1024'), ('2', '-1'), ('65', '1024'), ('20', '4294967297'),
+    ('2.0', '1024'), (' 2', '1024'), ('2', '1e9'), ('true', '1024'), ('２', '1024')])
+def test_native_frame_cache_env_rejects_invalid_pair(monkeypatch, frames, byte_limit):
+    """半套、空值、非ASCII正整數及超限環境必須清楚拒絕，不得改成無界快取。"""
+    for name, value in zip(('LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES',
+                            'LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES'), (frames, byte_limit), strict=True):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match='LBT_BAYTRACE_FRAME_CACHE_MAX_'):
+        runtime_module._native_frame_cache_limits()
+
+
 def _runtime_fixture_data() -> dict[str, Any]:
     """重用既有 runtime synthetic manifest builder，避免另造一套 request schema。"""
 
@@ -86,8 +102,9 @@ def test_advection_backend_default_preserves_old_hash_and_explicit_token_enters_
 
 
 @pytest.mark.parametrize("experiment_case_id", ["no_stokes", "finite_depth_stokes"])
+@pytest.mark.parametrize('cache_limits', [None, (20, 4294967296)])
 def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, experiment_case_id: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, experiment_case_id: str, cache_limits
 ) -> None:
     """純流／流波均強制原版批次器，且如實保留成功與工程拒絕的不同證據。"""
 
@@ -98,6 +115,12 @@ def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
     (tmp_path / "nww-analysis").mkdir()
     monkeypatch.setenv("LBT_BAYTRACE_ROOT", str(source_root))
     monkeypatch.delenv("NUMBA_CACHE_DIR", raising=False)
+    for index, name in enumerate(('LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES',
+                                  'LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES')):
+        if cache_limits is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, str(cache_limits[index]))
 
     class FakeResolver:
         """只驗證 Q3 建構參數與 report 邊界的 resolver 替身。"""
@@ -165,8 +188,8 @@ def test_runtime_factory_native_loader_uses_env_and_reports_source_hashes(
     assert isinstance(factory.advection_batcher, FakeBatcher)
     assert factory.advection_batcher.require_native is True
     assert FakeResolver.init_kwargs == {
-        "max_cached_frames": 2,
-        "max_cached_bytes": 512 * 1024 * 1024,
+        "max_cached_frames": 2 if cache_limits is None else cache_limits[0],
+        "max_cached_bytes": 512 * 1024 * 1024 if cache_limits is None else cache_limits[1],
     }
     report = factory.advection_report()
     assert report["backend"] == ADVECTION_BACKEND_BAYTRACE_NATIVE_CPU_V1

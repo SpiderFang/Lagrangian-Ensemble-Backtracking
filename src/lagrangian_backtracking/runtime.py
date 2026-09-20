@@ -2133,6 +2133,29 @@ def initialize_formal_run(
     )
 
 
+def _native_frame_cache_limits() -> tuple[int, int]:
+    """讀取成對明示的執行記憶體配置；不改物理設定或不可變執行計畫。
+
+    未設定維持2場／512MiB。兩個環境值都須為ASCII十進位正整數，最高64場／4GiB；
+    拒絕半套、空字串與無界容量，避免不明的程序記憶體增長。這是場快取常駐上限，
+    並非整個程序RSS上限，既有可用記憶體保護仍不可省略。
+    """
+    names = ('LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES', 'LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES')
+    values = [os.environ.get(name) for name in names]
+    if values == [None, None]:
+        return 2, 512 * 1024**2
+    limits = (64, 4 * 1024**3)
+    parsed = []
+    for name, value, limit in zip(names, values, limits, strict=True):
+        if value is None or re.fullmatch(r'[0-9]+', value) is None:
+            raise ValueError(f'{name}須與另一容量變數成對設定為ASCII十進位正整數，不可空值')
+        number = int(value)
+        if not 1 <= number <= limit:
+            raise ValueError(f'{name}須介於1與{limit}之間')
+        parsed.append(number)
+    return parsed[0], parsed[1]
+
+
 class RuntimeRequestFactory:
     """建立 pilot/formal ``RunUnit`` 所需的 immutable identity 與 lazy forcing facade。
 
@@ -2393,8 +2416,13 @@ class RuntimeRequestFactory:
         外部目錄，否則建立獨立 temporary cache，避免 JIT 寫入 source tree。Q3 adapter
         尚未可用或 source artifact 缺檔時直接拋出帶路徑／依賴名稱的錯誤；這裡不能把
         未準備的 native backend 假裝成 legacy 或完整原版路徑。
+
+        場快取容量由成對的LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES／MAX_BYTES環境值
+        核對後傳入resolver；未設定仍2場／512MiB，只調執行記憶體、不改場建構算法。
         """
 
+        # 容量先核對再載入原版核心；非法環境不應先分配場或進行編譯。
+        max_frames, max_bytes = _native_frame_cache_limits()
         source_text = os.environ.get("LBT_BAYTRACE_ROOT")
         if source_text is None or not source_text.strip():
             raise RuntimeError(
@@ -2450,8 +2478,8 @@ class RuntimeRequestFactory:
 
         try:
             resolver = OCMPreparedFrameResolver(
-                max_cached_frames=2,
-                max_cached_bytes=512 * 1024 * 1024,
+                max_cached_frames=max_frames,
+                max_cached_bytes=max_bytes,
             )
         except Exception as exc:
             raise RuntimeError(

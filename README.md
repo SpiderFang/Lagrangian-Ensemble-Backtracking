@@ -223,6 +223,17 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 有限水深波浪採 `finite_depth_node_fields_v1`：以既有有限水深公式先在OCM兩端UTC的濕節點／垂向層組成總u/v，再用原版內插及RK4，沉降只加入一次。這與舊粒子／RK4 stage取樣有離散差異，不能宣稱軌跡完全等價；512MiB場快取上限也不是整個程序RSS上限。`scripts/run_native_wave_trial.py --help` 提供新正式H30/M1波浪計畫的單片一次掃描小試，保留原H30／dt／seed、靜態及逐片驗證，並以獨立程序群組與30GiB可用記憶體保護取得可續跑檢查點、來源與原版計數。小試通過不等於完整計算或科學驗收；其操作腳本可放NFS package並保存SHA，數值checkout保持核准commit乾淨不變。
 
+原版場快取的runtime容量可成對明示 `LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES` 與
+`LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES`；兩者皆未設定仍為2場／512MiB。值須為ASCII
+十進位正整數，最高64場／4GiB；只設其一、空值、負數、小數或超限皆拒絕。
+這只是執行記憶體配置，不更改物理設定、原版RK4、粒子順序、批次分組、seed、dt或run plan。
+只有固定100入口 `run_current100_subset.py` 明示覆寫20場／4294967296 bytes，
+將實際環境與容量記入新session `demo-manifest.json` 的 `frame_cache_limits`；
+resolver report沿用實際上限與建場／淘汰計數。五worker場快取合計上限20GiB，
+但常駐場快取上限**不是程序RSS上限**，建場暫存、forcing與檢查點另占記憶體；
+仍須保留MemAvailable30GiB安全停止及五項單執行緒限制。不得無條件將這個配置
+套到56worker或50k；其他入口未設上述環境即維持原容量。
+
 來源根目錄用 `LBT_BAYTRACE_ROOT`，外部快取用 `NUMBA_CACHE_DIR`；缺少來源或 OCM frame resolver 會明確失敗。啟用方式、限制與詳細測速表見[BayTrace CPU 對照](docs/development/baytrace_native_cpu_comparison.md)。
 
 相關繁中註解檔案：`advection.py`、`engine.py`、`production.py`、`config.py`、`runtime.py`、`run_control.py`；完整分工見上述文件。

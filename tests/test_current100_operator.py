@@ -151,6 +151,36 @@ def test_low_memory_stops_only_started_workers_with_existing_safe_helper(tmp_pat
     assert len(started) == len(stopped) == 2
 
 
+def test_five_workers_receive_bounded_cache_and_manifest_policy(tmp_path, monkeypatch):
+    """五席皆收到固定容量，manifest保存同一環境值；低記憶體仍經原helper收尾。"""
+    import lagrangian_backtracking.parallel_execution as parallel
+
+    inherited = {key: 'incorrect' for key in (*operator.THREAD_ENV, *operator.FRAME_CACHE_ENV)}
+    env = operator.worker_environment(inherited)
+    assert all(env[key] == '1' for key in operator.THREAD_ENV)
+    assert all(inherited[key] == 'incorrect' for key in inherited)
+    policy = operator.frame_cache_policy(env)
+    assert policy['max_cached_frames'] == 20
+    assert policy['max_cached_bytes'] == 4294967296
+    assert policy['environment'] == operator.FRAME_CACHE_ENV
+    assert '非物理設定' in policy['semantics'] and '非程序RSS' in policy['semantics']
+    memories = iter([operator.MIN_MEMORY + 1] * 5 + [operator.MIN_MEMORY - 1])
+    monkeypatch.setattr(operator, 'memory_available', lambda: next(memories))
+    monkeypatch.setattr(operator, 'worker_command', lambda *args: ['unused'])
+    passed = []
+
+    def spawn(*args, **kwargs):
+        """僅記錄每席的執行環境，不建立真實程序。"""
+        passed.append(kwargs['env'])
+        return SimpleNamespace(pid=700 + len(passed))
+
+    monkeypatch.setattr(operator.subprocess, 'Popen', spawn)
+    monkeypatch.setattr(parallel, '_stop_active_processes', lambda active, **kwargs: {})
+    selected = {site: ['first', 'second'] for site in operator.SELECTION}
+    assert operator.supervise(SimpleNamespace(project_root=tmp_path), selected, tmp_path, env) == 2
+    assert len(passed) == 5 and all(operator.frame_cache_policy(e) == policy for e in passed)
+
+
 @pytest.mark.parametrize("fallback,completed,expected", [(0, 20, True), (1, 20, False), (0, 0, False)])
 def test_completion_requires_actual_native_steps_but_preserves_physical_qc(
     tmp_path, fallback, completed, expected

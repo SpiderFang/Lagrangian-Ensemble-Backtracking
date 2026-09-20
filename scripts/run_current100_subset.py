@@ -34,6 +34,25 @@ MIN_MEMORY = 30 * 1024**3
 """Linux MemAvailable最低可用位元組數；讀取失敗也不允許繼續啟動。"""
 THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
               "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS")
+FRAME_CACHE_ENV = {'LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES': '20',
+                   'LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES': '4294967296'}
+"""僅固定100入口覆寫每worker場快取上限；不影響其他部署或物理設定。"""
+
+
+def frame_cache_policy(env):
+    """保存實際傳給五個worker的容量；場快取常駐上限不等於程序RSS上限。"""
+    return dict(environment={k: env[k] for k in FRAME_CACHE_ENV},
+                max_cached_frames=int(env['LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES']),
+                max_cached_bytes=int(env['LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES']),
+                semantics='執行記憶體配置非物理設定；場快取常駐上限非程序RSS上限')
+
+
+def worker_environment(inherited):
+    """固定100入口覆寫五個執行緒限制與有界場快取，其他環境原樣保留。"""
+    env = dict(inherited)
+    env.update({key: '1' for key in THREAD_ENV})
+    env.update(FRAME_CACHE_ENV)
+    return env
 
 
 def select_shards(plan, rows):
@@ -266,8 +285,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     args.project_root = args.project_root.resolve(strict=True)
     # 科學套件首次匯入前固定五個thread限制；所有可寫快取沿用操作者提供的新NFS scratch。
-    env = dict(os.environ)
-    env.update({key: "1" for key in THREAD_ENV})
+    env = worker_environment(os.environ)
     env.update(PYTHONDONTWRITEBYTECODE="1", NUMBA_CACHE_DIR=str(args.numba_cache_dir))
     for key in ("TMPDIR", "MPLCONFIGDIR", "XDG_CACHE_HOME", "UV_CACHE_DIR"):
         path = Path(env[key]).resolve(strict=True)
@@ -330,6 +348,7 @@ def main(argv=None):
                     immutable_run_plan_modified=False,
                     total_run_particles=50000, experiment_case="no_stokes", workers=5,
                     thread_environment={k: env[k] for k in THREAD_ENV}, full_run_complete=False,
+                    frame_cache_limits=frame_cache_policy(env),
                     policy="每站固定最早到達20受體；不同站不同UTC；完整驗收另行執行")
     with (session / "demo-manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2)
