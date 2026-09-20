@@ -1844,7 +1844,8 @@ def load_validated_run_static_inputs(
     )
     geometry_hashes = _validated_canonical_hashes(
         geometries.canonical_component_hashes,
-        expected_keys=_PILOT_GEOMETRY_HASH_KEYS,
+        expected_keys=_PILOT_GEOMETRY_HASH_KEYS + (
+            ('native_coast',) if 'native_coast_manifest' in config.geometry else ()),
         label=f"{run_kind} geometries.canonical_component_hashes",
     )
 
@@ -1989,7 +1990,8 @@ def initialize_run(
     )
     geometry_hashes = _validated_canonical_hashes(
         geometries.canonical_component_hashes,
-        expected_keys=_PILOT_GEOMETRY_HASH_KEYS,
+        expected_keys=_PILOT_GEOMETRY_HASH_KEYS + (
+            ('native_coast',) if 'native_coast_manifest' in config.geometry else ()),
         label=f"{run_kind} geometries.canonical_component_hashes",
     )
     # 精確選擇延至下方完整輸入盤點及執行設定檢查後，既有完整／分層路徑維持原順序。

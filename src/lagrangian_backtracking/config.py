@@ -888,6 +888,26 @@ class ProjectConfig(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
+    def validate_native_coast_reference(cls, value: Any) -> Any:
+        """可選模型岸界的路徑與位元組SHA須成套；缺設定時完全不增加canonical欄位。
+
+        manifest內容／站點／投影及來源SHA由靜態geometry loader再核對。把期望SHA
+        寫進設定雜湊，使不同岸界版本不能沿用原checkpoint的config/geometry binding。
+        """
+        if isinstance(value, dict) and isinstance(value.get('geometry'), dict):
+            geometry = value['geometry']
+            if 'native_coast_manifest' in geometry:
+                ref = geometry['native_coast_manifest']
+                if (not isinstance(ref, dict) or set(ref) != {'path', 'sha256'}
+                        or not isinstance(ref['path'], str) or not ref['path']
+                        or not isinstance(ref['sha256'], str)
+                        or len(ref['sha256']) != 64
+                        or any(c not in '0123456789abcdef' for c in ref['sha256'])):
+                    raise ValueError('geometry.native_coast_manifest需明示path與小寫SHA256')
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
     def reject_new_horizon_coercion(cls, value: Any) -> Any:
         """在新支援窗契約啟用時，先拒絕 Pydantic 可能悄悄轉型的布林／字串。
 

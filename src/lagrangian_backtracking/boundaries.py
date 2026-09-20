@@ -28,6 +28,7 @@ from .models import (
     SampleQC,
     VelocitySample,
 )
+from .native_coast import NativeCoast
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,8 @@ class BoundaryGeometry:
     flow_boundary_segment_id: str = "flow_domain_open_boundary"
     coastline_segment_id: str = "coastline"
     boundary_match_tolerance_m: float = 1.0e-6
+    native_coast: NativeCoast | None = None
+    # 可選且範圍已審的模型岸界；None保留舊路徑，不從底圖或未知網格空洞自動建岸。
 
     def __post_init__(self) -> None:
         """拒絕不合理的容許誤差與非線狀的可進出邊界。
@@ -152,6 +155,8 @@ def resolve_horizontal_boundaries(
     單一步內可能先離開自己的局部分析區、再穿越另一研究區的局部範圍，最後離開共同
     流場範圍。本函式會保留真正停止前的所有事件，停止後的事件不再寫入。使用包含邊界
     的幾何判定，可避免極小浮點誤差把剛好在邊界上的步首位置誤認成範圍外。
+    可選模型岸界先查索引再取精確線交點，與原flow/local事件共用比例排序與
+    UTC／深度／年齡插值；水→水跨島亦停止。未設定時不建立此候選，舊行為不變。
     """
 
     start_xy = (previous.x_m, previous.y_m)
@@ -159,6 +164,18 @@ def resolve_horizontal_boundaries(
     start_point = Point(*start_xy)
     end_point = Point(*end_xy)
     candidates: list[tuple[float, str, BoundaryEvent]] = []
+    if geometry.native_coast is not None:
+        # 先以靜態STRtree篩選步內線段；即使終點又回水域，穿島仍必須在首次接觸停止。
+        contact = geometry.native_coast.first_contact(start_xy, end_xy)
+        if contact is not None:
+            crossing = SegmentCrossing(contact.x_m, contact.y_m, contact.fraction, contact.boundary_s_m)
+            event = _event_at_crossing(
+                previous, proposed, crossing=crossing,
+                event_type=EventType.COAST_CONTACT,
+                boundary_segment_id=contact.attributes['native_coast_edge_id'],
+                attributes=contact.attributes,
+            )
+            candidates.append((contact.fraction, 'coast_stop', event))
 
     own_start = geometry.own_local_domain.covers(start_point)
     own_end = geometry.own_local_domain.covers(end_point)

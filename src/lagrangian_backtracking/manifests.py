@@ -2901,7 +2901,9 @@ def load_boundary_geometries(
     boundary 則必須有自己的有效 line。formal 必須完整涵蓋 config 的四個 resolved
     flow-domain 與五個 study site；pilot 則允許 config study site 的非空子集，但 domain
     與 flow open-boundary 只能涵蓋該子集實際使用的 flow-domain，不能夾帶未使用的域。
-    回傳值內不保存 lon/lat geometry。
+    可選 ``geometry.native_coast_manifest`` 另讀已審模型岸界的公尺線／區域，核對
+    來源SHA與相同投影後只掛到指定站，並增加native_coast檔案／canonical雜湊。
+    未設定時仍只有原三份幾何與原雜湊，不新增停止規則。回傳值內不保存lon/lat幾何。
     """
 
     domain_ref = _geometry_manifest_reference(config, domain_manifest_path, "domain_manifest")
@@ -3097,6 +3099,24 @@ def load_boundary_geometries(
             boundary_match_tolerance_m=tolerance_m,
         )
         projections[site_id] = domain_projection[flow_id]
+    native_file_hashes = {}
+    native_canonical_hashes = {}
+    if 'native_coast_manifest' in config.geometry:
+        # 岸界僅在明示設定時載入；原三份geometry hash不變，額外綁定進run/checkpoint。
+        from dataclasses import replace
+
+        from .native_coast import load_native_coasts
+
+        coasts, coast_file_sha, coast_canonical_sha = load_native_coasts(
+            config.geometry['native_coast_manifest'], config_path=config_path,
+            site_flow=site_flow, projections=projections,
+            geometry_sha256={'domain': domain_document.file_sha256,
+                             'local': local_document.file_sha256,
+                             'open_boundary': open_document.file_sha256})
+        geometries = {site: replace(value, native_coast=coasts.get(site))
+                      for site, value in geometries.items()}
+        native_file_hashes['native_coast'] = coast_file_sha
+        native_canonical_hashes['native_coast'] = coast_canonical_sha
     return BoundaryGeometryBundle(
         geometries=geometries,
         projections=projections,
@@ -3104,11 +3124,13 @@ def load_boundary_geometries(
             "domain": domain_document.file_sha256,
             "local": local_document.file_sha256,
             "open_boundary": open_document.file_sha256,
+            **native_file_hashes,
         },
         canonical_component_hashes={
             "domain": domain_document.canonical_sha256,
             "local": local_document.canonical_sha256,
             "open_boundary": open_document.canonical_sha256,
+            **native_canonical_hashes,
         },
     )
 

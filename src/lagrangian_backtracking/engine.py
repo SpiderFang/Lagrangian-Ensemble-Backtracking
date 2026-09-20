@@ -1620,7 +1620,11 @@ def advance_particle_steps(
                 state,
                 reference=reference,
                 dt_seconds=accepted_step_seconds,
-                boundaries=boundaries,
+                # 新模型岸界只接純水平stage不支援；乾點／時間／其他混合QC不得借岸界
+                # 重分類。未設定模型岸界時仍傳原物件，原邊界恢復行為逐位元保持。
+                boundaries=(replace(boundaries, native_coast=None)
+                            if boundaries.native_coast is not None
+                            and error.qc != SampleQC.OUTSIDE_HORIZONTAL_DOMAIN else boundaries),
                 behavior_class=behavior_class,
             )
             if not stage_surface_adjustment_attempted and error.qc & boundary_qc
