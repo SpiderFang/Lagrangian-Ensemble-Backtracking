@@ -12,6 +12,11 @@
 只有另獲啟動授權後才加 `--execute`。入口固定來源／目標plan與岸界SHA，保留完整
 驗證、工作區級操作者互斥、逐片鎖、30GiB守護與300秒收尾；不接受任意站數或resume，
 不改原100入口契約、不擴完整50k。詳細命令與待验限制見上述契約文件。
+完成站點使用同版 `build_completed_subset_preview.py --current100-site SITE` 擷取兩片
+最終輸出；可選岸界manifest及其間接來源均納入擷取／渲染前後SHA，四份geometry
+canonical完整比對，不移除第四綁定。圖與來源清冊明示原100同受體重算替代，
+每站20顆、不新增40或混合A/B分母；底圖只作顯示。繪圖程式commit與原模型plan
+commit分開保存。修正後的隔離繪圖部署及產圖仍需各次主審GO。
 沒有 `geometry.native_coast_manifest` 時原行為與雜湊不變；有設定則新增來源／投影／
 岸界版本綁定，不能接續舊版本checkpoint。其餘網格空洞與品質失敗仍待查，七點幾何
 測試不等於H30真資料重算或完整科學驗收。C2僅隔離實作／靜態artifact，C3切換尚待核准。

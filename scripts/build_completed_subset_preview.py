@@ -12,6 +12,7 @@ import argparse
 import gc
 import importlib.util
 import json
+import subprocess
 from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -48,6 +49,11 @@ SELECTION_RULE = "每站依 arrival_time_utc_ns、material_id 排序，第一個
 """選擇只依時間、材質與完成狀態，不依軌跡長度、外觀或終止類型。"""
 SCOPE_NOTE = "部分已完成情境｜全批完整驗收待補｜M=1，非來源機率"
 """每張圖均展示的資格限制，不取代原始 run 的正式身分。"""
+NATIVE_COAST_SCOPE_NOTE = (
+    "原100同受體重算替代｜每站20顆，不新增40、不混A/B分母\n"
+    "非已執行50,000顆｜全批驗收待補｜底圖僅顯示，非物理岸界"
+)
+"""已審兩站重算的圖面限制；不能把新run身分當成新增研究母體。"""
 POSITION_FIELDS = (
     "time_utc_ns",
     "age_seconds",
@@ -82,6 +88,66 @@ def _snapshot(paths) -> dict[str, str]:
             raise ValueError("來源不是普通檔案")
         result[str(path)] = sha256_file(path)
     return result
+
+
+def _native_coast_snapshot(config, config_path, before):
+    """將可選模型岸界與其靜態來源納入擷取前快照，不重寫科學載入器。
+
+    路徑契約沿用 native_coast.load_native_coasts：岸界引用相對設定檔，
+    source_files 相對岸界檔；以既有 resolve_manifest_path 固定相同基準。
+    本函式只讀來源及記錄雜湊，SHA／投影／站點／幾何資格仍由既有loader拒絕錯綁。
+    無設定時不增欄位或來源，保持原三幾何行為；有設定時來源缺檔不可略過。
+    """
+    reference = config.geometry.get("native_coast_manifest")
+    if reference is None:
+        return None
+    path = resolve_manifest_path(config_path, reference["path"])
+    before.update(_snapshot([path]))
+    document = _json(path)
+    sources = [resolve_manifest_path(path, item["path"]) for item in document["source_files"]]
+    source_hashes = _snapshot(sources)
+    before.update(source_hashes)
+    return {
+        "manifest_path": str(path),
+        "manifest_sha256": before[str(path)],
+        "source_files_sha256": source_hashes,
+        "method": document["method"],
+        "coverage_policy": document["coverage_policy"],
+        "components": [
+            {key: record[key] for key in (
+                "study_site_id", "component_id", "flow_domain_id", "projection_wkt",
+                "region_sha256", "edges_sha256",
+            )}
+            for record in document["records"]
+        ],
+        "basemap_role": "display_only_not_physical_boundary",
+    }
+
+
+def _unchanged_snapshot(before, message):
+    """擷取及渲染兩階段均核對同一組普通檔案，不漏掉第四幾何的間接來源。"""
+    after = _snapshot(Path(p) for p in before)
+    if before != after:
+        raise ValueError(message)
+    return after
+
+
+def _plot_code_provenance():
+    """記錄實際繪圖checkout與腳本SHA，和原計畫中的不可變模型commit分開。
+
+    以執行腳本位置而非cwd找Git來源；非checkout不能假造commit。追蹤檔dirty另記，
+    未追蹤現場證據不當成已執行程式；不修改Git或載入另一份數值實作。
+    """
+    script = Path(__file__).resolve()
+    root = script.parents[1]
+    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    dirty = subprocess.check_output(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"], text=True
+    )
+    loader = Path(load_boundary_geometries.__code__.co_filename).resolve()
+    return {"checkout": str(root), "commit": commit, "dirty_flag": bool(dirty),
+            "script_path": str(script), "script_sha256": sha256_file(script),
+            "geometry_loader_path": str(loader), "geometry_loader_sha256": sha256_file(loader)}
 
 
 def select_completed_groups(scenarios, shards, progress, receptors, requested_ids):
@@ -269,6 +335,8 @@ def collect_subset(
     }
     component_paths = {key: resolve_manifest_path(config_path, ref) for key, ref in component_refs.items()}
     before.update(_snapshot(component_paths.values()))
+    # 必須在既有loader讀取前固定岸界及間接來源，避免只驗三份外框而漏記物理岸界。
+    native_coast = _native_coast_snapshot(config, config_path, before)
     # generated 幾何以工程讀取模式取得；以原 plan hashes 與正式 flow ID 再繫結。
     # 不升級 release_status，不經 pilot loader，不替換 scenario_selection。
     inputs = load_scenario_inputs(
@@ -280,6 +348,8 @@ def collect_subset(
         or dict(geometry.canonical_component_hashes) != plan["geometry_canonical_hashes"]
     ):
         raise ValueError("當前輸入／幾何canonical hash不符")
+    if native_coast is not None:
+        native_coast["canonical_sha256"] = geometry.canonical_component_hashes["native_coast"]
     expected_scenarios = {s.scenario_id: s for s in inputs.scenarios}
     if len(expected_scenarios) != len(scenarios) or any(
         expected_scenarios.get(s.scenario_id) != s for s in scenarios
@@ -290,6 +360,10 @@ def collect_subset(
         if current100_site else
         select_completed_groups(scenarios, shards, progress, inputs.receptors, shard_ids)
     )
+    if native_coast is not None and (
+        not current100_site or not set(groups) <= {"nanwan", "lienchiang"}
+    ):
+        raise ValueError("模型岸界展示僅接受此次南灣／連江同受體20顆重算")
     if config.boundaries.max_backtrack_days != 30 or any(
         s.material_id != "oca_aluminum_crushed_cylinder" or s.settling_velocity_mps != -0.02
         for values in groups.values()
@@ -419,15 +493,21 @@ def collect_subset(
             "geometry_release_status": domain_doc.get("release_status", domain_doc.get("status")),
             "domain_source_metadata": {k: v for k, v in domain_doc.items() if k != "records"},
         }
-    after = _snapshot(Path(p) for p in before)
+    after = _unchanged_snapshot(before, "製圖擷取期間來源改變，拒絕發布")
     current = load_run_progress(run)
-    if before != after or any(current["shards"][sid] != progress["shards"][sid] for sid in shard_ids):
+    if any(current["shards"][sid] != progress["shards"][sid] for sid in shard_ids):
         raise ValueError("製圖擷取期間來源改變，拒絕發布")
     return {
         "artifact_kind": "completed-subset-preview-v1",
         "validation_scope": "selected_complete_outputs_only",
         "full_validation_deferred": True,
-        "scope_note": SCOPE_NOTE,
+        "scope_note": NATIVE_COAST_SCOPE_NOTE if native_coast is not None else SCOPE_NOTE,
+        **({
+            "native_coast": native_coast,
+            "population_role": "replacement_same_receptors_of_original100_not_additional40",
+            "model_plan_commit": plan["code_commit"],
+            "plot_code": _plot_code_provenance(),
+        } if native_coast is not None else {}),
         "selection_rule": (
             "事前固定五站各最早指定鋁材20受體，僅擷取該站完整兩片；不同站不同UTC"
             if current100_site else SELECTION_RULE
@@ -562,7 +642,7 @@ def render_subset(payload, output: Path, project_root: Path):
             fig.text(
                 0.5,
                 0.018,
-                SCOPE_NOTE + "｜幾何資格照原始記錄，本圖非全批正式驗收",
+                payload["scope_note"] + "｜幾何資格照原始記錄，本圖非全批正式驗收",
                 ha="center",
                 fontsize=11,
                 color="#8b2424",
@@ -723,8 +803,7 @@ def main() -> int:
     _write_json(args.output / "render_inputs.json", payload)
     files = render_subset(payload, args.output, args.project_root)
     # PNG完成後再核對來源，發布manifest才算本次部分展示完成；不檢查未選checkpoints。
-    if _snapshot(Path(p) for p in payload["source_sha256_before"]) != payload["source_sha256_before"]:
-        raise ValueError("渲染期間來源改變，拒絕發布manifest")
+    _unchanged_snapshot(payload["source_sha256_before"], "渲染期間來源改變，拒絕發布manifest")
     summary = {key: value for key, value in payload.items() if key not in {"sites", "plan"}}
     summary["sites"] = {
         site: {key: value for key, value in data.items() if key not in {"particles", "coastline"}}
@@ -738,11 +817,12 @@ def main() -> int:
     _write_json(args.output / "manifest.json", summary)
     with (args.output / "README.md").open("x", encoding="utf-8") as stream:
         stream.write(
-            "# M1 部分完成情境展示\n\n" + SCOPE_NOTE + "。\n\n"
+            "# M1 部分完成情境展示\n\n" + payload["scope_note"] + "。\n\n"
             "來源維持 formal/full；只完整驗證所選 COMPLETE output，未做整批 checkpoint／歷史驗收。\n\n"
             + payload["selection_rule"]
             + f"。各站20受體（5水平×4隨機垂向抽樣），本圖{payload['selected_particles']}"
-            "／全run50,000情境。\n\n"
+            + ("顆；原run計畫母體50,000情境不代表已執行或已驗收50,000顆。\n\n"
+               if "native_coast" in payload else "／全run50,000情境。\n\n")
             + f"案例：{payload['experiment_case_id']}；不同站到達時間各自明示，不宣稱同時配對。\n"
             "顏色是抽樣序位，不是固定物理水層；M=1僅一成員。\n"
             "固定日曆窗以觀測錨點向前30天；扣除沉底停留後得到個別上限，實際線長由停止狀態決定。\n"
@@ -751,6 +831,14 @@ def main() -> int:
             "render_inputs.json 保存所有繪圖位置、受體／時間／seed身分與小型來源快照；"
             "manifest.json保存所選分片checksum、前後來源SHA與每張圖checksum。\n"
         )
+        if "native_coast" in payload:
+            stream.write(
+                "\n本次南灣／連江是原100同受體重算替代，不是額外40顆；A與B版本分開，"
+                "每站終止分母固定20，不能相加。模型岸界只覆蓋已審兩component，"
+                "不等於底圖岸線；底圖僅顯示，不作物理邊界。\n"
+                "native_coast欄位保存岸界檔案／canonical／來源SHA與兩component；"
+                "model_plan_commit為原計畫模型來源，plot_code為實際繪圖commit與腳本SHA。\n"
+            )
     print(json.dumps({"output": str(args.output), "png_count": len(files), "source_unchanged": True}))
     return 0
 

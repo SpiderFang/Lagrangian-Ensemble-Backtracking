@@ -1,5 +1,45 @@
 # 已審模型岸界：有限範圍的首次碰岸停止
 
+## 已完成站點的四圖與來源追溯
+
+`scripts/build_completed_subset_preview.py` 須與已支援第四幾何的同版 `src` 配套，
+沿用既有 `load_boundary_geometries`，不複製loader。`collect_subset` 保留情境component
+及geometry兩個完整canonical字典精確相等；不能刪除 `native_coast` key通過驗證。
+只有該站兩片都COMPLETE、最終output完整checksum／身分驗證通過才產原四張圖，
+不以最後checkpoint的active數代替 `particle_table.parquet` 的最終分類。
+
+可選 `geometry.native_coast_manifest.path` 依config所在目錄解析；其中 `source_files`
+依岸界manifest所在目錄解析，絕對引用原樣保留。使用既有 `resolve_manifest_path`
+規則，不跟隨symlink，不掃forcing、raw或checkpoint歷史。岸界manifest與所有列明
+source檔案在loader讀取前加入SHA快照，擷取結束及四图渲染後各核一次。缺檔、
+損壞、來源SHA／投影／站點錯綁仍由現有loader拒絕；中途變動拒絕發布manifest。
+沒有岸界設定時不新增來源／欄位，保留原三geometry流程。
+
+`render_inputs.json` 與發布 `manifest.json` 的 `native_coast` 保存實際岸界檔路徑、
+檔案SHA、canonical、間接來源路徑/SHA、兩component、投影WKT、region/edge指紋。
+`model_plan_commit` 是不可變計畫的模型來源；`plot_code` 是執行腳本所屬checkout的
+實際commit、tracked dirty旗標、腳本與幾何loader路徑/SHA，不能互相冒稱。
+底圖SHA仍在共同來源快照，但 `basemap_role=display_only_not_physical_boundary`：
+**模型岸界不等於底圖岸線**。只覆蓋已審兩component，其餘失敗仍待查，dt-halving及
+完整科學驗收仍未完成。
+
+南灣／連江的新版本是原100同受體重算替代，**不是額外40顆**。每站圖面與終止分母
+固定20；舊A與新B結果分開，不能合併分母。正式計畫50,000情境僅表示母體設計，
+不代表已執行50,000顆。圖與README明列此限制，仍採原四種圖式、不增圖型。
+
+以下命令只為審核準備，需主審GO後才在新的乾淨plot checkout執行：
+
+```bash
+PYTHONPATH="$PLOT_CODE/src" "$PYTHON" "$PLOT_CODE/scripts/build_completed_subset_preview.py" \
+  --run "$NEW_COAST_RUN" --config "$NEW_COAST_CONFIG" --coastline "$DISPLAY_BASEMAP" \
+  --project-root "$PLOT_CODE" --current100-site nanwan \
+  --shard "$NANWAN_FIRST_SHARD" --shard "$NANWAN_SECOND_SHARD" --output "$NEW_B_NANWAN_PREVIEW"
+```
+
+SERVER圖面只寫 `/data/LBT/previews` 下既定原100成果根的唯一
+`B-nanwan` 子目錄，不覆寫舊圖；所有TMPDIR/MPLCONFIGDIR/XDG_CACHE_HOME/UV_CACHE_DIR/
+NUMBA_CACHE_DIR皆本次NFS scratch，五項threads=1。此處不部署、不重算、不改運算程序。
+
 ## 已審兩站40顆操作入口
 
 `scripts/run_native_coast40_subset.py` 只適用本次已審來源／新岸界計畫對，雜湊常數
