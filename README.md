@@ -264,10 +264,15 @@ NumPy弱純量dtype捨入，不更動PI核心、RK4、步長、種子或停止�
 非停止式採樣60秒並保存 `profile.raw`，不附加既有worker、不sudo或改系統權限，
 也不混用faulthandler/cProfile。每10次掃描彙總已完成步數與年齡。保留原種子、檢查點亂數、
 步長、物理及批次平流器，不呼叫控制器執行／恢復／調和流程，也不發布軌跡或新檢查點。
-受控內部呼叫使用既有私有啟動驗證能力，保留全部不可變繫結與路徑檢核，但不掃全批歷史；
-只有明示檢查點的單片鏈由既有載入器驗證。來源紀錄明示
-`diagnostic_startup_bindings_only=true`、`full_history_validation_not_performed=true`、
-`formal_result=false`；這不是新公開略過驗證介面，不改原worker的驗證政策。
+`--setup-validation startup`（原預設）使用既有私有啟動驗證能力，保留不可變繫結與
+路徑檢核，不掃全批歷史；明示檢查點的單片鏈仍由既有載入器驗證。
+`--setup-validation full` 則不傳私有能力，完整走公開控制器預設的static歷史驗證；
+這是驗證路徑的有界比較，不另外重複CLI handler的前置掃描，也不能據此先宣告停滯原因。
+兩模式皆記錄setup起訖、建構／恢復、每10次步進與模組來源，硬時限及唯讀限制相同。
+來源紀錄分開保存模型commit／目錄與腳本路徑／SHA；startup明示
+`diagnostic_startup_bindings_only=true`、`full_history_validation_not_performed=true`。
+full啟動時只標記已要求完整驗證，是否完成必須以`setup_complete`判讀，不能由採樣器
+退出碼推斷。所有模式均`formal_result=false`，不改原worker驗證政策或PI BayTrace原始碼。
 所有暫存與快取另置診斷目錄、五種執行緒限制均為1；採樣完成或硬逾時只清理診斷自建群組。
 `provenance.json`、`pid.json`、`numerical-pid.json`、`stdout.jsonl`、`stacks.stderr`、
 `profile.raw`、`result.json` 是診斷證據；採樣失敗不得冒稱已定位卡點。

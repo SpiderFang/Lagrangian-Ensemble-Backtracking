@@ -52,7 +52,7 @@ def build_batch(controller, shard_id, checkpoint, batch_class):
     return batch_class(**options)
 
 
-def summarize(batch, sweep, started, report=None):
+def summarize(batch, sweep, started, report=None, setup_validation='startup'):
     """彙總步數／年齡及程序累計快取、原版批次計數，供辨識建場或快取反覆淘汰。
 
     快取計數是此次診斷程序累計值，不當作正式run進度；不輸出位置或整份軌跡。
@@ -63,7 +63,8 @@ def summarize(batch, sweep, started, report=None):
     times = [item.state.time_utc_ns for item in executions]
     report = report or {}
     cache = report.get('resolver_report', {})
-    emit('advance', sweep=sweep, elapsed_seconds=time.monotonic() - started,
+    emit('advance', setup_validation=setup_validation,
+         sweep=sweep, elapsed_seconds=time.monotonic() - started,
          particle_steps=sum(steps), step_min=min(steps), step_max=max(steps),
          age_seconds_min=min(ages), age_seconds_max=max(ages),
          model_utc_ns_min=min(times), model_utc_ns_max=max(times), terminal=batch.terminal,
@@ -77,15 +78,19 @@ def summarize(batch, sweep, started, report=None):
 def worker(args):
     """開啟唯讀控制器並最多逐次推進指定掃描數；結果只留在診斷目錄。
 
-    以既有私有能力執行啟動繫結驗證，保留不可變輸入、設定、種子與路徑檢核；
-    不掃描整批歷史。僅明示檢查點的恢復保留原載入器對該片鏈的驗證，不發布成果。
+    預設startup以既有私有能力執行啟動繫結驗證，保留不可變輸入、設定、種子
+    與路徑檢核；full則不傳私有能力，讓控制器完整驗證歷史，以比較前置耗時。
+    兩種模式均只在記憶體推進，明示檢查點恢復仍驗該片鏈，不能發布成果。
     靜態驗證、建構／載入與實際步進分開計時。由父層py-spy以祖先權限非停止式
     採樣；不啟用faulthandler或cProfile，避免混用診斷器。不得附加原計算程序。
     """
     sys.path.insert(0, str(args.project_root / 'src'))
     import lagrangian_backtracking.cli as cli
     import lagrangian_backtracking.production as production
-    from lagrangian_backtracking.runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
+
+    mode = getattr(args, 'setup_validation', 'startup')
+    if mode not in {'full', 'startup'}:
+        raise ValueError('setup_validation只允許full或startup')
 
     with (args.output / 'numerical-pid.json').open('x') as stream:
         json.dump(dict(pid=os.getpid(), ppid=os.getppid(), pgid=os.getpgrp()), stream)
@@ -93,32 +98,40 @@ def worker(args):
         path = Path(module.__file__).resolve()
         if not path.is_relative_to((args.project_root / 'src').resolve()):
             raise ValueError("數值模組來源不是明示版本")
-        emit('module_source', module=module.__name__, path=str(path), sha256=digest(path))
+        emit('module_source', setup_validation=mode,
+             module=module.__name__, path=str(path), sha256=digest(path))
     start = time.monotonic()
-    emit('setup_start', diagnostic_startup_bindings_only=True,
-         full_history_validation_not_performed=True, formal_result=False)
-    # 此私有能力只限本受控、完全不發布結果的重現；不是新公開略過驗證旗標。
+    emit('setup_start', setup_validation=mode, diagnostic_startup_bindings_only=mode == 'startup',
+         full_history_validation_requested=mode == 'full', formal_result=False)
+    # full不傳任何私有參數，保留公開控制器預設完整static驗證；不另呼叫run_shard。
+    # startup能力只限本受控、完全不發布結果的重現，並非正式入口的通用略過旗標。
+    validation_kwargs = {}
+    if mode == 'startup':
+        from lagrangian_backtracking.runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
+
+        validation_kwargs = dict(_defer_full_validation=True,
+                                 _private_dynamic_bootstrap=_DEFERRED_VALIDATION_PRIVATE_TOKEN)
     controller = cli.open_worker_controller(
         args.workspace, config_path=args.config, ocm_native_root=args.ocm_native_root,
         ocm_reconstruction_root=args.ocm_reconstruction_root,
         checkpoint_root=args.checkpoint_root, continuous_time_fallback=True,
-        _defer_full_validation=True,
-        _private_dynamic_bootstrap=_DEFERRED_VALIDATION_PRIVATE_TOKEN)
-    emit('setup_complete', elapsed_seconds=time.monotonic() - start)
+        **validation_kwargs)
+    emit('setup_complete', setup_validation=mode, elapsed_seconds=time.monotonic() - start,
+         full_history_validation_not_performed=mode == 'startup')
     restore_start = time.monotonic()
-    emit('restore_start' if args.checkpoint else 'initialization_start')
+    emit('restore_start' if args.checkpoint else 'initialization_start', setup_validation=mode)
     batch = build_batch(controller, args.shard_id, args.checkpoint, production.ProductionBatch)
-    emit('batch_ready', restore_seconds=time.monotonic() - restore_start,
+    emit('batch_ready', setup_validation=mode, restore_seconds=time.monotonic() - restore_start,
          from_checkpoint=args.checkpoint is not None)
     advance_start = time.monotonic()
-    summarize(batch, 0, advance_start, controller.advection_reporter())
+    summarize(batch, 0, advance_start, controller.advection_reporter(), mode)
     for sweep in range(1, args.max_sweeps + 1):
         if batch.terminal:
             break
         batch.advance(1)
         if sweep % 10 == 0 or batch.terminal:
-            summarize(batch, sweep, advance_start, controller.advection_reporter())
-    emit('diagnostic_return', elapsed_seconds=time.monotonic() - start,
+            summarize(batch, sweep, advance_start, controller.advection_reporter(), mode)
+    emit('diagnostic_return', setup_validation=mode, elapsed_seconds=time.monotonic() - start,
          native_report=controller.advection_reporter(), formal_result=False)
     return 0
 
@@ -151,6 +164,8 @@ def main(argv=None):
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--shard-id', required=True)
     parser.add_argument('--expected-commit', required=True)
+    parser.add_argument('--setup-validation', choices=('full', 'startup'), default='startup',
+                        help='僅診斷控制器前置驗證：full完整歷史；startup啟動繫結（預設）')
     parser.add_argument('--py-spy', required=True, type=Path,
                         help='獨立工具環境的py-spy絕對路徑；只由它啟動新診斷子程序')
     parser.add_argument('--max-sweeps', type=int, default=1000)
@@ -198,11 +213,16 @@ def main(argv=None):
                '--rate', '5', '--format', 'raw', '--full-filenames', '--duration', '60',
                '--output', str(output / 'profile.raw'), '--', *child_command]
     evidence = dict(policy='READ_ONLY_IN_MEMORY_DIAGNOSTIC_NOT_RESULTS', actual_commit=actual,
-                    diagnostic_startup_bindings_only=True,
-                    full_history_validation_not_performed=True, formal_result=False,
+                    setup_validation=args.setup_validation,
+                    diagnostic_startup_bindings_only=args.setup_validation == 'startup',
+                    full_history_validation_requested=args.setup_validation == 'full',
+                    full_history_validation_not_performed=(
+                        True if args.setup_validation == 'startup' else None),
+                    formal_result=False,
                     profiler='py-spy nonblocking ancestor sampling; no faulthandler/cProfile',
                     profiling_seconds=60, profiling_rate_hz=5,
-                    project_root=str(args.project_root), script_sha256=digest(__file__),
+                    project_root=str(args.project_root), script_path=str(Path(__file__).resolve()),
+                    script_sha256=digest(__file__),
                     plan_sha256=digest(plan_path), run_id=plan['run_id'], shard_id=args.shard_id,
                     checkpoint=str(args.checkpoint) if args.checkpoint else None,
                     checkpoint_sha256=(digest(args.checkpoint / 'checkpoint.json')

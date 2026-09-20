@@ -69,8 +69,24 @@ def test_missing_native_rejected():
         runner.build_batch(controller, 'selected', None, object)
 
 
-def test_worker_private_capability_and_native(monkeypatch, tmp_path):
-    """受控重現傳入既有私有能力，後續記憶體批次仍使用同一原版平流器。"""
+@pytest.mark.parametrize('mode', ['full', 'startup'])
+@pytest.mark.parametrize('timeout', ['119', '181'])
+def test_validation_mode_cannot_relax_hard_limit(tmp_path, mode, timeout):
+    """兩種模式均在任何目錄建立／程序啟動前拒絕超出既有硬時限的參數。"""
+    argv = []
+    for name in ('workspace', 'config', 'project-root', 'checkpoint-root', 'ocm-native-root',
+                 'ocm-reconstruction-root', 'output', 'py-spy'):
+        argv.extend(['--' + name, str(tmp_path / name)])
+    argv.extend(['--shard-id', 'only', '--expected-commit', 'source',
+                 '--setup-validation', mode, '--timeout-seconds', timeout])
+    with pytest.raises(ValueError, match='硬上限'):
+        runner.main(argv)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('mode', [None, 'startup', 'full'])
+def test_worker_private_capability_and_native(monkeypatch, tmp_path, mode):
+    """預設／startup保留私有契約；full不傳能力，兩者均只建記憶體原版批次。"""
     import lagrangian_backtracking.cli as cli
     import lagrangian_backtracking.production as production
     from lagrangian_backtracking.runtime import _DEFERRED_VALIDATION_PRIVATE_TOKEN
@@ -102,9 +118,15 @@ def test_worker_private_capability_and_native(monkeypatch, tmp_path):
                            ocm_reconstruction_root=tmp_path / 'patch',
                            checkpoint_root=tmp_path / 'checkpoint', checkpoint=None,
                            shard_id='selected', max_sweeps=1, output=tmp_path)
+    if mode is not None:
+        args.setup_validation = mode
     assert runner.worker(args) == 0
-    assert calls['open']['_defer_full_validation'] is True
-    assert calls['open']['_private_dynamic_bootstrap'] is _DEFERRED_VALIDATION_PRIVATE_TOKEN
+    if mode == 'full':
+        assert '_defer_full_validation' not in calls['open']
+        assert '_private_dynamic_bootstrap' not in calls['open']
+    else:
+        assert calls['open']['_defer_full_validation'] is True
+        assert calls['open']['_private_dynamic_bootstrap'] is _DEFERRED_VALIDATION_PRIVATE_TOKEN
     assert calls['batch']['advection_batcher'] is native
     assert not args.workspace.exists()
 
