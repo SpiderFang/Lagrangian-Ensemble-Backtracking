@@ -17,7 +17,10 @@ source檔案在loader讀取前加入SHA快照，擷取結束及四图渲染後�
 
 `render_inputs.json` 與發布 `manifest.json` 的 `native_coast` 保存實際岸界檔路徑、
 檔案SHA、canonical、間接來源路徑/SHA、兩component、投影WKT、region/edge指紋。
-`model_plan_commit` 是不可變計畫的模型來源；`plot_code` 是執行腳本所屬checkout的
+`model_plan_commit` 必須取自不可變計畫的 `code_provenance.git_commit`，並以
+`model_code_provenance` 原樣保存整份來源；計畫沒有頂層 `code_commit`。
+輸出清冊另用 `run_metadata.code_commit`，不得混用或以operator版本補缺欄。
+`plot_code` 是執行腳本所屬checkout的
 實際commit、tracked dirty旗標、腳本與幾何loader路徑/SHA，不能互相冒稱。
 底圖SHA仍在共同來源快照，但 `basemap_role=display_only_not_physical_boundary`：
 **模型岸界不等於底圖岸線**。只覆蓋已審兩component，其餘失敗仍待查，dt-halving及

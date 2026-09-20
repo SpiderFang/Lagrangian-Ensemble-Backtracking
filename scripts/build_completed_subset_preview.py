@@ -505,7 +505,10 @@ def collect_subset(
         **({
             "native_coast": native_coast,
             "population_role": "replacement_same_receptors_of_original100_not_additional40",
-            "model_plan_commit": plan["code_commit"],
+            # 計畫的模型來源位於code_provenance；run_metadata.code_commit是輸出清冊
+            # 的另一份契約，不能拿operator／plot版本補值。缺欄直接拒絕並保留原始來源。
+            "model_plan_commit": plan["code_provenance"]["git_commit"],
+            "model_code_provenance": plan["code_provenance"],
             "plot_code": _plot_code_provenance(),
         } if native_coast is not None else {}),
         "selection_rule": (
@@ -837,7 +840,8 @@ def main() -> int:
                 "每站終止分母固定20，不能相加。模型岸界只覆蓋已審兩component，"
                 "不等於底圖岸線；底圖僅顯示，不作物理邊界。\n"
                 "native_coast欄位保存岸界檔案／canonical／來源SHA與兩component；"
-                "model_plan_commit為原計畫模型來源，plot_code為實際繪圖commit與腳本SHA。\n"
+                "model_plan_commit取自原計畫code_provenance.git_commit，"
+                "model_code_provenance原樣保存該來源；plot_code另記實際繪圖commit與腳本SHA。\n"
             )
     print(json.dumps({"output": str(args.output), "png_count": len(files), "source_unchanged": True}))
     return 0

@@ -16,7 +16,9 @@
 最終輸出；可選岸界manifest及其間接來源均納入擷取／渲染前後SHA，四份geometry
 canonical完整比對，不移除第四綁定。圖與來源清冊明示原100同受體重算替代，
 每站20顆、不新增40或混合A/B分母；底圖只作顯示。繪圖程式commit與原模型plan
-commit分開保存。修正後的隔離繪圖部署及產圖仍需各次主審GO。
+commit分開保存：`model_plan_commit` 必須讀取 `plan.code_provenance.git_commit`，
+並以 `model_code_provenance` 原樣保存來源；輸出清冊的 `run_metadata.code_commit`
+不是計畫頂層欄位，缺欄不得改填operator或plot版本。修正後的隔離繪圖部署及產圖仍需各次主審GO。
 沒有 `geometry.native_coast_manifest` 時原行為與雜湊不變；有設定則新增來源／投影／
 岸界版本綁定，不能接續舊版本checkpoint。其餘網格空洞與品質失敗仍待查，七點幾何
 測試不等於H30真資料重算或完整科學驗收。C2僅隔離實作／靜態artifact，C3切換尚待核准。

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from copy import deepcopy
+from dataclasses import make_dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -334,6 +335,115 @@ def test_collect_requires_full_four_geometry_dictionary(tmp_path, monkeypatch):
     plan["geometry_canonical_hashes"].pop("native_coast")
     with pytest.raises(ValueError, match="canonical hash不符"):
         preview.collect_subset(tmp_path, config_path, coast, [], current100_site="nanwan")
+
+
+@pytest.mark.parametrize("missing_commit", [False, True])
+def test_collect_return_uses_initialized_plan_provenance(tmp_path, monkeypatch, missing_commit):
+    """用正式初始化器的計畫結構走完20粒子擷取，避免選片探針漏掉回傳欄位錯誤。
+
+    僅替代昂貴的情境／seed／輸出驗證I/O；四幾何loader、來源前後SHA、粒子初始
+    座標與20分母檢核及collect_subset回傳皆真走。合成單點紀錄只驗接線，不是軌跡
+    科學驗收。模型版本沿用本次6992身分；合成輸出故意填入錯誤operator值41aa，
+    只用來阻擋代填回歸，並非真實輸出清冊的模型來源。
+    """
+    config, config_path, _, _ = _coast_geometry_fixture(tmp_path)
+    geometry = preview.load_boundary_geometries(config, config_path=config_path, formal=False)
+    run = _workspace(tmp_path, "plot-schema", run_kind="formal")
+    plan = load_run_plan(run)
+    assert "code_commit" not in plan
+    model_commit = "6992f3f64ff6288eb3eb1493667d0f45db05e324"
+    plan["code_provenance"]["git_commit"] = model_commit
+    if missing_commit:
+        plan["code_provenance"].pop("git_commit")
+    original_provenance = deepcopy(plan["code_provenance"])
+    plan.update(scenario_selection={"mode": "full"}, members_per_scenario=1,
+                scenario_count=50000, experiment_case_id="no_stokes", files={},
+                config_hash=config.config_hash(), component_canonical_hashes={"fixture": "same"},
+                geometry_canonical_hashes=dict(geometry.canonical_component_hashes))
+
+    def record(**fields):
+        """提供可由正式asdict序列化的合成輸入，不替代擷取函式或其回傳邏輯。"""
+        return make_dataclass("FixtureRecord", [(key, object) for key in fields])(**fields)
+
+    residence = SimpleNamespace(backtrack_mode="fixed_calendar_window", maximum_age_days=30,
+                                sampling_seed=1)
+    scenario_config = SimpleNamespace(**config.scenarios.model_dump())
+    scenario_config.bed_residence_time = residence
+    # 保留loader會讀取的完整設定欄位；只替代此接線測試所需的停留時間與hash方法。
+    config_view = SimpleNamespace(**{key: getattr(config, key) for key in type(config).model_fields})
+    config_view.scenarios = scenario_config
+    config_view.boundaries = config.boundaries.model_copy(update={"max_backtrack_days": 30})
+    config_view.config_hash = lambda: plan["config_hash"]
+    domain = next(d for d in config.domains if d.analysis_region_id == "C")
+    lon, lat = domain.center_lonlat
+    x, y = geometry.projections["nanwan"].project(lon, lat)
+    flow = preview.resolve_flow_domain_id(config_view, "C", formal=True)
+    arrival = record(arrival_time_id="arrival", time_utc_ns=1)
+    pair = record(flow_domain_id=flow, z_m_positive_up=-1.0)
+    scenarios, receptors = [], []
+    for i in range(20):
+        receptors.append(record(receptor_id=f"r{i}", study_site_id="nanwan", lon=lon, lat=lat,
+            vertical_id=f"v{i % 4}", metadata=dict(
+                vertical_identity_semantics="random_draw_rank_not_physical_layer",
+                horizontal_receptor_id=f"h{i // 4}", horizontal_selection_draw_order=i // 4,
+                vertical_selection_draw_order=i % 4)))
+        scenarios.append(record(scenario_id=f"s{i}", receptor_id=f"r{i}", study_site_id="nanwan",
+            analysis_region_id="C", arrival_time_id="arrival", arrival_time_utc_ns=1,
+            material_id="oca_aluminum_crushed_cylinder", settling_velocity_mps=-0.02))
+    shards = [SimpleNamespace(shard_id=f"selected-{i}", scenarios=scenarios[i:i + 10])
+              for i in (0, 10)]
+    ids = [sh.shard_id for sh in shards]
+    progress = {"shards": {sid: {"lifecycle": "COMPLETE"} for sid in ids}}
+    for shard in shards:
+        output = run / plan["output_root"] / shard.shard_id
+        output.mkdir(parents=True)
+        (output / "manifest.json").write_text("{}")
+        for name in preview.POSITION_FIELDS:
+            value = {"time_utc_ns": 1, "age_seconds": 0, "x_m": x, "y_m": y,
+                     "z_m": -1.0}.get(name, 0)
+            preview.np.save(output / f"{name}.npy", preview.np.full(10, value))
+        preview.np.save(output / "trajectory_offsets.npy", preview.np.arange(11))
+    coastline = tmp_path / "basemap.json"
+    coastline.write_text(json.dumps(dict(type="FeatureCollection", features=[],
+        crs={"properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}})))
+    (run / "run_plan.json").write_text(json.dumps(plan))
+    monkeypatch.setattr(preview, "load_run_plan", lambda _: plan)
+    monkeypatch.setattr(preview, "load_run_progress", lambda _: progress)
+    for name in ("_cross_check_plan_progress", "_validate_run_files", "_validate_seed_table"):
+        monkeypatch.setattr(preview, name, lambda *a: None)
+    monkeypatch.setattr(preview, "_load_scenarios", lambda *a: scenarios)
+    monkeypatch.setattr(preview, "_build_shards", lambda *a: shards)
+    monkeypatch.setattr(preview, "load_config", lambda *a, **k: config_view)
+    monkeypatch.setattr(preview, "load_scenario_inputs", lambda *a, **k: SimpleNamespace(
+        canonical_component_hashes={"fixture": "same"}, scenarios=scenarios, receptors=receptors,
+        arrival_times=[arrival], initial_conditions_by_pair={(r.receptor_id, "arrival"): pair
+                                                            for r in receptors}))
+    monkeypatch.setattr(preview, "select_current_site", lambda *a: {"nanwan": scenarios})
+    monkeypatch.setattr(preview, "resolve_bed_residence_timing", lambda *a, **k: record(horizon_days=30))
+
+    def selected_output(run, plan, progress, shard):
+        """只替代已另測的輸出validator，保留真實npy讀取與逐粒子回傳組装。"""
+        rows = [dict(particle_id=f"p{s.scenario_id}", analysis_region_id="C", final_status="flow_exit")
+                for s in shard.scenarios]
+        units = [SimpleNamespace(scenario=s, seed=i) for i, s in enumerate(shard.scenarios)]
+        manifest = dict(particle_count=10, observation_count=10, event_count=0,
+                        run_metadata={"code_commit": "41aa654"})
+        return run / plan["output_root"] / shard.shard_id, manifest, rows, units
+
+    monkeypatch.setattr(preview, "validate_selected_output", selected_output)
+    if missing_commit:
+        # 到回傳才缺git_commit也必須拒絕，不能從輸出清冊或繪圖版本代填。
+        with pytest.raises(KeyError, match="git_commit"):
+            preview.collect_subset(run, config_path, coastline, ids, current100_site="nanwan")
+        return
+    payload = preview.collect_subset(run, config_path, coastline, ids, current100_site="nanwan")
+    assert payload["model_plan_commit"] == model_commit
+    assert payload["model_code_provenance"] == original_provenance
+    assert payload["plot_code"] == preview._plot_code_provenance()
+    assert payload["plot_code"]["commit"] not in {model_commit, "41aa654"}
+    assert "code_commit" not in payload["plan"]
+    assert payload["selected_particles"] == payload["sites"]["nanwan"]["counts"]["terminal_denominator"] == 20
+    assert payload["source_unchanged"] and payload["source_sha256_before"] == payload["source_sha256_after"]
 
 
 @pytest.mark.parametrize("source", ["native.json", "source.json"])
