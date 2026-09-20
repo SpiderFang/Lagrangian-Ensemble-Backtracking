@@ -139,7 +139,7 @@ def worker(args):
 def stop_owned(process, child_pid=None):
     """硬逾時只清理由 Popen 新建且群組編號等於自身PID的診斷子程序。
 
-    不搜尋模型程序。py-spy正常完成60秒採樣後，可能留下仍在計算的診斷子程序；
+    不搜尋模型程序。py-spy正常完成指定秒數採樣後，可能留下仍在計算的診斷子程序；
     此時僅接受本次獨立目錄記錄的child_pid，且再次確認它仍在新建群組內。
     """
     if process.poll() is None:
@@ -153,6 +153,14 @@ def stop_owned(process, child_pid=None):
             if os.getpgid(child_pid) != process.pid or process.pid == os.getpgrp():
                 raise RuntimeError("診斷子程序不在自建群組，拒絕清理")
             os.killpg(process.pid, signal.SIGKILL)
+
+
+def profiler_command(py_spy, child_command, output, profiling_seconds):
+    """組成祖先非停止式採樣命令；僅呼叫新子程序，不附加任何既有模型PID。"""
+    return [str(py_spy.resolve(strict=True)), 'record', '--nonblocking',
+            '--rate', '5', '--format', 'raw', '--full-filenames',
+            '--duration', str(profiling_seconds),
+            '--output', str(output / 'profile.raw'), '--', *child_command]
 
 
 def main(argv=None):
@@ -170,10 +178,15 @@ def main(argv=None):
                         help='獨立工具環境的py-spy絕對路徑；只由它啟動新診斷子程序')
     parser.add_argument('--max-sweeps', type=int, default=1000)
     parser.add_argument('--timeout-seconds', type=int, default=150)
+    parser.add_argument('--profiling-seconds', type=int, default=60,
+                        help='採樣30–150整數秒，須比硬上限至少少20秒；預設60秒')
     parser.add_argument('--internal-worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not 1 <= args.max_sweeps <= 1000 or not 120 <= args.timeout_seconds <= 180:
         raise ValueError("診斷只允許1–1000次掃描及120–180秒硬上限")
+    # 預留至少20秒讓採樣器寫出證據及父層清理；不得靠延長採樣解除180秒上限。
+    if not 30 <= args.profiling_seconds <= 150 or args.profiling_seconds > args.timeout_seconds - 20:
+        raise ValueError('採樣秒數須為30–150且不超過硬上限減20秒')
     if args.internal_worker:
         return worker(args)
     output = args.output.resolve()
@@ -207,11 +220,9 @@ def main(argv=None):
         env[key] = str(path)
     child_command = [sys.executable, '-u', str(Path(__file__).resolve()),
                      *(argv if argv is not None else sys.argv[1:]), '--internal-worker']
-    # 60秒自動結束採樣以先落盤原始堆疊；外層仍有150秒預設硬上限。
+    # 預設60秒，自訂時以經核對秒數自動落盤；外層仍有150秒預設／180秒最大硬上限。
     # 不使用--pid附加原worker，py-spy是新診斷Python的直接父程序。
-    command = [str(args.py_spy.resolve(strict=True)), 'record', '--nonblocking',
-               '--rate', '5', '--format', 'raw', '--full-filenames', '--duration', '60',
-               '--output', str(output / 'profile.raw'), '--', *child_command]
+    command = profiler_command(args.py_spy, child_command, output, args.profiling_seconds)
     evidence = dict(policy='READ_ONLY_IN_MEMORY_DIAGNOSTIC_NOT_RESULTS', actual_commit=actual,
                     setup_validation=args.setup_validation,
                     diagnostic_startup_bindings_only=args.setup_validation == 'startup',
@@ -220,7 +231,7 @@ def main(argv=None):
                         True if args.setup_validation == 'startup' else None),
                     formal_result=False,
                     profiler='py-spy nonblocking ancestor sampling; no faulthandler/cProfile',
-                    profiling_seconds=60, profiling_rate_hz=5,
+                    profiling_seconds=args.profiling_seconds, profiling_rate_hz=5,
                     project_root=str(args.project_root), script_path=str(Path(__file__).resolve()),
                     script_sha256=digest(__file__),
                     plan_sha256=digest(plan_path), run_id=plan['run_id'], shard_id=args.shard_id,

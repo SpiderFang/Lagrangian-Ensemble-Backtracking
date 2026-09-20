@@ -84,6 +84,46 @@ def test_validation_mode_cannot_relax_hard_limit(tmp_path, mode, timeout):
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize('seconds,timeout,valid', [
+    (None, 150, True), ('30', 120, True), ('100', 120, True),
+    ('150', 180, True), ('150', 170, True), ('29', 180, False),
+    ('151', 180, False), ('101', 120, False), ('150', 169, False),
+    ('30.5', 180, False), ('true', 180, False)])
+def test_profiling_duration_limits_and_default(monkeypatch, tmp_path, seconds, timeout, valid):
+    """參數解析保留60秒預設，核對上下界與20秒餘裕，拒絕小數／非整數。"""
+    argv = []
+    for name in ('workspace', 'config', 'project-root', 'checkpoint-root', 'ocm-native-root',
+                 'ocm-reconstruction-root', 'output', 'py-spy'):
+        argv.extend(['--' + name, str(tmp_path / name)])
+    argv.extend(['--shard-id', 'only', '--expected-commit', 'source',
+                 '--timeout-seconds', str(timeout), '--internal-worker'])
+    if seconds is not None:
+        argv.extend(['--profiling-seconds', seconds])
+    calls = []
+    monkeypatch.setattr(runner, 'worker', lambda args: calls.append(args.profiling_seconds) or 0)
+    if valid:
+        assert runner.main(argv) == 0
+        assert calls == [60 if seconds is None else int(seconds)]
+    else:
+        with pytest.raises((ValueError, SystemExit)):
+            runner.main(argv)
+        assert not calls
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('seconds', [30, 60, 150])
+def test_profiler_command_uses_actual_duration_and_new_child(tmp_path, seconds):
+    """命令使用實際秒數及新子程序，維持低頻非停止式採樣，不能變成附加PID。"""
+    executable = tmp_path / 'py-spy'
+    executable.touch()
+    child = ['python', 'readonly.py', '--internal-worker']
+    command = runner.profiler_command(executable, child, tmp_path, seconds)
+    assert command[command.index('--duration') + 1] == str(seconds)
+    assert command[command.index('--rate') + 1] == '5'
+    assert '--nonblocking' in command and '--pid' not in command
+    assert command[command.index('--') + 1:] == child
+
+
 @pytest.mark.parametrize('mode', [None, 'startup', 'full'])
 def test_worker_private_capability_and_native(monkeypatch, tmp_path, mode):
     """預設／startup保留私有契約；full不傳能力，兩者均只建記憶體原版批次。"""

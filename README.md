@@ -261,7 +261,11 @@ NumPy弱純量dtype捨入，不更動PI核心、RK4、步長、種子或停止�
 
 另明示獨立工具環境的 `--py-spy` 絕對路徑。最多 `--max-sweeps 1000`，
 `--timeout-seconds` 限120–180秒；py-spy直接啟動新診斷Python，以祖先權限每秒5次
-非停止式採樣60秒並保存 `profile.raw`，不附加既有worker、不sudo或改系統權限，
+非停止式預設採樣60秒並保存 `profile.raw`；`--profiling-seconds` 可指定30–150整數秒，
+且須不超過 `--timeout-seconds` 減20秒，預留採樣落盤及清理時間。較長單次重現可用
+`--setup-validation startup --profiling-seconds 150 --timeout-seconds 180 --max-sweeps 1000`，
+仍不能超過180秒硬上限；命令與來源紀錄保存實際採樣秒數。
+不附加既有worker、不sudo或改系統權限，
 也不混用faulthandler/cProfile。每10次掃描彙總已完成步數與年齡。保留原種子、檢查點亂數、
 步長、物理及批次平流器，不呼叫控制器執行／恢復／調和流程，也不發布軌跡或新檢查點。
 `--setup-validation startup`（原預設）使用既有私有啟動驗證能力，保留不可變繫結與
