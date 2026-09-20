@@ -1,5 +1,49 @@
 # 已審模型岸界：有限範圍的首次碰岸停止
 
+## 已審兩站40顆操作入口
+
+`scripts/run_native_coast40_subset.py` 只適用本次已審來源／新岸界計畫對，雜湊常數
+在腳本 `REVIEWED`；沒有任意站點、worker數、續跑或縮短步數的公開參數。
+先沿用固定100選樣核對五站完整母體，再取南灣／連江各兩片，四片內外均須
+PLANNED、零保存步數、零checkpoint。兩張完整scenario／seed表的實檔SHA必須與來源及
+plan相符，master_seed／component及三舊geometry保持；唯一新增已審native_coast。
+完整 `validate_run_inputs(execution_priority=True)` 仍執行，不使用defer或私有略過入口。
+
+```bash
+python scripts/run_native_coast40_subset.py \
+  --workspace "$NEW_WORKSPACE" --source-workspace "$READONLY_SOURCE" \
+  --config "$NEW_CONFIG" --project-root "$CLEAN_CODE" \
+  --checkpoint-root "$NEW_CHECKPOINT" --ocm-native-root "$OCM_NATIVE_ROOT" \
+  --ocm-reconstruction-root "$OCM_RECONSTRUCTION_ROOT" \
+  --scratch-root "$NEW_SCRATCH" --log-root "$NEW_LOGS" \
+  --numba-cache-dir "$NEW_NUMBA_CACHE" --storage-gate-evidence "$STORAGE_GATE" \
+  --expected-commit "$ACTUAL_OPERATOR_COMMIT"
+```
+
+以上預設只核對與寫新session，不啟動粒子；另獲GO才加 `--execute`。所有目標、
+checkpoint、scratch、log與cache須在 `/data/LBT`，且即時掛載身分須與已通過的NFS
+storage gate一致。呼叫前建立目錄並將 `TMPDIR`、`MPLCONFIGDIR`、`XDG_CACHE_HOME`、
+`UV_CACHE_DIR`、`NUMBA_CACHE_DIR` 放在本次scratch；log與Numba cache須為分開的嚴格
+子目錄。五項thread環境固定1，場快取固定20／4GiB；此為執行記憶體配置，不是物理變更，
+快取常駐上限也不等於RSS。
+
+每個工作區的operator鎖位於工作區父目錄，以固定run名稱產生零長度檔案，不加到
+run根白名單、不修改plan或清冊；鎖從核對開始持有到自身子程序收尾結束。這不是
+run_gate獨占鎖，避免擋住worker需要的共用鎖；既有assigned shard鎖照常防止同片雙寫。
+操作者PID與啟動tick存於session manifest，鎖檔不寫入內容也不刪除重建。
+
+共用原生命週期只接受五站或此次兩站、各兩個唯一shard；完成分母分別為100／40，
+兩站完成不等其餘三站。MemAvailable不足30GiB或無法讀取即停止啟動／安全收尾；
+SIGINT、SIGTERM或任何非零worker退出，只對本次新建process group使用原300秒
+SIGINT→TERM／KILL策略，不依名稱pkill、不碰其他run，不自動重試。
+
+`demo-manifest.json` 分開保存immutable plan的6992模型來源與actual operator來源、
+已審綁定、表SHA、各站兩片命令、執行緒／快取實值、40顆／50000母體分母及待驗狀態。
+逐站完成仍須有實際原版native completed、批次group及source SHA、fallback=0，保留
+rejected／物理QC，不將有失敗的完成片稱為科學通過。dry-run不產生native推進證據，
+真資料與dt-halving驗收仍待後續授權；50k保持HOLD。原固定100 main的來源hash與
+default／resume契約不變。
+
 本版本只新增南灣 `nanwan-boundary-0` 主缺支援區的原生交界，及連江
 `lienchiang-boundary-35` 的112條內孔邊。這是已審的**模型岸界**，不是底圖岸線，
 不自動將所有單一三角形擁有的邊、未知網格孔洞或水平品質旗標1改為海岸。

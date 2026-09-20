@@ -8,6 +8,10 @@
 
 可選的[已審模型岸界](docs/development/reviewed_native_coast.md)只覆蓋南灣主缺支援區的
 原生交界與連江指定112邊內孔，以首次碰岸停止，不反射、不把底圖升為物理輸入。
+已審兩站40顆重算使用 `scripts/run_native_coast40_subset.py`，預設僅核對準備；
+只有另獲啟動授權後才加 `--execute`。入口固定來源／目標plan與岸界SHA，保留完整
+驗證、工作區級操作者互斥、逐片鎖、30GiB守護與300秒收尾；不接受任意站數或resume，
+不改原100入口契約、不擴完整50k。詳細命令與待验限制見上述契約文件。
 沒有 `geometry.native_coast_manifest` 時原行為與雜湊不變；有設定則新增來源／投影／
 岸界版本綁定，不能接續舊版本checkpoint。其餘網格空洞與品質失敗仍待查，七點幾何
 測試不等於H30真資料重算或完整科學驗收。C2僅隔離實作／靜態artifact，C3切換尚待核准。
@@ -233,7 +237,8 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 `LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES`；兩者皆未設定仍為2場／512MiB。值須為ASCII
 十進位正整數，最高64場／4GiB；只設其一、空值、負數、小數或超限皆拒絕。
 這只是執行記憶體配置，不更改物理設定、原版RK4、粒子順序、批次分組、seed、dt或run plan。
-只有固定100入口 `run_current100_subset.py` 明示覆寫20場／4294967296 bytes，
+固定100入口 `run_current100_subset.py` 與已審兩站岸界40顆入口
+`run_native_coast40_subset.py` 明示覆寫20場／4294967296 bytes，
 將實際環境與容量記入新session `demo-manifest.json` 的 `frame_cache_limits`；
 resolver report沿用實際上限與建場／淘汰計數。五worker場快取合計上限20GiB，
 但常駐場快取上限**不是程序RSS上限**，建場暫存、forcing與檢查點另占記憶體；

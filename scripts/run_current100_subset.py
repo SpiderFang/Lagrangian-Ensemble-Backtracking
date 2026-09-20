@@ -187,11 +187,34 @@ def completed_evidence(workspace, ids):
     return {"native_completed_particle_steps": completed, "shard_reports": reports}
 
 
+def selection_size(selected):
+    """只接受已驗證五站或已審南灣／連江兩站，各兩片且全域不重複。
+
+    此為共用生命週期的最後防線，不提供任意站數排程；情境身分仍由入口
+    select_shards 及正式綁定核對。每片十顆，因此回傳期望站數及40／100分母。
+    """
+    if set(selected) not in (set(SELECTION), {"nanwan", "lienchiang"}):
+        raise ValueError("只允許原五站或已審南灣／連江兩站")
+    if any(not isinstance(values, (list, tuple)) for values in selected.values()):
+        raise ValueError("各站分片須為兩個ID的序列")
+    ids = [sid for values in selected.values() for sid in values]
+    if (any(len(values) != 2 for values in selected.values())
+            or any(not isinstance(sid, str) or not sid for sid in ids)
+            or len(set(ids)) != 2 * len(selected)):
+        raise ValueError("各站須兩片，分片ID不得重複")
+    return len(selected), len(ids) * 10
+
+
 def supervise(args, selected, session, env):
-    """固定五席、各啟動一次；監看資源與所選進度，任何失敗安全收尾且不重試。"""
+    """已審兩席或五席各啟動一次；沿用資源監看、安全收尾且不重試。
+
+    分母由已核對的固定選片推導，不把40顆或100顆當完整50,000母體。
+    原100入口的選樣、來源雜湊與新跑／續跑契約不在此更動。
+    """
     from lagrangian_backtracking.parallel_execution import _stop_active_processes
     from lagrangian_backtracking.run_control import load_run_progress
 
+    expected_sites, particle_count = selection_size(selected)
     started = time.monotonic()
     active, streams, finished = {}, [], set()
     interrupted = []
@@ -222,7 +245,7 @@ def supervise(args, selected, session, env):
             active[site] = process
             record("worker_started", site=site, shard_ids=ids, pid=process.pid)
         last_steps = {}
-        while len(finished) != 5:
+        while len(finished) != expected_sites:
             if interrupted:
                 status = "INTERRUPTED"
                 raise InterruptedError("操作者要求安全停止")
@@ -248,9 +271,9 @@ def supervise(args, selected, session, env):
                 evidence = completed_evidence(args.workspace, ids)
                 record("station_compute_complete", site=site, selected_particles=20, **evidence)
                 finished.add(site)
-            if len(finished) != 5:
+            if len(finished) != expected_sites:
                 time.sleep(5)
-        status = "SELECTED_100_COMPUTE_COMPLETE_FULL_RUN_INCOMPLETE"
+        status = f"SELECTED_{particle_count}_COMPUTE_COMPLETE_FULL_RUN_INCOMPLETE"
         return 0
     except BaseException as exc:
         record("stopping", status=status, error_type=type(exc).__name__, error=str(exc))

@@ -146,7 +146,7 @@ def test_low_memory_stops_only_started_workers_with_existing_safe_helper(tmp_pat
 
     monkeypatch.setattr(operator.subprocess, "Popen", spawn)
     monkeypatch.setattr(parallel, "_stop_active_processes", stop)
-    selected = {site: ["a", "b"] for site in operator.SELECTION}
+    selected = {site: [site + "-a", site + "-b"] for site in operator.SELECTION}
     assert operator.supervise(SimpleNamespace(project_root=tmp_path), selected, tmp_path, {}) == 2
     assert len(started) == len(stopped) == 2
 
@@ -176,7 +176,7 @@ def test_five_workers_receive_bounded_cache_and_manifest_policy(tmp_path, monkey
 
     monkeypatch.setattr(operator.subprocess, 'Popen', spawn)
     monkeypatch.setattr(parallel, '_stop_active_processes', lambda active, **kwargs: {})
-    selected = {site: ['first', 'second'] for site in operator.SELECTION}
+    selected = {site: [site + '-first', site + '-second'] for site in operator.SELECTION}
     assert operator.supervise(SimpleNamespace(project_root=tmp_path), selected, tmp_path, env) == 2
     assert len(passed) == 5 and all(operator.frame_cache_policy(e) == policy for e in passed)
 
