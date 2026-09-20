@@ -263,6 +263,20 @@ NumPy弱純量dtype捨入，不更動PI核心、RK4、步長、種子或停止�
 `tests/baytrace_scalar_reference.py`保存向量化前逐節點／元素參考，
 由混合float32／float64逐陣列bitwise與拒絕理由測試核對，不能據此宣稱已排除全部效能瓶頸。
 
+`scripts/diagnose_failure_points_readonly.py` 僅用於一至五個既有失敗點的唯讀比對：
+依原事件座標／UTC及固定代提示，呼叫原速度取樣器、帶／不帶提示的定位，以及
+全部三角形包圍盒候選的既有精確定位；只量測投影與邊界距離，不自行分類或外插。
+以 `--spec` 指定已核對的乾淨模型版本與原run／事件／狀態路徑，`--output` 必須是
+獨立NFS操作目錄；只建一個診斷子程序，180秒硬限及30GiB可用記憶體門檻。
+不建立執行批次、不推進、不消耗亂數、不寫原進度，結果不是正式成果。
+規格JSON的新欄位 `checkpoint_dir`、`expected_sequence`、`expected_point_count`
+必須成套指定；序號為正整數，點數為1..5整數，布林值、文字與浮點數皆拒絕。
+舊規格僅含 `checkpoint62` 時仍固定第62代／五點；新舊欄位混用拒絕。
+原十粒子分片、描述檔序號／分片、compact狀態SHA、事件粒子唯一且屬於request與
+狀態、位置與UTC精確相等的檢核均保留；全面候選精驗容差仍為1e-10。
+結果分開保存模型版本與 `diagnostic_script_commit`／腳本SHA，不能將診斷工具
+更新誤認為現行數值模型版本切換，也不以水平取樣不支援自行決定停止分類。
+
 `scripts/diagnose_batch_readonly.py` 只在新的獨立程序記憶體中重現指定純流分片，
 不是正式計算或成果。必須明示 `--project-root`、`--expected-commit`、`--workspace`、
 `--config`、`--checkpoint-root`、`--ocm-native-root`、`--ocm-reconstruction-root`、
