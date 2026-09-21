@@ -442,6 +442,40 @@ def test_dry_and_missing_are_kept_separate(tmp_path: Path) -> None:
         pair.raise_if_unresolved_gap()
 
 
+def test_raise_if_unresolved_gap_ignores_below_bed_nan_only_when_kbp_given() -> None:
+    """真實 ocm_native 在海床以下層（k<kbp）存 NaN：提供 kbp 時不算缺口，海床以上的缺值仍要報錯。"""
+
+    from lagrangian_backtracking.native_runner.forcing_bridge import HourlyFieldPair
+
+    nvrt, nnode = 5, 4
+    kbp = np.array([0, 2, 3, 1])
+    layers = np.arange(nvrt)[:, None]
+    below_bed = layers < kbp[None, :]
+    u = np.where(below_bed, np.nan, 0.1)
+    mask = ~np.isfinite(u)
+    eta = np.zeros(nnode)
+
+    def _pair(mask1: np.ndarray) -> HourlyFieldPair:
+        return HourlyFieldPair(
+            time_before_utc_ns=_t(0), time_after_utc_ns=_t(1), trat=0.0, ibf=1,
+            u_field1=u, v_field1=u, w_field1=u, eta_field1=eta, diffusivity_field1=None,
+            missing_mask1=mask1, dry_face_flag1=np.zeros(2), month_id1="202401", time_origin1="observed",
+            u_field2=u, v_field2=u, w_field2=u, eta_field2=eta, diffusivity_field2=None,
+            missing_mask2=mask, dry_face_flag2=np.zeros(2), month_id2="202401", time_origin2="observed",
+        )
+
+    dry = np.zeros(nnode, dtype=bool)
+    pair = _pair(mask)
+    with pytest.raises(UnresolvedForcingGapError):
+        pair.raise_if_unresolved_gap(node_is_dry1=dry, node_is_dry2=dry)
+    pair.raise_if_unresolved_gap(node_is_dry1=dry, node_is_dry2=dry, kbp=kbp)
+
+    above = mask.copy()
+    above[4, 2] = True
+    with pytest.raises(UnresolvedForcingGapError):
+        _pair(above).raise_if_unresolved_gap(node_is_dry1=dry, node_is_dry2=dry, kbp=kbp)
+
+
 # ── 6. 欄位可直接餵進 BayTrace 原版 batch_interpolate_velocity ──────────
 
 

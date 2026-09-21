@@ -222,6 +222,7 @@ from .backward_driver import (
     locate_initial_elements,
     mirror_rk4_substep_loop,
     particle_bed_z_levels,
+    zeroed_current_field2_for_smagorinsky,
 )
 from .forcing_bridge import HourlyFieldPair, UnresolvedForcingGapError
 from .orchestrator import NativeWorkUnit
@@ -843,7 +844,7 @@ def run_flow_domain_hour_major(
             gap_detected = False
             try:
                 field_pair.raise_if_unresolved_gap(
-                    node_is_dry1=node_is_dry_check, node_is_dry2=node_is_dry_check
+                    node_is_dry1=node_is_dry_check, node_is_dry2=node_is_dry_check, kbp=driver_grid.grid.kbp
                 )
             except UnresolvedForcingGapError:
                 gap_detected = True
@@ -937,9 +938,12 @@ def run_flow_domain_hour_major(
                         hour_overhead.smagorinsky_cache_hits += 1
                     else:
                         t0 = _time.perf_counter()
+                        u_smag, v_smag = zeroed_current_field2_for_smagorinsky(
+                            field_pair, kbp=driver_grid.grid.kbp, node_is_dry=node_is_dry_check
+                        )
                         hf2_now = compute_smagorinsky_kh_field(
                             driver_grid, handles,
-                            u_current_mps=field_pair.u_field2, v_current_mps=field_pair.v_field2,
+                            u_current_mps=u_smag, v_current_mps=v_smag,
                             horcon=config.horcon,
                         )
                         hour_overhead.time_smagorinsky_s += _time.perf_counter() - t0

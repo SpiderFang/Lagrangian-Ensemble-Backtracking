@@ -490,6 +490,7 @@ __all__ = [
     "apply_settling_velocity",
     "compose_total_velocity_fields",
     "compute_smagorinsky_kh_field",
+    "zeroed_current_field2_for_smagorinsky",
     "compute_wet_dry_flags",
     "estimate_substep_count",
     "particle_bed_z_levels",
@@ -1222,6 +1223,27 @@ def _same_source_arrays(recorded: tuple, current: tuple) -> bool:
         elif not np.array_equal(a, b):
             return False
     return True
+
+
+def zeroed_current_field2_for_smagorinsky(
+    field_pair: HourlyFieldPair, *, kbp: np.ndarray, node_is_dry: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """回傳乾節點與海床以下層已歸零的純海流 field2（u, v），供 Smagorinsky 使用。
+
+    BayTrace 原版在 ``_compute_smagorinsky_hf2`` 之前一定先呼叫
+    ``_zero_dry_velocities``（乾節點與 ``k<kbp`` 層歸零），因此原版的應變率
+    從不讀到海床以下的數值。真實 ``ocm_native`` 產品在海床以下層存 ``NaN``，
+    若直接把原始 ``field_pair.u_field2`` 傳給 Smagorinsky，相鄰節點海床深度
+    不同的元素在該層會算出 ``NaN`` 擴散係數；這裡以複本歸零（不改動
+    ``field_pair``），與 ``compose_current_and_stokes_fields`` 對 field2 的
+    歸零規則、乾濕遮罩完全一致。
+    """
+
+    u = np.array(field_pair.u_field2, dtype=np.float64, copy=True)
+    v = np.array(field_pair.v_field2, dtype=np.float64, copy=True)
+    w = np.array(field_pair.w_field2, dtype=np.float64, copy=True)
+    _zero_dry_and_below_kbp(u, v, w, kbp=kbp, node_is_dry=node_is_dry)
+    return u, v
 
 
 def _zero_dry_and_below_kbp(
@@ -2601,9 +2623,16 @@ def locate_initial_elements(
     shim = _TrackerMethodShim(driver_grid.schism_grid, h0=driver_grid.h0, horcon=0.2)
     shim.pa = pa
     shim.eta_field1 = np.ascontiguousarray(eta_m, dtype=np.float64)
-    shim.u_field2 = np.ascontiguousarray(u_current_mps, dtype=np.float64)
-    shim.v_field2 = np.ascontiguousarray(v_current_mps, dtype=np.float64)
-    shim.w_field2 = np.ascontiguousarray(w_current_mps, dtype=np.float64)
+    # 比照原版在第一步先 ``_zero_dry_velocities(include_field1=True)`` 再定位：乾節點與
+    # 海床以下層以複本歸零（真實 ocm_native 在海床以下存 NaN），不改動呼叫端陣列。
+    node_is_dry_init, _ = compute_wet_dry_flags(driver_grid, handles, eta_m=shim.eta_field1)
+    u_init = np.array(u_current_mps, dtype=np.float64, copy=True)
+    v_init = np.array(v_current_mps, dtype=np.float64, copy=True)
+    w_init = np.array(w_current_mps, dtype=np.float64, copy=True)
+    _zero_dry_and_below_kbp(u_init, v_init, w_init, kbp=driver_grid.grid.kbp, node_is_dry=node_is_dry_init)
+    shim.u_field2 = np.ascontiguousarray(u_init)
+    shim.v_field2 = np.ascontiguousarray(v_init)
+    shim.w_field2 = np.ascontiguousarray(w_init)
     handles.tracker_cls.find_initial_elements(shim)
     return pa.status == -1
 
@@ -2880,7 +2909,9 @@ def run_backward_batch(
         )
         hour_overhead.time_wet_dry_check_s += _time.perf_counter() - t0
         try:
-            field_pair.raise_if_unresolved_gap(node_is_dry1=node_is_dry_check, node_is_dry2=node_is_dry_check)
+            field_pair.raise_if_unresolved_gap(
+                node_is_dry1=node_is_dry_check, node_is_dry2=node_is_dry_check, kbp=driver_grid.grid.kbp
+            )
         except UnresolvedForcingGapError:
             active = native_status == NATIVE_STATUS_ACTIVE
             native_status[active] = NATIVE_STATUS_FORCING_MISSING
@@ -2972,9 +3003,12 @@ def run_backward_batch(
                 hour_overhead.smagorinsky_cache_hits += 1
             else:
                 t0 = _time.perf_counter()
+                u_smag, v_smag = zeroed_current_field2_for_smagorinsky(
+                    field_pair, kbp=driver_grid.grid.kbp, node_is_dry=node_is_dry_check
+                )
                 hf2_now = compute_smagorinsky_kh_field(
                     driver_grid, handles,
-                    u_current_mps=field_pair.u_field2, v_current_mps=field_pair.v_field2,
+                    u_current_mps=u_smag, v_current_mps=v_smag,
                     horcon=config.horcon,
                 )
                 hour_overhead.time_smagorinsky_s += _time.perf_counter() - t0

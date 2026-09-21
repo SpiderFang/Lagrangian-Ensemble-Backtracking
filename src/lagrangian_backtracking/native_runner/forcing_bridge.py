@@ -632,33 +632,50 @@ class HourlyFieldPair:
         *,
         node_is_dry1: np.ndarray | None = None,
         node_is_dry2: np.ndarray | None = None,
+        kbp: np.ndarray | None = None,
     ) -> None:
-        """確認缺值遮罩沒有殘留在（呼叫端認定為）濕的節點上。
+        """確認缺值遮罩沒有殘留在（呼叫端認定為）濕的節點、且位於海床以上的層。
 
         ``node_is_dryN`` 是呼叫端用 BayTrace 自己的 ``dp``／``eta``／``h0``
         算出的節點乾濕狀態（``(nnode,)`` 布林，``True``=乾）；未提供時視為
         「沒有任何節點已知為乾」，也就是任何缺值都會被視為未解釋而報錯。
+
+        ``kbp``（``(nnode,)`` 整數，每節點最底一個有效層的索引）：真實 OCM
+        ``ocm_native`` 產品在「海床以下層」（``k < kbp``）存放 ``NaN``，這是
+        網格幾何造成的「海床以下」狀態，不是資料缺口；BayTrace 原版在讀取後也
+        固定把這些層歸零（``tracker._zero_below_kbp``），從不使用其數值。提供
+        ``kbp`` 時，這些層不列入缺值判定（其狀態仍由 ``missing_maskN`` 原樣
+        保存，本方法不改寫任何陣列）；未提供時沿用舊行為（全部層都檢查）。
         這個方法只做檢查、不修改任何陣列，也不會把缺值改寫成 0。
         """
 
-        self._raise_if_unresolved(self.missing_mask1, node_is_dry1, self.time_before_utc_ns, "field1")
-        self._raise_if_unresolved(self.missing_mask2, node_is_dry2, self.time_after_utc_ns, "field2")
+        self._raise_if_unresolved(self.missing_mask1, node_is_dry1, kbp, self.time_before_utc_ns, "field1")
+        self._raise_if_unresolved(self.missing_mask2, node_is_dry2, kbp, self.time_after_utc_ns, "field2")
 
     @staticmethod
     def _raise_if_unresolved(
-        missing_mask: np.ndarray, node_is_dry: np.ndarray | None, utc_ns: int, label: str
+        missing_mask: np.ndarray,
+        node_is_dry: np.ndarray | None,
+        kbp: np.ndarray | None,
+        utc_ns: int,
+        label: str,
     ) -> None:
-        if node_is_dry is None:
-            remaining = missing_mask
-        else:
+        remaining = missing_mask
+        if node_is_dry is not None:
             dry = np.asarray(node_is_dry, dtype=bool)
             if dry.shape != (missing_mask.shape[1],):
                 raise ForcingBridgeError(f"node_is_dry shape 必須等於節點數：{dry.shape}")
-            remaining = missing_mask & ~dry[None, :]
+            remaining = remaining & ~dry[None, :]
+        if kbp is not None:
+            kbp_arr = np.asarray(kbp)
+            if kbp_arr.shape != (missing_mask.shape[1],):
+                raise ForcingBridgeError(f"kbp shape 必須等於節點數：{kbp_arr.shape}")
+            layers = np.arange(missing_mask.shape[0])[:, None]
+            remaining = remaining & (layers >= kbp_arr[None, :])
         if np.any(remaining):
             bad_nodes = np.flatnonzero(np.any(remaining, axis=0))
             raise UnresolvedForcingGapError(
-                f"{label}（UTC {_iso(utc_ns)}）在濕節點上仍有 {bad_nodes.size} 個缺值節點，"
+                f"{label}（UTC {_iso(utc_ns)}）在濕節點海床以上層仍有 {bad_nodes.size} 個缺值節點，"
                 f"第一個是節點 {int(bad_nodes[0])}；缺值不得以零值或最近值頂替，"
                 "請確認是否需要 OCM 缺口重建 patch 或排除該節點"
             )
