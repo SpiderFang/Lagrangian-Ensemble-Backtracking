@@ -54,11 +54,17 @@ def _write_month(
     elev: np.ndarray | None = None,
     wetdry_elem: np.ndarray | None = None,
     diffusivity: np.ndarray | None = None,
+    include_diffusivity: bool = True,
 ) -> Path:
     """在 ``root/month_id`` 造出一個最小可用的合成 ``ocm_native`` 月份。
 
     未指定的欄位使用可重現、彼此不同的預設值（依 time/node/layer 索引線性
     展開），方便測試斷言轉置後的數值仍可追溯回原始索引。
+
+    ``include_diffusivity=False``（預設 ``True``，不影響既有呼叫端）時完全
+    不寫 ``diffusivity.npy``，模擬本機一次性複製（只留逆向運算需要的變數）
+    的月份副本，供 WP-12 ``load_diffusivity`` 開關測試使用（見
+    ``tests/test_native_local_staging.py``）。
     """
 
     month_dir = root / month_id
@@ -94,7 +100,8 @@ def _write_month(
     np.save(month_dir / "zcor.npy", zcor)
     np.save(month_dir / "elev.npy", elev)
     np.save(month_dir / "wetdry_elem.npy", wetdry_elem)
-    np.save(month_dir / "diffusivity.npy", diffusivity)
+    if include_diffusivity:
+        np.save(month_dir / "diffusivity.npy", diffusivity)
     return month_dir
 
 

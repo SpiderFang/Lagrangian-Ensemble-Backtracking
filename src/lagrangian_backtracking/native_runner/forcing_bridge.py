@@ -35,7 +35,42 @@ field1，不重新讀取、不重新轉置——見 ``NativeForcingBridgeReader.
 * ``missing_mask``：``(nvrt, nnode)`` 布林，只要 ``hvel``／``zcor``／
   ``vertical_velocity``／``diffusivity`` 任一者在該 (層, 節點) 非有限，就記
   為 ``True``。這是「資料缺值」的唯一權威判定，本模組**不會**把這些位置填成
-  0 或任何替代值——``u/v/w/eta/diffusivity`` 保留原生 ``NaN``。
+  0 或任何替代值——``u/v/w/eta/diffusivity`` 保留原生 ``NaN``。停用 OCM
+  擴散係數讀取（見下方「``load_diffusivity`` 開關」）時，``diffusivity`` 不
+  再是這個判定的一部分——缺值只由 ``hvel``／``zcor``／``vertical_velocity``
+  決定。
+
+``load_diffusivity`` 開關：本專案逆向驅動層不讀 OCM 擴散係數
+-------------------------------------------------------------------
+BayTrace 原版逆向驅動層（``native_runner.backward_driver``／
+``native_runner.hour_major``）的水平擴散係數（Kh）一律由
+``backward_driver.compute_smagorinsky_kh_field`` 以 Smagorinsky 方法（工作書
+式 (10)）從本次運算合成後的流速直接算出，再交給未修改的
+``handles.batch_interpolate_diffusivity`` 取樣；驅動層從未讀取、也從未傳入
+``HourlyFieldPair.diffusivity_field1``／``diffusivity_field2``——這兩個欄位
+只在本模組的資料契約檢查（例如缺值遮罩）中使用。這件事已經以程式碼搜尋
+確認（``diffusivity_field1``／``diffusivity_field2`` 只出現在本模組與測試
+fixture，未出現在 ``backward_driver.py``／``hour_major.py`` 的任何 kernel
+呼叫參數中）。
+
+由於正式運算伺服器讀 NAS 頻寬有限（約 11.7 MB/s），已驗收 OCM 產品正在被
+一次性複製到本機，且**只複製逆向運算需要的變數**，本機月份副本刻意不含
+``diffusivity.npy``。``NativeForcingBridgeReader`` 因此提供選用參數
+``load_diffusivity``（預設 ``True``，與既有行為完全相同：仍會開啟
+``diffusivity.npy``，缺檔一樣報錯）。呼叫端明確傳入
+``load_diffusivity=False`` 時：
+
+* 不會嘗試開啟任何月份的 ``diffusivity.npy``（該檔案存在與否都不影響）。
+* ``_HourSnapshot.diffusivity``／``HourlyFieldPair.diffusivity_field1``／
+  ``diffusivity_field2`` 一律為 ``None``。
+* 缺值遮罩不再把 diffusivity 的有限性計入判定。
+* 跨月合併時，重建 patch 的 diffusivity 列也一併忽略（不比對 shape、不讀取
+  資料），即使 patch 月份本身仍保留完整的 diffusivity 陣列。
+
+這個模式**只適用於本身不使用 OCM 擴散係數的驅動層**（即本專案的逆向
+``native_runner``）；若有其他呼叫端仍需要 OCM 原生擴散係數（例如舊版
+``forcing.OCMNativeMonth`` 為其他管線提供的取樣路徑），不得對它使用
+``load_diffusivity=False``。
 * ``dry_face_flag``：直接透傳 ``wetdry_elem`` 該小時的原始列（``0=wet,
   1=dry``，重建 patch 另有 ``NaN=not_persistent``），不做任何節點投影或再
   解讀。
@@ -181,7 +216,7 @@ class _RawMonth:
     zcor: np.ndarray
     elev: np.ndarray
     wetdry_elem: np.ndarray
-    diffusivity: np.ndarray
+    diffusivity: np.ndarray | None
 
 
 def _require(condition: bool, message: str) -> None:
@@ -211,8 +246,8 @@ def _load_month_time_axis(month_dir: str | Path) -> np.ndarray:
     return times
 
 
-def _load_raw_month(month_dir: str | Path) -> _RawMonth:
-    """唯讀開啟一個月份的全部 ``ocm_native`` 動態欄位，並檢查彼此形狀一致。
+def _load_raw_month(month_dir: str | Path, *, load_diffusivity: bool = True) -> _RawMonth:
+    """唯讀開啟一個月份的 ``ocm_native`` 動態欄位，並檢查彼此形狀一致。
 
     載入型態與檢查項目對照 ``forcing.py`` 的 ``OCMNativeMonth.from_directory``
     ／``__init__``（約 722-766 行、597-615 行），但刻意不要求呼叫端提供
@@ -220,6 +255,11 @@ def _load_raw_month(month_dir: str | Path) -> _RawMonth:
     陣列，節點數是否與某個特定追蹤網格一致，交由使用這些陣列的呼叫端（例如
     ``native_runner.grid_bridge``）驗證，避免這裡重複耦合一份不相干的網格
     拓撲相依。
+
+    ``load_diffusivity=False``（見模組 docstring「``load_diffusivity`` 開關」
+    一節）時完全不嘗試開啟 ``diffusivity.npy``——本機一次性複製只保留逆向
+    驅動層需要的變數，該檔案可能根本不存在；``_RawMonth.diffusivity`` 此時
+    為 ``None``，且不納入形狀檢查。
     """
 
     root = Path(month_dir)
@@ -236,7 +276,7 @@ def _load_raw_month(month_dir: str | Path) -> _RawMonth:
     zcor = load("zcor.npy")
     elev = load("elev.npy")
     wetdry_elem = load("wetdry_elem.npy")
-    diffusivity = load("diffusivity.npy")
+    diffusivity = load("diffusivity.npy") if load_diffusivity else None
 
     time_count = int(time_utc_ns.size)
     _require(
@@ -245,11 +285,10 @@ def _load_raw_month(month_dir: str | Path) -> _RawMonth:
         f"{root} 的 hvel 必須是浮點 (time,node,layer,component>=2) 且與 time_utc_ns 對齊",
     )
     expected_tnl = hvel.shape[:3]
-    for name, array in (
-        ("vertical_velocity", vertical_velocity),
-        ("zcor", zcor),
-        ("diffusivity", diffusivity),
-    ):
+    required_fields = [("vertical_velocity", vertical_velocity), ("zcor", zcor)]
+    if load_diffusivity:
+        required_fields.append(("diffusivity", diffusivity))
+    for name, array in required_fields:
         _require(
             array.shape == expected_tnl and np.issubdtype(array.dtype, np.floating),
             f"{root} 的 {name} 必須是浮點且與 hvel 的 time/node/layer 對齊",
@@ -292,7 +331,11 @@ class _MergedMonth:
 
 
 def _merge_month_with_patch(
-    month_id: str, raw: _RawMonth, patch: OCMReconstructionPatchMonth | None
+    month_id: str,
+    raw: _RawMonth,
+    patch: OCMReconstructionPatchMonth | None,
+    *,
+    load_diffusivity: bool = True,
 ) -> _MergedMonth:
     """合併一個月份的觀測時間軸與（若有）已核准重建 patch。
 
@@ -304,6 +347,11 @@ def _merge_month_with_patch(
     該類別合併時間軸的演算法本身（串接、``argsort(kind="stable")``、
     ``source_kind``／``source_index``），並比照其 shape 與不重疊檢查，確保
     行為與既有已驗收流程一致。
+
+    ``load_diffusivity=False`` 時不比對 diffusivity 的 shape——``raw.
+    diffusivity`` 此時是 ``None``，即使 ``patch``（補值月份）仍保留完整的
+    diffusivity 陣列（本機一次性複製時補值 patch 是完整檔案），也一併忽略，
+    對稱於「驅動層本來就不讀 diffusivity」的設計（見模組 docstring）。
     """
 
     if patch is None:
@@ -324,7 +372,10 @@ def _merge_month_with_patch(
         np.intersect1d(raw.time_utc_ns, patch_times).size == 0,
         f"{month_id} 的重建 patch 與觀測 UTC 重疊，不得覆寫觀測資料",
     )
-    for name in ("hvel", "vertical_velocity", "zcor", "diffusivity"):
+    shape_check_fields = ["hvel", "vertical_velocity", "zcor"]
+    if load_diffusivity:
+        shape_check_fields.append("diffusivity")
+    for name in shape_check_fields:
         _require(
             np.asarray(getattr(patch, name)).shape[1:] == getattr(raw, name).shape[1:],
             f"{month_id} 重建 patch 的 {name} 網格 shape 與觀測不一致",
@@ -379,7 +430,9 @@ class _HourSnapshot:
     為 ``(nnode,)``；缺值（來源 ``hvel``／``zcor``／``vertical_velocity``／
     ``diffusivity`` 任一非有限）保留原生 ``NaN``，不做任何填補，另以
     ``missing_mask`` 明確標記同一位置。``dry_face_flag`` 是 ``wetdry_elem``
-    當小時的原始列，未經任何節點投影。
+    當小時的原始列，未經任何節點投影。``diffusivity`` 在
+    ``load_diffusivity=False``（見模組 docstring）時為 ``None``，且不計入
+    ``missing_mask``。
     """
 
     utc_ns: int
@@ -389,37 +442,43 @@ class _HourSnapshot:
     v: np.ndarray
     w: np.ndarray
     eta: np.ndarray
-    diffusivity: np.ndarray
+    diffusivity: np.ndarray | None
     missing_mask: np.ndarray
     dry_face_flag: np.ndarray
 
 
-def _build_snapshot(merged: _MergedMonth, local_index: int) -> _HourSnapshot:
+def _build_snapshot(
+    merged: _MergedMonth, local_index: int, *, load_diffusivity: bool = True
+) -> _HourSnapshot:
     """讀取並轉置單一 UTC 小時的全部欄位；呼叫端必須確保同一小時只呼叫一次。
 
     轉置與缺值遮罩都只在這裡計算一次（每小時一次，不是每粒子一次）：
     ``hvel``／``zcor``／``vertical_velocity``／``diffusivity`` 原生排列是
     ``(node, layer[, component])``，BayTrace 原版 kernel 要 ``(layer, node)``；
     ``np.ascontiguousarray`` 確保轉置後的陣列是 njit 友善的 C-contiguous
-    記憶體配置，而不是原陣列的 strided view。
+    記憶體配置，而不是原陣列的 strided view。``load_diffusivity=False`` 時
+    完全不讀取、不轉置 diffusivity 列，``missing_mask`` 也不再把它計入缺值
+    判定（見模組 docstring「``load_diffusivity`` 開關」）。
     """
 
     utc_ns = int(merged.time_utc_ns[local_index])
     hvel_row = _merged_row(merged, local_index, "hvel")
     zcor_row = _merged_row(merged, local_index, "zcor")
     w_row = _merged_row(merged, local_index, "vertical_velocity")
-    diff_row = _merged_row(merged, local_index, "diffusivity")
     elev_row = _merged_row(merged, local_index, "elev")
     wetdry_row = _merged_row(merged, local_index, "wetdry_elem")
 
     u = np.ascontiguousarray(np.asarray(hvel_row[:, :, 0], dtype=np.float64).T)
     v = np.ascontiguousarray(np.asarray(hvel_row[:, :, 1], dtype=np.float64).T)
     w = np.ascontiguousarray(np.asarray(w_row, dtype=np.float64).T)
-    diffusivity = np.ascontiguousarray(np.asarray(diff_row, dtype=np.float64).T)
     zcor = np.asarray(zcor_row, dtype=np.float64).T
-    missing_mask = ~(
-        np.isfinite(u) & np.isfinite(v) & np.isfinite(w) & np.isfinite(zcor) & np.isfinite(diffusivity)
-    )
+    finite_terms = np.isfinite(u) & np.isfinite(v) & np.isfinite(w) & np.isfinite(zcor)
+    diffusivity: np.ndarray | None = None
+    if load_diffusivity:
+        diff_row = _merged_row(merged, local_index, "diffusivity")
+        diffusivity = np.ascontiguousarray(np.asarray(diff_row, dtype=np.float64).T)
+        finite_terms = finite_terms & np.isfinite(diffusivity)
+    missing_mask = ~finite_terms
     eta = np.ascontiguousarray(np.asarray(elev_row, dtype=np.float64))
     dry_face_flag = np.ascontiguousarray(np.asarray(wetdry_row, dtype=np.float64))
     kind = int(merged.source_kind[local_index])
@@ -500,6 +559,11 @@ class HourlyFieldPair:
     ``NaN`` 於缺值位置，``missing_maskN`` 明確標記同一批位置，呼叫端在套用
     BayTrace 自己的乾濕判定（``dp``/``eta``/``h0``）之後，應呼叫
     ``raise_if_unresolved_gap`` 確認濕節點沒有殘留缺值。
+
+    ``diffusivity_field1``／``diffusivity_field2`` 在
+    ``NativeForcingBridgeReader(load_diffusivity=False)``（見模組 docstring
+    「``load_diffusivity`` 開關」）時為 ``None``——本專案逆向驅動層本來就
+    不讀這兩個欄位，水平擴散改由 Smagorinsky 方法從流速直接算出。
     """
 
     time_before_utc_ns: int
@@ -511,7 +575,7 @@ class HourlyFieldPair:
     v_field1: np.ndarray
     w_field1: np.ndarray
     eta_field1: np.ndarray
-    diffusivity_field1: np.ndarray
+    diffusivity_field1: np.ndarray | None
     missing_mask1: np.ndarray
     dry_face_flag1: np.ndarray
     month_id1: str
@@ -521,7 +585,7 @@ class HourlyFieldPair:
     v_field2: np.ndarray
     w_field2: np.ndarray
     eta_field2: np.ndarray
-    diffusivity_field2: np.ndarray
+    diffusivity_field2: np.ndarray | None
     missing_mask2: np.ndarray
     dry_face_flag2: np.ndarray
     month_id2: str
@@ -532,13 +596,25 @@ class HourlyFieldPair:
 
         if not (0.0 <= float(self.trat) <= 1.0) or not np.isfinite(self.trat):
             raise ForcingBridgeError(f"trat 必須是 [0,1] 內的有限值，收到 {self.trat}")
+        if (self.diffusivity_field1 is None) != (self.diffusivity_field2 is None):
+            raise ForcingBridgeError(
+                "diffusivity_field1 與 diffusivity_field2 必須同時為 None 或同時有值"
+            )
         shape = self.u_field1.shape
         if len(shape) != 2 or shape[0] < 1 or shape[1] < 1:
             raise ForcingBridgeError("速度場必須是非空的 (nvrt, nnode) 陣列")
-        for name in (
-            "v_field1", "w_field1", "diffusivity_field1", "missing_mask1",
-            "u_field2", "v_field2", "w_field2", "diffusivity_field2", "missing_mask2",
-        ):
+        shape_check_names = [
+            "v_field1", "w_field1", "missing_mask1",
+            "u_field2", "v_field2", "w_field2", "missing_mask2",
+        ]
+        contiguous_check_names = [
+            "u_field1", "v_field1", "w_field1", "eta_field1",
+            "u_field2", "v_field2", "w_field2", "eta_field2",
+        ]
+        if self.diffusivity_field1 is not None:
+            shape_check_names += ["diffusivity_field1", "diffusivity_field2"]
+            contiguous_check_names += ["diffusivity_field1", "diffusivity_field2"]
+        for name in shape_check_names:
             array = getattr(self, name)
             if array.shape != shape:
                 raise ForcingBridgeError(f"{name} shape 必須與 u_field1 一致：{array.shape} != {shape}")
@@ -546,10 +622,7 @@ class HourlyFieldPair:
             array = getattr(self, name)
             if array.shape != (shape[1],):
                 raise ForcingBridgeError(f"{name} shape 必須等於節點數：{array.shape} != {(shape[1],)}")
-        for name in (
-            "u_field1", "v_field1", "w_field1", "diffusivity_field1", "eta_field1",
-            "u_field2", "v_field2", "w_field2", "diffusivity_field2", "eta_field2",
-        ):
+        for name in contiguous_check_names:
             array = getattr(self, name)
             if not array.flags["C_CONTIGUOUS"]:
                 raise ForcingBridgeError(f"{name} 必須是 C-contiguous，供 njit kernel 安全讀取")
@@ -771,6 +844,12 @@ class NativeForcingBridgeReader:
     一次，往前（或依 ``ibf`` 往追蹤方向）滑動一小時時，原本的 field2 快照
     直接變成新的 field1。``read_counts`` 記錄每個 UTC 小時實際被讀取（轉置）
     的次數，供效能測試驗證「沒有重複讀取」。
+
+    ``load_diffusivity``（預設 ``True``，行為與既有完全相同）：``False`` 時
+    完全不開啟任何月份的 ``diffusivity.npy``，回傳的 ``HourlyFieldPair.
+    diffusivity_field1``／``diffusivity_field2`` 為 ``None``，缺值遮罩也不
+    再把 diffusivity 計入。這個模式只適用於本身不讀 OCM 擴散係數的呼叫端
+    （本專案逆向驅動層，見模組 docstring「``load_diffusivity`` 開關」）。
     """
 
     def __init__(
@@ -779,17 +858,21 @@ class NativeForcingBridgeReader:
         *,
         ibf: int,
         patches: Mapping[str, OCMReconstructionPatchMonth] | None = None,
+        load_diffusivity: bool = True,
     ) -> None:
         if ibf not in (1, -1):
             raise ForcingBridgeError(f"ibf 只能是 1（正向）或 -1（逆向），收到 {ibf}")
         if not month_dirs:
             raise ForcingBridgeError("month_dirs 不得為空")
         self.ibf = int(ibf)
+        self._load_diffusivity = bool(load_diffusivity)
         patches = patches or {}
         self._months: dict[str, _MergedMonth] = {}
         for month_id, path in month_dirs.items():
-            raw = _load_raw_month(path)
-            self._months[month_id] = _merge_month_with_patch(month_id, raw, patches.get(month_id))
+            raw = _load_raw_month(path, load_diffusivity=self._load_diffusivity)
+            self._months[month_id] = _merge_month_with_patch(
+                month_id, raw, patches.get(month_id), load_diffusivity=self._load_diffusivity
+            )
         self._times, self._location_by_time = _build_canonical_index(self._months)
         if self._times.size < 2:
             raise ForcingBridgeError("可用時間格點不足兩筆，無法建立雙時次欄位")
@@ -812,7 +895,9 @@ class NativeForcingBridgeReader:
         if location is None:  # pragma: no cover - _bracket 已保證存在，防禦性檢查
             raise ForcingBridgeError(f"canonical 時間軸不含 {_iso(utc_ns)}")
         month_id, local_index = location
-        snapshot = _build_snapshot(self._months[month_id], local_index)
+        snapshot = _build_snapshot(
+            self._months[month_id], local_index, load_diffusivity=self._load_diffusivity
+        )
         self._snapshot_cache[utc_ns] = snapshot
         self.read_counts[utc_ns] = self.read_counts.get(utc_ns, 0) + 1
         return snapshot

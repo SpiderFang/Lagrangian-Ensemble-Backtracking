@@ -119,7 +119,7 @@ from typing import Any
 import numpy as np
 
 from ..config import ProjectConfig, load_config, resolve_flow_domain_id
-from ..forcing import OCMNativeMonth, OCMReconstructionPatchMonth
+from ..forcing import OCMReconstructionPatchMonth
 from ..forcing_window import _ReconstructionPatchStore
 from ..geometry import DomainProjection
 from ..manifests import load_boundary_geometries, load_scenario_inputs
@@ -313,6 +313,79 @@ def _load_reconstruction_patches(
 
 # ── 一、DomainResources 接線 ────────────────────────────────────────────────
 
+#: 一個 OCM 原生月份資料夾在「不讀 diffusivity」模式下仍必須存在的動態陣列
+#: 檔名（刻意不含 ``diffusivity.npy``——見 ``forcing_bridge`` 模組文件
+#: 「``load_diffusivity`` 開關」一節：本機一次性複製只保留逆向驅動層需要的
+#: 變數，擴散係數改由 Smagorinsky 方法從流速算出，OCM 的 diffusivity 不再是
+#: 必要檔案）。``metadata.json``／``quality_report.json`` 是背景描述的隨附
+#: 檔案，本模組現有讀取路徑（``forcing_bridge``／本檔）都不會打開它們，因此
+#: 這裡不列入「會被實際讀取」的必要清單，只檢查真正會被載入的動態陣列。
+_REQUIRED_OCM_MONTH_ARRAYS: tuple[str, ...] = (
+    "hvel.npy",
+    "vertical_velocity.npy",
+    "zcor.npy",
+    "elev.npy",
+    "wetdry_elem.npy",
+    "time_utc_ns.npy",
+)
+
+
+def _check_required_ocm_month_files(flow_root: Path, months: Sequence[str]) -> list[str]:
+    """檢查每個月份資料夾是否具備 ``_REQUIRED_OCM_MONTH_ARRAYS`` 全部檔案。
+
+    回傳問題訊息清單（缺一個檔案就是一條訊息，明確列出月份與檔名），不
+    fail-fast——讓呼叫端（``preflight_native_inputs``）一次收集完整缺漏，
+    不必修一個、重跑一次才發現下一個。刻意不檢查 ``diffusivity.npy``：本
+    模組正式運算一律以 ``load_diffusivity=False`` 呼叫
+    ``NativeForcingBridgeReader``（見 ``build_domain_resources``），該檔案
+    是否存在不影響是否可以開跑。
+    """
+
+    problems: list[str] = []
+    for month_id in months:
+        month_dir = flow_root / "months" / month_id
+        for file_name in _REQUIRED_OCM_MONTH_ARRAYS:
+            if not (month_dir / file_name).is_file():
+                problems.append(f"OCM 月份 {month_id} 缺少必要檔案：{month_dir / file_name}")
+    return problems
+
+
+def _load_reference_month_zcor_elev(month_dir: Path, *, mesh: NativeMesh) -> tuple[np.ndarray, np.ndarray]:
+    """只讀參考月份 ``zcor``／``elev`` 的第 0 個時間列，供反推固定分率垂向座標用。
+
+    ``build_domain_resources`` 需要的只是 ``grid_bridge.build_native_grid_
+    arrays`` 要求的單一參考時刻 ``zcor``／``eta``（見該函式模組文件「單一
+    參考時刻」設計），刻意不透過 ``forcing.OCMNativeMonth``——那個類別的
+    建構子固定要求 ``diffusivity.npy`` 存在，因為它服務的是另一條仍需要
+    OCM 原生擴散係數逐節點取樣的既有管線（``forcing_window``／其他非
+    native_runner 呼叫端），本模組（逆向驅動層的水平擴散改用 Smagorinsky
+    方法，見 ``forcing_bridge`` 模組文件「``load_diffusivity`` 開關」）不
+    應該為了讀兩個陣列的第 0 列，反過來要求本機一次性複製（刻意不含
+    diffusivity）補一個它用不到的檔案。因此改用唯讀 memmap 直接開檔，只讀
+    ``hvel`` 的 shape（不觸資料本體，確認節點軸與 ``mesh`` 一致）與
+    ``zcor``／``elev`` 的第 0 列，行為與 ``OCMNativeMonth.__init__`` 對這兩
+    個欄位原本做的形狀檢查等價。
+    """
+
+    def load(name: str) -> np.ndarray:
+        path = month_dir / name
+        if not path.is_file():
+            raise WiringError(f"缺少 OCM month 陣列：{path}")
+        return np.load(path, mmap_mode="r", allow_pickle=False)
+
+    hvel_shape = load("hvel.npy").shape
+    zcor = load("zcor.npy")
+    elev = load("elev.npy")
+    node_count = int(mesh.node_xy.shape[0])
+    if len(hvel_shape) != 4 or hvel_shape[1] != node_count:
+        found = hvel_shape[1] if len(hvel_shape) > 1 else None
+        raise WiringError(f"{month_dir} 的 hvel 節點軸 {found} 與網格節點數 {node_count} 不一致")
+    if zcor.shape[:2] != hvel_shape[:2]:
+        raise WiringError(f"{month_dir} 的 zcor shape 與 hvel 的 time/node 軸不一致")
+    if elev.shape != hvel_shape[:2]:
+        raise WiringError(f"{month_dir} 的 elev shape 與 hvel 的 time/node 軸不一致")
+    return np.asarray(zcor[0], dtype=np.float64), np.asarray(elev[0], dtype=np.float64)
+
 
 def build_domain_resources(
     config_path_or_config: str | Path | ProjectConfig,
@@ -336,12 +409,18 @@ def build_domain_resources(
     - ``native_runner.backward_driver.load_baytrace_modules``／
       ``build_native_backward_driver_grid``：受控載入 BayTrace 原始碼、建立
       驅動層網格。
-    - ``forcing.OCMNativeMonth.from_directory``：讀取單一參考月份的
-      ``zcor``／``elev``，供 ``grid_bridge.build_native_grid_arrays`` 反推
-      固定分率垂向座標（只用該月份第 0 個時間列當參考時刻，與既有
-      ``grid_bridge`` 模組文件的「單一參考時刻」設計一致，不代表其餘時刻
-      的垂向結構完全相同——這是既有 ``grid_bridge`` 模組已經記載並驗證過的
-      科學限制，本函式只是選擇「哪一個參考時刻」，不改變限制本身）。
+    - ``_load_reference_month_zcor_elev``（本模組自有，WP-12 新增）：讀取
+      單一參考月份的 ``zcor``／``elev``，供 ``grid_bridge.build_native_grid_
+      arrays`` 反推固定分率垂向座標（只用該月份第 0 個時間列當參考時刻，與
+      既有 ``grid_bridge`` 模組文件的「單一參考時刻」設計一致，不代表其餘
+      時刻的垂向結構完全相同——這是既有 ``grid_bridge`` 模組已經記載並驗證
+      過的科學限制，本函式只是選擇「哪一個參考時刻」，不改變限制本身）。
+      WP-12 之前這裡呼叫 ``forcing.OCMNativeMonth.from_directory``，但該類
+      別固定要求 ``diffusivity.npy`` 存在；本專案逆向驅動層本來就不讀 OCM
+      擴散係數（水平擴散改用 Smagorinsky 方法，見 ``forcing_bridge`` 模組
+      文件「``load_diffusivity`` 開關」），且本機一次性複製的月份副本刻意
+      不含 ``diffusivity.npy``，因此改用只讀 ``zcor``／``elev``／``hvel``
+      形狀的最小讀取，不再耦合這個用不到的檔案契約。
     - ``native_runner.forcing_bridge.NativeForcingBridgeReader``（``ibf=-1``
       逆向）／``native_runner.wave_bridge.NativeWaveBridgeReader``：分別包成
       無參數工廠，每個工作程序各自呼叫一次取得自己的解析器（見
@@ -397,9 +476,9 @@ def build_domain_resources(
 
     ocm_months = _year_window_months(flow_root / "months", config.inputs.years)
     reference_month_id = ocm_months[0]
-    reference_month = OCMNativeMonth.from_directory(flow_root / "months" / reference_month_id, mesh=mesh)
-    zcor_reference = np.asarray(reference_month.zcor[0])
-    eta_reference = np.asarray(reference_month.elev[0])
+    zcor_reference, eta_reference = _load_reference_month_zcor_elev(
+        flow_root / "months" / reference_month_id, mesh=mesh
+    )
     grid_arrays = build_native_grid_arrays(mesh, zcor_reference=zcor_reference, eta_reference=eta_reference)
     driver_grid = build_native_backward_driver_grid(grid_arrays, handles)
 
@@ -412,12 +491,23 @@ def build_domain_resources(
     forcing_month_dirs = {month_id: str(flow_root / "months" / month_id) for month_id in ocm_months}
 
     def forcing_resolver_factory() -> Callable[[int], Any]:
-        """每個工作程序各自呼叫一次，取得自己的逆向（``ibf=-1``）流場解析器。"""
+        """每個工作程序各自呼叫一次，取得自己的逆向（``ibf=-1``）流場解析器。
 
-        reader = NativeForcingBridgeReader(forcing_month_dirs, ibf=-1, patches=patches)
+        ``load_diffusivity=False``：本專案逆向驅動層不讀 OCM 原生擴散係數
+        （水平擴散改用 Smagorinsky 方法直接從流速算出，見 ``forcing_bridge``
+        模組文件「``load_diffusivity`` 開關」一節），本機一次性複製的月份
+        副本也刻意不含 ``diffusivity.npy``；固定傳 ``False`` 讓正式資源不
+        依賴這個檔案是否存在。
+        """
+
+        reader = NativeForcingBridgeReader(
+            forcing_month_dirs, ibf=-1, patches=patches, load_diffusivity=False
+        )
         return reader.resolve
 
-    probe_forcing_reader = NativeForcingBridgeReader(forcing_month_dirs, ibf=-1, patches=patches)
+    probe_forcing_reader = NativeForcingBridgeReader(
+        forcing_month_dirs, ibf=-1, patches=patches, load_diffusivity=False
+    )
     available_lo_ns, available_hi_ns = probe_forcing_reader.available_time_range_utc_ns
 
     nww_native_root = Path(
@@ -489,6 +579,12 @@ def build_domain_resources(
         "ocm_reconstruction_root": reconstruction_root,
         "ocm_reconstruction_attempted": reconstruction_attempted,
         "ocm_reconstruction_patch_months_used": tuple(sorted(patches)),
+        "ocm_diffusivity_used": False,
+        "horizontal_diffusion_method": (
+            "本次運算不使用 OCM diffusivity，水平擴散採 Smagorinsky 方法（工作書式 (10)），"
+            "由 backward_driver.compute_smagorinsky_kh_field 從本次運算合成後的流速直接算出；"
+            "NativeForcingBridgeReader 以 load_diffusivity=False 建立，不讀取 diffusivity.npy"
+        ),
         "nww_analysis_root": str(nww_native_root),
         "nww_months_used": tuple(nww_months),
         "wave_data_available": wave_resolver_factory is not None,
@@ -905,15 +1001,25 @@ def _preflight_one_domain(
         except WiringError as exc:
             problems.append(str(exc))
 
+        if ocm_months:
+            # 逐月檢查必要動態陣列都存在（刻意不含 diffusivity.npy——本專案
+            # 逆向驅動層不讀 OCM 原生擴散係數，見 build_domain_resources 與
+            # forcing_bridge 模組文件「load_diffusivity 開關」一節）。這裡
+            # 獨立於下面的 hvel/wetdry 抽樣檢查先跑一次，即使只抽查參考月份
+            # 也能一次列出「哪個月份缺哪個檔案」，不必等 inventory_forcing_
+            # gaps 在缺 time_utc_ns.npy 時才間接暴露問題。
+            problems.extend(_check_required_ocm_month_files(flow_root, ocm_months))
+
         if mesh is not None and ocm_months:
             sample_month_dir = flow_root / "months" / ocm_months[0]
-            # 先只窺視 hvel 的節點軸（不觸發 OCMNativeMonth 建構），因為
-            # ``OCMNativeMonth.__init__`` 一旦發現節點軸與傳入的 ``mesh`` 不符會直接
-            # 以 ``ValueError`` 拒絕建構——若把節點數比對放在建構「之後」，這段比對
-            # 永遠執行不到（例外一定先發生），會變成誤導人的死碼。因此改成先用
-            # ``np.load`` 讀 shape（不讀資料本體，記憶體映射，成本可忽略）比對節點數，
-            # 節點數若不符就不再嘗試建構、直接報告；節點數相符才繼續走正常建構路徑，
-            # 讓 wetdry 檢查等其餘既有邏輯不變。
+            # 先只窺視 hvel 的節點軸（不需要完整讀取 hvel 陣列），因為節點數
+            # 若與 mesh 不符，後續的 wetdry 抽樣檢查也沒有意義——先用
+            # ``np.load`` 讀 shape（不讀資料本體，記憶體映射，成本可忽略）
+            # 比對節點數，節點數若不符就不再嘗試往下讀，直接報告；節點數
+            # 相符才繼續走 wetdry 檢查。刻意不透過 ``forcing.OCMNativeMonth``
+            # ——該類別固定要求 diffusivity.npy 存在，本機一次性複製的月份
+            # 副本刻意不含這個檔案（見 build_domain_resources 同一段說明），
+            # 因此這裡與它一樣改成只讀 wetdry_elem.npy 的最小讀取。
             try:
                 sample_hvel_shape = np.load(
                     sample_month_dir / "hvel.npy", mmap_mode="r", allow_pickle=False
@@ -930,15 +1036,17 @@ def _preflight_one_domain(
                     )
                 else:
                     try:
-                        sample_month = OCMNativeMonth.from_directory(sample_month_dir, mesh=mesh)
-                        wetdry_sample = np.asarray(sample_month.wetdry_elem[0])
+                        wetdry_path = sample_month_dir / "wetdry_elem.npy"
+                        wetdry_sample = np.asarray(
+                            np.load(wetdry_path, mmap_mode="r", allow_pickle=False)[0], dtype=np.float64
+                        )
                         finite_values = wetdry_sample[np.isfinite(wetdry_sample)]
                         wetdry_ok = bool(np.all(np.isin(finite_values, (0.0, 1.0))))
                         if not wetdry_ok:
                             problems.append(
                                 f"OCM 樣本月份 {ocm_months[0]} 的 wetdry_elem 出現非 {{0,1,NaN}} 的值"
                             )
-                    except (OSError, ValueError) as exc:
+                    except OSError as exc:
                         problems.append(f"OCM 樣本月份 {ocm_months[0]} 載入失敗：{exc}")
 
         if ocm_months:
