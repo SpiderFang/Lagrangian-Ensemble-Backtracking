@@ -145,7 +145,8 @@ __all__ = [
     "DomainPreflightReport",
     "PreflightReport",
     "preflight_native_inputs",
-    "load_domain_reconstruction_patches",
+    "ReconstructionPatchTimeAxis",
+    "load_domain_reconstruction_patch_time_axes",
 ]
 
 
@@ -625,42 +626,44 @@ def _domain_resources_factory_entrypoint(
     return build_domain_resources(config_path, domain_id, env=env, formal=formal)
 
 
-def load_domain_reconstruction_patches(
-    config_path: str | Path,
-    domain_id: str,
-    *,
-    ocm_native_root: str | Path,
-    reconstruction_root: str | None,
-    months: Sequence[str],
-    formal: bool = True,
-) -> dict[str, OCMReconstructionPatchMonth]:
-    """載入某分析區域對應流場區域的已核准 OCM 缺口重建 patch，供規劃階段的缺口盤點使用。
+@dataclass(frozen=True, slots=True)
+class ReconstructionPatchTimeAxis:
+    """規劃階段用的重建 patch「時間軸」替身：只含 ``time_utc_ns``，不含任何流場陣列。"""
 
-    ``native-plan`` 的到達時刻缺口安全檢查若不考慮已核准的重建 patch，會把
-    「已由版本化重建方法填補」的小時誤判為未登錄缺口；正式執行時
-    ``forcing_bridge`` 的讀取端本來就會套用這些 patch，因此規劃階段必須用
-    同一份 patch 盤點才一致。網格（算 mesh fingerprint 用）與 patch 驗證
-    邏輯完全沿用 ``build_domain_resources`` 與 ``_load_reconstruction_patches``。
-    ``reconstruction_root`` 為空時回傳空字典（等同未啟用重建）。
+    month_id: str
+    time_utc_ns: np.ndarray
+
+
+def load_domain_reconstruction_patch_time_axes(
+    reconstruction_root: str | Path | None,
+    flow_domain_id: str,
+    *,
+    months: Sequence[str],
+) -> dict[str, ReconstructionPatchTimeAxis]:
+    """讀取某流場區域已核准重建 patch 在指定月份補上的 UTC 小時，供 ``native-plan`` 缺口盤點。
+
+    ``inventory_forcing_gaps`` 只使用 patch 的時間軸，因此規劃階段不必載入並逐檔
+    驗證整份 patch（NE 區單月可達數 GB，經 100 Mb/s 網路磁碟驗證雜湊要數十分鐘）；
+    這裡只讀 domain manifest 是否存在與各月份的 ``time_utc_ns.npy``。**完整驗證
+    （checksum、root index、網格指紋）仍在正式執行時由 ``build_domain_resources`` →
+    ``_ReconstructionPatchStore`` 執行**，驗證失敗會讓該區域 fail-closed，不會因為
+    規劃階段較寬鬆而使用未驗證的補值。``reconstruction_root`` 為空或此區域沒有
+    domain manifest 時回傳空字典（等同未啟用重建）。
     """
 
     if not reconstruction_root:
         return {}
-    config, _ = _resolve_config(config_path, config_path=None)
-    domain_matches = [item for item in config.domains if item.analysis_region_id == domain_id]
-    if len(domain_matches) != 1:
-        raise WiringError(f"config.domains 必須恰有一個 analysis_region_id={domain_id!r} 的流場區域")
-    domain_config = domain_matches[0]
-    flow_domain_id = resolve_flow_domain_id(config, domain_id, formal=formal)
-    projection = DomainProjection(*domain_config.center_lonlat)
-    grid_dir = Path(ocm_native_root) / flow_domain_id / "grid"
-    if not grid_dir.is_dir():
-        raise WiringError(f"缺少 OCM 原生網格資料夾：{grid_dir}")
-    mesh = NativeMesh.from_directory(grid_dir, projection=projection)
-    patches, _ = _load_reconstruction_patches(
-        reconstruction_root, flow_domain_id=flow_domain_id, months=list(months), mesh=mesh
-    )
-    return patches
+    domain_root = Path(reconstruction_root) / flow_domain_id
+    if not (domain_root / "reconstruction-manifest.json").is_file():
+        return {}
+    axes: dict[str, ReconstructionPatchTimeAxis] = {}
+    for month_id in months:
+        time_path = domain_root / "months" / month_id / "time_utc_ns.npy"
+        if time_path.is_file():
+            axes[month_id] = ReconstructionPatchTimeAxis(
+                month_id=month_id, time_utc_ns=np.asarray(np.load(time_path), dtype=np.int64)
+            )
+    return axes
 
 
 def make_domain_resources_factory(

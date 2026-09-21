@@ -1062,13 +1062,10 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
             # 誤判為未登錄缺口）。
             patches = {}
             if args.config is not None:
-                patches = native_production_wiring.load_domain_reconstruction_patches(
-                    args.config,
-                    region,
-                    ocm_native_root=args.ocm_native_root,
-                    reconstruction_root=os.environ.get("OCM_RECONSTRUCTION_ROOT"),
+                patches = native_production_wiring.load_domain_reconstruction_patch_time_axes(
+                    os.environ.get("OCM_RECONSTRUCTION_ROOT"),
+                    flow_domain_id,
                     months=_months_overlapping_window(sorted(month_dirs), expected_start, expected_end),
-                    formal=args.formal,
                 )
                 patch_months_used[region] = sorted(patches)
             gap_reports[region] = inventory_forcing_gaps(
