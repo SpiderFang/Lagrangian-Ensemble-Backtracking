@@ -185,6 +185,160 @@ from .stokes_batch import (
     batch_finite_depth_stokes,
 )
 
+# ══════════════════════════════════════════════════════════════════════════
+# WP-13 任務 2：底場合成的小時內平行化——只針對 Stokes 全網格計算
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 實測（見最終報告）：``stokes_batch.batch_finite_depth_stokes`` 是
+# ``@njit(cache=True)``、**沒有**設定 ``nogil=True`` 的函式；本專案規定不得
+# 修改 ``stokes_batch.py``（不在 WP-13 可修改檔案清單內），因此無法在那個
+# 檔案裡加上 ``nogil=True`` 或 ``parallel=True``。實測（2 核心沙盒環境，見
+# 最終報告的機器規格誠實揭露）證實：4 個 Python 執行緒同時呼叫這個函式，
+# 總耗時與序列呼叫完全相同（4.542s vs 4.518s，4 執行緒沒有任何加速）——
+# GIL 確實沒有被釋放，``ThreadPoolExecutor`` 對這個函式完全無效。
+#
+# 因此本模組改用**行程**（``ProcessPoolExecutor``）而非執行緒平行化 Stokes
+# 計算：把 (層,節點) 點集合切成 N 段，各自送進行程池呼叫「同一個」未經修改
+# 的 ``batch_finite_depth_stokes``，再依原本的索引寫回結果陣列。這個計算
+# 是逐點獨立、完全沒有跨點歸約（每個點的 Stokes 解只由自己的波高／週期／
+# 波向／水深／深度決定，不依賴其他點），因此**不論怎麼切、切幾段、哪個
+# 行程算哪一段，結果都是逐位元相同**——不是「機率上通常一樣」，是這個計算
+# 本身的數學結構保證的，這也是任務書「若某項無法位元相同，改用不涉及歸約
+# 順序的平行化方式」這句話在本模組唯一能夠安全套用平行化的地方（比較：
+# ``compute_smagorinsky_kh_field`` 的節點平均步驟有跨點依賴、且是 BayTrace
+# 原始碼的一部分、本模組不得修改，因此本 WP 沒有平行化它，見最終報告的
+# 誠實揭露）。
+#
+# 預設 ``stokes_pool=None``：完全不啟用，呼叫路徑與此優化新增前逐位元
+# 相同，不影響任何既有呼叫端或測試。呼叫端只有在明確傳入一個
+# ``concurrent.futures.ProcessPoolExecutor``（通常是尾端只剩少數工作單元、
+# 其餘核心閒置時才建立／啟用，見 ``hour_major.py``／``hour_major_provider.py``
+# 的整合點）時才會真正切段平行送出。
+
+
+def _stokes_chunk_task(
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    particle_z_m: np.ndarray,
+    water_depth_m: np.ndarray,
+    valid_mask_wave: np.ndarray,
+    qc_flags: np.ndarray,
+    gravity_mps2: float,
+    surface_tolerance_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """在（可能是另一個）行程裡對一個點子集合呼叫 ``batch_finite_depth_stokes``。
+
+    模組層級函式（非閉包）：``ProcessPoolExecutor`` 預設 ``spawn`` 啟動方式
+    要求任務函式可以被 pickle 匯入，理由與 ``orchestrator._run_single_unit_task``
+    的既有說明相同。這裡呼叫的是與序列路徑完全相同、未經任何修改的
+    ``batch_finite_depth_stokes``，因此每個點的計算結果與序列呼叫逐位元相同
+    （見上方模組層級說明）；本函式只負責配置輸出陣列與呼叫，不含任何額外
+    的數值邏輯。
+    """
+
+    n = significant_wave_height_m.shape[0]
+    stokes_u = np.empty(n, dtype=np.float64)
+    stokes_v = np.empty(n, dtype=np.float64)
+    wave_number = np.empty(n, dtype=np.float64)
+    status = np.empty(n, dtype=np.int32)
+    batch_finite_depth_stokes(
+        significant_wave_height_m,
+        peak_frequency_hz,
+        direction_raw_deg,
+        particle_z_m,
+        water_depth_m,
+        valid_mask_wave,
+        qc_flags,
+        stokes_u,
+        stokes_v,
+        wave_number,
+        status,
+        gravity_mps2,
+        surface_tolerance_m,
+    )
+    return stokes_u, stokes_v, wave_number, status
+
+
+def _evaluate_batch_finite_depth_stokes(
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    particle_z_m: np.ndarray,
+    water_depth_m: np.ndarray,
+    valid_mask_wave: np.ndarray,
+    qc_flags: np.ndarray,
+    *,
+    gravity_mps2: float,
+    surface_tolerance_m: float,
+    stokes_pool: Any | None,
+    stokes_worker_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``compose_current_and_stokes_fields`` 的 Stokes 求解分派點：序列或平行。
+
+    ``stokes_pool is None`` 或 ``stokes_worker_count <= 1`` 或點數少於
+    ``stokes_worker_count``（切了也沒有意義，行程呼叫的固定開銷會蓋過收益）
+    時，走原本的單次呼叫路徑，與這個優化新增前逐位元相同。否則把點集合切成
+    ``stokes_worker_count`` 個連續區段（``np.array_split`` 的切法），各自
+    ``pool.submit`` 一次 ``_stokes_chunk_task``，收集結果依原索引寫回——
+    每個點的計算彼此獨立，切法與收集順序不影響任何一個點的數值結果。
+    """
+
+    n = significant_wave_height_m.shape[0]
+    if stokes_pool is None or stokes_worker_count <= 1 or n < stokes_worker_count:
+        stokes_u = np.empty(n, dtype=np.float64)
+        stokes_v = np.empty(n, dtype=np.float64)
+        wave_number = np.empty(n, dtype=np.float64)
+        status = np.empty(n, dtype=np.int32)
+        batch_finite_depth_stokes(
+            significant_wave_height_m,
+            peak_frequency_hz,
+            direction_raw_deg,
+            particle_z_m,
+            water_depth_m,
+            valid_mask_wave,
+            qc_flags,
+            stokes_u,
+            stokes_v,
+            wave_number,
+            status,
+            gravity_mps2,
+            surface_tolerance_m,
+        )
+        return stokes_u, stokes_v, wave_number, status
+
+    boundaries = np.linspace(0, n, stokes_worker_count + 1).astype(np.int64)
+    pending: list[tuple[int, int, Any]] = []
+    for i in range(stokes_worker_count):
+        start, stop = int(boundaries[i]), int(boundaries[i + 1])
+        if start == stop:
+            continue
+        future = stokes_pool.submit(
+            _stokes_chunk_task,
+            np.ascontiguousarray(significant_wave_height_m[start:stop]),
+            np.ascontiguousarray(peak_frequency_hz[start:stop]),
+            np.ascontiguousarray(direction_raw_deg[start:stop]),
+            np.ascontiguousarray(particle_z_m[start:stop]),
+            np.ascontiguousarray(water_depth_m[start:stop]),
+            np.ascontiguousarray(valid_mask_wave[start:stop]),
+            np.ascontiguousarray(qc_flags[start:stop]),
+            gravity_mps2,
+            surface_tolerance_m,
+        )
+        pending.append((start, stop, future))
+
+    stokes_u = np.empty(n, dtype=np.float64)
+    stokes_v = np.empty(n, dtype=np.float64)
+    wave_number = np.empty(n, dtype=np.float64)
+    status = np.empty(n, dtype=np.int32)
+    for start, stop, future in pending:
+        u_chunk, v_chunk, k_chunk, status_chunk = future.result()
+        stokes_u[start:stop] = u_chunk
+        stokes_v[start:stop] = v_chunk
+        wave_number[start:stop] = k_chunk
+        status[start:stop] = status_chunk
+    return stokes_u, stokes_v, wave_number, status
+
 __all__ = [
     "BackwardDriverError",
     "NATIVE_STATUS_ACTIVE",
@@ -853,6 +1007,8 @@ def compose_current_and_stokes_fields(
     gravity_mps2: float = GRAVITY_MPS2,
     surface_tolerance_m: float = 5.0e-6,
     stokes_depth_threshold_ratio: float | None = None,
+    stokes_pool: Any | None = None,
+    stokes_worker_count: int = 1,
 ) -> ComposedCurrentAndStokesFields:
     """``compose_total_velocity_fields`` 拆成兩階段後，計算「與沉降速度無關」
     的那一半（乾濕判定＋歸零＋Stokes 全網格計算），供多個沉降速度批次共用。
@@ -918,6 +1074,17 @@ def compose_current_and_stokes_fields(
             失敗），一律**不截斷**（該節點全部層都納入第二次呼叫，交由
             正常的逐層狀態碼判定），避免在「不確定波數」的節點錯誤地跳過
             本來就該正常計算（或正常回報缺值）的層——寧可多算，不可少算。
+        stokes_pool: WP-13 任務 2 新增。``None``（預設）：Stokes 求解在呼叫
+            端自己的程序內單次呼叫，行為與此參數新增前逐位元相同。提供一個
+            ``concurrent.futures.ProcessPoolExecutor`` 時，搭配
+            ``stokes_worker_count`` 把 Stokes 求解切成多段、分派給這個行程
+            池平行計算（見模組層級「WP-13 任務 2」說明：Stokes 逐點獨立、
+            沒有跨點歸約，切幾段、哪個行程算哪一段都不影響結果，保證逐位元
+            相同）。呼叫端負責建立與關閉這個 pool（通常只在尾端剩餘工作
+            單元數少於可用核心數時才建立，見 ``hour_major_provider.py`` 的
+            整合點），本函式不擁有它的生命週期。
+        stokes_worker_count: 搭配 ``stokes_pool`` 使用，Stokes 點集合要切成
+            幾段；``<= 1`` 時等同不啟用（即使提供了 ``stokes_pool``）。
 
     Raises:
         BackwardDriverError: ``wave_field1``／``wave_field2`` 只提供其中
@@ -1019,11 +1186,7 @@ def compose_current_and_stokes_fields(
             stokes_points_evaluated += n_kept
             stokes_points_possible += int(np.count_nonzero(effective_mask))
             if n_kept > 0:
-                stokes_u = np.empty(n_kept, dtype=np.float64)
-                stokes_v = np.empty(n_kept, dtype=np.float64)
-                wave_number = np.empty(n_kept, dtype=np.float64)
-                status = np.empty(n_kept, dtype=np.int32)
-                batch_finite_depth_stokes(
+                stokes_u, stokes_v, wave_number, status = _evaluate_batch_finite_depth_stokes(
                     np.ascontiguousarray(hs_grid[stokes_mask], dtype=np.float64),
                     np.ascontiguousarray(fp_grid[stokes_mask], dtype=np.float64),
                     np.ascontiguousarray(dir_grid[stokes_mask], dtype=np.float64),
@@ -1031,12 +1194,10 @@ def compose_current_and_stokes_fields(
                     np.ascontiguousarray(depth_grid[stokes_mask], dtype=np.float64),
                     np.ascontiguousarray(valid_grid[stokes_mask], dtype=bool),
                     np.ascontiguousarray(qc_grid[stokes_mask], dtype=np.int64),
-                    stokes_u,
-                    stokes_v,
-                    wave_number,
-                    status,
-                    float(gravity_mps2),
-                    float(surface_tolerance_m),
+                    gravity_mps2=float(gravity_mps2),
+                    surface_tolerance_m=float(surface_tolerance_m),
+                    stokes_pool=stokes_pool,
+                    stokes_worker_count=stokes_worker_count,
                 )
                 ok_kept = status == STOKES_BATCH_STATUS_OK
                 ok = np.zeros((nvrt, nnode), dtype=bool)

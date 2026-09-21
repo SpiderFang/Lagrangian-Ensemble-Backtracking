@@ -84,6 +84,32 @@ WP-11 可修改檔案清單內，因此本模組退回 ``hour_major.HourMajorCon
 - ``LBT_NATIVE_DEPOSITION_TOLERANCE_M``：浮點，預設 ``0.5``。
 - ``LBT_NATIVE_STOKES_DEPTH_THRESHOLD_RATIO``：浮點或空字串（``None``），
   預設 ``None``（沿用 ``run_backward_batch`` 自身預設）。
+
+  **WP-13 誠實記載的已知限制（史托克斯子行程池未接線到正式路徑）**：
+  ``backward_driver.compose_current_and_stokes_fields``／
+  ``hour_major.run_flow_domain_hour_major`` 都已支援 ``stokes_pool``／
+  ``stokes_worker_count`` 參數，把每小時只算一次的史托克斯漂移（Stokes
+  drift）逐點求解切塊分派到呼叫端自備的子行程池平行計算，且已用直接呼叫
+  （不巢狀在任何其他 ``ProcessPoolExecutor`` 的 worker 之內）驗證過位元
+  相同（見 ``tests/test_native_hour_major.py::
+  test_hour_major_stokes_pool_matches_sequential_bit_identical``）。但本
+  模組**刻意不**提供環境變數旋鈕在 ``native-run`` 的每個 worker 子程序內
+  再自動建立這個子行程池——因為 ``native-run`` 的每個 worker 子程序本身
+  就已經是 ``orchestrator.run_native_plan`` 用 ``ProcessPoolExecutor``
+  （spawn）開出來的子程序，實測在這種「子程序裡面再建一個
+  ``ProcessPoolExecutor``」（巢狀行程池）的組態下，會不穩定地出現兩種
+  失敗模式：(1) 整個 worker 卡死（觀察到的 CPU 時間在數分鐘內完全不再
+  增加，符合死結特徵，而非單純運算緩慢）；(2) 孫行程在 bootstrap 階段
+  丟出 ``FileNotFoundError``（``SemLock._rebuild`` 找不到底層號誌檔），
+  兩者在同一份程式碼、同一組參數下都曾經重現，屬於競態（race），不是
+  每次都會發生。受限於本工作包的時間範圍，未能查明根本原因（懷疑與
+  ``concurrent.futures.process`` 的佇列管理執行緒／號誌在巢狀行程池組態
+  下的既知脆弱性有關，但未證實），因此判斷**不能**把這個旋鈕接上正式
+  ``native-run`` 管線——正式管線的可靠性優先於這項優化的效能收益。詳細
+  重現腳本與分析見 ``reports/WP-13.md``。這不影響
+  ``LBT_NATIVE_STOKES_DEPTH_THRESHOLD_RATIO``（上面這個環境變數）本身的
+  行為；只是本模組沒有另外提供、也不建議自行加上
+  「在 worker 子程序內建立史托克斯子行程池」的環境變數。
 - ``LBT_NATIVE_TEST_FORCE_INTERRUPT_AFTER_HOURS``：整數，預設不設定
   （``None``）。**測試專用、正式部署禁止設定**：見下方「測試專用：模擬
   工作程序中途消失」一節，用來在自動化測試裡驗證「子程序被系統砍掉後、

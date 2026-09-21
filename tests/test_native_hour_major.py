@@ -566,6 +566,62 @@ def test_hour_major_checkpoint_resume_bit_identical(driver_grid, handles, tmp_pa
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 驗收 8（WP-13 任務 2／3）：小時內平行化（史托克斯子行程池）位元等價
+# ══════════════════════════════════════════════════════════════════════════
+#
+# ``run_flow_domain_hour_major`` 每小時只呼叫一次的
+# ``compose_current_and_stokes_fields`` 新增了 ``stokes_pool``／
+# ``stokes_worker_count`` 參數（見 ``hour_major.py`` 該函式 docstring 與
+# ``backward_driver._evaluate_batch_finite_depth_stokes``）：史托克斯漂移
+# （Stokes drift）逐點求解彼此獨立、沒有跨節點化簡（reduction），因此切成
+# 多塊分派到子行程池平行計算，理論上不該改變任何數值結果。這裡直接驗證
+# 「不給行程池（預設、單一行程逐點）」與「給 2 個工作行程的子行程池」在
+# 同一個小時主軸批次上跑出來的最終狀態、軌跡、departures 完全位元相同。
+
+
+def test_hour_major_stokes_pool_matches_sequential_bit_identical(driver_grid, handles) -> None:
+    from concurrent.futures import ProcessPoolExecutor
+
+    table, units, interest_regions, _t0 = _build_staggered_domain()
+    resolver = _make_resolver(driver_grid, u=0.02, v=0.015, kh=1.0e-4)
+    n_nodes = _n_nodes(driver_grid)
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=np.full(n_nodes, 1.2),
+        peak_frequency_hz=np.full(n_nodes, 0.15),
+        direction_raw_deg=np.full(n_nodes, 30.0),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+
+    def wave_resolver(_utc_ns: int) -> bd.WaveFieldAtNodes:
+        return wave
+
+    config = hm.HourMajorConfig(
+        max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=7,
+    )
+
+    batch_sequential = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    result_sequential = hm.run_flow_domain_hour_major(
+        driver_grid, handles, batch_sequential, config=config,
+        forcing_resolver=resolver, wave_field_resolver=wave_resolver,
+    )
+
+    batch_parallel = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        result_parallel = hm.run_flow_domain_hour_major(
+            driver_grid, handles, batch_parallel, config=config,
+            forcing_resolver=resolver, wave_field_resolver=wave_resolver,
+            stokes_pool=pool, stokes_worker_count=2,
+        )
+
+    assert set(result_sequential.unit_results) == set(result_parallel.unit_results) == {"A0", "A1", "B0"}
+    for unit_id in result_sequential.unit_results:
+        _assert_results_bit_identical(
+            result_sequential.unit_results[unit_id], result_parallel.unit_results[unit_id], label=unit_id
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 驗收 7：效能——與逐工作單元路徑比較固定開銷攤提效果
 # ══════════════════════════════════════════════════════════════════════════
 

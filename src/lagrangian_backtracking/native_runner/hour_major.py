@@ -647,6 +647,8 @@ def run_flow_domain_hour_major(
     checkpoint_dir: str | Path | None = None,
     checkpoint_every_hours: int = 24,
     _max_master_hours: int | None = None,
+    stokes_pool: Any | None = None,
+    stokes_worker_count: int = 1,
 ) -> HourMajorRunResult:
     """以小時主軸推進一個流場區域的全部沉降速度分組，直到全部單元終止。
 
@@ -667,6 +669,21 @@ def run_flow_domain_hour_major(
             立即停止（並寫一次 checkpoint，若有提供 ``checkpoint_dir``），
             用於模擬「執行到一半被中斷」，驗證續跑的位元相同性。正式用途
             不應該傳入這個參數（``None`` 代表跑到全部單元終止為止）。
+        stokes_pool／stokes_worker_count: 原樣轉交給每小時呼叫一次的
+            ``compose_current_and_stokes_fields``（見該函式與
+            ``backward_driver`` 模組頂端的設計說明）：把史托克斯漂移
+            （Stokes drift）逐點求解切成 ``stokes_worker_count`` 塊、分派到
+            呼叫端預先建立好的行程池（process pool，``stokes_pool``）平行
+            計算，藉由行程重用避開「每小時建立/銷毀行程池」的固定開銷。
+            由於每個節點的史托克斯解互相獨立、沒有跨節點的化簡
+            （reduction），切塊方式不影響數值結果，因此無論
+            ``stokes_worker_count`` 是多少、或根本不提供 ``stokes_pool``
+            （沿用單一行程逐點計算），輸出必須位元相同——這個等價性由
+            ``tests/test_native_hour_major.py`` 驗證。呼叫端（目前是
+            ``hour_major_provider``）決定要不要建立、何時建立行程池；本函式
+            不負責行程池的生命週期管理。預設 ``stokes_pool=None``、
+            ``stokes_worker_count=1``，即維持 WP-13 之前逐點單一行程執行的
+            行為。
 
     Returns:
         ``HourMajorRunResult``。
@@ -809,6 +826,8 @@ def run_flow_domain_hour_major(
                     base = compose_current_and_stokes_fields(
                         driver_grid, handles, field_pair, wave_field1=wave1, wave_field2=wave2,
                         stokes_depth_threshold_ratio=config.stokes_depth_threshold_ratio,
+                        stokes_pool=stokes_pool,
+                        stokes_worker_count=stokes_worker_count,
                     )
                     hour_overhead.time_compose_base_s += _time.perf_counter() - t0
                     hour_overhead.compose_base_cache_misses += 1

@@ -113,6 +113,27 @@
 #   LBT_NATIVE_TARGET_WORKER_COUNT
 #                                 `native-plan --target-worker-count`；兩者都省略
 #                                 時等同 `K=1`（不切段）
+#   LBT_NATIVE_NODE_COUNTS／LBT_NATIVE_LAYER_COUNTS
+#                                 WP-13：兩者都提供時（各自一個
+#                                 `{flow_domain_id: 數量}` JSON 檔路徑），
+#                                 `native-plan` 改用正確成本模型（流場小時數×
+#                                 節點數×層數）自動選段數，並在報表印出
+#                                 `cost_model`（預估牆鐘時間、重複成本比例、
+#                                 各段成本）；只提供其中一個不會生效，見
+#                                 docs/operations/19_native_backward_batch_
+#                                 orchestrator.md 第 9.10.2／9.10.3 節
+#   LBT_NATIVE_SECONDS_PER_NODE_LAYER_HOUR
+#                                 WP-13 成本模型的校準常數，省略時用模組內建
+#                                 預設值（在小規模沙箱量測，正式伺服器應該
+#                                 重新量測後覆寫，見同上文件節次）
+#   LBT_NATIVE_WORKER_COUNT_FOR_ESTIMATE
+#                                 WP-13：只影響 native-plan 報表估算的「預估
+#                                 總牆鐘時間」，不影響實際切段；省略時退回
+#                                 `LBT_NATIVE_TARGET_WORKER_COUNT`
+#   LBT_NATIVE_WAIT_FOR_STAGED    WP-13：資料逐區域到位時，指到
+#                                 `native-run --wait-for-staged` 用的標記檔
+#                                 目錄；省略時（預設）行為與 WP-13 之前完全
+#                                 相同，見同上文件第 9.10.4 節
 #   LBT_NATIVE_SKIP_GAP_CHECK     設為 `1` 讓 `native-plan` 加 `--skip-gap-check`
 #                                 （不建議正式使用；僅供合成資料試跑）
 #   LBT_NATIVE_ALLOW_UNSAFE_ARRIVALS
@@ -337,6 +358,20 @@ run_plan() {
   elif [[ -n "${LBT_NATIVE_TARGET_WORKER_COUNT:-}" ]]; then
     plan_args+=(--target-worker-count "${LBT_NATIVE_TARGET_WORKER_COUNT}")
   fi
+  # WP-13：--node-counts／--layer-counts 兩者都提供時才會啟用正確成本模型
+  # 自動選段數＋native-plan 報表的 cost_model 欄位（見 docs/operations/
+  # 19_native_backward_batch_orchestrator.md 第 9.10.2／9.10.3 節）；只提供
+  # 其中一個沒有意義，這裡刻意要求兩者同時設定才加上旗標，避免呼叫端誤以為
+  # 只設定一個就夠。
+  if [[ -n "${LBT_NATIVE_NODE_COUNTS:-}" && -n "${LBT_NATIVE_LAYER_COUNTS:-}" ]]; then
+    plan_args+=(--node-counts "${LBT_NATIVE_NODE_COUNTS}" --layer-counts "${LBT_NATIVE_LAYER_COUNTS}")
+    if [[ -n "${LBT_NATIVE_SECONDS_PER_NODE_LAYER_HOUR:-}" ]]; then
+      plan_args+=(--seconds-per-node-layer-hour "${LBT_NATIVE_SECONDS_PER_NODE_LAYER_HOUR}")
+    fi
+    if [[ -n "${LBT_NATIVE_WORKER_COUNT_FOR_ESTIMATE:-}" ]]; then
+      plan_args+=(--worker-count-for-estimate "${LBT_NATIVE_WORKER_COUNT_FOR_ESTIMATE}")
+    fi
+  fi
   if [[ "${LBT_NATIVE_SKIP_GAP_CHECK:-0}" == "1" ]]; then
     plan_args+=(--skip-gap-check)
   fi
@@ -395,6 +430,15 @@ start_native_run_in_background() {
   fi
   if [[ -n "${LBT_NATIVE_MAX_WORKERS:-}" ]]; then
     run_args+=(--max-workers "${LBT_NATIVE_MAX_WORKERS}")
+  fi
+  # WP-13：資料依區域逐批到位（工作書記載的到站順序：連江 → 後灣 → 新竹 →
+  # 東北）時，設定這個變數指到 --staged-root 用的同一個目錄，讓 native-run
+  # 在早到的區域資料就緒後立即開始算，不必等全部區域到齊；見 docs/operations/
+  # 19_native_backward_batch_orchestrator.md 第 9.10.4 節。省略時（預設）
+  # 行為與 WP-13 之前完全相同——必須全部區域都已經在計畫檔的工作單元裡才會
+  # 啟動（本腳本一律等 plan 完成後才呼叫 run，本來就隱含這個前提）。
+  if [[ -n "${LBT_NATIVE_WAIT_FOR_STAGED:-}" ]]; then
+    run_args+=(--wait-for-staged "${LBT_NATIVE_WAIT_FOR_STAGED}")
   fi
 
   local timestamp

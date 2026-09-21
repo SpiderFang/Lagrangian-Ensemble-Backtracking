@@ -974,3 +974,407 @@ def test_end_to_end_run_backward_batch_via_orchestrator_two_workers(tmp_path: Pa
         assert payload["particle_count"] == 3
         assert payload["hours_run"] >= 1
         assert sum(payload["final_status_counts"].values()) == 3
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-13：動態工作佇列——尾端不閒置、依資料就緒動態加入、成本模型
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _make_synthetic_unit(
+    *, unit_id: str, flow_domain_id: str, sleep_seconds: float, particle_count: int = 1
+) -> orch.NativeWorkUnit:
+    """建一個只用來量測排程行為的合成工作單元：``settling_velocity_mps`` 欄位
+    借用來夾帶「這個單元應該睡多久」，供 ``_toy_sleep_run_unit`` 讀取——這樣
+    才能讓測試的「真實耗時」與「粒子數」故意不成比例，驗證新排程不再像舊版
+    ``plan_worker_schedule`` 那樣被粒子數這個不準確的成本代理誤導。
+    """
+
+    indices = np.arange(particle_count, dtype=np.int64)
+    return orch.NativeWorkUnit(
+        unit_id=unit_id,
+        analysis_region_id=flow_domain_id,
+        flow_domain_id=flow_domain_id,
+        study_site_id="site",
+        arrival_time_utc_ns=10 * _DAY_NS,
+        settling_velocity_mps=float(sleep_seconds),
+        particle_row_indices=indices,
+        input_hash=f"hash-{unit_id}",
+    )
+
+
+def _toy_sleep_build_resources(worker_id: int) -> dict:
+    return {"worker_id": worker_id}
+
+
+def _toy_sleep_run_unit(resources: dict, spec: orch.NativeWorkUnitSpec) -> dict:
+    import time as _time
+
+    _time.sleep(max(0.0, float(spec.settling_velocity_mps)))
+    return {"unit_id": spec.unit_id, "slept_seconds": float(spec.settling_velocity_mps)}
+
+
+def test_dynamic_queue_no_worker_idles_while_units_remain(tmp_path: Path) -> None:
+    """1 個大成本單元＋多個小成本單元、3 個 worker：驗證尾端不會有 worker
+    做完自己分到的工作就提早閒置——即使「粒子數」這個舊版排程代理刻意設定成
+    與真實耗時（``sleep_seconds``）完全相反（大成本單元粒子數最少），只要
+    ``unit_costs`` 正確反映真實成本，動態佇列仍應該讓總牆鐘時間逼近
+    ``max(總成本／worker 數, 最大單元成本)``，而不是被誤導成「大成本單元最後
+    才被排到、其餘 worker 提早閒置」的舊版行為。
+    """
+
+    import time as _time
+
+    big_sleep = 1.2
+    small_sleep = 0.12
+    n_small = 9
+    worker_count = 3
+
+    units = [
+        _make_synthetic_unit(unit_id="big", flow_domain_id="D", sleep_seconds=big_sleep, particle_count=1)
+    ]
+    units += [
+        _make_synthetic_unit(
+            unit_id=f"small{i}", flow_domain_id="D", sleep_seconds=small_sleep, particle_count=500
+        )
+        for i in range(n_small)
+    ]
+    unit_costs = {u.unit_id: float(u.settling_velocity_mps) for u in units}
+
+    total_cost = big_sleep + n_small * small_sleep
+    theoretical_lower_bound = max(total_cost / worker_count, big_sleep)
+
+    start = _time.monotonic()
+    summary = orch.run_native_plan(
+        units,
+        worker_count=worker_count,
+        build_worker_resources=_toy_sleep_build_resources,
+        run_unit=_toy_sleep_run_unit,
+        output_dir=tmp_path,
+        unit_costs=unit_costs,
+        poll_interval_seconds=0.02,
+    )
+    elapsed = _time.monotonic() - start
+
+    assert summary.completed_unit_count == len(units)
+    assert summary.failed_unit_count == 0
+
+    # 允許程序啟動（spawn 3 個子程序、匯入模組）與輪詢間隔的額外開銷，但不能
+    # 接近「完全沒有平行化」的序列總和（total_cost + 明顯的序列化開銷），
+    # 否則代表有 worker 提早閒置、大成本單元被拖到最後才單獨執行。
+    assert elapsed < theoretical_lower_bound + 5.0, (
+        f"elapsed={elapsed:.3f}s 遠高於理論下界 {theoretical_lower_bound:.3f}s，"
+        "疑似動態佇列未生效、仍有 worker 提早閒置"
+    )
+    assert elapsed < total_cost * 0.9 + 5.0, (
+        f"elapsed={elapsed:.3f}s 接近完全序列執行的總成本 {total_cost:.3f}s，"
+        "動態佇列似乎沒有讓多個 worker 同時工作"
+    )
+
+
+def test_dynamic_queue_matches_bound_with_uneven_worker_counts(tmp_path: Path) -> None:
+    """2 個 worker、1 個特大單元＋多個小單元：驗證總牆鐘時間逼近
+    ``max(總成本／2, 最大單元成本)``（此情境下最大單元成本本身就是瓶頸）。
+    """
+
+    import time as _time
+
+    big_sleep = 1.5
+    small_sleep = 0.1
+    n_small = 6
+    worker_count = 2
+
+    units = [_make_synthetic_unit(unit_id="big", flow_domain_id="D", sleep_seconds=big_sleep)]
+    units += [
+        _make_synthetic_unit(unit_id=f"small{i}", flow_domain_id="D", sleep_seconds=small_sleep)
+        for i in range(n_small)
+    ]
+    unit_costs = {u.unit_id: float(u.settling_velocity_mps) for u in units}
+    total_cost = big_sleep + n_small * small_sleep
+    theoretical_lower_bound = max(total_cost / worker_count, big_sleep)
+
+    start = _time.monotonic()
+    summary = orch.run_native_plan(
+        units,
+        worker_count=worker_count,
+        build_worker_resources=_toy_sleep_build_resources,
+        run_unit=_toy_sleep_run_unit,
+        output_dir=tmp_path,
+        unit_costs=unit_costs,
+        poll_interval_seconds=0.02,
+    )
+    elapsed = _time.monotonic() - start
+
+    assert summary.completed_unit_count == len(units)
+    assert elapsed < theoretical_lower_bound + 5.0
+
+
+def test_run_native_plan_worker_reports_group_outcomes_by_process(tmp_path: Path) -> None:
+    """WP-13：``worker_reports`` 改成事後依 ``worker_id``（pid）分組重建，
+    仍必須涵蓋全部完成的工作單元，且不遺漏、不重複。
+    """
+
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+
+    summary = orch.run_native_plan(
+        units,
+        worker_count=3,
+        build_worker_resources=_toy_build_resources,
+        run_unit=_toy_run_unit,
+        output_dir=tmp_path,
+    )
+
+    all_unit_ids_in_reports = [
+        outcome.unit_id for report in summary.worker_reports for outcome in report.outcomes
+    ]
+    assert sorted(all_unit_ids_in_reports) == sorted(u.unit_id for u in units)
+    assert len(all_unit_ids_in_reports) == len(set(all_unit_ids_in_reports))
+    for report in summary.worker_reports:
+        assert all(outcome.worker_id == report.worker_id for outcome in report.outcomes)
+
+
+def _always_fail_build(worker_id: int) -> dict:
+    raise RuntimeError("模擬 build_worker_resources 失敗")
+
+
+def test_run_native_plan_isolates_build_worker_resources_failure(tmp_path: Path) -> None:
+    """``build_worker_resources`` 本身失敗時，動態佇列裡每個工作單元最終都
+    應該被記為失敗（因為只有一個 worker、它是唯一可用的子程序，且一旦壞掉
+    就會讓後續每個單元都立即失敗），但不應該讓 ``run_native_plan`` 掛掉或
+    漏算任何單元。
+    """
+
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+
+    summary = orch.run_native_plan(
+        units,
+        worker_count=1,
+        build_worker_resources=_always_fail_build,
+        run_unit=_toy_run_unit,
+        output_dir=tmp_path,
+    )
+
+    assert summary.failed_unit_count == len(units)
+    assert summary.completed_unit_count == 0
+    assert set(summary.failed_unit_ids) == {u.unit_id for u in units}
+    for unit in units:
+        marker = orch._load_existing_marker(tmp_path, unit.unit_id)
+        assert marker is not None and marker["status"] == "failed"
+        assert "模擬 build_worker_resources 失敗" in marker["error"]
+
+
+def test_run_native_plan_waits_for_staged_domains_before_finishing(tmp_path: Path) -> None:
+    """WP-13「依資料就緒動態加入」：區域 B 的完成標記在 run_native_plan 執行
+    期間才出現；驗證區域 A 的工作單元先完成，區域 B 的工作單元要等標記出現
+    後才會被排入佇列，且 worker 在等待期間不會退出，全部就緒後才正常結束。
+    """
+
+    import threading
+    import time as _time
+
+    staged_dir = tmp_path / "staged"
+    staged_dir.mkdir()
+    output_dir = tmp_path / "output"
+
+    units = [
+        _make_synthetic_unit(unit_id="a0", flow_domain_id="domainA", sleep_seconds=0.05),
+        _make_synthetic_unit(unit_id="a1", flow_domain_id="domainA", sleep_seconds=0.05),
+        _make_synthetic_unit(unit_id="b0", flow_domain_id="domainB", sleep_seconds=0.05),
+        _make_synthetic_unit(unit_id="b1", flow_domain_id="domainB", sleep_seconds=0.05),
+    ]
+    # 一開始只有 domainA 就緒；domainB 的標記延後由背景執行緒寫入。
+    (staged_dir / "domainA.done").write_text("ok", encoding="utf-8")
+
+    result_holder: dict[str, orch.NativeRunSummary] = {}
+
+    def _run() -> None:
+        result_holder["summary"] = orch.run_native_plan(
+            units,
+            worker_count=2,
+            build_worker_resources=_toy_sleep_build_resources,
+            run_unit=_toy_sleep_run_unit,
+            output_dir=output_dir,
+            staged_ready_dir=staged_dir,
+            staged_flow_domain_ids=["domainA", "domainB"],
+            poll_interval_seconds=0.02,
+        )
+
+    # 背景執行緒刻意設為 daemon：即使下面的斷言在寫入 domainB 標記之前失敗，
+    # 也不會讓 run_native_plan（此時會永遠等待 domainB 就緒）卡住整個測試
+    # 行程、阻塞 pytest 收尾（這是撰寫本測試時實際踩到的坑，誠實記錄於此）。
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    # 這台機器的 ProcessPoolExecutor(spawn) 啟動子程序（匯入 numpy／shapely
+    # 等模組）本身就可能耗時數秒，遠比兩個 0.05 秒的合成單元久；因此改成
+    # 輪詢等待 domainA 兩個單元真正完成，而不是猜一個固定的 sleep 時間，
+    # 避免在較慢的機器上把「還沒排到」誤判成「卡住」。
+    deadline = _time.monotonic() + 20.0
+    while _time.monotonic() < deadline:
+        if (output_dir / "a0.done.json").is_file() and (output_dir / "a1.done.json").is_file():
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail("domainA 的工作單元在 20 秒內未完成，無法繼續驗證 staged 等待行為")
+
+    # domainA 完成的當下，domainB 的標記還沒寫入，domainB 兩個單元不應該有
+    # 任何完成證據（仍在佇列外等待，worker 沒有因為佇列暫時空了就退出）。
+    assert not (output_dir / "b0.done.json").is_file()
+    assert not (output_dir / "b1.done.json").is_file()
+
+    # 現在才讓 domainB 就緒；run_native_plan 的 worker 應該仍在等待（沒有
+    # 因為佇列暫時空了就結束），偵測到標記後立刻把 domainB 的單元排入佇列。
+    (staged_dir / "domainB.done").write_text("ok", encoding="utf-8")
+    thread.join(timeout=30.0)
+    assert not thread.is_alive(), "run_native_plan 在 domainB 就緒後應該能正常結束，不應該卡住"
+
+    summary = result_holder["summary"]
+    assert summary.completed_unit_count == 4
+    assert summary.failed_unit_count == 0
+    for unit in units:
+        assert (output_dir / f"{unit.unit_id}.done.json").is_file()
+
+
+def test_run_native_plan_staged_rejects_unexpected_flow_domain(tmp_path: Path) -> None:
+    staged_dir = tmp_path / "staged"
+    staged_dir.mkdir()
+    units = [_make_synthetic_unit(unit_id="x0", flow_domain_id="domainX", sleep_seconds=0.01)]
+    with pytest.raises(orch.NativeOrchestratorError):
+        orch.run_native_plan(
+            units,
+            worker_count=1,
+            build_worker_resources=_toy_sleep_build_resources,
+            run_unit=_toy_sleep_run_unit,
+            output_dir=tmp_path,
+            staged_ready_dir=staged_dir,
+            staged_flow_domain_ids=["domainOther"],
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-13：正確成本模型與自動選段數
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_estimate_hour_major_unit_cost_seconds_dominated_by_node_layer_hours() -> None:
+    """成本幾乎與粒子數無關：粒子數差 1000 倍，只要小時數×節點數×層數相同，
+    成本應該幾乎相同（差距只來自次要的粒子步項）。
+    """
+
+    cost_few_particles = orch.estimate_hour_major_unit_cost_seconds(
+        hours_to_synthesize=100, node_count=67_600, layer_count=48, particle_count=10
+    )
+    cost_many_particles = orch.estimate_hour_major_unit_cost_seconds(
+        hours_to_synthesize=100, node_count=67_600, layer_count=48, particle_count=10_000
+    )
+    assert cost_many_particles > cost_few_particles
+    # 粒子步項遠小於底場合成主項：差 1000 顆粒子的相對差距應該遠小於 5%。
+    assert (cost_many_particles - cost_few_particles) / cost_few_particles < 0.05
+
+
+def test_estimate_hour_major_unit_cost_seconds_scales_linearly_with_hours_and_grid() -> None:
+    base = orch.estimate_hour_major_unit_cost_seconds(
+        hours_to_synthesize=100, node_count=1000, layer_count=10, particle_count=0
+    )
+    double_hours = orch.estimate_hour_major_unit_cost_seconds(
+        hours_to_synthesize=200, node_count=1000, layer_count=10, particle_count=0
+    )
+    double_nodes = orch.estimate_hour_major_unit_cost_seconds(
+        hours_to_synthesize=100, node_count=2000, layer_count=10, particle_count=0
+    )
+    assert double_hours == pytest.approx(base * 2.0)
+    assert double_nodes == pytest.approx(base * 2.0)
+
+
+def test_estimate_total_wall_clock_seconds_matches_formula() -> None:
+    costs = {"a": 10.0, "b": 2.0, "c": 3.0}
+    wall_clock, max_cost = orch.estimate_total_wall_clock_seconds(costs, worker_count=3)
+    assert max_cost == 10.0
+    # 總成本 15／3=5，小於最大單元成本 10，因此取後者。
+    assert wall_clock == pytest.approx(10.0)
+
+    costs2 = {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0}
+    wall_clock2, max_cost2 = orch.estimate_total_wall_clock_seconds(costs2, worker_count=2)
+    assert max_cost2 == 1.0
+    assert wall_clock2 == pytest.approx(2.0)  # 總成本 4／2=2，大於最大單元成本 1。
+
+
+def test_choose_hour_major_segment_count_balances_repeat_cost_against_parallelism() -> None:
+    """到達跨距遠大於回溯窗、核心數充足時，應該選擇多於 1 段以利用平行度；
+    但段數不會無限增加——重複的回溯窗開銷最終會讓再多切一段變得不划算。
+    """
+
+    k, diagnostics = orch.choose_hour_major_segment_count(
+        arrival_span_days=300.0,
+        distinct_arrival_count=300,
+        max_backtrack_days=30.0,
+        node_count=67_600,
+        layer_count=48,
+        available_cores=16,
+    )
+    assert k > 1
+    assert k <= 16
+    # 段數為 1（完全不切）應該比選出的 K 慢（否則選 K 就沒有意義）。
+    assert diagnostics[k]["wall_clock_seconds"] <= diagnostics[1]["wall_clock_seconds"]
+
+
+def test_choose_hour_major_segment_count_single_core_prefers_no_split() -> None:
+    """只有 1 個核心可用時，切段只會增加重複計算、不會縮短牆鐘時間，
+    應該選擇 K=1（不切段）。
+    """
+
+    k, _diagnostics = orch.choose_hour_major_segment_count(
+        arrival_span_days=300.0,
+        distinct_arrival_count=300,
+        max_backtrack_days=30.0,
+        node_count=67_600,
+        layer_count=48,
+        available_cores=1,
+    )
+    assert k == 1
+
+
+def test_recommend_hour_major_segment_counts_by_workload_requires_grid_sizes() -> None:
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+    with pytest.raises(orch.NativeOrchestratorError):
+        orch.recommend_hour_major_segment_counts_by_workload(
+            units, available_cores=8, node_counts={"flowA_cache_v1": 1000}, layer_counts={}
+        )
+
+
+def test_plan_native_hour_major_segments_uses_workload_cost_model_when_grid_sizes_given() -> None:
+    """``plan_native_hour_major_segments`` 在提供 ``node_counts``／
+    ``layer_counts`` 時改用 WP-13 成本模型自動選段，且回傳的報表帶有
+    ``segment_hours_to_synthesize``，可以直接餵給
+    ``estimate_hour_major_segment_costs``。
+    """
+
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+
+    domain_units, members, reports = orch.plan_native_hour_major_segments(
+        units,
+        target_worker_count=8,
+        node_counts={"flowA_cache_v1": 67_600, "flowB_cache_v1": 27_015},
+        layer_counts={"flowA_cache_v1": 48, "flowB_cache_v1": 48},
+    )
+
+    assert domain_units
+    assert members
+    for report in reports:
+        assert len(report.segment_hours_to_synthesize) == len(report.segment_unit_ids)
+        assert all(h > 0 for h in report.segment_hours_to_synthesize)
+
+    costs = orch.estimate_hour_major_segment_costs(
+        reports,
+        domain_units,
+        node_counts={"flowA_cache_v1": 67_600, "flowB_cache_v1": 27_015},
+        layer_counts={"flowA_cache_v1": 48, "flowB_cache_v1": 48},
+    )
+    assert set(costs) == {u.unit_id for u in domain_units}
+    wall_clock, max_cost = orch.estimate_total_wall_clock_seconds(costs, worker_count=8)
+    assert wall_clock >= max_cost
+    assert wall_clock > 0.0

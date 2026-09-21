@@ -78,16 +78,15 @@ worker，最終由 ``run_native_plan`` 彙整全部失敗清單，不靜默吞�
 
 from __future__ import annotations
 
-import contextlib
 import json
 import multiprocessing as _multiprocessing
 import os
-import queue
 import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool as _BrokenProcessPool
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -108,6 +107,11 @@ __all__ = [
     "HourMajorSegmentPlanReport",
     "estimate_segment_extra_cost_fraction",
     "recommend_hour_major_segment_counts",
+    "estimate_hour_major_unit_cost_seconds",
+    "estimate_hour_major_segment_costs",
+    "estimate_total_wall_clock_seconds",
+    "choose_hour_major_segment_count",
+    "recommend_hour_major_segment_counts_by_workload",
     "plan_native_hour_major_segments",
     "NativeWorkPlanSummary",
     "summarize_native_work_plan",
@@ -482,6 +486,13 @@ class HourMajorSegmentPlanReport:
     estimated_extra_cost_fraction: float
     segment_unit_ids: tuple[str, ...]
     segment_arrival_counts: tuple[int, ...]
+    segment_hours_to_synthesize: tuple[int, ...] = ()
+    """WP-13 新增：每段自己需要合成底場的流場小時數（該段最早到達時刻減去
+    ``max_backtrack_days`` 到該段最晚到達時刻的整段小時數），供
+    ``estimate_hour_major_segment_costs`` 套用正確成本模型；預設空 tuple
+    只是為了不打破舊呼叫端以位置引數建構本 dataclass 的既有測試，
+    ``plan_native_hour_major_segments`` 一律會填入與 ``segment_unit_ids``
+    等長的值。"""
 
 
 def estimate_segment_extra_cost_fraction(
@@ -575,12 +586,330 @@ def recommend_hour_major_segment_counts(
     return result
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# WP-13：正確成本模型與自動選段數
+#
+# 舊版 ``recommend_hour_major_segment_counts``（上面）以「粒子數」估計每個
+# 流場區域的計算成本；但 ``hour_major.py`` 模組文件與本次 WP-13 實測都已
+# 證明，小時主軸排程的成本幾乎全部來自「每個流場小時合成一次底場」（乾濕、
+# Stokes、Smagorinsky、sigma、轉置），這個成本正比於「需要合成底場的流場
+# 小時數 × 節點數 × 垂向層數」，幾乎與粒子數無關（見最終報告 29,929／
+# 67,600 節點 × 48 層的量測：每小時成本分別是 10.008 秒／22.553 秒，正規化
+# 後幾乎相同，強烈支持這個線性模型）。以下函式提供正確的成本模型與依此
+# 模型自動選段數的邏輯，供 ``plan_native_hour_major_segments`` 與
+# ``native-plan`` CLI 使用；舊函式保留不動，避免打破既有呼叫端與測試。
+# ══════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_SECONDS_PER_NODE_LAYER_HOUR = 7.0e-6
+"""WP-13 實測校準常數：每小時、每個 (節點, 層) 組合的底場合成成本（秒）。
+
+來源（見最終報告完整量測表與機器規格誠實揭露）：在 29,929 節點×48 層與
+67,600 節點×48 層的合成網格上，量測 ``backward_driver.
+compose_current_and_stokes_fields``（提供波浪場、啟用 Stokes）＋
+``compute_smagorinsky_kh_field``＋``apply_settling_velocity``＋
+``estimate_substep_count`` 的單一流場小時總耗時，分別是 10.008 秒與
+22.553 秒；除以各自的節點數×層數（1,436,592 與 3,244,800）得到 6.968e-6
+秒與 6.950e-6 秒——兩個相差 2.3 倍規模的網格算出幾乎相同的「每節點層小時」
+成本，這是本模組選擇「成本正比於節點數×層數×小時數」這個線性模型、而不是
+更複雜模型的實證依據。7.0e-6 秒是這兩個實測值的簡單捨入。
+
+**誠實揭露**：這是在這次 WP-13 量測用的機器（2 核心沙盒環境，非正式伺服器，
+見最終報告）上的實測值；正式伺服器的 CPU 時脈、快取、記憶體頻寬都不同，
+绝對秒數一定不同（東北區實際節點數比這裡量測的 67,600 略多，見下方
+``NORTHEAST_NODE_COUNT`` 一類的常數由呼叫端自行提供，本模組不內建）。
+呼叫端應該在正式伺服器上重新量測、以 ``seconds_per_node_layer_hour``
+參數覆寫這個預設值；這裡只是提供一個「量級正確、不必每次呼叫前都先跑一次
+量測」的合理起點。
+"""
+
+_DEFAULT_SECONDS_PER_PARTICLE_SUBSTEP = 5.0e-6
+"""既有量測：``run_backward_batch`` 粒子步 kernel 本身的成本量級約
+5 µs/步（見 ``native_runner/orchestrator.py`` 模組文件開頭引用的既有效能
+量測，及 WP-9 ``hour_major`` 模組文件「背景與問題」一節引用的同一個
+數字）。"""
+
+_DEFAULT_SUBSTEPS_PER_HOUR = 4.0
+"""粗略估計：一個流場小時內 CFL 子步數（``ndeltp``）的量級。真正的子步數
+由每小時實際流速決定（見 ``estimate_substep_count``），逐小時、逐區域都會
+變動；本模組不假裝能在排程前精確預知它，這裡只需要一個量級正確的常數，
+確保成本模型裡「粒子步」這一項不會被完全設成零、而是如任務書要求「加上
+極小的粒子步項」，同時不會喧賓奪主蓋過真正主導成本的節點數×層數×小時數
+這一項（見 ``estimate_hour_major_unit_cost_seconds`` 的兩項合計）。"""
+
+
+def estimate_hour_major_unit_cost_seconds(
+    *,
+    hours_to_synthesize: int,
+    node_count: int,
+    layer_count: int,
+    particle_count: int,
+    seconds_per_node_layer_hour: float = _DEFAULT_SECONDS_PER_NODE_LAYER_HOUR,
+    seconds_per_particle_substep: float = _DEFAULT_SECONDS_PER_PARTICLE_SUBSTEP,
+    substeps_per_hour: float = _DEFAULT_SUBSTEPS_PER_HOUR,
+) -> float:
+    """WP-13 正確成本模型：估計一個小時主軸排程單元（整個流場區域或其中一段）
+    的計算成本（秒）。
+
+    ``estimated_cost = hours_to_synthesize × node_count × layer_count ×
+    seconds_per_node_layer_hour``（底場合成主項，見上方
+    ``_DEFAULT_SECONDS_PER_NODE_LAYER_HOUR`` 的量測依據）``+
+    hours_to_synthesize × substeps_per_hour × particle_count ×
+    seconds_per_particle_substep``（粒子步次項，量級遠小於主項，只在段內
+    粒子數差距懸殊時才會影響排序）。
+
+    這是工作書「已由主代理確認」問題描述要求的成本模型（「幾乎與粒子數無關」
+    的固定開銷正比於「該段需走過的流場小時數 × 網格節點數 × 層數」），取代
+    舊版 ``plan_worker_schedule`` 以粒子數估計成本的近似——後者對逐工作單元
+    路徑（每個工作單元一次 kernel 呼叫）勉強成立，但對小時主軸排程（見
+    ``hour_major.py``）完全失真：兩個粒子數差 100 倍、但涵蓋相同流場小時數
+    的段，實際成本幾乎相同。
+    """
+
+    if hours_to_synthesize < 0:
+        raise NativeOrchestratorError("hours_to_synthesize 不可為負")
+    if node_count < 0 or layer_count < 0 or particle_count < 0:
+        raise NativeOrchestratorError("node_count／layer_count／particle_count 不可為負")
+    field_synthesis_cost = hours_to_synthesize * node_count * layer_count * seconds_per_node_layer_hour
+    particle_step_cost = (
+        hours_to_synthesize * substeps_per_hour * particle_count * seconds_per_particle_substep
+    )
+    return field_synthesis_cost + particle_step_cost
+
+
+def estimate_hour_major_segment_costs(
+    reports: Sequence[HourMajorSegmentPlanReport],
+    domain_units: Sequence[NativeWorkUnit],
+    *,
+    node_counts: Mapping[str, int],
+    layer_counts: Mapping[str, int],
+    seconds_per_node_layer_hour: float = _DEFAULT_SECONDS_PER_NODE_LAYER_HOUR,
+    seconds_per_particle_substep: float = _DEFAULT_SECONDS_PER_PARTICLE_SUBSTEP,
+    substeps_per_hour: float = _DEFAULT_SUBSTEPS_PER_HOUR,
+) -> dict[str, float]:
+    """對 ``plan_native_hour_major_segments`` 的輸出，逐排程單元套用 WP-13
+    成本模型，回傳 ``{domain_unit_id: 估計成本秒數}``。
+
+    Args:
+        reports: ``plan_native_hour_major_segments`` 回傳的 ``reports``。
+        domain_units: 同一次呼叫回傳的 ``domain_units``（用來查每個排程
+            單元自己的 ``particle_count``，即成本模型的次要項）。
+        node_counts / layer_counts: ``{flow_domain_id: 節點數／層數}``；
+            缺少任何一個出現在 ``reports`` 裡的 ``flow_domain_id`` 都會
+            fail-closed，不會用臆測值頂替（節點數／層數是決定成本的主要
+            因子，猜錯會讓整個排程與報告的預估牆鐘時間失真）。
+
+    Returns:
+        ``{domain_unit_id: 估計成本秒數}``，鍵值涵蓋 ``reports`` 內全部
+        ``segment_unit_ids``。
+    """
+
+    particle_count_by_unit_id = {u.unit_id: u.particle_count for u in domain_units}
+    costs: dict[str, float] = {}
+    for report in reports:
+        if report.flow_domain_id not in node_counts or report.flow_domain_id not in layer_counts:
+            raise NativeOrchestratorError(
+                f"缺少流場區域 {report.flow_domain_id!r} 的 node_counts／layer_counts，"
+                "無法套用 WP-13 成本模型（節點數／層數是成本模型的主要因子，本函式"
+                "拒絕以臆測值頂替）"
+            )
+        node_count = node_counts[report.flow_domain_id]
+        layer_count = layer_counts[report.flow_domain_id]
+        for unit_id, hours in zip(
+            report.segment_unit_ids, report.segment_hours_to_synthesize, strict=True
+        ):
+            particle_count = particle_count_by_unit_id.get(unit_id, 0)
+            costs[unit_id] = estimate_hour_major_unit_cost_seconds(
+                hours_to_synthesize=hours,
+                node_count=node_count,
+                layer_count=layer_count,
+                particle_count=particle_count,
+                seconds_per_node_layer_hour=seconds_per_node_layer_hour,
+                seconds_per_particle_substep=seconds_per_particle_substep,
+                substeps_per_hour=substeps_per_hour,
+            )
+    return costs
+
+
+def estimate_total_wall_clock_seconds(
+    unit_costs: Mapping[str, float], *, worker_count: int
+) -> tuple[float, float]:
+    """工作書要求的總牆鐘時間估算：``max(總成本／核心數, 最大單段成本)``。
+
+    第一項是「假設完美負載平衡、核心永不閒置」下的理論下界；第二項是工作書
+    「不可壓縮的下限」——單一到達時刻的回溯窗長度決定的成本，即使核心再多
+    也壓不下去這個數字（因為任何一段都必須從自己的到達時刻依時間順序走到
+    回溯上限，不能拆給另一個核心分攤），除非用任務 2 的小時內平行化壓低
+    這個最大單段自己的成本。兩者取最大值，是對「總牆鐘時間」最粗略但方向
+    正確的估計：實際值一定不會低於這兩個下界中較大的一個，但因為裝箱
+    （bin packing）不可能永遠完美平衡，實際值通常會比這個估計更高一些
+    （見 ``plan_worker_schedule`` 的 LPT 裝箱有界誤差說明）。
+
+    Returns:
+        ``(estimated_wall_clock_seconds, max_single_unit_cost_seconds)``；
+        第二個回傳值供報告單獨列出「不可壓縮下限」。
+    """
+
+    if worker_count < 1:
+        raise NativeOrchestratorError("worker_count 必須是正整數")
+    if not unit_costs:
+        raise NativeOrchestratorError("unit_costs 不可為空")
+    total = sum(unit_costs.values())
+    max_cost = max(unit_costs.values())
+    return max(total / worker_count, max_cost), max_cost
+
+
+def choose_hour_major_segment_count(
+    *,
+    arrival_span_days: float,
+    distinct_arrival_count: int,
+    max_backtrack_days: float,
+    node_count: int,
+    layer_count: int,
+    available_cores: int,
+    seconds_per_node_layer_hour: float = _DEFAULT_SECONDS_PER_NODE_LAYER_HOUR,
+    max_segment_count: int | None = None,
+) -> tuple[int, dict[int, dict[str, float]]]:
+    """WP-13：依單一流場區域的網格規模、到達時刻分布、回溯天數與可用核心數，
+    自動選擇這個區域要切成幾段（``K``）。
+
+    對每個候選 ``K``（``1`` 到 ``distinct_arrival_count``，或
+    ``max_segment_count`` 進一步夾住的上限），假設 ``K`` 段把全部到達時刻
+    跨距平分（與 ``_split_sorted_into_k_chunks`` 的實際切法一致），估計：
+
+    - ``per_segment_hours = arrival_span_hours / K + max_backtrack_hours``
+      （每段自己的小時數：平分後的到達時刻跨距，加上每段都要各自付出的
+      回溯窗長度）
+    - ``total_hours = K × per_segment_hours``（``K`` 段合計的小時數，
+      ``K`` 越大，段與段之間回溯窗重疊而重複計算的比例越高，見
+      ``estimate_segment_extra_cost_fraction``）
+    - ``wall_clock = max(total_hours × 每節點層小時成本 / min(K,
+      available_cores), per_segment_hours × 每節點層小時成本)``（與
+      ``estimate_total_wall_clock_seconds`` 相同的下界公式，套用到「假設
+      這個區域自己能用到 ``available_cores`` 個核心」這個樂觀假設——實際
+      上跟其他區域共用同一個 worker pool，見 ``run_native_plan`` 的動態
+      佇列設計，因此這個函式選出的 ``K`` 是「合理」而非「全域最佳」，真正
+      的整體牆鐘時間仍要用 ``estimate_total_wall_clock_seconds`` 對全部
+      區域、全部段的實際成本重新估一次）
+
+    選出讓 ``wall_clock`` 最小的 ``K``；``K`` 太大時 ``total_hours``（進而
+    重複計算的固定開銷）會持續增加，但 ``per_segment_hours``／
+    ``total_hours/K`` 會持續下降，兩者的極小值通常落在
+    ``K ≈ available_cores`` 附近但可能因為回溯窗的固定開銷而更小，這正是
+    本函式要用數值搜尋而不是拍腦袋公式的原因。
+
+    Returns:
+        ``(建議段數, {K: 該候選 K 的診斷字典（wall_clock_seconds／
+        extra_cost_fraction／total_cost_seconds／max_segment_cost_seconds／
+        cores_used）})``；診斷字典供 ``native-plan`` 報表列出候選比較，不是
+        只回傳最終選擇，方便人工覆寫時參考。
+    """
+
+    if distinct_arrival_count < 1:
+        raise NativeOrchestratorError("distinct_arrival_count 必須是正整數")
+    if available_cores < 1:
+        raise NativeOrchestratorError("available_cores 必須是正整數")
+    if node_count < 0 or layer_count < 0:
+        raise NativeOrchestratorError("node_count／layer_count 不可為負")
+    if arrival_span_days < 0 or max_backtrack_days < 0:
+        raise NativeOrchestratorError("arrival_span_days／max_backtrack_days 不可為負")
+
+    cap = (
+        distinct_arrival_count
+        if max_segment_count is None
+        else min(distinct_arrival_count, max_segment_count)
+    )
+    cap = max(1, cap)
+    arrival_span_hours = arrival_span_days * 24.0
+    max_backtrack_hours = max_backtrack_days * 24.0
+    cost_per_hour = node_count * layer_count * seconds_per_node_layer_hour
+    no_split_hours = arrival_span_hours + max_backtrack_hours
+
+    diagnostics: dict[int, dict[str, float]] = {}
+    best_k = 1
+    best_wall_clock: float | None = None
+    for k in range(1, cap + 1):
+        per_segment_hours = arrival_span_hours / k + max_backtrack_hours
+        total_hours = per_segment_hours * k
+        extra_fraction = (total_hours - no_split_hours) / no_split_hours if no_split_hours > 0 else 0.0
+        cores_used = min(k, available_cores)
+        total_cost = total_hours * cost_per_hour
+        max_segment_cost = per_segment_hours * cost_per_hour
+        wall_clock = max(total_cost / cores_used, max_segment_cost)
+        diagnostics[k] = {
+            "wall_clock_seconds": wall_clock,
+            "extra_cost_fraction": extra_fraction,
+            "total_cost_seconds": total_cost,
+            "max_segment_cost_seconds": max_segment_cost,
+            "cores_used": float(cores_used),
+        }
+        if best_wall_clock is None or wall_clock < best_wall_clock - 1.0e-9:
+            best_wall_clock = wall_clock
+            best_k = k
+    return best_k, diagnostics
+
+
+def recommend_hour_major_segment_counts_by_workload(
+    units: Sequence[NativeWorkUnit],
+    *,
+    available_cores: int,
+    node_counts: Mapping[str, int],
+    layer_counts: Mapping[str, int],
+    max_backtrack_seconds: float = _DEFAULT_MAX_BACKTRACK_SECONDS,
+    seconds_per_node_layer_hour: float = _DEFAULT_SECONDS_PER_NODE_LAYER_HOUR,
+    max_segments_per_domain: int | None = None,
+) -> dict[str, int]:
+    """WP-13：``recommend_hour_major_segment_counts`` 的正確成本模型版本。
+
+    把 ``units`` 依 ``flow_domain_id`` 分組後，逐區域呼叫
+    ``choose_hour_major_segment_count`` 決定段數；與舊版不同，**不**依粒子數
+    比例分配段數名額，而是每個區域各自依自己的網格規模、到達時刻跨距與
+    回溯天數，獨立選出讓自己的估計牆鐘時間最小的段數（見
+    ``choose_hour_major_segment_count`` docstring 對「合理而非全域最佳」的
+    說明）。回傳 ``{flow_domain_id: K}``，可直接餵給
+    ``plan_native_hour_major_segments`` 的 ``segment_count`` 參數。
+    """
+
+    if not units:
+        raise NativeOrchestratorError("units 不可為空")
+    by_domain: dict[str, list[NativeWorkUnit]] = {}
+    for unit in units:
+        by_domain.setdefault(unit.flow_domain_id, []).append(unit)
+    max_backtrack_days = max_backtrack_seconds / 86400.0
+
+    result: dict[str, int] = {}
+    for domain in sorted(by_domain):
+        if domain not in node_counts or domain not in layer_counts:
+            raise NativeOrchestratorError(f"缺少流場區域 {domain!r} 的 node_counts／layer_counts")
+        domain_units = by_domain[domain]
+        distinct_arrivals = sorted({int(u.arrival_time_utc_ns) for u in domain_units})
+        arrival_span_days = (
+            (distinct_arrivals[-1] - distinct_arrivals[0]) / (86400.0 * 1_000_000_000.0)
+            if len(distinct_arrivals) > 1
+            else 0.0
+        )
+        k, _diagnostics = choose_hour_major_segment_count(
+            arrival_span_days=arrival_span_days,
+            distinct_arrival_count=len(distinct_arrivals),
+            max_backtrack_days=max_backtrack_days,
+            node_count=node_counts[domain],
+            layer_count=layer_counts[domain],
+            available_cores=available_cores,
+            seconds_per_node_layer_hour=seconds_per_node_layer_hour,
+            max_segment_count=max_segments_per_domain,
+        )
+        result[domain] = k
+    return result
+
+
 def plan_native_hour_major_segments(
     units: Sequence[NativeWorkUnit],
     *,
     segment_count: int | Mapping[str, int] | None = None,
     target_worker_count: int | None = None,
     max_backtrack_seconds: float = _DEFAULT_MAX_BACKTRACK_SECONDS,
+    node_counts: Mapping[str, int] | None = None,
+    layer_counts: Mapping[str, int] | None = None,
+    seconds_per_node_layer_hour: float = _DEFAULT_SECONDS_PER_NODE_LAYER_HOUR,
 ) -> tuple[
     tuple[NativeWorkUnit, ...],
     Mapping[str, tuple[NativeWorkUnit, ...]],
@@ -617,13 +946,25 @@ def plan_native_hour_major_segments(
             區域）、``{flow_domain_id: K}`` 對照表（逐區域指定），或
             ``None``（改用 ``target_worker_count`` 透過
             ``recommend_hour_major_segment_counts`` 自動決定）。
-        target_worker_count: ``segment_count`` 為 ``None`` 時，傳給
-            ``recommend_hour_major_segment_counts`` 的目標平行度（通常是
-            可用核心數）。兩者都是 ``None`` 時等同 ``segment_count=1``
+        target_worker_count: ``segment_count`` 為 ``None`` 時的目標平行度
+            （通常是可用核心數）。兩者都是 ``None`` 時等同 ``segment_count=1``
             （不切段，行為與 ``plan_native_hour_major_work_units`` 相同）。
-        max_backtrack_seconds: 只用於 ``HourMajorSegmentPlanReport`` 的額外
-            成本估計，不影響實際切段（實際回溯窗長度仍由 ``hour_major``
-            執行時的 ``HourMajorConfig.max_backtrack_seconds`` 決定）。
+        max_backtrack_seconds: 用於 ``HourMajorSegmentPlanReport`` 的額外
+            成本估計與（WP-13）每段成本模型的回溯窗小時數，不影響實際切段
+            （實際回溯窗長度仍由 ``hour_major`` 執行時的
+            ``HourMajorConfig.max_backtrack_seconds`` 決定）。
+        node_counts / layer_counts: WP-13 新增。``{flow_domain_id: 節點數}``／
+            ``{flow_domain_id: 垂向層數}``；``segment_count`` 為 ``None`` 且
+            ``target_worker_count`` 提供時，若兩者都提供，改用 WP-13 正確
+            成本模型（``recommend_hour_major_segment_counts_by_workload``，
+            依「流場小時數×節點數×層數」而非粒子數選段數）；若只提供
+            ``target_worker_count`` 而缺少 ``node_counts``／``layer_counts``，
+            退回舊版 ``recommend_hour_major_segment_counts``（純粒子數啟發式，
+            見該函式文件對「成本模型不精確」的既有誠實揭露——WP-13 之前的
+            版本不知道底場合成成本幾乎與粒子數無關這件事）。
+        seconds_per_node_layer_hour: WP-13 成本模型的校準常數，見
+            ``estimate_hour_major_unit_cost_seconds`` 文件；只在使用新成本
+            模型（``node_counts``／``layer_counts`` 都有提供）時生效。
 
     Returns:
         ``(domain_units, members, reports)``；``domain_units``／``members``
@@ -642,6 +983,15 @@ def plan_native_hour_major_segments(
     if segment_count is None:
         if target_worker_count is None:
             resolved_counts: dict[str, int] = {domain: 1 for domain in by_domain}
+        elif node_counts is not None and layer_counts is not None:
+            resolved_counts = recommend_hour_major_segment_counts_by_workload(
+                units,
+                available_cores=target_worker_count,
+                node_counts=node_counts,
+                layer_counts=layer_counts,
+                max_backtrack_seconds=max_backtrack_seconds,
+                seconds_per_node_layer_hour=seconds_per_node_layer_hour,
+            )
         else:
             resolved_counts = recommend_hour_major_segment_counts(
                 units, target_worker_count=target_worker_count, max_backtrack_seconds=max_backtrack_seconds
@@ -677,6 +1027,8 @@ def plan_native_hour_major_segments(
         segment_unit_ids: list[str] = []
         arrival_span_days = (distinct_arrivals[-1] - distinct_arrivals[0]) / (86400.0 * 1_000_000_000.0)
         segment_arrival_counts: list[int] = []
+        segment_hours_to_synthesize: list[int] = []
+        max_backtrack_hours = int(round(max_backtrack_days * 24.0))
         for segment_index, member_units in enumerate(segment_members):
             member_units_sorted = tuple(sorted(member_units, key=lambda u: u.unit_id))
             all_rows = np.unique(np.concatenate([m.particle_row_indices for m in member_units_sorted]))
@@ -701,6 +1053,14 @@ def plan_native_hour_major_segments(
             members[domain_unit_id] = member_units_sorted
             segment_unit_ids.append(domain_unit_id)
             segment_arrival_counts.append(len(member_units_sorted))
+            # WP-13 正確成本模型：這一段自己需要合成底場的流場小時數，是「這一段
+            # 涵蓋的到達時刻跨距（小時）」加上「回溯窗長度（小時）」，與段內粒子
+            # 數無關——這正是 hour_major.py 固定開銷與粒子數無關這件事的排程層
+            # 對應。``chunk`` 是 ``_split_sorted_into_k_chunks`` 產生的這一段到達
+            # 時刻（已排序、單位 ns），只有一個到達時刻時跨距為 0。
+            chunk = chunks[segment_index]
+            segment_span_hours = int(round((chunk[-1] - chunk[0]) / _HOUR_NS)) if len(chunk) > 1 else 0
+            segment_hours_to_synthesize.append(segment_span_hours + max_backtrack_hours + 1)
 
         reports.append(
             HourMajorSegmentPlanReport(
@@ -717,6 +1077,7 @@ def plan_native_hour_major_segments(
                 ),
                 segment_unit_ids=tuple(segment_unit_ids),
                 segment_arrival_counts=tuple(segment_arrival_counts),
+                segment_hours_to_synthesize=tuple(segment_hours_to_synthesize),
             )
         )
 
@@ -1346,109 +1707,140 @@ def filter_pending_units(
 
 @dataclass(frozen=True, slots=True)
 class WorkerRunReport:
-    """單一 worker 處理完其被指派的整串工作單元後的完整回報。"""
+    """單一 worker 程序（依 ``os.getpid()`` 分組）處理過的工作單元回報。
+
+    WP-13 改成動態拉取佇列（見 ``run_native_plan`` 模組文件「執行引擎」一節）
+    之後，「worker」不再對應一份事先排定的整串清單，而是「同一個長駐子
+    程序，在其存活期間依序拉取並處理過的工作單元」；本 dataclass 的欄位
+    語意因此從「這個 worker 被指派了什麼」變成「這個 worker 實際做了什麼」，
+    在事後（全部單元執行完）依 ``NativeUnitOutcome.worker_id`` 分組重建，
+    純粹為了保留既有回報結構，不影響任何呼叫端讀取這個欄位的既有程式碼。
+    """
 
     worker_id: int
     outcomes: tuple[NativeUnitOutcome, ...]
     fatal_error: str | None = None
 
 
-def _run_assigned_units(
-    worker_id: int,
-    unit_specs: tuple[NativeWorkUnitSpec, ...],
-    *,
+# 每個長駐子程序自己的資源快取（見 ``_run_single_unit_task`` docstring）。
+# ``multiprocessing`` 的 ``spawn`` 啟動方式讓每個子程序有獨立的模組狀態，
+# 這個模組層級變數天生就是「每個程序各自一份」，不需要額外用鎖保護。
+_WORKER_RESOURCE_CACHE: list[tuple[str, Any]] = []
+
+
+def _reset_worker_resource_cache_for_tests() -> None:
+    """測試專用：在同一個程序內重跑多次 ``run_native_plan``（例如
+    ``mp_context_method`` 用 fork 或直接呼叫本模組內部函式做單元測試）時，
+    清掉上一次呼叫殘留的資源快取，避免不同次呼叫的 ``build_worker_resources``
+    互相污染。正式路徑（``spawn``）每次呼叫都會產生全新的子程序，不需要
+    呼叫這個函式；只有測試需要在同一個直譯器程序內模擬「新的一批 worker」
+    時才使用。
+    """
+
+    _WORKER_RESOURCE_CACHE.clear()
+
+
+def _run_single_unit_task(
+    spec: NativeWorkUnitSpec,
     build_worker_resources: WorkerResourceBuilder,
     run_unit: UnitRunner,
     output_dir: str,
     numba_cache_dir: str | None,
-    progress_queue: Any,
-) -> WorkerRunReport:
-    """單一 worker 子程序的主迴圈：建構一次資源、連續處理整串工作單元。
+) -> NativeUnitOutcome:
+    """動態佇列的執行單元：處理**一個**工作單元，供 ``ProcessPoolExecutor``
+    的內部工作佇列逐一派給任一目前空閒的長駐子程序。
 
-    這是模組層級（非巢狀）函式，是刻意的設計：``multiprocessing`` 的 ``spawn``／
-    ``forkserver`` 啟動方式要求任務函式可以被 pickle 匯入，巢狀函式或閉包在
-    ``spawn`` 下無法可靠序列化；``build_worker_resources``／``run_unit`` 由呼叫端
-    以模組層級函式（或其 ``functools.partial``）提供，同樣是為了滿足這個限制。
+    這是 WP-13 取代舊版「每個 worker 一次 submit 整串清單」（見模組文件
+    「已知限制」曾經記載、現已修正的靜態排程問題）的核心：``run_native_plan``
+    對**每一個**待執行工作單元各自呼叫一次 ``pool.submit(_run_single_unit_task,
+    ...)``，而不是先用 ``plan_worker_schedule`` 把清單靜態切給固定的
+    worker。``ProcessPoolExecutor`` 內建的呼叫佇列本來就是「任何一個子程序
+    處理完手上的任務，立刻去佇列拿下一個」的行為（這正是 CPython
+    ``concurrent.futures.process`` 的既有實作，不需要另外實作一套佇列協定）
+    ——這就是「常駐 worker 從共享佇列拉取下一個工作單元，做完立刻拿下一個」
+    的直接體現，消除了舊版「部分 worker 做完自己的整串清單就退出、不能接手
+    其他 worker 剩餘工作」的尾端閒置問題。
+
+    每個子程序只在**第一次**被呼叫時建構資源（``build_worker_resources``），
+    之後同一個子程序處理的每一個工作單元都重用同一份快取（見
+    ``_WORKER_RESOURCE_CACHE``），與舊版「每個 worker 只呼叫一次
+    ``build_worker_resources``」的資源重用行為完全相同，只是觸發時機從
+    「程序啟動時」改成「程序第一次真正拿到工作單元時」（差異不影響任何
+    正確性或效能特性：worker 啟動後在拿到第一個單元之前本來就沒有其他
+    事可做）。
+
+    失敗隔離語意與舊版相同：``build_worker_resources`` 失敗時，這個子程序
+    往後收到的**每一個**工作單元都會立即回報失敗（快取住失敗原因，不會
+    對同一個注定失敗的子程序重複嘗試重建資源），但完全不影響其他子程序
+    ——因為現在是動態拉取，這個「毒化」的子程序仍然會繼續從佇列拉工作單元
+    （只是每個都立刻失敗），不像舊版整批工作單元從一開始就固定綁死在它
+    身上；淨效果是這個子程序等同於少了一個能真正做事的 worker，但不會
+    卡住整體排程或讓其他子程序等待它。單一工作單元執行失敗（``run_unit``
+    拋例外）則只讓那一個單元失敗，同一個子程序的資源快取不受影響，繼續
+    處理佇列裡的下一個單元——與舊版逐單元失敗隔離語意相同。
+
+    若子程序本身異常終止（作業系統層級的 kill、segfault，不是這裡任何
+    ``except`` 能攔截的 Python 例外），``ProcessPoolExecutor`` 會把整個
+    pool 標記成 ``BrokenProcessPool``；呼叫端 ``run_native_plan`` 對這個
+    情況的處理見該函式文件「已知限制」一節，本函式不處理、也無法處理這個
+    情況（此時本函式所在的程序已經不存在了）。
     """
 
     output_path = Path(output_dir)
     if numba_cache_dir:
         os.environ["NUMBA_CACHE_DIR"] = numba_cache_dir
+    worker_id = os.getpid()
 
-    try:
-        resources = build_worker_resources(worker_id)
-    except Exception:  # noqa: BLE001 - 資源建構失敗必須讓整個 worker 的單元都回報失敗，不能讓程序直接崩潰
-        error_text = traceback.format_exc()
-        now_ns = time.time_ns()
-        outcomes = tuple(
-            NativeUnitOutcome(
-                unit_id=spec.unit_id,
-                status="failed",
-                input_hash=spec.input_hash,
-                worker_id=worker_id,
-                elapsed_seconds=0.0,
-                particle_count=int(spec.particle_row_indices.shape[0]),
-                completed_at_utc_ns=now_ns,
-                error=error_text,
-            )
-            for spec in unit_specs
-        )
-        for outcome in outcomes:
-            _persist_outcome(output_path, outcome, extra_summary=None)
-            _safe_put(
-                progress_queue, {"worker_id": worker_id, "unit_id": outcome.unit_id, "status": "failed"}
-            )
-        return WorkerRunReport(worker_id=worker_id, outcomes=outcomes, fatal_error=error_text)
-
-    outcomes: list[NativeUnitOutcome] = []
-    for spec in unit_specs:
-        start = time.monotonic()
+    if not _WORKER_RESOURCE_CACHE:
         try:
-            summary = run_unit(resources, spec)
-            elapsed = time.monotonic() - start
-            outcome = NativeUnitOutcome(
-                unit_id=spec.unit_id,
-                status="completed",
-                input_hash=spec.input_hash,
-                worker_id=worker_id,
-                elapsed_seconds=elapsed,
-                particle_count=int(spec.particle_row_indices.shape[0]),
-                completed_at_utc_ns=time.time_ns(),
-            )
-            _persist_outcome(output_path, outcome, extra_summary=summary)
-        except Exception:  # noqa: BLE001 - 單一單元失敗必須被隔離，不能拖垮同 worker 佇列的其餘單元
-            elapsed = time.monotonic() - start
-            error_text = traceback.format_exc()
-            outcome = NativeUnitOutcome(
-                unit_id=spec.unit_id,
-                status="failed",
-                input_hash=spec.input_hash,
-                worker_id=worker_id,
-                elapsed_seconds=elapsed,
-                particle_count=int(spec.particle_row_indices.shape[0]),
-                completed_at_utc_ns=time.time_ns(),
-                error=error_text,
-            )
-            _persist_outcome(output_path, outcome, extra_summary=None)
-        outcomes.append(outcome)
-        _safe_put(
-            progress_queue,
-            {
-                "worker_id": worker_id,
-                "unit_id": outcome.unit_id,
-                "status": outcome.status,
-                "elapsed_seconds": outcome.elapsed_seconds,
-                "particle_count": outcome.particle_count,
-            },
+            _WORKER_RESOURCE_CACHE.append(("ok", build_worker_resources(worker_id)))
+        except Exception:  # noqa: BLE001 - 資源建構失敗必須讓這個子程序往後的單元都回報失敗，不能讓程序直接崩潰
+            _WORKER_RESOURCE_CACHE.append(("failed", traceback.format_exc()))
+
+    cache_status, cache_payload = _WORKER_RESOURCE_CACHE[0]
+    if cache_status == "failed":
+        outcome = NativeUnitOutcome(
+            unit_id=spec.unit_id,
+            status="failed",
+            input_hash=spec.input_hash,
+            worker_id=worker_id,
+            elapsed_seconds=0.0,
+            particle_count=int(spec.particle_row_indices.shape[0]),
+            completed_at_utc_ns=time.time_ns(),
+            error=cache_payload,
         )
-    return WorkerRunReport(worker_id=worker_id, outcomes=tuple(outcomes))
+        _persist_outcome(output_path, outcome, extra_summary=None)
+        return outcome
 
-
-def _safe_put(progress_queue: Any, message: Mapping[str, Any]) -> None:
-    """進度回報是盡力而為的觀測用途，佇列已滿或已關閉都不應該讓計算失敗。"""
-
-    with contextlib.suppress(Exception):
-        progress_queue.put_nowait(dict(message))
+    resources = cache_payload
+    start = time.monotonic()
+    try:
+        summary = run_unit(resources, spec)
+        elapsed = time.monotonic() - start
+        outcome = NativeUnitOutcome(
+            unit_id=spec.unit_id,
+            status="completed",
+            input_hash=spec.input_hash,
+            worker_id=worker_id,
+            elapsed_seconds=elapsed,
+            particle_count=int(spec.particle_row_indices.shape[0]),
+            completed_at_utc_ns=time.time_ns(),
+        )
+        _persist_outcome(output_path, outcome, extra_summary=summary)
+    except Exception:  # noqa: BLE001 - 單一單元失敗必須被隔離，不能拖垮同一子程序後續要處理的其他單元
+        elapsed = time.monotonic() - start
+        outcome = NativeUnitOutcome(
+            unit_id=spec.unit_id,
+            status="failed",
+            input_hash=spec.input_hash,
+            worker_id=worker_id,
+            elapsed_seconds=elapsed,
+            particle_count=int(spec.particle_row_indices.shape[0]),
+            completed_at_utc_ns=time.time_ns(),
+            error=traceback.format_exc(),
+        )
+        _persist_outcome(output_path, outcome, extra_summary=None)
+    return outcome
 
 
 def _persist_outcome(
@@ -1537,6 +1929,10 @@ def read_progress_snapshot(
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _domain_staged_marker_path(staged_ready_dir: Path, flow_domain_id: str, suffix: str) -> Path:
+    return staged_ready_dir / f"{flow_domain_id}{suffix}"
+
+
 def run_native_plan(
     units: Sequence[NativeWorkUnit],
     *,
@@ -1548,8 +1944,32 @@ def run_native_plan(
     mp_context_method: str = "spawn",
     poll_interval_seconds: float = 0.2,
     progress_filename: str = "progress.json",
+    unit_costs: Mapping[str, float] | None = None,
+    staged_ready_dir: str | Path | None = None,
+    staged_flow_domain_ids: Sequence[str] | None = None,
+    staged_marker_suffix: str = ".done",
 ) -> NativeRunSummary:
-    """規劃、排程並平行執行一批 native 工作單元，支援續跑與失敗隔離。
+    """規劃、以動態拉取佇列平行執行一批 native 工作單元，支援續跑與失敗隔離。
+
+    WP-13 動態工作佇列
+    --------------------
+    取代 WP-7 原本「``plan_worker_schedule`` 靜態 LPT 裝箱、每個 worker 一次
+    ``submit`` 整串清單」的排程方式（見該函式文件與模組文件「已知限制」曾經
+    記載的問題：部分 worker 做完自己的清單就退出、不能接手其他 worker 剩餘
+    的工作，造成尾端 CPU 閒置）。本函式改成對**每一個**待執行工作單元各自
+    ``pool.submit(_run_single_unit_task, ...)``（見該函式文件），讓
+    ``ProcessPoolExecutor`` 內建的呼叫佇列自然達成「常駐子程序做完手上的
+    單元立刻拿下一個，佇列清空才沒有下一個可拿」的動態拉取語意——不需要
+    另外實作一套佇列協定（比較 ``dynamic_execution.py`` 的 subprocess
+    JSON-line 協定：本模組的排程單元本身已經是「一整個流場區域或其中一段」
+    這麼粗的粒度，用 ``ProcessPoolExecutor`` 的內建佇列已經足夠穩健，不需要
+    重新發明一套機制）。
+
+    提交順序依 ``unit_costs`` 由大到小排序（見下方 ``unit_costs`` 參數）：
+    讓成本最高的工作單元最早開始執行，是動態拉取佇列搭配「工作單元數量
+    多於 worker 數」時常見的負載平衡手法（避免最後才輪到一個超大工作單元、
+    此時其他 worker 已經閒置卻無事可做的情況；若工作單元數不多於 worker
+    數，提交順序本來就不影響總牆鐘時間）。
 
     參數
     ------
@@ -1563,12 +1983,51 @@ def run_native_plan(
         存放完成證據（``*.done.json``）、結果摘要（``*.result.json``）與進度快照
         （預設 ``progress.json``）的目錄；呼叫端負責先建立它，並確保它與其他 run
         的輸出目錄不共用（否則不同 run 的完成證據會互相干擾續跑判斷）。
+    unit_costs:
+        ``{unit_id: 估計成本}``（見 ``estimate_hour_major_segment_costs``）；
+        提供時依此由大到小排序提交順序，未提供或某個 ``unit_id`` 不在裡面時
+        退回該單元的 ``particle_count`` 當作成本代理（與 WP-7 舊版
+        ``plan_worker_schedule`` 相同的退化行為，只影響提交順序，不影響
+        排程結構本身）。
+    staged_ready_dir / staged_flow_domain_ids / staged_marker_suffix:
+        WP-13「依資料就緒動態加入」：``staged_ready_dir`` 提供時，本函式不會
+        一開始就把全部工作單元送進佇列，而是先只送出
+        ``flow_domain_id`` 已經就緒（``<staged_ready_dir>/<flow_domain_id>
+        {staged_marker_suffix}`` 存在）的工作單元；尚未就緒的區域，其工作
+        單元先保留在父程序記憶體內，主迴圈每一輪（每 ``poll_interval_seconds``
+        秒）重新檢查尚未就緒區域的完成標記，一旦某個區域就緒就立刻把它的
+        全部工作單元送進佇列（任何目前空閒的子程序都能立刻拿到，不需要
+        等其他區域也就緒）。``staged_flow_domain_ids`` 必須列出**全部**
+        預期會出現的 ``flow_domain_id``（即使某些現在已經就緒）：本函式用
+        它決定「全部區域都就緒了嗎」，藉此判斷何時可以正常結束；``pending``
+        內出現任何不在這個集合裡的 ``flow_domain_id`` 都會 fail-closed 拒絕
+        （防止呼叫端忘記列出某個區域，導致該區域的工作單元被誤判永遠等待
+        或永遠不會被視為「還在等」）。全部區域就緒且佇列清空、全部工作單元
+        都有結果之後才會結束；只要還有任何區域未就緒，即使目前佇列暫時是
+        空的（已就緒區域的單元都做完了），也會繼續等待、不會提前結束或讓
+        子程序判斷「沒事做了」而退出（子程序本身完全不知道 staged 這件事，
+        是父程序決定何時 submit，子程序只是持續存在、等待下一次
+        ``submit``）。
 
     續跑行為：本函式一律先呼叫 ``filter_pending_units`` 排除輸入雜湊完全相符的
     已完成單元，只把真正待執行的單元排入排程；就算所有單元都已完成（``units`` 全部
     命中既有完成證據），本函式仍會回傳一份 ``NativeRunSummary``（不會啟動任何
     worker 子程序），讓呼叫端可以安全地把「重跑一次確認完成度」與「第一次執行」
     寫成同一段程式碼路徑。
+
+    已知限制（誠實揭露）
+    --------------------
+    若某個子程序本身異常終止（作業系統層級的 kill、segfault，不是
+    ``run_unit`` 內部例外），``ProcessPoolExecutor`` 會把整個 pool 標記成
+    broken；本函式偵測到這個情況時，會把當時仍在佇列裡（已提交但尚未拿到
+    結果）與仍在等待資料就緒、尚未提交的工作單元**全部**記為失敗（不會嘗試
+    在同一個 pool 內重試或啟動替代子程序），並立即停止、回傳目前為止的
+    ``NativeRunSummary``——這與單一工作單元計算失敗（只隔離那一個單元）是
+    不同層級的失敗，因為 pool 一旦 broken，父程序已經無法確認其他子程序是
+    否還存活、是否已經寫出部分結果。呼叫端應該把這種情況視為「這次 run 需要
+    重跑」，重新呼叫 ``run_native_plan``（同一個 ``output_dir``）會透過
+    ``filter_pending_units`` 自動跳過已經正確完成的單元，只重算真正失敗或
+    未完成的部分。
     """
 
     if worker_count < 1:
@@ -1600,54 +2059,156 @@ def run_native_plan(
             elapsed_seconds=time.monotonic() - start_monotonic,
         )
 
-    schedule = plan_worker_schedule(pending, worker_count=worker_count)
-    unit_by_id = {u.unit_id: u for u in pending}
+    def _cost_of(unit: NativeWorkUnit) -> float:
+        if unit_costs is not None and unit.unit_id in unit_costs:
+            return float(unit_costs[unit.unit_id])
+        return float(unit.particle_count)
 
+    ordered_pending = sorted(pending, key=_cost_of, reverse=True)
+
+    staged_ready_path: Path | None = None
+    not_ready_domains: set[str] = set()
+    if staged_ready_dir is not None:
+        if not staged_flow_domain_ids:
+            raise NativeOrchestratorError("staged_ready_dir 提供時必須同時提供 staged_flow_domain_ids")
+        staged_ready_path = Path(staged_ready_dir)
+        expected_domains = set(staged_flow_domain_ids)
+        present_domains = {u.flow_domain_id for u in ordered_pending}
+        unexpected = present_domains - expected_domains
+        if unexpected:
+            raise NativeOrchestratorError(
+                f"pending 出現不在 staged_flow_domain_ids 內的流場區域：{sorted(unexpected)}"
+            )
+        not_ready_domains = {
+            domain
+            for domain in expected_domains
+            if not _domain_staged_marker_path(staged_ready_path, domain, staged_marker_suffix).is_file()
+        }
+
+    ready_now = [u for u in ordered_pending if u.flow_domain_id not in not_ready_domains]
+    held_back = [u for u in ordered_pending if u.flow_domain_id in not_ready_domains]
+
+    n_workers = min(worker_count, len(ordered_pending))
     ctx = _multiprocessing.get_context(mp_context_method)
-    manager = ctx.Manager()
-    progress_queue = manager.Queue()
-    try:
-        worker_reports: dict[int, WorkerRunReport] = {}
-        live_counts: dict[str, int] = {"completed": 0, "failed": 0}
-        live_elapsed: list[float] = []
-        with ProcessPoolExecutor(max_workers=len(schedule), mp_context=ctx) as pool:
-            futures = {}
-            for worker_index, unit_ids in schedule.items():
-                specs = tuple(unit_by_id[unit_id].to_spec() for unit_id in unit_ids)
-                future = pool.submit(
-                    _run_assigned_units,
-                    worker_index,
-                    specs,
-                    build_worker_resources=build_worker_resources,
-                    run_unit=run_unit,
-                    output_dir=str(output_path),
-                    numba_cache_dir=numba_cache_dir,
-                    progress_queue=progress_queue,
-                )
-                futures[future] = worker_index
 
-            pending_futures = set(futures)
-            while pending_futures:
-                _drain_progress_queue(progress_queue, live_counts, live_elapsed)
+    outcomes: dict[str, NativeUnitOutcome] = {}
+    live_counts: dict[str, int] = {"completed": 0, "failed": 0}
+    live_elapsed: list[float] = []
+    broken_pool_error: str | None = None
+
+    def _record_outcome(unit_id: str, outcome: NativeUnitOutcome) -> None:
+        outcomes[unit_id] = outcome
+        if outcome.status == "completed":
+            live_counts["completed"] = live_counts.get("completed", 0) + 1
+            live_elapsed.append(outcome.elapsed_seconds)
+        elif outcome.status == "failed":
+            live_counts["failed"] = live_counts.get("failed", 0) + 1
+
+    def _mark_unsubmitted_as_failed(remaining: Sequence[NativeWorkUnit], *, reason: str) -> None:
+        now_ns = time.time_ns()
+        for unit in remaining:
+            outcome = NativeUnitOutcome(
+                unit_id=unit.unit_id,
+                status="failed",
+                input_hash=unit.input_hash,
+                worker_id=-1,
+                elapsed_seconds=0.0,
+                particle_count=unit.particle_count,
+                completed_at_utc_ns=now_ns,
+                error=reason,
+            )
+            _persist_outcome(output_path, outcome, extra_summary=None)
+            _record_outcome(unit.unit_id, outcome)
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+        futures: dict[Any, str] = {}
+        for unit in ready_now:
+            future = pool.submit(
+                _run_single_unit_task,
+                unit.to_spec(),
+                build_worker_resources,
+                run_unit,
+                str(output_path),
+                numba_cache_dir,
+            )
+            futures[future] = unit.unit_id
+
+        while futures or held_back or not_ready_domains:
+            if staged_ready_path is not None and not_ready_domains:
+                newly_ready = {
+                    domain
+                    for domain in not_ready_domains
+                    if _domain_staged_marker_path(staged_ready_path, domain, staged_marker_suffix).is_file()
+                }
+                if newly_ready:
+                    not_ready_domains -= newly_ready
+                    still_held_back: list[NativeWorkUnit] = []
+                    for unit in held_back:
+                        if unit.flow_domain_id in newly_ready:
+                            future = pool.submit(
+                                _run_single_unit_task,
+                                unit.to_spec(),
+                                build_worker_resources,
+                                run_unit,
+                                str(output_path),
+                                numba_cache_dir,
+                            )
+                            futures[future] = unit.unit_id
+                        else:
+                            still_held_back.append(unit)
+                    held_back = still_held_back
+
+            if not futures:
+                # 佇列暫時空了，但還有區域未就緒（或還有工作單元在等待它們的
+                # 區域就緒）：子程序繼續存活、等待下一輪 submit，不視為完成。
                 _write_progress_snapshot(
-                    progress_path,
-                    total_units=len(units),
-                    skipped=skipped,
-                    live_counts=live_counts,
-                    live_elapsed_seconds=live_elapsed,
+                    progress_path, total_units=len(units), skipped=skipped,
+                    live_counts=live_counts, live_elapsed_seconds=live_elapsed,
                     started_at_utc_ns=started_at,
                 )
-                done_now = {future for future in pending_futures if future.done()}
-                for future in done_now:
-                    pending_futures.discard(future)
-                    worker_reports[futures[future]] = future.result()
-                if pending_futures:
+                if held_back or not_ready_domains:
                     time.sleep(poll_interval_seconds)
-            _drain_progress_queue(progress_queue, live_counts, live_elapsed)
-    finally:
-        manager.shutdown()
+                    continue
+                break
 
-    all_outcomes = [outcome for report in worker_reports.values() for outcome in report.outcomes]
+            done_now = [future for future in list(futures) if future.done()]
+            if not done_now:
+                _write_progress_snapshot(
+                    progress_path, total_units=len(units), skipped=skipped,
+                    live_counts=live_counts, live_elapsed_seconds=live_elapsed,
+                    started_at_utc_ns=started_at,
+                )
+                time.sleep(poll_interval_seconds)
+                continue
+
+            for future in done_now:
+                unit_id = futures.pop(future)
+                try:
+                    outcome = future.result()
+                except _BrokenProcessPool as exc:
+                    # 整個 pool 已經損壞（子程序被作業系統砍掉），父程序無法再
+                    # 信任其他仍在佇列裡的子程序狀態；見本函式文件「已知限制」。
+                    broken_pool_error = f"{type(exc).__name__}: {exc}"
+                    break
+                _record_outcome(unit_id, outcome)
+
+            if broken_pool_error is not None:
+                break
+
+            _write_progress_snapshot(
+                progress_path, total_units=len(units), skipped=skipped,
+                live_counts=live_counts, live_elapsed_seconds=live_elapsed,
+                started_at_utc_ns=started_at,
+            )
+
+        if broken_pool_error is not None:
+            unresolved_unit_ids = set(futures.values()) | {u.unit_id for u in held_back}
+            unresolved_units = [u for u in ordered_pending if u.unit_id in unresolved_unit_ids]
+            _mark_unsubmitted_as_failed(
+                unresolved_units, reason=f"worker_process_pool_broken: {broken_pool_error}"
+            )
+
+    all_outcomes = list(outcomes.values())
     completed = sum(1 for outcome in all_outcomes if outcome.status == "completed")
     failed_outcomes = [outcome for outcome in all_outcomes if outcome.status == "failed"]
     _write_progress_snapshot(
@@ -1661,34 +2222,23 @@ def run_native_plan(
         started_at_utc_ns=started_at,
     )
 
+    by_worker: dict[int, list[NativeUnitOutcome]] = {}
+    for outcome in all_outcomes:
+        by_worker.setdefault(outcome.worker_id, []).append(outcome)
+    worker_reports = tuple(
+        WorkerRunReport(worker_id=worker_id, outcomes=tuple(worker_outcomes))
+        for worker_id, worker_outcomes in sorted(by_worker.items())
+    )
+
     return NativeRunSummary(
         total_units=len(units),
         completed_unit_count=completed,
         failed_unit_count=len(failed_outcomes),
         skipped_unit_count=len(skipped),
         failed_unit_ids=tuple(sorted(outcome.unit_id for outcome in failed_outcomes)),
-        worker_reports=tuple(worker_reports[index] for index in sorted(worker_reports)),
+        worker_reports=worker_reports,
         elapsed_seconds=time.monotonic() - start_monotonic,
     )
-
-
-def _drain_progress_queue(
-    progress_queue: Any, live_counts: dict[str, int], live_elapsed: list[float]
-) -> None:
-    """非阻塞地清空目前累積的進度訊息，更新父程序端的即時統計。"""
-
-    while True:
-        try:
-            message = progress_queue.get_nowait()
-        except queue.Empty:
-            return
-        except (OSError, EOFError):  # pragma: no cover - manager 已關閉時的防禦性處理
-            return
-        status = message.get("status")
-        if status in ("completed", "failed"):
-            live_counts[status] = live_counts.get(status, 0) + 1
-            if status == "completed" and "elapsed_seconds" in message:
-                live_elapsed.append(float(message["elapsed_seconds"]))
 
 
 # ══════════════════════════════════════════════════════════════════════════

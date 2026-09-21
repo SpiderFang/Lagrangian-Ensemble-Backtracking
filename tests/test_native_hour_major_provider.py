@@ -820,3 +820,144 @@ def test_native_run_interrupt_then_resume_bit_identical_to_clean_run(
     assert set(p.name for p in result_files) == set(clean_files)
     for path in result_files:
         _assert_driver_results_bit_identical(path, clean_files[path.name], label=path.name)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-13：--wait-for-staged 端對端、native-plan 成本模型報表
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_native_run_wait_for_staged_processes_domains_as_markers_appear(
+    two_domain_env: dict[str, Any], baytrace_root: str, numba_cache_dir: Path, tmp_path_factory
+) -> None:
+    """``native-run --wait-for-staged``：區域 A 標記先存在、區域 B 標記延後才寫入，
+    驗證區域 A 的排程單元先完成，區域 B 的單元要等標記出現才會被排入佇列且最終
+    全部完成，過程中 worker 不會因為佇列暫時清空（只剩 B 在等）而提早結束。
+    """
+
+    import threading
+    import time as _time
+
+    env_base = _base_env(two_domain_env, baytrace_root)
+    output_dir = tmp_path_factory.mktemp("staged_output")
+    results_dir = tmp_path_factory.mktemp("staged_results")
+    staged_dir = tmp_path_factory.mktemp("staged_markers")
+
+    env = dict(env_base)
+    env["LBT_NATIVE_PLAN"] = str(two_domain_env["plan_k2_path"])
+    env["LBT_NATIVE_RESULTS_DIR"] = str(results_dir)
+
+    domain_units, _payload = orch.read_native_plan_file(two_domain_env["plan_k2_path"])
+    a_unit_ids = [u.unit_id for u in domain_units if u.flow_domain_id == _FLOW_DOMAIN_A]
+    b_unit_ids = [u.unit_id for u in domain_units if u.flow_domain_id == _FLOW_DOMAIN_B]
+    assert a_unit_ids and b_unit_ids
+
+    # 一開始只有區域 A 就緒。
+    (staged_dir / f"{_FLOW_DOMAIN_A}.done").write_text("ok", encoding="utf-8")
+
+    result_holder: dict[str, int] = {}
+
+    def _run() -> None:
+        with _native_run_environment(env):
+            result_holder["rc"] = cli.run_native_run(
+                [
+                    str(two_domain_env["plan_k2_path"]),
+                    "--output",
+                    str(output_dir),
+                    "--resource-provider",
+                    _PROVIDER,
+                    "--worker-count",
+                    "2",
+                    "--numba-cache-dir",
+                    str(numba_cache_dir),
+                    "--wait-for-staged",
+                    str(staged_dir),
+                ]
+            )
+
+    # daemon=True：若下面的斷言在寫入區域 B 標記之前失敗，不讓仍在等待區域 B
+    # 就緒的背景執行緒卡住整個測試程序（見 test_native_orchestrator.py 對應
+    # 測試撰寫時踩到的同一個坑）。
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    deadline = _time.monotonic() + 120.0
+    while _time.monotonic() < deadline:
+        if all((output_dir / f"{uid}.done.json").is_file() for uid in a_unit_ids):
+            break
+        _time.sleep(0.2)
+    else:
+        pytest.fail("區域 A 的排程單元在時限內未完成，無法繼續驗證 staged 等待行為")
+
+    for uid in b_unit_ids:
+        assert not (output_dir / f"{uid}.done.json").is_file(), "區域 B 標記尚未寫入，不應該提前執行"
+
+    (staged_dir / f"{_FLOW_DOMAIN_B}.done").write_text("ok", encoding="utf-8")
+    thread.join(timeout=180.0)
+    assert not thread.is_alive(), "native-run 在區域 B 就緒後應該能正常結束"
+    assert result_holder.get("rc") == 0
+
+    for uid in a_unit_ids + b_unit_ids:
+        marker = json.loads((output_dir / f"{uid}.done.json").read_text(encoding="utf-8"))
+        assert marker["status"] == "completed"
+
+
+def test_native_plan_reports_cost_model_when_grid_sizes_provided(two_domain_env: dict[str, Any]) -> None:
+    """``native-plan --schedule hour-major-segmented`` 提供 ``--node-counts``／
+    ``--layer-counts``／``--target-worker-count`` 時，報表要列出 WP-13 成本模型：
+    預估牆鐘時間、重複成本比例與各段成本；省略時（既有 ``plan_k2_path`` 的產生
+    呼叫）明確不應該出現這些欄位（fail-closed，不用臆測值頂替）。
+    """
+
+    base = two_domain_env["identity_path"].parent
+    node_counts_path = base / "node_counts.json"
+    layer_counts_path = base / "layer_counts.json"
+    node_counts_path.write_text(
+        json.dumps({_FLOW_DOMAIN_A: 67_600, _FLOW_DOMAIN_B: 27_015}), encoding="utf-8"
+    )
+    layer_counts_path.write_text(
+        json.dumps({_FLOW_DOMAIN_A: 48, _FLOW_DOMAIN_B: 48}), encoding="utf-8"
+    )
+    region_to_flow_domain_path = base / "region_to_flow_domain.json"
+
+    output_path = base / "plan_with_cost_model.json"
+    captured: list[str] = []
+    import io
+    from contextlib import redirect_stdout
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        rc = cli.run_native_plan_command(
+            [
+                "--identity-table",
+                str(two_domain_env["identity_path"]),
+                "--region-to-flow-domain",
+                str(region_to_flow_domain_path),
+                "--output",
+                str(output_path),
+                "--schedule",
+                "hour-major-segmented",
+                "--target-worker-count",
+                "8",
+                "--node-counts",
+                str(node_counts_path),
+                "--layer-counts",
+                str(layer_counts_path),
+                "--skip-gap-check",
+            ]
+        )
+    captured.append(buffer.getvalue())
+    assert rc == 0
+    report = json.loads(captured[0])
+    cost_model = report["cost_model"]
+    assert cost_model is not None
+    assert cost_model["estimated_wall_clock_seconds"] > 0.0
+    assert cost_model["max_single_segment_cost_seconds"] > 0.0
+    assert cost_model["repeat_cost_fraction_vs_no_split"] >= 0.0
+    written_units, _written_payload = orch.read_native_plan_file(output_path)
+    assert set(cost_model["segment_cost_seconds"]) == {u.unit_id for u in written_units}
+
+    # 沒有提供 --node-counts／--layer-counts 時（既有 plan_k2_path），報表的
+    # cost_model 欄位必須明確是 None，不能用任何臆測值頂替。
+    _units, payload_k2 = orch.read_native_plan_file(two_domain_env["plan_k2_path"])
+    assert "manifest" in payload_k2

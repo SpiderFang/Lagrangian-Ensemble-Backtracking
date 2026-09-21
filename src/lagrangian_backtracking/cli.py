@@ -885,8 +885,49 @@ def _native_plan_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "只在 --schedule hour-major-segmented 且未提供 --segments 時使用："
-            "自動切段的目標平行度（通常填伺服器可用核心數），見"
-            " native_runner.orchestrator.recommend_hour_major_segment_counts"
+            "自動切段的目標平行度（通常填伺服器可用核心數）。同時提供"
+            " --node-counts／--layer-counts 時，改用 WP-13 正確成本模型"
+            "（native_runner.orchestrator.recommend_hour_major_segment_counts_by_workload，"
+            "依「流場小時數×節點數×層數」而非粒子數選段數）；否則退回舊版"
+            " recommend_hour_major_segment_counts（純粒子數啟發式）"
+        ),
+    )
+    parser.add_argument(
+        "--node-counts",
+        type=Path,
+        default=None,
+        help=(
+            "WP-13：JSON 檔 {flow_domain_id: 節點數}；與 --layer-counts 一起提供時"
+            "才會啟用正確成本模型（自動選段數＋報表列出的預估牆鐘時間／重複成本"
+            "比例／各段成本）。缺少任一區域的節點數會在該區域需要成本模型時"
+            "fail-closed 報錯，不會用臆測值頂替"
+        ),
+    )
+    parser.add_argument(
+        "--layer-counts",
+        type=Path,
+        default=None,
+        help="WP-13：JSON 檔 {flow_domain_id: 垂向層數}；見 --node-counts",
+    )
+    parser.add_argument(
+        "--seconds-per-node-layer-hour",
+        type=float,
+        default=None,
+        help=(
+            "WP-13 成本模型的校準常數（見"
+            " native_runner.orchestrator._DEFAULT_SECONDS_PER_NODE_LAYER_HOUR"
+            " 文件的量測依據與誠實揭露）；省略時使用該模組內建的預設值，"
+            "正式伺服器應該重新量測後覆寫"
+        ),
+    )
+    parser.add_argument(
+        "--worker-count-for-estimate",
+        type=int,
+        default=None,
+        help=(
+            "WP-13：只用於 native-plan 報表估算「總牆鐘時間」"
+            "（native_runner.orchestrator.estimate_total_wall_clock_seconds），"
+            "不影響實際切段；省略時退回 --target-worker-count"
         ),
     )
     return parser
@@ -944,6 +985,19 @@ def _native_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--formal", action="store_true")
     parser.add_argument("--config-sha256", default="not_provided")
     parser.add_argument("--mp-context", default="spawn", choices=("spawn", "forkserver", "fork"))
+    parser.add_argument(
+        "--wait-for-staged",
+        type=Path,
+        default=None,
+        help=(
+            "WP-13：依資料就緒動態加入。提供一個目錄，本命令啟動後監看"
+            " <目錄>/<flow_domain_id>.done 完成標記；已就緒的流場區域立即開跑，"
+            "尚未就緒的區域的工作單元先保留、worker 不因此閒置或退出，一偵測到"
+            "標記就立刻把該區域排入佇列。全部區域都出現在計畫檔裡的"
+            " flow_domain_id 集合就緒、且佇列清空後才正常結束。省略時（預設）"
+            "一律視為全部區域已就緒，行為與 WP-13 之前完全相同"
+        ),
+    )
     return parser
 
 
@@ -1008,6 +1062,22 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
     # safety`` 需要每個工作單元自己的 arrival_time_utc_ns，摺疊後的小時主軸排程
     # 單元用 sentinel 值填那個欄位，不能拿來做這個檢查。只有真正寫進計畫檔的
     # ``units``（供 native-run 排程執行）才依 --schedule 決定要不要摺疊／切段。
+    node_counts: dict[str, int] | None = None
+    layer_counts: dict[str, int] | None = None
+    if args.node_counts is not None:
+        node_counts = {
+            str(k): int(v) for k, v in json.loads(args.node_counts.read_text(encoding="utf-8")).items()
+        }
+    if args.layer_counts is not None:
+        layer_counts = {
+            str(k): int(v) for k, v in json.loads(args.layer_counts.read_text(encoding="utf-8")).items()
+        }
+    seconds_per_node_layer_hour = (
+        args.seconds_per_node_layer_hour
+        if args.seconds_per_node_layer_hour is not None
+        else native_orchestrator._DEFAULT_SECONDS_PER_NODE_LAYER_HOUR
+    )
+
     hour_major_members: Mapping[str, tuple[native_orchestrator.NativeWorkUnit, ...]] | None = None
     plan_units = units
     segment_reports: tuple[native_orchestrator.HourMajorSegmentPlanReport, ...] = ()
@@ -1026,7 +1096,60 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
             segment_count=segment_count,
             target_worker_count=args.target_worker_count,
             max_backtrack_seconds=max_backtrack_seconds,
+            node_counts=node_counts,
+            layer_counts=layer_counts,
+            seconds_per_node_layer_hour=seconds_per_node_layer_hour,
         )
+
+    # WP-13：只有在呼叫端提供了 --node-counts／--layer-counts（成本模型的
+    # 主要因子）時，才計算並列出各段成本、預估牆鐘時間與重複成本比例；
+    # 缺少網格規模時不臆測，報表明確省略這幾個欄位，不會用誤導性的數字
+    # 頂替（見 estimate_hour_major_segment_costs 對這個 fail-closed 策略的
+    # 說明）。
+    cost_model_report: dict[str, Any] | None = None
+    if args.schedule == "hour-major-segmented" and node_counts is not None and layer_counts is not None:
+        segment_costs = native_orchestrator.estimate_hour_major_segment_costs(
+            segment_reports,
+            plan_units,
+            node_counts=node_counts,
+            layer_counts=layer_counts,
+            seconds_per_node_layer_hour=seconds_per_node_layer_hour,
+        )
+        estimate_worker_count = args.worker_count_for_estimate or args.target_worker_count
+        if estimate_worker_count is not None and segment_costs:
+            wall_clock_seconds, max_unit_cost_seconds = native_orchestrator.estimate_total_wall_clock_seconds(
+                segment_costs, worker_count=estimate_worker_count
+            )
+            no_split_costs = {
+                domain: native_orchestrator.estimate_hour_major_unit_cost_seconds(
+                    hours_to_synthesize=int(
+                        round(report.arrival_span_days * 24.0 + report.max_backtrack_days * 24.0) + 1
+                    ),
+                    node_count=node_counts[report.flow_domain_id],
+                    layer_count=layer_counts[report.flow_domain_id],
+                    particle_count=0,
+                    seconds_per_node_layer_hour=seconds_per_node_layer_hour,
+                )
+                for domain, report in {r.flow_domain_id: r for r in segment_reports}.items()
+            }
+            total_no_split_cost = sum(no_split_costs.values()) or 1.0
+            total_cost = sum(segment_costs.values())
+            repeat_cost_fraction = (total_cost - total_no_split_cost) / total_no_split_cost
+            cost_model_report = {
+                "seconds_per_node_layer_hour": seconds_per_node_layer_hour,
+                "worker_count_for_estimate": estimate_worker_count,
+                "estimated_wall_clock_seconds": wall_clock_seconds,
+                "max_single_segment_cost_seconds": max_unit_cost_seconds,
+                "total_cost_seconds": total_cost,
+                "repeat_cost_fraction_vs_no_split": repeat_cost_fraction,
+                "segment_cost_seconds": segment_costs,
+            }
+
+    if cost_model_report is not None:
+        # 把成本模型算出的各段成本一併存進 manifest，native-run 讀回計畫檔時
+        # 可以直接拿來當 run_native_plan 的 unit_costs（依成本由大到小提交，
+        # 不需要 native-run 重新知道節點數／層數才能排序），見 run_native_run。
+        manifest["extra"]["unit_costs"] = cost_model_report["segment_cost_seconds"]
 
     native_orchestrator.write_native_plan_file(
         args.output,
@@ -1051,6 +1174,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         "unsafe_arrival_count": len(unsafe),
         "unsafe_arrivals": [dataclasses.asdict(check) for check in unsafe],
         "segment_plan": [dataclasses.asdict(item) for item in segment_reports],
+        "cost_model": cost_model_report,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if report["is_gap_safe_ready"] else 2
@@ -1116,6 +1240,16 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
     )
 
+    raw_unit_costs = payload.get("manifest", {}).get("extra", {}).get("unit_costs")
+    unit_costs: Mapping[str, float] | None = None
+    if isinstance(raw_unit_costs, Mapping):
+        unit_costs = {str(k): float(v) for k, v in raw_unit_costs.items()}
+
+    staged_kwargs: dict[str, Any] = {}
+    if args.wait_for_staged is not None:
+        staged_kwargs["staged_ready_dir"] = args.wait_for_staged
+        staged_kwargs["staged_flow_domain_ids"] = sorted({u.flow_domain_id for u in units})
+
     summary = native_orchestrator.run_native_plan(
         units,
         worker_count=worker_count,
@@ -1124,6 +1258,8 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output,
         numba_cache_dir=str(args.numba_cache_dir) if args.numba_cache_dir else None,
         mp_context_method=args.mp_context,
+        unit_costs=unit_costs,
+        **staged_kwargs,
     )
     report = dataclasses.asdict(summary)
     report["worker_count"] = worker_count

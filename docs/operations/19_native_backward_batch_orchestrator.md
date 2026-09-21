@@ -521,3 +521,130 @@ server.sh {preflight|gap-fill|plan|run|status|postprocess|all}` 把它們包成�
 （4 區域、每站 50 個到達時刻、10 沉降速度、20 受體、`M=1`／`M=10`）與
 `estimate_segment_extra_cost_fraction` 的重疊成本模型，外推 56 核心下的總牆鐘時間與建議
 `K`。
+
+## 9.10 WP-13：動態拉取佇列、正確成本模型與資料就緒串接
+
+完整設計理由、量測數字與誠實揭露的限制見 `reports/WP-13.md`；本節只記錄操作介面。
+
+### 9.10.1 動態拉取佇列（取代 9.9 之前的靜態 LPT 指派）
+
+`run_native_plan` 不再用 `plan_worker_schedule`（LPT bin-packing）把整串工作單元一次性
+靜態指派給固定 worker——舊版的問題是「某個 worker 分到的整串單元做完就沒事做、即使其他
+worker 還有一大串沒做完，也不能互相支援」，在「1 個很貴的區段＋多個很便宜的區段」這種
+尾端負載不均的組合下，會讓總牆鐘時間被那個最慢的 worker 卡住。WP-13 改成對**每一個**
+待執行單元各自呼叫一次 `pool.submit(_run_single_unit_task, ...)`：`ProcessPoolExecutor`
+內建的呼叫佇列本來就是「任何一個常駐子程序處理完手上的任務，立刻去佇列拿下一個」的行為，
+不需要另外實作佇列協定；每個 worker 只在第一次真正拿到任務時呼叫一次
+`build_worker_resources`，之後所有指派給它的單元共用同一份快取資源，與舊版的資源重用
+行為相同。`plan_worker_schedule` 本身仍保留在原始碼裡（供既有呼叫端相容），但
+`run_native_plan` 不再呼叫它。
+
+### 9.10.2 正確成本模型（取代粒子數代理）
+
+舊版排程用「工作單元底下的粒子數」當成本代理，這對小時主軸排程是**系統性錯誤**的：小時
+主軸單元真正的成本主要來自「要合成幾個流場小時的底場（乾濕＋Stokes＋Smagorinsky）」，
+這由該單元涵蓋的到達時刻跨度＋回溯窗決定，跟粒子數幾乎無關（`apply_settling_velocity`
+＋粒子移動 kernel 每粒子每小時的成本遠小於底場合成成本，見 `reports/WP-13.md` 的分解
+量測）。`orchestrator.estimate_hour_major_unit_cost_seconds` 用
+
+```
+成本（秒）≈ 要合成的流場小時數 × 節點數 × 層數 × seconds_per_node_layer_hour
+           + 粒子數 × 平均每小時子步數 × seconds_per_particle_substep
+```
+
+估算單一排程單元的成本，第一項在正式規模下幾乎主導總成本（第二項的校準常數刻意保留但
+在目前量測到的規模下貢獻可忽略，見該函式 docstring）。`seconds_per_node_layer_hour`
+預設值 `7.0e-6`（`orchestrator._DEFAULT_SECONDS_PER_NODE_LAYER_HOUR`）是在本次開發用的
+沙箱環境（2 核心）以 29,929／67,600 節點×48 層合成網格量測、確認線性模型在 2.3 倍網格
+規模差距下誤差在 0.3% 以內後校準出來的；**這不是正式 56 核心伺服器的量測值**，正式
+部署前應該用 `--seconds-per-node-layer-hour` 覆寫成伺服器上實測的常數（方法：跑一次
+`hour_major.run_flow_domain_hour_major`，記錄 `HourlyOverheadDiagnostics.
+time_compose_base_s` 除以節點數×層數×小時數）。
+
+`orchestrator.plan_native_hour_major_segments`（透過 `lbt native-plan --schedule
+hour-major-segmented`）新增 `--node-counts`／`--layer-counts`（各自一個 JSON 檔
+`{flow_domain_id: 數量}`）：**兩者都提供時**才啟用這個成本模型（`recommend_hour_major_
+segment_counts_by_workload`）自動選段數，否則 fail-closed 退回舊版純粒子數啟發式
+（`recommend_hour_major_segment_counts`），不會用臆測的網格規模頂替。`--target-worker-
+count` 在兩種模式下都用來當自動選段數的目標平行度上限。
+
+### 9.10.3 自動選段數與 `native-plan` 報表新增欄位
+
+`choose_hour_major_segment_count` 對每個流場區域，在 `1..distinct_arrival_count` 之間
+搜尋讓下式最小的段數 `K`：
+
+```
+total_wall_clock_seconds(K) ≈ max(total_cost_seconds(K) / min(K, target_worker_count),
+                                    max_segment_cost_seconds(K))
+```
+
+（`total_cost_seconds(K)` 隨 `K` 增加而增加，因為段與段之間的回溯窗重疊會被重複合成；
+`max_segment_cost_seconds(K)` 隨 `K` 增加而下降；两者的極大值在中間某個 `K` 取最小。）
+`--node-counts`／`--layer-counts`／`--worker-count-for-estimate`（省略時退回
+`--target-worker-count`）都提供時，`native-plan` 的 JSON 報表會多出一個 `cost_model`
+物件：
+
+```json
+{
+  "cost_model": {
+    "seconds_per_node_layer_hour": 7e-06,
+    "worker_count_for_estimate": 56,
+    "estimated_wall_clock_seconds": 1234.5,
+    "max_single_segment_cost_seconds": 210.0,
+    "total_cost_seconds": 9876.5,
+    "repeat_cost_fraction_vs_no_split": 0.18,
+    "segment_cost_seconds": {"northeast_taiwan_common_cache_v3::seg0of8__": 180.2, "...": "..."}
+  }
+}
+```
+
+`repeat_cost_fraction_vs_no_split` 是「切段後的總成本」相對「完全不切段（K=1）的總成本」
+多出的比例，用來判斷切段的重疊代價是否划算。`native-plan` 同時把 `segment_cost_seconds`
+寫進計畫檔 `manifest.extra.unit_costs`；`native-run` 讀回計畫檔時會自動取用這份成本表
+（見下一節），呼叫端不需要在 `native-run` 階段重新提供節點／層數。仍然可以用
+`--segments`（單一整數或逐區域 JSON）手動覆寫段數，跳過自動選段。
+
+### 9.10.4 `native-run --wait-for-staged`：資料就緒後才把整區工作加入佇列
+
+伺服器的原始資料是逐流場區域分批到位的（工作書記載的到站順序：連江 → 後灣 → 新竹 →
+東北，見 `reports/WP-13.md`），舊版必須等**全部**區域的資料都就緒才能啟動
+`native-run`，即使先到的區域其實已經可以開始算。`lbt native-run --wait-for-staged
+<目錄>` 讓 `run_native_plan` 用「哪些流場區域已經出現在計畫檔的 `units` 裡」自動算出
+需要等待的 `flow_domain_id` 集合，在 `<目錄>/<flow_domain_id>.done` 標記檔出現前，
+該區域的工作單元先保留在「尚未就緒」清單裡、**不**提交進 `ProcessPoolExecutor`
+的佇列；已就緒區域的單元立刻正常提交。主迴圈在「還有進行中的 future、或還有保留住的
+單元、或還有尚未就緒的區域」任一條件成立時都不會結束，因此空閒 worker 在資料還沒到齊
+時只是繼續等待，不會誤判「佇列暫時空了」就提前結束或跑出不完整的結果；標記檔出現後，
+下一輪輪詢立刻把該區域的單元補進佇列。全部區域都就緒、且佇列清空後才正常結束、寫出
+最終的 `NativeRunSummary`。省略這個參數時（預設）行為與 WP-13 之前完全相同（視為全部
+區域已就緒）。
+
+驗收：`tests/test_native_orchestrator.py::
+test_run_native_plan_waits_for_staged_domains_before_finishing`（背景執行緒＋輪詢，模擬
+標記檔延遲出現，確認先就緒區域的單元先完成、後就緒區域的單元直到標記出現才被提交）、
+`tests/test_native_hour_major_provider.py::
+test_native_run_wait_for_staged_processes_domains_as_markers_appear`（同一件事透過真正
+的 CLI 端對端驗證）。
+
+### 9.10.5 小時內平行化（任務 2）：已驗證位元相同，但刻意未接線到 `native-run`
+
+`backward_driver.compose_current_and_stokes_fields`／`hour_major.run_flow_domain_hour_
+major` 都新增了 `stokes_pool`／`stokes_worker_count` 參數：史托克斯漂移（Stokes drift）
+逐點求解彼此獨立、沒有跨節點化簡，因此可以切塊分派到呼叫端自備的
+`concurrent.futures.ProcessPoolExecutor` 平行計算；已用**不巢狀**在任何其他行程池 worker
+之內的直接呼叫，驗證輸出與逐點單一行程執行位元相同（`tests/test_native_hour_major.py::
+test_hour_major_stokes_pool_matches_sequential_bit_identical`）。
+
+**誠實記錄未完成的部分**：原本規劃是讓 `native_runner/hour_major_provider.py`（`native-
+run --resource-provider` 的正式接線）依環境變數在每個 worker 子程序內自動建立這個子行程
+池，這樣才能真正利用「排程單元數少於核心數」時的閒置核心。但 `native-run` 的每個 worker
+子程序本身已經是 `orchestrator.run_native_plan` 用 `ProcessPoolExecutor`（spawn）開出來
+的子程序；實測在「子程序裡面再建一個 `ProcessPoolExecutor`」（巢狀行程池）的組態下，
+即使兩層都明確指定 `spawn` context，仍然會不穩定地重現兩種失敗模式：整個 worker 卡死
+（CPU 時間數分鐘內不再增加，符合死結特徵）、或孫行程在 bootstrap 階段丟出
+`FileNotFoundError`（號誌檔案 rebuild 失敗，屬於競態，不是每次都會發生）。受限於本工作
+包的時間範圍未能查明根本原因，因此**沒有**把這個旋鈕接上正式 `native-run` 管線——正式
+管線的可靠性優先於這項優化的效能收益。詳細重現腳本、程序樹觀察與分析見
+`reports/WP-13.md`「任務 2」一節；`stokes_pool` 參數本身保留在
+`backward_driver.py`／`hour_major.py`，供未來有更安全的方式建立/取得子行程池（例如頂層
+建立、不巢狀在 worker 之內）時直接使用，不需要重新設計介面。
