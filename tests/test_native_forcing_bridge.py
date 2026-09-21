@@ -273,7 +273,9 @@ def test_inventory_forcing_gaps_clean_period_is_run_ready(tmp_path: Path) -> Non
     assert report.observed_hour_count == 5
 
 
-def _minimal_patch_for_gap(month_id: str, missing_hour: int, node_count: int, layer_count: int, face_count: int) -> OCMReconstructionPatchMonth:
+def _minimal_patch_for_gap(
+    month_id: str, missing_hour: int, node_count: int, layer_count: int, face_count: int
+) -> OCMReconstructionPatchMonth:
     """建立一個只覆蓋單一缺失小時的最小合法重建 patch，供「已登錄缺口」測試使用。"""
 
     time_utc_ns = np.asarray([_t(missing_hour)], dtype=np.int64)

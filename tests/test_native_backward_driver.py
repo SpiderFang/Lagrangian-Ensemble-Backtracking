@@ -36,8 +36,8 @@ import pytest
 from shapely.geometry import Polygon
 
 from lagrangian_backtracking.mesh import NativeMesh
-from lagrangian_backtracking.native_runner import build_native_grid_arrays
 from lagrangian_backtracking.native_runner import backward_driver as bd
+from lagrangian_backtracking.native_runner import build_native_grid_arrays
 from lagrangian_backtracking.native_runner.forcing_bridge import HourlyFieldPair
 from lagrangian_backtracking.native_runner.stokes_batch import finite_depth_stokes_reference
 
@@ -198,7 +198,7 @@ def _make_particles(handles: bd.BayTraceModuleHandles, n: int):
     return handles.particle_arrays_cls(n)
 
 
-def _copy_particle_arrays(handles: bd.BayTraceModuleHandles, src) -> "object":
+def _copy_particle_arrays(handles: bd.BayTraceModuleHandles, src) -> object:
     dst = handles.particle_arrays_cls(src.n)
     for name in (*src._FLOAT_FIELDS, *src._INT64_FIELDS, *src._INT_FIELDS):
         getattr(dst, name)[:] = getattr(src, name)
@@ -318,7 +318,9 @@ def test_mirror_matches_direct_kernel_calls_bit_identical(driver_grid, handles) 
     ndeltp = bd.estimate_substep_count(driver_grid, composed.u_field1, composed.v_field1, dt_seconds=3600.0)
     dtb = 3600.0 / ndeltp
 
-    _direct_kernel_substep_loop(driver_grid, handles, pa_reference, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed)
+    _direct_kernel_substep_loop(
+        driver_grid, handles, pa_reference, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed
+    )
     bd.mirror_rk4_substep_loop(
         driver_grid, handles, pa_mirror,
         ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed, enable_diffusion=False,
@@ -434,7 +436,9 @@ def test_mirror_matches_real_tracker_batch_update_particles_both_directions(driv
 
     for ibf in (1, -1):
         field_pair = _uniform_field_pair(driver_grid, u1=0.06, v1=-0.04, ibf=ibf, trat=0.0)
-        composed = bd.compose_total_velocity_fields(driver_grid, handles, field_pair, settling_velocity_mps=0.0)
+        composed = bd.compose_total_velocity_fields(
+            driver_grid, handles, field_pair, settling_velocity_mps=0.0,
+        )
 
         n = 6
         x = np.array([700.0 + 15.0 * k for k in range(n)])
@@ -445,7 +449,9 @@ def test_mirror_matches_real_tracker_batch_update_particles_both_directions(driv
         _place_and_locate(driver_grid, handles, pa_reference, x=x, y=y, z=z, field_pair=field_pair)
         pa_mirror = _copy_particle_arrays(handles, pa_reference)
 
-        ndeltp = bd.estimate_substep_count(driver_grid, composed.u_field1, composed.v_field1, dt_seconds=3600.0)
+        ndeltp = bd.estimate_substep_count(
+            driver_grid, composed.u_field1, composed.v_field1, dt_seconds=3600.0,
+        )
         dtb = 3600.0 / ndeltp
         assert dtb == pytest.approx(3600.0 / ndeltp)  # 供下方注意事項對照，非實質斷言
 
@@ -633,7 +639,9 @@ def test_composed_velocity_all_four_rk4_stages_vs_wrong_k1_only_addition(driver_
     pa_correct.v[:] = v_curr + stokes_v
     pa_correct.w[:] = settling
 
-    ndeltp = bd.estimate_substep_count(driver_grid, composed_correct.u_field1, composed_correct.v_field1, dt_seconds=3600.0)
+    ndeltp = bd.estimate_substep_count(
+        driver_grid, composed_correct.u_field1, composed_correct.v_field1, dt_seconds=3600.0,
+    )
     dtb = 3600.0 / ndeltp
     bd.mirror_rk4_substep_loop(
         driver_grid, handles, pa_correct,
@@ -670,7 +678,7 @@ def test_composed_velocity_all_four_rk4_stages_vs_wrong_k1_only_addition(driver_
     # 錯誤做法應該非常接近「完全沒有附加速度」的純海流位移（略多一點點，
     # 來自第一個子步 k1 那 1/6 權重），藉此佐證額外速度幾乎全部遺失。
     pure_current_x = x0 + u_curr * dt_total
-    pure_current_y = y0 + v_curr * dt_total
+    y0 + v_curr * dt_total
     assert np.max(np.abs(pa_wrong.x - pure_current_x)) < np.max(np.abs(expected_x - pure_current_x)) * 0.5
 
 
@@ -722,11 +730,16 @@ def test_reverse_time_direction_retraces_forward_trajectory(driver_grid, handles
     for hi in (t0 + _HOUR_NS, t0 + 2 * _HOUR_NS):
         lo = hi - _HOUR_NS
         field = field_between(ibf=1, hi=hi, lo=lo)
-        composed = bd.compose_total_velocity_fields(driver_grid, handles, field, settling_velocity_mps=0.0)
-        ndeltp = bd.estimate_substep_count(driver_grid, composed.u_field1, composed.v_field1, dt_seconds=3600.0)
+        composed = bd.compose_total_velocity_fields(
+            driver_grid, handles, field, settling_velocity_mps=0.0,
+        )
+        ndeltp = bd.estimate_substep_count(
+            driver_grid, composed.u_field1, composed.v_field1, dt_seconds=3600.0,
+        )
         dtb = 3600.0 / ndeltp
         bd.mirror_rk4_substep_loop(
-            driver_grid, handles, pa_fwd, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed, enable_diffusion=False,
+            driver_grid, handles, pa_fwd, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed,
+            enable_diffusion=False,
         )
 
     forward_end_x = float(pa_fwd.x[0])
@@ -844,12 +857,14 @@ def test_diffusion_disabled_is_bit_identical_to_no_diffusion_path(driver_grid, h
     dtb = 3600.0 / ndeltp
 
     bd.mirror_rk4_substep_loop(
-        driver_grid, handles, pa_no_diff, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed, enable_diffusion=False,
+        driver_grid, handles, pa_no_diff, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed,
+        enable_diffusion=False,
     )
     n_nodes = _n_nodes(driver_grid)
-    hf_field = np.full((_NVRT, n_nodes), 1.0, dtype=np.float64)
+    np.full((_NVRT, n_nodes), 1.0, dtype=np.float64)
     bd.mirror_rk4_substep_loop(
-        driver_grid, handles, pa_disabled, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed, enable_diffusion=False,
+        driver_grid, handles, pa_disabled, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed,
+        enable_diffusion=False,
     )
     assert np.array_equal(pa_no_diff.x, pa_disabled.x)
     assert np.array_equal(pa_no_diff.y, pa_disabled.y)
@@ -867,7 +882,10 @@ def test_stopping_conditions_and_status_codes_are_distinct(driver_grid, handles)
     def resolver(target_utc_ns: int) -> HourlyFieldPair:
         hi = target_utc_ns
         lo = target_utc_ns - _HOUR_NS
-        return _uniform_field_pair(driver_grid, u1=u_curr, v1=v_curr, ibf=-1, trat=0.0, time_before_utc_ns=hi, time_after_utc_ns=lo)
+        return _uniform_field_pair(
+            driver_grid, u1=u_curr, v1=v_curr, ibf=-1, trat=0.0,
+            time_before_utc_ns=hi, time_after_utc_ns=lo,
+        )
 
     # 兩顆粒子共用同一個空間均勻流場（逆向時 ibf=-1 使真實位移方向與
     # u_curr 相反：batch_move_rk4 的 k1u = ibf*u，往 -x 移動），因此哪一顆
@@ -948,12 +966,15 @@ def test_forcing_missing_status_stops_batch_at_that_hour(driver_grid, handles) -
     """濕節點缺值未經解釋時，整批粒子在該小時停止並標記為 FORCING_MISSING。"""
 
     arrival_utc = 4_000 * _HOUR_NS
-    n_nodes = _n_nodes(driver_grid)
+    _n_nodes(driver_grid)
 
     def resolver(target_utc_ns: int) -> HourlyFieldPair:
         hi = target_utc_ns
         lo = target_utc_ns - _HOUR_NS
-        pair = _uniform_field_pair(driver_grid, u1=0.01, v1=0.0, ibf=-1, trat=0.0, time_before_utc_ns=hi, time_after_utc_ns=lo)
+        pair = _uniform_field_pair(
+            driver_grid, u1=0.01, v1=0.0, ibf=-1, trat=0.0,
+            time_before_utc_ns=hi, time_after_utc_ns=lo,
+        )
         # 在其中一個濕節點的 field1 製造一個未登錄的缺值（missing_mask=True
         # 但沒有任何乾點可以解釋它），觸發 UnresolvedForcingGapError。
         u1 = pair.u_field1.copy()
@@ -976,7 +997,6 @@ def test_forcing_missing_status_stops_batch_at_that_hour(driver_grid, handles) -
         )
 
     interest_polygon = Polygon([(-1.0e6, -1.0e6), (1.0e6, -1.0e6), (1.0e6, 1.0e6), (-1.0e6, 1.0e6)])
-    n = 1
 
     soa = _SyntheticSoa(
         x=np.array([700.0]), y=np.array([700.0]), z=np.array([-5.0]),
@@ -1012,7 +1032,10 @@ def test_reproducibility_same_seed_bit_identical(driver_grid, handles) -> None:
     def resolver(target_utc_ns: int) -> HourlyFieldPair:
         hi = target_utc_ns
         lo = target_utc_ns - _HOUR_NS
-        return _uniform_field_pair(driver_grid, u1=0.02, v1=-0.015, ibf=-1, trat=0.0, time_before_utc_ns=hi, time_after_utc_ns=lo)
+        return _uniform_field_pair(
+            driver_grid, u1=0.02, v1=-0.015, ibf=-1, trat=0.0,
+            time_before_utc_ns=hi, time_after_utc_ns=lo,
+        )
 
     interest_polygon = Polygon([(-1.0e6, -1.0e6), (1.0e6, -1.0e6), (1.0e6, 1.0e6), (-1.0e6, 1.0e6)])
     n = 8
@@ -1075,7 +1098,10 @@ def test_performance_benchmark_reports_breakdown(driver_grid, handles) -> None:
     def resolver(target_utc_ns: int) -> HourlyFieldPair:
         hi = target_utc_ns
         lo = target_utc_ns - _HOUR_NS
-        return _uniform_field_pair(driver_grid, u1=0.03, v1=0.02, ibf=-1, trat=0.0, time_before_utc_ns=hi, time_after_utc_ns=lo)
+        return _uniform_field_pair(
+            driver_grid, u1=0.03, v1=0.02, ibf=-1, trat=0.0,
+            time_before_utc_ns=hi, time_after_utc_ns=lo,
+        )
 
     interest_polygon = Polygon([(-1.0e6, -1.0e6), (1.0e6, -1.0e6), (1.0e6, 1.0e6), (-1.0e6, 1.0e6)])
     rng_place = np.random.default_rng(555)
@@ -1139,7 +1165,7 @@ def test_performance_benchmark_reports_breakdown(driver_grid, handles) -> None:
     total_us_per_step = us_per_particle_step(diag.total_kernel_and_overhead_s)
     wall_us_per_step = wall_elapsed_s / total_particle_substeps * 1.0e6
 
-    print("\n=== WP-5 效能量測（N={}, 子步總數={}, hours_run={}） ===".format(n, diag.n_substeps, result.hours_run))
+    print(f"\n=== WP-5 效能量測（N={n}, 子步總數={diag.n_substeps}, hours_run={result.hours_run}） ===")
     for name, value in breakdown_us.items():
         print(f"  {name:>22s}: {value:8.3f} µs/粒子步")
     print(f"  {'kernel 階段合計':>22s}: {total_us_per_step:8.3f} µs/粒子步")
@@ -1211,7 +1237,9 @@ def _build_regular_grid_mesh(nx: int, ny: int, *, spacing_m: float = 200.0, dp_m
     )
 
 
-def _build_realistic_scale_driver_grid(handles: bd.BayTraceModuleHandles, node_target: int) -> tuple[bd.NativeBackwardDriverGrid, int, int]:
+def _build_realistic_scale_driver_grid(
+    handles: bd.BayTraceModuleHandles, node_target: int,
+) -> tuple[bd.NativeBackwardDriverGrid, int, int]:
     """依目標節點數挑一個接近的正方形 ``nx × ny``，建出 20 層垂向的驅動層網格。
 
     垂向 sigma 用 20 層等間隔（``[-1, 0]``）、``eta=0`` 的參考時刻反推，滿足
@@ -1233,7 +1261,9 @@ def _build_realistic_scale_driver_grid(handles: bd.BayTraceModuleHandles, node_t
     return driver_grid, side, side
 
 
-def _realistic_scale_field_pair(driver_grid: bd.NativeBackwardDriverGrid, hi: int, lo: int) -> HourlyFieldPair:
+def _realistic_scale_field_pair(
+    driver_grid: bd.NativeBackwardDriverGrid, hi: int, lo: int,
+) -> HourlyFieldPair:
     n_nodes = _n_nodes(driver_grid)
     nvrt = driver_grid.grid.nvrt
     shape = (nvrt, n_nodes)
@@ -1244,15 +1274,17 @@ def _realistic_scale_field_pair(driver_grid: bd.NativeBackwardDriverGrid, hi: in
     return HourlyFieldPair(
         time_before_utc_ns=hi, time_after_utc_ns=lo, trat=0.0, ibf=-1,
         u_field1=np.full(shape, 0.05), v_field1=np.full(shape, 0.02), w_field1=np.zeros(shape),
-        eta_field1=eta.copy(), diffusivity_field1=diffusivity.copy(), missing_mask1=missing.copy(), dry_face_flag1=dry_face.copy(),
+        eta_field1=eta.copy(), diffusivity_field1=diffusivity.copy(),
+        missing_mask1=missing.copy(), dry_face_flag1=dry_face.copy(),
         month_id1="synthetic", time_origin1="test",
         u_field2=np.full(shape, 0.05), v_field2=np.full(shape, 0.02), w_field2=np.zeros(shape),
-        eta_field2=eta.copy(), diffusivity_field2=diffusivity.copy(), missing_mask2=missing.copy(), dry_face_flag2=dry_face.copy(),
+        eta_field2=eta.copy(), diffusivity_field2=diffusivity.copy(),
+        missing_mask2=missing.copy(), dry_face_flag2=dry_face.copy(),
         month_id2="synthetic", time_origin2="test",
     )
 
 
-def _realistic_scale_wave_resolver(driver_grid: bd.NativeBackwardDriverGrid) -> "callable":
+def _realistic_scale_wave_resolver(driver_grid: bd.NativeBackwardDriverGrid) -> callable:
     n_nodes = _n_nodes(driver_grid)
 
     def _resolve(_target_utc_ns: int) -> bd.WaveFieldAtNodes:
@@ -1432,10 +1464,17 @@ def test_realistic_grid_scale_hourly_overhead_benchmark(handles) -> None:
 
     # 正確性：快取只應該改變效能，不應該改變任何數值結果——逐一比對三種
     # 沉降速度在有無快取下的最終位置與狀態必須位元相同。
-    for settle, result_a, result_b in zip(settling_speeds, results_without_cache, results_with_cache):
-        assert np.array_equal(result_a.final_x_m, result_b.final_x_m), f"settle={settle}：啟用快取後 x 結果不應改變"
-        assert np.array_equal(result_a.final_y_m, result_b.final_y_m), f"settle={settle}：啟用快取後 y 結果不應改變"
-        assert np.array_equal(result_a.final_status, result_b.final_status), f"settle={settle}：啟用快取後狀態不應改變"
+    zipped = zip(settling_speeds, results_without_cache, results_with_cache, strict=False)
+    for settle, result_a, result_b in zipped:
+        assert np.array_equal(result_a.final_x_m, result_b.final_x_m), (
+            f"settle={settle}：啟用快取後 x 結果不應改變"
+        )
+        assert np.array_equal(result_a.final_y_m, result_b.final_y_m), (
+            f"settle={settle}：啟用快取後 y 結果不應改變"
+        )
+        assert np.array_equal(result_a.final_status, result_b.final_status), (
+            f"settle={settle}：啟用快取後狀態不應改變"
+        )
 
     # 效能：有快取應該明顯更快——第一個批次仍要付出完整的乾濕判定＋Stokes＋
     # Smagorinsky 成本，但第二、三個批次應該幾乎只剩下 apply_settling_velocity
@@ -1445,3 +1484,448 @@ def test_realistic_grid_scale_hourly_overhead_benchmark(handles) -> None:
         f"啟用 composed_base_cache／smagorinsky_cache 後應該明顯更快："
         f"無快取={elapsed_without_cache:.3f}s，有快取={elapsed_with_cache:.3f}s"
     )
+
+
+# ── WP-9：計數器型擴散亂數 ───────────────────────────────────────────────────
+
+
+def test_counter_based_gaussian_pairs_statistics() -> None:
+    """計數器型亂數的統計品質：均值≈0、變異數≈1、x/y 不相關、跨步不自相關。
+
+    這是純函式測試，不需要網格或 BayTrace handles；驗證
+    ``counter_based_gaussian_pairs`` 本身的隨機數品質是否足以支撐
+    「Box–Muller 轉換出的標準常態亂數」這個假設，供 WP-9 小時主軸的擴散
+    位移直接使用。
+    """
+
+    n_particles = 6000
+    n_steps = 400
+    seed_lo, seed_hi = bd.derive_particle_diffusion_seed_lo_hi_u64(
+        [f"{i:032x}" for i in range(n_particles)], master_seed=7
+    )
+
+    all_z0 = []
+    all_z1 = []
+    for step in range(n_steps):
+        counter = np.full(n_particles, step, dtype=np.int64)
+        z0, z1 = bd.counter_based_gaussian_pairs(seed_lo, seed_hi, counter)
+        assert np.all(np.isfinite(z0)) and np.all(np.isfinite(z1))
+        all_z0.append(z0)
+        all_z1.append(z1)
+    all_z0 = np.concatenate(all_z0)
+    all_z1 = np.concatenate(all_z1)
+
+    n_total = all_z0.size
+    assert np.mean(all_z0) == pytest.approx(0.0, abs=5.0 / np.sqrt(n_total))
+    assert np.mean(all_z1) == pytest.approx(0.0, abs=5.0 / np.sqrt(n_total))
+    assert np.var(all_z0) == pytest.approx(1.0, abs=5.0 * np.sqrt(2.0 / n_total))
+    assert np.var(all_z1) == pytest.approx(1.0, abs=5.0 * np.sqrt(2.0 / n_total))
+    assert abs(np.corrcoef(all_z0, all_z1)[0, 1]) < 0.05
+
+    # 單一粒子跨步序列的 lag-1 自相關應接近 0（不同步計數器之間相互獨立）。
+    single_seed_lo = seed_lo[:1]
+    single_seed_hi = seed_hi[:1]
+    n_series = 20000
+    long_series = np.array(
+        [
+            bd.counter_based_gaussian_pairs(
+                single_seed_lo, single_seed_hi, np.array([c], dtype=np.int64),
+            )[0][0]
+            for c in range(n_series)
+        ]
+    )
+    # 5 個標準誤（獨立常態序列 lag-1 自相關係數的抽樣標準誤約 1/sqrt(n)）。
+    autocorr_tolerance = 5.0 / np.sqrt(n_series)
+    assert abs(np.corrcoef(long_series[:-1], long_series[1:])[0, 1]) < autocorr_tolerance
+
+
+def test_counter_based_diffusion_seed_independent_of_master_seed_and_particle() -> None:
+    """同一顆粒子換一個 ``master_seed`` 得到不同序列；不同粒子彼此序列不同。"""
+
+    seed_hex_values = [f"{i:032x}" for i in range(8)]
+    lo_a, hi_a = bd.derive_particle_diffusion_seed_lo_hi_u64(seed_hex_values, master_seed=1)
+    lo_b, hi_b = bd.derive_particle_diffusion_seed_lo_hi_u64(seed_hex_values, master_seed=2)
+    assert not np.array_equal(lo_a, lo_b) or not np.array_equal(hi_a, hi_b)
+
+    # 同一個 (seed_hex, master_seed) 重跑必須完全相同（純函式、可重現）。
+    lo_a2, hi_a2 = bd.derive_particle_diffusion_seed_lo_hi_u64(seed_hex_values, master_seed=1)
+    assert np.array_equal(lo_a, lo_a2)
+    assert np.array_equal(hi_a, hi_a2)
+
+    # 不同粒子（不同 seed_hex）的種子必須互異。
+    assert len(set(lo_a.tolist())) == len(seed_hex_values)
+
+
+def test_diffusion_apply_counter_mode_matches_regardless_of_batch_composition() -> None:
+    """計數器型擴散：同一顆粒子單獨跑與併入更大批次跑，位移必須位元相同。
+
+    這是 WP-9「合併批次不改變擴散序列」設計的最小單元測試：直接呼叫
+    ``_apply_horizontal_diffusion``（不透過完整的 ``mirror_rk4_substep_loop``
+    或 ``run_backward_batch``），驗證同一顆粒子（同一組
+    ``seed_lo``／``seed_hi``、同一個 ``counter`` 起始值）不論被放進長度為
+    1 的陣列，還是長度為 5、位置在第 3 列的陣列，得到的位移都完全相同。
+    """
+
+    seed_hex_values = [f"{i:032x}" for i in range(5)]
+    seed_lo_all, seed_hi_all = bd.derive_particle_diffusion_seed_lo_hi_u64(seed_hex_values, master_seed=42)
+    kh = 0.02
+    dtb = 15.0
+
+    # 場景 A：這顆粒子（索引 2）獨自一個長度為 1 的批次。
+    px_a = np.array([100.0])
+    py_a = np.array([200.0])
+    active_a = np.array([True])
+    counter_a = np.zeros(1, dtype=np.int64)
+    bd._apply_horizontal_diffusion(
+        px_a, py_a, active_a, kh_mps2=np.array([kh]), dtb=dtb,
+        particle_seed_lo=seed_lo_all[2:3], particle_seed_hi=seed_hi_all[2:3],
+        particle_step_counter=counter_a,
+    )
+
+    # 場景 B：這顆粒子併入一個長度為 5 的批次（同樣是它自己第一次套用擴散，
+    # 起始 counter 為 0；批次內其他粒子的座標、活躍與否都不同）。
+    px_b = np.array([1.0, 2.0, 100.0, 4.0, 5.0])
+    py_b = np.array([1.0, 2.0, 200.0, 4.0, 5.0])
+    active_b = np.array([True, False, True, True, False])
+    counter_b = np.zeros(5, dtype=np.int64)
+    bd._apply_horizontal_diffusion(
+        px_b, py_b, active_b, kh_mps2=np.full(5, kh), dtb=dtb,
+        particle_seed_lo=seed_lo_all, particle_seed_hi=seed_hi_all,
+        particle_step_counter=counter_b,
+    )
+
+    assert px_a[0] == pytest.approx(px_b[2])
+    assert py_a[0] == pytest.approx(py_b[2])
+    assert counter_a[0] == counter_b[2] == 1
+
+    # 未活躍的粒子（索引 1、4）計數器不應該遞增（尚未真正套用擴散）。
+    assert counter_b[1] == 0
+    assert counter_b[4] == 0
+
+
+def test_mirror_rk4_substep_loop_rejects_mixed_diffusion_rng_sources(driver_grid, handles) -> None:
+    """同時提供 ``rng`` 與計數器型三參數、或兩者都不提供，必須明確拒絕。"""
+
+    field_pair = _uniform_field_pair(driver_grid, u1=0.0, v1=0.0, ibf=1, trat=0.0)
+    n = 3
+    pa = _make_particles(handles, n)
+    _place_and_locate(
+        driver_grid, handles, pa,
+        x=np.full(n, _DOMAIN_X / 2.0), y=np.full(n, _DOMAIN_Y / 2.0), z=np.full(n, -5.0),
+        field_pair=field_pair,
+    )
+    composed = bd.compose_total_velocity_fields(
+        driver_grid, handles, field_pair, settling_velocity_mps=0.0,
+    )
+    n_nodes = _n_nodes(driver_grid)
+    hf_field = np.full((_NVRT, n_nodes), 0.01, dtype=np.float64)
+    seed_lo, seed_hi = bd.derive_particle_diffusion_seed_lo_hi_u64(
+        [f"{i:032x}" for i in range(n)], master_seed=0,
+    )
+    counter = np.zeros(n, dtype=np.int64)
+    rng = np.random.default_rng(0)
+
+    with pytest.raises(bd.BackwardDriverError):
+        bd.mirror_rk4_substep_loop(
+            driver_grid, handles, pa, ibf=1, ndeltp=1, dtb=60.0, composed=composed, enable_diffusion=True,
+            hf1_field=hf_field, hf2_field=hf_field,
+            rng=rng, particle_seed_lo=seed_lo, particle_seed_hi=seed_hi, particle_step_counter=counter,
+        )
+    with pytest.raises(bd.BackwardDriverError):
+        bd.mirror_rk4_substep_loop(
+            driver_grid, handles, pa, ibf=1, ndeltp=1, dtb=60.0, composed=composed, enable_diffusion=True,
+            hf1_field=hf_field, hf2_field=hf_field,
+        )
+    with pytest.raises(bd.BackwardDriverError):
+        bd.mirror_rk4_substep_loop(
+            driver_grid, handles, pa, ibf=1, ndeltp=1, dtb=60.0, composed=composed, enable_diffusion=True,
+            hf1_field=hf_field, hf2_field=hf_field,
+            particle_seed_lo=seed_lo, particle_seed_hi=seed_hi,
+        )
+
+
+def test_run_backward_batch_default_uses_counter_rng_and_is_reproducible(driver_grid, handles) -> None:
+    """``run_backward_batch`` 預設（未傳入 ``rng``）改用計數器型擴散，仍可重現。
+
+    這取代舊版「批次共用種子」的預設路徑；本測試同時確認新預設路徑的
+    可重現性（與既有 ``test_reproducibility_same_seed_bit_identical`` 互補，
+    但那個測試沒有明確驗證『這是計數器型路徑』，只驗證『重跑位元相同』，
+    任何一種亂數方案都能通過；本測試額外確認同一顆粒子單獨抽出來看，序列
+    完全由自己的 ``seed_hex`` 決定，見上面的批次組成無關性測試）。
+    """
+
+    arrival_utc = 6_000 * _HOUR_NS
+
+    def resolver(target_utc_ns: int) -> HourlyFieldPair:
+        hi = target_utc_ns
+        lo = target_utc_ns - _HOUR_NS
+        return _uniform_field_pair(
+            driver_grid, u1=0.01, v1=-0.005, ibf=-1, trat=0.0,
+            time_before_utc_ns=hi, time_after_utc_ns=lo,
+        )
+
+    interest_polygon = Polygon([(-1.0e6, -1.0e6), (1.0e6, -1.0e6), (1.0e6, 1.0e6), (-1.0e6, 1.0e6)])
+    n = 6
+    x0 = np.full(n, _DOMAIN_X / 2.0)
+    y0 = np.full(n, _DOMAIN_Y / 2.0)
+    z0 = np.full(n, -5.0)
+    seed_hex_values = [f"{i:032x}" for i in range(n)]
+    soa = _SyntheticSoa(x=x0, y=y0, z=z0, row_particle_index=np.arange(n, dtype=np.int64))
+    config = bd.BackwardDriverConfig(
+        arrival_time_utc_ns=arrival_utc, settling_velocity_mps=0.0,
+        max_backtrack_seconds=2.0 * 3600.0, enable_diffusion=True, master_seed=99,
+    )
+
+    result_a = bd.run_backward_batch(
+        driver_grid, handles, soa, seed_hex_values=seed_hex_values, config=config,
+        forcing_resolver=resolver, interest_region_polygon=interest_polygon,
+    )
+    result_b = bd.run_backward_batch(
+        driver_grid, handles, soa, seed_hex_values=seed_hex_values, config=config,
+        forcing_resolver=resolver, interest_region_polygon=interest_polygon,
+    )
+    assert np.array_equal(result_a.trajectory_x_m, result_b.trajectory_x_m)
+    assert np.array_equal(result_a.trajectory_y_m, result_b.trajectory_y_m)
+
+    # 位移不應該全部是 0（確認擴散確實有作用，不是誤用到停用路徑）。
+    assert not np.array_equal(result_a.trajectory_x_m[0], result_a.trajectory_x_m[-1])
+
+
+# ── WP-9：逐列關注區域多邊形 ─────────────────────────────────────────────────
+
+
+def test_interest_region_polygons_per_row_matches_separate_single_polygon_calls(driver_grid, handles) -> None:
+    """合併呼叫（逐列多邊形）與分開呼叫（各自單一多邊形）必須位元相同。
+
+    模擬 WP-9 小時主軸「同一次 kernel 呼叫混合多個測站的粒子」的情境：
+    兩個測站各自的關注區域是不同的正方形，把兩站粒子合併成一個陣列、用
+    ``interest_region_polygons`` 逐列指定後跑一次子步，其結果應該與「兩站
+    粒子分開、各自用 ``interest_region_polygon`` 單一多邊形跑」完全相同。
+    """
+
+    field_pair = _uniform_field_pair(driver_grid, u1=0.05, v1=0.0, ibf=1, trat=0.0)
+    polygon_a = Polygon([(0.0, 0.0), (500.0, 0.0), (500.0, 500.0), (0.0, 500.0)])
+    polygon_b = Polygon([(700.0, 0.0), (1400.0, 0.0), (1400.0, 1400.0), (700.0, 1400.0)])
+
+    # 站 A 的粒子：起點靠近 polygon_a 右邊界，往 +x 平流後應該離開。
+    # 站 B 的粒子：起點靠近 polygon_b 右邊界，同樣往 +x 平流後應該離開，
+    # 但離開的時間點與 polygon_a 不同（門檻不同），用來確認兩者互不干擾。
+    x_a = np.array([480.0, 100.0])
+    y_a = np.array([250.0, 250.0])
+    x_b = np.array([1380.0, 900.0])
+    y_b = np.array([700.0, 700.0])
+
+    def _run_combined() -> tuple:
+        n = 4
+        pa = _make_particles(handles, n)
+        _place_and_locate(
+            driver_grid, handles, pa,
+            x=np.concatenate([x_a, x_b]), y=np.concatenate([y_a, y_b]), z=np.full(n, -5.0),
+            field_pair=field_pair,
+        )
+        composed = bd.compose_total_velocity_fields(
+            driver_grid, handles, field_pair, settling_velocity_mps=0.0,
+        )
+        ndeltp = bd.estimate_substep_count(
+            driver_grid, composed.u_field1, composed.v_field1, dt_seconds=600.0,
+        )
+        dtb = 600.0 / ndeltp
+        native_status = np.full(n, bd.NATIVE_STATUS_ACTIVE, dtype=np.int32)
+        departures: list = []
+        polygons_per_row = np.array([polygon_a, polygon_a, polygon_b, polygon_b], dtype=object)
+        bd.mirror_rk4_substep_loop(
+            driver_grid, handles, pa, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed,
+            enable_diffusion=False,
+            native_status=native_status, substep_utc_ns=lambda idt: idt,
+            interest_region_polygons=polygons_per_row, departures=departures,
+        )
+        return pa.x.copy(), pa.y.copy(), native_status.copy(), pa.status.copy()
+
+    def _run_separate() -> tuple:
+        results_x = []
+        results_y = []
+        results_status = []
+        results_pa_status = []
+        for x_group, y_group, polygon in ((x_a, y_a, polygon_a), (x_b, y_b, polygon_b)):
+            n_group = x_group.shape[0]
+            pa = _make_particles(handles, n_group)
+            _place_and_locate(
+                driver_grid, handles, pa,
+                x=x_group, y=y_group, z=np.full(n_group, -5.0), field_pair=field_pair,
+            )
+            composed = bd.compose_total_velocity_fields(
+                driver_grid, handles, field_pair, settling_velocity_mps=0.0,
+            )
+            ndeltp = bd.estimate_substep_count(
+                driver_grid, composed.u_field1, composed.v_field1, dt_seconds=600.0,
+            )
+            dtb = 600.0 / ndeltp
+            native_status = np.full(n_group, bd.NATIVE_STATUS_ACTIVE, dtype=np.int32)
+            departures: list = []
+            bd.mirror_rk4_substep_loop(
+                driver_grid, handles, pa, ibf=1, ndeltp=ndeltp, dtb=dtb, composed=composed,
+                enable_diffusion=False,
+                native_status=native_status, substep_utc_ns=lambda idt: idt,
+                interest_region_polygon=polygon, departures=departures,
+            )
+            results_x.append(pa.x.copy())
+            results_y.append(pa.y.copy())
+            results_status.append(native_status.copy())
+            results_pa_status.append(pa.status.copy())
+        return (
+            np.concatenate(results_x), np.concatenate(results_y),
+            np.concatenate(results_status), np.concatenate(results_pa_status),
+        )
+
+    combined_x, combined_y, combined_native_status, combined_pa_status = _run_combined()
+    separate_x, separate_y, separate_native_status, separate_pa_status = _run_separate()
+
+    assert np.array_equal(combined_x, separate_x)
+    assert np.array_equal(combined_y, separate_y)
+    assert np.array_equal(combined_native_status, separate_native_status)
+    assert np.array_equal(combined_pa_status, separate_pa_status)
+    # 確認測試場景真的有粒子離開（不是門檻設得太鬆導致測試沒有鑑別力）。
+    assert np.any(combined_native_status == bd.NATIVE_STATUS_LEFT_INTEREST_REGION)
+
+
+def test_interest_region_polygon_and_polygons_mutually_exclusive(driver_grid, handles) -> None:
+    """同時提供 ``interest_region_polygon`` 與 ``interest_region_polygons`` 必須拒絕。"""
+
+    field_pair = _uniform_field_pair(driver_grid, u1=0.0, v1=0.0, ibf=1, trat=0.0)
+    n = 2
+    pa = _make_particles(handles, n)
+    _place_and_locate(
+        driver_grid, handles, pa,
+        x=np.full(n, _DOMAIN_X / 2.0), y=np.full(n, _DOMAIN_Y / 2.0), z=np.full(n, -5.0),
+        field_pair=field_pair,
+    )
+    composed = bd.compose_total_velocity_fields(driver_grid, handles, field_pair, settling_velocity_mps=0.0)
+    polygon = Polygon([(-1.0e6, -1.0e6), (1.0e6, -1.0e6), (1.0e6, 1.0e6), (-1.0e6, 1.0e6)])
+    with pytest.raises(bd.BackwardDriverError):
+        bd.mirror_rk4_substep_loop(
+            driver_grid, handles, pa, ibf=1, ndeltp=1, dtb=60.0, composed=composed, enable_diffusion=False,
+            native_status=np.full(n, bd.NATIVE_STATUS_ACTIVE, dtype=np.int32), substep_utc_ns=lambda idt: idt,
+            interest_region_polygon=polygon,
+            interest_region_polygons=np.array([polygon, polygon], dtype=object),
+        )
+
+
+# ── WP-9：Stokes 深度截斷優化 ────────────────────────────────────────────────
+
+
+def test_stokes_depth_threshold_none_is_bit_identical_to_original(driver_grid, handles) -> None:
+    """``stokes_depth_threshold_ratio=None``（預設）必須與未加此參數前逐位元相同。
+
+    直接沿用既有的 Stokes 交叉驗證合成場景（見
+    ``test_composed_velocity_matches_stokes_reference_at_each_node_layer``），
+    只是在這裡改成明確比較「有沒有傳這個新參數」兩種呼叫方式。
+    """
+
+    n_nodes = _n_nodes(driver_grid)
+    field_pair = _uniform_field_pair(driver_grid, u1=0.03, v1=0.01, ibf=-1, trat=0.0)
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=np.full(n_nodes, 1.2),
+        peak_frequency_hz=np.full(n_nodes, 0.15),
+        direction_raw_deg=np.full(n_nodes, 30.0),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+    base_default = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, field_pair, wave_field1=wave, wave_field2=wave
+    )
+    base_explicit_none = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, field_pair, wave_field1=wave, wave_field2=wave,
+        stokes_depth_threshold_ratio=None,
+    )
+    assert np.array_equal(base_default.u_field1, base_explicit_none.u_field1)
+    assert np.array_equal(base_default.v_field1, base_explicit_none.v_field1)
+    # 未啟用截斷時，「顯著點」就是全部 effective_mask 內的點，兩個計數器
+    # 應該相等（沒有任何點被跳過）。
+    assert base_default.stokes_points_evaluated == base_default.stokes_points_possible
+    assert base_default.stokes_points_evaluated > 0
+
+
+def test_stokes_depth_threshold_rejects_out_of_range_values(driver_grid, handles) -> None:
+    """``stokes_depth_threshold_ratio`` 必須落在 (0, 1) 開區間，否則拒絕。"""
+
+    n_nodes = _n_nodes(driver_grid)
+    field_pair = _uniform_field_pair(driver_grid, u1=0.0, v1=0.0, ibf=-1, trat=0.0)
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=np.full(n_nodes, 1.0),
+        peak_frequency_hz=np.full(n_nodes, 0.1),
+        direction_raw_deg=np.zeros(n_nodes),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+    for bad_ratio in (0.0, 1.0, -0.1, 1.5):
+        with pytest.raises(bd.BackwardDriverError):
+            bd.compose_current_and_stokes_fields(
+                driver_grid, handles, field_pair, wave_field1=wave, wave_field2=wave,
+                stokes_depth_threshold_ratio=bad_ratio,
+            )
+
+
+def test_stokes_depth_threshold_truncates_deep_layers_within_bounded_error(handles) -> None:
+    """深水（相對波長）情境下，深度截斷應該真的跳過部分點，且誤差有界。
+
+    用一個比既有合成網格更深（``dp=150 m``）、更高頻（``fp=0.2 Hz``，波長
+    較短）的網格，讓 Stokes 垂向衰減在水柱內達到「顯著」之下——這正是
+    近岸淺水（既有 8x8 合成網格 ``dp=20 m``）不容易展示出截斷效果的原因
+    （見最終報告的誠實揭露）。誤差上界直接來自截斷門檻本身的物理意義：
+    被跳過的點，其真實 Stokes 貢獻本來就 ``<= threshold_ratio`` 倍表面值，
+    這裡用「表面速度量級」估計一個寬鬆但可驗證的絕對誤差上界。
+    """
+
+    mesh = _build_regular_grid_mesh(6, 6, spacing_m=200.0, dp_m=150.0)
+    nvrt = 20
+    n_nodes = mesh.node_xy.shape[0]
+    sigma_1d = np.linspace(-1.0, 0.0, nvrt)
+    zcor_reference = sigma_1d[None, :] * mesh.source_depth_m[:, None]
+    eta_reference = np.zeros(n_nodes, dtype=np.float64)
+    grid = build_native_grid_arrays(mesh, zcor_reference=zcor_reference, eta_reference=eta_reference)
+    driver_grid_deep = bd.build_native_backward_driver_grid(grid, handles, h0=0.0)
+
+    shape = (nvrt, n_nodes)
+    eta = np.zeros(n_nodes)
+    field_pair = HourlyFieldPair(
+        time_before_utc_ns=2 * _HOUR_NS, time_after_utc_ns=1 * _HOUR_NS, trat=0.0, ibf=-1,
+        u_field1=np.full(shape, 0.05), v_field1=np.full(shape, 0.02), w_field1=np.zeros(shape),
+        eta_field1=eta.copy(), diffusivity_field1=np.full(shape, 1.0e-4),
+        missing_mask1=np.zeros(shape, dtype=bool),
+        dry_face_flag1=np.zeros(shape, dtype=bool), month_id1="synthetic", time_origin1="test",
+        u_field2=np.full(shape, 0.05), v_field2=np.full(shape, 0.02), w_field2=np.zeros(shape),
+        eta_field2=eta.copy(), diffusivity_field2=np.full(shape, 1.0e-4),
+        missing_mask2=np.zeros(shape, dtype=bool),
+        dry_face_flag2=np.zeros(shape, dtype=bool), month_id2="synthetic", time_origin2="test",
+    )
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=np.full(n_nodes, 1.5),
+        peak_frequency_hz=np.full(n_nodes, 0.2),
+        direction_raw_deg=np.full(n_nodes, 45.0),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+
+    base_full = bd.compose_current_and_stokes_fields(
+        driver_grid_deep, handles, field_pair, wave_field1=wave, wave_field2=wave
+    )
+    threshold_ratio = 1.0e-3
+    base_truncated = bd.compose_current_and_stokes_fields(
+        driver_grid_deep, handles, field_pair, wave_field1=wave, wave_field2=wave,
+        stokes_depth_threshold_ratio=threshold_ratio,
+    )
+
+    assert base_truncated.stokes_points_possible == base_full.stokes_points_possible
+    assert 0 < base_truncated.stokes_points_evaluated < base_truncated.stokes_points_possible, (
+        "這個深水情境應該要讓深度截斷真正跳過一部分點，否則測試沒有鑑別力"
+    )
+
+    diff_u = np.abs(base_truncated.u_field1 - base_full.u_field1)
+    diff_v = np.abs(base_truncated.v_field1 - base_full.v_field1)
+    # 表面 Stokes 速度量級：a²ωk ~ (Hs/2)² * omega * k；用一個寬鬆但物理
+    # 上合理的上界（表面速度量級 × 門檻比例 × 安全係數 10）驗證誤差確實
+    # 被門檻控制住，而不是隨意大小。
+    surface_speed_scale = 0.5  # m/s，遠大於本測試波高／週期下的實際表面 Stokes 速度
+    error_bound = surface_speed_scale * threshold_ratio * 10.0
+    assert np.nanmax(diff_u) < error_bound
+    assert np.nanmax(diff_v) < error_bound

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -128,6 +129,121 @@ def test_plan_native_work_units_defaults_flow_domain_to_region_when_unmapped() -
     table = _synthetic_plan_table()
     units = orch.plan_native_work_units(table)
     assert {u.flow_domain_id for u in units} == {"A", "B"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-9：plan_native_hour_major_work_units 把逐工作單元摺疊成每個流場區域一個
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_plan_native_hour_major_work_units_groups_by_flow_domain() -> None:
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+
+    domain_units, members = orch.plan_native_hour_major_work_units(units)
+
+    # 兩個流場區域各摺成一個排程單元，且依 flow_domain_id 字串排序。
+    assert [u.flow_domain_id for u in domain_units] == sorted({"flowA_cache_v1", "flowB_cache_v1"})
+    assert len(domain_units) == 2
+    assert len({u.unit_id for u in domain_units}) == 2
+    assert all(u.unit_id.startswith("hourmajor::") for u in domain_units)
+
+    for domain_unit in domain_units:
+        member_units = members[domain_unit.unit_id]
+        # members 對照表裡的每個成員都真的屬於這個流場區域。
+        assert all(m.flow_domain_id == domain_unit.flow_domain_id for m in member_units)
+        # 摺疊出來的粒子列位置聯集，必須跟底下全部成員單元的列位置聯集完全相同
+        # （不遺漏、不重複、不多算）。
+        expected_rows = np.unique(np.concatenate([m.particle_row_indices for m in member_units]))
+        assert np.array_equal(np.sort(domain_unit.particle_row_indices), expected_rows)
+        assert domain_unit.particle_count == sum(m.particle_count for m in member_units)
+        # 成員清單依 unit_id 確定性排序。
+        assert list(member_units) == sorted(member_units, key=lambda m: m.unit_id)
+
+    flow_a_members = members[
+        next(u.unit_id for u in domain_units if u.flow_domain_id == "flowA_cache_v1")
+    ]
+    flow_b_members = members[
+        next(u.unit_id for u in domain_units if u.flow_domain_id == "flowB_cache_v1")
+    ]
+    assert len(flow_a_members) == 12  # 2 站 × 3 到達 × 2 沉降
+    assert len(flow_b_members) == 6  # 1 站 × 3 到達 × 2 沉降
+    # 整個表的粒子數在兩個流場區域的排程單元之間沒有遺漏或重複。
+    assert sum(u.particle_count for u in domain_units) == len(table)
+
+
+def test_plan_native_hour_major_work_units_input_hash_changes_when_any_member_changes() -> None:
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+    domain_units_before, _ = orch.plan_native_hour_major_work_units(units)
+    hash_before = {u.flow_domain_id: u.input_hash for u in domain_units_before}
+
+    # 第 0 列粒子屬於區域 A（見 ``_synthetic_plan_table`` 先建區域 A 再建區域 B），
+    # 只動它的起點，模擬「只有流場區域 A 底下某個成員單元的輸入變了」。``content_
+    # sha256`` 是凍結資料類別在建構當下（``__post_init__``）算好的，事後直接改
+    # ``table.x0_m`` 陣列內容不會讓它重新計算，因此必須用 ``dataclasses.replace``
+    # 重新走一次建構流程，而不是原地修改陣列。
+    assert table.analysis_region_id[0] == "A"
+    modified_x0 = table.x0_m.copy()
+    modified_x0[0] += 1.0
+    table2 = dataclasses.replace(table, x0_m=modified_x0)
+    assert table2.content_sha256 != table.content_sha256
+    units2 = orch.plan_native_work_units(table2, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+    domain_units_after, _ = orch.plan_native_hour_major_work_units(units2)
+    hash_after = {u.flow_domain_id: u.input_hash for u in domain_units_after}
+
+    # 受影響流場區域（A）的摺疊雜湊必須改變，才能讓 run_native_plan 的續跑判斷
+    # 正確地判定「這個流場區域的輸入變了，必須重算」，而不是誤判為已完成。注意
+    # ``_unit_input_hash`` 本來就把整張身分表的 ``content_sha256`` 也混進每個
+    # 單元的雜湊（見其實作），所以這裡連沒受影響的流場區域 B 雜湊也會一起變，
+    # 這是既有 ``plan_native_work_units`` 的既有行為，不是本函式另外引入的差異，
+    # 因此本測試不對 B 的雜湊做「維持不變」的斷言。
+    assert hash_before["flowA_cache_v1"] != hash_after["flowA_cache_v1"]
+
+
+def test_plan_native_hour_major_work_units_rejects_empty_input() -> None:
+    with pytest.raises(orch.NativeOrchestratorError):
+        orch.plan_native_hour_major_work_units([])
+
+
+def test_native_plan_file_round_trips_hour_major_members(tmp_path: Path) -> None:
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+    domain_units, members = orch.plan_native_hour_major_work_units(units)
+    summary = orch.summarize_native_work_plan(domain_units)
+
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(
+        plan_path, units=domain_units, gap_checks=(), summary=summary, hour_major_members=members
+    )
+
+    read_units, payload = orch.read_native_plan_file(plan_path)
+    assert [u.unit_id for u in read_units] == [u.unit_id for u in domain_units]
+
+    read_members = orch.read_native_hour_major_members(payload)
+    assert set(read_members) == set(members)
+    for domain_unit_id, member_units in members.items():
+        restored = read_members[domain_unit_id]
+        assert [m.unit_id for m in restored] == [m.unit_id for m in member_units]
+        for original, restored_unit in zip(member_units, restored, strict=True):
+            assert original.flow_domain_id == restored_unit.flow_domain_id
+            assert original.arrival_time_utc_ns == restored_unit.arrival_time_utc_ns
+            assert original.settling_velocity_mps == restored_unit.settling_velocity_mps
+            assert original.study_site_id == restored_unit.study_site_id
+            assert np.array_equal(original.particle_row_indices, restored_unit.particle_row_indices)
+            assert original.input_hash == restored_unit.input_hash
+
+
+def test_native_plan_file_without_hour_major_members_reads_back_empty(tmp_path: Path) -> None:
+    table = _synthetic_plan_table()
+    units = orch.plan_native_work_units(table, region_to_flow_domain=REGION_TO_FLOW_DOMAIN)
+    summary = orch.summarize_native_work_plan(units)
+
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(plan_path, units=units, gap_checks=(), summary=summary)
+
+    _, payload = orch.read_native_plan_file(plan_path)
+    assert orch.read_native_hour_major_members(payload) == {}
 
 
 def test_summarize_native_work_plan_matches_manual_counts() -> None:

@@ -275,7 +275,8 @@ class ParticleIdentityTable:
 
         if not isinstance(self.experiment_case_id, str) or not self.experiment_case_id.strip():
             raise ParticleInputError("experiment_case_id 不可空白")
-        if isinstance(self.master_seed, bool) or not isinstance(self.master_seed, int) or self.master_seed < 0:
+        seed = self.master_seed
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ParticleInputError("master_seed 必須是非負整數")
         if self.random_stream_id is not None and (
             not isinstance(self.random_stream_id, str) or not self.random_stream_id.strip()
@@ -318,7 +319,8 @@ def _compute_identity_table_hash(table: ParticleIdentityTable) -> str:
         "random_stream_id": table.random_stream_id,
         "particle_count": int(table.particle_id.shape[0]),
     }
-    digest.update(json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    canonical_metadata = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest.update(canonical_metadata.encode("utf-8"))
     return digest.hexdigest()
 
 

@@ -14,7 +14,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.native_runner import (
     NativeGridBridgeError,
@@ -247,7 +246,7 @@ def test_evaluator_detects_drift_when_sigma_is_not_actually_static() -> None:
     # 且保持隨層遞增以維持單調，避免污染成「資料本身不合法」而非「靜態化
     # 誤差」。
     drift_series = zcor_series.copy()
-    for t_index, eta in enumerate(other_etas):
+    for t_index, _eta in enumerate(other_etas):
         drift_series[t_index] += 0.4 * (t_index + 1)
 
     report = evaluate_static_sigma_error(

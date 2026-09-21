@@ -227,7 +227,7 @@ def test_invalid_inputs_produce_distinct_status_codes_not_zero_velocity() -> Non
         assert math.isnan(stokes_v[i])
         assert math.isnan(wave_number[i])
         # 明確排除「無效被靜默當成 0」：NaN 不等於 0，也不能被 np.allclose 誤判。
-        assert not (stokes_u[i] == 0.0)
+        assert stokes_u[i] != 0.0
     assert status[5] == STOKES_BATCH_STATUS_OK
     assert not math.isnan(stokes_u[5])
 

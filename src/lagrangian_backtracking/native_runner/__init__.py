@@ -16,7 +16,14 @@
 - ``particle_input``：情境矩陣轉成粒子身分表與 BayTrace 結構陣列，並提供分組。
 - ``backward_driver``：逆向驅動層。把「海流＋Stokes＋沉降」合成進流場陣列後呼叫
   未修改的 BayTrace 核心；隨機擴散以算子分裂在四階 Runge-Kutta 法（RK4）之外逐子步施加。
+- ``hour_major``：以小時為主軸的逆向排程。每區域每小時只合成一次底場，同沉降速度的
+  活動粒子合併為一次核心呼叫；計數器型亂數使結果與批次組成無關。
+- ``hour_major_provider``：``lbt native-run --resource-provider`` 使用的正式資源入口，
+  執行一個（區域, 段）工作單元。
+- ``gap_fill``：流場缺口補值（優先沿用既有正式重建方法，長缺口以 25 小時位移混合備援）。
+- ``production_wiring``：從正式設定與已驗收產品建立各區域資源、粒子身分表與前置檢查。
 - ``orchestrator``：工作單元切分、長駐多程序平行執行、續跑、缺口安全到達時刻。
+- ``resources``：每個流場區域資源的共用契約（接線端與排程端之間的介面）。
 - ``postprocess``：串流合併批次成果、離開紀錄、邊界穿越通量與條件式來源足跡。
 
 BayTrace 原始碼一律不修改。
@@ -27,30 +34,45 @@ from __future__ import annotations
 from . import (
     backward_driver,
     forcing_bridge,
+    gap_fill,
     grid_bridge,
+    hour_major,
+    hour_major_provider,
     orchestrator,
     particle_input,
     postprocess,
+    production_wiring,
+    resources,
     stokes_batch,
     wave_bridge,
 )
 from .backward_driver import *  # noqa: F403
 from .forcing_bridge import *  # noqa: F403
+from .gap_fill import *  # noqa: F403
 from .grid_bridge import *  # noqa: F403
+from .hour_major import *  # noqa: F403
+from .hour_major_provider import *  # noqa: F403
 from .orchestrator import *  # noqa: F403
 from .particle_input import *  # noqa: F403
 from .postprocess import *  # noqa: F403
+from .production_wiring import *  # noqa: F403
+from .resources import *  # noqa: F403
 from .stokes_batch import *  # noqa: F403
 from .wave_bridge import *  # noqa: F403
 
 # 公開名稱由各模組自己的 ``__all__`` 決定，避免此處清單與模組實作脫節。
 __all__ = [
+    *resources.__all__,
     *grid_bridge.__all__,
     *forcing_bridge.__all__,
     *wave_bridge.__all__,
     *stokes_batch.__all__,
     *particle_input.__all__,
     *backward_driver.__all__,
+    *hour_major.__all__,
+    *hour_major_provider.__all__,
+    *gap_fill.__all__,
     *orchestrator.__all__,
+    *production_wiring.__all__,
     *postprocess.__all__,
 ]

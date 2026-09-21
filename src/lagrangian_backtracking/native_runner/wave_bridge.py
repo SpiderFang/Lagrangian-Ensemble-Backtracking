@@ -363,9 +363,16 @@ def gather_nww3_hour_at_nodes(
     # 0/360 度邊界附近直接對角度做線性平均（見模組 docstring）。角度慣例
     # 與 forcing.py 1946-1958 行、stokes_batch.py 完全一致：sin↔東分量、
     # cos↔北分量、atan2(東,北) 取回「正北為 0、順時針為正」的角度。
-    theta00, theta01, theta10, theta11 = np.deg2rad(dir00), np.deg2rad(dir01), np.deg2rad(dir10), np.deg2rad(dir11)
-    direction_x = w00 * np.sin(theta00) + w01 * np.sin(theta01) + w10 * np.sin(theta10) + w11 * np.sin(theta11)
-    direction_y = w00 * np.cos(theta00) + w01 * np.cos(theta01) + w10 * np.cos(theta10) + w11 * np.cos(theta11)
+    theta00 = np.deg2rad(dir00)
+    theta01 = np.deg2rad(dir01)
+    theta10 = np.deg2rad(dir10)
+    theta11 = np.deg2rad(dir11)
+    direction_x = (
+        w00 * np.sin(theta00) + w01 * np.sin(theta01) + w10 * np.sin(theta10) + w11 * np.sin(theta11)
+    )
+    direction_y = (
+        w00 * np.cos(theta00) + w01 * np.cos(theta01) + w10 * np.cos(theta10) + w11 * np.cos(theta11)
+    )
     degenerate_direction = (np.abs(direction_x) + np.abs(direction_y)) <= 1.0e-15
 
     physics_ok = (hs_interp >= 0.0) & (fp_interp > 0.0) & ~degenerate_direction

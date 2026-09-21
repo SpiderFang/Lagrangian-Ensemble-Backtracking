@@ -783,16 +783,21 @@ class PostprocessAccumulator:
                 "上限時才回傳），後處理拒絕接受未完成的批次結果"
             )
 
-        local_index_by_row = {int(row): local for local, row in enumerate(rows)}
+        # 兩種列位置不可混用：``result.row_particle_index`` 是全體身分表的列位置（全域），
+        # 而驅動層（``backward_driver``／``hour_major``）寫進 ``DepartureRecord`` 的
+        # ``row_particle_index`` 是「這個批次內」的局部位置 0..n-1。因此先以
+        # ``rows[局部位置]`` 轉成全域列位置，再與 ``final_status`` 逐顆比對。
         departure_status_by_row: dict[int, int] = {}
         for record in result.departures:
-            if record.row_particle_index not in local_index_by_row:
+            local = int(record.row_particle_index)
+            if local < 0 or local >= rows.size:
                 raise PostprocessError(
-                    f"批次 {batch_id!r} 的 DepartureRecord 參照了不在這個批次內的 row_particle_index"
+                    f"批次 {batch_id!r} 的 DepartureRecord 局部列位置 {local} 超出批次範圍 0..{rows.size - 1}"
                 )
-            if record.row_particle_index in departure_status_by_row:
+            global_row = int(rows[local])
+            if global_row in departure_status_by_row:
                 raise PostprocessError(f"批次 {batch_id!r} 對同一顆粒子回報了超過一筆 DepartureRecord")
-            departure_status_by_row[record.row_particle_index] = int(record.status)
+            departure_status_by_row[global_row] = int(record.status)
         for row_value, status_value in zip(rows.tolist(), final_status.tolist(), strict=True):
             departure_status = departure_status_by_row.get(row_value)
             if departure_status is None:

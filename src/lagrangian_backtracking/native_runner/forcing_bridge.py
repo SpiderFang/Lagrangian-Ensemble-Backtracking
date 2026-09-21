@@ -124,8 +124,8 @@ from pathlib import Path
 import numpy as np
 
 from ..forcing import OCMReconstructionPatchMonth
-from ..ocm_reconstruction import HOURLY_NS, GapSpec, discover_hourly_gaps
 from ..mesh import NativeMesh
+from ..ocm_reconstruction import HOURLY_NS, GapSpec, discover_hourly_gaps
 
 __all__ = [
     "ForcingBridgeError",

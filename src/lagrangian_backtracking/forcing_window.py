@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
@@ -287,14 +288,52 @@ class _MonthEntry:
             self.combined = {}
 
 
-def _sha256_file(path: Path) -> str:
-    """以串流方式計算小型重建檔案的 SHA-256，不把 patch 全檔讀入記憶體。"""
+# 已驗證雜湊快取的環境變數名稱。未設定時完全不使用快取，行為與舊版相同。
+CHECKSUM_CACHE_DIR_ENV = "LBT_CHECKSUM_CACHE_DIR"
 
+
+def _checksum_cache_entry(path: Path) -> Path | None:
+    """回傳這個檔案在已驗證雜湊快取中的紀錄檔位置；未啟用快取時回傳 ``None``。
+
+    為什麼需要：重建 patch 在網路磁碟上可達數十 GB，``load_month`` 每次都會對每個陣列
+    重算完整 SHA-256。平行運算時每個工作程序都各自重讀一次，I/O 放大數十倍。快取鍵是
+    「實際路徑＋檔案大小＋修改時間（奈秒）」：檔案內容一旦被改寫，大小或修改時間就會
+    改變，鍵不同便會重新完整計算，因此快取只省略「同一個未變動檔案」的重複讀取，
+    不放寬任何驗證。每個鍵一個小檔案、以原子改名寫入，多程序同時寫入也不需要鎖。
+    """
+
+    cache_dir = os.environ.get(CHECKSUM_CACHE_DIR_ENV)
+    if not cache_dir:
+        return None
+    stat = path.stat()
+    key = f"{os.path.realpath(path)}|{stat.st_size}|{stat.st_mtime_ns}"
+    return Path(cache_dir) / f"{hashlib.sha256(key.encode('utf-8')).hexdigest()}.sha256"
+
+
+def _sha256_file(path: Path) -> str:
+    """以串流方式計算重建檔案的 SHA-256，不把 patch 全檔讀入記憶體。
+
+    若設定了 ``LBT_CHECKSUM_CACHE_DIR``，同一個未變動檔案只完整計算一次（見
+    ``_checksum_cache_entry``）；比對仍由呼叫端 ``_validate_checksum`` 進行，
+    快取只儲存「這個檔案實際內容的雜湊」，不儲存「驗證通過」的判定。
+    """
+
+    entry = _checksum_cache_entry(path)
+    if entry is not None and entry.is_file():
+        cached = entry.read_text(encoding="ascii").strip()
+        if len(cached) == 64 and all(char in "0123456789abcdef" for char in cached):
+            return cached
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    value = digest.hexdigest()
+    if entry is not None:
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        tmp = entry.with_name(f"{entry.name}.{os.getpid()}.tmp")
+        tmp.write_text(value, encoding="ascii")
+        os.replace(tmp, entry)
+    return value
 
 
 def _read_json_object(path: Path, *, label: str) -> dict[str, object]:

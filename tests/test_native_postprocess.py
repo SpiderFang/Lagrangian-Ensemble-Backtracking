@@ -114,7 +114,8 @@ def _make_result(
     if departures is None:
         departures = [
             DepartureRecord(
-                row_particle_index=rows[i],
+                # 與驅動層一致：DepartureRecord 存的是批次內的局部列位置 0..n-1。
+                row_particle_index=i,
                 status=final_status[i],
                 x_m=final_x_m[i],
                 y_m=final_y_m[i],

@@ -104,6 +104,11 @@ __all__ = [
     "NativeWorkUnit",
     "NativeWorkUnitSpec",
     "plan_native_work_units",
+    "plan_native_hour_major_work_units",
+    "HourMajorSegmentPlanReport",
+    "estimate_segment_extra_cost_fraction",
+    "recommend_hour_major_segment_counts",
+    "plan_native_hour_major_segments",
     "NativeWorkPlanSummary",
     "summarize_native_work_plan",
     "estimate_formal_native_work_plan",
@@ -126,6 +131,7 @@ __all__ = [
     "read_progress_snapshot",
     "write_native_plan_file",
     "read_native_plan_file",
+    "read_native_hour_major_members",
 ]
 
 
@@ -359,6 +365,383 @@ def _validate_units_cover_table(table: ParticleIdentityTable, units: Sequence[Na
 
     groups = [BatchGroup(key=((("unit_id", u.unit_id),)), indices=u.particle_row_indices) for u in units]
     validate_batch_partition(table, groups)
+
+
+_HOUR_MAJOR_DOMAIN_UNIT_PREFIX = "hourmajor::"
+
+
+def plan_native_hour_major_work_units(
+    units: Sequence[NativeWorkUnit],
+) -> tuple[tuple[NativeWorkUnit, ...], Mapping[str, tuple[NativeWorkUnit, ...]]]:
+    """把 ``plan_native_work_units`` 產生的逐工作單元，依 ``flow_domain_id`` 併成
+    小時主軸排程（``hour_major.run_flow_domain_hour_major``）要用的「每個流場區域
+    一個」排程單元，供 ``run_native_plan`` 的既有執行引擎直接重用。
+
+    背景
+    ----
+    ``run_native_plan``／``plan_worker_schedule``／``filter_pending_units`` 這一整套
+    執行引擎（見模組文件「執行引擎」一節）完全是靠 ``NativeWorkUnit`` 的欄位在運作
+    （worker 指派看 ``particle_count``、續跑判斷看 ``input_hash``、完成證據檔名看
+    ``unit_id``），沒有任何一處假設「一個 ``NativeWorkUnit`` 只對應一次
+    ``run_backward_batch`` 呼叫」。因此小時主軸排程不需要另外重寫一套執行引擎，只要
+    把「同一個流場區域底下全部的逐工作單元」**摺疊成一個新的 ``NativeWorkUnit``**
+    （``unit_id`` 帶 ``"hourmajor::"`` 前綴、``flow_domain_id`` 不變、
+    ``particle_row_indices`` 是底下全部單元列位置的聯集），其餘四個鍵值
+    （``analysis_region_id``／``study_site_id``／``arrival_time_utc_ns``／
+    ``settling_velocity_mps``）在小時主軸這個更粗的粒度下沒有單一值可以代表，因此
+    填入本函式定義的 sentinel 值（``"__hour_major_domain__"``／``1``／``0.0``，
+    呼叫端一律不應該讀取這幾個欄位的值，只應該讀 ``unit_id``／
+    ``flow_domain_id``／``particle_row_indices``），把這批摺疊出來的
+    ``NativeWorkUnit`` 原封不動交給 ``run_native_plan`` 排程執行，就能重用它既有的
+    worker 指派、原子性完成證據、續跑判斷與進度快照，不必重寫。
+
+    真正「摺疊回去的原始逐工作單元是哪些」這個對照關係，``NativeWorkUnit`` 本身
+    （凍結 dataclass、欄位固定）放不下，所以另外用回傳值的第二項
+    ``members``（``{domain_unit_id: (原始 NativeWorkUnit, ...)}``）回傳；呼叫端的
+    ``run_unit(resources, spec)`` 回呼要能在子程序裡看到這個對照表，才能對
+    ``spec.unit_id`` 查出這個流場區域底下全部的到達時刻／沉降速度／測站組合，逐一
+    建出 ``hour_major.HourMajorSettlingGroupInput``（見 ``hour_major`` 模組文件
+    「分批粒度與 NativeWorkUnit 的關係」一節），再呼叫一次
+    ``hour_major.build_hour_major_domain_batch`` ＋
+    ``hour_major.run_flow_domain_hour_major`` 取得整個流場區域全部單元的結果，最後
+    把每個原始單元自己的 ``BackwardDriverResult`` 轉成 ``run_unit`` 該回傳的摘要字典
+    （即 ``NativeUnitOutcome``／``*.result.json`` 的內容）。這個轉接（如何把
+    ``members`` 這個對照表用可以跨 ``multiprocessing.spawn`` 序列化的方式送進
+    worker、如何從 ``ParticleIdentityTable`` 取得小時主軸需要的 ``x0_m``／``y0_m``／
+    ``z0_m``／``seed_hex``、如何取得各測站的 ``interest_regions`` 多邊形、如何取得
+    ``forcing_resolver``）需要 import 本模組刻意不依賴的重量級模組（見模組文件
+    「背景與定位」一節），因此留給 ``build_worker_resources``／``run_unit`` 的實作端
+    （即 ``production_wiring.py``）負責，不在本函式的職責範圍內。
+
+    參數與回傳
+    ----------
+    units:
+        ``plan_native_work_units`` 的輸出（或任何欄位相容的 ``NativeWorkUnit``
+        序列）。
+
+    回傳 ``(domain_units, members)``：``domain_units`` 依 ``flow_domain_id`` 字串
+    排序，每個流場區域恰好一個；``members[domain_unit.unit_id]`` 是該流場區域底下
+    的原始工作單元，依 ``unit_id`` 排序（確定性順序，與呼叫時 ``units`` 的原始
+    順序無關）。
+    """
+
+    if not units:
+        raise NativeOrchestratorError("小時主軸排程不可對空的工作單元清單規劃")
+
+    by_domain: dict[str, list[NativeWorkUnit]] = {}
+    for unit in units:
+        by_domain.setdefault(unit.flow_domain_id, []).append(unit)
+
+    domain_units: list[NativeWorkUnit] = []
+    members: dict[str, tuple[NativeWorkUnit, ...]] = {}
+    for flow_domain_id in sorted(by_domain):
+        member_units = tuple(sorted(by_domain[flow_domain_id], key=lambda u: u.unit_id))
+        all_rows = np.unique(np.concatenate([m.particle_row_indices for m in member_units]))
+        combined_hash = sha256(
+            "|".join(f"{m.unit_id}:{m.input_hash}" for m in member_units).encode("utf-8")
+        ).hexdigest()
+        domain_unit_id = f"{_HOUR_MAJOR_DOMAIN_UNIT_PREFIX}{flow_domain_id}__{combined_hash[:12]}"
+        domain_unit = NativeWorkUnit(
+            unit_id=domain_unit_id,
+            analysis_region_id="__hour_major_domain__",
+            flow_domain_id=flow_domain_id,
+            study_site_id="__hour_major_domain__",
+            arrival_time_utc_ns=1,
+            settling_velocity_mps=0.0,
+            particle_row_indices=all_rows,
+            input_hash=combined_hash,
+        )
+        domain_units.append(domain_unit)
+        members[domain_unit_id] = member_units
+
+    return tuple(domain_units), members
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-11：切段平行——把「每個流場區域一個」的小時主軸排程單元，依到達時刻
+# 進一步切成 K 段，讓核心數遠多於流場區域數的伺服器也能吃滿全部核心。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class HourMajorSegmentPlanReport:
+    """單一流場區域切段規劃的報表：段數、涵蓋範圍與估計的重疊額外成本。
+
+    「額外成本」是指段與段之間因為各自獨立回溯 ``max_backtrack_seconds``
+    （預設 30 天）而重複合成底場的小時數，相對於「完全不切段（``K=1``）只
+    合成一次」所多付出的比例；只是**分析式估計**（假設每小時固定開銷佔比
+    均勻），不是實際量測，見 ``estimate_segment_extra_cost_fraction`` 的說明。
+    """
+
+    flow_domain_id: str
+    segment_count: int
+    min_arrival_utc_ns: int
+    max_arrival_utc_ns: int
+    arrival_span_days: float
+    max_backtrack_days: float
+    estimated_extra_cost_fraction: float
+    segment_unit_ids: tuple[str, ...]
+    segment_arrival_counts: tuple[int, ...]
+
+
+def estimate_segment_extra_cost_fraction(
+    *, arrival_span_days: float, segment_count: int, max_backtrack_days: float
+) -> float:
+    """估計切成 ``segment_count`` 段後，因回溯窗重疊而多付出的小時計算比例。
+
+    推導：一個流場區域的到達時刻分布在 ``[t_min, t_max]``（跨距
+    ``arrival_span_days`` 天）；不切段時，小時主軸排程沿絕對時鐘從
+    ``t_max`` 走回 ``t_min - max_backtrack_days``，總共約
+    ``arrival_span_days + max_backtrack_days`` 天的「固定開銷小時」（乾濕＋
+    Stokes＋CFL 估計，與粒子數無關，見 ``hour_major`` 模組文件 9.1 節）。
+    切成 ``K`` 段、每段各自涵蓋約 ``arrival_span_days / K`` 天的到達時刻，
+    但各自仍要獨立回溯 ``max_backtrack_days`` 天，因此 ``K`` 段合計的固定
+    開銷小時約為 ``K × (arrival_span_days / K + max_backtrack_days)
+    = arrival_span_days + K × max_backtrack_days``。與不切段（``K=1``）的
+    ``arrival_span_days + max_backtrack_days`` 相比，多出的比例是：
+
+    ``(K - 1) × max_backtrack_days / (arrival_span_days + max_backtrack_days)``
+
+    這是**固定開銷小時數**的額外比例，不是總牆鐘時間的額外比例——後者還要
+    看固定開銷在總耗時裡的佔比（見 ``hour_major`` 模組文件 9.7 節「固定
+    開銷攤提的相對收益隨粒子數增加而下降」），本函式刻意只估計前者，呼叫端
+    在報告中應該連同粒子數規模的脈絡一起呈現，不應該單獨當成總牆鐘時間的
+    倍率使用。
+
+    範例：兩年資料（``arrival_span_days≈730``）切成 8 段、``max_backtrack_
+    days=30``：``(8-1)×30/(730+30) = 210/760 ≈ 0.276``，與工作包描述的
+    「額外成本約 1/3」量級一致（差異來自「跨距」定義用 730 或 760 當分母的
+    近似取捨，此函式選擇較保守、分母較小的 ``arrival_span_days +
+    max_backtrack_days``）。
+    """
+
+    if segment_count < 1:
+        raise NativeOrchestratorError("segment_count 必須是正整數")
+    if arrival_span_days < 0 or max_backtrack_days < 0:
+        raise NativeOrchestratorError("arrival_span_days／max_backtrack_days 不可為負")
+    denominator = arrival_span_days + max_backtrack_days
+    if denominator <= 0:
+        return 0.0
+    return (segment_count - 1) * max_backtrack_days / denominator
+
+
+def recommend_hour_major_segment_counts(
+    units: Sequence[NativeWorkUnit],
+    *,
+    target_worker_count: int,
+    max_backtrack_seconds: float = _DEFAULT_MAX_BACKTRACK_SECONDS,
+    max_segments_per_domain: int | None = None,
+) -> dict[str, int]:
+    """依目標平行度自動決定每個流場區域要切成幾段。
+
+    策略：把 ``target_worker_count`` 個「段」名額，依各流場區域的粒子總數
+    佔比分配（粒子數愈多的區域分到愈多段，讓每段的計算量盡量平衡），每個
+    區域至少分到 1 段；受限於這個區域實際的相異到達時刻數（不能切出比到達
+    時刻數更多的段，否則會有空段）。這是**啟發式**分配，不保證嚴格最佳
+    makespan——精確排程仍需搭配 ``plan_worker_schedule`` 對切段後的實際
+    工作單元重新做 LPT 裝箱。
+
+    ``max_segments_per_domain`` 提供時額外夾住每個區域的段數上限，避免
+    ``estimate_segment_extra_cost_fraction`` 估計的重疊額外成本過高（呼叫端
+    可以先用該函式估算不同 ``K`` 的額外成本，再據此設定這個上限）。
+    """
+
+    if target_worker_count < 1:
+        raise NativeOrchestratorError("target_worker_count 必須是正整數")
+    if not units:
+        raise NativeOrchestratorError("units 不可為空")
+
+    by_domain: dict[str, list[NativeWorkUnit]] = {}
+    for unit in units:
+        by_domain.setdefault(unit.flow_domain_id, []).append(unit)
+
+    particle_counts = {
+        domain: sum(u.particle_count for u in domain_units) for domain, domain_units in by_domain.items()
+    }
+    distinct_arrival_counts = {
+        domain: len({u.arrival_time_utc_ns for u in domain_units})
+        for domain, domain_units in by_domain.items()
+    }
+    total_particles = sum(particle_counts.values()) or 1
+
+    result: dict[str, int] = {}
+    for domain in sorted(by_domain):
+        share = particle_counts[domain] / total_particles
+        raw = max(1, round(target_worker_count * share))
+        cap = distinct_arrival_counts[domain]
+        if max_segments_per_domain is not None:
+            cap = min(cap, max_segments_per_domain)
+        result[domain] = max(1, min(raw, cap))
+    return result
+
+
+def plan_native_hour_major_segments(
+    units: Sequence[NativeWorkUnit],
+    *,
+    segment_count: int | Mapping[str, int] | None = None,
+    target_worker_count: int | None = None,
+    max_backtrack_seconds: float = _DEFAULT_MAX_BACKTRACK_SECONDS,
+) -> tuple[
+    tuple[NativeWorkUnit, ...],
+    Mapping[str, tuple[NativeWorkUnit, ...]],
+    tuple[HourMajorSegmentPlanReport, ...],
+]:
+    """``plan_native_hour_major_work_units`` 的切段版本：每個流場區域切成 K 段。
+
+    每段各自摺疊成一個 ``hourmajor::`` 排程單元（沿用同一套 sentinel 欄位
+    與 ``members`` 對照表機制，見 ``plan_native_hour_major_work_units``
+    docstring），因此可以原封不動交給既有 ``run_native_plan`` 執行引擎，唯一
+    差異是同一個流場區域現在對應多個排程單元（``K`` 個），可以分派給不同
+    worker 平行執行。
+
+    **正確性保證（切段不得改變任何粒子的結果）**：切段只改變「哪些
+    ``NativeWorkUnit`` 被摺進同一次 ``run_flow_domain_hour_major`` 呼叫」，
+    不改變任何粒子的起點、seed 或亂數串流；``hour_major`` 模組的計數器型
+    亂數與逐單元位元等價驗收（``tests/test_native_hour_major.py``）已經
+    證明「同一顆粒子併入不同批次組成跑，結果位元相同」，切段是這個既有
+    不變量的直接應用——``K=1``（全部單元併一段，等同
+    ``plan_native_hour_major_work_units`` 的行為）與 ``K>1`` 對同一顆粒子
+    必須得到位元相同的最終狀態，這是本函式的核心驗收要求，見
+    ``tests/test_native_hour_major_provider.py``。
+
+    切段依據：對每個流場區域，把該區域內全部相異 ``arrival_time_utc_ns``
+    由舊到新排序後，切成 ``K`` 個盡量等長（相差至多 1 個到達時刻）的連續
+    區段；每個 ``NativeWorkUnit`` 依自己的到達時刻歸入對應區段。這保證每段
+    的回溯窗聯集是「該段最早到達時刻 − max_backtrack_seconds 至該段最晚
+    到達時刻」的一個連續區間，段與段之間只在回溯窗重疊處重複計算，不會有
+    「同一到達時刻被拆進兩段」這種需要額外去重邏輯的情況。
+
+    Args:
+        units: ``plan_native_work_units`` 的輸出。
+        segment_count: 每個流場區域要切的段數；可以是單一整數（套用到全部
+            區域）、``{flow_domain_id: K}`` 對照表（逐區域指定），或
+            ``None``（改用 ``target_worker_count`` 透過
+            ``recommend_hour_major_segment_counts`` 自動決定）。
+        target_worker_count: ``segment_count`` 為 ``None`` 時，傳給
+            ``recommend_hour_major_segment_counts`` 的目標平行度（通常是
+            可用核心數）。兩者都是 ``None`` 時等同 ``segment_count=1``
+            （不切段，行為與 ``plan_native_hour_major_work_units`` 相同）。
+        max_backtrack_seconds: 只用於 ``HourMajorSegmentPlanReport`` 的額外
+            成本估計，不影響實際切段（實際回溯窗長度仍由 ``hour_major``
+            執行時的 ``HourMajorConfig.max_backtrack_seconds`` 決定）。
+
+    Returns:
+        ``(domain_units, members, reports)``；``domain_units``／``members``
+        語意與 ``plan_native_hour_major_work_units`` 相同（只是每個流場
+        區域可能對應多個排程單元），``reports`` 是逐區域的切段規劃報表，
+        依 ``flow_domain_id`` 排序。
+    """
+
+    if not units:
+        raise NativeOrchestratorError("小時主軸切段排程不可對空的工作單元清單規劃")
+
+    by_domain: dict[str, list[NativeWorkUnit]] = {}
+    for unit in units:
+        by_domain.setdefault(unit.flow_domain_id, []).append(unit)
+
+    if segment_count is None:
+        if target_worker_count is None:
+            resolved_counts: dict[str, int] = {domain: 1 for domain in by_domain}
+        else:
+            resolved_counts = recommend_hour_major_segment_counts(
+                units, target_worker_count=target_worker_count, max_backtrack_seconds=max_backtrack_seconds
+            )
+    elif isinstance(segment_count, Mapping):
+        resolved_counts = {domain: int(segment_count.get(domain, 1)) for domain in by_domain}
+    else:
+        resolved_counts = {domain: int(segment_count) for domain in by_domain}
+
+    max_backtrack_days = max_backtrack_seconds / 86400.0
+    domain_units: list[NativeWorkUnit] = []
+    members: dict[str, tuple[NativeWorkUnit, ...]] = {}
+    reports: list[HourMajorSegmentPlanReport] = []
+
+    for flow_domain_id in sorted(by_domain):
+        domain_member_units = by_domain[flow_domain_id]
+        distinct_arrivals = sorted({int(u.arrival_time_utc_ns) for u in domain_member_units})
+        k = resolved_counts.get(flow_domain_id, 1)
+        if k < 1:
+            raise NativeOrchestratorError(f"流場區域 {flow_domain_id!r} 的段數必須是正整數，實際={k}")
+        k = min(k, len(distinct_arrivals))  # 不切出比相異到達時刻數更多的段，避免空段
+
+        chunks = _split_sorted_into_k_chunks(distinct_arrivals, k)
+        arrival_to_segment: dict[int, int] = {}
+        for segment_index, chunk in enumerate(chunks):
+            for arrival in chunk:
+                arrival_to_segment[arrival] = segment_index
+
+        segment_members: list[list[NativeWorkUnit]] = [[] for _ in chunks]
+        for unit in domain_member_units:
+            segment_members[arrival_to_segment[int(unit.arrival_time_utc_ns)]].append(unit)
+
+        segment_unit_ids: list[str] = []
+        arrival_span_days = (distinct_arrivals[-1] - distinct_arrivals[0]) / (86400.0 * 1_000_000_000.0)
+        segment_arrival_counts: list[int] = []
+        for segment_index, member_units in enumerate(segment_members):
+            member_units_sorted = tuple(sorted(member_units, key=lambda u: u.unit_id))
+            all_rows = np.unique(np.concatenate([m.particle_row_indices for m in member_units_sorted]))
+            combined_hash = sha256(
+                "|".join(f"{m.unit_id}:{m.input_hash}" for m in member_units_sorted).encode("utf-8")
+            ).hexdigest()
+            domain_unit_id = (
+                f"{_HOUR_MAJOR_DOMAIN_UNIT_PREFIX}{flow_domain_id}__seg{segment_index}of{len(chunks)}"
+                f"__{combined_hash[:12]}"
+            )
+            domain_unit = NativeWorkUnit(
+                unit_id=domain_unit_id,
+                analysis_region_id="__hour_major_domain__",
+                flow_domain_id=flow_domain_id,
+                study_site_id="__hour_major_domain__",
+                arrival_time_utc_ns=1,
+                settling_velocity_mps=0.0,
+                particle_row_indices=all_rows,
+                input_hash=combined_hash,
+            )
+            domain_units.append(domain_unit)
+            members[domain_unit_id] = member_units_sorted
+            segment_unit_ids.append(domain_unit_id)
+            segment_arrival_counts.append(len(member_units_sorted))
+
+        reports.append(
+            HourMajorSegmentPlanReport(
+                flow_domain_id=flow_domain_id,
+                segment_count=len(chunks),
+                min_arrival_utc_ns=distinct_arrivals[0],
+                max_arrival_utc_ns=distinct_arrivals[-1],
+                arrival_span_days=arrival_span_days,
+                max_backtrack_days=max_backtrack_days,
+                estimated_extra_cost_fraction=estimate_segment_extra_cost_fraction(
+                    arrival_span_days=arrival_span_days,
+                    segment_count=len(chunks),
+                    max_backtrack_days=max_backtrack_days,
+                ),
+                segment_unit_ids=tuple(segment_unit_ids),
+                segment_arrival_counts=tuple(segment_arrival_counts),
+            )
+        )
+
+    return tuple(domain_units), members, tuple(reports)
+
+
+def _split_sorted_into_k_chunks(sorted_values: Sequence[int], k: int) -> list[list[int]]:
+    """把已排序的序列切成 ``k`` 個盡量等長（相差至多 1）的連續區塊。
+
+    前 ``n % k`` 個區塊多分到 1 個元素，其餘區塊平分，確保 ``k`` 個區塊的
+    聯集恰好是原序列、彼此不重疊、且保持原本的排序（每個區塊內部與區塊之間
+    都遞增），這是切段要求「每段涵蓋連續到達時刻區間」的直接實作。
+    """
+
+    n = len(sorted_values)
+    if k < 1 or k > n:
+        raise NativeOrchestratorError(f"k 必須介於 1 與序列長度 {n} 之間，實際 k={k}")
+    base, extra = divmod(n, k)
+    chunks: list[list[int]] = []
+    cursor = 0
+    for index in range(k):
+        size = base + (1 if index < extra else 0)
+        chunks.append(list(sorted_values[cursor : cursor + size]))
+        cursor += size
+    return chunks
 
 
 @dataclass(frozen=True, slots=True)
@@ -1346,12 +1729,24 @@ def write_native_plan_file(
     gap_checks: Sequence[ArrivalGapCheck],
     summary: NativeWorkPlanSummary,
     manifest: Mapping[str, Any] | None = None,
+    hour_major_members: Mapping[str, Sequence[NativeWorkUnit]] | None = None,
 ) -> None:
     """把規劃結果（工作單元、缺口檢查、規模摘要、manifest）寫成單一 JSON 計畫檔。
 
     ``lbt native-plan`` 只產生這個檔案、不執行任何計算；``lbt native-run`` 讀入
     這個檔案重建 ``NativeWorkUnit`` 序列後才開始排程與執行，兩個命令因此可以在
     不同時間、甚至不同人核准後才分別執行。
+
+    ``hour_major_members``：只在 ``units`` 是 ``plan_native_hour_major_work_units``
+    摺疊過的「每個流場區域一個」排程單元時才提供，內容是該函式回傳的
+    ``members`` 對照表（``{domain_unit_id: (原始逐工作單元 NativeWorkUnit, ...)}``）
+    原封不動寫進去；``lbt native-run`` 本身不需要讀這個欄位（``run_native_plan``
+    只依賴 ``units`` 本身），但 ``--resource-provider`` 指定的 ``run_unit`` 實作
+    （即 ``production_wiring.py``）需要它才能對 ``hourmajor::`` 開頭的
+    ``spec.unit_id`` 查出底下實際涵蓋哪些到達時刻／沉降速度／測站組合——它可以
+    用 ``read_native_plan_file`` 再讀一次同一個計畫檔路徑（native-run 呼叫時已經
+    知道這個路徑），取回的 payload 裡就有這個欄位，見
+    ``read_native_hour_major_members`` 的重建方式。
     """
 
     unsafe = [check for check in gap_checks if not check.is_gap_safe]
@@ -1364,6 +1759,11 @@ def write_native_plan_file(
     }
     if manifest is not None:
         payload["manifest"] = dict(manifest)
+    if hour_major_members is not None:
+        payload["hour_major_members"] = {
+            domain_unit_id: [_work_unit_to_record(member) for member in members]
+            for domain_unit_id, members in hour_major_members.items()
+        }
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(output_path, payload)
@@ -1375,3 +1775,21 @@ def read_native_plan_file(path: str | Path) -> tuple[tuple[NativeWorkUnit, ...],
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     units = tuple(_work_unit_from_record(record) for record in payload["units"])
     return units, payload
+
+
+def read_native_hour_major_members(
+    payload: Mapping[str, Any],
+) -> Mapping[str, tuple[NativeWorkUnit, ...]]:
+    """從 ``read_native_plan_file`` 回傳的 payload 重建 ``hour_major_members``。
+
+    只有用 ``--schedule hour-major`` 寫出的計畫檔才有這個欄位；其餘情況回傳空
+    字典（呼叫端可以用 ``bool(members)`` 判斷這份計畫是不是小時主軸排程）。
+    """
+
+    raw = payload.get("hour_major_members")
+    if not raw:
+        return {}
+    return {
+        domain_unit_id: tuple(_work_unit_from_record(record) for record in records)
+        for domain_unit_id, records in raw.items()
+    }

@@ -169,7 +169,7 @@ import sys
 import threading
 import types
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -208,7 +208,10 @@ __all__ = [
     "compute_smagorinsky_kh_field",
     "compute_wet_dry_flags",
     "estimate_substep_count",
+    "particle_bed_z_levels",
     "derive_batch_diffusion_seed",
+    "derive_particle_diffusion_seed_lo_hi_u64",
+    "counter_based_gaussian_pairs",
     "SubstepDiagnostics",
     "HourlyOverheadDiagnostics",
     "mirror_rk4_substep_loop",
@@ -697,7 +700,9 @@ def compute_smagorinsky_kh_field(
 # ── 垂向 z：與 compute_z_levels_lsc 相同公式的向量化版本（僅供場合成用）────
 
 
-def _vectorized_z_levels(sigma_lcl: np.ndarray, kbp: np.ndarray, dp: np.ndarray, eta: np.ndarray) -> np.ndarray:
+def _vectorized_z_levels(
+    sigma_lcl: np.ndarray, kbp: np.ndarray, dp: np.ndarray, eta: np.ndarray
+) -> np.ndarray:
     """向量化計算 ``(nvrt, nnode)`` 的節點垂向 z（公尺），公式與
     ``vertical.compute_z_levels_lsc`` 完全相同：
     ``z = eta + sigma_lcl[k] * (dp + eta)``，``k < kbp`` 的層 clamp 成
@@ -785,6 +790,18 @@ class ComposedCurrentAndStokesFields:
     ``effective_mask`` 是 ``(nvrt, nnode)`` 布林陣列，``True`` 代表「濕節點
     且在該節點的有效垂向層（``k>=kbp``）」，沉降速度只應該加在這個遮罩內
     ——直接暴露出來，讓 ``apply_settling_velocity`` 不必重新計算一次。
+
+    ``stokes_points_evaluated``／``stokes_points_possible``（WP-9 效能診斷）
+    ------------------------------------------------------------------------
+    見 ``compose_current_and_stokes_fields`` 的 ``stokes_depth_threshold_ratio``
+    參數：啟用「Stokes 深度截斷」優化時，這兩個欄位分別是「真正呼叫過
+    ``batch_finite_depth_stokes`` 求解色散關係與垂向 Stokes 分佈的
+    (層,節點) 點數」與「``effective_mask`` 內的 (層,節點) 總點數」；比值
+    即為深度截斷後真正需要重算 Stokes 的點數比例，供效能報告量化優化效果
+    （見模組文件與最終報告）。未提供波浪場（不需要算 Stokes）時，兩者
+    一律是 0；提供波浪場但未啟用截斷（``stokes_depth_threshold_ratio=
+    None``）時，兩者相等且等於 ``effective_mask`` 內的點數（代表「全部
+    點都照舊計算，沒有跳過任何一個」，不是「未使用這組計數」）。
     """
 
     u_field1: np.ndarray
@@ -798,6 +815,8 @@ class ComposedCurrentAndStokesFields:
     elem_is_dry: np.ndarray
     effective_mask: np.ndarray
     stokes_ok_fraction: float
+    stokes_points_evaluated: int = 0
+    stokes_points_possible: int = 0
 
 
 def _zero_dry_and_below_kbp(
@@ -833,6 +852,7 @@ def compose_current_and_stokes_fields(
     wave_field2: WaveFieldAtNodes | None = None,
     gravity_mps2: float = GRAVITY_MPS2,
     surface_tolerance_m: float = 5.0e-6,
+    stokes_depth_threshold_ratio: float | None = None,
 ) -> ComposedCurrentAndStokesFields:
     """``compose_total_velocity_fields`` 拆成兩階段後，計算「與沉降速度無關」
     的那一半（乾濕判定＋歸零＋Stokes 全網格計算），供多個沉降速度批次共用。
@@ -854,14 +874,61 @@ def compose_current_and_stokes_fields(
     Args:
         與 ``compose_total_velocity_fields`` 相同，唯獨不接受
         ``settling_velocity_mps``。
+        stokes_depth_threshold_ratio: WP-9 新增的「Stokes 深度截斷」優化
+            開關與門檻。``None``（預設）：完全不啟用，行為與此參數新增前
+            逐位元相同（``compose_total_velocity_fields`` 原本 1-3 步）—
+            —這是 ``run_backward_batch`` 的預設值，確保既有測試與呼叫端
+            不受影響。給定 ``(0, 1)`` 開區間的值時，啟用截斷：
+
+            物理依據——有限水深 Stokes 表面漂流的垂向結構是
+            ``exp(2 k z)``（``k`` 為波數、``z`` 為相對海面的深度，負值），
+            等價於工作書式(7)常寫成的 ``exp(4π z / L)``（``L=2π/k`` 為
+            波長）；這是隨深度單調遞減的指數衰減，與粒子的沉降速度、到達
+            時刻、測站完全無關，只跟這一小時、這一節點的波浪參數與水深
+            有關。當 ``exp(2kz)`` 相對表面值（``z=0``）已經小於
+            ``stokes_depth_threshold_ratio`` 時，即使不計算，也已經比
+            NWW3 輸入的 ``Hs``／``fp``／波向本身的觀測與內插不確定度小了
+            幾個數量級，直接視為 0 不會造成有意義的科學誤差；門檻越小，
+            截斷越保守（保留越多層），``1e-3``（千分之一）是一個合理、
+            保守的預設，對應「衰減到千分之一以下視為可忽略」，可由呼叫端
+            依實際近岸波浪不確定度調整。
+
+            實作：**先**對每個節點在 ``z=0`` 呼叫一次
+            ``batch_finite_depth_stokes``（``nnode`` 個點，而不是
+            ``nvrt*nnode`` 個點）求出波數 ``k``——色散關係求根本身完全不
+            依賴 ``z``（見 ``stokes_batch.py`` ``_solve_wave_number_embedded``
+            docstring 與原始碼，同一節點在不同垂向層的 ``Hs``／``fp``／
+            水深皆相同，因此 ``k`` 對同一節點的每一層都相同），這一步的
+            成本只有原本「對全部 ``nvrt`` 層都各自重新求解一次色散關係」
+            的 ``1/nvrt``；**再**用求出的 ``k`` 算出每個節點的截斷深度
+            （``z_cutoff = ln(threshold) / (2k)``），只對「淺於截斷深度」
+            且在 ``effective_mask`` 內的 (層,節點) 組合，第二次呼叫
+            ``batch_finite_depth_stokes``（陣列縮小成只含這些點，用布林
+            fancy indexing 選取、計算後再散回原陣列，深於截斷深度的位置
+            維持 0，效果等同「衰減後貢獻視為 0」）。第二次呼叫仍然會對
+            保留下來的每個點重新求解一次色散關係（``batch_finite_depth_stokes``
+            把求解 ``k`` 與套用垂向結構耦合在同一個 njit 函式內，本模組
+            依專案規定不修改該檔案，因此無法直接重用第一次呼叫已經解出的
+            ``k``），但因為保留點數遠少於 ``nvrt*nnode``（近岸淺水站點
+            可能仍需保留全部或大部分層，外海深水站點通常只需保留表層附近
+            少數幾層），總求解次數仍遠低於未截斷時的 ``nvrt*nnode`` 次，
+            見 ``stokes_points_evaluated``／``stokes_points_possible`` 與
+            最終報告的量化結果。任何節點若第一次呼叫本身狀態非
+            ``STOKES_BATCH_STATUS_OK``（例如波浪缺值、QC 不通過、色散求根
+            失敗），一律**不截斷**（該節點全部層都納入第二次呼叫，交由
+            正常的逐層狀態碼判定），避免在「不確定波數」的節點錯誤地跳過
+            本來就該正常計算（或正常回報缺值）的層——寧可多算，不可少算。
 
     Raises:
         BackwardDriverError: ``wave_field1``／``wave_field2`` 只提供其中
-            一個（必須同時提供或同時不提供）。
+            一個（必須同時提供或同時不提供），或
+            ``stokes_depth_threshold_ratio`` 不在 ``(0, 1)`` 開區間內。
     """
 
     if (wave_field1 is None) != (wave_field2 is None):
         raise BackwardDriverError("wave_field1 與 wave_field2 必須同時提供或同時不提供")
+    if stokes_depth_threshold_ratio is not None and not (0.0 < stokes_depth_threshold_ratio < 1.0):
+        raise BackwardDriverError("stokes_depth_threshold_ratio 必須落在 (0, 1) 開區間內")
 
     grid = driver_grid.grid
     node_is_dry, elem_is_dry = compute_wet_dry_flags(driver_grid, handles, eta_m=field_pair.eta_field1)
@@ -883,9 +950,17 @@ def compose_current_and_stokes_fields(
 
     stokes_ok_count = 0
     stokes_total_count = 0
+    stokes_points_evaluated = 0
+    stokes_points_possible = 0
     if wave_field1 is not None and wave_field2 is not None:
-        z1 = _vectorized_z_levels(grid.sigma_lcl, kbp, dp, field_pair.eta_field1) - field_pair.eta_field1[None, :]
-        z2 = _vectorized_z_levels(grid.sigma_lcl, kbp, dp, field_pair.eta_field2) - field_pair.eta_field2[None, :]
+        z1 = (
+            _vectorized_z_levels(grid.sigma_lcl, kbp, dp, field_pair.eta_field1)
+            - field_pair.eta_field1[None, :]
+        )
+        z2 = (
+            _vectorized_z_levels(grid.sigma_lcl, kbp, dp, field_pair.eta_field2)
+            - field_pair.eta_field2[None, :]
+        )
         for z_rel, u_field, v_field, wave in (
             (z1, u1, v1, wave_field1),
             (z2, u2, v2, wave_field2),
@@ -897,30 +972,78 @@ def compose_current_and_stokes_fields(
             valid_grid = np.broadcast_to(wave.valid_mask_wave[None, :], (nvrt, nnode))
             qc_grid = np.broadcast_to(wave.qc_flags[None, :], (nvrt, nnode))
 
-            n = nvrt * nnode
-            stokes_u = np.empty(n, dtype=np.float64)
-            stokes_v = np.empty(n, dtype=np.float64)
-            wave_number = np.empty(n, dtype=np.float64)
-            status = np.empty(n, dtype=np.int32)
-            batch_finite_depth_stokes(
-                hs_grid.reshape(-1).copy(),
-                fp_grid.reshape(-1).copy(),
-                dir_grid.reshape(-1).copy(),
-                z_rel.reshape(-1).copy(),
-                depth_grid.reshape(-1).copy(),
-                valid_grid.reshape(-1).copy(),
-                qc_grid.reshape(-1).astype(np.int64).copy(),
-                stokes_u,
-                stokes_v,
-                wave_number,
-                status,
-                float(gravity_mps2),
-                float(surface_tolerance_m),
-            )
-            ok = (status.reshape(nvrt, nnode) == STOKES_BATCH_STATUS_OK) & effective_mask
-            u_field[ok] += stokes_u.reshape(nvrt, nnode)[ok]
-            v_field[ok] += stokes_v.reshape(nvrt, nnode)[ok]
-            stokes_ok_count += int(np.count_nonzero(ok))
+            # 決定這一次呼叫實際要計算 Stokes 的 (層,節點) 遮罩：未啟用深度
+            # 截斷時就是整個 effective_mask（與此優化新增前完全相同）；啟用
+            # 時先以 nnode 個點的表層 (z=0) 呼叫求出每個節點的波數，據此縮小
+            # 遮罩，詳見本函式 docstring「stokes_depth_threshold_ratio」一節。
+            if stokes_depth_threshold_ratio is None:
+                stokes_mask = effective_mask
+            else:
+                zero_z_at_nodes = np.zeros(nnode, dtype=np.float64)
+                surface_u = np.empty(nnode, dtype=np.float64)
+                surface_v = np.empty(nnode, dtype=np.float64)
+                surface_k = np.empty(nnode, dtype=np.float64)
+                surface_status = np.empty(nnode, dtype=np.int32)
+                batch_finite_depth_stokes(
+                    np.ascontiguousarray(wave.significant_wave_height_m, dtype=np.float64),
+                    np.ascontiguousarray(wave.peak_frequency_hz, dtype=np.float64),
+                    np.ascontiguousarray(wave.direction_raw_deg, dtype=np.float64),
+                    zero_z_at_nodes,
+                    np.ascontiguousarray(dp, dtype=np.float64),
+                    np.ascontiguousarray(wave.valid_mask_wave, dtype=bool),
+                    np.ascontiguousarray(wave.qc_flags, dtype=np.int64),
+                    surface_u,
+                    surface_v,
+                    surface_k,
+                    surface_status,
+                    float(gravity_mps2),
+                    float(surface_tolerance_m),
+                )
+                k_known = (
+                    (surface_status == STOKES_BATCH_STATUS_OK)
+                    & np.isfinite(surface_k)
+                    & (surface_k > 0.0)
+                )
+                # 波數不確定的節點一律不截斷（cutoff 設成 -inf，等同「全部
+                # 深度都視為顯著」），寧可多算也不可漏算；波數已知的節點才
+                # 依 exp(2kz)>=threshold 反推出截斷深度 z_cutoff（負值）。
+                cutoff_z_node = np.where(
+                    k_known,
+                    np.log(stokes_depth_threshold_ratio) / (2.0 * np.where(k_known, surface_k, 1.0)),
+                    -np.inf,
+                )
+                cutoff_z_grid = np.broadcast_to(cutoff_z_node[None, :], (nvrt, nnode))
+                stokes_mask = effective_mask & (z_rel >= cutoff_z_grid)
+
+            n_kept = int(np.count_nonzero(stokes_mask))
+            stokes_points_evaluated += n_kept
+            stokes_points_possible += int(np.count_nonzero(effective_mask))
+            if n_kept > 0:
+                stokes_u = np.empty(n_kept, dtype=np.float64)
+                stokes_v = np.empty(n_kept, dtype=np.float64)
+                wave_number = np.empty(n_kept, dtype=np.float64)
+                status = np.empty(n_kept, dtype=np.int32)
+                batch_finite_depth_stokes(
+                    np.ascontiguousarray(hs_grid[stokes_mask], dtype=np.float64),
+                    np.ascontiguousarray(fp_grid[stokes_mask], dtype=np.float64),
+                    np.ascontiguousarray(dir_grid[stokes_mask], dtype=np.float64),
+                    np.ascontiguousarray(z_rel[stokes_mask], dtype=np.float64),
+                    np.ascontiguousarray(depth_grid[stokes_mask], dtype=np.float64),
+                    np.ascontiguousarray(valid_grid[stokes_mask], dtype=bool),
+                    np.ascontiguousarray(qc_grid[stokes_mask], dtype=np.int64),
+                    stokes_u,
+                    stokes_v,
+                    wave_number,
+                    status,
+                    float(gravity_mps2),
+                    float(surface_tolerance_m),
+                )
+                ok_kept = status == STOKES_BATCH_STATUS_OK
+                ok = np.zeros((nvrt, nnode), dtype=bool)
+                ok[stokes_mask] = ok_kept
+                u_field[ok] += stokes_u[ok_kept]
+                v_field[ok] += stokes_v[ok_kept]
+                stokes_ok_count += int(np.count_nonzero(ok_kept))
             stokes_total_count += int(np.count_nonzero(effective_mask))
 
     # 這裡不加沉降，因此不需要在此再做一次歸零：u1/v1/u2/v2 已在上面歸零過，
@@ -943,6 +1066,8 @@ def compose_current_and_stokes_fields(
         elem_is_dry=elem_is_dry,
         effective_mask=effective_mask,
         stokes_ok_fraction=stokes_ok_fraction,
+        stokes_points_evaluated=stokes_points_evaluated,
+        stokes_points_possible=stokes_points_possible,
     )
 
 
@@ -1017,6 +1142,7 @@ def compose_total_velocity_fields(
     wave_field2: WaveFieldAtNodes | None = None,
     gravity_mps2: float = GRAVITY_MPS2,
     surface_tolerance_m: float = 5.0e-6,
+    stokes_depth_threshold_ratio: float | None = None,
 ) -> ComposedFieldPair:
     """把海流、Stokes 漂流（WP-3）、沉降速度合成為 kernel 用的總速度場。
 
@@ -1062,6 +1188,9 @@ def compose_total_velocity_fields(
             單一常數；呼叫端必須先以
             ``validate_settling_velocity_homogeneous_batches`` 確認同批
             粒子共用同一個值。
+        stokes_depth_threshold_ratio: 直接透傳給
+            ``compose_current_and_stokes_fields``，見該函式 docstring；
+            預設 ``None`` 不啟用截斷，行為與此參數新增前完全相同。
 
     Raises:
         BackwardDriverError: ``wave_field1``／``wave_field2`` 只提供其中
@@ -1077,6 +1206,7 @@ def compose_total_velocity_fields(
         wave_field2=wave_field2,
         gravity_mps2=gravity_mps2,
         surface_tolerance_m=surface_tolerance_m,
+        stokes_depth_threshold_ratio=stokes_depth_threshold_ratio,
     )
     return apply_settling_velocity(base, settling_velocity_mps, kbp=driver_grid.grid.kbp)
 
@@ -1100,7 +1230,8 @@ def estimate_substep_count(
     ``cfl_number=0.5``，即子步位移不超過半個最小網格邊長）；真正決定
     ``ndeltp`` 的是兩者中較嚴格（``ndeltp`` 較大）的那一個：
 
-    ``ndeltp = max(ceil(dt_seconds / dt_max_seconds), ceil(dt_seconds * max_speed / (cfl_number * min_edge_length)))``
+    ``ndeltp = max(ceil(dt_seconds / dt_max_seconds),``
+    ``              ceil(dt_seconds * max_speed / (cfl_number * min_edge_length)))``
 
     ``max_speed`` 取這一小時合成後總速度場（含 Stokes、沉降）在所有濕、
     有效層節點上的最大水平速度量值；若場中沒有任何有限速度（例如整個
@@ -1174,6 +1305,173 @@ def derive_batch_diffusion_seed(seed_hex_values: Sequence[str], *, master_seed: 
     return int.from_bytes(digest[:8], "big", signed=False)
 
 
+# ── WP-9：計數器型（counter-based）擴散亂數 ──────────────────────────────────
+#
+# 背景（為什麼要新增這一套，取代 derive_batch_diffusion_seed 的預設用途）
+# ------------------------------------------------------------------------
+# ``derive_batch_diffusion_seed``＋共用 ``Generator`` 的方案，刻意選擇
+# 「向量化優先」，代價是同一顆粒子的擴散序列與「這顆粒子被分到哪一個批次、
+# 批次內排在第幾列」綁定（見該函式 docstring 的取捨說明）。WP-9 的小時主軸
+# 排程刻意把「同一到達時刻、同一測站」的粒子，與「其他到達時刻、其他測站」
+# 但沉降速度相同的粒子合併成同一次 kernel 呼叫（見 ``hour_major.py`` 模組
+# 文件），批次的組成與列序因此不再是恆定不變的實驗設計參數，而是排程演算法
+# 的實作細節（例如換一種排程策略、換一種 worker 數，同一顆粒子仍應得到完全
+# 相同的擴散序列）。若繼續用共用 ``Generator`` 的方案，排程細節的變動會讓
+# 擴散序列跟著變，這既違反「正確性不可妥協」，也讓「小時主軸與逐單元路徑
+# 位元相同」這條驗收標準無法成立。
+#
+# 解法：**計數器型（counter-based）亂數**——不維護任何有狀態的 RNG 物件、
+# 不依賴呼叫順序，而是把「這顆粒子的固定種子」與「這顆粒子自己的子步計數器
+# （從牠被啟動那一刻起算，每套用一次擴散就加一，累加跨越小時邊界）」一起
+# 雜湊，直接算出這一步要用的常態亂數。這樣一來，只要滿足兩個physically
+# 保證成立的條件——(a) 同一顆粒子每次重新執行同一個實驗設計，都會在同一個
+# UTC 走到同一個累積子步序號（因為 ``estimate_substep_count`` 算出的
+# ``ndeltp`` 只跟「流場區域、這一個小時」有關，見該函式 docstring，與批次
+# 組成、沉降速度、到達時刻本身都無關）；(b) 每顆粒子有自己獨一無二、與其他
+# 粒子無關的種子——這顆粒子的擴散序列就與批次組成、列序、worker 數完全
+# 無關，可以在合併／不合併、單執行緒／多執行緒之間位元相同地重現。
+#
+# 演算法：SplitMix64（Steele, Lea & Flood 2014 提出，Java
+# ``SplittableRandom``／多個現代 PRNG 函式庫採用的 64-bit 狀態終結函式，
+# 已發表且廣泛測試過雪崩效應與統計品質）的終結混合函式
+# （``_splitmix64_finalize``），先把粒子的 128-bit 種子（拆成 ``seed_lo``／
+# ``seed_hi`` 兩個 64-bit 半段）二次混合成一個 64-bit 「粒子專屬狀態種子」，
+# 再對每個子步計數器 ``counter`` 算出
+# ``state = seed_mixed + counter * GOLDEN_GAMMA``（``GOLDEN_GAMMA`` 是
+# SplitMix64 標準的黃金比例增量常數，讓連續計數器的狀態在 64-bit 空間均勻
+# 散開），對 ``state`` 與 ``state XOR SALT``（``SALT`` 只是另一個任意的
+# 64-bit 常數，用來讓兩個輸出彼此獨立，不是安全性用途）分別再做一次終結
+# 混合，得到兩個獨立的 64-bit 雜湊值，取其高 53 個位元轉成
+# ``(0,1)``（開區間，見下方避免 ``log(0)`` 的處理）均勻亂數 ``u1``／``u2``，
+# 最後以標準 Box–Muller 轉換
+# （``z0=sqrt(-2 ln u1) cos(2π u2)``、``z1=sqrt(-2 ln u1) sin(2π u2)``）
+# 得到兩個獨立標準常態亂數，分別當作 x／y 方向的擴散抽樣。
+#
+# 全程都是 NumPy 向量化的整數位元運算與浮點運算，沒有逐粒子 Python 迴圈，
+# 也沒有任何有狀態物件（純函式：同樣的輸入永遠得到同樣的輸出），可以直接
+# 對「這一小時所有作用中粒子」一次算完，效能與現有共用 ``Generator`` 方案
+# 相當（皆為 O(n) 向量化呼叫），統計品質見
+# ``tests/test_native_hour_major.py`` 的均值／變異數／自相關檢定。
+#
+# 誠實揭露：這不是密碼學安全的雜湊，也不是像 PCG64／Philox 那樣經過完整
+# TestU01／PractRand 統計套件驗證過的正式亂數演算法函式庫；SplitMix64
+# 本身作為「不需要密碼學安全性的高品質 64-bit 狀態終結函式」在業界與學術界
+# 已有相當長的使用歷史（例如作為 xoshiro／xoroshiro 系列的種子初始化器），
+# 本模組的統計驗證（見測試檔）只涵蓋均值、變異數、成對相關與單一粒子跨步
+# 自相關，不是完整的隨機性套件驗證；若未來對更嚴謹的統計品質有疑慮，可以
+# 用同一個 ``(particle_step_counter)`` 介面替換成 Philox／Threefry 等
+# 「計數器型」正式演算法，呼叫端（``mirror_rk4_substep_loop``／
+# ``run_backward_batch``／``hour_major.py``）都不需要跟著修改。
+
+_SPLITMIX64_MUL1 = np.uint64(0xBF58476D1CE4E5B9)
+_SPLITMIX64_MUL2 = np.uint64(0x94D049BB133111EB)
+_SPLITMIX64_GOLDEN_GAMMA = np.uint64(0x9E3779B97F4A7C15)
+_SPLITMIX64_SALT = np.uint64(0xD6E8FEB86659FD93)
+_SPLITMIX64_MAX53 = np.float64(2.0**53)
+
+
+def _splitmix64_finalize(state: np.ndarray) -> np.ndarray:
+    """SplitMix64 的終結混合函式，把任意 64-bit 狀態打散成看似均勻的 64-bit 值。
+
+    輸入輸出皆為 ``numpy.uint64`` 陣列；乘法、位移在 numpy 的 ``uint64``
+    dtype 下天然以模 ``2**64`` 迴繞（與 C 的無號 64-bit 整數運算語意相同，
+    已在開發期以互動測試確認 numpy 不會對這個 dtype 的溢位丟出例外或警告），
+    因此可以放心把整個函式當成模 ``2**64`` 的純數論運算，不需要另外處理
+    溢位或負值。
+    """
+
+    state = state.astype(np.uint64, copy=False)
+    state = state ^ (state >> np.uint64(30))
+    state = state * _SPLITMIX64_MUL1
+    state = state ^ (state >> np.uint64(27))
+    state = state * _SPLITMIX64_MUL2
+    state = state ^ (state >> np.uint64(31))
+    return state
+
+
+def derive_particle_diffusion_seed_lo_hi_u64(
+    seed_hex_values: Sequence[str], *, master_seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """為每一顆粒子各自推導一組獨立的 64-bit 擴散種子半段 ``(seed_lo, seed_hi)``。
+
+    與 ``derive_batch_diffusion_seed``（批次共用一個種子）不同，這裡**每一列
+    各自**以自己的 ``seed_hex``（``ParticleIdentityTable.seed_hex``，即
+    ``RunUnit.seed`` 的 128-bit 十六進位表示，見 ``particle_input.py``）與
+    共同的 ``master_seed`` 一起做 SHA-256，取雜湊摘要的前 16 個位元組拆成
+    兩個 64-bit 半段；同一個 ``(seed_hex, master_seed)`` 永遠得到同一組
+    ``(lo, hi)``，且與這顆粒子在陣列中的位置、與其他粒子的種子完全無關
+    （SHA-256 逐列獨立計算，不像 ``derive_batch_diffusion_seed`` 那樣先把
+    整批排序、串接再雜湊一次）。
+
+    這個函式本身**不是**熱路徑（只在一批粒子第一次啟動時呼叫一次，往後每
+    小時的擴散抽樣直接用回傳的 ``(seed_lo, seed_hi)`` 陣列＋
+    ``counter_based_gaussian_pairs``，不重新雜湊種子），因此即使對 50 萬顆
+    粒子逐列呼叫 Python 的 ``hashlib.sha256``（而非向量化位元運算），效能
+    仍可接受；換取的是雜湊輸入與既有 ``derive_member_seed``
+    （``scenarios.py``）、``derive_batch_diffusion_seed`` 一致，全部走
+    SHA-256、不使用受 ``PYTHONHASHSEED`` 影響的 Python 內建 ``hash``。
+
+    Returns:
+        ``(seed_lo, seed_hi)``：兩個 ``(n,)`` 的 ``numpy.uint64`` 陣列，
+        ``n = len(seed_hex_values)``。
+    """
+
+    n = len(seed_hex_values)
+    if n == 0:
+        raise BackwardDriverError("seed_hex_values 不可為空")
+    seed_lo = np.empty(n, dtype=np.uint64)
+    seed_hi = np.empty(n, dtype=np.uint64)
+    master_suffix = f"|{int(master_seed)}".encode()
+    for row, seed_hex in enumerate(seed_hex_values):
+        digest = hashlib.sha256(seed_hex.encode("utf-8") + master_suffix).digest()
+        seed_lo[row] = int.from_bytes(digest[0:8], "big", signed=False)
+        seed_hi[row] = int.from_bytes(digest[8:16], "big", signed=False)
+    return seed_lo, seed_hi
+
+
+def counter_based_gaussian_pairs(
+    seed_lo: np.ndarray, seed_hi: np.ndarray, counter: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """依「粒子種子＋粒子自己的子步計數器」算出一對獨立標準常態亂數。
+
+    純函式、全程向量化（見模組文件「計數器型擴散亂數」一節的完整設計說明
+    與取捨）：同樣的 ``(seed_lo[i], seed_hi[i], counter[i])`` 永遠得到同樣的
+    ``(z0[i], z1[i])``，與陣列中其他列的內容、陣列長度、呼叫順序完全無關。
+
+    Args:
+        seed_lo, seed_hi: ``(n,)`` ``numpy.uint64``，見
+            ``derive_particle_diffusion_seed_lo_hi_u64``。
+        counter: ``(n,)`` 整數陣列（呼叫端通常是 ``int64``），這顆粒子從
+            啟動以來已經套用過幾次擴散（0-based）；呼叫端負責只在真正對該
+            粒子套用擴散時才遞增，見 ``_apply_horizontal_diffusion``。
+
+    Returns:
+        ``(z0, z1)``：兩個 ``(n,)`` 的 ``float64`` 標準常態亂數陣列，分別
+        供 x／y 方向的擴散位移使用。
+    """
+
+    seed_lo64 = np.asarray(seed_lo, dtype=np.uint64)
+    seed_hi64 = np.asarray(seed_hi, dtype=np.uint64)
+    counter_u64 = np.asarray(counter, dtype=np.int64).astype(np.uint64)
+    if seed_lo64.shape != seed_hi64.shape or seed_lo64.shape != counter_u64.shape:
+        raise BackwardDriverError("seed_lo／seed_hi／counter 必須是相同 shape 的一維陣列")
+
+    seed_mixed = _splitmix64_finalize(seed_lo64 ^ _splitmix64_finalize(seed_hi64))
+    state = seed_mixed + counter_u64 * _SPLITMIX64_GOLDEN_GAMMA
+    bits1 = _splitmix64_finalize(state)
+    bits2 = _splitmix64_finalize(state ^ _SPLITMIX64_SALT)
+    # 取高 53 個位元（對應 float64 尾數精度）轉成 (0,1) 開區間均勻亂數：
+    # 分子加 1、分母加 1，讓值域嚴格落在 (0,1) 之間（不含 0 與 1），避免
+    # u1 剛好等於 0 時 Box–Muller 的 ``log(u1)`` 產生 -inf。
+    u1 = ((bits1 >> np.uint64(11)).astype(np.float64) + 1.0) / (_SPLITMIX64_MAX53 + 1.0)
+    u2 = ((bits2 >> np.uint64(11)).astype(np.float64) + 1.0) / (_SPLITMIX64_MAX53 + 1.0)
+    radius = np.sqrt(-2.0 * np.log(u1))
+    angle = 2.0 * np.pi * u2
+    z0 = radius * np.cos(angle)
+    z1 = radius * np.sin(angle)
+    return z0, z1
+
+
 def _apply_horizontal_diffusion(
     px: np.ndarray,
     py: np.ndarray,
@@ -1181,7 +1479,10 @@ def _apply_horizontal_diffusion(
     *,
     kh_mps2: np.ndarray,
     dtb: float,
-    rng: np.random.Generator,
+    rng: np.random.Generator | None = None,
+    particle_seed_lo: np.ndarray | None = None,
+    particle_seed_hi: np.ndarray | None = None,
+    particle_step_counter: np.ndarray | None = None,
 ) -> None:
     """對作用中粒子施加一次算子分裂的水平隨機擴散位移（工作書式(9)）。
 
@@ -1190,22 +1491,49 @@ def _apply_horizontal_diffusion(
     ``mirror_rk4_substep_loop`` 逐子步累加後、經 ``dtb`` 加總得到
     ``2*Kh*t``（``t`` 為總擴散時間）的來源，供驗收 4 的統計檢定直接對照。
 
-    為了讓 ``derive_batch_diffusion_seed`` 描述的可重現性成立，這裡永遠對
-    **全部** ``n`` 顆粒子抽樣（不論是否 ``active_mask``），只有套用時才用
-    ``active_mask`` 遮罩；如此一來 RNG 串流的位置只跟「已經呼叫過幾次、
-    每次陣列多大」有關，不會因為某些粒子提早停止而讓其餘粒子的後續抽樣
-    悄悄错位到不同的串流位置。
+    兩種互斥的亂數來源（呼叫端必須恰好提供其中一組，見
+    ``mirror_rk4_substep_loop`` 的參數驗證）：
+
+    1. **legacy／批次共用串流**（``rng`` 非 ``None``）：與本函式最初版本
+       完全相同的行為，供既有直接呼叫 ``mirror_rk4_substep_loop`` 的低階
+       測試與呼叫端維持位元相容，見 ``derive_batch_diffusion_seed``
+       docstring 的取捨說明。這裡永遠對**全部** ``n`` 顆粒子抽樣（不論是否
+       ``active_mask``），只有套用時才用 ``active_mask`` 遮罩，理由同上。
+    2. **計數器型**（``particle_seed_lo``／``particle_seed_hi``／
+       ``particle_step_counter`` 三者皆非 ``None``）：見
+       ``counter_based_gaussian_pairs`` 與模組文件「計數器型擴散亂數」
+       一節。這裡**只**對 ``active_mask`` 為真的粒子抽樣＋遞增計數器；
+       不需要「對全部粒子抽樣」的技巧，因為每顆粒子的亂數只跟自己的種子與
+       自己的計數器有關，其他粒子是否抽樣、抽了幾次都不影響它。
+       ``particle_step_counter`` 會被原地遞增（``+= 1``，只加在
+       ``active_mask`` 為真的列），呼叫端應該用同一個陣列跨越多個小時
+       重複傳入，讓計數器連續累加。
 
     ``kh_mps2`` 允許逐粒子不同（水平擴散係數本來就隨位置變化）。
     """
 
     n = px.shape[0]
-    draws = rng.standard_normal(size=(n, 2))
     if dtb < 0.0:
         raise BackwardDriverError("dtb 不可為負")
+
+    if rng is not None:
+        draws = rng.standard_normal(size=(n, 2))
+        dx_std = draws[:, 0]
+        dy_std = draws[:, 1]
+    else:
+        if particle_seed_lo is None or particle_seed_hi is None or particle_step_counter is None:
+            raise BackwardDriverError(
+                "_apply_horizontal_diffusion 必須提供 rng，或同時提供 particle_seed_lo／"
+                "particle_seed_hi／particle_step_counter 三者"
+            )
+        dx_std, dy_std = counter_based_gaussian_pairs(
+            particle_seed_lo, particle_seed_hi, particle_step_counter
+        )
+        particle_step_counter[active_mask] += 1
+
     scale = np.sqrt(2.0 * np.maximum(kh_mps2, 0.0) * dtb)
-    dx = draws[:, 0] * scale
-    dy = draws[:, 1] * scale
+    dx = dx_std * scale
+    dy = dy_std * scale
     px[active_mask] += dx[active_mask]
     py[active_mask] += dy[active_mask]
 
@@ -1232,7 +1560,7 @@ class SubstepDiagnostics:
     time_diffusion_apply_s: float = 0.0
     time_interest_check_s: float = 0.0
 
-    def add(self, other: "SubstepDiagnostics") -> None:
+    def add(self, other: SubstepDiagnostics) -> None:
         """把另一個小時的拆解累加進本物件，供多小時彙整成整批總覽。"""
 
         self.n_substeps += other.n_substeps
@@ -1303,8 +1631,16 @@ class HourlyOverheadDiagnostics:
     smagorinsky_cache_hits: int = 0
     smagorinsky_cache_misses: int = 0
     time_substep_count_s: float = 0.0
+    stokes_points_evaluated: int = 0
+    """WP-9 效能診斷：只在 ``compose_base_cache`` 未命中（真正呼叫過
+    ``compose_current_and_stokes_fields``）的小時才累加，累加值就是那些小時
+    ``ComposedCurrentAndStokesFields.stokes_points_evaluated`` 的總和；搭配
+    ``stokes_points_possible`` 可以算出深度截斷優化後，全部小時平均下來
+    真正重新求解 Stokes 的 (層,節點) 點數比例。"""
+    stokes_points_possible: int = 0
+    """與 ``stokes_points_evaluated`` 對應的分母，見上。"""
 
-    def add(self, other: "HourlyOverheadDiagnostics") -> None:
+    def add(self, other: HourlyOverheadDiagnostics) -> None:
         """把另一個小時的拆解累加進本物件，供多小時彙整成整批總覽。"""
 
         self.n_hours += other.n_hours
@@ -1319,6 +1655,8 @@ class HourlyOverheadDiagnostics:
         self.smagorinsky_cache_hits += other.smagorinsky_cache_hits
         self.smagorinsky_cache_misses += other.smagorinsky_cache_misses
         self.time_substep_count_s += other.time_substep_count_s
+        self.stokes_points_evaluated += other.stokes_points_evaluated
+        self.stokes_points_possible += other.stokes_points_possible
 
     @property
     def total_s(self) -> float:
@@ -1361,9 +1699,13 @@ def mirror_rk4_substep_loop(
     hf2_field: np.ndarray | None = None,
     hdc: float = 1.0,
     rng: np.random.Generator | None = None,
+    particle_seed_lo: np.ndarray | None = None,
+    particle_seed_hi: np.ndarray | None = None,
+    particle_step_counter: np.ndarray | None = None,
     native_status: np.ndarray | None = None,
     substep_utc_ns: Callable[[int], int] | None = None,
     interest_region_polygon: Polygon | None = None,
+    interest_region_polygons: np.ndarray | None = None,
     departures: list[DepartureRecord] | None = None,
 ) -> SubstepDiagnostics:
     """鏡像 ``ParticleTracker.batch_update_particles`` 的子步迴圈（passive＋RK4）。
@@ -1395,11 +1737,11 @@ def mirror_rk4_substep_loop(
     - STEP 3 INTERPOLATE（1622 行）：呼叫未修改的
       ``handles.batch_interpolate_velocity``，更新 ``pa.u/v/w`` 供下一個
       子步的 k1 使用。
-    - 每個子步結束後（若提供 ``interest_region_polygon``）：以 Shapely
-      2.0 向量化 ``contains_xy`` 一次判斷全部作用中粒子是否仍在關注區域
-      內（不對任何粒子逐一建立 Shapely 物件），新離開者記錄
-      ``DepartureRecord`` 並停用（``pa.status=0``、
-      ``native_status=NATIVE_STATUS_LEFT_INTEREST_REGION``）。
+    - 每個子步結束後（若提供 ``interest_region_polygon`` 或
+      ``interest_region_polygons``）：以 Shapely 2.0 向量化 ``contains_xy``
+      一次判斷全部作用中粒子是否仍在關注區域內（不對任何粒子逐一建立
+      Shapely 物件），新離開者記錄 ``DepartureRecord`` 並停用
+      （``pa.status=0``、``native_status=NATIVE_STATUS_LEFT_INTEREST_REGION``）。
 
     Args:
         pa: 真正的（未修改的）``ParticleArrays`` 執行個體，``x/y/z/u/v/w/
@@ -1408,13 +1750,43 @@ def mirror_rk4_substep_loop(
         ndeltp、dtb: 這一小時的子步數與子步秒數，``ndeltp*dtb`` 應等於
             這一小時的秒數（呼叫端保證，本函式不重複檢查）。
         composed: ``compose_total_velocity_fields`` 的輸出。
+        rng: 啟用擴散時的**legacy／批次共用串流**亂數來源，與
+            ``particle_seed_lo``／``particle_seed_hi``／
+            ``particle_step_counter`` 三者擇一提供（不可同時提供、也不可
+            都不提供），見 ``_apply_horizontal_diffusion`` docstring 兩種
+            模式的說明。
+        particle_seed_lo, particle_seed_hi, particle_step_counter:
+            啟用擴散時的**計數器型**亂數來源，三者必須同時提供（見
+            ``derive_particle_diffusion_seed_lo_hi_u64``／
+            ``counter_based_gaussian_pairs``）；``particle_step_counter``
+            會被原地遞增，呼叫端應該用同一個陣列跨越多個小時重複傳入。
+            這是 WP-9 小時主軸排程使用的模式，讓合併批次的擴散序列與批次
+            組成、列序、worker 數完全無關（見模組文件「計數器型擴散亂數」
+            一節）。
         native_status: ``(n,)`` int32，本函式只在偵測到離開關注區域時
             寫入 ``NATIVE_STATUS_LEFT_INTEREST_REGION``；其餘終止原因由
             呼叫端（``run_backward_batch``）在小時邊界另行判定。提供
-            ``interest_region_polygon`` 時必須同時提供本參數。
+            ``interest_region_polygon``／``interest_region_polygons`` 時
+            必須同時提供本參數。
         substep_utc_ns: 給定子步索引 ``idt``（``1..ndeltp``），回傳該子步
             結束時對應的 UTC 奈秒，供 ``DepartureRecord.utc_ns`` 使用；
-            提供 ``interest_region_polygon`` 時必須同時提供。
+            提供 ``interest_region_polygon``／``interest_region_polygons``
+            時必須同時提供。
+        interest_region_polygon: **單一**關注區域多邊形，套用到全部 ``n``
+            顆粒子——適用於「整批粒子共用同一個測站」的既有逐單元路徑
+            （``run_backward_batch``）。與 ``interest_region_polygons``
+            互斥。
+        interest_region_polygons: ``(n,)`` 的 Shapely ``Polygon`` object
+            陣列，**逐列**指定每顆粒子自己的關注區域——適用於 WP-9
+            小時主軸排程「同一次 kernel 呼叫混合多個測站的粒子」的情境
+            （見 ``hour_major.py``）。Shapely 2.0 的向量化函式（例如
+            ``contains_xy``）支援「geometry 引數本身也是與座標陣列等長的
+            object 陣列」，逐點配對計算，因此這裡對每個粒子使用正確多邊形
+            的計算結果，與「把每個測站的粒子分開、各自呼叫一次
+            ``interest_region_polygon``」完全等價（幾何述詞是逐點獨立
+            計算，不受同一次呼叫還有哪些其他點／多邊形影響），可以安全
+            合併呼叫而不改變任何一顆粒子的判定結果。與
+            ``interest_region_polygon`` 互斥。
 
     Returns:
         ``SubstepDiagnostics``，這個小時的效能拆解。
@@ -1424,10 +1796,36 @@ def mirror_rk4_substep_loop(
         raise BackwardDriverError("ibf 只能是 1 或 -1")
     if ndeltp < 1:
         raise BackwardDriverError("ndeltp 必須是正整數")
-    if interest_region_polygon is not None and (native_status is None or substep_utc_ns is None):
-        raise BackwardDriverError("提供 interest_region_polygon 時必須同時提供 native_status 與 substep_utc_ns")
-    if enable_diffusion and (rng is None or hf1_field is None or hf2_field is None):
-        raise BackwardDriverError("啟用擴散時必須提供 rng、hf1_field 與 hf2_field")
+    if interest_region_polygon is not None and interest_region_polygons is not None:
+        raise BackwardDriverError("interest_region_polygon 與 interest_region_polygons 只能擇一提供")
+    if (interest_region_polygon is not None or interest_region_polygons is not None) and (
+        native_status is None or substep_utc_ns is None
+    ):
+        raise BackwardDriverError(
+            "提供 interest_region_polygon／interest_region_polygons 時必須同時提供 "
+            "native_status 與 substep_utc_ns"
+        )
+    if enable_diffusion:
+        if hf1_field is None or hf2_field is None:
+            raise BackwardDriverError("啟用擴散時必須提供 hf1_field 與 hf2_field")
+        using_rng = rng is not None
+        counter_fields = (particle_seed_lo, particle_seed_hi, particle_step_counter)
+        using_counter = any(field is not None for field in counter_fields)
+        if using_rng and using_counter:
+            raise BackwardDriverError(
+                "啟用擴散時 rng 與計數器型參數（particle_seed_lo／particle_seed_hi／"
+                "particle_step_counter）只能擇一提供"
+            )
+        if using_counter and any(field is None for field in counter_fields):
+            raise BackwardDriverError(
+                "計數器型擴散必須同時提供 particle_seed_lo／particle_seed_hi／"
+                "particle_step_counter 三者，不可只提供部分"
+            )
+        if not using_rng and not using_counter:
+            raise BackwardDriverError(
+                "啟用擴散時必須提供 rng，或同時提供 particle_seed_lo／particle_seed_hi／"
+                "particle_step_counter 三者"
+            )
 
     import time as _time
 
@@ -1506,7 +1904,12 @@ def mirror_rk4_substep_loop(
         if enable_diffusion:
             t0 = _time.perf_counter()
             active_mask = pa.status == 1
-            _apply_horizontal_diffusion(pa.x, pa.y, active_mask, kh_mps2=pa.dhfx, dtb=dtb, rng=rng)
+            _apply_horizontal_diffusion(
+                pa.x, pa.y, active_mask, kh_mps2=pa.dhfx, dtb=dtb, rng=rng,
+                particle_seed_lo=particle_seed_lo,
+                particle_seed_hi=particle_seed_hi,
+                particle_step_counter=particle_step_counter,
+            )
             diag.time_diffusion_apply_s += _time.perf_counter() - t0
 
         t0 = _time.perf_counter()
@@ -1548,12 +1951,19 @@ def mirror_rk4_substep_loop(
         )
         diag.time_interpolate_s += _time.perf_counter() - t0
 
-        if interest_region_polygon is not None:
+        if interest_region_polygon is not None or interest_region_polygons is not None:
             t0 = _time.perf_counter()
             active_mask = pa.status == 1
             if np.any(active_mask):
                 inside = np.ones(n, dtype=bool)
-                inside[active_mask] = contains_xy(interest_region_polygon, pa.x[active_mask], pa.y[active_mask])
+                if interest_region_polygon is not None:
+                    inside[active_mask] = contains_xy(
+                        interest_region_polygon, pa.x[active_mask], pa.y[active_mask]
+                    )
+                else:
+                    inside[active_mask] = contains_xy(
+                        interest_region_polygons[active_mask], pa.x[active_mask], pa.y[active_mask]
+                    )
                 left_now = active_mask & ~inside
                 if np.any(left_now):
                     utc_ns = int(substep_utc_ns(idt))
@@ -1632,7 +2042,9 @@ def locate_initial_elements(
 # ── 停留於海床附近的偵測：供沉底判定使用 ────────────────────────────────
 
 
-def _particle_bed_z_levels(driver_grid: NativeBackwardDriverGrid, eta_m: np.ndarray, elements: np.ndarray) -> np.ndarray:
+def particle_bed_z_levels(
+    driver_grid: NativeBackwardDriverGrid, eta_m: np.ndarray, elements: np.ndarray
+) -> np.ndarray:
     """回傳每顆粒子目前所在元素的海床 z（公尺），供沉底判定比較。
 
     簡化自 ``batch_clamp_z``（``batch_interp.py`` 703-756 行）的元素級
@@ -1671,6 +2083,13 @@ class BackwardDriverConfig:
     ``BatchGroup`` 鍵值一致（呼叫端應先以
     ``validate_arrival_time_homogeneous_batches``／
     ``validate_settling_velocity_homogeneous_batches`` 確認）。
+
+    ``stokes_depth_threshold_ratio``：見
+    ``compose_current_and_stokes_fields`` docstring 的「Stokes 深度截斷」
+    優化；預設 ``None`` 不啟用，維持此欄位新增前完全相同的行為。WP-9
+    小時主軸路徑（``hour_major.py``）預設啟用（見該模組文件），若要跟
+    ``run_backward_batch`` 做位元相同的等價驗收，兩邊必須明確傳入同一個
+    數值。
     """
 
     arrival_time_utc_ns: int
@@ -1685,6 +2104,7 @@ class BackwardDriverConfig:
     deposition_consecutive_hours: int = 3
     deposition_tolerance_m: float = 0.5
     master_seed: int = 0
+    stokes_depth_threshold_ratio: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1830,12 +2250,26 @@ def run_backward_batch(
             )
     pa.status[:] = (native_status == NATIVE_STATUS_ACTIVE).astype(np.int64)
 
-    diffusion_seed = derive_batch_diffusion_seed(seed_hex_values, master_seed=config.master_seed)
-    rng = (
-        np.random.Generator(np.random.PCG64DXSM(np.random.SeedSequence(diffusion_seed)))
-        if config.enable_diffusion
-        else None
-    )
+    # 擴散亂數：WP-9 起改用計數器型（見 backward_driver 模組文件「計數器型
+    # 擴散亂數」一節），每顆粒子各自的種子只跟自己的 seed_hex 與
+    # master_seed 有關，與批次組成、列序完全無關；``particle_step_counter``
+    # 從 0 開始，只在真正套用擴散的子步才遞增（``_apply_horizontal_diffusion``
+    # 負責），並跨越整個回溯過程（含跨小時邊界）持續累加，讓「單獨呼叫
+    # run_backward_batch」與「WP-9 小時主軸把同一顆粒子併入更大批次」得到
+    # 位元相同的擴散序列（見 ``hour_major.py`` 模組文件與驗收 2）。
+    #
+    # 舊版 ``derive_batch_diffusion_seed``＋批次共用 ``Generator`` 的方案仍
+    # 保留（見該函式 docstring），但不再是本函式的預設路徑：那個方案的
+    # 擴散序列與批次組成、列序綁定，無法滿足「合併／不合併批次得到相同
+    # 結果」這個 WP-9 的驗收要求。
+    particle_seed_lo: np.ndarray | None = None
+    particle_seed_hi: np.ndarray | None = None
+    particle_step_counter: np.ndarray | None = None
+    if config.enable_diffusion:
+        particle_seed_lo, particle_seed_hi = derive_particle_diffusion_seed_lo_hi_u64(
+            seed_hex_values, master_seed=config.master_seed
+        )
+        particle_step_counter = np.zeros(n, dtype=np.int64)
 
     trajectory_utc = [arrival_utc]
     trajectory_x = [pa.x.copy()]
@@ -1858,7 +2292,10 @@ def run_backward_batch(
             pa.status[active] = 0
             for row in np.flatnonzero(active):
                 departures.append(
-                    DepartureRecord(int(row), NATIVE_STATUS_MAX_BACKTRACK, float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(current_utc))
+                    DepartureRecord(
+                        int(row), NATIVE_STATUS_MAX_BACKTRACK,
+                        float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(current_utc),
+                    )
                 )
             break
 
@@ -1869,7 +2306,9 @@ def run_backward_batch(
         hour_overhead.time_forcing_resolve_s += _time.perf_counter() - t0
 
         t0 = _time.perf_counter()
-        node_is_dry_check, _elem_dry_check = compute_wet_dry_flags(driver_grid, handles, eta_m=field_pair.eta_field1)
+        node_is_dry_check, _elem_dry_check = compute_wet_dry_flags(
+            driver_grid, handles, eta_m=field_pair.eta_field1
+        )
         hour_overhead.time_wet_dry_check_s += _time.perf_counter() - t0
         try:
             field_pair.raise_if_unresolved_gap(node_is_dry1=node_is_dry_check, node_is_dry2=node_is_dry_check)
@@ -1879,13 +2318,24 @@ def run_backward_batch(
             pa.status[active] = 0
             for row in np.flatnonzero(active):
                 departures.append(
-                    DepartureRecord(int(row), NATIVE_STATUS_FORCING_MISSING, float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(current_utc))
+                    DepartureRecord(
+                        int(row), NATIVE_STATUS_FORCING_MISSING,
+                        float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(current_utc),
+                    )
                 )
             break
 
         t0 = _time.perf_counter()
-        wave1 = wave_field_resolver(int(field_pair.time_before_utc_ns)) if wave_field_resolver is not None else None
-        wave2 = wave_field_resolver(int(field_pair.time_after_utc_ns)) if wave_field_resolver is not None else None
+        wave1 = (
+            wave_field_resolver(int(field_pair.time_before_utc_ns))
+            if wave_field_resolver is not None
+            else None
+        )
+        wave2 = (
+            wave_field_resolver(int(field_pair.time_after_utc_ns))
+            if wave_field_resolver is not None
+            else None
+        )
         hour_overhead.time_wave_resolve_s += _time.perf_counter() - t0
 
         # 任務 3 效能優化：乾濕判定＋Stokes 全網格計算（compose_current_and_
@@ -1908,9 +2358,12 @@ def run_backward_batch(
                 field_pair,
                 wave_field1=wave1,
                 wave_field2=wave2,
+                stokes_depth_threshold_ratio=config.stokes_depth_threshold_ratio,
             )
             hour_overhead.time_compose_base_s += _time.perf_counter() - t0
             hour_overhead.compose_base_cache_misses += 1
+            hour_overhead.stokes_points_evaluated += base.stokes_points_evaluated
+            hour_overhead.stokes_points_possible += base.stokes_points_possible
             if composed_base_cache is not None:
                 composed_base_cache[cache_key] = base
 
@@ -1951,7 +2404,9 @@ def run_backward_batch(
             else:
                 t0 = _time.perf_counter()
                 hf2_now = compute_smagorinsky_kh_field(
-                    driver_grid, handles, u_current_mps=field_pair.u_field2, v_current_mps=field_pair.v_field2, horcon=config.horcon
+                    driver_grid, handles,
+                    u_current_mps=field_pair.u_field2, v_current_mps=field_pair.v_field2,
+                    horcon=config.horcon,
                 )
                 hour_overhead.time_smagorinsky_s += _time.perf_counter() - t0
                 hour_overhead.smagorinsky_cache_misses += 1
@@ -1962,7 +2417,8 @@ def run_backward_batch(
 
         t0 = _time.perf_counter()
         ndeltp = estimate_substep_count(
-            driver_grid, composed.u_field1, composed.v_field1, dt_seconds=3600.0, dt_max_seconds=config.dt_max_seconds, cfl_number=config.cfl_number
+            driver_grid, composed.u_field1, composed.v_field1,
+            dt_seconds=3600.0, dt_max_seconds=config.dt_max_seconds, cfl_number=config.cfl_number,
         )
         hour_overhead.time_substep_count_s += _time.perf_counter() - t0
         dtb = 3600.0 / ndeltp
@@ -1983,7 +2439,9 @@ def run_backward_batch(
             enable_diffusion=config.enable_diffusion,
             hf1_field=hf1_now,
             hf2_field=hf2_now,
-            rng=rng,
+            particle_seed_lo=particle_seed_lo,
+            particle_seed_hi=particle_seed_hi,
+            particle_step_counter=particle_step_counter,
             native_status=native_status,
             substep_utc_ns=_substep_utc_ns,
             interest_region_polygon=interest_region_polygon,
@@ -1999,7 +2457,10 @@ def run_backward_batch(
             pa.status[bad] = 0
             for row in np.flatnonzero(bad):
                 departures.append(
-                    DepartureRecord(int(row), NATIVE_STATUS_NUMERICAL_FAILURE, float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc))
+                    DepartureRecord(
+                        int(row), NATIVE_STATUS_NUMERICAL_FAILURE,
+                        float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc),
+                    )
                 )
 
         active = native_status == NATIVE_STATUS_ACTIVE
@@ -2014,13 +2475,16 @@ def run_backward_batch(
                 pa.status[stranded] = 0
                 for row in np.flatnonzero(stranded):
                     departures.append(
-                        DepartureRecord(int(row), NATIVE_STATUS_STRANDED, float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc))
+                        DepartureRecord(
+                            int(row), NATIVE_STATUS_STRANDED,
+                            float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc),
+                        )
                     )
 
         if config.settling_velocity_mps < 0.0:
             active = native_status == NATIVE_STATUS_ACTIVE
             if np.any(active):
-                bed_z = _particle_bed_z_levels(driver_grid, field_pair.eta_field1, pa.element)
+                bed_z = particle_bed_z_levels(driver_grid, field_pair.eta_field1, pa.element)
                 at_bed = active & np.isfinite(bed_z) & ((pa.z - bed_z) <= config.deposition_tolerance_m)
                 deposit_streak[at_bed] += 1
                 deposit_streak[active & ~at_bed] = 0
@@ -2030,7 +2494,10 @@ def run_backward_batch(
                     pa.status[newly_deposited] = 0
                     for row in np.flatnonzero(newly_deposited):
                         departures.append(
-                            DepartureRecord(int(row), NATIVE_STATUS_DEPOSITED, float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc))
+                            DepartureRecord(
+                                int(row), NATIVE_STATUS_DEPOSITED,
+                                float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc),
+                            )
                         )
 
         current_utc = hour_end_utc

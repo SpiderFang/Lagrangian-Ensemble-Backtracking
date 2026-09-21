@@ -114,7 +114,9 @@ def test_gather_matches_forcing_reference_sample_at_time_index() -> None:
         reference = month.sample_at_time_index(float(node_lon[i]), float(node_lat[i]), 0)
         assert bool(result.valid_mask_wave[i]) == reference.valid
         assert reference.valid, "本測試合成資料全部有效，任何節點判定無效都代表內插邏輯有分歧"
-        assert result.significant_wave_height_m[i] == pytest.approx(reference.significant_wave_height_m, rel=1e-12)
+        assert result.significant_wave_height_m[i] == pytest.approx(
+            reference.significant_wave_height_m, rel=1e-12
+        )
         assert result.peak_frequency_hz[i] == pytest.approx(reference.peak_frequency_hz, rel=1e-12)
         # 方向是圓週期量，用最小夾角比較，避免 359.9999 vs 0.0001 這種數值上
         # 幾乎相等、但直接相減會誤判為不相等的邊界情況。
@@ -446,11 +448,13 @@ def test_end_to_end_wave_field_resolver_changes_trajectory(tmp_path) -> None:
             time_before_utc_ns=hi, time_after_utc_ns=lo, trat=0.0, ibf=-1,
             u_field1=np.full(shape_field, u_curr), v_field1=np.full(shape_field, v_curr),
             w_field1=np.zeros(shape_field), eta_field1=eta.copy(),
-            diffusivity_field1=diffusivity.copy(), missing_mask1=missing.copy(), dry_face_flag1=dry_face.copy(),
+            diffusivity_field1=diffusivity.copy(),
+            missing_mask1=missing.copy(), dry_face_flag1=dry_face.copy(),
             month_id1="synthetic", time_origin1="test",
             u_field2=np.full(shape_field, u_curr), v_field2=np.full(shape_field, v_curr),
             w_field2=np.zeros(shape_field), eta_field2=eta.copy(),
-            diffusivity_field2=diffusivity.copy(), missing_mask2=missing.copy(), dry_face_flag2=dry_face.copy(),
+            diffusivity_field2=diffusivity.copy(),
+            missing_mask2=missing.copy(), dry_face_flag2=dry_face.copy(),
             month_id2="synthetic", time_origin2="test",
         )
 

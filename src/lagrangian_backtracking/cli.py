@@ -53,6 +53,7 @@ from .boundaries import BoundaryGeometry
 from .config import load_config
 from .diffusion import DiffusionCoefficients
 from .engine import EngineSettings, run_particle
+from .geometry import DomainProjection
 from .horizon_suite import build_horizon_suite, resume_horizon_suite, validate_horizon_suite
 from .input_derivation import (
     build_input_derivatives,
@@ -61,7 +62,10 @@ from .input_derivation import (
     validate_release_config,
 )
 from .models import ParticleState, VelocitySample
+from .native_runner import hour_major_provider as native_hour_major_provider
 from .native_runner import orchestrator as native_orchestrator
+from .native_runner import postprocess as native_postprocess
+from .native_runner import production_wiring as native_production_wiring
 from .native_runner.backward_driver import load_baytrace_modules
 from .native_runner.forcing_bridge import inventory_forcing_gaps
 from .native_runner.particle_input import load_particle_identity_table_npz
@@ -846,6 +850,45 @@ def _native_plan_parser() -> argparse.ArgumentParser:
     parser.add_argument("--formal", action="store_true")
     parser.add_argument("--config-sha256", default="not_provided")
     parser.add_argument("--output", required=True, type=Path, help="輸出的工作計畫 JSON 路徑")
+    parser.add_argument(
+        "--schedule",
+        choices=("per-unit", "hour-major", "hour-major-segmented"),
+        default="per-unit",
+        help=(
+            "per-unit（預設）：計畫檔逐工作單元寫出，沿用既有一次一顆 kernel 呼叫的"
+            "正式排程路徑。hour-major：計畫檔改寫成每個流場區域一個摺疊後的排程單元"
+            "（見 native_runner.orchestrator.plan_native_hour_major_work_units 與"
+            " native_runner.hour_major 模組文件），配合支援 hourmajor:: 前綴"
+            " unit_id 的 --resource-provider 實作使用。hour-major-segmented"
+            "（WP-11）：在 hour-major 的基礎上，把每個流場區域依到達時刻再切成"
+            " --segments 段（或依 --target-worker-count 自動決定），讓核心數遠多於"
+            "流場區域數的伺服器能吃滿全部核心（見"
+            " native_runner.orchestrator.plan_native_hour_major_segments）；"
+            "缺口安全檢查一律仍在摺疊之前、以原本的逐工作單元粒度進行，不受"
+            "這個選項影響"
+        ),
+    )
+    parser.add_argument(
+        "--segments",
+        type=str,
+        default=None,
+        help=(
+            "只在 --schedule hour-major-segmented 時使用。單一整數：套用到全部流場"
+            "區域的段數；或 JSON 檔路徑（{flow_domain_id: K}）：逐區域指定段數；"
+            "省略時改用 --target-worker-count 自動決定（兩者都省略則等同 K=1，"
+            "與 hour-major 相同）"
+        ),
+    )
+    parser.add_argument(
+        "--target-worker-count",
+        type=int,
+        default=None,
+        help=(
+            "只在 --schedule hour-major-segmented 且未提供 --segments 時使用："
+            "自動切段的目標平行度（通常填伺服器可用核心數），見"
+            " native_runner.orchestrator.recommend_hour_major_segment_counts"
+        ),
+    )
     return parser
 
 
@@ -958,16 +1001,48 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         config_sha256=args.config_sha256,
         seed_policy="particle_identity_table_master_seed_v1",
         master_seed=int(table.master_seed),
-        extra={"gap_check_skipped": bool(args.skip_gap_check)},
+        extra={"gap_check_skipped": bool(args.skip_gap_check), "schedule": args.schedule},
     )
+
+    # 缺口安全檢查（上面）永遠以原本的逐工作單元粒度進行——``check_arrival_gap_
+    # safety`` 需要每個工作單元自己的 arrival_time_utc_ns，摺疊後的小時主軸排程
+    # 單元用 sentinel 值填那個欄位，不能拿來做這個檢查。只有真正寫進計畫檔的
+    # ``units``（供 native-run 排程執行）才依 --schedule 決定要不要摺疊／切段。
+    hour_major_members: Mapping[str, tuple[native_orchestrator.NativeWorkUnit, ...]] | None = None
+    plan_units = units
+    segment_reports: tuple[native_orchestrator.HourMajorSegmentPlanReport, ...] = ()
+    if args.schedule == "hour-major":
+        plan_units, hour_major_members = native_orchestrator.plan_native_hour_major_work_units(units)
+    elif args.schedule == "hour-major-segmented":
+        max_backtrack_seconds = args.max_backtrack_days * 86400.0
+        segment_count: int | Mapping[str, int] | None = None
+        if args.segments is not None:
+            try:
+                segment_count = int(args.segments)
+            except ValueError:
+                segment_count = json.loads(Path(args.segments).read_text(encoding="utf-8"))
+        plan_units, hour_major_members, segment_reports = native_orchestrator.plan_native_hour_major_segments(
+            units,
+            segment_count=segment_count,
+            target_worker_count=args.target_worker_count,
+            max_backtrack_seconds=max_backtrack_seconds,
+        )
+
     native_orchestrator.write_native_plan_file(
-        args.output, units=units, gap_checks=gap_checks, summary=summary, manifest=manifest
+        args.output,
+        units=plan_units,
+        gap_checks=gap_checks,
+        summary=summary,
+        manifest=manifest,
+        hour_major_members=hour_major_members,
     )
 
     unsafe = [check for check in gap_checks if not check.is_gap_safe]
     report = {
         "output": str(args.output),
+        "schedule": args.schedule,
         "unit_count": summary.unit_count,
+        "scheduled_unit_count": len(plan_units),
         "locality_group_count": summary.locality_group_count,
         "particle_count_total": summary.particle_count_total,
         "region_ids": list(summary.region_ids),
@@ -975,6 +1050,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         "is_gap_safe_ready": args.skip_gap_check or len(unsafe) == 0,
         "unsafe_arrival_count": len(unsafe),
         "unsafe_arrivals": [dataclasses.asdict(check) for check in unsafe],
+        "segment_plan": [dataclasses.asdict(item) for item in segment_reports],
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if report["is_gap_safe_ready"] else 2
@@ -1076,6 +1152,304 @@ def run_native_status(argv: Sequence[str] | None = None) -> int:
 
     report = dict(snapshot)
     report["unit_status_counts"] = status_counts
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-11：native-preflight／native-gap-fill／native-postprocess
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _native_preflight_parser() -> argparse.ArgumentParser:
+    """建立 ``lbt native-preflight`` parser：伺服器上第一步、秒到分鐘級資料契約檢查。
+
+    只呼叫既有 ``production_wiring.preflight_native_inputs``（見該函式文件），不
+    另外定義任何檢查規則；本命令的價值在於把它包成一條可以直接接在
+    ``run_native_backtrack_server.sh`` 第一步的 CLI 子命令，失敗時以非零狀態碼
+    讓伺服器腳本 fail-closed 停止，不繼續往下跑昂貴的網格建構或 kernel 呼叫。
+    """
+
+    parser = argparse.ArgumentParser(description="正式 native 資料前置檢查（目錄、節點數、缺口、到達窗）")
+    parser.add_argument("--config", required=True, type=Path, help="正式設定 YAML 路徑")
+    parser.add_argument(
+        "--domain",
+        action="append",
+        dest="domains",
+        default=None,
+        help="只檢查指定的 analysis_region_id；可重複指定，省略時檢查設定內全部區域",
+    )
+    parser.add_argument("--max-backtrack-days", type=float, default=30.0)
+    parser.add_argument("--formal", action="store_true", default=True)
+    parser.add_argument("--pilot", dest="formal", action="store_false", help="以 pilot（非正式）模式檢查")
+    parser.add_argument("--output", type=Path, help="可選：把人類可讀報告額外寫成文字檔")
+    return parser
+
+
+def run_native_preflight_command(argv: Sequence[str] | None = None) -> int:
+    """執行正式 native 資料前置檢查，回傳碼反映 ``PreflightReport.is_run_ready``。"""
+
+    args = _native_preflight_parser().parse_args(argv)
+    report = native_production_wiring.preflight_native_inputs(
+        str(args.config),
+        env=os.environ,
+        domain_ids=args.domains,
+        formal=args.formal,
+        max_backtrack_seconds=args.max_backtrack_days * 86400.0,
+    )
+    text = report.describe()
+    print(text)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(text, encoding="utf-8")
+    return 0 if report.is_run_ready else 2
+
+
+def _native_gap_fill_parser() -> argparse.ArgumentParser:
+    """建立 ``lbt native-gap-fill`` parser：逐流場區域呼叫已核准的缺口重建管線。
+
+    重建邏輯本身由 ``native_runner.gap_fill``（另一個並行開發的工作包）提供，本
+    命令只以**延遲匯入**（``run_native_gap_fill_command`` 函式內才 import）呼叫
+    ``build_gap_fill_patches``／``build_wave_gap_fill_patches``／
+    ``validate_gap_fill_blocked`` 三個函式，逐一對每個在 ``--ocm-native-domain-root``
+    下找到的流場區域執行，輸出寫到 ``--output-root``（即 ``OCM_RECONSTRUCTION_
+    ROOT``）。延遲匯入是刻意的：``gap_fill.py`` 可能在本命令交付時尚未完成，
+    延遲匯入讓本檔案本身可以先通過語法檢查與其餘 native-* 命令的測試，只有真正
+    執行 ``native-gap-fill`` 時才需要該模組存在。
+    """
+
+    parser = argparse.ArgumentParser(description="逐流場區域執行已核准的 OCM／波浪缺口重建")
+    parser.add_argument(
+        "--ocm-native-domain-root",
+        required=True,
+        type=Path,
+        help="ocm_native schema 3 根目錄（其下每個子目錄是一個 flow_domain_id）",
+    )
+    parser.add_argument(
+        "--output-root",
+        required=True,
+        type=Path,
+        help="重建 patch 輸出根目錄，即後續 OCM_RECONSTRUCTION_ROOT 指向的路徑",
+    )
+    parser.add_argument("--start-utc", default="2024-01-01T00:00:00+00:00", help="重建區間起點（ISO 8601）")
+    parser.add_argument("--end-utc", default="2025-12-31T23:00:00+00:00", help="重建區間終點（ISO 8601）")
+    parser.add_argument(
+        "--flow-domain-id",
+        action="append",
+        dest="flow_domain_ids",
+        default=None,
+        help="只處理指定的 flow_domain_id；可重複指定，省略時處理 --ocm-native-domain-root 下全部子目錄",
+    )
+    parser.add_argument(
+        "--include-wave",
+        action="store_true",
+        help="同時呼叫 build_wave_gap_fill_patches 重建波浪缺口（需要 --nww-native-domain-root）",
+    )
+    parser.add_argument("--nww-native-domain-root", type=Path, help="--include-wave 時的 NWW3 根目錄")
+    parser.add_argument(
+        "--skip-validate",
+        action="store_true",
+        help="略過每個區域重建後的 validate_gap_fill_blocked 阻擋式交叉驗證（不建議在正式流程使用）",
+    )
+    return parser
+
+
+def _iso8601_to_utc_ns(text: str) -> int:
+    """把 ISO 8601 字串轉成 UTC 奈秒；不接受缺時區資訊的字串（避免時區歧義）。"""
+
+    from datetime import datetime
+
+    normalized = text.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        raise ValueError(f"時間字串 {text!r} 缺少時區資訊，native-gap-fill 只接受明示時區的 ISO 8601")
+    return int(parsed.timestamp() * 1_000_000_000)
+
+
+def run_native_gap_fill_command(argv: Sequence[str] | None = None) -> int:
+    """逐流場區域執行 ``native_runner.gap_fill`` 的缺口重建管線。
+
+    ``gap_fill`` 模組由另一個並行開發的工作包負責，本函式在呼叫當下才 import，
+    找不到時直接以清楚的錯誤訊息與非零狀態碼回報，不假裝已完成重建。
+    """
+
+    args = _native_gap_fill_parser().parse_args(argv)
+    try:
+        from .native_runner import gap_fill as native_gap_fill
+    except ImportError as exc:
+        error_payload = {
+            "error": "gap_fill_module_not_available",
+            "message": (
+                "native_runner.gap_fill 尚未提供（由另一個工作包負責），"
+                "native-gap-fill 無法執行；請確認該模組已交付後重試"
+            ),
+            "import_error": str(exc),
+        }
+        print(json.dumps(error_payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 2
+
+    start_utc_ns = _iso8601_to_utc_ns(args.start_utc)
+    end_utc_ns = _iso8601_to_utc_ns(args.end_utc)
+    if end_utc_ns <= start_utc_ns:
+        raise ValueError("--end-utc 必須晚於 --start-utc")
+
+    domain_root = Path(args.ocm_native_domain_root)
+    if args.flow_domain_ids:
+        flow_domain_ids = list(args.flow_domain_ids)
+    else:
+        flow_domain_ids = sorted(entry.name for entry in domain_root.iterdir() if entry.is_dir())
+
+    per_domain_reports: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for flow_domain_id in flow_domain_ids:
+        domain_report: dict[str, Any] = {"flow_domain_id": flow_domain_id}
+        try:
+            ocm_patches = native_gap_fill.build_gap_fill_patches(
+                domain_root / flow_domain_id,
+                args.output_root,
+                start_utc_ns=start_utc_ns,
+                end_utc_ns=end_utc_ns,
+                flow_domain_id=flow_domain_id,
+            )
+            domain_report["ocm_patches"] = ocm_patches
+            if args.include_wave:
+                if args.nww_native_domain_root is None:
+                    raise ValueError("--include-wave 需要同時提供 --nww-native-domain-root")
+                wave_patches = native_gap_fill.build_wave_gap_fill_patches(
+                    Path(args.nww_native_domain_root) / flow_domain_id,
+                    args.output_root,
+                    start_utc_ns=start_utc_ns,
+                    end_utc_ns=end_utc_ns,
+                    flow_domain_id=flow_domain_id,
+                )
+                domain_report["wave_patches"] = wave_patches
+            if not args.skip_validate:
+                domain_report["validation"] = native_gap_fill.validate_gap_fill_blocked(
+                    args.output_root, flow_domain_id=flow_domain_id
+                )
+        except Exception as exc:  # noqa: BLE001 - 單一區域失敗不應中止其餘區域的重建
+            domain_report["error"] = str(exc)
+            failures.append(flow_domain_id)
+        per_domain_reports[flow_domain_id] = domain_report
+
+    report = {
+        "output_root": str(args.output_root),
+        "start_utc": args.start_utc,
+        "end_utc": args.end_utc,
+        "flow_domain_ids": flow_domain_ids,
+        "failed_flow_domain_ids": failures,
+        "per_domain": per_domain_reports,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+    return 0 if not failures else 2
+
+
+def _native_postprocess_parser() -> argparse.ArgumentParser:
+    """建立 ``lbt native-postprocess`` parser：合併全部工作單元成果、輸出正式產品。
+
+    只認得 ``hour_major_provider.save_backward_driver_result_npz`` 寫出的
+    ``<unit_id>.driver_result.npz`` 檔案格式（見該模組文件「重量級輸出的存放
+    格式」一節）；``--results-dir`` 應該是 ``LBT_NATIVE_RESULTS_DIR`` 指向的
+    同一個目錄。
+    """
+
+    parser = argparse.ArgumentParser(description="合併 native-run 全部工作單元成果，輸出後處理正式產品")
+    parser.add_argument("--identity-table", required=True, type=Path, help="WP-4 粒子身分表 npz 路徑")
+    parser.add_argument(
+        "--results-dir",
+        required=True,
+        type=Path,
+        help="hour_major_provider 寫出的 <unit_id>.driver_result.npz 所在目錄（LBT_NATIVE_RESULTS_DIR）",
+    )
+    parser.add_argument("--output", required=True, type=Path, help="後處理成果輸出目錄")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="可選：正式設定 YAML 路徑，提供時輸出的離開紀錄會額外帶經緯度（由各站所屬" "區域投影反算）",
+    )
+    parser.add_argument("--trajectory-sample-size-per-group", type=int, default=24)
+    parser.add_argument("--trajectory-sample-seed", type=int, default=0)
+    parser.add_argument("--kde-grid-cell-count", type=int, default=64)
+    parser.add_argument("--kde-minimum-point-count", type=int, default=30)
+    return parser
+
+
+def _build_native_lonlat_projector(
+    config: Any,
+) -> native_postprocess.LonLatProjector:
+    """由設定檔的 ``study_sites``／``domains`` 建立「站點局部座標 → 經緯度」投影器。
+
+    與 ``production_wiring._site_projection_map`` 使用完全相同的
+    ``DomainProjection(*domain_config.center_lonlat)`` 建構方式（該函式是私有
+    輔助函式，本處為避免跨模組依賴私有名稱而在 CLI 層獨立重建，但邏輯與其
+    保持一致，任一方修改投影中心的取得方式都必須同步更新另一方）。
+    """
+
+    domain_by_region = {domain.analysis_region_id: domain for domain in config.domains}
+    site_to_region = {site.study_site_id: site.analysis_region_id for site in config.study_sites}
+    projections: dict[str, DomainProjection] = {}
+    for site_id, region_id in site_to_region.items():
+        domain_config = domain_by_region.get(region_id)
+        if domain_config is not None:
+            projections[site_id] = DomainProjection(*domain_config.center_lonlat)
+
+    def projector(
+        study_site_id: np.ndarray, x_m: np.ndarray, y_m: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        lon = np.full(x_m.shape, np.nan, dtype=np.float64)
+        lat = np.full(x_m.shape, np.nan, dtype=np.float64)
+        for site_id, projection in projections.items():
+            mask = study_site_id == site_id
+            if not np.any(mask):
+                continue
+            site_lon, site_lat = projection.unproject(x_m[mask], y_m[mask])
+            lon[mask] = site_lon
+            lat[mask] = site_lat
+        return lon, lat
+
+    return projector
+
+
+def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
+    """合併 ``native-run`` 全部工作單元成果，輸出離開紀錄、通量與條件式來源足跡。"""
+
+    args = _native_postprocess_parser().parse_args(argv)
+    identity_table = load_particle_identity_table_npz(args.identity_table)
+
+    lonlat_projector: native_postprocess.LonLatProjector | None = None
+    if args.config is not None:
+        config = load_config(str(args.config), formal_release=False)
+        lonlat_projector = _build_native_lonlat_projector(config)
+
+    postprocess_config = native_postprocess.PostprocessConfig(
+        trajectory_sample_size_per_group=args.trajectory_sample_size_per_group,
+        trajectory_sample_seed=args.trajectory_sample_seed,
+        kde_grid_cell_count=args.kde_grid_cell_count,
+        kde_minimum_point_count=args.kde_minimum_point_count,
+    )
+    accumulator = native_postprocess.PostprocessAccumulator(
+        identity_table,
+        output_dir=args.output,
+        config=postprocess_config,
+        lonlat_projector=lonlat_projector,
+    )
+
+    result_paths = sorted(Path(args.results_dir).glob("*.driver_result.npz"))
+    if not result_paths:
+        raise ValueError(f"{args.results_dir} 底下找不到任何 *.driver_result.npz 成果檔")
+    for result_path in result_paths:
+        unit_id = result_path.name[: -len(".driver_result.npz")]
+        driver_result = native_hour_major_provider.load_backward_driver_result_npz(result_path)
+        accumulator.add_batch(unit_id, driver_result)
+
+    manifest = accumulator.finalize()
+    report = {
+        "output": str(args.output),
+        "batch_count": len(manifest.batches),
+        "particle_count_total": manifest.particle_count_total,
+        "status_counts": {str(k): v for k, v in manifest.status_counts.items()},
+        "status_descriptions_zh": {str(k): v for k, v in manifest.status_descriptions_zh.items()},
+    }
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
@@ -2770,9 +3144,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parents=[_source_pathway_validate_parser()],
         add_help=False,
     )
+    subparsers.add_parser("native-preflight", parents=[_native_preflight_parser()], add_help=False)
+    subparsers.add_parser("native-gap-fill", parents=[_native_gap_fill_parser()], add_help=False)
     subparsers.add_parser("native-plan", parents=[_native_plan_parser()], add_help=False)
     subparsers.add_parser("native-run", parents=[_native_run_parser()], add_help=False)
     subparsers.add_parser("native-status", parents=[_native_status_parser()], add_help=False)
+    subparsers.add_parser("native-postprocess", parents=[_native_postprocess_parser()], add_help=False)
     parsed, remainder = parser.parse_known_args(argv)
     # 重新交給共用 handler 解析完整參數，確保獨立與整合 entry point 行為一致。
     command_argv = list(argv if argv is not None else sys.argv[1:])[1:]
@@ -2840,12 +3217,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_source_pathway_build(command_argv)
     if parsed.command == "source-pathway-validate":
         return run_source_pathway_validate(command_argv)
+    if parsed.command == "native-preflight":
+        return run_native_preflight_command(command_argv)
+    if parsed.command == "native-gap-fill":
+        return run_native_gap_fill_command(command_argv)
     if parsed.command == "native-plan":
         return run_native_plan_command(command_argv)
     if parsed.command == "native-run":
         return run_native_run(command_argv)
     if parsed.command == "native-status":
         return run_native_status(command_argv)
+    if parsed.command == "native-postprocess":
+        return run_native_postprocess_command(command_argv)
     parser.error(f"未知命令：{parsed.command}; 其餘參數={remainder}")
     return 2
 
