@@ -839,6 +839,11 @@ def _native_plan_parser() -> argparse.ArgumentParser:
         default=os.environ.get("OCM_NATIVE_ROOT"),
         help="ocm_native schema 3 根目錄；省略時讀取 OCM_NATIVE_ROOT 環境變數",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="正式設定 YAML；提供時缺口檢查會納入 OCM_RECONSTRUCTION_ROOT 內已核准的重建 patch",
+    )
     parser.add_argument("--max-backtrack-days", type=float, default=30.0)
     parser.add_argument(
         "--skip-gap-check",
@@ -1023,6 +1028,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
     summary = native_orchestrator.summarize_native_work_plan(units)
 
     gap_checks: tuple[native_orchestrator.ArrivalGapCheck, ...] = ()
+    patch_months_used: dict[str, list[str]] = {}
     if not args.skip_gap_check:
         if args.ocm_native_root is None:
             raise ValueError(
@@ -1038,10 +1044,25 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
             expected_start = int(min(region_arrivals) - round(max_backtrack_seconds * 1.0e9))
             expected_end = int(max(region_arrivals))
             month_dirs = _discover_native_month_dirs(args.ocm_native_root, flow_domain_id)
+            # 已核准的 OCM 缺口重建 patch：提供 --config 且設定 OCM_RECONSTRUCTION_ROOT
+            # 時一併納入盤點，與正式執行時讀取端套用的 patch 一致（否則已重建的小時會被
+            # 誤判為未登錄缺口）。
+            patches = {}
+            if args.config is not None:
+                patches = native_production_wiring.load_domain_reconstruction_patches(
+                    args.config,
+                    region,
+                    ocm_native_root=args.ocm_native_root,
+                    reconstruction_root=os.environ.get("OCM_RECONSTRUCTION_ROOT"),
+                    months=sorted(month_dirs),
+                    formal=args.formal,
+                )
+                patch_months_used[region] = sorted(patches)
             gap_reports[region] = inventory_forcing_gaps(
                 month_dirs,
                 expected_start_utc_ns=expected_start,
                 expected_end_utc_ns=expected_end,
+                patches=patches,
                 flow_id=flow_domain_id,
             )
         gap_checks = native_orchestrator.check_arrival_gap_safety(
@@ -1055,7 +1076,11 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         config_sha256=args.config_sha256,
         seed_policy="particle_identity_table_master_seed_v1",
         master_seed=int(table.master_seed),
-        extra={"gap_check_skipped": bool(args.skip_gap_check), "schedule": args.schedule},
+        extra={
+            "gap_check_skipped": bool(args.skip_gap_check),
+            "schedule": args.schedule,
+            "gap_check_reconstruction_patch_months": patch_months_used,
+        },
     )
 
     # 缺口安全檢查（上面）永遠以原本的逐工作單元粒度進行——``check_arrival_gap_

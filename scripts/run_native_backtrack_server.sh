@@ -248,6 +248,12 @@ esac
 mkdir -p "${NUMBA_CACHE_DIR}"
 export NUMBA_CACHE_DIR
 export PYTHONDONTWRITEBYTECODE=1
+# 每個工作程序只用一個數學函式庫執行緒：平行度由 native-run 的多程序提供，
+# 若讓 NumPy／BLAS 各自再開多執行緒，56 個程序會嚴重過度訂閱核心。
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMBA_NUM_THREADS="${NUMBA_NUM_THREADS:-1}"
 
 # 重建 patch 的已驗證雜湊快取：同一個未變動的 patch 檔只完整計算一次 SHA-256，
 # 避免每個工作程序啟動時都把數十 GB 的 patch 重讀一遍（見 forcing_window._sha256_file）。
@@ -347,6 +353,7 @@ run_plan() {
     --config-sha256 "${LBT_NATIVE_CONFIG_SHA256:-not_provided}"
     --output "${PLAN_JSON}"
     --schedule hour-major-segmented
+    --config "${LBT_NATIVE_CONFIG}"
   )
   if [[ -n "${LBT_NATIVE_REGION_TO_FLOW_DOMAIN:-}" ]]; then
     plan_args+=(--region-to-flow-domain "${LBT_NATIVE_REGION_TO_FLOW_DOMAIN}")

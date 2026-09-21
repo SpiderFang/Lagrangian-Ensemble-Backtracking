@@ -145,6 +145,7 @@ __all__ = [
     "DomainPreflightReport",
     "PreflightReport",
     "preflight_native_inputs",
+    "load_domain_reconstruction_patches",
 ]
 
 
@@ -622,6 +623,44 @@ def _domain_resources_factory_entrypoint(
     """
 
     return build_domain_resources(config_path, domain_id, env=env, formal=formal)
+
+
+def load_domain_reconstruction_patches(
+    config_path: str | Path,
+    domain_id: str,
+    *,
+    ocm_native_root: str | Path,
+    reconstruction_root: str | None,
+    months: Sequence[str],
+    formal: bool = True,
+) -> dict[str, OCMReconstructionPatchMonth]:
+    """載入某分析區域對應流場區域的已核准 OCM 缺口重建 patch，供規劃階段的缺口盤點使用。
+
+    ``native-plan`` 的到達時刻缺口安全檢查若不考慮已核准的重建 patch，會把
+    「已由版本化重建方法填補」的小時誤判為未登錄缺口；正式執行時
+    ``forcing_bridge`` 的讀取端本來就會套用這些 patch，因此規劃階段必須用
+    同一份 patch 盤點才一致。網格（算 mesh fingerprint 用）與 patch 驗證
+    邏輯完全沿用 ``build_domain_resources`` 與 ``_load_reconstruction_patches``。
+    ``reconstruction_root`` 為空時回傳空字典（等同未啟用重建）。
+    """
+
+    if not reconstruction_root:
+        return {}
+    config, _ = _resolve_config(config_path, config_path=None)
+    domain_matches = [item for item in config.domains if item.analysis_region_id == domain_id]
+    if len(domain_matches) != 1:
+        raise WiringError(f"config.domains 必須恰有一個 analysis_region_id={domain_id!r} 的流場區域")
+    domain_config = domain_matches[0]
+    flow_domain_id = resolve_flow_domain_id(config, domain_id, formal=formal)
+    projection = DomainProjection(*domain_config.center_lonlat)
+    grid_dir = Path(ocm_native_root) / flow_domain_id / "grid"
+    if not grid_dir.is_dir():
+        raise WiringError(f"缺少 OCM 原生網格資料夾：{grid_dir}")
+    mesh = NativeMesh.from_directory(grid_dir, projection=projection)
+    patches, _ = _load_reconstruction_patches(
+        reconstruction_root, flow_domain_id=flow_domain_id, months=list(months), mesh=mesh
+    )
+    return patches
 
 
 def make_domain_resources_factory(
