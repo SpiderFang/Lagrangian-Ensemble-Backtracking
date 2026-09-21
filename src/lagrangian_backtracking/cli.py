@@ -938,6 +938,19 @@ def _native_plan_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _months_overlapping_window(month_ids: Sequence[str], start_utc_ns: int, end_utc_ns: int) -> list[str]:
+    """只保留與 ``[start, end]`` 期間重疊的 ``YYYYMM`` 月份，避免載入（並逐檔驗證雜湊）期間外的重建 patch。"""
+
+    start = np.datetime64(int(start_utc_ns), "ns").astype("datetime64[M]")
+    end = np.datetime64(int(end_utc_ns), "ns").astype("datetime64[M]")
+    kept = []
+    for month_id in month_ids:
+        month = np.datetime64(f"{month_id[:4]}-{month_id[4:6]}", "M")
+        if start <= month <= end:
+            kept.append(month_id)
+    return kept
+
+
 def _discover_native_month_dirs(ocm_native_root: Path, flow_domain_id: str) -> dict[str, str]:
     """列出 ``<root>/<flow_domain_id>/months/<YYYYMM>`` 既有月份目錄，供缺口盤點使用。
 
@@ -1054,7 +1067,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
                     region,
                     ocm_native_root=args.ocm_native_root,
                     reconstruction_root=os.environ.get("OCM_RECONSTRUCTION_ROOT"),
-                    months=sorted(month_dirs),
+                    months=_months_overlapping_window(sorted(month_dirs), expected_start, expected_end),
                     formal=args.formal,
                 )
                 patch_months_used[region] = sorted(patches)
