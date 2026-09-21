@@ -22,6 +22,8 @@ generated pilot execution YAML；它不建立軌跡、不把設定升為 approve
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import importlib
 import json
 import math
 import os
@@ -59,6 +61,10 @@ from .input_derivation import (
     validate_release_config,
 )
 from .models import ParticleState, VelocitySample
+from .native_runner import orchestrator as native_orchestrator
+from .native_runner.backward_driver import load_baytrace_modules
+from .native_runner.forcing_bridge import inventory_forcing_gaps
+from .native_runner.particle_input import load_particle_identity_table_npz
 from .outputs import validate_trajectory_shard, write_trajectory_shard
 from .pilot_calibration import (
     build_pilot_calibration,
@@ -805,6 +811,273 @@ def _source_pathway_validate_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="驗證 source-pathway-v1 成果包")
     parser.add_argument("release", type=Path)
     return parser
+
+
+def _native_plan_parser() -> argparse.ArgumentParser:
+    """建立 WP-7 native 工作單元規劃＋缺口安全檢查 parser（見 CLI 參考）。
+
+    只讀取既有粒子身分表（WP-4 ``build_particle_identity_table`` 的 npz 輸出）與
+    ``ocm_native`` 月份時間軸，切分工作單元並檢查每個到達時刻的 30 天回溯窗是否
+    落在未登錄缺口內；不載入 BayTrace 原始碼、不建構網格、不執行任何 kernel 呼叫，
+    因此可以在秒等級完成，供核准者在啟動正式計算前先審查。
+    """
+
+    parser = argparse.ArgumentParser(description="規劃 native 逆向批次工作單元並檢查到達時刻缺口安全性")
+    parser.add_argument("--identity-table", required=True, type=Path, help="WP-4 粒子身分表 npz 路徑")
+    parser.add_argument(
+        "--region-to-flow-domain",
+        type=Path,
+        help="JSON 檔：{analysis_region_id: flow_domain_id}；省略時 flow_domain_id 沿用 analysis_region_id",
+    )
+    parser.add_argument(
+        "--ocm-native-root",
+        type=Path,
+        default=os.environ.get("OCM_NATIVE_ROOT"),
+        help="ocm_native schema 3 根目錄；省略時讀取 OCM_NATIVE_ROOT 環境變數",
+    )
+    parser.add_argument("--max-backtrack-days", type=float, default=30.0)
+    parser.add_argument(
+        "--skip-gap-check",
+        action="store_true",
+        help="明確略過缺口安全檢查（例如合成資料試跑）；一律在輸出中標記，不靜默略過",
+    )
+    parser.add_argument("--project-root", type=Path, default=Path("."))
+    parser.add_argument("--declared-git-commit")
+    parser.add_argument("--formal", action="store_true")
+    parser.add_argument("--config-sha256", default="not_provided")
+    parser.add_argument("--output", required=True, type=Path, help="輸出的工作計畫 JSON 路徑")
+    return parser
+
+
+def _discover_native_month_dirs(ocm_native_root: Path, flow_domain_id: str) -> dict[str, str]:
+    """列出 ``<root>/<flow_domain_id>/months/<YYYYMM>`` 既有月份目錄，供缺口盤點使用。
+
+    只列目錄名稱與路徑，不讀取任何月份內的陣列檔；``inventory_forcing_gaps`` 本身
+    只讀取每個月份的 ``time_utc_ns.npy``（見其 docstring），維持整體檢查在秒等級。
+    """
+
+    months_dir = Path(ocm_native_root) / flow_domain_id / "months"
+    if not months_dir.is_dir():
+        raise ValueError(f"找不到 flow_domain_id={flow_domain_id} 的月份目錄：{months_dir}")
+    return {entry.name: str(entry) for entry in sorted(months_dir.iterdir()) if entry.is_dir()}
+
+
+def _native_run_parser() -> argparse.ArgumentParser:
+    """建立 WP-7 native 工作單元執行／續跑 parser（見 CLI 參考）。
+
+    真正呼叫 BayTrace 核心的 ``build_worker_resources``／``run_unit`` 由
+    ``--resource-provider`` 指定的模組層級 factory 函式提供（見
+    ``native_runner.orchestrator`` 模組文件「執行引擎」一節與「已知限制」）；本命令
+    本身不假設任何特定的流場區域網格、interest region 或波浪橋接實作方式。
+    """
+
+    parser = argparse.ArgumentParser(description="執行（或續跑）native-plan 產生的工作單元")
+    parser.add_argument("plan", type=Path, help="native-plan 產生的工作計畫 JSON")
+    parser.add_argument("--output", required=True, type=Path, help="完成證據、結果摘要與進度快照目錄")
+    parser.add_argument(
+        "--resource-provider",
+        required=True,
+        help=(
+            "'模組路徑:函式名稱'；該函式呼叫時不帶參數，須回傳 "
+            "(build_worker_resources, run_unit) 兩個模組層級可 pickle 的 callable"
+        ),
+    )
+    parser.add_argument("--worker-count", type=int)
+    parser.add_argument(
+        "--auto-worker-count", action="store_true", help="依可用記憶體與 CPU 數自動估算 worker 數"
+    )
+    parser.add_argument("--per-worker-memory-bytes", type=int, help="--auto-worker-count 時必須提供")
+    parser.add_argument("--reserved-memory-bytes", type=int, default=0)
+    parser.add_argument("--max-workers", type=int)
+    parser.add_argument("--numba-cache-dir", type=Path, default=os.environ.get("NUMBA_CACHE_DIR"))
+    parser.add_argument(
+        "--allow-unsafe-arrivals",
+        action="store_true",
+        help="明確覆寫 native-plan 回報的缺口不安全狀態；預設 fail-closed 拒絕啟動",
+    )
+    parser.add_argument("--baytrace-root", type=Path, default=os.environ.get("LBT_BAYTRACE_ROOT"))
+    parser.add_argument("--project-root", type=Path, default=Path("."))
+    parser.add_argument("--declared-git-commit")
+    parser.add_argument("--formal", action="store_true")
+    parser.add_argument("--config-sha256", default="not_provided")
+    parser.add_argument("--mp-context", default="spawn", choices=("spawn", "forkserver", "fork"))
+    return parser
+
+
+def _native_status_parser() -> argparse.ArgumentParser:
+    """建立 WP-7 native 執行進度查詢 parser。"""
+
+    parser = argparse.ArgumentParser(description="讀取 native-run 執行進度快照與完成證據統計")
+    parser.add_argument("--output", required=True, type=Path, help="native-run 使用的同一個輸出目錄")
+    return parser
+
+
+def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
+    """規劃 native 工作單元、檢查缺口安全性並寫出計畫 JSON。"""
+
+    args = _native_plan_parser().parse_args(argv)
+    table = load_particle_identity_table_npz(args.identity_table)
+
+    region_to_flow_domain: dict[str, str] = {}
+    if args.region_to_flow_domain is not None:
+        region_to_flow_domain = json.loads(args.region_to_flow_domain.read_text(encoding="utf-8"))
+
+    units = native_orchestrator.plan_native_work_units(table, region_to_flow_domain=region_to_flow_domain)
+    summary = native_orchestrator.summarize_native_work_plan(units)
+
+    gap_checks: tuple[native_orchestrator.ArrivalGapCheck, ...] = ()
+    if not args.skip_gap_check:
+        if args.ocm_native_root is None:
+            raise ValueError(
+                "缺口檢查需要 --ocm-native-root 或 OCM_NATIVE_ROOT；如需略過請明示 --skip-gap-check"
+            )
+        max_backtrack_seconds = args.max_backtrack_days * 86400.0
+        gap_reports: dict[str, object] = {}
+        for region in sorted({unit.analysis_region_id for unit in units}):
+            flow_domain_id = region_to_flow_domain.get(region, region)
+            region_arrivals = [
+                unit.arrival_time_utc_ns for unit in units if unit.analysis_region_id == region
+            ]
+            expected_start = int(min(region_arrivals) - round(max_backtrack_seconds * 1.0e9))
+            expected_end = int(max(region_arrivals))
+            month_dirs = _discover_native_month_dirs(args.ocm_native_root, flow_domain_id)
+            gap_reports[region] = inventory_forcing_gaps(
+                month_dirs,
+                expected_start_utc_ns=expected_start,
+                expected_end_utc_ns=expected_end,
+                flow_id=flow_domain_id,
+            )
+        gap_checks = native_orchestrator.check_arrival_gap_safety(
+            table, gap_reports_by_region=gap_reports, max_backtrack_seconds=max_backtrack_seconds
+        )
+
+    manifest = native_orchestrator.build_native_run_manifest(
+        project_root=args.project_root,
+        declared_git_commit=args.declared_git_commit,
+        formal=args.formal,
+        config_sha256=args.config_sha256,
+        seed_policy="particle_identity_table_master_seed_v1",
+        master_seed=int(table.master_seed),
+        extra={"gap_check_skipped": bool(args.skip_gap_check)},
+    )
+    native_orchestrator.write_native_plan_file(
+        args.output, units=units, gap_checks=gap_checks, summary=summary, manifest=manifest
+    )
+
+    unsafe = [check for check in gap_checks if not check.is_gap_safe]
+    report = {
+        "output": str(args.output),
+        "unit_count": summary.unit_count,
+        "locality_group_count": summary.locality_group_count,
+        "particle_count_total": summary.particle_count_total,
+        "region_ids": list(summary.region_ids),
+        "gap_check_skipped": bool(args.skip_gap_check),
+        "is_gap_safe_ready": args.skip_gap_check or len(unsafe) == 0,
+        "unsafe_arrival_count": len(unsafe),
+        "unsafe_arrivals": [dataclasses.asdict(check) for check in unsafe],
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if report["is_gap_safe_ready"] else 2
+
+
+def run_native_run(argv: Sequence[str] | None = None) -> int:
+    """執行（或續跑）``native-plan`` 產生的工作單元。"""
+
+    args = _native_run_parser().parse_args(argv)
+    units, payload = native_orchestrator.read_native_plan_file(args.plan)
+
+    if not payload.get("is_gap_safe_ready", False) and not args.allow_unsafe_arrivals:
+        report = {
+            "error": "plan_not_gap_safe_ready",
+            "message": "native-plan 回報有到達時刻不安全；請先解決缺口或明確加上 --allow-unsafe-arrivals",
+            "unsafe_gap_checks": [
+                check for check in payload.get("gap_checks", []) if not check.get("is_gap_safe")
+            ],
+        }
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 2
+
+    if args.worker_count is not None:
+        worker_count = args.worker_count
+    elif args.auto_worker_count:
+        if args.per_worker_memory_bytes is None:
+            raise ValueError("--auto-worker-count 必須搭配 --per-worker-memory-bytes")
+        worker_count = native_orchestrator.estimate_worker_count(
+            available_memory_bytes=native_orchestrator.read_available_memory_bytes(),
+            per_worker_memory_bytes=args.per_worker_memory_bytes,
+            cpu_count=os.cpu_count(),
+            reserved_memory_bytes=args.reserved_memory_bytes,
+            max_workers=args.max_workers,
+        )
+    else:
+        raise ValueError("必須提供 --worker-count 或 --auto-worker-count")
+
+    module_path, _, func_name = args.resource_provider.partition(":")
+    if not module_path or not func_name:
+        raise ValueError("--resource-provider 必須是 '模組路徑:函式名稱' 格式")
+    provider_module = importlib.import_module(module_path)
+    provider_factory = getattr(provider_module, func_name)
+    build_worker_resources, run_unit = provider_factory()
+
+    baytrace_dependency_sha256: Mapping[str, str] | None = None
+    if args.baytrace_root is not None:
+        handles = load_baytrace_modules(args.baytrace_root)
+        baytrace_dependency_sha256 = handles.dependency_sha256
+
+    manifest = native_orchestrator.build_native_run_manifest(
+        project_root=args.project_root,
+        declared_git_commit=args.declared_git_commit,
+        formal=args.formal,
+        config_sha256=args.config_sha256,
+        seed_policy="particle_identity_table_master_seed_v1",
+        master_seed=int(payload.get("manifest", {}).get("master_seed", 0)),
+        baytrace_source_root=str(args.baytrace_root) if args.baytrace_root else None,
+        baytrace_dependency_sha256=baytrace_dependency_sha256,
+        extra={"plan_path": str(args.plan), "worker_count": worker_count},
+    )
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    summary = native_orchestrator.run_native_plan(
+        units,
+        worker_count=worker_count,
+        build_worker_resources=build_worker_resources,
+        run_unit=run_unit,
+        output_dir=args.output,
+        numba_cache_dir=str(args.numba_cache_dir) if args.numba_cache_dir else None,
+        mp_context_method=args.mp_context,
+    )
+    report = dataclasses.asdict(summary)
+    report["worker_count"] = worker_count
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if summary.all_succeeded else 2
+
+
+def run_native_status(argv: Sequence[str] | None = None) -> int:
+    """讀取 native-run 的進度快照與完成證據統計。"""
+
+    args = _native_status_parser().parse_args(argv)
+    snapshot = native_orchestrator.read_progress_snapshot(args.output)
+    if snapshot is None:
+        error_payload = {"error": "no_progress_snapshot_found", "output": str(args.output)}
+        print(json.dumps(error_payload, ensure_ascii=False))
+        return 2
+
+    status_counts: dict[str, int] = {}
+    for marker_path in sorted(Path(args.output).glob("*.done.json")):
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        status = str(marker.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    report = dict(snapshot)
+    report["unit_status_counts"] = status_counts
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 def _report_spec_create_parser() -> argparse.ArgumentParser:
@@ -2497,6 +2770,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parents=[_source_pathway_validate_parser()],
         add_help=False,
     )
+    subparsers.add_parser("native-plan", parents=[_native_plan_parser()], add_help=False)
+    subparsers.add_parser("native-run", parents=[_native_run_parser()], add_help=False)
+    subparsers.add_parser("native-status", parents=[_native_status_parser()], add_help=False)
     parsed, remainder = parser.parse_known_args(argv)
     # 重新交給共用 handler 解析完整參數，確保獨立與整合 entry point 行為一致。
     command_argv = list(argv if argv is not None else sys.argv[1:])[1:]
@@ -2564,6 +2840,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_source_pathway_build(command_argv)
     if parsed.command == "source-pathway-validate":
         return run_source_pathway_validate(command_argv)
+    if parsed.command == "native-plan":
+        return run_native_plan_command(command_argv)
+    if parsed.command == "native-run":
+        return run_native_run(command_argv)
+    if parsed.command == "native-status":
+        return run_native_status(command_argv)
     parser.error(f"未知命令：{parsed.command}; 其餘參數={remainder}")
     return 2
 

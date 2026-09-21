@@ -1,111 +1,56 @@
-"""驅動 BayTrace 原版 njit 批次主迴圈的 LBT 專用數值核心集合。
+"""以 BayTrace 原版 njit 批次核心執行逆向追蹤的 LBT 子套件。
 
-本子套件放置「直接取代或補齊 BayTrace 批次主迴圈中某一物理項」的獨立模組，例如
-有限水深 Stokes 漂流批次核心（見 ``stokes_batch``）。這裡的模組只負責計算物理量並
-寫入呼叫端提供的輸出陣列，不讀取原始資料檔、不管理粒子生命週期、也不修改
-BayTrace 原始碼；月份選擇、缺值狀態、格網內插與粒子狀態機仍由 LBT 既有的
-``forcing.py``、``engine.py`` 等控制層決定。
+為什麼需要這個子套件
+--------------------
+舊路徑逐粒子以 Python 步進（每粒子步約 5 ms），正式試跑中 BayTrace 原版核心的呼叫
+次數為 0。本子套件改為**直接驅動 BayTrace 原版批次核心**：同一批粒子共用全域同步
+時鐘，每個子步只呼叫一次未修改的 ``batch_move_rk4``，一次處理整批粒子。
 
-之所以獨立於主套件的物理模組（例如 ``stokes.py``）之外，是因為這裡實作的是
-工作書「2-4 節式(7)」明確規定的簡化公式（波長由有限水深色散關係求出，垂向衰減
-採深水型指數項），刻意不套用 ``stokes.py`` 內更完整的雙曲餘弦／正弦有限水深垂向
-結構；兩者服務不同工作包，不應互相取代或合併。
+各模組分工（資料流由上而下）
+----------------------------
+- ``grid_bridge``：靜態網格（``NativeMesh`` 與 ``zcor``）一次轉成 BayTrace 網格陣列。
+- ``forcing_bridge``：已驗收 ``ocm_native`` 逐月記憶體映射（memmap）產品轉成
+  BayTrace 雙時次流場，每流場小時只建一次；缺值與乾點分開；缺口盤點。
+- ``wave_bridge``：已驗收 ``nww3_analysis`` 波浪場以預先計算的雙線性權重內插到網格節點。
+- ``stokes_batch``：工作書式(7) 有限水深 Stokes 漂流批次核心。
+- ``particle_input``：情境矩陣轉成粒子身分表與 BayTrace 結構陣列，並提供分組。
+- ``backward_driver``：逆向驅動層。把「海流＋Stokes＋沉降」合成進流場陣列後呼叫
+  未修改的 BayTrace 核心；隨機擴散以算子分裂在四階 Runge-Kutta 法（RK4）之外逐子步施加。
+- ``orchestrator``：工作單元切分、長駐多程序平行執行、續跑、缺口安全到達時刻。
+- ``postprocess``：串流合併批次成果、離開紀錄、邊界穿越通量與條件式來源足跡。
+
+BayTrace 原始碼一律不修改。
 """
 
 from __future__ import annotations
 
-from .forcing_bridge import (
-    ForcingBridgeError,
-    ForcingGapInventoryReport,
-    HourlyFieldPair,
-    NativeForcingBridgeReader,
-    UnregisteredForcingGapError,
-    UnresolvedForcingGapError,
-    inventory_forcing_gaps,
-    project_face_dryness_to_nodes,
+from . import (
+    backward_driver,
+    forcing_bridge,
+    grid_bridge,
+    orchestrator,
+    particle_input,
+    postprocess,
+    stokes_batch,
+    wave_bridge,
 )
-from .grid_bridge import (
-    NativeGridArrays,
-    NativeGridBridgeError,
-    SigmaStaticizationReport,
-    build_native_grid_arrays,
-    evaluate_static_sigma_error,
-)
-from .particle_input import (
-    BatchGroup,
-    BatchLayoutReport,
-    BayTraceParticleSoA,
-    InitialPositionResolver,
-    ParticleIdentityTable,
-    ParticleInputError,
-    build_baytrace_particle_soa,
-    build_particle_identity_table,
-    group_indices_by_arrival_time,
-    group_indices_by_settling_velocity,
-    group_indices_by_settling_velocity_and_arrival_time,
-    load_particle_identity_table_npz,
-    save_particle_identity_table_npz,
-    summarize_batch_layout,
-    validate_arrival_time_homogeneous_batches,
-    validate_batch_partition,
-    validate_settling_velocity_homogeneous_batches,
-)
-from .stokes_batch import (
-    STOKES_BATCH_STATUS_DESCRIPTIONS,
-    STOKES_BATCH_STATUS_DISPERSION_BRACKET_FAILED,
-    STOKES_BATCH_STATUS_DISPERSION_NOT_CONVERGED,
-    STOKES_BATCH_STATUS_DISPERSION_RESIDUAL_TOO_LARGE,
-    STOKES_BATCH_STATUS_INVALID_PHYSICS,
-    STOKES_BATCH_STATUS_OK,
-    STOKES_BATCH_STATUS_PARTICLE_OUTSIDE_WATER_COLUMN,
-    STOKES_BATCH_STATUS_WAVE_MASK_INVALID,
-    STOKES_BATCH_STATUS_WAVE_QC_FLAGGED,
-    StokesBatchResult,
-    batch_finite_depth_stokes,
-    finite_depth_stokes_reference,
-)
+from .backward_driver import *  # noqa: F403
+from .forcing_bridge import *  # noqa: F403
+from .grid_bridge import *  # noqa: F403
+from .orchestrator import *  # noqa: F403
+from .particle_input import *  # noqa: F403
+from .postprocess import *  # noqa: F403
+from .stokes_batch import *  # noqa: F403
+from .wave_bridge import *  # noqa: F403
 
+# 公開名稱由各模組自己的 ``__all__`` 決定，避免此處清單與模組實作脫節。
 __all__ = [
-    "BatchGroup",
-    "BatchLayoutReport",
-    "BayTraceParticleSoA",
-    "ForcingBridgeError",
-    "ForcingGapInventoryReport",
-    "HourlyFieldPair",
-    "InitialPositionResolver",
-    "NativeForcingBridgeReader",
-    "NativeGridArrays",
-    "NativeGridBridgeError",
-    "ParticleIdentityTable",
-    "ParticleInputError",
-    "STOKES_BATCH_STATUS_DESCRIPTIONS",
-    "STOKES_BATCH_STATUS_DISPERSION_BRACKET_FAILED",
-    "STOKES_BATCH_STATUS_DISPERSION_NOT_CONVERGED",
-    "STOKES_BATCH_STATUS_DISPERSION_RESIDUAL_TOO_LARGE",
-    "STOKES_BATCH_STATUS_INVALID_PHYSICS",
-    "STOKES_BATCH_STATUS_OK",
-    "STOKES_BATCH_STATUS_PARTICLE_OUTSIDE_WATER_COLUMN",
-    "STOKES_BATCH_STATUS_WAVE_MASK_INVALID",
-    "STOKES_BATCH_STATUS_WAVE_QC_FLAGGED",
-    "SigmaStaticizationReport",
-    "StokesBatchResult",
-    "UnregisteredForcingGapError",
-    "UnresolvedForcingGapError",
-    "batch_finite_depth_stokes",
-    "build_baytrace_particle_soa",
-    "build_native_grid_arrays",
-    "build_particle_identity_table",
-    "evaluate_static_sigma_error",
-    "finite_depth_stokes_reference",
-    "group_indices_by_arrival_time",
-    "group_indices_by_settling_velocity",
-    "group_indices_by_settling_velocity_and_arrival_time",
-    "inventory_forcing_gaps",
-    "load_particle_identity_table_npz",
-    "project_face_dryness_to_nodes",
-    "save_particle_identity_table_npz",
-    "summarize_batch_layout",
-    "validate_arrival_time_homogeneous_batches",
-    "validate_batch_partition",
-    "validate_settling_velocity_homogeneous_batches",
+    *grid_bridge.__all__,
+    *forcing_bridge.__all__,
+    *wave_bridge.__all__,
+    *stokes_batch.__all__,
+    *particle_input.__all__,
+    *backward_driver.__all__,
+    *orchestrator.__all__,
+    *postprocess.__all__,
 ]

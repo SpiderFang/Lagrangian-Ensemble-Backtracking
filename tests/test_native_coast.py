@@ -101,7 +101,7 @@ def test_local_event_order_and_no_rng_consumption():
 
 
 def manifest_fixture(tmp_path):
-    """合成核准站資料驗證loader；來源檔／manifest／config各有独立SHA。"""
+    """合成核准站資料驗證loader；來源檔／manifest／config各有獨立SHA。"""
     projection = DomainProjection(120, 22)
     c = coast()
     source = tmp_path / "source.json"

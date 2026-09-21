@@ -56,6 +56,7 @@
 | 單站沉降先導執行計畫 | [operations/pilot_run_plan.md](operations/pilot_run_plan.md) | 定義單站 pilot 的選取、限制、命令與[獨立海岸底圖重繪](operations/pilot_run_plan.md#獨立海岸底圖重繪)入口。 | 現行 | `docs/pilot_run_plan.md` |
 | 單站 30 天工程測速操作契約 | [operations/17_engineering_window_benchmark.md](operations/17_engineering_window_benchmark.md) | 規範工程時窗的輸入、分片、計時、續跑與結果解讀界線。 | 現行 | `docs/operations/17_engineering_window_benchmark.md` |
 | Execution checkpoint schema 3.1 gzip 操作契約 | [operations/18_checkpoint_segment_storage.md](operations/18_checkpoint_segment_storage.md) | 說明 gzip payload、immutable history segment、compact state、hash chain、容量語意與故障恢復。 | 工程候選 | `docs/operations/18_checkpoint_segment_storage.md` |
+| native 逆向批次 orchestrator 操作契約 | [operations/19_native_backward_batch_orchestrator.md](operations/19_native_backward_batch_orchestrator.md) | 說明工作單元切分、worker 排程與記憶體策略、續跑與失敗隔離、到達時刻缺口安全重用機制與伺服器入口用法。 | 工程候選 | `docs/operations/19_native_backward_batch_orchestrator.md` |
 
 ## 產生物與其他入口
 

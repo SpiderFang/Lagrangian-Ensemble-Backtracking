@@ -25,7 +25,72 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = PROJECT_ROOT / "src" / "lagrangian_backtracking"
+NATIVE_RUNNER_PACKAGE_ROOT = PACKAGE_ROOT / "native_runner"
 DEFAULT_OUTPUT = PROJECT_ROOT / "docs" / "source_code_architecture_map.html"
+
+
+# ``native_runner`` 是子套件（一個資料夾，不是 ``PACKAGE_ROOT`` 底下的單一 .py 檔），
+# 因此完全不出現在上面 ``GROUPS``／``MODULE_INFO`` 依賴的「頂層模組」contract 裡——
+# ``test_module_catalog_covers_package_exactly`` 明確要求 ``MODULE_INFO`` 的鍵集合
+# 恰好等於 ``PACKAGE_ROOT.glob("*.py")`` 的頂層檔名集合，把子套件模組塞進去只會讓
+# 那個測試失敗。這裡改用完全獨立的資料結構＋獨立渲染區塊呈現 native_runner 內部
+# 的模組責任與相依關係，不影響、也不需要通過上面那個頂層 contract 測試。
+#
+# 這裡登錄的九個模組對應 WP-1～WP-7；``wave_bridge``（WP-6 波浪橋接）、
+# ``postprocess``（WP-6 合併／KDE）與 ``orchestrator``（WP-7 本身）由不同工作包
+# 平行開發，登錄時可能尚未落地檔案——``build_native_runner_modules`` 會依實際檔案
+# 是否存在標記 ``file_exists``，渲染時仍會列出條目本身（責任分工先登錄），但不會
+# 假裝已經有可點閱的原始碼連結。
+NATIVE_RUNNER_MODULE_ORDER: tuple[str, ...] = (
+    "__init__",
+    "grid_bridge",
+    "forcing_bridge",
+    "stokes_batch",
+    "particle_input",
+    "backward_driver",
+    "wave_bridge",
+    "postprocess",
+    "orchestrator",
+)
+
+NATIVE_RUNNER_MODULE_INFO: dict[str, dict[str, str]] = {
+    "__init__": {
+        "role": "子套件的唯一公開介面，重新匯出下列各模組的穩定符號",
+        "read_first": "只看它決定要不要 import 個別模組；不含任何計算邏輯本身。",
+    },
+    "grid_bridge": {
+        "role": "把 OCM 原生網格轉成 BayTrace batch_interp 看得懂的靜態陣列（WP-1）",
+        "read_first": "節點/層/sigma 反推與乾濕由此建立一次，之後不重新三角化。",
+    },
+    "forcing_bridge": {
+        "role": "把多月 ocm_native memmap 轉成雙時次欄位，含缺口盤點與滑動快取（WP-2）",
+        "read_first": "先看 inventory_forcing_gaps（秒級掃描）再看 NativeForcingBridgeReader 的兩小時快取。",
+    },
+    "stokes_batch": {
+        "role": "有限水深 Stokes 漂流的批次核心，供 backward_driver 合成總速度使用（WP-3）",
+        "read_first": "純數值核心，不讀資料檔；輸入是節點波浪場，不是逐粒子迴圈。",
+    },
+    "particle_input": {
+        "role": "全案粒子身分表與分批（依沉降速度／到達時刻）建構（WP-4）",
+        "read_first": "ParticleIdentityTable 的 content_sha256 是續跑判斷輸入是否改變的依據。",
+    },
+    "backward_driver": {
+        "role": "驅動未修改的 BayTrace njit 核心完成單批逆向追蹤（WP-5，效能核心）",
+        "read_first": "先看模組頂端「四項關鍵事實」，再看 run_backward_batch 的完整逐小時迴圈。",
+    },
+    "wave_bridge": {
+        "role": "NWW3 分析產品到追蹤節點的波浪場解析器，供 wave_field_resolver 使用（WP-6）",
+        "read_first": "由另一工作包開發；orchestrator 只透過可注入的 callable 介面呼叫它。",
+    },
+    "postprocess": {
+        "role": "工作單元結果的合併與 KDE 後處理（WP-6）",
+        "read_first": "由另一工作包開發；本圖只登錄責任分工，實際介面以該工作包文件為準。",
+    },
+    "orchestrator": {
+        "role": "把粒子身分表切成工作單元，跨核心長駐平行驅動 run_backward_batch（WP-7）",
+        "read_first": "先看模組頂端「執行引擎」與「已知限制」，再看 run_native_plan 的排程與續跑邏輯。",
+    },
+}
 
 
 # 五個群組的順序與 ``docs/development/11_source_code_guide_and_plan_traceability.md`` 第 3 節一致，左右排列代表由上游資料逐步走向
@@ -73,6 +138,8 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "engine",
             "advection",
             "baytrace_ocm_adapter",
+            "native_coast",
+            "baytrace_wave_frame",
         ),
     },
     {
@@ -371,6 +438,26 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         "read_first": (
             "只對 no-Stokes OCM 加定值沉降建立原版 frame；Stokes 與未支援形狀回傳明示原因，"
             "不把混合路徑誤標成完整 BayTrace，且 resolver counters 與 gauge 分開保存。"
+        ),
+    },
+    "native_coast": {
+        "role": "版本化已審模型岸界的嚴格載入與逐步首次接觸查詢",
+        "inputs": "已審南灣主缺支援區與連江112邊內孔的岸界公尺線段、component 身分與 geometry SHA-256",
+        "outputs": "NativeCoast／CoastContact：逐步首次接觸位置與線段來源，不反射、不外插速度",
+        "entrypoints": ["load_native_coasts", "NativeCoast", "CoastContact"],
+        "read_first": (
+            "只涵蓋兩個已核准 component（南灣、連江112邊內孔）；索引在靜態載入時一次建立，"
+            "每步只查詢線段包圍盒做首次碰岸判定，不聯集整個網格、不把底圖升為物理輸入。"
+        ),
+    },
+    "baytrace_wave_frame": {
+        "role": "把 NWW3 波浪場整理成 BayTrace 原版 RK4 可讀的節點／水層速度",
+        "inputs": "既有 forcing manager 的 OCM 兩端 UTC 全域波浪時間列、節點 Hs／峰頻／來向",
+        "outputs": "WaveNodeFields：各 zcor 水層的有限水深 Stokes 節點速度與逐節點 QC",
+        "entrypoints": ["prepare_finite_depth_node_fields", "WaveNodeFields"],
+        "read_first": (
+            "採 finite_depth_node_fields_v1：離散取樣點與舊逐粒子／stage 取樣不同，"
+            "不宣稱軌跡完全等價；缺資料節點保留 NaN 與拒絕原因，不可補零。"
         ),
     },
     "scenarios": {
@@ -1501,6 +1588,93 @@ def build_modules() -> list[dict[str, Any]]:
     return modules
 
 
+def discover_native_runner_imports() -> list[dict[str, str]]:
+    """以 AST 掃描 ``native_runner`` 子套件內的同目錄相對匯入（``level == 1``）。
+
+    只收錄子套件「內部」彼此的匯入（``from .backward_driver import ...``），跨到
+    父套件的匯入（``from ..stokes import ...``，``level == 2``）不在這裡呈現——
+    那些屬於上面主圖表的責任，這裡只畫子套件內部的模組關係。檔案若尚未落地
+    （例如 ``wave_bridge``、``postprocess`` 由其他工作包開發中）就不會出現在
+    ``glob`` 結果裡，因此也不會有以它為 source 的邊；``NATIVE_RUNNER_MODULE_INFO``
+    仍會登錄它的責任分工（見上方常數說明），只是暫時沒有可畫的 import 邊。
+    """
+
+    edges: set[tuple[str, str]] = set()
+    if not NATIVE_RUNNER_PACKAGE_ROOT.is_dir():
+        return []
+    for path in sorted(NATIVE_RUNNER_PACKAGE_ROOT.glob("*.py")):
+        source = path.stem
+        if source == "__init__":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level != 1 or not node.module:
+                continue
+            target = node.module.split(".")[0]
+            if (NATIVE_RUNNER_PACKAGE_ROOT / f"{target}.py").is_file():
+                edges.add((source, target))
+    return [{"source": source, "target": target} for source, target in sorted(edges)]
+
+
+def build_native_runner_modules() -> list[dict[str, Any]]:
+    """把 ``NATIVE_RUNNER_MODULE_ORDER`` 與檔案實際存在狀態整理成渲染用資料。"""
+
+    modules: list[dict[str, Any]] = []
+    for module_id in NATIVE_RUNNER_MODULE_ORDER:
+        info = NATIVE_RUNNER_MODULE_INFO[module_id]
+        file_path = NATIVE_RUNNER_PACKAGE_ROOT / f"{module_id}.py"
+        modules.append(
+            {
+                "id": module_id,
+                "title": f"native_runner/{module_id}.py",
+                "file_exists": file_path.is_file(),
+                "source": f"../src/lagrangian_backtracking/native_runner/{module_id}.py",
+                **info,
+            }
+        )
+    return modules
+
+
+def _render_native_runner_section_html(modules: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+    """把 native_runner 子套件的模組表與內部匯入邊組成一段獨立、靜態的 HTML。
+
+    刻意不重用主圖表的 SVG／canvas 互動繪製邏輯：九個模組的責任表格已經足以
+    交接，不需要為一個子套件重新實作一次完整的節點拖曳／篩選介面。
+    """
+
+    rows = []
+    for module in modules:
+        status = "已有原始碼" if module["file_exists"] else "尚待其他工作包產出"
+        link = (
+            f'<a href="{module["source"]}"><code>{module["title"]}</code></a>'
+            if module["file_exists"]
+            else f'<code>{module["title"]}</code>'
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{link}</td>"
+            f"<td>{module['role']}</td>"
+            f"<td>{module['read_first']}</td>"
+            f"<td>{status}</td>"
+            "</tr>"
+        )
+    edge_text = (
+        "、".join(f"{edge['source']} → {edge['target']}" for edge in edges) if edges else "（尚無可畫的內部匯入邊）"
+    )
+    return (
+        '<section class="native-runner-panel" aria-label="native_runner 子套件模組">'
+        "<h2>native_runner 子套件（WP-1～WP-7）</h2>"
+        "<p>這是 <code>src/lagrangian_backtracking/native_runner/</code> 子套件的模組責任表，"
+        "獨立於上方主圖表（子套件檔案不計入頂層模組節點契約）。"
+        "目前子套件內部實際 import 邊：" + edge_text + "。</p>"
+        '<table class="native-runner-table">'
+        "<thead><tr><th>模組</th><th>責任</th><th>先讀重點</th><th>狀態</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+        "</section>"
+    )
+
+
 HTML_TEMPLATE = r'''<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -1595,6 +1769,21 @@ HTML_TEMPLATE = r'''<!doctype html>
       .toggle { flex: 0 1 auto; }
       .legend { flex-wrap: wrap; }
     }
+    .native-runner-panel {
+      background: var(--panel-bg, #fff);
+      border: 1px solid var(--border, #d8dee9);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 0 1rem 1rem;
+    }
+    .native-runner-panel h2 { margin-top: 0; font-size: 1.05rem; }
+    .native-runner-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    .native-runner-table th, .native-runner-table td {
+      text-align: left;
+      vertical-align: top;
+      padding: 0.4rem 0.6rem;
+      border-bottom: 1px solid var(--border, #e5e9f0);
+    }
   </style>
 </head>
 <body>
@@ -1632,6 +1821,7 @@ HTML_TEMPLATE = r'''<!doctype html>
       </section>
       <aside id="detail-panel" class="detail-panel" aria-live="polite"></aside>
     </main>
+    __NATIVE_RUNNER_SECTION_HTML__
     <footer>
       實線只表示模組層級的相對 <code>import</code>，不宣稱每條線都是函式直接呼叫；虛線是文件化的資料／控制流程。若要追到函式級行為，從右側「主要閱讀入口」開啟對應原始碼，再回看測試與 <code>docs/development/11_source_code_guide_and_plan_traceability.md</code> 的追溯表。
     </footer>
@@ -1924,12 +2114,17 @@ def render_html(output_path: Path) -> None:
         {"id": group["id"], "label": group["label"], "description": group["description"], "color": group["color"], "modules": list(group["modules"])}
         for group in GROUPS
     ]
+    native_runner_modules = build_native_runner_modules()
+    native_runner_edges = discover_native_runner_imports()
     html = HTML_TEMPLATE
     replacements = {
         "__MODULES_JSON__": json.dumps(modules, ensure_ascii=False, separators=(",", ":")),
         "__IMPORT_EDGES_JSON__": json.dumps(import_edges, ensure_ascii=False, separators=(",", ":")),
         "__FLOW_EDGES_JSON__": json.dumps(list(FLOW_EDGES), ensure_ascii=False, separators=(",", ":")),
         "__GROUPS_JSON__": json.dumps(groups, ensure_ascii=False, separators=(",", ":")),
+        "__NATIVE_RUNNER_SECTION_HTML__": _render_native_runner_section_html(
+            native_runner_modules, native_runner_edges
+        ),
     }
     for placeholder, value in replacements.items():
         html = html.replace(placeholder, value)
