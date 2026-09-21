@@ -304,6 +304,12 @@ def _load_reconstruction_patches(
             root=reconstruction_root, flow_domain_id=flow_domain_id, mesh=mesh
         )
     except FileNotFoundError:
+        # 只有「此流場區域根本沒有 domain manifest」才視為未啟用重建；manifest 在、
+        # 但 root index 或其他必要檔案缺漏，代表重建產品不完整（例如本機副本漏複製
+        # root index），必須 fail-closed，否則補值會被靜默忽略，運算到缺口時才失敗。
+        domain_manifest = Path(reconstruction_root) / flow_domain_id / "reconstruction-manifest.json"
+        if domain_manifest.is_file():
+            raise
         return {}, True
     patches: dict[str, OCMReconstructionPatchMonth] = {}
     for month_id in months:
