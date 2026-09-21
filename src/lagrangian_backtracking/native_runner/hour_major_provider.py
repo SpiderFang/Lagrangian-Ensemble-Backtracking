@@ -468,6 +468,10 @@ def _domain_resources_for(resources: HourMajorWorkerResources, analysis_region_i
     cached = resources.domain_resources_cache.get(analysis_region_id)
     if cached is not None:
         return cached
+    # 每個 worker 只保留「目前這個區域」的資源：資料依區域分批就緒時，worker 會先後處理
+    # 不同區域，若全部留在記憶體，56 個 worker 各自累積四區網格與讀取器會超過伺服器記憶體。
+    # 換區時重建資源只需數秒，遠小於一個排程單元的運算時間。
+    resources.domain_resources_cache.clear()
     built = resources.domain_resources_factory(analysis_region_id)
     resources.domain_resources_cache[analysis_region_id] = built
     return built
