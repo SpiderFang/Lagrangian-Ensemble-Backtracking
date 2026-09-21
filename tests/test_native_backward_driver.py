@@ -1929,3 +1929,126 @@ def test_stokes_depth_threshold_truncates_deep_layers_within_bounded_error(handl
     error_bound = surface_speed_scale * threshold_ratio * 10.0
     assert np.nanmax(diff_u) < error_bound
     assert np.nanmax(diff_v) < error_bound
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-14 任務 B：field1_reuse_candidate（端點重用）驗收
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _endpoint_pair(driver_grid, *, eta1, eta2, u1, v1, u2, v2, time_before_utc_ns, time_after_utc_ns):
+    n_nodes = _n_nodes(driver_grid)
+    shape = (_NVRT, n_nodes)
+    return HourlyFieldPair(
+        time_before_utc_ns=time_before_utc_ns, time_after_utc_ns=time_after_utc_ns, trat=0.0, ibf=-1,
+        u_field1=np.full(shape, u1), v_field1=np.full(shape, v1), w_field1=np.zeros(shape),
+        eta_field1=eta1.copy(), diffusivity_field1=np.full(shape, 1.0e-4),
+        missing_mask1=np.zeros(shape, dtype=bool), dry_face_flag1=np.zeros(shape, dtype=bool),
+        month_id1="synthetic", time_origin1="test",
+        u_field2=np.full(shape, u2), v_field2=np.full(shape, v2), w_field2=np.zeros(shape),
+        eta_field2=eta2.copy(), diffusivity_field2=np.full(shape, 1.0e-4),
+        missing_mask2=np.zeros(shape, dtype=bool), dry_face_flag2=np.zeros(shape, dtype=bool),
+        month_id2="synthetic", time_origin2="test",
+    )
+
+
+def test_field1_reuse_candidate_matches_fresh_when_node_is_dry_equal(driver_grid, handles) -> None:
+    """``field1_reuse_candidate`` 在 ``node_is_dry`` 逐位元相同時必須安全重用，
+    結果與完全不傳這個參數（重新計算）逐位元相同——這是 WP-14 任務 B 的
+    核心正確性保證，見 ``compose_current_and_stokes_fields`` 該參數 docstring
+    「為什麼需要比對 node_is_dry」一節。
+    """
+
+    n_nodes = _n_nodes(driver_grid)
+    eta_zero = np.zeros(n_nodes)
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=np.linspace(0.5, 2.0, n_nodes),
+        peak_frequency_hz=np.linspace(0.08, 0.25, n_nodes),
+        direction_raw_deg=np.linspace(0.0, 300.0, n_nodes),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+
+    # 三個相連的流場時刻 T、T-Δh、T-2Δh，讓「hour h 的 field2」與
+    # 「hour h+1 的 field1」指向同一份原始資料（T-Δh），模擬小時主軸相鄰
+    # 兩小時的窗口相連。
+    pair_h = _endpoint_pair(
+        driver_grid, eta1=eta_zero, eta2=eta_zero, u1=0.02, v1=0.01, u2=0.015, v2=-0.005,
+        time_before_utc_ns=3 * _HOUR_NS, time_after_utc_ns=2 * _HOUR_NS,
+    )
+    pair_h1 = _endpoint_pair(
+        driver_grid, eta1=eta_zero, eta2=eta_zero, u1=0.015, v1=-0.005, u2=0.01, v2=0.03,
+        time_before_utc_ns=2 * _HOUR_NS, time_after_utc_ns=1 * _HOUR_NS,
+    )
+
+    base_h = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, pair_h, wave_field1=wave, wave_field2=wave
+    )
+    base_h1_fresh = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, pair_h1, wave_field1=wave, wave_field2=wave
+    )
+    base_h1_cached = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, pair_h1, wave_field1=wave, wave_field2=wave,
+        field1_reuse_candidate=base_h.field2_endpoint,
+    )
+
+    assert np.array_equal(base_h1_cached.u_field1, base_h.field2_endpoint.u)
+    assert np.array_equal(base_h1_cached.u_field1, base_h1_fresh.u_field1)
+    assert np.array_equal(base_h1_cached.v_field1, base_h1_fresh.v_field1)
+    assert np.array_equal(base_h1_cached.w_field1_no_settling, base_h1_fresh.w_field1_no_settling)
+    assert base_h1_cached.stokes_ok_fraction == base_h1_fresh.stokes_ok_fraction
+    assert base_h1_cached.stokes_points_evaluated == base_h1_fresh.stokes_points_evaluated
+    assert base_h1_cached.stokes_points_possible == base_h1_fresh.stokes_points_possible
+    # field2 一定照常重新計算，不受這個參數影響。
+    assert np.array_equal(base_h1_cached.u_field2, base_h1_fresh.u_field2)
+
+
+def test_field1_reuse_candidate_fails_closed_when_node_is_dry_differs(driver_grid, handles) -> None:
+    """``node_is_dry`` 不同時必須放棄重用、整段重新計算，不得誤用不相容的
+    快取（即使兩個端點指向的原始流場資料時刻相連）。
+    """
+
+    n_nodes = _n_nodes(driver_grid)
+    eta_zero = np.zeros(n_nodes)
+    eta_dry = np.full(n_nodes, -_DP_M * 1.5)  # 水位低於海床，保證全部節點乾
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=np.linspace(0.5, 2.0, n_nodes),
+        peak_frequency_hz=np.linspace(0.08, 0.25, n_nodes),
+        direction_raw_deg=np.linspace(0.0, 300.0, n_nodes),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+
+    # hour h 自己的 eta_field1 是乾的（時刻 T），field2（時刻 T-Δh）因此也
+    # 用「乾」的節點遮罩合成；hour h+1 自己的 eta_field1 就是時刻 T-Δh 的
+    # 真正海面（這裡設為全濕），兩者遮罩基礎不同，不能重用。
+    pair_h_dry = _endpoint_pair(
+        driver_grid, eta1=eta_dry, eta2=eta_zero, u1=0.02, v1=0.01, u2=0.015, v2=-0.005,
+        time_before_utc_ns=3 * _HOUR_NS, time_after_utc_ns=2 * _HOUR_NS,
+    )
+    pair_h1_wet = _endpoint_pair(
+        driver_grid, eta1=eta_zero, eta2=eta_zero, u1=0.015, v1=-0.005, u2=0.01, v2=0.03,
+        time_before_utc_ns=2 * _HOUR_NS, time_after_utc_ns=1 * _HOUR_NS,
+    )
+
+    base_h_dry = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, pair_h_dry, wave_field1=wave, wave_field2=wave
+    )
+    assert np.all(base_h_dry.node_is_dry), "測試前提：hour h 的節點應該全部是乾的"
+
+    base_h1_fresh = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, pair_h1_wet, wave_field1=wave, wave_field2=wave
+    )
+    assert not np.any(base_h1_fresh.node_is_dry), "測試前提：hour h+1 的節點應該全部是濕的"
+
+    base_h1_cached_attempt = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, pair_h1_wet, wave_field1=wave, wave_field2=wave,
+        field1_reuse_candidate=base_h_dry.field2_endpoint,
+    )
+
+    assert np.array_equal(base_h1_cached_attempt.u_field1, base_h1_fresh.u_field1)
+    assert np.array_equal(base_h1_cached_attempt.v_field1, base_h1_fresh.v_field1)
+    assert np.array_equal(base_h1_cached_attempt.w_field1_no_settling, base_h1_fresh.w_field1_no_settling)
+    # 誤用快取的話，field1 會被錯誤地全部歸零（沿用 hour h 的「全乾」遮罩），
+    # 這裡明確排除這個錯誤結果。
+    assert not np.array_equal(base_h1_cached_attempt.u_field1, base_h_dry.field2_endpoint.u)

@@ -214,9 +214,16 @@ def _seed_hex_for(row_ids: np.ndarray) -> np.ndarray:
 
 def _run_unit_standalone(
     driver_grid, handles, *, table: _FakeIdentityTable, unit: NativeWorkUnit,
-    hm_config: hm.HourMajorConfig, resolver,
+    hm_config: hm.HourMajorConfig, resolver, wave_field_resolver=None,
 ) -> bd.BackwardDriverResult:
-    """獨立呼叫 ``run_backward_batch`` 跑同一個工作單元，作為等價驗收的對照組。"""
+    """獨立呼叫 ``run_backward_batch`` 跑同一個工作單元，作為等價驗收的對照組。
+
+    ``run_backward_batch`` 一律不啟用 WP-14 任務 B 的端點重用（該路徑只在
+    ``hour_major.py`` 的小時主軸迴圈接線，見該模組
+    ``run_flow_domain_hour_major`` docstring），因此這個對照組天然是「完全
+    不重用」的基準，適合用來驗證「啟用端點重用」與「完全不重用」兩條路徑
+    逐位元相同。
+    """
 
     rows = unit.particle_row_indices
     soa = _FakeSoa(
@@ -234,6 +241,7 @@ def _run_unit_standalone(
         config=config,
         forcing_resolver=resolver,
         interest_region_polygon=_BIG_POLYGON,
+        wave_field_resolver=wave_field_resolver,
     )
 
 
@@ -360,6 +368,57 @@ def test_hour_major_diffusion_on_matches_standalone_per_unit(driver_grid, handle
     for unit in units:
         standalone = _run_unit_standalone(
             driver_grid, handles, table=table, unit=unit, hm_config=config, resolver=resolver,
+        )
+        _assert_results_bit_identical(result.unit_results[unit.unit_id], standalone, label=unit.unit_id)
+
+
+def test_hour_major_endpoint_reuse_matches_standalone_and_reports_hits(driver_grid, handles) -> None:
+    """WP-14 任務 B：端點重用（field1 沿用上一小時的 field2）啟用時，
+    小時主軸路徑的結果仍須與完全不重用的逐單元路徑逐位元相同，且
+    ``endpoint_reuse_hits`` 必須大於 0（否則這個測試沒有鑑別力，等於沒有
+    真正驗證到重用路徑）。
+
+    用非均勻（隨節點變化）的波浪場，確保 Stokes 全網格計算真的被觸發、
+    且每個節點的計算結果不是平凡的常數，才能有效區分「端點重用算對」與
+    「端點重用算錯但恰好因為資料太簡單而看不出來」。
+    """
+
+    table, units, interest_regions, _t0 = _build_staggered_domain()
+    resolver = _make_resolver(driver_grid, u=0.02, v=0.015, kh=1.0e-4)
+    n_nodes = _n_nodes(driver_grid)
+    rng = np.random.default_rng(20260921)
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=rng.uniform(0.5, 2.5, size=n_nodes),
+        peak_frequency_hz=rng.uniform(0.08, 0.25, size=n_nodes),
+        direction_raw_deg=rng.uniform(0.0, 360.0, size=n_nodes),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+
+    def wave_resolver(_utc_ns: int) -> bd.WaveFieldAtNodes:
+        return wave
+
+    config = hm.HourMajorConfig(
+        max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=2026,
+    )
+
+    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, batch, config=config,
+        forcing_resolver=resolver, wave_field_resolver=wave_resolver,
+    )
+
+    assert result.domain_overhead_diagnostics.endpoint_reuse_hits > 0, (
+        "這個情境（固定波浪場、eta 全程為 0、單一資料來源）每個小時的 field1 "
+        "都應該能沿用上一小時的 field2，端點重用命中數應該大於 0，否則本測試"
+        "沒有真正驗證到 WP-14 任務 B 的重用路徑"
+    )
+    assert result.domain_overhead_diagnostics.endpoint_reuse_misses == 0
+
+    for unit in units:
+        standalone = _run_unit_standalone(
+            driver_grid, handles, table=table, unit=unit, hm_config=config, resolver=resolver,
+            wave_field_resolver=wave_resolver,
         )
         _assert_results_bit_identical(result.unit_results[unit.unit_id], standalone, label=unit.unit_id)
 

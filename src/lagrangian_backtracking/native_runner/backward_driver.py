@@ -183,6 +183,8 @@ from .grid_bridge import NativeGridArrays
 from .stokes_batch import (
     STOKES_BATCH_STATUS_OK,
     batch_finite_depth_stokes,
+    finite_depth_stokes_from_wave_number_batch,
+    solve_wave_number_batch,
 )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -339,6 +341,133 @@ def _evaluate_batch_finite_depth_stokes(
         status[start:stop] = status_chunk
     return stokes_u, stokes_v, wave_number, status
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-14 任務 A：每節點只求一次波數，套用到各層時改呼叫「給定波數」的批次核心
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 見 ``stokes_batch.py`` 模組層級「WP-14 任務 A」說明與
+# ``compose_current_and_stokes_fields`` docstring「wave_number 快取」一節的
+# 完整推導。這裡只負責把 WP-13 既有的「序列或行程池」分派邏輯，從呼叫
+# ``batch_finite_depth_stokes``（每個點都重新求解色散關係）改成呼叫
+# ``finite_depth_stokes_from_wave_number_batch``（套用已經在節點層級算好的
+# 波數，不重新求解），行程池切段與寫回索引的邏輯與 WP-13 完全相同、原樣
+# 保留，只是換了要平行呼叫的目標函式。
+
+
+def _stokes_chunk_task_given_wave_number(
+    node_wave_number: np.ndarray,
+    node_status: np.ndarray,
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    particle_z_m: np.ndarray,
+    water_depth_m: np.ndarray,
+    surface_tolerance_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``_stokes_chunk_task`` 的「給定波數」版本，呼叫未經修改的
+    ``finite_depth_stokes_from_wave_number_batch``。模組層級函式（非閉包），
+    理由同 ``_stokes_chunk_task``：``ProcessPoolExecutor`` 的 ``spawn``
+    啟動方式要求任務函式可以被 pickle 匯入。
+    """
+
+    n = significant_wave_height_m.shape[0]
+    stokes_u = np.empty(n, dtype=np.float64)
+    stokes_v = np.empty(n, dtype=np.float64)
+    wave_number = np.empty(n, dtype=np.float64)
+    status = np.empty(n, dtype=np.int32)
+    finite_depth_stokes_from_wave_number_batch(
+        node_wave_number,
+        node_status,
+        significant_wave_height_m,
+        peak_frequency_hz,
+        direction_raw_deg,
+        particle_z_m,
+        water_depth_m,
+        stokes_u,
+        stokes_v,
+        wave_number,
+        status,
+        surface_tolerance_m,
+    )
+    return stokes_u, stokes_v, wave_number, status
+
+
+def _evaluate_finite_depth_stokes_given_wave_number(
+    node_wave_number: np.ndarray,
+    node_status: np.ndarray,
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    particle_z_m: np.ndarray,
+    water_depth_m: np.ndarray,
+    *,
+    surface_tolerance_m: float,
+    stokes_pool: Any | None,
+    stokes_worker_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``_evaluate_batch_finite_depth_stokes`` 的「給定波數」版本：分派點
+    完全相同（序列或依 ``stokes_worker_count`` 切段的行程池），差別只在
+    呼叫 ``finite_depth_stokes_from_wave_number_batch`` 而非
+    ``batch_finite_depth_stokes``——因為波數已經在節點層級算好、不再需要
+    每個點各自重新求解色散關係，這一步比 WP-13 原本的版本便宜得多（見
+    最終報告的量測），但切段平行邏輯仍保留給呼叫端在需要時使用。
+    """
+
+    n = significant_wave_height_m.shape[0]
+    if stokes_pool is None or stokes_worker_count <= 1 or n < stokes_worker_count:
+        stokes_u = np.empty(n, dtype=np.float64)
+        stokes_v = np.empty(n, dtype=np.float64)
+        wave_number = np.empty(n, dtype=np.float64)
+        status = np.empty(n, dtype=np.int32)
+        finite_depth_stokes_from_wave_number_batch(
+            node_wave_number,
+            node_status,
+            significant_wave_height_m,
+            peak_frequency_hz,
+            direction_raw_deg,
+            particle_z_m,
+            water_depth_m,
+            stokes_u,
+            stokes_v,
+            wave_number,
+            status,
+            surface_tolerance_m,
+        )
+        return stokes_u, stokes_v, wave_number, status
+
+    boundaries = np.linspace(0, n, stokes_worker_count + 1).astype(np.int64)
+    pending: list[tuple[int, int, Any]] = []
+    for i in range(stokes_worker_count):
+        start, stop = int(boundaries[i]), int(boundaries[i + 1])
+        if start == stop:
+            continue
+        future = stokes_pool.submit(
+            _stokes_chunk_task_given_wave_number,
+            np.ascontiguousarray(node_wave_number[start:stop]),
+            np.ascontiguousarray(node_status[start:stop]),
+            np.ascontiguousarray(significant_wave_height_m[start:stop]),
+            np.ascontiguousarray(peak_frequency_hz[start:stop]),
+            np.ascontiguousarray(direction_raw_deg[start:stop]),
+            np.ascontiguousarray(particle_z_m[start:stop]),
+            np.ascontiguousarray(water_depth_m[start:stop]),
+            surface_tolerance_m,
+        )
+        pending.append((start, stop, future))
+
+    stokes_u = np.empty(n, dtype=np.float64)
+    stokes_v = np.empty(n, dtype=np.float64)
+    wave_number = np.empty(n, dtype=np.float64)
+    status = np.empty(n, dtype=np.int32)
+    for start, stop, future in pending:
+        u_chunk, v_chunk, k_chunk, status_chunk = future.result()
+        stokes_u[start:stop] = u_chunk
+        stokes_v[start:stop] = v_chunk
+        wave_number[start:stop] = k_chunk
+        status[start:stop] = status_chunk
+    return stokes_u, stokes_v, wave_number, status
+
+
 __all__ = [
     "BackwardDriverError",
     "NATIVE_STATUS_ACTIVE",
@@ -356,6 +485,7 @@ __all__ = [
     "WaveFieldAtNodes",
     "ComposedFieldPair",
     "ComposedCurrentAndStokesFields",
+    "ComposedFieldEndpoint",
     "compose_current_and_stokes_fields",
     "apply_settling_velocity",
     "compose_total_velocity_fields",
@@ -818,6 +948,7 @@ def compute_smagorinsky_kh_field(
     u_current_mps: np.ndarray,
     v_current_mps: np.ndarray,
     horcon: float = 0.2,
+    use_numba: bool = False,
 ) -> np.ndarray:
     """重用 ``ParticleTracker._compute_smagorinsky_hf2`` 計算水平擴散係數場。
 
@@ -839,10 +970,38 @@ def compute_smagorinsky_kh_field(
             的既定用法）。
         horcon: Smagorinsky 係數，BayTrace 預設 0.2（``params.get('horcon',
             0.2)``）。
+        use_numba: WP-14 任務 C 新增。``False``（預設）：完全不變，呼叫
+            BayTrace 原版 ``_compute_smagorinsky_hf2``（本函式新增這個參數
+            前的唯一行為）。``True``：改呼叫
+            ``smagorinsky_batch.compute_smagorinsky_kh_field_numba``，這個
+            獨立 Numba 移植版本**已知與原版不是逐位元相同**（實測相對誤差
+            落在 ``3e-16``～``5e-16``，即 1-2 個 ulp，來自 NumPy 內積與本
+            模組手寫序列求和的浮點加法結合律差異，不是公式錯誤，見
+            ``smagorinsky_batch.py`` 模組 docstring「位元相同性」一節與
+            ``tests/test_native_smagorinsky_batch.py`` 的量測），因此**預設
+            關閉**、不接線到任何正式呼叫路徑（``hour_major.py``／
+            ``run_backward_batch`` 都不會傳這個參數，恆為 ``False``）；只
+            提供給需要自行評估這個 ulp 級別誤差是否可接受的呼叫端明確
+            選用，選用後果由呼叫端自行承擔。
 
     Returns:
         ``(nvrt, nnode)`` 的水平擴散係數場（``hf2_field``），單位 m²/s。
     """
+
+    if use_numba:
+        from .smagorinsky_batch import SmagorinskyGridArrays, compute_smagorinsky_kh_field_numba
+
+        g = driver_grid.schism_grid
+        grid_arrays = SmagorinskyGridArrays(
+            elnode=g.elnode, area=g.area, dldxy=g.dldxy, nne=g.nne, indel=g.indel,
+            x=g.x, y=g.y, xctr=g.xctr, yctr=g.yctr,
+        )
+        return compute_smagorinsky_kh_field_numba(
+            grid_arrays,
+            u_field2=np.ascontiguousarray(u_current_mps, dtype=np.float64),
+            v_field2=np.ascontiguousarray(v_current_mps, dtype=np.float64),
+            horcon=horcon,
+        )
 
     shim = _TrackerMethodShim(driver_grid.schism_grid, h0=driver_grid.h0, horcon=horcon)
     shim.u_field2 = np.ascontiguousarray(u_current_mps, dtype=np.float64)
@@ -956,6 +1115,12 @@ class ComposedCurrentAndStokesFields:
     一律是 0；提供波浪場但未啟用截斷（``stokes_depth_threshold_ratio=
     None``）時，兩者相等且等於 ``effective_mask`` 內的點數（代表「全部
     點都照舊計算，沒有跳過任何一個」，不是「未使用這組計數」）。
+
+    ``field2_endpoint``（WP-14 任務 B）
+    -------------------------------------
+    這一小時 ``field2`` 端點的合成結果快取單元（``ComposedFieldEndpoint``），
+    供呼叫端保留給**下一小時**當 ``field1_reuse_candidate`` 候選使用，見
+    ``compose_current_and_stokes_fields`` 該參數 docstring 的完整推導。
     """
 
     u_field1: np.ndarray
@@ -971,6 +1136,92 @@ class ComposedCurrentAndStokesFields:
     stokes_ok_fraction: float
     stokes_points_evaluated: int = 0
     stokes_points_possible: int = 0
+    field2_endpoint: ComposedFieldEndpoint | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComposedFieldEndpoint:
+    """WP-14 任務 B：單一流場時刻「端點」的合成結果快取單元。
+
+    背景與動機
+    ----------
+    小時主軸迴圈（``hour_major.run_flow_domain_hour_major``）逐小時遞減
+    UTC 呼叫 ``compose_current_and_stokes_fields``，每次都同時合成該小時的
+    兩個端點（``field_pair.time_before_utc_ns``／``time_after_utc_ns``，即
+    ``field1``／``field2``）。但相鄰兩個小時的窗口是相連的：第 h 小時的
+    ``field2``（較早的端點）與第 h+1 小時的 ``field1``（較晚的端點）通常是
+    **同一個絕對時刻的同一份流場資料**（``field_pair.time_after_utc_ns`` ==
+    下一小時的 ``time_before_utc_ns``，且來自同一個月份／同一種資料來源，
+    見 ``forcing_bridge.HourlyFieldPair`` 的 ``month_id``／``time_origin``
+    欄位），因此把第 h 小時已經算好的 ``field2``（含乾濕歸零、含 Stokes）
+    快取起來，下一小時直接當 ``field1`` 重用，理論上可以省下一半的乾濕＋
+    Stokes 合成成本。
+
+    這裡的欄位就是「重用一個端點所需的最小資訊」：不是重新暴露
+    ``ComposedCurrentAndStokesFields`` 全部欄位，而是只保留「已經套用某個
+    ``node_is_dry`` 遮罩、已經加總 Stokes 貢獻」的 ``u/v/w`` 陣列，以及
+    **那個遮罩本身**（``node_is_dry``）——重用是否安全，完全取決於下一
+    小時自己重新算出的 ``node_is_dry`` 是否與這裡記錄的逐位元相同，見
+    ``compose_current_and_stokes_fields`` 參數 ``field1_reuse_candidate``
+    docstring「為什麼需要比對 node_is_dry」一節的完整推導。呼叫端
+    （``hour_major.py``）另外自行記錄 UTC 時刻／``month_id``／
+    ``time_origin``／波浪時刻等「資料來源」身分資訊，決定要不要把這個
+    快取單元當候選傳進下一小時；本類別本身不含這些身分欄位，因為
+    ``compose_current_and_stokes_fields`` 不知道、也不需要知道呼叫端的
+    快取鍵設計。
+    """
+
+    node_is_dry: np.ndarray
+    u: np.ndarray
+    v: np.ndarray
+    w_no_settling: np.ndarray
+    stokes_ok_count: int
+    stokes_total_count: int
+    stokes_points_evaluated: int
+    stokes_points_possible: int
+    # 主代理補強：產生這個端點的「原始輸入陣列」（海流 u/v/w、水位 eta、以及有波浪時的
+    # 波高／尖峰頻率／波向／有效遮罩／品質旗標）。重用前逐一以 ``np.array_equal`` 比對下一小時
+    # field1 的原始輸入，確保「輸入完全相同＋乾濕遮罩完全相同」才重用；合成是確定性函式，
+    # 兩者皆相同即保證輸出逐位元相同，不再只依賴呼叫端的時刻／來源身分預過濾。
+    # 預設空元組代表「沒有記錄來源」，此時一律不重用（fail-closed）。
+    source_arrays: tuple = ()
+
+
+def _endpoint_source_arrays(
+    u: np.ndarray, v: np.ndarray, w: np.ndarray, eta: np.ndarray, wave: Any | None
+) -> tuple:
+    """收集單一端點合成所需的全部原始輸入陣列，供端點重用時做逐位元相同比對。"""
+
+    arrays = [u, v, w, eta]
+    if wave is not None:
+        arrays.extend(
+            [
+                wave.significant_wave_height_m,
+                wave.peak_frequency_hz,
+                wave.direction_raw_deg,
+                wave.valid_mask_wave,
+                wave.qc_flags,
+            ]
+        )
+    return tuple(arrays)
+
+
+def _same_source_arrays(recorded: tuple, current: tuple) -> bool:
+    """兩組原始輸入陣列是否數量相同且逐一形狀、內容完全相同（NaN 位置也須相同）。"""
+
+    if not recorded or len(recorded) != len(current):
+        return False
+    for a, b in zip(recorded, current, strict=True):
+        a = np.asarray(a)
+        b = np.asarray(b)
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return False
+        if a.dtype.kind == "f":
+            if not np.array_equal(a, b, equal_nan=True):
+                return False
+        elif not np.array_equal(a, b):
+            return False
+    return True
 
 
 def _zero_dry_and_below_kbp(
@@ -997,6 +1248,146 @@ def _zero_dry_and_below_kbp(
     w_field[below_wet] = 0.0
 
 
+def _compose_single_endpoint(
+    grid: NativeGridArrays,
+    u_field: np.ndarray,
+    v_field: np.ndarray,
+    w_field: np.ndarray,
+    *,
+    eta: np.ndarray,
+    wave: WaveFieldAtNodes | None,
+    kbp: np.ndarray,
+    dp: np.ndarray,
+    effective_mask: np.ndarray,
+    nvrt: int,
+    nnode: int,
+    gravity_mps2: float,
+    surface_tolerance_m: float,
+    stokes_depth_threshold_ratio: float | None,
+    stokes_pool: Any | None,
+    stokes_worker_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int]:
+    """單一流場端點（field1 或 field2 其中之一）的「視情況加 Stokes」計算。
+
+    ``compose_current_and_stokes_fields`` 對 field1／field2 原本是同一段
+    程式碼跑兩次（一個 for 迴圈），WP-14 任務 B 需要讓 field1 可以視情況
+    整段跳過（改用快取），field2 則永遠要重新計算，因此把這段邏輯抽成
+    可以各自獨立呼叫一次的輔助函式；運算式與執行順序完全比照 WP-14 任務 A
+    修改後的版本（每節點只求一次波數、套用 ``stokes_depth_threshold_ratio``
+    深度截斷），只是把原本「同一個 for 迴圈跑兩次」的寫法改成「呼叫端呼叫
+    兩次」，不是重新設計計算內容，逐位元相同由
+    ``tests/test_native_backward_driver.py`` 交叉驗證。
+
+    Args:
+        u_field, v_field, w_field: 呼叫端已經複製、且已經套用過
+            ``_zero_dry_and_below_kbp`` 的速度場；本函式會原地疊加 Stokes
+            貢獻，回傳的就是同一個陣列物件（呼叫端不需要另外接手）。
+        eta: 這個端點自己的海面高程（對應 ``field_pair.eta_field1`` 或
+            ``eta_field2``），只用來計算 Stokes 垂向結構所需的相對深度
+            ``z_rel = z_levels(eta) - eta``；**不**用於乾濕判定——乾濕
+            判定的遮罩（``effective_mask``）由呼叫端傳入，完全由「這一
+            小時」自己的 ``eta_field1`` 決定，兩個端點共用同一份，見
+            ``compose_current_and_stokes_fields`` docstring
+            ``field1_reuse_candidate`` 一節「為什麼需要比對 node_is_dry」
+            的完整推導。
+        wave: 這個端點的波浪場；``None`` 代表不計算 Stokes（呼叫端已經把
+            「wave_field1／wave_field2 是否同時提供」的檢查做完，這裡只
+            單純依 ``None``/非 ``None`` 決定要不要算）。
+
+    Returns:
+        ``(u_field, v_field, w_field, stokes_ok_count, stokes_total_count,
+        stokes_points_evaluated, stokes_points_possible)``——後四個是這個
+        單一端點的統計，呼叫端把 field1／field2 兩次呼叫的結果相加即為
+        ``ComposedCurrentAndStokesFields`` 最終回報的欄位。
+    """
+
+    stokes_ok_count = 0
+    stokes_total_count = 0
+    stokes_points_evaluated = 0
+    stokes_points_possible = 0
+
+    if wave is None:
+        return (
+            u_field, v_field, w_field,
+            stokes_ok_count, stokes_total_count, stokes_points_evaluated, stokes_points_possible,
+        )
+
+    z_rel = _vectorized_z_levels(grid.sigma_lcl, kbp, dp, eta) - eta[None, :]
+
+    depth_grid = np.broadcast_to(dp[None, :], (nvrt, nnode))
+    hs_grid = np.broadcast_to(wave.significant_wave_height_m[None, :], (nvrt, nnode))
+    fp_grid = np.broadcast_to(wave.peak_frequency_hz[None, :], (nvrt, nnode))
+    dir_grid = np.broadcast_to(wave.direction_raw_deg[None, :], (nvrt, nnode))
+
+    # WP-14 任務 A：每個節點的 fp／h／Hs／方向／valid_mask_wave／qc_flags
+    # 在 nvrt 個垂向層之間完全相同（上面都是 np.broadcast_to 展開），色散
+    # 關係求根本身也完全不依賴 z，因此對每個節點只求一次波數，而不是對每個
+    # (層,節點) 組合都各自重新求解——這一步同時取代了 WP-9 原本為了
+    # stokes_depth_threshold_ratio 而額外做的「z=0 表層呼叫」，兩者是同一個
+    # 計算（z=0 的物理有效性判斷與節點級判斷完全等價，見
+    # ``stokes_batch.solve_wave_number_batch`` docstring），不需要再算兩次。
+    node_wave_number = np.empty(nnode, dtype=np.float64)
+    node_status = np.empty(nnode, dtype=np.int32)
+    solve_wave_number_batch(
+        np.ascontiguousarray(wave.significant_wave_height_m, dtype=np.float64),
+        np.ascontiguousarray(wave.peak_frequency_hz, dtype=np.float64),
+        np.ascontiguousarray(wave.direction_raw_deg, dtype=np.float64),
+        np.ascontiguousarray(dp, dtype=np.float64),
+        np.ascontiguousarray(wave.valid_mask_wave, dtype=bool),
+        np.ascontiguousarray(wave.qc_flags, dtype=np.int64),
+        node_wave_number,
+        node_status,
+        float(gravity_mps2),
+    )
+    node_wave_number_grid = np.broadcast_to(node_wave_number[None, :], (nvrt, nnode))
+    node_status_grid = np.broadcast_to(node_status[None, :], (nvrt, nnode))
+
+    if stokes_depth_threshold_ratio is None:
+        stokes_mask = effective_mask
+    else:
+        k_known = (
+            (node_status == STOKES_BATCH_STATUS_OK)
+            & np.isfinite(node_wave_number)
+            & (node_wave_number > 0.0)
+        )
+        cutoff_z_node = np.where(
+            k_known,
+            np.log(stokes_depth_threshold_ratio) / (2.0 * np.where(k_known, node_wave_number, 1.0)),
+            -np.inf,
+        )
+        cutoff_z_grid = np.broadcast_to(cutoff_z_node[None, :], (nvrt, nnode))
+        stokes_mask = effective_mask & (z_rel >= cutoff_z_grid)
+
+    n_kept = int(np.count_nonzero(stokes_mask))
+    stokes_points_evaluated = n_kept
+    stokes_points_possible = int(np.count_nonzero(effective_mask))
+    stokes_total_count = int(np.count_nonzero(effective_mask))
+    if n_kept > 0:
+        stokes_u, stokes_v, wave_number, status = _evaluate_finite_depth_stokes_given_wave_number(
+            np.ascontiguousarray(node_wave_number_grid[stokes_mask], dtype=np.float64),
+            np.ascontiguousarray(node_status_grid[stokes_mask], dtype=np.int32),
+            np.ascontiguousarray(hs_grid[stokes_mask], dtype=np.float64),
+            np.ascontiguousarray(fp_grid[stokes_mask], dtype=np.float64),
+            np.ascontiguousarray(dir_grid[stokes_mask], dtype=np.float64),
+            np.ascontiguousarray(z_rel[stokes_mask], dtype=np.float64),
+            np.ascontiguousarray(depth_grid[stokes_mask], dtype=np.float64),
+            surface_tolerance_m=float(surface_tolerance_m),
+            stokes_pool=stokes_pool,
+            stokes_worker_count=stokes_worker_count,
+        )
+        ok_kept = status == STOKES_BATCH_STATUS_OK
+        ok = np.zeros((nvrt, nnode), dtype=bool)
+        ok[stokes_mask] = ok_kept
+        u_field[ok] += stokes_u[ok_kept]
+        v_field[ok] += stokes_v[ok_kept]
+        stokes_ok_count = int(np.count_nonzero(ok_kept))
+
+    return (
+        u_field, v_field, w_field,
+        stokes_ok_count, stokes_total_count, stokes_points_evaluated, stokes_points_possible,
+    )
+
+
 def compose_current_and_stokes_fields(
     driver_grid: NativeBackwardDriverGrid,
     handles: BayTraceModuleHandles,
@@ -1009,6 +1400,7 @@ def compose_current_and_stokes_fields(
     stokes_depth_threshold_ratio: float | None = None,
     stokes_pool: Any | None = None,
     stokes_worker_count: int = 1,
+    field1_reuse_candidate: ComposedFieldEndpoint | None = None,
 ) -> ComposedCurrentAndStokesFields:
     """``compose_total_velocity_fields`` 拆成兩階段後，計算「與沉降速度無關」
     的那一半（乾濕判定＋歸零＋Stokes 全網格計算），供多個沉降速度批次共用。
@@ -1085,6 +1477,38 @@ def compose_current_and_stokes_fields(
             整合點），本函式不擁有它的生命週期。
         stokes_worker_count: 搭配 ``stokes_pool`` 使用，Stokes 點集合要切成
             幾段；``<= 1`` 時等同不啟用（即使提供了 ``stokes_pool``）。
+        field1_reuse_candidate: WP-14 任務 B 新增。``None``（預設）：完全
+            不啟用，``field1`` 一律照原本路徑重新計算乾濕歸零＋Stokes，
+            行為與此參數新增前逐位元相同。呼叫端（通常是
+            ``hour_major.py`` 的小時主軸迴圈）可以傳入**上一小時**回傳的
+            ``ComposedCurrentAndStokesFields.field2_endpoint``，供本函式
+            嘗試直接拿來當這一小時的 ``field1``，省下一次乾濕歸零＋Stokes
+            全網格計算——前提是相鄰兩小時的窗口相連（第 h 小時的
+            ``field2`` 端點＝第 h+1 小時的 ``field1`` 端點，同一絕對時刻、
+            同一資料來源），這件事本函式無從得知，完全由呼叫端自行判斷
+            （比對 ``field_pair`` 的 ``time_before_utc_ns``／
+            ``month_id1``／``time_origin1`` 是否與上一小時 ``field2`` 端點
+            的身分相符，以及波浪時刻是否相符），本函式只負責**傳進來的
+            候選是否在數值上真的可以安全重用**這件事。
+
+            **為什麼需要比對 node_is_dry**：``compose_current_and_
+            stokes_fields`` 對同一小時的 ``field1``／``field2`` 套用
+            **同一份**乾濕遮罩（``node_is_dry``，只由這一小時自己的
+            ``field_pair.eta_field1`` 決定，見上方步驟 1），不是「每個端點
+            各自用自己時刻的海面高程判定乾濕」。這代表：即使第 h 小時的
+            ``field2``（端點時刻 ``T-Δh``）與第 h+1 小時的 ``field1``
+            （同一個端點時刻 ``T-Δh``）指向同一份原始流場資料，兩者在各自
+            小時裡實際套用的乾濕遮罩未必相同——前者用的是第 h 小時自己的
+            ``eta_field1``（時刻 ``T``）算出的遮罩，後者用的是第 h+1 小時
+            自己的 ``eta_field1``（時刻 ``T-Δh``，即端點自己的海面）算出的
+            遮罩，兩個遮罩來自不同時刻的海面高程，只有在這兩個時刻的乾濕
+            狀態剛好完全一致時才會逐位元相同。因此本函式**一律**先算出
+            這一小時自己的 ``node_is_dry``，再與候選記錄的
+            ``node_is_dry`` 逐點比對（``np.array_equal``）；只有完全相同
+            才重用，任何一個節點不同就整個放棄重用、退回正常重新計算——
+            這是刻意保守的 fail-closed 設計，寧可少省一次重用機會，也不
+            冒任何逐位元不一致的風險。這個檢查本身很便宜（一次布林陣列
+            比較，遠比重新算一次 Stokes 便宜），不會抵銷重用帶來的效益。
 
     Raises:
         BackwardDriverError: ``wave_field1``／``wave_field2`` 只提供其中
@@ -1101,111 +1525,64 @@ def compose_current_and_stokes_fields(
     node_is_dry, elem_is_dry = compute_wet_dry_flags(driver_grid, handles, eta_m=field_pair.eta_field1)
     kbp = grid.kbp
     dp = grid.dp
+    nvrt, nnode = field_pair.u_field1.shape
+    effective_mask = (np.arange(nvrt)[:, None] >= kbp[None, :]) & ~node_is_dry[None, :]
+    has_wave = wave_field1 is not None and wave_field2 is not None
 
-    u1 = np.array(field_pair.u_field1, dtype=np.float64, copy=True)
-    v1 = np.array(field_pair.v_field1, dtype=np.float64, copy=True)
-    w1 = np.array(field_pair.w_field1, dtype=np.float64, copy=True)
+    # WP-14 任務 B：field1 是否可以直接沿用上一小時已經算好的 field2 端點，
+    # 見 ``field1_reuse_candidate`` docstring「為什麼需要比對 node_is_dry」
+    # 一節；只有在呼叫端提供候選、且候選記錄的遮罩與這一小時剛算好的
+    # ``node_is_dry`` 逐位元相同時才重用，否則照原本路徑重新計算——不確定
+    # 就重算，不冒險假設兩者一定一樣。
+    field1_reused = (
+        field1_reuse_candidate is not None
+        and np.array_equal(field1_reuse_candidate.node_is_dry, node_is_dry)
+        and _same_source_arrays(
+            field1_reuse_candidate.source_arrays,
+            _endpoint_source_arrays(
+                field_pair.u_field1, field_pair.v_field1, field_pair.w_field1, field_pair.eta_field1,
+                wave_field1 if has_wave else None,
+            ),
+        )
+    )
+    if field1_reused:
+        u1 = np.array(field1_reuse_candidate.u, dtype=np.float64, copy=True)
+        v1 = np.array(field1_reuse_candidate.v, dtype=np.float64, copy=True)
+        w1 = np.array(field1_reuse_candidate.w_no_settling, dtype=np.float64, copy=True)
+        stokes_ok_count = field1_reuse_candidate.stokes_ok_count
+        stokes_total_count = field1_reuse_candidate.stokes_total_count
+        stokes_points_evaluated = field1_reuse_candidate.stokes_points_evaluated
+        stokes_points_possible = field1_reuse_candidate.stokes_points_possible
+    else:
+        u1 = np.array(field_pair.u_field1, dtype=np.float64, copy=True)
+        v1 = np.array(field_pair.v_field1, dtype=np.float64, copy=True)
+        w1 = np.array(field_pair.w_field1, dtype=np.float64, copy=True)
+        _zero_dry_and_below_kbp(u1, v1, w1, kbp=kbp, node_is_dry=node_is_dry)
+        u1, v1, w1, ok1, total1, eval1, possible1 = _compose_single_endpoint(
+            grid, u1, v1, w1, eta=field_pair.eta_field1, wave=wave_field1 if has_wave else None,
+            kbp=kbp, dp=dp, effective_mask=effective_mask, nvrt=nvrt, nnode=nnode,
+            gravity_mps2=gravity_mps2, surface_tolerance_m=surface_tolerance_m,
+            stokes_depth_threshold_ratio=stokes_depth_threshold_ratio,
+            stokes_pool=stokes_pool, stokes_worker_count=stokes_worker_count,
+        )
+        stokes_ok_count, stokes_total_count = ok1, total1
+        stokes_points_evaluated, stokes_points_possible = eval1, possible1
+
     u2 = np.array(field_pair.u_field2, dtype=np.float64, copy=True)
     v2 = np.array(field_pair.v_field2, dtype=np.float64, copy=True)
     w2 = np.array(field_pair.w_field2, dtype=np.float64, copy=True)
-
-    _zero_dry_and_below_kbp(u1, v1, w1, kbp=kbp, node_is_dry=node_is_dry)
     _zero_dry_and_below_kbp(u2, v2, w2, kbp=kbp, node_is_dry=node_is_dry)
-
-    nvrt, nnode = u1.shape
-    effective_mask = (np.arange(nvrt)[:, None] >= kbp[None, :]) & ~node_is_dry[None, :]
-
-    stokes_ok_count = 0
-    stokes_total_count = 0
-    stokes_points_evaluated = 0
-    stokes_points_possible = 0
-    if wave_field1 is not None and wave_field2 is not None:
-        z1 = (
-            _vectorized_z_levels(grid.sigma_lcl, kbp, dp, field_pair.eta_field1)
-            - field_pair.eta_field1[None, :]
-        )
-        z2 = (
-            _vectorized_z_levels(grid.sigma_lcl, kbp, dp, field_pair.eta_field2)
-            - field_pair.eta_field2[None, :]
-        )
-        for z_rel, u_field, v_field, wave in (
-            (z1, u1, v1, wave_field1),
-            (z2, u2, v2, wave_field2),
-        ):
-            depth_grid = np.broadcast_to(dp[None, :], (nvrt, nnode))
-            hs_grid = np.broadcast_to(wave.significant_wave_height_m[None, :], (nvrt, nnode))
-            fp_grid = np.broadcast_to(wave.peak_frequency_hz[None, :], (nvrt, nnode))
-            dir_grid = np.broadcast_to(wave.direction_raw_deg[None, :], (nvrt, nnode))
-            valid_grid = np.broadcast_to(wave.valid_mask_wave[None, :], (nvrt, nnode))
-            qc_grid = np.broadcast_to(wave.qc_flags[None, :], (nvrt, nnode))
-
-            # 決定這一次呼叫實際要計算 Stokes 的 (層,節點) 遮罩：未啟用深度
-            # 截斷時就是整個 effective_mask（與此優化新增前完全相同）；啟用
-            # 時先以 nnode 個點的表層 (z=0) 呼叫求出每個節點的波數，據此縮小
-            # 遮罩，詳見本函式 docstring「stokes_depth_threshold_ratio」一節。
-            if stokes_depth_threshold_ratio is None:
-                stokes_mask = effective_mask
-            else:
-                zero_z_at_nodes = np.zeros(nnode, dtype=np.float64)
-                surface_u = np.empty(nnode, dtype=np.float64)
-                surface_v = np.empty(nnode, dtype=np.float64)
-                surface_k = np.empty(nnode, dtype=np.float64)
-                surface_status = np.empty(nnode, dtype=np.int32)
-                batch_finite_depth_stokes(
-                    np.ascontiguousarray(wave.significant_wave_height_m, dtype=np.float64),
-                    np.ascontiguousarray(wave.peak_frequency_hz, dtype=np.float64),
-                    np.ascontiguousarray(wave.direction_raw_deg, dtype=np.float64),
-                    zero_z_at_nodes,
-                    np.ascontiguousarray(dp, dtype=np.float64),
-                    np.ascontiguousarray(wave.valid_mask_wave, dtype=bool),
-                    np.ascontiguousarray(wave.qc_flags, dtype=np.int64),
-                    surface_u,
-                    surface_v,
-                    surface_k,
-                    surface_status,
-                    float(gravity_mps2),
-                    float(surface_tolerance_m),
-                )
-                k_known = (
-                    (surface_status == STOKES_BATCH_STATUS_OK)
-                    & np.isfinite(surface_k)
-                    & (surface_k > 0.0)
-                )
-                # 波數不確定的節點一律不截斷（cutoff 設成 -inf，等同「全部
-                # 深度都視為顯著」），寧可多算也不可漏算；波數已知的節點才
-                # 依 exp(2kz)>=threshold 反推出截斷深度 z_cutoff（負值）。
-                cutoff_z_node = np.where(
-                    k_known,
-                    np.log(stokes_depth_threshold_ratio) / (2.0 * np.where(k_known, surface_k, 1.0)),
-                    -np.inf,
-                )
-                cutoff_z_grid = np.broadcast_to(cutoff_z_node[None, :], (nvrt, nnode))
-                stokes_mask = effective_mask & (z_rel >= cutoff_z_grid)
-
-            n_kept = int(np.count_nonzero(stokes_mask))
-            stokes_points_evaluated += n_kept
-            stokes_points_possible += int(np.count_nonzero(effective_mask))
-            if n_kept > 0:
-                stokes_u, stokes_v, wave_number, status = _evaluate_batch_finite_depth_stokes(
-                    np.ascontiguousarray(hs_grid[stokes_mask], dtype=np.float64),
-                    np.ascontiguousarray(fp_grid[stokes_mask], dtype=np.float64),
-                    np.ascontiguousarray(dir_grid[stokes_mask], dtype=np.float64),
-                    np.ascontiguousarray(z_rel[stokes_mask], dtype=np.float64),
-                    np.ascontiguousarray(depth_grid[stokes_mask], dtype=np.float64),
-                    np.ascontiguousarray(valid_grid[stokes_mask], dtype=bool),
-                    np.ascontiguousarray(qc_grid[stokes_mask], dtype=np.int64),
-                    gravity_mps2=float(gravity_mps2),
-                    surface_tolerance_m=float(surface_tolerance_m),
-                    stokes_pool=stokes_pool,
-                    stokes_worker_count=stokes_worker_count,
-                )
-                ok_kept = status == STOKES_BATCH_STATUS_OK
-                ok = np.zeros((nvrt, nnode), dtype=bool)
-                ok[stokes_mask] = ok_kept
-                u_field[ok] += stokes_u[ok_kept]
-                v_field[ok] += stokes_v[ok_kept]
-                stokes_ok_count += int(np.count_nonzero(ok_kept))
-            stokes_total_count += int(np.count_nonzero(effective_mask))
+    u2, v2, w2, ok2, total2, eval2, possible2 = _compose_single_endpoint(
+        grid, u2, v2, w2, eta=field_pair.eta_field2, wave=wave_field2 if has_wave else None,
+        kbp=kbp, dp=dp, effective_mask=effective_mask, nvrt=nvrt, nnode=nnode,
+        gravity_mps2=gravity_mps2, surface_tolerance_m=surface_tolerance_m,
+        stokes_depth_threshold_ratio=stokes_depth_threshold_ratio,
+        stokes_pool=stokes_pool, stokes_worker_count=stokes_worker_count,
+    )
+    stokes_ok_count += ok2
+    stokes_total_count += total2
+    stokes_points_evaluated += eval2
+    stokes_points_possible += possible2
 
     # 這裡不加沉降，因此不需要在此再做一次歸零：u1/v1/u2/v2 已在上面歸零過，
     # 而 Stokes 只加在 effective_mask（已經排除乾點與海床以下）之內，不會
@@ -1229,6 +1606,20 @@ def compose_current_and_stokes_fields(
         stokes_ok_fraction=stokes_ok_fraction,
         stokes_points_evaluated=stokes_points_evaluated,
         stokes_points_possible=stokes_points_possible,
+        field2_endpoint=ComposedFieldEndpoint(
+            node_is_dry=node_is_dry,
+            u=np.ascontiguousarray(u2),
+            v=np.ascontiguousarray(v2),
+            w_no_settling=np.ascontiguousarray(w2),
+            stokes_ok_count=ok2,
+            stokes_total_count=total2,
+            stokes_points_evaluated=eval2,
+            stokes_points_possible=possible2,
+            source_arrays=_endpoint_source_arrays(
+                field_pair.u_field2, field_pair.v_field2, field_pair.w_field2, field_pair.eta_field2,
+                wave_field2 if has_wave else None,
+            ),
+        ),
     )
 
 
@@ -1800,6 +2191,21 @@ class HourlyOverheadDiagnostics:
     真正重新求解 Stokes 的 (層,節點) 點數比例。"""
     stokes_points_possible: int = 0
     """與 ``stokes_points_evaluated`` 對應的分母，見上。"""
+    endpoint_reuse_hits: int = 0
+    """WP-14 任務 B 效能診斷：這一小時的 ``field1`` 成功沿用上一小時已經
+    算好的 ``field2`` 端點（``compose_current_and_stokes_fields`` 的
+    ``field1_reuse_candidate`` 命中，省下一次乾濕歸零＋Stokes 全網格計算）
+    的次數；只在 ``compose_base_cache`` 未命中（真正呼叫過
+    ``compose_current_and_stokes_fields``）的小時才有意義，只用於
+    ``hour_major.py`` 的小時主軸路徑，``run_backward_batch`` 的逐單元路徑
+    不會用到端點重用，恆為 0。"""
+    endpoint_reuse_misses: int = 0
+    """與 ``endpoint_reuse_hits`` 對應：有候選但因為身分不符（不同流場
+    時刻／資料來源／波浪時刻）或 ``node_is_dry`` 遮罩不同而 fail-closed
+    重新計算的次數；不含「根本沒有候選」（例如這一小時是整個 run 的第一
+    個小時，或緊接在缺值缺口、checkpoint 續跑之後）的情形，那些情形不計入
+    任何一個計數器，避免把「本來就不該重用」的正常情形誤讀成「重用失敗」。
+    """
 
     def add(self, other: HourlyOverheadDiagnostics) -> None:
         """把另一個小時的拆解累加進本物件，供多小時彙整成整批總覽。"""
@@ -1818,6 +2224,8 @@ class HourlyOverheadDiagnostics:
         self.time_substep_count_s += other.time_substep_count_s
         self.stokes_points_evaluated += other.stokes_points_evaluated
         self.stokes_points_possible += other.stokes_points_possible
+        self.endpoint_reuse_hits += other.endpoint_reuse_hits
+        self.endpoint_reuse_misses += other.endpoint_reuse_misses
 
     @property
     def total_s(self) -> float:

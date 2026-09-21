@@ -180,8 +180,13 @@ __all__ = [
     "STOKES_BATCH_STATUS_DISPERSION_RESIDUAL_TOO_LARGE",
     "STOKES_BATCH_STATUS_DESCRIPTIONS",
     "StokesBatchResult",
+    "NodeWaveNumberResult",
     "finite_depth_stokes_reference",
     "batch_finite_depth_stokes",
+    "solve_wave_number_batch",
+    "finite_depth_stokes_from_wave_number_batch",
+    "solve_wave_number_reference",
+    "finite_depth_stokes_from_wave_number_reference",
 ]
 
 # ── 狀態碼：明確區分「無效」與「合法零速度」，不得以 0 靜默頂替 ─────────────
@@ -442,6 +447,266 @@ def batch_finite_depth_stokes(
         status_out[i] = STOKES_BATCH_STATUS_OK
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# WP-14 任務 A：把「求波數」與「套用波數算 Stokes 速度」拆成兩個獨立批次核心
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 動機（見 reports/WP-14.md 完整說明）：``batch_finite_depth_stokes`` 對每個
+# 呼叫端傳入的點各自求解一次有限水深色散關係（``_solve_wave_number_embedded``
+# 的二分法），但波數 ``k`` 只由 ``omega = 2π fp`` 與水深 ``h`` 決定，跟粒子
+# 垂向位置 ``z`` 完全無關。呼叫端 ``backward_driver.compose_current_and_
+# stokes_fields`` 把 ``(nvrt, nnode)`` 整個網格攤平成點集合送進來時，同一個
+# 節點的 ``fp``／``h``（連同 ``Hs``、波向、``valid_mask_wave``、``qc_flags``）
+# 在 ``nvrt`` 個垂向層之間完全相同（呼叫端用 ``np.broadcast_to`` 從
+# ``(nnode,)`` 展開成 ``(nvrt, nnode)``），因此同一節點的色散求根被重複算了
+# 最多 ``nvrt`` 倍，是底場合成成本的最大單一來源（WP-13 量測占 62%）。
+#
+# 下面兩個函式把 ``batch_finite_depth_stokes`` 的單一迴圈拆成兩段，**逐行
+# 沿用完全相同的判斷順序與運算式**（不是重新設計演算法），確保「先對每個
+# 節點求一次波數、再展開套用到各層」與「對每個 (層,節點) 都各自重新求解」
+# 逐位元相同：
+#
+# 1. ``solve_wave_number_batch``：只做原本迴圈的前半段——``valid_mask_wave``
+#    判定、``qc_flags`` 判定、「物理有效性」判定（``Hs``／``fp``／方向／``h``
+#    四項，**刻意不含 ``z``**，因為這四項在同一節點的每一層都相同）、色散
+#    求根。輸出 ``node_status_out`` 只會是
+#    ``STOKES_BATCH_STATUS_WAVE_MASK_INVALID``／``_WAVE_QC_FLAGGED``／
+#    ``_INVALID_PHYSICS``（不含 ``z`` 那一項失敗的情形）／色散相關三種狀態
+#    之一／``STOKES_BATCH_STATUS_OK``。呼叫端對每個節點呼叫一次（陣列長度
+#    是 ``nnode``，不是 ``nvrt*nnode``），再用 ``np.broadcast_to`` 展開成
+#    ``(nvrt, nnode)`` 餵給下面的第二段函式——這一步與原本
+#    ``compose_current_and_stokes_fields`` 為了 ``stokes_depth_threshold_
+#    ratio`` 優化，本來就會在 ``z=0`` 額外呼叫一次 ``batch_finite_depth_
+#    stokes`` 求「表層波數」是同一件事，本函式讓這個表層求解與「供套用波數
+#    使用」的求解合併成同一次呼叫，不再重複求解兩次。
+#
+# 2. ``finite_depth_stokes_from_wave_number_batch``：做原本迴圈的後半段
+#    ——用第 1 步算好、依索引展開到各層的 ``node_wave_number``／
+#    ``node_status``，補上「只跟 ``z`` 有關」的兩個檢查（``z`` 是否有限、
+#    粒子垂向位置是否落在水柱內），最後套用速度公式。因為原本第 3 步
+#    （物理有效性）的判斷式是「``Hs``／``fp``／方向／``z``／``h`` 五項的
+#    單一 ``and`` 運算式」，只要前四項（節點級）任一為假，結果就是
+#    ``INVALID_PHYSICS``、與 ``z`` 是否有限完全無關；因此「節點級四項失敗」
+#    與「節點級四項通過但 ``z`` 非有限」兩種情形都會得到
+#    ``STOKES_BATCH_STATUS_INVALID_PHYSICS``，只是判斷的先後順序不同——這正
+#    是本函式把「節點級」與「僅 z」兩段檢查分開後，仍能重現同一個狀態碼的
+#    關鍵。色散求根的狀態（成功或三種失敗之一）同樣完全不依賴 ``z``，因此
+#    也可以直接沿用第 1 步已經算好的結果，不需要在這裡重新判斷。
+#
+# 兩者串接起來，對任意輸入都與直接呼叫 ``batch_finite_depth_stokes``
+# 逐位元相同——由 ``tests/test_stokes_batch.py`` 的
+# ``test_two_phase_wave_number_split_matches_single_call_bit_identical``
+# （涵蓋隨機取樣、乾點、越界、QC 旗標、Hs=0、多層共用同一節點等情境）與
+# ``tests/test_native_backward_driver.py`` 的端對端測試交叉驗證，不是「近似
+# 一致」而是 ``np.array_equal``。
+
+
+@njit(cache=True)
+def solve_wave_number_batch(
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    water_depth_m: np.ndarray,
+    valid_mask_wave: np.ndarray,
+    qc_flags: np.ndarray,
+    wave_number_out: np.ndarray,
+    node_status_out: np.ndarray,
+    gravity_mps2: float,
+) -> None:
+    """只求波數，不套用垂向結構——``batch_finite_depth_stokes`` 迴圈的前半段。
+
+    刻意**不接受 ``particle_z_m``**：色散求根本身完全不依賴粒子垂向位置，
+    呼叫端應該對「每個節點」（而非每個 (層,節點) 組合）呼叫一次本函式，把
+    結果用 ``np.broadcast_to`` 展開到各層後，再交給
+    ``finite_depth_stokes_from_wave_number_batch`` 補上與 ``z`` 有關的判斷、
+    套用速度公式。詳見本函式上方模組層級「WP-14 任務 A」說明。
+
+    判斷順序與 ``batch_finite_depth_stokes`` 逐行對應，唯一差別是「物理
+    有效性」判斷式刻意拿掉 ``z`` 這一項（其餘 ``Hs``／``fp``／方向／``h``
+    四項不變，因為它們在同一節點的每一層都相同，判斷結果也必然相同）：
+
+    1. ``valid_mask_wave`` 為假 → ``STOKES_BATCH_STATUS_WAVE_MASK_INVALID``。
+    2. ``qc_flags`` 非零 → ``STOKES_BATCH_STATUS_WAVE_QC_FLAGGED``。
+    3. ``Hs``、``fp``、方向、``h`` 任一非有限，或 ``Hs<0``、``fp<=0``、
+       ``h<=0`` → ``STOKES_BATCH_STATUS_INVALID_PHYSICS``。
+    4. 色散求根（``_solve_wave_number_embedded``，與
+       ``batch_finite_depth_stokes`` 共用同一個 njit 函式，確保數值行為
+       逐位元相同）→ 對應三種失敗狀態之一，或成功時
+       ``STOKES_BATCH_STATUS_OK``。
+
+    Args:
+        significant_wave_height_m: 已內插到節點的有效波高 ``Hs``（m）。
+        peak_frequency_hz: 已內插到節點的 NWW3 尖峰頻率 ``fp``（Hz）。
+        direction_raw_deg: 已內插到節點的原始尖峰波向（度），僅用於物理
+            有效性判斷（本函式不計算方向分量，波向套用留給下一段函式）。
+        water_depth_m: 節點正值水深 ``h``（m）。
+        valid_mask_wave: 對應 NWW3 ``valid_mask_wave`` 內插後的布林陣列。
+        qc_flags: 對應 NWW3 ``qc_flags`` 內插後的整數位元旗標。
+        wave_number_out: 輸出：色散求得的波數 ``k``（m⁻¹）；狀態非
+            ``STOKES_BATCH_STATUS_OK`` 時為 ``NaN``。
+        node_status_out: 輸出：本模組 ``STOKES_BATCH_STATUS_*`` 狀態碼
+            （int32），**不含**任何與 ``z`` 有關的狀態
+            （``PARTICLE_OUTSIDE_WATER_COLUMN`` 永遠不會出現在這裡）。
+        gravity_mps2: 重力加速度（m/s²）。
+    """
+
+    n = significant_wave_height_m.shape[0]
+    for i in range(n):
+        if not valid_mask_wave[i]:
+            wave_number_out[i] = np.nan
+            node_status_out[i] = STOKES_BATCH_STATUS_WAVE_MASK_INVALID
+            continue
+        if qc_flags[i] != 0:
+            wave_number_out[i] = np.nan
+            node_status_out[i] = STOKES_BATCH_STATUS_WAVE_QC_FLAGGED
+            continue
+
+        hs = significant_wave_height_m[i]
+        fp = peak_frequency_hz[i]
+        theta_deg = direction_raw_deg[i]
+        h = water_depth_m[i]
+
+        if not (
+            np.isfinite(hs)
+            and hs >= 0.0
+            and np.isfinite(fp)
+            and fp > 0.0
+            and np.isfinite(theta_deg)
+            and np.isfinite(h)
+            and h > 0.0
+        ):
+            wave_number_out[i] = np.nan
+            node_status_out[i] = STOKES_BATCH_STATUS_INVALID_PHYSICS
+            continue
+
+        omega = 2.0 * math.pi * fp
+        wave_number, disp_status = _solve_wave_number_embedded(omega, h, gravity_mps2)
+        if disp_status != STOKES_BATCH_STATUS_OK:
+            wave_number_out[i] = np.nan
+            node_status_out[i] = disp_status
+            continue
+
+        wave_number_out[i] = wave_number
+        node_status_out[i] = STOKES_BATCH_STATUS_OK
+
+
+@njit(cache=True)
+def finite_depth_stokes_from_wave_number_batch(
+    node_wave_number: np.ndarray,
+    node_status: np.ndarray,
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    particle_z_m: np.ndarray,
+    water_depth_m: np.ndarray,
+    stokes_u_out: np.ndarray,
+    stokes_v_out: np.ndarray,
+    wave_number_out: np.ndarray,
+    status_out: np.ndarray,
+    surface_tolerance_m: float,
+) -> None:
+    """用預先求好的波數套用垂向結構與方向——``batch_finite_depth_stokes``
+    迴圈的後半段。
+
+    ``node_wave_number``／``node_status`` 必須是
+    ``solve_wave_number_batch`` 的輸出，已經用 ``np.broadcast_to`` 展開到
+    與其餘輸入陣列相同的長度（呼叫端通常是 ``(nvrt, nnode)`` 攤平後的一維
+    陣列，但本函式不關心原始形狀，只逐點處理）。本函式**不重新求解色散
+    關係**，只補上與粒子垂向位置 ``z`` 有關的兩個判斷、再套用速度公式，見
+    上方模組層級「WP-14 任務 A」說明為何這樣拆分仍能與
+    ``batch_finite_depth_stokes`` 逐位元相同。
+
+    判斷順序：
+
+    1. ``node_status`` 是 ``WAVE_MASK_INVALID``／``WAVE_QC_FLAGGED``／
+       ``INVALID_PHYSICS`` 之一 → 直接沿用該狀態，輸出 ``NaN``（與 ``z``
+       無關，因為節點級判斷已經足以決定結果）。
+    2. 否則（節點級的 ``Hs``／``fp``／方向／``h`` 皆有效）：若 ``z`` 非有限
+       → ``STOKES_BATCH_STATUS_INVALID_PHYSICS``（補回原本判斷式裡含
+       ``z`` 的那一支）。
+    3. ``z`` 有限但超出水柱範圍（含容差）→
+       ``STOKES_BATCH_STATUS_PARTICLE_OUTSIDE_WATER_COLUMN``。
+    4. ``node_status`` 若是色散求根失敗的三種狀態之一 → 直接沿用（``z``
+       通過檢查也不能挽救色散求根本身的失敗）。
+    5. 以上皆通過（等同 ``node_status == STOKES_BATCH_STATUS_OK``）→
+       套用速度公式，輸出 ``STOKES_BATCH_STATUS_OK``。
+
+    Args:
+        node_wave_number: ``solve_wave_number_batch`` 輸出的波數 ``k``
+            （m⁻¹），已展開到與其餘輸入相同長度。
+        node_status: ``solve_wave_number_batch`` 輸出的節點級狀態碼，已
+            展開到與其餘輸入相同長度。
+        significant_wave_height_m, peak_frequency_hz, direction_raw_deg,
+            water_depth_m: 與 ``batch_finite_depth_stokes`` 同名參數相同
+            語意（已展開到各層的節點級欄位）。
+        particle_z_m: 粒子相對海面的垂向位置（m），逐層變化。
+        stokes_u_out, stokes_v_out, wave_number_out, status_out:
+            輸出陣列，語意與 ``batch_finite_depth_stokes`` 相同。
+        surface_tolerance_m: 海面邊界定位容差（m）。
+    """
+
+    n = significant_wave_height_m.shape[0]
+    for i in range(n):
+        ns = node_status[i]
+        if ns in (
+            STOKES_BATCH_STATUS_WAVE_MASK_INVALID,
+            STOKES_BATCH_STATUS_WAVE_QC_FLAGGED,
+            STOKES_BATCH_STATUS_INVALID_PHYSICS,
+        ):
+            stokes_u_out[i] = np.nan
+            stokes_v_out[i] = np.nan
+            wave_number_out[i] = np.nan
+            status_out[i] = ns
+            continue
+
+        z = particle_z_m[i]
+        h = water_depth_m[i]
+
+        if not np.isfinite(z):
+            stokes_u_out[i] = np.nan
+            stokes_v_out[i] = np.nan
+            wave_number_out[i] = np.nan
+            status_out[i] = STOKES_BATCH_STATUS_INVALID_PHYSICS
+            continue
+
+        if z > surface_tolerance_m or z < -h - surface_tolerance_m:
+            stokes_u_out[i] = np.nan
+            stokes_v_out[i] = np.nan
+            wave_number_out[i] = np.nan
+            status_out[i] = STOKES_BATCH_STATUS_PARTICLE_OUTSIDE_WATER_COLUMN
+            continue
+        z_clamped = z
+        if z_clamped > 0.0:
+            z_clamped = 0.0
+
+        if ns != STOKES_BATCH_STATUS_OK:
+            stokes_u_out[i] = np.nan
+            stokes_v_out[i] = np.nan
+            wave_number_out[i] = np.nan
+            status_out[i] = ns
+            continue
+
+        hs = significant_wave_height_m[i]
+        fp = peak_frequency_hz[i]
+        theta_deg = direction_raw_deg[i]
+        wave_number = node_wave_number[i]
+        omega = 2.0 * math.pi * fp
+
+        if hs == 0.0:
+            speed = 0.0
+        else:
+            speed = (hs * hs / 4.0) * omega * wave_number * math.exp(2.0 * wave_number * z_clamped)
+
+        direction_to_rad = math.radians((theta_deg + 180.0) % 360.0)
+        east = math.sin(direction_to_rad)
+        north = math.cos(direction_to_rad)
+
+        stokes_u_out[i] = speed * east
+        stokes_v_out[i] = speed * north
+        wave_number_out[i] = wave_number
+        status_out[i] = STOKES_BATCH_STATUS_OK
+
+
 @dataclass(frozen=True, slots=True)
 class StokesBatchResult:
     """``finite_depth_stokes_reference`` 的回傳容器，欄位語意對齊批次核心輸出。
@@ -642,6 +907,253 @@ def finite_depth_stokes_reference(
             bool(valid_flat[i]),
             int(qc_flat[i]),
             gravity_mps2,
+            surface_tolerance_m,
+        )
+        stokes_u[i] = u_i
+        stokes_v[i] = v_i
+        wave_number[i] = k_i
+        status[i] = status_i
+
+    return StokesBatchResult(
+        stokes_u_mps=stokes_u.reshape(shape),
+        stokes_v_mps=stokes_v.reshape(shape),
+        wave_number_per_m=wave_number.reshape(shape),
+        status=status.reshape(shape),
+    )
+
+
+# ── WP-14 任務 A：兩段式拆分的純 Python 參考實作 ──────────────────────────
+#
+# 依 AGENTS.md「先建立純 NumPy 參考核心」的要求，``solve_wave_number_batch``
+# 與 ``finite_depth_stokes_from_wave_number_batch`` 這兩個 njit 核心各自都有
+# 對應的純 Python／``math`` 參考版本，刻意逐行對應同一套判斷順序，但完全不
+# 共用程式碼、不呼叫 njit 版本，作為交叉驗證用的獨立基準（見
+# ``tests/test_stokes_batch.py``）。
+
+
+@dataclass(frozen=True, slots=True)
+class NodeWaveNumberResult:
+    """``solve_wave_number_reference`` 的回傳容器。
+
+    兩個陣列 shape 皆與輸入相同；``node_status`` 非
+    ``STOKES_BATCH_STATUS_OK`` 且非三種色散失敗狀態時（即
+    ``WAVE_MASK_INVALID``／``WAVE_QC_FLAGGED``／``INVALID_PHYSICS``），
+    ``wave_number_per_m`` 固定為 ``NaN``；色散失敗時也是 ``NaN``。
+    """
+
+    wave_number_per_m: np.ndarray
+    node_status: np.ndarray
+
+
+def _solve_wave_number_for_node_reference_scalar(
+    hs: float,
+    fp: float,
+    theta_deg: float,
+    h: float,
+    valid: bool,
+    qc: int,
+    gravity_mps2: float,
+) -> tuple[float, int]:
+    """單一節點的純 Python 參考計算，對應 ``solve_wave_number_batch`` 迴圈
+    本體（刻意不含任何與 ``z`` 有關的判斷）。
+    """
+
+    if not valid:
+        return math.nan, STOKES_BATCH_STATUS_WAVE_MASK_INVALID
+    if qc != 0:
+        return math.nan, STOKES_BATCH_STATUS_WAVE_QC_FLAGGED
+
+    if not (
+        math.isfinite(hs)
+        and hs >= 0.0
+        and math.isfinite(fp)
+        and fp > 0.0
+        and math.isfinite(theta_deg)
+        and math.isfinite(h)
+        and h > 0.0
+    ):
+        return math.nan, STOKES_BATCH_STATUS_INVALID_PHYSICS
+
+    omega = 2.0 * math.pi * fp
+    wave_number, disp_status = _solve_wave_number_reference_scalar(omega, h, gravity_mps2)
+    if disp_status != STOKES_BATCH_STATUS_OK:
+        return math.nan, disp_status
+    return wave_number, STOKES_BATCH_STATUS_OK
+
+
+def solve_wave_number_reference(
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    water_depth_m: np.ndarray,
+    valid_mask_wave: np.ndarray,
+    qc_flags: np.ndarray,
+    *,
+    gravity_mps2: float = GRAVITY_MPS2,
+) -> NodeWaveNumberResult:
+    """``solve_wave_number_batch`` 的純 Python／NumPy 參考實作，逐節點呼叫
+    ``_solve_wave_number_for_node_reference_scalar``。參數語意對齊
+    ``solve_wave_number_batch``（見其 docstring），輸入可為任意形狀。
+
+    Raises:
+        ValueError: 任一輸入陣列形狀與 ``significant_wave_height_m`` 不一致。
+    """
+
+    hs = np.asarray(significant_wave_height_m, dtype=np.float64)
+    fp = np.asarray(peak_frequency_hz, dtype=np.float64)
+    theta_deg = np.asarray(direction_raw_deg, dtype=np.float64)
+    h = np.asarray(water_depth_m, dtype=np.float64)
+    valid = np.asarray(valid_mask_wave, dtype=bool)
+    qc = np.asarray(qc_flags)
+
+    shape = hs.shape
+    for name, array in (
+        ("peak_frequency_hz", fp),
+        ("direction_raw_deg", theta_deg),
+        ("water_depth_m", h),
+        ("valid_mask_wave", valid),
+        ("qc_flags", qc),
+    ):
+        if array.shape != shape:
+            raise ValueError(
+                f"{name} shape 必須與 significant_wave_height_m 一致：{array.shape} != {shape}"
+            )
+
+    hs_flat = hs.reshape(-1)
+    fp_flat = fp.reshape(-1)
+    theta_flat = theta_deg.reshape(-1)
+    h_flat = h.reshape(-1)
+    valid_flat = valid.reshape(-1)
+    qc_flat = qc.reshape(-1)
+
+    n = hs_flat.size
+    wave_number = np.empty(n, dtype=np.float64)
+    status = np.empty(n, dtype=np.int32)
+    for i in range(n):
+        k_i, status_i = _solve_wave_number_for_node_reference_scalar(
+            float(hs_flat[i]),
+            float(fp_flat[i]),
+            float(theta_flat[i]),
+            float(h_flat[i]),
+            bool(valid_flat[i]),
+            int(qc_flat[i]),
+            gravity_mps2,
+        )
+        wave_number[i] = k_i
+        status[i] = status_i
+
+    return NodeWaveNumberResult(
+        wave_number_per_m=wave_number.reshape(shape),
+        node_status=status.reshape(shape),
+    )
+
+
+def _finite_depth_stokes_from_wave_number_reference_scalar(
+    node_wave_number: float,
+    node_status: int,
+    hs: float,
+    fp: float,
+    theta_deg: float,
+    z: float,
+    h: float,
+    surface_tolerance_m: float,
+) -> tuple[float, float, float, int]:
+    """單一點的純 Python 參考計算，對應
+    ``finite_depth_stokes_from_wave_number_batch`` 迴圈本體。
+    """
+
+    if node_status in (
+        STOKES_BATCH_STATUS_WAVE_MASK_INVALID,
+        STOKES_BATCH_STATUS_WAVE_QC_FLAGGED,
+        STOKES_BATCH_STATUS_INVALID_PHYSICS,
+    ):
+        return math.nan, math.nan, math.nan, node_status
+
+    if not math.isfinite(z):
+        return math.nan, math.nan, math.nan, STOKES_BATCH_STATUS_INVALID_PHYSICS
+
+    if z > surface_tolerance_m or z < -h - surface_tolerance_m:
+        return math.nan, math.nan, math.nan, STOKES_BATCH_STATUS_PARTICLE_OUTSIDE_WATER_COLUMN
+    z_clamped = 0.0 if z > 0.0 else z
+
+    if node_status != STOKES_BATCH_STATUS_OK:
+        return math.nan, math.nan, math.nan, node_status
+
+    omega = 2.0 * math.pi * fp
+    if hs == 0.0:
+        speed = 0.0
+    else:
+        speed = (hs * hs / 4.0) * omega * node_wave_number * math.exp(2.0 * node_wave_number * z_clamped)
+
+    direction_to_rad = math.radians((theta_deg + 180.0) % 360.0)
+    east = math.sin(direction_to_rad)
+    north = math.cos(direction_to_rad)
+    return speed * east, speed * north, node_wave_number, STOKES_BATCH_STATUS_OK
+
+
+def finite_depth_stokes_from_wave_number_reference(
+    node_wave_number: np.ndarray,
+    node_status: np.ndarray,
+    significant_wave_height_m: np.ndarray,
+    peak_frequency_hz: np.ndarray,
+    direction_raw_deg: np.ndarray,
+    particle_z_m: np.ndarray,
+    water_depth_m: np.ndarray,
+    *,
+    surface_tolerance_m: float = SURFACE_BOUNDARY_TOLERANCE_M,
+) -> StokesBatchResult:
+    """``finite_depth_stokes_from_wave_number_batch`` 的純 Python／NumPy
+    參考實作。參數語意對齊該函式（見其 docstring），輸入可為任意形狀。
+
+    Raises:
+        ValueError: 任一輸入陣列形狀與 ``significant_wave_height_m`` 不一致。
+    """
+
+    node_k = np.asarray(node_wave_number, dtype=np.float64)
+    node_st = np.asarray(node_status)
+    hs = np.asarray(significant_wave_height_m, dtype=np.float64)
+    fp = np.asarray(peak_frequency_hz, dtype=np.float64)
+    theta_deg = np.asarray(direction_raw_deg, dtype=np.float64)
+    z = np.asarray(particle_z_m, dtype=np.float64)
+    h = np.asarray(water_depth_m, dtype=np.float64)
+
+    shape = hs.shape
+    for name, array in (
+        ("node_wave_number", node_k),
+        ("node_status", node_st),
+        ("peak_frequency_hz", fp),
+        ("direction_raw_deg", theta_deg),
+        ("particle_z_m", z),
+        ("water_depth_m", h),
+    ):
+        if array.shape != shape:
+            raise ValueError(
+                f"{name} shape 必須與 significant_wave_height_m 一致：{array.shape} != {shape}"
+            )
+
+    node_k_flat = node_k.reshape(-1)
+    node_st_flat = node_st.reshape(-1)
+    hs_flat = hs.reshape(-1)
+    fp_flat = fp.reshape(-1)
+    theta_flat = theta_deg.reshape(-1)
+    z_flat = z.reshape(-1)
+    h_flat = h.reshape(-1)
+
+    n = hs_flat.size
+    stokes_u = np.empty(n, dtype=np.float64)
+    stokes_v = np.empty(n, dtype=np.float64)
+    wave_number = np.empty(n, dtype=np.float64)
+    status = np.empty(n, dtype=np.int32)
+
+    for i in range(n):
+        u_i, v_i, k_i, status_i = _finite_depth_stokes_from_wave_number_reference_scalar(
+            float(node_k_flat[i]),
+            int(node_st_flat[i]),
+            float(hs_flat[i]),
+            float(fp_flat[i]),
+            float(theta_flat[i]),
+            float(z_flat[i]),
+            float(h_flat[i]),
             surface_tolerance_m,
         )
         stokes_u[i] = u_i

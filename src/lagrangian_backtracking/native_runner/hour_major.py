@@ -207,6 +207,7 @@ from .backward_driver import (
     BackwardDriverResult,
     BayTraceModuleHandles,
     ComposedCurrentAndStokesFields,
+    ComposedFieldEndpoint,
     DepartureRecord,
     HourlyOverheadDiagnostics,
     NativeBackwardDriverGrid,
@@ -636,6 +637,50 @@ def _record_departures(
                 break
 
 
+@dataclass(frozen=True, slots=True)
+class _FieldEndpointIdentity:
+    """WP-14 任務 B：辨識「這是不是同一個流場端點」的身分鍵。
+
+    只記錄可以廉價比對、且足以代表「同一份已核准產品資料」的欄位：流場
+    時刻（UTC 奈秒）、月份 ID、資料來源（``observed``／``reconstructed``，
+    見 ``forcing_bridge.HourlyFieldPair`` 的 ``month_id``／``time_origin``
+    docstring），以及（若有提供波浪場）波浪時刻。刻意**不**比對實際陣列內容
+    ——逐點比對陣列內容的成本與直接重算 Stokes 相近，會抵銷重用的效益；
+    改用「同一個 UTC 時刻 + 同一份月份資料 + 同一種來源」代表「這兩次呼叫
+    ``forcing_resolver``／``wave_field_resolver`` 一定回傳相同的陣列內容」
+    ——這是對 ``forcing_resolver``／``wave_field_resolver`` 必須是純函式
+    （同樣輸入必然得到同樣輸出，不依賴呼叫次序或隱藏狀態）的信賴，也是
+    ``AGENTS.md`` 對已驗收產品「版本化重建方法」與 provenance 要求的自然
+    延伸。真正決定能不能安全重用的「數值」判斷仍然是
+    ``compose_current_and_stokes_fields`` 內部對 ``node_is_dry`` 的逐位元
+    比對（見該函式 docstring），這裡的身分鍵只是「值不值得去試」的第一層
+    篩選，篩選錯了也不會產生錯誤結果，只是浪費一次白算的重用嘗試。
+    """
+
+    utc_ns: int
+    month_id: str
+    time_origin: str
+    wave_utc_ns: int | None
+
+
+def _field1_identity(field_pair: HourlyFieldPair, *, has_wave: bool) -> _FieldEndpointIdentity:
+    return _FieldEndpointIdentity(
+        utc_ns=int(field_pair.time_before_utc_ns),
+        month_id=field_pair.month_id1,
+        time_origin=field_pair.time_origin1,
+        wave_utc_ns=int(field_pair.time_before_utc_ns) if has_wave else None,
+    )
+
+
+def _field2_identity(field_pair: HourlyFieldPair, *, has_wave: bool) -> _FieldEndpointIdentity:
+    return _FieldEndpointIdentity(
+        utc_ns=int(field_pair.time_after_utc_ns),
+        month_id=field_pair.month_id2,
+        time_origin=field_pair.time_origin2,
+        wave_utc_ns=int(field_pair.time_after_utc_ns) if has_wave else None,
+    )
+
+
 def run_flow_domain_hour_major(
     driver_grid: NativeBackwardDriverGrid,
     handles: BayTraceModuleHandles,
@@ -710,6 +755,16 @@ def run_flow_domain_hour_major(
     smagorinsky_cache: MutableMapping[int, np.ndarray] = {}
     domain_overhead = HourlyOverheadDiagnostics()
     kernel_call_count = 0
+
+    # WP-14 任務 B：上一個「真正算過」的小時，其 field2 端點的合成結果與
+    # 身分鍵；``None`` 代表「還沒有可用候選」（run 剛開始、checkpoint 續跑
+    # 後第一個小時、缺值缺口或完全沒有工作的小時之後），此時
+    # ``field1_reuse_candidate`` 一律不傳、直接重新計算，等同任務 B 新增前
+    # 的行為——這也是為什麼續跑後第一個小時「直接重算即可」自動成立，不需要
+    # 額外的續跑專用邏輯：checkpoint 不持久化這兩個變數，重新呼叫本函式時
+    # 它們必然是 ``None``。
+    prev_field2_endpoint: ComposedFieldEndpoint | None = None
+    prev_field2_identity: _FieldEndpointIdentity | None = None
 
     import time as _time
 
@@ -817,23 +872,52 @@ def run_flow_domain_hour_major(
                 )
                 hour_overhead.time_wave_resolve_s += _time.perf_counter() - t0
 
+                has_wave = wave_field_resolver is not None
                 cache_key = (int(field_pair.time_before_utc_ns), int(field_pair.time_after_utc_ns))
                 base = composed_base_cache.get(cache_key)
                 if base is not None:
                     hour_overhead.compose_base_cache_hits += 1
                 else:
+                    # WP-14 任務 B：只有在「上一個真正算過的小時」的 field2
+                    # 端點，身分（流場時刻／資料來源／波浪時刻）與這一小時
+                    # 的 field1 相符時，才把它當候選傳進去；真正能不能安全
+                    # 重用（node_is_dry 是否逐位元相同）由
+                    # compose_current_and_stokes_fields 內部判斷，這裡的
+                    # 身分比對只是「值不值得嘗試」的第一層篩選，篩選錯了
+                    # 也不會產生錯誤結果（見 ``_FieldEndpointIdentity``
+                    # docstring）。
+                    this_field1_identity = _field1_identity(field_pair, has_wave=has_wave)
+                    reuse_candidate = (
+                        prev_field2_endpoint
+                        if prev_field2_identity is not None and prev_field2_identity == this_field1_identity
+                        else None
+                    )
+
                     t0 = _time.perf_counter()
                     base = compose_current_and_stokes_fields(
                         driver_grid, handles, field_pair, wave_field1=wave1, wave_field2=wave2,
                         stokes_depth_threshold_ratio=config.stokes_depth_threshold_ratio,
                         stokes_pool=stokes_pool,
                         stokes_worker_count=stokes_worker_count,
+                        field1_reuse_candidate=reuse_candidate,
                     )
                     hour_overhead.time_compose_base_s += _time.perf_counter() - t0
                     hour_overhead.compose_base_cache_misses += 1
                     hour_overhead.stokes_points_evaluated += base.stokes_points_evaluated
                     hour_overhead.stokes_points_possible += base.stokes_points_possible
+                    if reuse_candidate is not None:
+                        # compose_current_and_stokes_fields 內部用同一份
+                        # node_is_dry 邏輯決定是否真的重用；這裡用同一個
+                        # 比較重新得出布林值只是為了診斷計數，不影響正確性
+                        # （即使誤判，也只是統計數字不準，不會用錯資料）。
+                        if np.array_equal(reuse_candidate.node_is_dry, base.node_is_dry):
+                            hour_overhead.endpoint_reuse_hits += 1
+                        else:
+                            hour_overhead.endpoint_reuse_misses += 1
                     composed_base_cache[cache_key] = base
+
+                prev_field2_endpoint = base.field2_endpoint
+                prev_field2_identity = _field2_identity(field_pair, has_wave=has_wave)
 
                 t0 = _time.perf_counter()
                 ndeltp = estimate_substep_count(

@@ -20,7 +20,11 @@ from lagrangian_backtracking.native_runner.stokes_batch import (
     STOKES_BATCH_STATUS_WAVE_MASK_INVALID,
     STOKES_BATCH_STATUS_WAVE_QC_FLAGGED,
     batch_finite_depth_stokes,
+    finite_depth_stokes_from_wave_number_batch,
+    finite_depth_stokes_from_wave_number_reference,
     finite_depth_stokes_reference,
+    solve_wave_number_batch,
+    solve_wave_number_reference,
 )
 from lagrangian_backtracking.stokes import GRAVITY_MPS2, finite_depth_stokes
 
@@ -322,3 +326,159 @@ def test_batch_matches_reference_at_scale_and_reports_per_particle_time() -> Non
     # 寬鬆的上限（10 ms/顆）以攔截「根本沒有批次化、退化成逐顆解釋執行」的
     # 重大回歸。
     assert per_particle_us < 10_000.0
+
+
+# ── 9. WP-14 任務 A：兩段式（先求波數、再套用）與單次呼叫逐位元相同 ──────
+
+
+def _broadcast_layers(node_values: np.ndarray, nvrt: int) -> np.ndarray:
+    """把 ``(nnode,)`` 節點級欄位展開成 ``(nvrt, nnode)``，比照
+    ``compose_current_and_stokes_fields`` 用 ``np.broadcast_to`` 的方式。
+    """
+
+    return np.broadcast_to(node_values[None, :], (nvrt, node_values.shape[0]))
+
+
+def test_two_phase_wave_number_split_matches_single_call_bit_identical() -> None:
+    """涵蓋隨機取樣、乾點遮罩、QC 旗標、越界、NaN z、Hs=0 等情境：
+    ``solve_wave_number_batch`` + ``finite_depth_stokes_from_wave_number_batch``
+    對每個節點只求一次波數、展開到多層後套用，必須與對每個 (層,節點) 都
+    各自呼叫一次 ``batch_finite_depth_stokes`` 逐位元相同——不是近似一致。
+    """
+
+    rng = np.random.default_rng(20260921)
+    nnode = 97
+    nvrt = 11
+
+    hs = rng.uniform(0.0, 4.0, size=nnode)
+    fp = rng.uniform(0.05, 0.3, size=nnode)
+    theta = rng.uniform(0.0, 360.0, size=nnode)
+    h = np.exp(rng.uniform(np.log(0.3), np.log(3000.0), size=nnode))
+    valid = rng.random(nnode) > 0.08
+    qc = (rng.random(nnode) > 0.9).astype(np.int64)
+
+    # 刻意混入各種節點級無效情境，涵蓋 mask／qc／物理無效三種狀態碼路徑。
+    hs[0] = -1.0
+    fp[1] = 0.0
+    h[2] = -3.0
+    theta[3] = np.nan
+    hs[4] = 0.0  # 合法零波高，應得到 OK 且速度為 0
+
+    z = -rng.uniform(0.0, 1.0, size=(nvrt, nnode)) * h[None, :]
+    # 刻意混入越界與非有限的 z，只出現在部分層，驗證「同節點不同層可以有
+    # 不同的 z 相關狀態碼，但節點級狀態碼（mask/qc/physics）在所有層一致」。
+    z[0, 5] = 1000.0
+    z[1, 6] = -np.inf
+    z[2, 7] = np.nan
+
+    hs_grid = _broadcast_layers(hs, nvrt)
+    fp_grid = _broadcast_layers(fp, nvrt)
+    theta_grid = _broadcast_layers(theta, nvrt)
+    h_grid = _broadcast_layers(h, nvrt)
+    valid_grid = _broadcast_layers(valid, nvrt)
+    qc_grid = _broadcast_layers(qc, nvrt)
+
+    u_ref, v_ref, k_ref, st_ref = _run_batch(
+        hs_grid.reshape(-1), fp_grid.reshape(-1), theta_grid.reshape(-1),
+        z.reshape(-1), h_grid.reshape(-1), valid_grid.reshape(-1), qc_grid.reshape(-1),
+    )
+
+    node_k = np.empty(nnode, dtype=np.float64)
+    node_status = np.empty(nnode, dtype=np.int32)
+    solve_wave_number_batch(
+        np.ascontiguousarray(hs), np.ascontiguousarray(fp), np.ascontiguousarray(theta),
+        np.ascontiguousarray(h), np.ascontiguousarray(valid, dtype=np.bool_),
+        np.ascontiguousarray(qc), node_k, node_status, GRAVITY_MPS2,
+    )
+    node_k_grid = np.ascontiguousarray(_broadcast_layers(node_k, nvrt).reshape(-1))
+    node_status_grid = np.ascontiguousarray(_broadcast_layers(node_status, nvrt).reshape(-1))
+
+    n = nvrt * nnode
+    u2 = np.empty(n, dtype=np.float64)
+    v2 = np.empty(n, dtype=np.float64)
+    k2 = np.empty(n, dtype=np.float64)
+    st2 = np.empty(n, dtype=np.int32)
+    finite_depth_stokes_from_wave_number_batch(
+        node_k_grid, node_status_grid,
+        np.ascontiguousarray(hs_grid.reshape(-1)), np.ascontiguousarray(fp_grid.reshape(-1)),
+        np.ascontiguousarray(theta_grid.reshape(-1)), np.ascontiguousarray(z.reshape(-1)),
+        np.ascontiguousarray(h_grid.reshape(-1)),
+        u2, v2, k2, st2, _SURFACE_TOL,
+    )
+
+    assert np.array_equal(st_ref, st2)
+    assert np.array_equal(u_ref, u2, equal_nan=True)
+    assert np.array_equal(v_ref, v2, equal_nan=True)
+    assert np.array_equal(k_ref, k2, equal_nan=True)
+
+    # 同一節點跨所有層的節點級狀態碼（mask/qc/physics）必須完全一致。
+    node_status_2d = node_status_grid.reshape(nvrt, nnode)
+    for j in range(nnode):
+        assert len(set(node_status_2d[:, j].tolist())) == 1
+
+
+def test_two_phase_reference_matches_single_call_reference_bit_identical() -> None:
+    """純 Python 參考版本的兩段式拆分，同樣須與單次呼叫參考版本逐位元相同。"""
+
+    rng = np.random.default_rng(1234)
+    nnode = 31
+    nvrt = 4
+
+    hs = rng.uniform(0.0, 3.0, size=nnode)
+    fp = rng.uniform(0.05, 0.3, size=nnode)
+    theta = rng.uniform(0.0, 360.0, size=nnode)
+    h = np.exp(rng.uniform(np.log(0.5), np.log(500.0), size=nnode))
+    valid = rng.random(nnode) > 0.1
+    qc = (rng.random(nnode) > 0.85).astype(np.int64)
+    h[0] = -1.0
+    fp[1] = -0.1
+
+    z = -rng.uniform(0.0, 1.0, size=(nvrt, nnode)) * h[None, :]
+    z[0, 2] = 999.0
+
+    hs_grid = _broadcast_layers(hs, nvrt)
+    fp_grid = _broadcast_layers(fp, nvrt)
+    theta_grid = _broadcast_layers(theta, nvrt)
+    h_grid = _broadcast_layers(h, nvrt)
+    valid_grid = _broadcast_layers(valid, nvrt)
+    qc_grid = _broadcast_layers(qc, nvrt)
+
+    ref = finite_depth_stokes_reference(hs_grid, fp_grid, theta_grid, z, h_grid, valid_grid, qc_grid)
+
+    node = solve_wave_number_reference(hs, fp, theta, h, valid, qc)
+    node_k_grid = _broadcast_layers(node.wave_number_per_m, nvrt)
+    node_status_grid = _broadcast_layers(node.node_status, nvrt)
+
+    ref2 = finite_depth_stokes_from_wave_number_reference(
+        node_k_grid, node_status_grid, hs_grid, fp_grid, theta_grid, z, h_grid,
+    )
+
+    assert np.array_equal(ref.status, ref2.status)
+    assert np.array_equal(ref.stokes_u_mps, ref2.stokes_u_mps, equal_nan=True)
+    assert np.array_equal(ref.stokes_v_mps, ref2.stokes_v_mps, equal_nan=True)
+    assert np.array_equal(ref.wave_number_per_m, ref2.wave_number_per_m, equal_nan=True)
+
+
+def test_solve_wave_number_batch_reports_only_node_level_status_codes() -> None:
+    """``solve_wave_number_batch`` 不接受 ``z``，其狀態碼絕不能是
+    ``PARTICLE_OUTSIDE_WATER_COLUMN``（那是只跟 ``z`` 有關的層級判斷）。
+    """
+
+    hs = np.array([2.0, 2.0, -1.0, 2.0])
+    fp = np.array([0.1, 0.1, 0.1, 0.0])
+    theta = np.array([0.0, 0.0, 0.0, 0.0])
+    h = np.array([100.0, 100.0, 100.0, 100.0])
+    valid = np.array([False, True, True, True])
+    qc = np.array([0, 5, 0, 0])
+
+    node_k = np.empty(4, dtype=np.float64)
+    node_status = np.empty(4, dtype=np.int32)
+    solve_wave_number_batch(hs, fp, theta, h, valid.astype(np.bool_), qc, node_k, node_status, GRAVITY_MPS2)
+
+    assert list(node_status) == [
+        STOKES_BATCH_STATUS_WAVE_MASK_INVALID,
+        STOKES_BATCH_STATUS_WAVE_QC_FLAGGED,
+        STOKES_BATCH_STATUS_INVALID_PHYSICS,
+        STOKES_BATCH_STATUS_INVALID_PHYSICS,
+    ]
+    assert STOKES_BATCH_STATUS_PARTICLE_OUTSIDE_WATER_COLUMN not in node_status
