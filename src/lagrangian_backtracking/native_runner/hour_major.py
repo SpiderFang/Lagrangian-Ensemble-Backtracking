@@ -875,6 +875,11 @@ def run_flow_domain_hour_major(
 
                 has_wave = wave_field_resolver is not None
                 cache_key = (int(field_pair.time_before_utc_ns), int(field_pair.time_after_utc_ns))
+                # 快取只在「同一個流場小時」內有意義（逆向逐小時遞減，已走過的小時不會再用到）；
+                # 換到新的小時就先清空，避免整個回溯窗（數百小時 × 每小時數十至數百 MB 的合成
+                # 場）全部留在記憶體中。只影響記憶體，不影響任何數值。
+                if cache_key not in composed_base_cache:
+                    composed_base_cache.clear()
                 base = composed_base_cache.get(cache_key)
                 if base is not None:
                     hour_overhead.compose_base_cache_hits += 1
@@ -948,6 +953,7 @@ def run_flow_domain_hour_major(
                         )
                         hour_overhead.time_smagorinsky_s += _time.perf_counter() - t0
                         hour_overhead.smagorinsky_cache_misses += 1
+                        smagorinsky_cache.clear()  # 同上：只保留目前這一小時
                         smagorinsky_cache[smagorinsky_key] = hf2_now
 
                 for group in groups:
