@@ -89,6 +89,66 @@
 ``bandwidth_factor`` 已足以讓下游報告層另外做頻寬敏感度比較，不在 WP-6 這一層
 重複建立。
 
+開放邊界分段細分（WP-20：方位扇區／沿邊界弧長位置）
+------------------------------------------------------
+WP-17 的 ``classify_boundary_segment`` 只回答「這個離開點比較靠近哪一**條**開放邊界
+線（``own_local_open_boundary`` 或 ``flow_open_boundary``）」；正式部署後發現每站
+實際上通常只登錄**一條**開放邊界線（例如 ``gongliao_local_open_boundary``），因此
+WP-17 的分段表對每站只會有一列、相對來源權重恆為 1，答不出「粒子從這條邊界的
+哪個方向／哪一段進入」。WP-20 在同一條已判定的開放邊界線之上，再新增兩種**互相
+獨立**的細分方式：
+
+1. **方位扇區（azimuth sector）**：以該站「受體位置的中心」為原點——定義為該站
+   全部相異 ``receptor_id`` 各自 ``(x0_m, y0_m)`` 座標（``ParticleIdentityTable``
+   既有欄位，逆向追蹤的公尺制起點，即受體位置）的算術平均，不依粒子數加權，
+   避免受體間粒子數不均拉偏中心——再依「離開點」相對這個中心的方位角（正北為
+   0 度，順時針，即標準航海方位角；``axis_order=x_east_y_north`` 已由
+   ``aggregate_spec.SiteMetricCRSSpec`` 確立，見 ``classify_azimuth_sector``）
+   分成 ``sector_count`` 個等角扇區（預設 16 個、每 22.5 度，名稱依羅盤 16 方位
+   N、NNE、NE…由正北順時針；``sector_count`` 若不是 16，扇區名稱退化為
+   ``sector_{index:03d}``，因為非 16 分割沒有標準羅盤名稱可用，寧可用明確的
+   數字命名，也不要套用不精確的方位名稱）。
+2. **沿邊界弧長位置（arc-length position）**：把「離開點已判定所屬」的那一條開放
+   邊界折線，依其自身弧長（``shapely`` 線幾何的 ``.length``／``.project()``／
+   ``.interpolate()``，多段折線 ``MultiLineString`` 會被視為依線段順序串接，與
+   既有 ``boundaries._open_boundary_crossing`` 用同一組 API）等分成
+   ``arc_segment_count`` 段（預設 20 段），再把離開點投影到線上的弧長位置
+   （``line.project(point)``）歸入對應分段。
+
+兩種方式都只回答「同一批已經確定成功穿越關注區域邊界的離開點，在既有分類之下
+還可以再細分成哪些子群」，**不改變、不重算**穿越／未穿越的判定本身（仍完全依賴
+``final_status``），也**不是**更精確的邊界交點重建——沿用 WP-17
+``classify_boundary_segment`` 已知的近似與限制（離開座標是子步結束後的原始位置，
+不是離開瞬間與邊界的精確交點）。方位扇區的「代表座標」是**為了繪圖方便而人工
+建構**的點（沿該扇區中心方位角、從站中心量測「到最近開放邊界線的距離」這個
+固定半徑），**不是任何實際粒子的位置**，在輸出欄位與 docstring 中都以
+``representative_*`` 命名並在文件中明確揭露這一點，避免被誤讀為真實觀測。
+
+輸出新增：
+
+- ``departures.parquet`` 新增 5 欄：``departure_azimuth_deg``（相對站受體中心的
+  方位角，度）、``departure_azimuth_sector_index``／``departure_azimuth_sector_name``
+  （方位扇區編號與名稱）、``boundary_arc_segment_index``／
+  ``boundary_arc_length_position_m``（沿已判定邊界線的弧段編號與弧長位置，公尺）。
+  五欄都只在該列成功穿越邊界（``crossed_interest_region_boundary=True``）且
+  ``boundary_geometries`` 有提供時才有值，其餘情況一律明確 ``null``。
+- ``boundary_entry_by_site_azimuth_sector.{parquet,csv}``／
+  ``boundary_entry_by_site_settling_velocity_azimuth_sector.{parquet,csv}``：各站
+  （或各站×沉降速度）內，各方位扇區的穿越粒子數與組內相對來源權重（分母只在
+  同一分組內加總，不跨站或跨分段比較，用語一律「相對來源權重」，見 AGENTS.md）。
+- ``boundary_entry_by_site_arc_segment.{parquet,csv}``／
+  ``boundary_entry_by_site_settling_velocity_arc_segment.{parquet,csv}``：同上，
+  分組鍵是「所屬開放邊界線＋沿線弧段編號」。
+- ``boundary_sectors_geometry_by_site.{parquet,csv}``／
+  ``boundary_arc_segments_geometry_by_site.{parquet,csv}``：每站分段的純幾何描述
+  （扇區起訖方位角、代表座標；弧段起訖與中點的公尺座標與經緯度），與上面兩張
+  統計表分開輸出，供繪圖時不需要重新推導幾何。
+- ``boundary_summary_by_site.{parquet,csv}``：每站一列的總表，把既有
+  ``boundary_flux_by_site`` 的計數換算成人類可讀的比例欄位（穿越比例、回溯達
+  上限比例、擱淺、沉底、流場缺值、數值失敗、pre-window 各自比例），分母沿用
+  ``boundary_flux_by_site`` 的 ``total_particle_count`` 定義，不另立新分母。這張
+  表**不需要** ``boundary_geometries``，永遠輸出。
+
 不做的事（誠實揭露）
 ----------------------
 1. 本模組不知道也不假設任何 ``(lon, lat) ↔ (x, y)`` 的投影方式；``lonlat_projector``
@@ -123,6 +183,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
+import math
 import resource
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -172,6 +233,11 @@ __all__ = [
     "PostprocessManifest",
     "PostprocessAccumulator",
     "classify_boundary_segment",
+    "classify_azimuth_sector",
+    "classify_boundary_arc_position",
+    "DEFAULT_AZIMUTH_SECTOR_COUNT",
+    "DEFAULT_BOUNDARY_ARC_SEGMENT_COUNT",
+    "COMPASS_16_SECTOR_NAMES",
 ]
 
 
@@ -256,6 +322,11 @@ DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
         pa.field("row_particle_index", pa.int64(), nullable=False),
         pa.field("boundary_segment_id", pa.string(), nullable=True),
         pa.field("boundary_classification_distance_m", pa.float64(), nullable=True),
+        pa.field("departure_azimuth_deg", pa.float64(), nullable=True),
+        pa.field("departure_azimuth_sector_index", pa.int32(), nullable=True),
+        pa.field("departure_azimuth_sector_name", pa.string(), nullable=True),
+        pa.field("boundary_arc_segment_index", pa.int32(), nullable=True),
+        pa.field("boundary_arc_length_position_m", pa.float64(), nullable=True),
     ]
 )
 """每顆粒子一列的離開紀錄表 schema。``departure_x_m``／``y_m``／``z_m`` 是公尺制
@@ -269,7 +340,15 @@ DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
 ``boundary_classification_distance_m``（WP-17 新增）只在建構時提供
 ``boundary_geometries`` 且該列 ``crossed_interest_region_boundary=True`` 時才有值，
 見 ``classify_boundary_segment`` 的方法與已知限制說明；其餘情況一律是明確的
-``null``（未提供邊界幾何，或這列根本沒有穿越邊界），不得以任何分段代碼頂替。"""
+``null``（未提供邊界幾何，或這列根本沒有穿越邊界），不得以任何分段代碼頂替。
+``departure_azimuth_deg``／``departure_azimuth_sector_index``／
+``departure_azimuth_sector_name``（WP-20 新增）是離開點相對該站受體位置中心的
+方位角與方位扇區分類（見 ``classify_azimuth_sector``）；
+``boundary_arc_segment_index``／``boundary_arc_length_position_m``（WP-20 新增）
+是離開點在其已判定所屬開放邊界線上的弧長分段與弧長位置（公尺，見
+``classify_boundary_arc_position``）。這五欄與 ``boundary_segment_id`` 同樣只在
+``boundary_geometries`` 有提供且該列成功穿越邊界時才有值，其餘情況一律明確
+``null``。"""
 
 
 LonLatProjector = Callable[[np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]
@@ -545,6 +624,21 @@ class BatchRecord:
     fingerprint_sha256: str
 
 
+DEFAULT_AZIMUTH_SECTOR_COUNT = 16
+"""方位扇區細分預設扇區數（每 22.5 度一扇區），對應標準羅盤 16 方位。"""
+
+DEFAULT_BOUNDARY_ARC_SEGMENT_COUNT = 20
+"""沿邊界弧長位置細分預設段數（把單一開放邊界折線依弧長等分成 20 段）。"""
+
+COMPASS_16_SECTOR_NAMES: tuple[str, ...] = (
+    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+    "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+)
+"""羅盤 16 方位名稱，由正北（N）順時針排列，索引 0 對應方位角 [0°, 22.5°) 那一扇區。
+只在 ``sector_count == 16``（預設值）時使用；其餘扇區數沒有標準羅盤名稱可套用，
+``classify_azimuth_sector`` 改用明確的 ``sector_{index:03d}`` 數字命名。"""
+
+
 @dataclass(frozen=True, slots=True)
 class PostprocessConfig:
     """一次 ``PostprocessAccumulator`` 執行的設定；全部欄位在建構時驗證。
@@ -562,6 +656,8 @@ class PostprocessConfig:
     kde_minimum_point_count: int = 30
     kde_hdr_levels: tuple[float, ...] = (0.50, 0.75, 0.90)
     depth_quartile_count: int = 4
+    azimuth_sector_count: int = DEFAULT_AZIMUTH_SECTOR_COUNT
+    boundary_arc_segment_count: int = DEFAULT_BOUNDARY_ARC_SEGMENT_COUNT
     project_root: str | None = None
     declared_git_commit: str | None = None
     formal_provenance: bool = False
@@ -577,6 +673,10 @@ class PostprocessConfig:
             raise PostprocessError("kde_minimum_point_count 必須至少為 3（conditional_kde_2d 的硬性下限）")
         if self.depth_quartile_count < 1:
             raise PostprocessError("depth_quartile_count 必須是正整數")
+        if self.azimuth_sector_count < 1:
+            raise PostprocessError("azimuth_sector_count 必須是正整數")
+        if self.boundary_arc_segment_count < 1:
+            raise PostprocessError("boundary_arc_segment_count 必須是正整數")
         levels = tuple(float(v) for v in self.kde_hdr_levels)
         if not levels or any(not (0.0 < v < 1.0) for v in levels):
             raise PostprocessError("kde_hdr_levels 必須是介於 0 與 1 之間的非空序列")
@@ -734,6 +834,528 @@ def classify_boundary_segment(
     return candidates[0]
 
 
+# ── 開放邊界分段細分（WP-20）：方位扇區／沿邊界弧長位置 ─────────────────────
+
+
+def classify_azimuth_sector(
+    x_m: float,
+    y_m: float,
+    center_x_m: float,
+    center_y_m: float,
+    *,
+    sector_count: int = DEFAULT_AZIMUTH_SECTOR_COUNT,
+) -> tuple[int, float, str]:
+    """把一個座標點依相對某個中心點的方位角分類到等角扇區。
+
+    方位角定義為標準航海方位角：以正北為 0 度、順時針量測到 360 度。本專案公尺制
+    運算座標固定 ``axis_order=x_east_y_north``（見 ``aggregate_spec.SiteMetricCRSSpec``
+    ``__post_init__`` 的驗證），即 ``x_m`` 向東為正、``y_m`` 向北為正，因此方位角
+    ``= atan2(dx_east, dy_north)``（不是慣用的數學極角 ``atan2(y, x)``），這裡的
+    ``dx``／``dy`` 是「點」相對「中心點」的偏移。中心點與待分類點完全重合（偏移量
+    恰好為零向量）這種退化情況，方位角定義為 0 度（歸入第 0 扇區），因為零向量沒有
+    方向，任何選擇都是武斷的，選 0 度只是避免呼叫 ``atan2(0, 0)`` 的未定義結果。
+
+    Args:
+        x_m, y_m: 待分類點的公尺制座標。
+        center_x_m, center_y_m: 方位角量測的原點（例如站受體位置中心）。
+        sector_count: 等角扇區數，必須是正整數；預設 16（每 22.5 度）。
+
+    Returns:
+        ``(sector_index, azimuth_deg, sector_name)``：``sector_index`` 是
+        ``0..sector_count-1``（``0`` 對應正北開始順時針的第一扇區）；``azimuth_deg``
+        是原始方位角（``[0, 360)`` 度，未離散化，供需要連續值的下游使用）；
+        ``sector_name`` 是人類可讀標籤（見 ``COMPASS_16_SECTOR_NAMES``）。
+    """
+
+    if sector_count < 1:
+        raise PostprocessError("sector_count 必須是正整數")
+    dx = float(x_m) - float(center_x_m)
+    dy = float(y_m) - float(center_y_m)
+    azimuth_deg = 0.0 if dx == 0.0 and dy == 0.0 else math.degrees(math.atan2(dx, dy)) % 360.0
+    sector_width_deg = 360.0 / sector_count
+    sector_index = min(int(azimuth_deg / sector_width_deg), sector_count - 1)
+    if sector_count == DEFAULT_AZIMUTH_SECTOR_COUNT:
+        sector_name = COMPASS_16_SECTOR_NAMES[sector_index]
+    else:
+        sector_name = f"sector_{sector_index:03d}"
+    return sector_index, azimuth_deg, sector_name
+
+
+def _named_open_boundary_lines(geometry: BoundaryGeometry) -> list[tuple[str, Any]]:
+    """回傳這個站已命名、非空的開放邊界線 ``(boundary_segment_id, geometry)`` 清單。
+
+    最多兩條（``own_local_open_boundary``／``flow_open_boundary``），與
+    ``classify_boundary_segment`` 判定「離開點最靠近哪一條」時考慮的候選集合完全
+    一致，確保沿邊界弧長細分只會對「離開點確實被分類到的那一條線」計算弧長位置。
+    """
+
+    lines: list[tuple[str, Any]] = []
+    if geometry.own_local_open_boundary is not None:
+        lines.append((geometry.own_local_boundary_segment_id, geometry.own_local_open_boundary))
+    if geometry.flow_open_boundary is not None:
+        lines.append((geometry.flow_boundary_segment_id, geometry.flow_open_boundary))
+    return lines
+
+
+def classify_boundary_arc_position(
+    x_m: float,
+    y_m: float,
+    boundary_segment_id: str,
+    geometry: BoundaryGeometry,
+    *,
+    arc_segment_count: int = DEFAULT_BOUNDARY_ARC_SEGMENT_COUNT,
+) -> tuple[int, float, float] | None:
+    """把一個「已經由 ``classify_boundary_segment`` 判定所屬開放邊界線」的離開點，
+    進一步定位到沿那條線的弧長分段。
+
+    ``boundary_segment_id`` 必須是 ``classify_boundary_segment`` 對同一個
+    ``(x_m, y_m)`` 回傳的分段識別碼；本函式用它反查 ``geometry`` 對應的實際線
+    幾何（``own_local_open_boundary`` 或 ``flow_open_boundary``），再用
+    ``shapely`` 的 ``line.project(point)`` 算出離開點在線上最近點的弧長位置
+    （多段折線 ``MultiLineString`` 由 ``shapely`` 依線段順序串接處理，與
+    ``boundaries._open_boundary_crossing`` 用同一組 API，語意一致），最後依
+    ``arc_segment_count`` 等分弧長區間。
+
+    Args:
+        boundary_segment_id: 這個離開點已判定所屬的開放邊界線識別碼；若不等於
+            ``geometry.own_local_boundary_segment_id`` 也不等於
+            ``geometry.flow_boundary_segment_id``（例如這個點根本沒有穿越邊界，
+            或 ``classify_boundary_segment`` 因兩條線都缺席而退回
+            ``coastline_segment_id``），視為「沒有對應線可用」，回傳 ``None``。
+        arc_segment_count: 弧長等分段數，必須是正整數；預設 20。
+
+    Returns:
+        ``(arc_segment_index, arc_length_position_m, boundary_length_m)``，或
+        ``None``（沒有對應線，或該線長度為零這種退化幾何）。``arc_length_position_m``
+        限制在 ``[0, boundary_length_m]`` 內（``shapely`` 的 ``project`` 對線外
+        延伸點會回傳線端點對應的弧長，本身已滿足這個界限，這裡的 clamp 只是防禦
+        浮點誤差）。
+    """
+
+    if arc_segment_count < 1:
+        raise PostprocessError("arc_segment_count 必須是正整數")
+    line = None
+    if boundary_segment_id == geometry.own_local_boundary_segment_id:
+        line = geometry.own_local_open_boundary
+    elif boundary_segment_id == geometry.flow_boundary_segment_id:
+        line = geometry.flow_open_boundary
+    if line is None:
+        return None
+    length_m = float(line.length)
+    if length_m <= 0.0:
+        return None
+    point = Point(float(x_m), float(y_m))
+    s_m = min(max(float(line.project(point)), 0.0), length_m)
+    segment_width_m = length_m / arc_segment_count
+    arc_segment_index = min(int(s_m / segment_width_m), arc_segment_count - 1)
+    return arc_segment_index, s_m, length_m
+
+
+def _site_receptor_centers(identity_table: ParticleIdentityTable) -> dict[str, tuple[float, float]]:
+    """算出每站「受體位置中心」，供方位扇區細分的原點使用。
+
+    定義為該站**全部相異** ``receptor_id`` 各自公尺制起點座標
+    （``ParticleIdentityTable.x0_m``／``y0_m``，逆向追蹤的起點，即受體所在位置）
+    的算術平均，**不依粒子數加權**——同一受體底下有多少顆粒子（不同沉降速度、
+    不同到達時刻、不同系集成員）純粹是抽樣設計的產物，與「這個受體實際在哪裡」
+    無關，若按粒子數加權，粒子數較多的受體會不成比例地拉偏中心。取每個相異
+    ``receptor_id`` 的第一筆座標（同一受體的座標理論上對全部粒子完全相同，是
+    固定的受體位置，不是逐粒子變化的量）。
+    """
+
+    centers: dict[str, tuple[float, float]] = {}
+    sites = identity_table.study_site_id
+    receptors = identity_table.receptor_id
+    x0 = identity_table.x0_m
+    y0 = identity_table.y0_m
+    for site in np.unique(sites):
+        site_mask = sites == site
+        _, first_index = np.unique(receptors[site_mask], return_index=True)
+        site_x0 = x0[site_mask][first_index]
+        site_y0 = y0[site_mask][first_index]
+        centers[str(site)] = (float(np.mean(site_x0)), float(np.mean(site_y0)))
+    return centers
+
+
+def _reference_radius_m(geometry: BoundaryGeometry, center_x_m: float, center_y_m: float) -> float:
+    """算出方位扇區「代表座標」用的固定半徑：站中心到最近開放邊界線的直線距離。
+
+    只用來把扇區的方向（方位角）換算成一個可以畫在圖上的具體座標點，**不代表**
+    任何實際粒子或邊界上的位置（見模組 docstring「開放邊界分段細分」一節的揭露）。
+    沒有任何開放邊界線可用時退回 1 公尺（純粹避免半徑為零的退化點，這個站不應該
+    出現在 ``boundary_geometries`` 且成功分類穿越邊界的組合下，因為
+    ``classify_boundary_segment`` 對這種情況只會回傳海岸線、不會有粒子被歸類到
+    任何方位扇區）。
+    """
+
+    center_point = Point(float(center_x_m), float(center_y_m))
+    radii = [float(line.distance(center_point)) for _, line in _named_open_boundary_lines(geometry)]
+    if not radii:
+        return 1.0
+    return max(min(radii), 1.0)
+
+
+def _sector_representative_point(
+    center_x_m: float, center_y_m: float, azimuth_deg: float, radius_m: float
+) -> tuple[float, float]:
+    """由中心點、方位角與半徑，算出扇區代表座標（僅供繪圖，見上方函式說明）。"""
+
+    rad = math.radians(azimuth_deg)
+    return center_x_m + radius_m * math.sin(rad), center_y_m + radius_m * math.cos(rad)
+
+
+_KEY_COLUMN_PYARROW_TYPES: Mapping[str, pa.DataType] = MappingProxyType(
+    {"study_site_id": pa.string(), "settling_velocity_mps": pa.float64()}
+)
+"""分組表空表 fallback 用的欄位型別對照：這裡列出的分組鍵欄名，空表也要用正確
+型別（尤其 ``settling_velocity_mps`` 必須是 ``float64``，不能退化成字串），
+避免「有穿越粒子」與「完全沒有穿越粒子（空表）」兩種情況輸出的 schema 不一致。
+未列出的分組鍵欄名（理論上不應該發生）保守退回字串型別。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _SectorGeometryRow:
+    """單一站、單一方位扇區的純幾何描述（見 ``_build_sector_geometries``）。"""
+
+    sector_index: int
+    sector_name: str
+    start_azimuth_deg: float
+    end_azimuth_deg: float
+    center_azimuth_deg: float
+    center_x_m: float
+    center_y_m: float
+    representative_x_m: float
+    representative_y_m: float
+    representative_lon_deg: float | None
+    representative_lat_deg: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ArcSegmentGeometryRow:
+    """單一站、單一開放邊界線、單一弧段的純幾何描述（見 ``_build_arc_segment_geometries``）。"""
+
+    base_boundary_segment_id: str
+    arc_segment_index: int
+    arc_segment_id: str
+    start_s_m: float
+    end_s_m: float
+    start_x_m: float
+    start_y_m: float
+    end_x_m: float
+    end_y_m: float
+    midpoint_x_m: float
+    midpoint_y_m: float
+    start_lon_deg: float | None
+    start_lat_deg: float | None
+    end_lon_deg: float | None
+    end_lat_deg: float | None
+    midpoint_lon_deg: float | None
+    midpoint_lat_deg: float | None
+
+
+def _build_sector_geometries(
+    site_centers: Mapping[str, tuple[float, float]],
+    boundary_geometries: Mapping[str, BoundaryGeometry],
+    *,
+    sector_count: int,
+    lonlat_projector: LonLatProjector | None,
+) -> dict[tuple[str, int], _SectorGeometryRow]:
+    """對每個提供了邊界幾何的站，算出全部 ``sector_count`` 個方位扇區的幾何描述。"""
+
+    result: dict[tuple[str, int], _SectorGeometryRow] = {}
+    sector_width_deg = 360.0 / sector_count
+    for site in sorted(boundary_geometries):
+        center = site_centers.get(site)
+        if center is None:
+            continue
+        center_x, center_y = center
+        radius_m = _reference_radius_m(boundary_geometries[site], center_x, center_y)
+        indices = list(range(sector_count))
+        center_azimuths = [(i + 0.5) * sector_width_deg for i in indices]
+        rep_points = [
+            _sector_representative_point(center_x, center_y, az, radius_m) for az in center_azimuths
+        ]
+        rep_x = np.asarray([p[0] for p in rep_points], dtype=np.float64)
+        rep_y = np.asarray([p[1] for p in rep_points], dtype=np.float64)
+        if lonlat_projector is not None:
+            lon_arr, lat_arr = lonlat_projector(np.full(sector_count, site), rep_x, rep_y)
+        else:
+            lon_arr = lat_arr = None
+        for i in indices:
+            name = (
+                COMPASS_16_SECTOR_NAMES[i] if sector_count == DEFAULT_AZIMUTH_SECTOR_COUNT
+                else f"sector_{i:03d}"
+            )
+            result[(site, i)] = _SectorGeometryRow(
+                sector_index=i,
+                sector_name=name,
+                start_azimuth_deg=i * sector_width_deg,
+                end_azimuth_deg=(i + 1) * sector_width_deg,
+                center_azimuth_deg=center_azimuths[i],
+                center_x_m=center_x,
+                center_y_m=center_y,
+                representative_x_m=float(rep_x[i]),
+                representative_y_m=float(rep_y[i]),
+                representative_lon_deg=float(lon_arr[i]) if lon_arr is not None else None,
+                representative_lat_deg=float(lat_arr[i]) if lat_arr is not None else None,
+            )
+    return result
+
+
+def _build_arc_segment_geometries(
+    boundary_geometries: Mapping[str, BoundaryGeometry],
+    *,
+    arc_segment_count: int,
+    lonlat_projector: LonLatProjector | None,
+) -> dict[tuple[str, str, int], _ArcSegmentGeometryRow]:
+    """對每個提供了邊界幾何的站、每條已命名開放邊界線，算出全部弧段的幾何描述。"""
+
+    result: dict[tuple[str, str, int], _ArcSegmentGeometryRow] = {}
+    for site in sorted(boundary_geometries):
+        for base_id, line in _named_open_boundary_lines(boundary_geometries[site]):
+            length_m = float(line.length)
+            if length_m <= 0.0:
+                continue
+            segment_width_m = length_m / arc_segment_count
+            starts = [i * segment_width_m for i in range(arc_segment_count)]
+            ends = [
+                length_m if i == arc_segment_count - 1 else (i + 1) * segment_width_m
+                for i in range(arc_segment_count)
+            ]
+            mids = [(s + e) / 2.0 for s, e in zip(starts, ends, strict=True)]
+            start_xy = np.asarray([(line.interpolate(s).x, line.interpolate(s).y) for s in starts])
+            end_xy = np.asarray([(line.interpolate(s).x, line.interpolate(s).y) for s in ends])
+            mid_xy = np.asarray([(line.interpolate(s).x, line.interpolate(s).y) for s in mids])
+            if lonlat_projector is not None:
+                site_arr = np.full(arc_segment_count, site)
+                start_lon, start_lat = lonlat_projector(site_arr, start_xy[:, 0], start_xy[:, 1])
+                end_lon, end_lat = lonlat_projector(site_arr, end_xy[:, 0], end_xy[:, 1])
+                mid_lon, mid_lat = lonlat_projector(site_arr, mid_xy[:, 0], mid_xy[:, 1])
+            else:
+                start_lon = start_lat = end_lon = end_lat = mid_lon = mid_lat = None
+            for i in range(arc_segment_count):
+                result[(site, base_id, i)] = _ArcSegmentGeometryRow(
+                    base_boundary_segment_id=base_id,
+                    arc_segment_index=i,
+                    arc_segment_id=f"{base_id}_arc{i:03d}",
+                    start_s_m=starts[i],
+                    end_s_m=ends[i],
+                    start_x_m=float(start_xy[i, 0]),
+                    start_y_m=float(start_xy[i, 1]),
+                    end_x_m=float(end_xy[i, 0]),
+                    end_y_m=float(end_xy[i, 1]),
+                    midpoint_x_m=float(mid_xy[i, 0]),
+                    midpoint_y_m=float(mid_xy[i, 1]),
+                    start_lon_deg=float(start_lon[i]) if start_lon is not None else None,
+                    start_lat_deg=float(start_lat[i]) if start_lat is not None else None,
+                    end_lon_deg=float(end_lon[i]) if end_lon is not None else None,
+                    end_lat_deg=float(end_lat[i]) if end_lat is not None else None,
+                    midpoint_lon_deg=float(mid_lon[i]) if mid_lon is not None else None,
+                    midpoint_lat_deg=float(mid_lat[i]) if mid_lat is not None else None,
+                )
+    return result
+
+
+def _sector_entry_table(
+    counts: Mapping[tuple[Any, ...], int],
+    key_columns: tuple[str, ...],
+    sector_geometries: Mapping[tuple[str, int], _SectorGeometryRow],
+) -> pa.Table:
+    """把 ``{(分組鍵..., sector_index): 穿越次數}`` 轉成方位扇區相對來源權重表。
+
+    最後一個分組鍵固定是 ``sector_index``；``key_columns[0]`` 固定是
+    ``study_site_id``（供反查該站的扇區幾何）。空表（沒有任何穿越粒子落入任何
+    方位扇區，例如整批都未穿越邊界）輸出明確定義 schema 的空表，不拋例外。
+    """
+
+    totals: dict[tuple[Any, ...], int] = {}
+    for key, count in counts.items():
+        group_key = key[:-1]
+        totals[group_key] = totals.get(group_key, 0) + count
+
+    rows: list[dict[str, Any]] = []
+    for key in sorted(counts):
+        group_key = key[:-1]
+        sector_index = int(key[-1])
+        site_id = str(key[0])
+        count = counts[key]
+        total = totals[group_key]
+        geometry_row = sector_geometries[(site_id, sector_index)]
+        row: dict[str, Any] = dict(zip(key_columns, group_key, strict=True))
+        row["sector_index"] = sector_index
+        row["sector_name"] = geometry_row.sector_name
+        row["sector_center_azimuth_deg"] = geometry_row.center_azimuth_deg
+        row["representative_x_m"] = geometry_row.representative_x_m
+        row["representative_y_m"] = geometry_row.representative_y_m
+        row["representative_lon_deg"] = geometry_row.representative_lon_deg
+        row["representative_lat_deg"] = geometry_row.representative_lat_deg
+        row["crossed_count"] = count
+        row["relative_source_weight_within_group"] = float(count) / float(total) if total else float("nan")
+        rows.append(row)
+    if not rows:
+        fields = [
+            pa.field(name, _KEY_COLUMN_PYARROW_TYPES.get(name, pa.string())) for name in key_columns
+        ] + [
+            pa.field("sector_index", pa.int32()),
+            pa.field("sector_name", pa.string()),
+            pa.field("sector_center_azimuth_deg", pa.float64()),
+            pa.field("representative_x_m", pa.float64()),
+            pa.field("representative_y_m", pa.float64()),
+            pa.field("representative_lon_deg", pa.float64()),
+            pa.field("representative_lat_deg", pa.float64()),
+            pa.field("crossed_count", pa.int64()),
+            pa.field("relative_source_weight_within_group", pa.float64()),
+        ]
+        return pa.table({f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields))
+    return pa.Table.from_pylist(rows)
+
+
+def _arc_segment_entry_table(
+    counts: Mapping[tuple[Any, ...], int],
+    key_columns: tuple[str, ...],
+    arc_geometries: Mapping[tuple[str, str, int], _ArcSegmentGeometryRow],
+) -> pa.Table:
+    """把 ``{(分組鍵..., base_boundary_segment_id, arc_segment_index): 穿越次數}``
+    轉成沿邊界弧長位置相對來源權重表。最後兩個分組鍵固定是
+    ``(base_boundary_segment_id, arc_segment_index)``；``key_columns[0]`` 固定是
+    ``study_site_id``。空表輸出明確定義 schema 的空表，不拋例外。
+    """
+
+    totals: dict[tuple[Any, ...], int] = {}
+    for key, count in counts.items():
+        group_key = key[:-2]
+        totals[group_key] = totals.get(group_key, 0) + count
+
+    rows: list[dict[str, Any]] = []
+    for key in sorted(counts):
+        group_key = key[:-2]
+        base_id = str(key[-2])
+        arc_index = int(key[-1])
+        site_id = str(key[0])
+        count = counts[key]
+        total = totals[group_key]
+        geometry_row = arc_geometries[(site_id, base_id, arc_index)]
+        row: dict[str, Any] = dict(zip(key_columns, group_key, strict=True))
+        row["base_boundary_segment_id"] = base_id
+        row["arc_segment_index"] = arc_index
+        row["arc_segment_id"] = geometry_row.arc_segment_id
+        row["midpoint_x_m"] = geometry_row.midpoint_x_m
+        row["midpoint_y_m"] = geometry_row.midpoint_y_m
+        row["midpoint_lon_deg"] = geometry_row.midpoint_lon_deg
+        row["midpoint_lat_deg"] = geometry_row.midpoint_lat_deg
+        row["crossed_count"] = count
+        row["relative_source_weight_within_group"] = float(count) / float(total) if total else float("nan")
+        rows.append(row)
+    if not rows:
+        fields = [
+            pa.field(name, _KEY_COLUMN_PYARROW_TYPES.get(name, pa.string())) for name in key_columns
+        ] + [
+            pa.field("base_boundary_segment_id", pa.string()),
+            pa.field("arc_segment_index", pa.int32()),
+            pa.field("arc_segment_id", pa.string()),
+            pa.field("midpoint_x_m", pa.float64()),
+            pa.field("midpoint_y_m", pa.float64()),
+            pa.field("midpoint_lon_deg", pa.float64()),
+            pa.field("midpoint_lat_deg", pa.float64()),
+            pa.field("crossed_count", pa.int64()),
+            pa.field("relative_source_weight_within_group", pa.float64()),
+        ]
+        return pa.table({f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields))
+    return pa.Table.from_pylist(rows)
+
+
+def _sector_geometry_table(sector_geometries: Mapping[tuple[str, int], _SectorGeometryRow]) -> pa.Table:
+    """把方位扇區幾何 dict 攤平成 ``boundary_sectors_geometry_by_site`` 表。"""
+
+    rows = [
+        {
+            "study_site_id": site,
+            "sector_index": geom.sector_index,
+            "sector_name": geom.sector_name,
+            "start_azimuth_deg": geom.start_azimuth_deg,
+            "end_azimuth_deg": geom.end_azimuth_deg,
+            "center_azimuth_deg": geom.center_azimuth_deg,
+            "center_x_m": geom.center_x_m,
+            "center_y_m": geom.center_y_m,
+            "representative_x_m": geom.representative_x_m,
+            "representative_y_m": geom.representative_y_m,
+            "representative_lon_deg": geom.representative_lon_deg,
+            "representative_lat_deg": geom.representative_lat_deg,
+        }
+        for (site, _index), geom in sorted(sector_geometries.items())
+    ]
+    if not rows:
+        fields = [
+            pa.field("study_site_id", pa.string()),
+            pa.field("sector_index", pa.int32()),
+            pa.field("sector_name", pa.string()),
+            pa.field("start_azimuth_deg", pa.float64()),
+            pa.field("end_azimuth_deg", pa.float64()),
+            pa.field("center_azimuth_deg", pa.float64()),
+            pa.field("center_x_m", pa.float64()),
+            pa.field("center_y_m", pa.float64()),
+            pa.field("representative_x_m", pa.float64()),
+            pa.field("representative_y_m", pa.float64()),
+            pa.field("representative_lon_deg", pa.float64()),
+            pa.field("representative_lat_deg", pa.float64()),
+        ]
+        return pa.table({f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields))
+    return pa.Table.from_pylist(rows)
+
+
+def _arc_segment_geometry_table(
+    arc_geometries: Mapping[tuple[str, str, int], _ArcSegmentGeometryRow],
+) -> pa.Table:
+    """把沿邊界弧長位置幾何 dict 攤平成 ``boundary_arc_segments_geometry_by_site`` 表。"""
+
+    rows = [
+        {
+            "study_site_id": site,
+            "base_boundary_segment_id": geom.base_boundary_segment_id,
+            "arc_segment_index": geom.arc_segment_index,
+            "arc_segment_id": geom.arc_segment_id,
+            "start_s_m": geom.start_s_m,
+            "end_s_m": geom.end_s_m,
+            "start_x_m": geom.start_x_m,
+            "start_y_m": geom.start_y_m,
+            "end_x_m": geom.end_x_m,
+            "end_y_m": geom.end_y_m,
+            "midpoint_x_m": geom.midpoint_x_m,
+            "midpoint_y_m": geom.midpoint_y_m,
+            "start_lon_deg": geom.start_lon_deg,
+            "start_lat_deg": geom.start_lat_deg,
+            "end_lon_deg": geom.end_lon_deg,
+            "end_lat_deg": geom.end_lat_deg,
+            "midpoint_lon_deg": geom.midpoint_lon_deg,
+            "midpoint_lat_deg": geom.midpoint_lat_deg,
+        }
+        for (site, _base_id, _index), geom in sorted(arc_geometries.items())
+    ]
+    if not rows:
+        fields = [
+            pa.field("study_site_id", pa.string()),
+            pa.field("base_boundary_segment_id", pa.string()),
+            pa.field("arc_segment_index", pa.int32()),
+            pa.field("arc_segment_id", pa.string()),
+            pa.field("start_s_m", pa.float64()),
+            pa.field("end_s_m", pa.float64()),
+            pa.field("start_x_m", pa.float64()),
+            pa.field("start_y_m", pa.float64()),
+            pa.field("end_x_m", pa.float64()),
+            pa.field("end_y_m", pa.float64()),
+            pa.field("midpoint_x_m", pa.float64()),
+            pa.field("midpoint_y_m", pa.float64()),
+            pa.field("start_lon_deg", pa.float64()),
+            pa.field("start_lat_deg", pa.float64()),
+            pa.field("end_lon_deg", pa.float64()),
+            pa.field("end_lat_deg", pa.float64()),
+            pa.field("midpoint_lon_deg", pa.float64()),
+            pa.field("midpoint_lat_deg", pa.float64()),
+        ]
+        return pa.table({f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields))
+    return pa.Table.from_pylist(rows)
+
+
 def _boundary_entry_table(
     counts: Mapping[tuple[Any, ...], int], key_columns: tuple[str, ...]
 ) -> pa.Table:
@@ -762,7 +1384,9 @@ def _boundary_entry_table(
         row["relative_source_weight_within_group"] = float(count) / float(total) if total else float("nan")
         rows.append(row)
     if not rows:
-        fields = [pa.field(name, pa.string()) for name in key_columns] + [
+        fields = [
+            pa.field(name, _KEY_COLUMN_PYARROW_TYPES.get(name, pa.string())) for name in key_columns
+        ] + [
             pa.field("boundary_segment_id", pa.string()),
             pa.field("crossed_count", pa.int64()),
             pa.field("relative_source_weight_within_group", pa.float64()),
@@ -859,6 +1483,16 @@ class PostprocessAccumulator:
         # 只在提供 boundary_geometries 時才有內容（見 classify_boundary_segment）。
         self._boundary_entry_counts_by_site: dict[tuple[str, str], int] = {}
         self._boundary_entry_counts_by_site_velocity: dict[tuple[str, float, str], int] = {}
+
+        # WP-20：開放邊界再細分（方位扇區／沿邊界弧長位置），只在提供
+        # boundary_geometries 時才有內容。``self._site_receptor_centers`` 與是否
+        # 提供 boundary_geometries 無關，一律計算（成本是 O(粒子數)，遠小於後續
+        # 批次處理），因為它只依賴 identity_table 本身。
+        self._site_receptor_centers = _site_receptor_centers(identity_table)
+        self._sector_entry_counts_by_site: dict[tuple[str, int], int] = {}
+        self._sector_entry_counts_by_site_velocity: dict[tuple[str, float, int], int] = {}
+        self._arc_entry_counts_by_site: dict[tuple[str, str, int], int] = {}
+        self._arc_entry_counts_by_site_velocity: dict[tuple[str, float, str, int], int] = {}
 
         n = len(identity_table)
         self._n_total = n
@@ -1004,9 +1638,18 @@ class PostprocessAccumulator:
 
         segment_ids: list[str | None] = [None] * rows.size
         segment_distances: list[float | None] = [None] * rows.size
+        # WP-20：開放邊界再細分（方位扇區／沿邊界弧長位置），與上面既有的
+        # boundary_segment_id 分類同一個迴圈內完成，避免重複掃描 crossed 列。
+        azimuth_degs: list[float | None] = [None] * rows.size
+        sector_indices: list[int | None] = [None] * rows.size
+        sector_names: list[str | None] = [None] * rows.size
+        arc_indices: list[int | None] = [None] * rows.size
+        arc_positions_m: list[float | None] = [None] * rows.size
         if self._boundary_geometries is not None:
             site_ids = identity.study_site_id[rows]
             velocities = identity.settling_velocity_mps[rows]
+            sector_count = self._config.azimuth_sector_count
+            arc_segment_count = self._config.boundary_arc_segment_count
             for local_index in np.flatnonzero(crossed):
                 site_id = str(site_ids[local_index])
                 geometry = self._boundary_geometries.get(site_id)
@@ -1015,19 +1658,53 @@ class PostprocessAccumulator:
                         f"boundary_geometries 缺少站點 {site_id!r} 的邊界幾何，"
                         "無法分類這顆已穿越關注區域邊界的粒子"
                     )
-                segment_id, distance_m = classify_boundary_segment(
-                    float(final_x[local_index]), float(final_y[local_index]), geometry
-                )
+                x_m = float(final_x[local_index])
+                y_m = float(final_y[local_index])
+                segment_id, distance_m = classify_boundary_segment(x_m, y_m, geometry)
                 segment_ids[local_index] = segment_id
                 segment_distances[local_index] = distance_m
                 site_key = (site_id, segment_id)
                 self._boundary_entry_counts_by_site[site_key] = (
                     self._boundary_entry_counts_by_site.get(site_key, 0) + 1
                 )
-                velocity_key = (site_id, float(velocities[local_index]), segment_id)
+                velocity_value = float(velocities[local_index])
+                velocity_key = (site_id, velocity_value, segment_id)
                 self._boundary_entry_counts_by_site_velocity[velocity_key] = (
                     self._boundary_entry_counts_by_site_velocity.get(velocity_key, 0) + 1
                 )
+
+                center = self._site_receptor_centers.get(site_id)
+                if center is not None:
+                    sector_index, azimuth_deg, sector_name = classify_azimuth_sector(
+                        x_m, y_m, center[0], center[1], sector_count=sector_count
+                    )
+                    azimuth_degs[local_index] = azimuth_deg
+                    sector_indices[local_index] = sector_index
+                    sector_names[local_index] = sector_name
+                    sector_key = (site_id, sector_index)
+                    self._sector_entry_counts_by_site[sector_key] = (
+                        self._sector_entry_counts_by_site.get(sector_key, 0) + 1
+                    )
+                    sector_velocity_key = (site_id, velocity_value, sector_index)
+                    self._sector_entry_counts_by_site_velocity[sector_velocity_key] = (
+                        self._sector_entry_counts_by_site_velocity.get(sector_velocity_key, 0) + 1
+                    )
+
+                arc_result = classify_boundary_arc_position(
+                    x_m, y_m, segment_id, geometry, arc_segment_count=arc_segment_count
+                )
+                if arc_result is not None:
+                    arc_index, arc_s_m, _length_m = arc_result
+                    arc_indices[local_index] = arc_index
+                    arc_positions_m[local_index] = arc_s_m
+                    arc_key = (site_id, segment_id, arc_index)
+                    self._arc_entry_counts_by_site[arc_key] = (
+                        self._arc_entry_counts_by_site.get(arc_key, 0) + 1
+                    )
+                    arc_velocity_key = (site_id, velocity_value, segment_id, arc_index)
+                    self._arc_entry_counts_by_site_velocity[arc_velocity_key] = (
+                        self._arc_entry_counts_by_site_velocity.get(arc_velocity_key, 0) + 1
+                    )
 
         columns = {
             "particle_id": pa.array(identity.particle_id[rows]),
@@ -1055,6 +1732,11 @@ class PostprocessAccumulator:
             "row_particle_index": pa.array(rows),
             "boundary_segment_id": pa.array(segment_ids, type=pa.string()),
             "boundary_classification_distance_m": pa.array(segment_distances, type=pa.float64()),
+            "departure_azimuth_deg": pa.array(azimuth_degs, type=pa.float64()),
+            "departure_azimuth_sector_index": pa.array(sector_indices, type=pa.int32()),
+            "departure_azimuth_sector_name": pa.array(sector_names, type=pa.string()),
+            "boundary_arc_segment_index": pa.array(arc_indices, type=pa.int32()),
+            "boundary_arc_length_position_m": pa.array(arc_positions_m, type=pa.float64()),
         }
         table = pa.table(columns, schema=DEPARTURE_TABLE_SCHEMA)
         self._departure_writer.write_table(table)
@@ -1188,6 +1870,17 @@ class PostprocessAccumulator:
                     if self._boundary_geometries is not None
                     else None
                 ),
+                # WP-20：開放邊界再細分（方位扇區／沿邊界弧長位置）設定與可用性。
+                "azimuth_sector_count": self._config.azimuth_sector_count,
+                "boundary_arc_segment_count": self._config.boundary_arc_segment_count,
+                "boundary_subdivision_available": self._boundary_geometries is not None,
+                "boundary_subdivision_method": (
+                    "azimuth_sector: classify_azimuth_sector（以站受體位置中心為原點的方位角等分）；"
+                    "arc_length_position: classify_boundary_arc_position（沿已判定所屬開放邊界線的"
+                    "弧長等分，見 postprocess.py 模組 docstring「開放邊界分段細分」一節）"
+                    if self._boundary_geometries is not None
+                    else None
+                ),
                 # WP-18：native-plan 計畫檔的實驗案例聲明（若呼叫端提供 --plan）。
                 # None 表示呼叫端未提供計畫檔，不代表「無 Stokes」，見
                 # PostprocessAccumulator.__init__ 對兩種 experiment_case_id 語意
@@ -1246,6 +1939,123 @@ class PostprocessAccumulator:
             _write_table_with_csv(
                 by_site_velocity_table, self._output_dir, "boundary_entry_by_site_settling_velocity"
             )
+            self._write_boundary_subdivision_tables()
+
+        self._write_site_summary_table()
+
+    def _write_boundary_subdivision_tables(self) -> None:
+        """輸出 WP-20 開放邊界再細分（方位扇區／沿邊界弧長位置）的統計表與幾何表。
+
+        只在 :meth:`_write_flux_tables` 內、已確認 ``self._boundary_geometries``
+        非 ``None`` 時呼叫。統計表分母與 ``_boundary_entry_table`` 一致（同一分組
+        鍵底下全部分段的穿越次數總和），沒有任何穿越粒子落入某個分組時，輸出
+        明確定義 schema 的空表（見 ``_sector_entry_table``／``_arc_segment_entry_table``
+        的空表 fallback），不拋例外。幾何表與是否有穿越粒子無關，只要站有邊界幾何
+        就會有對應的幾何列，供繪圖時即使某些分段完全沒有粒子穿越也能畫出完整的
+        邊界分段底圖。
+        """
+
+        assert self._boundary_geometries is not None  # 供型別檢查器確認，呼叫端已保證
+
+        sector_geometries = _build_sector_geometries(
+            self._site_receptor_centers,
+            self._boundary_geometries,
+            sector_count=self._config.azimuth_sector_count,
+            lonlat_projector=self._lonlat_projector,
+        )
+        arc_geometries = _build_arc_segment_geometries(
+            self._boundary_geometries,
+            arc_segment_count=self._config.boundary_arc_segment_count,
+            lonlat_projector=self._lonlat_projector,
+        )
+
+        _write_table_with_csv(
+            _sector_geometry_table(sector_geometries), self._output_dir, "boundary_sectors_geometry_by_site"
+        )
+        _write_table_with_csv(
+            _arc_segment_geometry_table(arc_geometries),
+            self._output_dir,
+            "boundary_arc_segments_geometry_by_site",
+        )
+
+        _write_table_with_csv(
+            _sector_entry_table(self._sector_entry_counts_by_site, ("study_site_id",), sector_geometries),
+            self._output_dir,
+            "boundary_entry_by_site_azimuth_sector",
+        )
+        _write_table_with_csv(
+            _sector_entry_table(
+                self._sector_entry_counts_by_site_velocity,
+                ("study_site_id", "settling_velocity_mps"),
+                sector_geometries,
+            ),
+            self._output_dir,
+            "boundary_entry_by_site_settling_velocity_azimuth_sector",
+        )
+        _write_table_with_csv(
+            _arc_segment_entry_table(self._arc_entry_counts_by_site, ("study_site_id",), arc_geometries),
+            self._output_dir,
+            "boundary_entry_by_site_arc_segment",
+        )
+        _write_table_with_csv(
+            _arc_segment_entry_table(
+                self._arc_entry_counts_by_site_velocity,
+                ("study_site_id", "settling_velocity_mps"),
+                arc_geometries,
+            ),
+            self._output_dir,
+            "boundary_entry_by_site_settling_velocity_arc_segment",
+        )
+
+    def _write_site_summary_table(self) -> None:
+        """輸出每站一列的總表（WP-20 任務 2）：穿越比例與各終止狀態比例。
+
+        分母與欄位定義完全沿用既有 ``boundary_flux_by_site``（``_flux_table_for_
+        grouping`` 的 ``total_particle_count``／``fraction_*`` 欄），本函式只是把
+        同一份計數換算成人類容易一眼讀懂的中文欄名摘要表，不重新定義任何分母或
+        分類。不需要 ``boundary_geometries`` 就能輸出（只依賴 ``final_status``），
+        因此在 ``finalize`` 中無條件呼叫。
+        """
+
+        table = _flux_table_for_grouping(
+            self._identity_table.study_site_id, "study_site_id", self._final_status
+        )
+        rows = table.to_pylist()
+        summary_rows: list[dict[str, Any]] = []
+        for row in rows:
+            summary_rows.append(
+                {
+                    "study_site_id": row["study_site_id"],
+                    "total_particle_count": row["total_particle_count"],
+                    "fraction_crossed_interest_region_boundary": row["fraction_crossed"],
+                    "fraction_max_backtrack": row[f"fraction_status_{NATIVE_STATUS_MAX_BACKTRACK}"],
+                    "fraction_stranded": row[f"fraction_status_{NATIVE_STATUS_STRANDED}"],
+                    "fraction_deposited": row[f"fraction_status_{NATIVE_STATUS_DEPOSITED}"],
+                    "fraction_forcing_missing": row[f"fraction_status_{NATIVE_STATUS_FORCING_MISSING}"],
+                    "fraction_numerical_failure": row[f"fraction_status_{NATIVE_STATUS_NUMERICAL_FAILURE}"],
+                    "fraction_pre_window_deposition": (
+                        row[f"fraction_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"]
+                    ),
+                }
+            )
+        if summary_rows:
+            summary_table = pa.Table.from_pylist(summary_rows)
+        else:
+            fields = [
+                pa.field("study_site_id", pa.string()),
+                pa.field("total_particle_count", pa.int64()),
+                pa.field("fraction_crossed_interest_region_boundary", pa.float64()),
+                pa.field("fraction_max_backtrack", pa.float64()),
+                pa.field("fraction_stranded", pa.float64()),
+                pa.field("fraction_deposited", pa.float64()),
+                pa.field("fraction_forcing_missing", pa.float64()),
+                pa.field("fraction_numerical_failure", pa.float64()),
+                pa.field("fraction_pre_window_deposition", pa.float64()),
+            ]
+            summary_table = pa.table(
+                {f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields)
+            )
+        _write_table_with_csv(summary_table, self._output_dir, "boundary_summary_by_site")
 
     def _write_kde_products(self) -> dict[str, dict[str, Any]]:
         """對兩種分組（各站；各站×沉降速度）建立條件式來源足跡並寫成 Parquet。

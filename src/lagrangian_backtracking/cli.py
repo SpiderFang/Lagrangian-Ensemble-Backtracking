@@ -1741,6 +1741,27 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trajectory-sample-seed", type=int, default=0)
     parser.add_argument("--kde-grid-cell-count", type=int, default=64)
     parser.add_argument("--kde-minimum-point-count", type=int, default=30)
+    parser.add_argument(
+        "--azimuth-sector-count",
+        type=int,
+        default=native_postprocess.DEFAULT_AZIMUTH_SECTOR_COUNT,
+        help=(
+            "WP-20：只在 --with-boundary-segments 時生效。以站受體位置中心為原點，"
+            "依離開點方位角把每站的開放邊界穿越點再細分成幾個等角扇區（預設 16 個，"
+            "每 22.5 度，由正北順時針；等於 16 時扇區名稱套用標準羅盤方位，否則退回"
+            "sector_NNN 數字命名），輸出 boundary_entry_by_site_azimuth_sector.*"
+        ),
+    )
+    parser.add_argument(
+        "--boundary-arc-segment-count",
+        type=int,
+        default=native_postprocess.DEFAULT_BOUNDARY_ARC_SEGMENT_COUNT,
+        help=(
+            "WP-20：只在 --with-boundary-segments 時生效。把每站已判定所屬的開放邊界"
+            "折線依弧長等分成幾段（預設 20 段），統計各段的相對來源權重，輸出"
+            "boundary_entry_by_site_arc_segment.*"
+        ),
+    )
     return parser
 
 
@@ -1810,6 +1831,8 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         trajectory_sample_seed=args.trajectory_sample_seed,
         kde_grid_cell_count=args.kde_grid_cell_count,
         kde_minimum_point_count=args.kde_minimum_point_count,
+        azimuth_sector_count=args.azimuth_sector_count,
+        boundary_arc_segment_count=args.boundary_arc_segment_count,
     )
     accumulator = native_postprocess.PostprocessAccumulator(
         identity_table,

@@ -817,3 +817,71 @@ uv run lbt native-derive-horizon \
 總和與粒子總數不符而失敗），確保「未離開（回溯達上限）」「沉底」「pre-window」等各類別
 的比例都能在同一張表的 `total_particle_count` 分母下正確呈現，且 pre-window 不貢獻任何
 穿越分子。所有表同時輸出 Parquet（正式資料契約）與 CSV（人可讀）兩種格式。
+
+## 9.13 WP-20：開放邊界再細分（方位扇區／沿邊界弧長位置）與每站總表
+
+### 9.13.1 背景
+
+主代理在伺服器上對 50,000 顆正式結果跑 `native-postprocess --with-boundary-segments`
+後發現：每站的開放邊界目前只登錄「一段」（例如 `gongliao_local_open_boundary`），因此
+9.12.6 節輸出的 `boundary_entry_by_site.csv` 每站永遠只有一列、相對來源權重恆為 1，
+答不出「粒子從這條邊界的哪個方向／哪一段進入」。WP-20 在 9.12.6 節既有的
+`postprocess.classify_boundary_segment`（判定離開點最靠近哪一**條**開放邊界線）之上，
+新增兩種**互相獨立**的細分方式，把同一條線再切得更細。
+
+### 9.13.2 兩種細分方式
+
+1. **方位扇區**（`postprocess.classify_azimuth_sector`）：以該站「受體位置中心」
+   （該站全部相異 `receptor_id` 各自 `x0_m`／`y0_m` 的算術平均，不依粒子數加權）
+   為原點，依離開點的方位角（正北 0 度，順時針）分成 `--azimuth-sector-count`
+   個等角扇區（預設 16 個、每 22.5 度，等於 16 時套用標準羅盤方位名稱 N、NNE…，
+   其餘扇區數退回 `sector_NNN` 數字命名）。
+2. **沿邊界弧長位置**（`postprocess.classify_boundary_arc_position`）：把離開點已經
+   判定所屬的那一條開放邊界折線，依其自身弧長（`shapely` 的 `.length`／
+   `.project()`／`.interpolate()`）等分成 `--boundary-arc-segment-count` 段（預設
+   20 段），再把離開點投影到線上的弧長位置歸入對應分段。
+
+兩種方式都只細分「已經確定成功穿越關注區域邊界」的離開點，不重算穿越判定本身，也
+沿用 9.12.6 節 `classify_boundary_segment` 已知的近似與限制（離開座標是子步結束後的
+原始位置，不是精確邊界交點）。方位扇區的「代表座標」（`representative_x_m`／`_y_m`／
+`_lon_deg`／`_lat_deg`）是為了繪圖方便而人工建構的點（沿扇區中心方位角、從站中心量測
+「到最近開放邊界線的距離」這個固定半徑），**不代表任何實際粒子位置**。
+
+### 9.13.3 CLI 與輸出
+
+```bash
+uv run lbt native-postprocess \
+  --results-dir <results 目錄> \
+  --identity-table <identity_table.npz> \
+  --output <輸出目錄> \
+  --config <正式設定 YAML> \
+  --with-boundary-segments \
+  --azimuth-sector-count 16 \
+  --boundary-arc-segment-count 20 \
+  --formal
+```
+
+`--azimuth-sector-count`／`--boundary-arc-segment-count` 只在 `--with-boundary-segments`
+時生效，省略時分別用預設值 16／20。新增輸出（全部同時寫 Parquet 與 CSV）：
+
+- `boundary_entry_by_site_azimuth_sector.*`／
+  `boundary_entry_by_site_settling_velocity_azimuth_sector.*`：各站（或各站×沉降速度）
+  內各方位扇區的穿越粒子數與組內相對來源權重。
+- `boundary_entry_by_site_arc_segment.*`／
+  `boundary_entry_by_site_settling_velocity_arc_segment.*`：同上，分組鍵是「所屬開放
+  邊界線＋沿線弧段編號」。
+- `boundary_sectors_geometry_by_site.*`／`boundary_arc_segments_geometry_by_site.*`：
+  每站分段的純幾何描述（供繪圖，與是否有粒子穿越無關，只要站有邊界幾何就會輸出全部
+  分段）。
+- `departures.parquet` 新增 5 欄：`departure_azimuth_deg`／
+  `departure_azimuth_sector_index`／`departure_azimuth_sector_name`／
+  `boundary_arc_segment_index`／`boundary_arc_length_position_m`，只在該列成功穿越
+  邊界且提供邊界幾何時才有值，其餘一律明確 `null`。
+- `boundary_summary_by_site.*`：每站一列的總表，把既有 `boundary_flux_by_site`
+  （9.12.6 節之前既有）的計數換算成人類可讀的比例欄位（穿越、回溯達上限、擱淺、
+  沉底、流場缺值、數值失敗、pre-window 各自比例），分母沿用 `boundary_flux_by_site`
+  的 `total_particle_count` 定義，不另立新分母。**不需要** `--with-boundary-segments`
+  就會輸出（只依賴 `final_status`，與是否提供邊界幾何無關）。
+
+依 AGENTS.md 用語，以上全部統計一律稱「相對來源權重」，不稱絕對來源機率或因果歸因。
+無穿越粒子落入某個分組時，統計表輸出明確定義 schema 的空表，不拋例外。

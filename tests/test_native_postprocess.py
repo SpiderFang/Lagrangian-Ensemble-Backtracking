@@ -15,6 +15,7 @@ from __future__ import annotations
 import resource
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -34,6 +35,7 @@ from lagrangian_backtracking.native_runner.backward_driver import (
 )
 from lagrangian_backtracking.native_runner.particle_input import ParticleIdentityTable
 from lagrangian_backtracking.native_runner.postprocess import (
+    COMPASS_16_SECTOR_NAMES,
     KDE_STATUS_AVAILABLE,
     KDE_STATUS_COLLINEAR_POINTS,
     KDE_STATUS_INSUFFICIENT_POINTS,
@@ -61,28 +63,42 @@ def _make_identity_table(
     settling_velocity_mps: list[float],
     arrival_time_utc_ns: list[int],
     z0_m: list[float] | None = None,
+    x0_m: list[float] | None = None,
+    y0_m: list[float] | None = None,
+    receptor_id: list[str] | None = None,
     experiment_case_id: str = "case-001",
     master_seed: int = 42,
 ) -> ParticleIdentityTable:
-    """建立測試用的合成粒子身分表，欄位語意與 particle_input.py 完全一致。"""
+    """建立測試用的合成粒子身分表，欄位語意與 particle_input.py 完全一致。
+
+    ``x0_m``／``y0_m``（逆向追蹤起點，即受體位置的公尺座標）預設全零，與 WP-17
+    之前既有測試的行為完全相同；WP-20 的方位扇區測試需要指定非零受體位置作為
+    「站受體位置中心」，因此新增這兩個可選覆寫參數，不影響既有呼叫端。
+    """
 
     n = len(particle_ids)
     if z0_m is None:
         z0_m = [-1.0] * n
+    if x0_m is None:
+        x0_m = [0.0] * n
+    if y0_m is None:
+        y0_m = [0.0] * n
+    if receptor_id is None:
+        receptor_id = [f"recv-{i % 5}" for i in range(n)]
     return ParticleIdentityTable(
         particle_id=np.asarray(particle_ids, dtype="<U64"),
         scenario_id=np.asarray([f"scn-{i}" for i in range(n)], dtype="<U64"),
         member_id=np.zeros(n, dtype=np.int32),
         study_site_id=np.asarray(study_site_id, dtype="<U64"),
         analysis_region_id=np.asarray(["region-a"] * n, dtype="<U64"),
-        receptor_id=np.asarray([f"recv-{i % 5}" for i in range(n)], dtype="<U64"),
+        receptor_id=np.asarray(receptor_id, dtype="<U64"),
         material_id=np.asarray(["microplastic"] * n, dtype="<U64"),
         arrival_time_id=np.asarray([f"arrival-{i}" for i in range(n)], dtype="<U64"),
         settling_velocity_mps=np.asarray(settling_velocity_mps, dtype=np.float64),
         arrival_time_utc_ns=np.asarray(arrival_time_utc_ns, dtype=np.int64),
         seed_hex=np.asarray([f"{i:032x}" for i in range(n)], dtype="<U32"),
-        x0_m=np.zeros(n, dtype=np.float64),
-        y0_m=np.zeros(n, dtype=np.float64),
+        x0_m=np.asarray(x0_m, dtype=np.float64),
+        y0_m=np.asarray(y0_m, dtype=np.float64),
         z0_m=np.asarray(z0_m, dtype=np.float64),
         experiment_case_id=experiment_case_id,
         master_seed=master_seed,
@@ -913,3 +929,267 @@ def test_pre_window_deposition_status_counted_separately_in_flux_tables(tmp_path
     assert row[f"count_status_{NATIVE_STATUS_MAX_BACKTRACK}"] == 1
     assert row[f"count_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"] == 2
     assert row[f"fraction_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"] == pytest.approx(0.5)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-20：開放邊界再細分（方位扇區／沿邊界弧長位置）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_classify_azimuth_sector_known_directions() -> None:
+    from lagrangian_backtracking.native_runner.postprocess import classify_azimuth_sector
+
+    # 正北：方位角 0 度，落在扇區 0（N）。
+    index, azimuth, name = classify_azimuth_sector(0.0, 100.0, 0.0, 0.0, sector_count=16)
+    assert (index, name) == (0, "N")
+    assert azimuth == pytest.approx(0.0)
+
+    # 正東：方位角 90 度，落在扇區 4（E）。
+    index, azimuth, name = classify_azimuth_sector(100.0, 0.0, 0.0, 0.0, sector_count=16)
+    assert (index, name) == (4, "E")
+    assert azimuth == pytest.approx(90.0)
+
+    # 正南：方位角 180 度，落在扇區 8（S）。
+    index, azimuth, name = classify_azimuth_sector(0.0, -100.0, 0.0, 0.0, sector_count=16)
+    assert (index, name) == (8, "S")
+    assert azimuth == pytest.approx(180.0)
+
+    # 正西：方位角 270 度，落在扇區 12（W）。
+    index, azimuth, name = classify_azimuth_sector(-100.0, 0.0, 0.0, 0.0, sector_count=16)
+    assert (index, name) == (12, "W")
+    assert azimuth == pytest.approx(270.0)
+
+    # 待分類點與中心點重合（零向量），定義為方位角 0 度、扇區 0，不拋例外。
+    index, azimuth, name = classify_azimuth_sector(5.0, 5.0, 5.0, 5.0, sector_count=16)
+    assert (index, azimuth) == (0, 0.0)
+
+    # 非 16 的扇區數：退回明確的數字命名，不套用羅盤方位名稱。
+    index, azimuth, name = classify_azimuth_sector(100.0, 0.0, 0.0, 0.0, sector_count=8)
+    assert name == "sector_002"
+
+    with pytest.raises(PostprocessError):
+        classify_azimuth_sector(0.0, 0.0, 0.0, 0.0, sector_count=0)
+
+
+def test_classify_boundary_arc_position_known_points() -> None:
+    from lagrangian_backtracking.native_runner.postprocess import classify_boundary_arc_position
+
+    geometry = _make_boundary_geometry("siteA")
+    # own_local_open_boundary：(100,-100) -> (100,100)，長度 200，預設 20 段（每段 10 m）。
+
+    # 線中點（s=100）應落在第 10 段。
+    result = classify_boundary_arc_position(
+        100.0, 0.0, "siteA_local_open_boundary", geometry, arc_segment_count=20
+    )
+    assert result is not None
+    index, s_m, length_m = result
+    assert length_m == pytest.approx(200.0)
+    assert s_m == pytest.approx(100.0)
+    assert index == 10
+
+    # 起點（s=0）落在第 0 段。
+    index, s_m, _length_m = classify_boundary_arc_position(
+        100.0, -100.0, "siteA_local_open_boundary", geometry, arc_segment_count=20
+    )
+    assert (index, s_m) == (0, pytest.approx(0.0))
+
+    # 終點（s=length）必須落在最後一段（index = K-1），不能因浮點誤差溢出成 K。
+    index, s_m, _length_m = classify_boundary_arc_position(
+        100.0, 100.0, "siteA_local_open_boundary", geometry, arc_segment_count=20
+    )
+    assert (index, s_m) == (19, pytest.approx(200.0))
+
+    # 不是這個 geometry 已知的任何一個開放邊界 segment id：沒有對應線，回傳 None。
+    assert (
+        classify_boundary_arc_position(100.0, 0.0, "unknown_segment", geometry, arc_segment_count=20)
+        is None
+    )
+
+    with pytest.raises(PostprocessError):
+        classify_boundary_arc_position(
+            100.0, 0.0, "siteA_local_open_boundary", geometry, arc_segment_count=0
+        )
+
+
+def test_boundary_subdivision_tables_and_departure_columns(tmp_path) -> None:
+    """完整走一次 accumulator：驗證方位扇區／弧段分類、departures 新欄位、
+    統計表組內相對來源權重加總為 1、幾何表内容正確。
+    """
+
+    n = 3
+    identity = _make_identity_table(
+        particle_ids=[f"p{i}" for i in range(n)],
+        study_site_id=["siteA"] * n,
+        settling_velocity_mps=[-0.001] * n,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * n,
+        # 受體位置全部在原點，與 _make_boundary_geometry 的兩條開放邊界線中心一致。
+        x0_m=[0.0] * n,
+        y0_m=[0.0] * n,
+        receptor_id=["recvX"] * n,  # 同一個受體，中心就是 (0, 0)。
+    )
+    result = _make_result(
+        rows=[0, 1, 2],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION] * n,
+        # 兩顆落在 own_local_open_boundary（正東方向），一顆落在 flow_open_boundary。
+        final_x_m=[100.0, 100.0, 480.0],
+        final_y_m=[0.0, 10.0, 0.0],
+    )
+    accumulator = PostprocessAccumulator(
+        identity,
+        output_dir=tmp_path,
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA")},
+    )
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+    assert manifest.config["boundary_subdivision_available"] is True
+    assert manifest.config["azimuth_sector_count"] == 16
+    assert manifest.config["boundary_arc_segment_count"] == 20
+
+    departures = pq.read_table(tmp_path / "departures.parquet").to_pylist()
+    by_row = {row["row_particle_index"]: row for row in departures}
+    assert by_row[0]["departure_azimuth_deg"] == pytest.approx(90.0)
+    assert by_row[0]["departure_azimuth_sector_name"] == "E"
+    assert by_row[0]["boundary_arc_segment_index"] == 10
+    assert by_row[0]["boundary_arc_length_position_m"] == pytest.approx(100.0)
+    assert by_row[2]["departure_azimuth_deg"] == pytest.approx(90.0)
+    assert by_row[2]["boundary_arc_segment_index"] == 10  # flow line 的 s=500 -> 第 10 段（每段 50 m）
+
+    sector_table = pq.read_table(tmp_path / "boundary_entry_by_site_azimuth_sector.parquet").to_pylist()
+    total_sector_count = sum(row["crossed_count"] for row in sector_table)
+    assert total_sector_count == n
+    weight_sum = sum(row["relative_source_weight_within_group"] for row in sector_table)
+    assert weight_sum == pytest.approx(1.0)
+    # p0 (100,0) 與 p2 (480,0) 方位角恰好 90 度（正東，E）；p1 (100,10) 方位角約
+    # 84.29 度，落在下一個扇區（ENE），因此 E 扇區只累積 2 顆。
+    e_sector_rows = [row for row in sector_table if row["sector_name"] == "E"]
+    assert len(e_sector_rows) == 1
+    assert e_sector_rows[0]["crossed_count"] == 2
+
+    arc_table = pq.read_table(tmp_path / "boundary_entry_by_site_arc_segment.parquet").to_pylist()
+    assert sum(row["crossed_count"] for row in arc_table) == n
+    arc_weight_sum = sum(row["relative_source_weight_within_group"] for row in arc_table)
+    assert arc_weight_sum == pytest.approx(1.0)
+    own_local_rows = [
+        row for row in arc_table if row["base_boundary_segment_id"] == "siteA_local_open_boundary"
+    ]
+    assert sum(row["crossed_count"] for row in own_local_rows) == 2
+    flow_rows = [row for row in arc_table if row["base_boundary_segment_id"] == "flow_open_boundary"]
+    assert sum(row["crossed_count"] for row in flow_rows) == 1
+
+    sector_geometry = pq.read_table(tmp_path / "boundary_sectors_geometry_by_site.parquet").to_pylist()
+    assert len(sector_geometry) == 16  # 每站固定輸出全部扇區的幾何，不管有沒有粒子穿越
+    assert {row["sector_name"] for row in sector_geometry} == set(COMPASS_16_SECTOR_NAMES)
+
+    arc_geometry = pq.read_table(tmp_path / "boundary_arc_segments_geometry_by_site.parquet").to_pylist()
+    # 兩條開放邊界線各 20 段。
+    assert len(arc_geometry) == 40
+    own_local_geom_rows = [
+        row for row in arc_geometry if row["base_boundary_segment_id"] == "siteA_local_open_boundary"
+    ]
+    assert len(own_local_geom_rows) == 20
+    first_segment = next(row for row in own_local_geom_rows if row["arc_segment_index"] == 0)
+    assert first_segment["start_s_m"] == pytest.approx(0.0)
+    assert first_segment["end_s_m"] == pytest.approx(10.0)
+    assert first_segment["start_x_m"] == pytest.approx(100.0)
+    assert first_segment["start_y_m"] == pytest.approx(-100.0)
+
+    for csv_name in (
+        "boundary_entry_by_site_azimuth_sector.csv",
+        "boundary_entry_by_site_settling_velocity_azimuth_sector.csv",
+        "boundary_entry_by_site_arc_segment.csv",
+        "boundary_entry_by_site_settling_velocity_arc_segment.csv",
+        "boundary_sectors_geometry_by_site.csv",
+        "boundary_arc_segments_geometry_by_site.csv",
+        "boundary_summary_by_site.csv",
+    ):
+        assert (tmp_path / csv_name).is_file()
+
+
+def test_boundary_subdivision_empty_group_outputs_empty_table_not_error(tmp_path) -> None:
+    """全部粒子都未穿越邊界時，方位扇區／弧段統計表必須是空表而不是拋例外，
+    但幾何表（不依賴有無穿越粒子）仍應完整輸出。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0", "p1"],
+        study_site_id=["siteA", "siteA"],
+        settling_velocity_mps=[-0.001] * 2,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 2,
+    )
+    result = _make_result(
+        rows=[0, 1],
+        final_status=[NATIVE_STATUS_MAX_BACKTRACK, NATIVE_STATUS_STRANDED],
+    )
+    accumulator = PostprocessAccumulator(
+        identity,
+        output_dir=tmp_path,
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA")},
+    )
+    accumulator.add_batch("batch-0", result)
+    accumulator.finalize()
+
+    sector_table = pq.read_table(tmp_path / "boundary_entry_by_site_azimuth_sector.parquet")
+    assert sector_table.num_rows == 0
+    assert set(sector_table.schema.names) >= {
+        "study_site_id", "sector_index", "sector_name", "crossed_count",
+        "relative_source_weight_within_group",
+    }
+
+    arc_table = pq.read_table(tmp_path / "boundary_entry_by_site_arc_segment.parquet")
+    assert arc_table.num_rows == 0
+
+    velocity_sector_table = pq.read_table(
+        tmp_path / "boundary_entry_by_site_settling_velocity_azimuth_sector.parquet"
+    )
+    assert velocity_sector_table.num_rows == 0
+    assert velocity_sector_table.schema.field("settling_velocity_mps").type == pa.float64()
+
+    # 幾何表不受「有沒有穿越粒子」影響，只要站有邊界幾何就完整輸出。
+    sector_geometry = pq.read_table(tmp_path / "boundary_sectors_geometry_by_site.parquet")
+    assert sector_geometry.num_rows == 16
+    arc_geometry = pq.read_table(tmp_path / "boundary_arc_segments_geometry_by_site.parquet")
+    assert arc_geometry.num_rows == 40
+
+
+def test_boundary_summary_by_site_matches_flux_definition(tmp_path) -> None:
+    """``boundary_summary_by_site`` 的比例欄位必須與既有 ``boundary_flux_by_site``
+    的計數換算結果完全一致（同一分母），且不需要 boundary_geometries 就會輸出。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=[f"p{i}" for i in range(4)],
+        study_site_id=["A", "A", "A", "A"],
+        settling_velocity_mps=[-0.001] * 4,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 4,
+    )
+    statuses = [
+        NATIVE_STATUS_LEFT_INTEREST_REGION,
+        NATIVE_STATUS_MAX_BACKTRACK,
+        NATIVE_STATUS_STRANDED,
+        NATIVE_STATUS_DEPOSITED,
+    ]
+    result = _make_result(rows=list(range(4)), final_status=statuses)
+
+    accumulator = PostprocessAccumulator(identity, output_dir=tmp_path, config=PostprocessConfig())
+    accumulator.add_batch("batch-0", result)
+    accumulator.finalize()
+
+    assert (tmp_path / "boundary_summary_by_site.parquet").is_file()
+    assert (tmp_path / "boundary_summary_by_site.csv").is_file()
+
+    flux_row = pq.read_table(tmp_path / "boundary_flux_by_site.parquet").to_pylist()[0]
+    summary_row = pq.read_table(tmp_path / "boundary_summary_by_site.parquet").to_pylist()[0]
+
+    assert summary_row["total_particle_count"] == flux_row["total_particle_count"] == 4
+    assert summary_row["fraction_crossed_interest_region_boundary"] == pytest.approx(
+        flux_row["fraction_crossed"]
+    )
+    assert summary_row["fraction_max_backtrack"] == pytest.approx(
+        flux_row[f"fraction_status_{NATIVE_STATUS_MAX_BACKTRACK}"]
+    )
+    assert summary_row["fraction_stranded"] == pytest.approx(
+        flux_row[f"fraction_status_{NATIVE_STATUS_STRANDED}"]
+    )
+    assert summary_row["fraction_deposited"] == pytest.approx(
+        flux_row[f"fraction_status_{NATIVE_STATUS_DEPOSITED}"]
+    )
