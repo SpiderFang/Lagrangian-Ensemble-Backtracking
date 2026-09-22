@@ -88,6 +88,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool as _BrokenProcessPool
 from dataclasses import asdict, dataclass
+from dataclasses import replace as _dataclass_replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,10 @@ import numpy as np
 
 from ..arrival_times import ArrivalTime, select_arrival_times
 from ..provenance import CodeProvenance, collect_code_provenance
+from .backtrack_horizon import (
+    BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
+    resolve_unit_backtrack_horizon,
+)
 from .forcing_bridge import ForcingGapInventoryReport
 from .particle_input import BatchGroup, ParticleIdentityTable, validate_batch_partition
 
@@ -183,6 +188,19 @@ class NativeWorkUnit:
     settling_velocity_mps: float
     particle_row_indices: np.ndarray
     input_hash: str
+    # WP-17：回溯模式明確化（見 ``backtrack_horizon.py``）。``resolved_max_backtrack_
+    # seconds=None`` 是刻意的向後相容預設值——沿用「不知道回溯模式」的舊呼叫端（例如
+    # 尚未更新的測試或工具直接建構 ``NativeWorkUnit``）時，``build_hour_major_domain_
+    # batch`` 會退回讀取 ``HourMajorConfig.max_backtrack_seconds``（即 WP-17 之前對
+    # 全部單元一律套用同一個 H 的行為），不會因為新增這兩個欄位而改變既有結果。
+    # ``pre_window_deposition=True`` 只應該由 ``lbt native-plan`` 在使用者明確要求
+    # ``fixed_calendar_window`` 且該到達時刻的沉底年齡 ≥ H 時設定；為 True 時這個
+    # 單元完全不會被送進 ``run_flow_domain_hour_major``（見 ``hour_major_provider.
+    # _run_unit_entrypoint``），改用 ``backward_driver.build_pre_window_deposition_
+    # result`` 直接組出結果。
+    resolved_max_backtrack_seconds: float | None = None
+    pre_window_deposition: bool = False
+    bed_residence_age_hours: int | None = None
 
     def __post_init__(self) -> None:
         indices = self.particle_row_indices
@@ -220,6 +238,9 @@ class NativeWorkUnit:
             settling_velocity_mps=float(self.settling_velocity_mps),
             particle_row_indices=self.particle_row_indices.copy(),
             input_hash=self.input_hash,
+            resolved_max_backtrack_seconds=self.resolved_max_backtrack_seconds,
+            pre_window_deposition=self.pre_window_deposition,
+            bed_residence_age_hours=self.bed_residence_age_hours,
         )
 
 
@@ -240,6 +261,9 @@ class NativeWorkUnitSpec:
     settling_velocity_mps: float
     particle_row_indices: np.ndarray
     input_hash: str
+    resolved_max_backtrack_seconds: float | None = None
+    pre_window_deposition: bool = False
+    bed_residence_age_hours: int | None = None
 
 
 def _split_indices_by_columns(
@@ -369,6 +393,87 @@ def _validate_units_cover_table(table: ParticleIdentityTable, units: Sequence[Na
 
     groups = [BatchGroup(key=((("unit_id", u.unit_id),)), indices=u.particle_row_indices) for u in units]
     validate_batch_partition(table, groups)
+
+
+def resolve_native_work_unit_backtrack_horizons(
+    units: Sequence[NativeWorkUnit],
+    *,
+    backtrack_mode: str,
+    requested_horizon_days: float,
+    arrivals_by_time_utc_ns: Mapping[int, ArrivalTime] | None = None,
+    maximum_age_days: int | None = None,
+    sampling_seed: int | None = None,
+) -> tuple[NativeWorkUnit, ...]:
+    """WP-17：把每個工作單元的有效回溯時間、pre-window 判定寫進 ``NativeWorkUnit``。
+
+    每個工作單元只對應**一個**到達時刻（``arrival_time_utc_ns``，見 ``plan_native_
+    work_units`` 的分組鍵值），而沉底年齡是到達時刻的屬性，因此「有效回溯時間」是
+    per-arrival（等價於 per-unit），不需要真正的 per-particle 計算——同一個到達
+    時刻底下不論多少顆粒子、多少個工作單元（不同沉降速度會拆成不同單元），都共用
+    同一個 ``bed_residence.resolve_bed_residence_timing`` 結果，本函式按
+    ``arrival_time_utc_ns`` 快取，只呼叫一次。
+
+    ``full_horizon_from_deposition``（預設）刻意**不**把 H 烤進
+    ``unit.resolved_max_backtrack_seconds``（維持 ``None``／``-1`` sentinel）：這個
+    模式對全部單元套用同一個 H，與 WP-17 之前「完全不知道回溯模式、一律讀
+    ``config.boundaries.max_backtrack_days``」的現行行為在數值上等價，因此不需要、
+    也不應該由 native-plan 另外決定一個獨立數值——``native-plan --max-backtrack-days``
+    歷來只是缺口檢查窗口的估計值（見 ``run_native_plan_command`` 既有用途），與
+    ``native-run`` 實際讀取的 ``LBT_NATIVE_CONFIG`` 是不同來源；若在這裡把它烤進
+    ``resolved_max_backtrack_seconds``，兩個來源不一致時（例如測試用小型
+    ``HourMajorConfig`` 但 native-plan 用預設 30 天）會讓 plan 端的值靜默覆蓋掉
+    run-time 設定的真正值。``full_horizon_from_deposition`` 的 ``ResolvedUnitHorizon.
+    effective_horizon_seconds`` 仍然算出來、寫進計畫檔／結果摘要供人核對，只是不
+    用來覆寫 ``NativeWorkUnit.resolved_max_backtrack_seconds``。
+
+    ``fixed_calendar_window`` 則不同：有效回溯時間本來就是逐到達時刻各自不同
+    （``H - age``），沒有「run-time 設定裡已經有的單一值」可以退回，因此必須提供
+    ``arrivals_by_time_utc_ns``（每個到達時刻對應的 ``ArrivalTime``，含完整沉底
+    metadata）、``maximum_age_days`` 與 ``sampling_seed``，並把解析結果**明確寫入**
+    ``unit.resolved_max_backtrack_seconds``／``pre_window_deposition``；缺少對應到達
+    時刻的 metadata 時 fail closed（不臆測年齡）。
+
+    回傳新的 ``NativeWorkUnit`` tuple（原物件不可變，這裡一律回傳 ``dataclasses.
+    replace`` 產生的新實例），保留原本的排序與其餘欄位。
+    """
+
+    cache: dict[int, Any] = {}
+    output: list[NativeWorkUnit] = []
+    for unit in units:
+        arrival_utc = int(unit.arrival_time_utc_ns)
+        if arrival_utc not in cache:
+            arrival = (
+                arrivals_by_time_utc_ns.get(arrival_utc)
+                if arrivals_by_time_utc_ns is not None
+                else None
+            )
+            if arrival is None and arrivals_by_time_utc_ns is not None:
+                raise NativeOrchestratorError(
+                    f"到達時刻 {arrival_utc} 沒有對應的 ArrivalTime metadata，"
+                    "無法在 fixed_calendar_window 模式下解析有效回溯時間"
+                )
+            cache[arrival_utc] = resolve_unit_backtrack_horizon(
+                backtrack_mode=backtrack_mode,
+                requested_horizon_days=requested_horizon_days,
+                arrival=arrival,
+                maximum_age_days=maximum_age_days,
+                sampling_seed=sampling_seed,
+            )
+        resolved = cache[arrival_utc]
+        unit_resolved_max_backtrack_seconds = (
+            resolved.effective_horizon_seconds
+            if backtrack_mode == BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW
+            else None
+        )
+        output.append(
+            _dataclass_replace(
+                unit,
+                resolved_max_backtrack_seconds=unit_resolved_max_backtrack_seconds,
+                pre_window_deposition=resolved.pre_window_deposition,
+                bed_residence_age_hours=resolved.bed_residence_age_hours,
+            )
+        )
+    return tuple(output)
 
 
 _HOUR_MAJOR_DOMAIN_UNIT_PREFIX = "hourmajor::"
@@ -2258,10 +2363,15 @@ def _work_unit_to_record(unit: NativeWorkUnit) -> dict[str, Any]:
         "settling_velocity_mps": float(unit.settling_velocity_mps),
         "particle_row_indices": unit.particle_row_indices.tolist(),
         "input_hash": unit.input_hash,
+        "resolved_max_backtrack_seconds": unit.resolved_max_backtrack_seconds,
+        "pre_window_deposition": bool(unit.pre_window_deposition),
+        "bed_residence_age_hours": unit.bed_residence_age_hours,
     }
 
 
 def _work_unit_from_record(record: Mapping[str, Any]) -> NativeWorkUnit:
+    resolved_max_backtrack_seconds = record.get("resolved_max_backtrack_seconds")
+    bed_residence_age_hours = record.get("bed_residence_age_hours")
     return NativeWorkUnit(
         unit_id=str(record["unit_id"]),
         analysis_region_id=str(record["analysis_region_id"]),
@@ -2271,6 +2381,13 @@ def _work_unit_from_record(record: Mapping[str, Any]) -> NativeWorkUnit:
         settling_velocity_mps=float(record["settling_velocity_mps"]),
         particle_row_indices=np.asarray(record["particle_row_indices"], dtype=np.int64),
         input_hash=str(record["input_hash"]),
+        resolved_max_backtrack_seconds=(
+            None if resolved_max_backtrack_seconds is None else float(resolved_max_backtrack_seconds)
+        ),
+        pre_window_deposition=bool(record.get("pre_window_deposition", False)),
+        bed_residence_age_hours=(
+            None if bed_residence_age_hours is None else int(bed_residence_age_hours)
+        ),
     )
 
 
@@ -2282,6 +2399,7 @@ def write_native_plan_file(
     summary: NativeWorkPlanSummary,
     manifest: Mapping[str, Any] | None = None,
     hour_major_members: Mapping[str, Sequence[NativeWorkUnit]] | None = None,
+    backtrack_mode_declaration: Mapping[str, Any] | None = None,
 ) -> None:
     """把規劃結果（工作單元、缺口檢查、規模摘要、manifest）寫成單一 JSON 計畫檔。
 
@@ -2316,6 +2434,11 @@ def write_native_plan_file(
             domain_unit_id: [_work_unit_to_record(member) for member in members]
             for domain_unit_id, members in hour_major_members.items()
         }
+    if backtrack_mode_declaration is not None:
+        # WP-17：把「設定檔宣稱的模式」與「本次規劃實際採用的模式與 H」一起寫進計畫檔，
+        # 避免 native-run／native-postprocess 只看到摺疊後的工作單元、猜不出到底用了
+        # 哪個回溯模式（見 backtrack_horizon.py 模組文件）。
+        payload["backtrack_horizon"] = dict(backtrack_mode_declaration)
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(output_path, payload)

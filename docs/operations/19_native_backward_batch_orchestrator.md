@@ -710,3 +710,110 @@ test_prepared_grid_cache_matches_uncached_bit_identical`）。**已知限制**�
 （第 1-8 節的逐工作單元路徑）目前**沒有**接上 `smagorinsky_prepared_grid` 快取，只有
 `run_flow_domain_hour_major`（小時主軸路徑）接了；逐工作單元路徑仍然每次呼叫都即時計算
 （`prepared=None` 的預設行為），數值不受影響，只是少了這個小節省。
+
+## 9.12 WP-17：回溯模式明確化、免重跑截斷推導、邊界進入統計
+
+完整背景（PI 原話判讀、正式身分表現況查證、兩種模式的科學定義）見 `reports/WP-17.md`；
+本節只記錄對本文件既有 CLI／排程介面的新增。
+
+### 9.12.1 背景：native_runner 之前完全不知道自己在跑哪個回溯模式
+
+WP-17 之前，`native_runner`（第 1-11 節描述的全部路徑）對每個工作單元一律套用
+`config.boundaries.max_backtrack_days` 當作回溯上限，從沉底 UTC 起算——這在數值上等同
+`bed_residence.BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION`（從沉底日起完整回溯 H
+天），但完全沒有讀取正式設定檔的 `bed_residence_time.backtrack_mode` 欄位，即使該欄位寫的
+是 `fixed_calendar_window`（固定日曆終點往前回溯 H 天，有效期間 `H - 沉底年齡`）。也就是說
+運算結果本身符合 PI「必須從沉底日起算」的原始需求，但設定檔與運算行為的標示是錯的、無法
+稽核。WP-17 的任務 1 把這個「實際採用哪個模式」變成明確、fail-closed 的一等公民。
+
+### 9.12.2 `lbt native-plan` 新增旗標
+
+- `--backtrack-mode {full_horizon_from_deposition,fixed_calendar_window}`：省略時讀取
+  `LBT_NATIVE_BACKTRACK_MODE` 環境變數，兩者都省略時預設
+  `full_horizon_from_deposition`（見 `native_runner/backtrack_horizon.py` 模組文件對這個
+  預設值的判讀依據）。
+- `--acknowledge-config-mode-mismatch`：`--config` 指定的設定檔若啟用
+  `scenarios.bed_residence_time` 且其 `backtrack_mode` 與 `--backtrack-mode` 實際採用值
+  不同，預設 fail closed 拒絕規劃；必須明確加上這個旗標才會放行，且兩個模式（設定檔宣稱、
+  實際採用）都會寫進計畫檔 `backtrack_horizon` 欄位、每個結果摘要與後處理 manifest。
+- `--arrival-manifest`：`--backtrack-mode fixed_calendar_window` 時必須提供（含沉底
+  metadata 的 `arrival.json`），用來對每個到達時刻呼叫
+  `bed_residence.resolve_bed_residence_timing` 解出有效回溯時間與 pre-window 判定；
+  `full_horizon_from_deposition` 不需要這個檔案（不看年齡）。
+
+規劃階段由新函式 `orchestrator.resolve_native_work_unit_backtrack_horizons` 把每個
+`NativeWorkUnit` 依到達時刻（沉底年齡是到達時刻的屬性，同一到達時刻底下不同沉降速度的
+單元共用同一次 `resolve_bed_residence_timing` 呼叫、按到達時刻快取）標上
+`resolved_max_backtrack_seconds`（只有 `fixed_calendar_window` 才寫入逐單元數值；
+`full_horizon_from_deposition` 刻意留 `None`，退回讀取 run-time 設定本身的
+`config.boundaries.max_backtrack_days`，理由見該函式 docstring：避免 plan-time 估計值
+與 run-time 真正值不一致時互相覆蓋）與 `pre_window_deposition`。
+
+### 9.12.3 運算層：`fixed_calendar_window` 的逐列（非純量）回溯上限
+
+`hour_major.HourMajorSettlingGroupInput` 新增 `max_backtrack_ns` 逐列陣列（`-1` sentinel
+表示「這個粒子沒有明示值，退回 `config.max_backtrack_seconds`」）；`run_flow_domain_
+hour_major` 的回溯上限判定從「整個分組共用一個純量」改成逐列 `np.where(...)` 比較，讓
+同一分組（可能合併多個到達時刻）裡不同沉底年齡的粒子各自在自己的有效回溯時間停止。
+`pre_window_deposition=True` 的單元完全不會被送進 `build_hour_major_domain_batch`（送入
+會 fail-closed 拒絕）；這批粒子由 `hour_major_provider._run_unit_entrypoint` 直接呼叫
+`backward_driver.build_pre_window_deposition_result` 組出「零運算」結果（不定位初始元素、
+不查詢任何流場、`hours_run=0`），新狀態碼 `NATIVE_STATUS_PRE_WINDOW_DEPOSITION=7`。
+
+### 9.12.4 `lbt native-run`：env 驅動 + 計畫檔一致性核對
+
+`native-run` 的模式輸入延續既有「per-worker 環境變數」架構（第 7 節、
+`hour_major_provider.py` 模組文件的 `LBT_NATIVE_*` 清單），沒有獨立 CLI 旗標：新增
+`LBT_NATIVE_BACKTRACK_MODE`（同 `native-plan` 的 `--backtrack-mode` 語意）與
+`LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH`。`native-run` 本身**不重新規劃**工作單元
+（每個單元的有效回溯時間已在 `native-plan` 階段烤進計畫檔），因此這兩個環境變數只用來：
+
+1. 每個 worker 行程內（`hour_major_provider._resolve_params`）核對「設定檔宣稱模式」與
+   「本次執行環境變數」是否一致；
+2. `native-run` 主行程讀回計畫檔後，立即核對計畫檔的 `backtrack_horizon.effective_
+   backtrack_mode`（`native-plan` 當初實際採用的模式）與「本次執行環境變數」是否一致——
+   這是本次接手後新增的修正（原始 WIP 沒有這一步）：沒有它，用模式 A 規劃好的計畫檔搭配
+   模式 B 的執行環境變數不會改變任何計算結果（因為已經烤進計畫檔），但每個結果摘要的
+   `effective_backtrack_mode` provenance 標籤會貼錯，違反「不得默默執行」的要求。兩個檢查
+   都不一致時預設 fail closed，都重用 `backtrack_horizon.require_mode_acknowledged_if_
+   mismatched`，不重寫比對邏輯。沒有 `backtrack_horizon` 欄位的舊計畫檔（WP-17 之前產生）
+   不受第 2 項檢查影響。
+
+### 9.12.5 `lbt native-derive-horizon`：免重跑截斷推導（任務 2）
+
+由既有 `full_horizon_from_deposition` H_src 的結果目錄（`*.driver_result.npz`）截斷推導出
+較短 `(模式, H)`（H ≤ H_src）的結果，寫到新目錄，不修改來源檔、不重新執行任何流場運算。
+正確性論證：兩種模式都是從同一個沉底 UTC 起逆向逐小時計算，任一小時的移動只依賴「到那個
+時刻為止已經算出的狀態」，因此「以較短期間單獨重算」與「用較長期間算好之後在較早時刻截斷」
+對截斷之前的同一顆粒子必須給出完全相同的軌跡與終止狀態；`native_runner/horizon_derivation.py`
+模組文件有完整推導。`substep_policy="global_cfl"` 下位元相同（見
+`tests/test_native_horizon_derivation_directory.py`），正式路徑預設的 `"local_cfl"` 子步數
+依當下整批活動粒子決定，因此只保證統計等價，manifest 會明確記載這個差異性質。
+
+```bash
+uv run lbt native-derive-horizon \
+  --source-results-dir work/native-h30-full/results \
+  --source-backtrack-mode full_horizon_from_deposition \
+  --source-horizon-days 30 \
+  --target-backtrack-mode fixed_calendar_window \
+  --target-horizon-days 30 \
+  --config configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml \
+  --arrival-manifest work/horizon-suite/common-input/arrival.json \
+  --output work/native-h30-fixed-derived/results
+```
+
+### 9.12.6 `lbt native-postprocess --with-boundary-segments`：邊界進入相對來源權重（任務 3）
+
+新增 `--with-boundary-segments`（須同時提供 `--config`）：讀取
+`manifests.load_boundary_geometries` 取得的開放邊界幾何，把每個「成功穿越關注區域邊界」
+的離開點分類到最近的開放邊界分段（`postprocess.classify_boundary_segment`，方法是離開點
+到 `own_local_open_boundary`／`flow_open_boundary` 的最短直線距離，屬近似啟發式，非精確
+交點，理由與已知限制見該函式 docstring），輸出 `boundary_entry_by_site.{parquet,csv}`／
+`boundary_entry_by_site_settling_velocity.{parquet,csv}`（每個分段的穿越次數與站內／
+站×沉降速度內的「相對來源權重」，依 AGENTS.md 用語，不稱絕對機率）。既有
+`boundary_flux_by_*` 通量表同步補上 `NATIVE_STATUS_PRE_WINDOW_DEPOSITION` 分類（本次
+接手後新增的修正：WIP 原始版本的 `_NON_CROSSING_STATUS_CODES` 沒有列出這個新狀態碼，
+若 `fixed_calendar_window` 的結果含 pre-window 粒子，`finalize()` 會直接因為狀態計數
+總和與粒子總數不符而失敗），確保「未離開（回溯達上限）」「沉底」「pre-window」等各類別
+的比例都能在同一張表的 `total_particle_count` 分母下正確呈現，且 pre-window 不貢獻任何
+穿越分子。所有表同時輸出 Parquet（正式資料契約）與 CSV（人可讀）兩種格式。

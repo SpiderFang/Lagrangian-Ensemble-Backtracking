@@ -25,6 +25,7 @@ from lagrangian_backtracking.native_runner.backward_driver import (
     NATIVE_STATUS_LEFT_INTEREST_REGION,
     NATIVE_STATUS_MAX_BACKTRACK,
     NATIVE_STATUS_NUMERICAL_FAILURE,
+    NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
     NATIVE_STATUS_STRANDED,
     BackwardDriverResult,
     DepartureRecord,
@@ -741,3 +742,174 @@ def test_streaming_merge_scale_500000_particles_memory_and_time(tmp_path):
     assert set(kde_by_site) == set(sites.tolist())
     for row in kde_by_site.values():
         assert row["status"] == KDE_STATUS_AVAILABLE
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-17 任務 3：依開放邊界分段統計相對來源權重（boundary_geometries）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _make_boundary_geometry(site_id: str):
+    """建一個最小合法 ``BoundaryGeometry``：東側是開放水域線，其餘視為海岸線。"""
+
+    from shapely.geometry import LineString, box
+
+    from lagrangian_backtracking.boundaries import BoundaryGeometry
+
+    local = box(-100.0, -100.0, 100.0, 100.0)
+    return BoundaryGeometry(
+        own_local_domain=local,
+        flow_domain=box(-500.0, -500.0, 500.0, 500.0),
+        foreign_local_domains={},
+        own_local_open_boundary=LineString([(100.0, -100.0), (100.0, 100.0)]),
+        flow_open_boundary=LineString([(500.0, -500.0), (500.0, 500.0)]),
+        own_local_boundary_segment_id=f"{site_id}_local_open_boundary",
+        flow_boundary_segment_id="flow_open_boundary",
+    )
+
+
+def test_boundary_segment_classification_picks_nearest_open_line() -> None:
+    from lagrangian_backtracking.native_runner.postprocess import classify_boundary_segment
+
+    geometry = _make_boundary_geometry("siteA")
+    # 離開點就在 own_local_open_boundary 線上（東側），應該分類到本站 local 分段。
+    segment_id, distance_m = classify_boundary_segment(100.0, 0.0, geometry)
+    assert segment_id == "siteA_local_open_boundary"
+    assert distance_m == pytest.approx(0.0, abs=1.0e-9)
+
+    # 離開點離 flow_open_boundary（500 m 處）比較近。
+    segment_id, distance_m = classify_boundary_segment(480.0, 0.0, geometry)
+    assert segment_id == "flow_open_boundary"
+    assert distance_m == pytest.approx(20.0, abs=1.0e-9)
+
+
+def test_boundary_geometries_populate_departure_columns_and_entry_tables(tmp_path) -> None:
+    n = 4
+    identity = _make_identity_table(
+        particle_ids=[f"p{i}" for i in range(n)],
+        study_site_id=["siteA", "siteA", "siteA", "siteA"],
+        settling_velocity_mps=[-0.001, -0.001, -0.002, -0.002],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * n,
+    )
+    result = _make_result(
+        rows=[0, 1, 2, 3],
+        final_status=[
+            NATIVE_STATUS_LEFT_INTEREST_REGION,
+            NATIVE_STATUS_LEFT_INTEREST_REGION,
+            NATIVE_STATUS_LEFT_INTEREST_REGION,
+            NATIVE_STATUS_MAX_BACKTRACK,
+        ],
+        final_x_m=[100.0, 480.0, 100.0, 0.0],
+        final_y_m=[0.0, 0.0, 10.0, 0.0],
+    )
+    accumulator = PostprocessAccumulator(
+        identity,
+        output_dir=tmp_path,
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA")},
+    )
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+    assert manifest.config["boundary_segment_classification_available"] is True
+
+    departures = pq.read_table(tmp_path / "departures.parquet").to_pylist()
+    by_row = {row["row_particle_index"]: row for row in departures}
+    assert by_row[0]["boundary_segment_id"] == "siteA_local_open_boundary"
+    assert by_row[1]["boundary_segment_id"] == "flow_open_boundary"
+    assert by_row[2]["boundary_segment_id"] == "siteA_local_open_boundary"
+    # 未穿越邊界的粒子（達回溯上限）不分類，欄位維持 null。
+    assert by_row[3]["boundary_segment_id"] is None
+    assert by_row[3]["boundary_classification_distance_m"] is None
+
+    by_site = {
+        row["boundary_segment_id"]: row
+        for row in pq.read_table(tmp_path / "boundary_entry_by_site.parquet").to_pylist()
+    }
+    assert by_site["siteA_local_open_boundary"]["crossed_count"] == 2
+    assert by_site["flow_open_boundary"]["crossed_count"] == 1
+    assert by_site["siteA_local_open_boundary"]["relative_source_weight_within_group"] == pytest.approx(
+        2.0 / 3.0
+    )
+    assert by_site["flow_open_boundary"]["relative_source_weight_within_group"] == pytest.approx(1.0 / 3.0)
+
+    assert (tmp_path / "boundary_entry_by_site.csv").is_file()
+    assert (tmp_path / "boundary_flux_by_site.csv").is_file()
+
+
+def test_boundary_geometries_missing_site_fails_closed(tmp_path) -> None:
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteB"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(rows=[0], final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION])
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path, boundary_geometries={"siteA": _make_boundary_geometry("siteA")},
+    )
+    with pytest.raises(PostprocessError):
+        accumulator.add_batch("batch-0", result)
+
+
+def test_flux_tables_without_boundary_geometries_have_null_segment_columns(tmp_path) -> None:
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteA"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(rows=[0], final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION])
+    accumulator = PostprocessAccumulator(identity, output_dir=tmp_path)
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+    assert manifest.config["boundary_segment_classification_available"] is False
+    assert not (tmp_path / "boundary_entry_by_site.parquet").exists()
+    departures = pq.read_table(tmp_path / "departures.parquet").to_pylist()
+    assert departures[0]["boundary_segment_id"] is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-17 任務 1／3：pre_window_deposition 狀態必須能進入既有邊界通量統計，
+# 並在分母與各類別比例中正確、單獨計數（不得與資料缺口／數值失敗混為一談，
+# 也不得讓整個 finalize 因為未登錄的狀態碼而報「內部錯誤」）。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_pre_window_deposition_status_counted_separately_in_flux_tables(tmp_path) -> None:
+    """``NATIVE_STATUS_PRE_WINDOW_DEPOSITION`` 必須能被 finalize／通量表正確消化：
+
+    - 計入 ``status_counts`` 與每個通量分組的 ``total_particle_count`` 分母
+      （見 ``docs/operations/14...`` 第 3.1 節「pre-window 成員保留在固定的
+      total 情境／成員 outcome 分母並單獨計數」）；
+    - 不與 ``NATIVE_STATUS_MAX_BACKTRACK``／``NATIVE_STATUS_NUMERICAL_FAILURE``
+      等既有五種未穿越狀態合併成同一欄；
+    - 不進入穿越邊界分子（``count_crossed``）。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=[f"p{i}" for i in range(4)],
+        study_site_id=["A", "A", "A", "A"],
+        settling_velocity_mps=[-0.001] * 4,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 4,
+    )
+    statuses = [
+        NATIVE_STATUS_LEFT_INTEREST_REGION,
+        NATIVE_STATUS_MAX_BACKTRACK,
+        NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+        NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+    ]
+    result = _make_result(rows=list(range(4)), final_status=statuses)
+
+    accumulator = PostprocessAccumulator(identity, output_dir=tmp_path, config=PostprocessConfig())
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+
+    assert manifest.particle_count_total == 4
+    assert sum(manifest.status_counts.values()) == 4
+    assert manifest.status_counts[NATIVE_STATUS_PRE_WINDOW_DEPOSITION] == 2
+    assert manifest.status_counts[NATIVE_STATUS_LEFT_INTEREST_REGION] == 1
+    assert manifest.status_counts[NATIVE_STATUS_MAX_BACKTRACK] == 1
+
+    flux_by_site = pq.read_table(tmp_path / "boundary_flux_by_site.parquet").to_pylist()
+    assert len(flux_by_site) == 1
+    row = flux_by_site[0]
+    assert row["total_particle_count"] == 4
+    assert row["count_crossed"] == 1
+    assert row[f"count_status_{NATIVE_STATUS_MAX_BACKTRACK}"] == 1
+    assert row[f"count_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"] == 2
+    assert row[f"fraction_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"] == pytest.approx(0.5)

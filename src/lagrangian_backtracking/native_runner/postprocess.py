@@ -28,9 +28,14 @@
 科學語意（依 AGENTS.md 與工作書）
 ------------------------------------
 - 只有 ``NATIVE_STATUS_LEFT_INTEREST_REGION``（成功穿越關注區域邊界）的離開點
-  才會進入條件式來源足跡（式 (11)）的核密度估計；其餘五種終止原因（達回溯
-  上限、擱淺、沉底、流場缺值、數值失敗）是不同的資料狀態，一律分開列出人數與
-  比例，**不與穿越邊界的分母混在一起，也不以零值頂替**。
+  才會進入條件式來源足跡（式 (11)）的核密度估計；其餘六種終止原因（達回溯
+  上限、擱淺、沉底、流場缺值、數值失敗、固定日曆回溯窗之外的沉底
+  ``pre_window_deposition``，見 WP-17）是不同的資料狀態，一律分開列出人數與
+  比例，**不與穿越邊界的分母混在一起，也不以零值頂替**。``pre_window_deposition``
+  依 ``docs/operations/14_input_derivation_and_release_contract.md`` 第 3.1 節，
+  保留在固定的情境／成員 outcome 分母（即這裡的 ``total_particle_count``）內單獨
+  計數，但不貢獻任何來源足跡分子，語意上與「資料缺口」「數值失敗」平行、但
+  成因不同（不是運算失敗，是這顆粒子的沉底時刻本身就在本次固定日曆窗之外）。
 - 本模組產出的所有空間密度、機率與高密度區（HDR）一律稱為「條件式來源足跡」
   或「相對來源權重」，不得解讀為絕對來源機率或因果歸因（AGENTS.md、
   ``aggregation.binned_gaussian_kde_2d``／``conditional_kde_2d`` docstring 已有
@@ -128,10 +133,13 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
+from shapely.geometry import Point
 
 from .. import aggregation as aggregation_module
 from ..arrival_times import SEASON_BY_MONTH
+from ..boundaries import BoundaryGeometry
 from ..outputs import sha256_file
 from ..provenance import CodeProvenance, collect_code_provenance
 from .backward_driver import (
@@ -142,6 +150,7 @@ from .backward_driver import (
     NATIVE_STATUS_LEFT_INTEREST_REGION,
     NATIVE_STATUS_MAX_BACKTRACK,
     NATIVE_STATUS_NUMERICAL_FAILURE,
+    NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
     NATIVE_STATUS_STRANDED,
     BackwardDriverResult,
 )
@@ -162,6 +171,7 @@ __all__ = [
     "BatchRecord",
     "PostprocessManifest",
     "PostprocessAccumulator",
+    "classify_boundary_segment",
 ]
 
 
@@ -177,6 +187,7 @@ _NON_CROSSING_STATUS_CODES: tuple[int, ...] = (
     NATIVE_STATUS_DEPOSITED,
     NATIVE_STATUS_FORCING_MISSING,
     NATIVE_STATUS_NUMERICAL_FAILURE,
+    NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
 )
 
 NON_CROSSING_STATUS_CATEGORY_ZH: Mapping[int, str] = MappingProxyType(
@@ -186,22 +197,34 @@ NON_CROSSING_STATUS_CATEGORY_ZH: Mapping[int, str] = MappingProxyType(
         NATIVE_STATUS_DEPOSITED: "沉底",
         NATIVE_STATUS_FORCING_MISSING: "流場缺值",
         NATIVE_STATUS_NUMERICAL_FAILURE: "數值失敗",
+        NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "固定日曆回溯窗之外的沉底（pre_window_deposition）",
     }
 )
-"""五種「未穿越關注區域邊界」終止原因的中文分類標籤，鍵為
+"""六種「未穿越關注區域邊界」終止原因的中文分類標籤，鍵為
 ``backward_driver.NATIVE_STATUS_*`` 狀態碼，供邊界通量統計表的欄位命名與人類
 可讀報告使用；刻意不包含 ``NATIVE_STATUS_ACTIVE``（正式輸出不應出現尚在追蹤中
 的粒子，出現即代表上游 run 未完整結束，見 ``PostprocessAccumulator.add_batch``
 的檢查）與 ``NATIVE_STATUS_LEFT_INTEREST_REGION``（成功穿越，不屬於「未穿越」
-分類）。"""
+分類）。``NATIVE_STATUS_PRE_WINDOW_DEPOSITION``（WP-17 新增）與其餘五種狀態不同
+的地方是：它不代表運算過程中發生了什麼（不是資料缺口、也不是數值失敗），而是
+這顆粒子的沉底時刻本身就落在 ``fixed_calendar_window`` 模式的研究窗之外，因此
+從一開始就不會進入 forcing 運算（見 ``backward_driver.build_pre_window_deposition_
+result``）；把它與其餘五種一起列在「未穿越」分類，只是沿用同一張表的分母與欄位
+慣例，不代表把它與資料缺口或數值失敗混為同一種資料品質問題。"""
 
 _FLUX_STATUS_ORDER: tuple[int, ...] = (
     NATIVE_STATUS_LEFT_INTEREST_REGION,
     *_NON_CROSSING_STATUS_CODES,
 )
-"""邊界通量統計表固定的狀態欄位順序：第一欄永遠是成功穿越，其餘五欄依
+"""邊界通量統計表固定的狀態欄位順序：第一欄永遠是成功穿越，其餘六欄依
 ``NON_CROSSING_STATUS_CATEGORY_ZH`` 的分類順序排列，讓不同分組輸出的欄位順序
 一致，方便下游程式直接依位置讀取，不需要每次都查欄名。"""
+
+
+# 欄名沿用既有 ``status_{整數碼}`` 慣例（例如 ``count_status_7``）：既有下游／測試
+# 已經依這個慣例讀欄，WP-17 只新增 ``NATIVE_STATUS_PRE_WINDOW_DEPOSITION``（碼 7）
+# 這一種狀態，不重新命名既有五種欄位。欄位語意一律以 ``NON_CROSSING_STATUS_
+# CATEGORY_ZH`` 的中文標籤為準，裸整數只是穩定的欄名尾碼。
 
 
 # ── 離開紀錄表：固定 Parquet schema，供串流逐批寫入 ─────────────────────────
@@ -231,6 +254,8 @@ DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
         pa.field("departure_utc_ns", pa.int64(), nullable=False),
         pa.field("backtrack_duration_seconds", pa.float64(), nullable=False),
         pa.field("row_particle_index", pa.int64(), nullable=False),
+        pa.field("boundary_segment_id", pa.string(), nullable=True),
+        pa.field("boundary_classification_distance_m", pa.float64(), nullable=True),
     ]
 )
 """每顆粒子一列的離開紀錄表 schema。``departure_x_m``／``y_m``／``z_m`` 是公尺制
@@ -240,7 +265,11 @@ DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
 ``depth_quartile`` 是站內 ``z0_m`` 四分位數代理分組（0 最靠近海面），不是官方
 垂向 receptor 分類，見模組 docstring 第 3 點揭露。``backtrack_duration_seconds``
 是 ``(arrival_time_utc_ns - departure_utc_ns) / 1e9``，恆為非負值（逆向追蹤，
-離開時刻必然早於或等於到達時刻）。"""
+離開時刻必然早於或等於到達時刻）。``boundary_segment_id``／
+``boundary_classification_distance_m``（WP-17 新增）只在建構時提供
+``boundary_geometries`` 且該列 ``crossed_interest_region_boundary=True`` 時才有值，
+見 ``classify_boundary_segment`` 的方法與已知限制說明；其餘情況一律是明確的
+``null``（未提供邊界幾何，或這列根本沒有穿越邊界），不得以任何分段代碼頂替。"""
 
 
 LonLatProjector = Callable[[np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]
@@ -646,6 +675,102 @@ def _seasons_for_arrival(identity_table: ParticleIdentityTable) -> np.ndarray:
     return season_by_month_index[months - 1]
 
 
+def _write_table_with_csv(table: pa.Table, output_dir: Path, stem: str) -> None:
+    """把同一張表同時寫成 ``<stem>.parquet``（正式資料契約）與 ``<stem>.csv``
+    （人可讀，供任何試算表或文字編輯器直接開啟；欄位順序與 Parquet 完全相同）。
+    """
+
+    pq.write_table(table, str(output_dir / f"{stem}.parquet"))
+    pa_csv.write_csv(table, str(output_dir / f"{stem}.csv"))
+
+
+# ── 邊界進入統計：依開放邊界分段分類離開點（WP-17 任務 3，見模組 docstring
+#    「邊界進入統計」一節的方法與已知限制揭露）───────────────────────────────
+
+
+def classify_boundary_segment(
+    x_m: float, y_m: float, geometry: BoundaryGeometry
+) -> tuple[str, float]:
+    """把一個「已離開關注區域」的離開點分類到最近的開放邊界分段。
+
+    **方法（近似，已知限制，誠實揭露）**：native_runner 記錄的離開座標是子步
+    結束後、已經在關注區域**之外**的原始粒子位置（見
+    ``backward_driver.mirror_rk4_substep_loop`` 與 ``substep_numba`` 的關注區域
+    判定），不是離開瞬間與 ``own_local_domain`` 邊界的精確交點；因此這裡**不能**
+    重用既有 ``boundaries._open_boundary_crossing``（它要求輸入點幾乎剛好落在
+    邊界線上，預設容忍度只有 ``1e-6`` 公尺）。本函式改用「離開點分別到
+    ``own_local_open_boundary``／``flow_open_boundary`` 兩條開放水域線的最短
+    直線距離，取較近者」這個較粗但穩健的啟發式；沒有開放邊界線可比對的站點
+    （理論上不應發生，``own_local_open_boundary`` 缺席會由呼叫端的
+    ``manifests.load_boundary_geometries`` 更早拒絕）回傳
+    ``geometry.coastline_segment_id``。
+
+    這個分類**不會**判斷離開點是不是真的離開海岸（``NATIVE_STATUS_STRANDED``
+    走的是完全不同、以網格乾濕元素判定的路徑，不會呼叫本函式）；它只回答「這個
+    已經確定成功穿越關注區域邊界的離開點，比較靠近哪一段開放邊界」。回傳的
+    ``distance_m``（離開點到判定分段的直線距離）保留在輸出表中，供使用者評估
+    這個啟發式在特定站點的典型誤差量級——距離越大，代表離開點離任何一段開放
+    邊界線都比較遠（例如剛好在兩條線的交角附近，或一次子步位移特別大），分類
+    結果的可信度也越低；本函式不對這個距離設任何拒絕門檻，是否要在下游報告中
+    排除高距離的分類，留給使用者依實際量測到的距離分布決定。
+
+    Returns:
+        ``(boundary_segment_id, distance_m)``。
+    """
+
+    point = Point(float(x_m), float(y_m))
+    candidates: list[tuple[str, float]] = []
+    if geometry.own_local_open_boundary is not None:
+        candidates.append(
+            (geometry.own_local_boundary_segment_id, float(point.distance(geometry.own_local_open_boundary)))
+        )
+    if geometry.flow_open_boundary is not None:
+        candidates.append(
+            (geometry.flow_boundary_segment_id, float(point.distance(geometry.flow_open_boundary)))
+        )
+    if not candidates:
+        return geometry.coastline_segment_id, float("nan")
+    candidates.sort(key=lambda item: item[1])
+    return candidates[0]
+
+
+def _boundary_entry_table(
+    counts: Mapping[tuple[Any, ...], int], key_columns: tuple[str, ...]
+) -> pa.Table:
+    """把 ``{(分組鍵..., boundary_segment_id): 穿越次數}`` 轉成人可讀的相對來源權重表。
+
+    每一列是一個 ``(分組鍵..., boundary_segment_id)`` 組合；``relative_source_weight``
+    是「這個分段的穿越次數」除以「同一分組鍵底下全部分段的穿越次數總和」——即
+    AGENTS.md 定義的相對來源權重，只在同一分組（例如同一站）內部比較，不跨分組
+    比較，也不宣稱是絕對來源機率。
+    """
+
+    totals: dict[tuple[Any, ...], int] = {}
+    for key, count in counts.items():
+        group_key = key[:-1]
+        totals[group_key] = totals.get(group_key, 0) + count
+
+    rows: list[dict[str, Any]] = []
+    for key in sorted(counts):
+        group_key = key[:-1]
+        segment_id = key[-1]
+        count = counts[key]
+        total = totals[group_key]
+        row: dict[str, Any] = dict(zip(key_columns, group_key, strict=True))
+        row["boundary_segment_id"] = segment_id
+        row["crossed_count"] = count
+        row["relative_source_weight_within_group"] = float(count) / float(total) if total else float("nan")
+        rows.append(row)
+    if not rows:
+        fields = [pa.field(name, pa.string()) for name in key_columns] + [
+            pa.field("boundary_segment_id", pa.string()),
+            pa.field("crossed_count", pa.int64()),
+            pa.field("relative_source_weight_within_group", pa.float64()),
+        ]
+        return pa.table({f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields))
+    return pa.Table.from_pylist(rows)
+
+
 # ── 邊界通量統計：向量化的一維邊際分組計數（見模組 docstring 第 2 點限制）───
 
 
@@ -712,12 +837,20 @@ class PostprocessAccumulator:
         output_dir: str | Path,
         config: PostprocessConfig | None = None,
         lonlat_projector: LonLatProjector | None = None,
+        boundary_geometries: Mapping[str, BoundaryGeometry] | None = None,
     ) -> None:
         self._identity_table = identity_table
         self._config = config if config is not None else PostprocessConfig()
         self._lonlat_projector = lonlat_projector
+        self._boundary_geometries = boundary_geometries
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
+
+        # WP-17 任務 3：依 (study_site_id, boundary_segment_id) 與
+        # (study_site_id, settling_velocity_mps, boundary_segment_id) 累計穿越次數，
+        # 只在提供 boundary_geometries 時才有內容（見 classify_boundary_segment）。
+        self._boundary_entry_counts_by_site: dict[tuple[str, str], int] = {}
+        self._boundary_entry_counts_by_site_velocity: dict[tuple[str, float, str], int] = {}
 
         n = len(identity_table)
         self._n_total = n
@@ -861,6 +994,33 @@ class PostprocessAccumulator:
             lon_array = pa.array([None] * rows.size, type=pa.float64())
             lat_array = pa.array([None] * rows.size, type=pa.float64())
 
+        segment_ids: list[str | None] = [None] * rows.size
+        segment_distances: list[float | None] = [None] * rows.size
+        if self._boundary_geometries is not None:
+            site_ids = identity.study_site_id[rows]
+            velocities = identity.settling_velocity_mps[rows]
+            for local_index in np.flatnonzero(crossed):
+                site_id = str(site_ids[local_index])
+                geometry = self._boundary_geometries.get(site_id)
+                if geometry is None:
+                    raise PostprocessError(
+                        f"boundary_geometries 缺少站點 {site_id!r} 的邊界幾何，"
+                        "無法分類這顆已穿越關注區域邊界的粒子"
+                    )
+                segment_id, distance_m = classify_boundary_segment(
+                    float(final_x[local_index]), float(final_y[local_index]), geometry
+                )
+                segment_ids[local_index] = segment_id
+                segment_distances[local_index] = distance_m
+                site_key = (site_id, segment_id)
+                self._boundary_entry_counts_by_site[site_key] = (
+                    self._boundary_entry_counts_by_site.get(site_key, 0) + 1
+                )
+                velocity_key = (site_id, float(velocities[local_index]), segment_id)
+                self._boundary_entry_counts_by_site_velocity[velocity_key] = (
+                    self._boundary_entry_counts_by_site_velocity.get(velocity_key, 0) + 1
+                )
+
         columns = {
             "particle_id": pa.array(identity.particle_id[rows]),
             "scenario_id": pa.array(identity.scenario_id[rows]),
@@ -885,6 +1045,8 @@ class PostprocessAccumulator:
             "departure_utc_ns": pa.array(departure_utc),
             "backtrack_duration_seconds": pa.array(backtrack_seconds),
             "row_particle_index": pa.array(rows),
+            "boundary_segment_id": pa.array(segment_ids, type=pa.string()),
+            "boundary_classification_distance_m": pa.array(segment_distances, type=pa.float64()),
         }
         table = pa.table(columns, schema=DEPARTURE_TABLE_SCHEMA)
         self._departure_writer.write_table(table)
@@ -1011,6 +1173,13 @@ class PostprocessAccumulator:
                 "kde_hdr_levels": list(self._config.kde_hdr_levels),
                 "depth_quartile_count": self._config.depth_quartile_count,
                 "kde_group_summary": kde_summary,
+                "boundary_segment_classification_available": self._boundary_geometries is not None,
+                "boundary_segment_classification_method": (
+                    "nearest_open_boundary_line_by_euclidean_distance_v1（見"
+                    " postprocess.classify_boundary_segment docstring 的近似方法與已知限制）"
+                    if self._boundary_geometries is not None
+                    else None
+                ),
             },
             kde_bandwidth_method=(
                 "scipy.stats.gaussian_kde 預設 Scott 法則（factor = n**(-1/(d+4))，d=2），"
@@ -1032,22 +1201,38 @@ class PostprocessAccumulator:
         return manifest
 
     def _write_flux_tables(self) -> None:
-        """輸出四個一維邊際邊界通量統計表（見模組 docstring 第 2 點的範圍限制）。"""
+        """輸出四個一維邊際邊界通量統計表（見模組 docstring 第 2 點的範圍限制），
+        以及（提供 ``boundary_geometries`` 時）依開放邊界分段的相對來源權重表
+        （WP-17 任務 3）。每張表同時寫出 Parquet 與 CSV 兩種格式。
+        """
 
         identity = self._identity_table
         groupings = (
-            ("study_site_id", identity.study_site_id, "boundary_flux_by_site.parquet"),
+            ("study_site_id", identity.study_site_id, "boundary_flux_by_site"),
             (
                 "settling_velocity_mps",
                 identity.settling_velocity_mps,
-                "boundary_flux_by_settling_velocity.parquet",
+                "boundary_flux_by_settling_velocity",
             ),
-            ("depth_quartile", self._depth_quartile, "boundary_flux_by_depth_quartile.parquet"),
-            ("season", self._season, "boundary_flux_by_season.parquet"),
+            ("depth_quartile", self._depth_quartile, "boundary_flux_by_depth_quartile"),
+            ("season", self._season, "boundary_flux_by_season"),
         )
-        for column_name, values, file_name in groupings:
+        for column_name, values, stem in groupings:
             table = _flux_table_for_grouping(values, column_name, self._final_status)
-            pq.write_table(table, str(self._output_dir / file_name))
+            _write_table_with_csv(table, self._output_dir, stem)
+
+        if self._boundary_geometries is not None:
+            by_site_table = _boundary_entry_table(
+                self._boundary_entry_counts_by_site, ("study_site_id",)
+            )
+            _write_table_with_csv(by_site_table, self._output_dir, "boundary_entry_by_site")
+            by_site_velocity_table = _boundary_entry_table(
+                self._boundary_entry_counts_by_site_velocity,
+                ("study_site_id", "settling_velocity_mps"),
+            )
+            _write_table_with_csv(
+                by_site_velocity_table, self._output_dir, "boundary_entry_by_site_settling_velocity"
+            )
 
     def _write_kde_products(self) -> dict[str, dict[str, Any]]:
         """對兩種分組（各站；各站×沉降速度）建立條件式來源足跡並寫成 Parquet。

@@ -477,6 +477,7 @@ __all__ = [
     "NATIVE_STATUS_DEPOSITED",
     "NATIVE_STATUS_FORCING_MISSING",
     "NATIVE_STATUS_NUMERICAL_FAILURE",
+    "NATIVE_STATUS_PRE_WINDOW_DEPOSITION",
     "NATIVE_STATUS_DESCRIPTIONS",
     "BayTraceModuleHandles",
     "load_baytrace_modules",
@@ -505,6 +506,7 @@ __all__ = [
     "mirror_rk4_substep_loop",
     "BackwardDriverConfig",
     "BackwardDriverResult",
+    "build_pre_window_deposition_result",
     "run_backward_batch",
 ]
 
@@ -543,6 +545,15 @@ NATIVE_STATUS_FORCING_MISSING = 5
 NATIVE_STATUS_NUMERICAL_FAILURE = 6
 """數值失敗：粒子位置在某一步之後出現非有限值。"""
 
+NATIVE_STATUS_PRE_WINDOW_DEPOSITION = 7
+"""固定日曆回溯模式（``fixed_calendar_window``）專屬：沉底時刻早於「觀測日往前 H 天」的研究窗，
+有效回溯期間（``H - bed_residence_age_hours``）不為正，因此這顆粒子完全不進入 forcing 運算
+（不定位初始元素、不查詢任何流場、不消耗任何子步）。這不是資料缺口，也不是數值失敗——粒子的
+沉底時刻本身就落在本次固定日曆窗之外，見 ``bed_residence.resolve_bed_residence_timing`` 與
+``docs/operations/14_input_derivation_and_release_contract.md`` 第 3.1 節「pre-window 成員」的
+定義。這類粒子從有效來源比例的分母排除，但仍保留在固定的情境／成員 outcome 總分母中單獨計數
+（見 ``native_runner.postprocess`` 對這個狀態碼的分母處理）。"""
+
 NATIVE_STATUS_DESCRIPTIONS: dict[int, str] = {
     NATIVE_STATUS_ACTIVE: "仍在追蹤中，尚未終止。",
     NATIVE_STATUS_LEFT_INTEREST_REGION: "已離開關注區域（own_local_domain），正常結束。",
@@ -551,6 +562,10 @@ NATIVE_STATUS_DESCRIPTIONS: dict[int, str] = {
     NATIVE_STATUS_DEPOSITED: "沉底：下沉行為粒子持續停留在海床附近。",
     NATIVE_STATUS_FORCING_MISSING: "流場缺值：本小時濕節點出現未登錄缺值，該批粒子在此停止。",
     NATIVE_STATUS_NUMERICAL_FAILURE: "數值失敗：粒子位置出現非有限值。",
+    NATIVE_STATUS_PRE_WINDOW_DEPOSITION: (
+        "固定日曆回溯窗之外的沉底（pre_window_deposition）：沉底時刻早於觀測日往前 H 天，"
+        "未進入運算。"
+    ),
 }
 
 
@@ -3049,6 +3064,72 @@ class BackwardDriverResult:
 
 
 _HOUR_NS = 3_600_000_000_000
+
+
+def build_pre_window_deposition_result(
+    *,
+    row_particle_index: np.ndarray,
+    x0_m: np.ndarray,
+    y0_m: np.ndarray,
+    z0_m: np.ndarray,
+    arrival_time_utc_ns: int,
+) -> BackwardDriverResult:
+    """為固定日曆回溯窗之外的沉底粒子組出一份「完全未進入運算」的結果。
+
+    ``bed_residence.resolve_bed_residence_timing`` 在 ``fixed_calendar_window`` 模式判定
+    ``pre_window_deposition=True`` 時，有效回溯期間為零——這批粒子的沉底時刻本身就早於
+    「觀測日往前 H 天」的研究窗，因此呼叫端（``orchestrator``／``hour_major_provider``）
+    不應該把它們送進 ``run_backward_batch``／``run_flow_domain_hour_major``：不定位初始
+    元素、不查詢任何流場、不消耗任何子步、不產生任何 forcing 讀取成本。本函式只是把這個
+    「零運算」決定包成與正常結果同型別的 ``BackwardDriverResult``（``final_status`` 全部
+    是 ``NATIVE_STATUS_PRE_WINDOW_DEPOSITION``，位置固定在沉底起點 ``x0_m``／``y0_m``／
+    ``z0_m``，``hours_run=0``，軌跡只有沉底當下這一筆），讓下游（後處理、npz 存檔、計畫檔
+    摘要）可以用同一套介面消費，不需要另外特判「這個單元完全沒有結果檔」的情況。
+
+    Args:
+        row_particle_index: 這批粒子在其所屬 ``NativeWorkUnit`` 陣列裡的局部列位置
+            （``0..n_unit-1``），語意與 ``BackwardDriverResult.row_particle_index`` 一致。
+        x0_m, y0_m, z0_m: 逆向追蹤起點（＝沉底位置），與 ``ParticleIdentityTable`` 同一套
+            公尺制座標；本函式不做任何座標轉換或有效性檢查（呼叫端已在身分表建構時驗證）。
+        arrival_time_utc_ns: 這批粒子共用的到達（沉底）UTC 奈秒。
+    """
+
+    n = int(row_particle_index.shape[0])
+    if n == 0:
+        raise BackwardDriverError("build_pre_window_deposition_result 不可處理空批次")
+    for name, array in (("x0_m", x0_m), ("y0_m", y0_m), ("z0_m", z0_m)):
+        if array.shape != (n,):
+            raise BackwardDriverError(f"{name} 形狀必須是 ({n},)，實際 {array.shape}")
+    status = np.full(n, NATIVE_STATUS_PRE_WINDOW_DEPOSITION, dtype=np.int32)
+    final_utc = np.full(n, int(arrival_time_utc_ns), dtype=np.int64)
+    departures = tuple(
+        DepartureRecord(
+            row_particle_index=int(row),
+            status=NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+            x_m=float(x0_m[row]),
+            y_m=float(y0_m[row]),
+            z_m=float(z0_m[row]),
+            utc_ns=int(arrival_time_utc_ns),
+        )
+        for row in range(n)
+    )
+    return BackwardDriverResult(
+        row_particle_index=np.asarray(row_particle_index, dtype=np.int64).copy(),
+        final_status=status,
+        final_x_m=np.asarray(x0_m, dtype=np.float64).copy(),
+        final_y_m=np.asarray(y0_m, dtype=np.float64).copy(),
+        final_z_m=np.asarray(z0_m, dtype=np.float64).copy(),
+        final_utc_ns=final_utc,
+        trajectory_utc_ns=np.array([int(arrival_time_utc_ns)], dtype=np.int64),
+        trajectory_x_m=np.asarray(x0_m, dtype=np.float64).reshape(1, n).copy(),
+        trajectory_y_m=np.asarray(y0_m, dtype=np.float64).reshape(1, n).copy(),
+        trajectory_z_m=np.asarray(z0_m, dtype=np.float64).reshape(1, n).copy(),
+        trajectory_status=status.reshape(1, n).copy(),
+        departures=departures,
+        diagnostics=SubstepDiagnostics(),
+        overhead_diagnostics=HourlyOverheadDiagnostics(),
+        hours_run=0,
+    )
 
 
 def run_backward_batch(

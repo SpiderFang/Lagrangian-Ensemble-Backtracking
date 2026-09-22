@@ -24,6 +24,7 @@ SplitMix64＋Box-Muller 的獨立性）已經在 ``tests/test_native_backward_dr
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import time as _time
 
@@ -34,7 +35,9 @@ from shapely.geometry import Polygon
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.native_runner import backward_driver as bd
 from lagrangian_backtracking.native_runner import build_native_grid_arrays
+from lagrangian_backtracking.native_runner import horizon_derivation as hd
 from lagrangian_backtracking.native_runner import hour_major as hm
+from lagrangian_backtracking.native_runner.backtrack_horizon import ResolvedUnitHorizon
 from lagrangian_backtracking.native_runner.forcing_bridge import HourlyFieldPair
 from lagrangian_backtracking.native_runner.orchestrator import NativeWorkUnit
 
@@ -552,6 +555,73 @@ def test_hour_major_max_backtrack_triggers_at_exact_hour(driver_grid, handles) -
     assert np.all(unit_result.final_status == bd.NATIVE_STATUS_MAX_BACKTRACK)
     assert unit_result.hours_run == 2
     assert np.all(unit_result.final_utc_ns == t0 - 2 * _HOUR_NS)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-17：逐單元的 resolved_max_backtrack_seconds 覆寫（fixed_calendar_window 的
+# 運算層支援）——同一個沉降速度分組裡混合兩個不同「有效回溯時間」的到達時刻，
+# 驗證各自在自己的時限觸頂，而不是被 config 的共用值或彼此覆蓋。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_hour_major_per_unit_resolved_max_backtrack_seconds_override(driver_grid, handles) -> None:
+    t0 = 22_000 * _HOUR_NS
+    x0 = np.full(2, _DOMAIN_X / 2.0)
+    y0 = np.full(2, _DOMAIN_Y / 2.0)
+    z0 = np.full(2, -5.0)
+    row_ids = np.array([0, 1], dtype=np.int64)
+    table = _FakeIdentityTable(x0_m=x0, y0_m=y0, z0_m=z0, seed_hex=_seed_hex_for(row_ids))
+
+    short_unit = dataclasses.replace(
+        _make_unit(
+            unit_id="SHORT", region="R", domain="D", site="S1", arrival_utc=t0, settling=0.0,
+            rows=row_ids[:1],
+        ),
+        resolved_max_backtrack_seconds=1.0 * 3600.0,
+    )
+    long_unit = dataclasses.replace(
+        _make_unit(
+            unit_id="LONG", region="R", domain="D", site="S1", arrival_utc=t0, settling=0.0,
+            rows=row_ids[1:],
+        ),
+        resolved_max_backtrack_seconds=3.0 * 3600.0,
+    )
+    resolver = _make_resolver(driver_grid, u=0.0, v=0.0)
+    # config 自己的 max_backtrack_seconds 故意設一個兩個單元都不相等的值，確認
+    # 兩個單元確實各自使用自己 resolved 的值，不是退回這個共用值。
+    config = hm.HourMajorConfig(max_backtrack_seconds=10.0 * 3600.0, enable_diffusion=False, master_seed=0)
+
+    batch = hm.build_hour_major_domain_batch(
+        table, [short_unit, long_unit], interest_regions={"S1": _BIG_POLYGON}
+    )
+    result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, batch, config=config, forcing_resolver=resolver,
+    )
+    short_result = result.unit_results["SHORT"]
+    long_result = result.unit_results["LONG"]
+    assert np.all(short_result.final_status == bd.NATIVE_STATUS_MAX_BACKTRACK)
+    assert short_result.hours_run == 1
+    assert np.all(short_result.final_utc_ns == t0 - 1 * _HOUR_NS)
+    assert np.all(long_result.final_status == bd.NATIVE_STATUS_MAX_BACKTRACK)
+    assert long_result.hours_run == 3
+    assert np.all(long_result.final_utc_ns == t0 - 3 * _HOUR_NS)
+
+
+def test_build_hour_major_domain_batch_rejects_pre_window_units(driver_grid, handles) -> None:
+    del driver_grid, handles
+    row_ids = np.array([0], dtype=np.int64)
+    table = _FakeIdentityTable(
+        x0_m=np.zeros(1), y0_m=np.zeros(1), z0_m=np.full(1, -5.0), seed_hex=_seed_hex_for(row_ids)
+    )
+    unit = dataclasses.replace(
+        _make_unit(
+            unit_id="PRE", region="R", domain="D", site="S1", arrival_utc=22_000 * _HOUR_NS,
+            settling=0.0, rows=row_ids,
+        ),
+        pre_window_deposition=True,
+    )
+    with pytest.raises(hm.HourMajorError):
+        hm.build_hour_major_domain_batch(table, [unit], interest_regions={"S1": _BIG_POLYGON})
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1209,3 +1279,176 @@ def test_hour_major_substep_loop_impl_numba_statistically_equivalent_to_python(d
         assert status_mismatch <= max(1, int(0.05 * py_result.final_status.shape[0])), (
             unit.unit_id, status_mismatch,
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-17 任務 2：native_runner.horizon_derivation——由既有較長結果截斷推導較短結果
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_derive_horizon_matches_direct_run_bit_identical_under_global_cfl(driver_grid, handles) -> None:
+    """H_src=6h 截斷推導出的 H_target=3h，必須與直接跑 H_target=3h 位元相同。
+
+    只有 ``substep_policy="global_cfl"`` 才保證這個等價（``local_cfl`` 的子步數
+    依當下整批哪些粒子仍在活動決定，只保證統計等價，見模組文件與
+    ``hour_major.py`` 既有政策，不是本測試新增的限制）。用 SMALL／BIG 兩個測站
+    分別涵蓋「截止前已終止（保留原狀）」與「截止時仍活動（改標回溯上限）」兩種
+    分支。
+    """
+
+    t0 = 22_000 * _HOUR_NS
+    n = 3
+    rng = np.random.default_rng(7)
+    x0 = _DOMAIN_X / 2.0 + rng.uniform(-30.0, 30.0, size=2 * n)
+    y0 = _DOMAIN_Y / 2.0 + rng.uniform(-30.0, 30.0, size=2 * n)
+    z0 = np.full(2 * n, -5.0)
+    row_ids = np.arange(2 * n, dtype=np.int64)
+    table = _FakeIdentityTable(x0_m=x0, y0_m=y0, z0_m=z0, seed_hex=_seed_hex_for(row_ids))
+
+    small_polygon = Polygon(
+        [
+            (_DOMAIN_X / 2.0 - 40.0, _DOMAIN_Y / 2.0 - 40.0),
+            (_DOMAIN_X / 2.0 + 40.0, _DOMAIN_Y / 2.0 - 40.0),
+            (_DOMAIN_X / 2.0 + 40.0, _DOMAIN_Y / 2.0 + 40.0),
+            (_DOMAIN_X / 2.0 - 40.0, _DOMAIN_Y / 2.0 + 40.0),
+        ]
+    )
+    interest_regions = {"SMALL": small_polygon, "BIG": _BIG_POLYGON}
+    unit_small = _make_unit(
+        unit_id="SMALL_UNIT", region="R", domain="D", site="SMALL", arrival_utc=t0, settling=0.0,
+        rows=np.arange(0, n),
+    )
+    unit_big = _make_unit(
+        unit_id="BIG_UNIT", region="R", domain="D", site="BIG", arrival_utc=t0, settling=0.0,
+        rows=np.arange(n, 2 * n),
+    )
+    resolver = _make_resolver(driver_grid, u=0.05, v=0.0)
+
+    source_config = hm.HourMajorConfig(
+        max_backtrack_seconds=6.0 * 3600.0, enable_diffusion=False, master_seed=1,
+        substep_policy="global_cfl",
+    )
+    source_batch = hm.build_hour_major_domain_batch(
+        table, [unit_small, unit_big], interest_regions=interest_regions
+    )
+    source_result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, source_batch, config=source_config, forcing_resolver=resolver,
+    )
+    # 確認場景確實同時涵蓋兩種分支：SMALL 在 3 小時前就已經離開，BIG 撐到 6 小時上限。
+    assert np.all(source_result.unit_results["SMALL_UNIT"].final_utc_ns > t0 - 3 * _HOUR_NS)
+    assert np.all(source_result.unit_results["BIG_UNIT"].final_status == bd.NATIVE_STATUS_MAX_BACKTRACK)
+
+    resolved = ResolvedUnitHorizon(
+        backtrack_mode="full_horizon_from_deposition",
+        requested_horizon_days=3 / 24,
+        effective_horizon_seconds=3.0 * 3600.0,
+        effective_horizon_ns=3 * _HOUR_NS,
+        pre_window_deposition=False,
+        bed_residence_age_hours=None,
+    )
+
+    target_config = hm.HourMajorConfig(
+        max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=False, master_seed=1,
+        substep_policy="global_cfl",
+    )
+    unit_small_direct = dataclasses.replace(unit_small, resolved_max_backtrack_seconds=3.0 * 3600.0)
+    unit_big_direct = dataclasses.replace(unit_big, resolved_max_backtrack_seconds=3.0 * 3600.0)
+    direct_batch = hm.build_hour_major_domain_batch(
+        table, [unit_small_direct, unit_big_direct], interest_regions=interest_regions
+    )
+    direct_result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, direct_batch, config=target_config, forcing_resolver=resolver,
+    )
+
+    for unit_id in ("SMALL_UNIT", "BIG_UNIT"):
+        derived, info = hd.derive_backward_driver_result(
+            source_result.unit_results[unit_id],
+            resolved=resolved,
+            source_requested_horizon_days=6 / 24,
+        )
+        _assert_results_bit_identical(
+            derived, direct_result.unit_results[unit_id], label=f"derive-vs-direct:{unit_id}"
+        )
+        assert info.hours_run == direct_result.unit_results[unit_id].hours_run
+    # BIG 三顆粒子全部原本都撐到 6 小時上限，在 3 小時截止時仍活動，因此全部
+    # 應該被重新標成「回溯達上限」；SMALL 則應該全部維持原狀（提早離開）。
+    small_info = hd.derive_backward_driver_result(
+        source_result.unit_results["SMALL_UNIT"], resolved=resolved, source_requested_horizon_days=6 / 24,
+    )[1]
+    big_info = hd.derive_backward_driver_result(
+        source_result.unit_results["BIG_UNIT"], resolved=resolved, source_requested_horizon_days=6 / 24,
+    )[1]
+    assert small_info.newly_capped_particle_count == 0
+    assert small_info.unchanged_particle_count == n
+    assert big_info.newly_capped_particle_count == n
+    assert big_info.unchanged_particle_count == 0
+
+
+def test_derive_horizon_pre_window_shortcut(driver_grid, handles) -> None:
+    """``pre_window_deposition=True`` 時完全不截斷計算，直接回到沉底起點。"""
+
+    del driver_grid, handles
+    t0 = 22_000 * _HOUR_NS
+    n = 2
+    row_ids = np.arange(n, dtype=np.int64)
+    x0 = np.array([10.0, 20.0])
+    y0 = np.array([-5.0, -6.0])
+    z0 = np.array([-3.0, -4.0])
+    trajectory_utc = np.array([t0, t0 - _HOUR_NS, t0 - 2 * _HOUR_NS], dtype=np.int64)
+    trajectory_x = np.stack([x0, x0 + 1.0, x0 + 2.0])
+    trajectory_y = np.stack([y0, y0 - 1.0, y0 - 2.0])
+    trajectory_z = np.stack([z0, z0, z0])
+    result = bd.BackwardDriverResult(
+        row_particle_index=row_ids,
+        final_status=np.full(n, bd.NATIVE_STATUS_MAX_BACKTRACK, dtype=np.int32),
+        final_x_m=x0 + 2.0, final_y_m=y0 - 2.0, final_z_m=z0,
+        final_utc_ns=np.full(n, t0 - 2 * _HOUR_NS, dtype=np.int64),
+        trajectory_utc_ns=trajectory_utc,
+        trajectory_x_m=trajectory_x, trajectory_y_m=trajectory_y, trajectory_z_m=trajectory_z,
+        trajectory_status=np.full((3, n), bd.NATIVE_STATUS_ACTIVE, dtype=np.int32),
+        departures=(), diagnostics=bd.SubstepDiagnostics(),
+        overhead_diagnostics=bd.HourlyOverheadDiagnostics(),
+        hours_run=2,
+    )
+    resolved = ResolvedUnitHorizon(
+        backtrack_mode="fixed_calendar_window",
+        requested_horizon_days=30.0,
+        effective_horizon_seconds=0.0,
+        effective_horizon_ns=0,
+        pre_window_deposition=True,
+        bed_residence_age_hours=45 * 24,
+    )
+    derived, info = hd.derive_backward_driver_result(
+        result, resolved=resolved, source_requested_horizon_days=30.0
+    )
+    assert np.all(derived.final_status == bd.NATIVE_STATUS_PRE_WINDOW_DEPOSITION)
+    assert np.array_equal(derived.final_x_m, x0)
+    assert np.array_equal(derived.final_y_m, y0)
+    assert derived.hours_run == 0
+    assert info.pre_window_deposition is True
+    assert info.cutoff_utc_ns == t0
+
+
+def test_derive_horizon_rejects_target_longer_than_source() -> None:
+    resolved = ResolvedUnitHorizon(
+        backtrack_mode="full_horizon_from_deposition",
+        requested_horizon_days=10.0,
+        effective_horizon_seconds=10 * 86_400.0,
+        effective_horizon_ns=10 * 86_400 * 1_000_000_000,
+        pre_window_deposition=False,
+        bed_residence_age_hours=None,
+    )
+    fake_result = bd.BackwardDriverResult(
+        row_particle_index=np.array([0], dtype=np.int64),
+        final_status=np.array([bd.NATIVE_STATUS_MAX_BACKTRACK], dtype=np.int32),
+        final_x_m=np.array([0.0]), final_y_m=np.array([0.0]), final_z_m=np.array([0.0]),
+        final_utc_ns=np.array([0], dtype=np.int64),
+        trajectory_utc_ns=np.array([_HOUR_NS], dtype=np.int64),
+        trajectory_x_m=np.zeros((1, 1)), trajectory_y_m=np.zeros((1, 1)), trajectory_z_m=np.zeros((1, 1)),
+        trajectory_status=np.zeros((1, 1), dtype=np.int32),
+        departures=(), diagnostics=bd.SubstepDiagnostics(),
+        overhead_diagnostics=bd.HourlyOverheadDiagnostics(),
+        hours_run=0,
+    )
+    with pytest.raises(hd.HorizonDerivationError):
+        hd.derive_backward_driver_result(fake_result, resolved=resolved, source_requested_horizon_days=5.0)

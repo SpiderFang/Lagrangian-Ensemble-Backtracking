@@ -70,6 +70,18 @@ WP-11 可修改檔案清單內，因此本模組退回 ``hour_major.HourMajorCon
 
 - ``LBT_NATIVE_FORMAL``：``"1"``（預設）／``"0"``，透傳給
   ``production_wiring`` 的 ``formal`` 參數。
+- ``LBT_NATIVE_BACKTRACK_MODE``（WP-17 新增）：``"full_horizon_from_deposition"``
+  （預設）或 ``"fixed_calendar_window"``，見 ``backtrack_horizon.py`` 模組文件。
+  這是「本次 native-run 實際採用哪個回溯模式」的最終判定，只用來核對與計畫檔
+  （``native-plan`` 階段已經用同一個模式解析過每個工作單元的
+  ``resolved_max_backtrack_seconds``／``pre_window_deposition``）是否一致，以及
+  與設定檔 ``bed_residence_time.backtrack_mode`` 是否一致；**不會**在這一步重新
+  規劃工作單元。
+- ``LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH``（WP-17 新增）：``"1"``／
+  ``"0"``（預設）。設定檔宣稱的 ``bed_residence_time.backtrack_mode`` 與
+  ``LBT_NATIVE_BACKTRACK_MODE`` 實際採用值不一致時，預設 fail-closed 拒絕啟動
+  （見 ``backtrack_horizon.require_mode_acknowledged_if_mismatched``）；只有明確
+  設成 ``"1"`` 才會放行，且這個承認狀態本身也會寫進每個結果摘要。
 - ``LBT_NATIVE_CHECKPOINT_ROOT``：提供時，每個切段排程單元各自在其下建立
   一個以 ``unit_id`` 命名的子目錄當 ``hour_major`` 的 ``checkpoint_dir``；
   省略時不做 checkpoint（中斷後整段必須從頭重算）。
@@ -225,6 +237,10 @@ import numpy as np
 from ..config import load_config
 from . import orchestrator as native_orchestrator
 from . import production_wiring
+from .backtrack_horizon import (
+    require_mode_acknowledged_if_mismatched,
+    resolve_backtrack_mode,
+)
 from .backward_driver import (
     NATIVE_STATUS_DESCRIPTIONS,
     BackwardDriverResult,
@@ -232,6 +248,7 @@ from .backward_driver import (
     DepartureRecord,
     HourlyOverheadDiagnostics,
     SubstepDiagnostics,
+    build_pre_window_deposition_result,
     load_baytrace_modules,
 )
 from .hour_major import (
@@ -332,6 +349,13 @@ class HourMajorProviderParams:
     checkpoint_root: str | None
     checkpoint_every_hours: int
     hour_major_config: HourMajorConfig
+    # WP-17：實際採用的回溯模式與設定檔宣稱的模式（見 backtrack_horizon.py）。
+    # 兩者不一致時 ``_resolve_params`` 已經 fail-closed 檢查過
+    # ``LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH``，這裡只是把結果凍結下來，
+    # 供 ``_run_unit_entrypoint`` 寫進每個結果摘要（不重新檢查一次）。
+    effective_backtrack_mode: str = "full_horizon_from_deposition"
+    config_declared_backtrack_mode: str | None = None
+    requested_horizon_days: float = 30.0
     test_force_interrupt_after_hours: int | None = None
 
 
@@ -356,6 +380,29 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         config.boundaries.max_backtrack_days * 86400.0
         if config.boundaries.max_backtrack_days is not None
         else HourMajorConfig().max_backtrack_seconds
+    )
+    requested_horizon_days = (
+        float(config.boundaries.max_backtrack_days)
+        if config.boundaries.max_backtrack_days is not None
+        else HourMajorConfig().max_backtrack_seconds / 86400.0
+    )
+
+    # WP-17：回溯模式明確化——native-run 這一步不重新規劃工作單元（單元的
+    # resolved_max_backtrack_seconds／pre_window_deposition 已經由 native-plan
+    # 決定並寫進計畫檔，見 orchestrator.resolve_native_work_unit_backtrack_horizons），
+    # 但仍必須重新核對「這次執行實際採用的模式」與設定檔宣稱的模式是否一致，
+    # 避免有人用同一份計畫檔搭配改過 backtrack_mode 的設定檔重跑、卻沒有人注意到。
+    bed_residence_time = getattr(config.scenarios, "bed_residence_time", None)
+    config_declared_backtrack_mode = (
+        getattr(bed_residence_time, "backtrack_mode", None) if bed_residence_time is not None else None
+    )
+    effective_backtrack_mode = resolve_backtrack_mode(cli_backtrack_mode=None, env=dict(env))
+    require_mode_acknowledged_if_mismatched(
+        effective_backtrack_mode=effective_backtrack_mode,
+        config_declared_backtrack_mode=config_declared_backtrack_mode,
+        acknowledge_config_mode_mismatch=_env_flag(
+            env, "LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", default=False
+        ),
     )
     dt_max_seconds = (
         config.integration.dt_max_seconds
@@ -396,6 +443,9 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         checkpoint_root=env.get("LBT_NATIVE_CHECKPOINT_ROOT") or None,
         checkpoint_every_hours=_env_int(env, "LBT_NATIVE_CHECKPOINT_EVERY_HOURS", default=24),
         hour_major_config=hour_major_config,
+        effective_backtrack_mode=effective_backtrack_mode,
+        config_declared_backtrack_mode=config_declared_backtrack_mode,
+        requested_horizon_days=requested_horizon_days,
         test_force_interrupt_after_hours=_env_optional_int(
             env, "LBT_NATIVE_TEST_FORCE_INTERRUPT_AFTER_HOURS"
         ),
@@ -641,8 +691,67 @@ def _run_unit_entrypoint(
         )
     analysis_region_id = next(iter(member_regions))
     domain_resources = _domain_resources_for(resources, analysis_region_id)
+
+    # WP-17：native-plan 已經依實際採用的回溯模式，把每個原始工作單元標成
+    # 「進入運算」或「pre_window_deposition」（沉底年齡 ≥ H，固定日曆窗之外，
+    # 不進入運算），見 orchestrator.resolve_native_work_unit_backtrack_horizons。
+    # 這裡先把兩者分開：pre-window 單元完全不建構小時主軸批次、不查詢任何流場，
+    # 直接組出結果；其餘單元才照舊路徑跑 run_flow_domain_hour_major。
+    pre_window_units = [unit for unit in member_units if unit.pre_window_deposition]
+    runnable_units = [unit for unit in member_units if not unit.pre_window_deposition]
+
+    results_dir = Path(params.results_dir)
+    member_summaries: dict[str, dict[str, Any]] = {}
+
+    def _unit_horizon_provenance(unit: NativeWorkUnit) -> dict[str, Any]:
+        return {
+            "declared_config_backtrack_mode": params.config_declared_backtrack_mode,
+            "effective_backtrack_mode": params.effective_backtrack_mode,
+            "requested_horizon_days": params.requested_horizon_days,
+            "resolved_max_backtrack_seconds": unit.resolved_max_backtrack_seconds,
+            "pre_window_deposition": bool(unit.pre_window_deposition),
+            "bed_residence_age_hours": unit.bed_residence_age_hours,
+        }
+
+    for unit in pre_window_units:
+        table = resources.identity_table
+        driver_result = build_pre_window_deposition_result(
+            row_particle_index=np.arange(unit.particle_count, dtype=np.int64),
+            x0_m=table.x0_m[unit.particle_row_indices],
+            y0_m=table.y0_m[unit.particle_row_indices],
+            z0_m=table.z0_m[unit.particle_row_indices],
+            arrival_time_utc_ns=int(unit.arrival_time_utc_ns),
+        )
+        save_backward_driver_result_npz(result_npz_path(results_dir, unit.unit_id), driver_result)
+        member_summaries[unit.unit_id] = {
+            "particle_count": unit.particle_count,
+            "hours_run": 0,
+            "final_status_counts": _status_counts(driver_result.final_status),
+            "result_npz": str(result_npz_path(results_dir, unit.unit_id)),
+            **_unit_horizon_provenance(unit),
+        }
+
+    if not runnable_units:
+        # 整個排程單元底下全部到達時刻都是 pre-window：不需要（也不應該）呼叫
+        # run_flow_domain_hour_major——沒有任何粒子需要查詢流場。
+        return {
+            "domain_unit_id": spec.unit_id,
+            "flow_domain_id": spec.flow_domain_id,
+            "member_unit_ids": sorted(member_summaries),
+            "member_unit_count": len(member_summaries),
+            "member_summaries": member_summaries,
+            "domain_hours_walked": 0,
+            "domain_kernel_call_count": 0,
+            "wave_data_available": None,
+            "smagorinsky_impl": params.hour_major_config.smagorinsky_impl,
+            "all_members_pre_window_deposition": True,
+            "declared_config_backtrack_mode": params.config_declared_backtrack_mode,
+            "effective_backtrack_mode": params.effective_backtrack_mode,
+            "requested_horizon_days": params.requested_horizon_days,
+        }
+
     batch = build_hour_major_domain_batch(
-        resources.identity_table, member_units, interest_regions=domain_resources.interest_regions
+        resources.identity_table, runnable_units, interest_regions=domain_resources.interest_regions
     )
 
     checkpoint_dir: str | None = None
@@ -703,9 +812,7 @@ def _run_unit_entrypoint(
         checkpoint_every_hours=params.checkpoint_every_hours,
     )
 
-    results_dir = Path(params.results_dir)
-    member_summaries: dict[str, dict[str, Any]] = {}
-    for unit in member_units:
+    for unit in runnable_units:
         driver_result = run_result.unit_results.get(unit.unit_id)
         if driver_result is None:
             raise HourMajorProviderError(
@@ -717,6 +824,7 @@ def _run_unit_entrypoint(
             "hours_run": int(driver_result.hours_run),
             "final_status_counts": _status_counts(driver_result.final_status),
             "result_npz": str(result_npz_path(results_dir, unit.unit_id)),
+            **_unit_horizon_provenance(unit),
         }
 
     return {
@@ -730,6 +838,9 @@ def _run_unit_entrypoint(
         "wave_data_available": wave_resolver is not None,
         # 每個排程單元都記錄實際使用的 Smagorinsky 實作，後處理與報告可據此區分。
         "smagorinsky_impl": params.hour_major_config.smagorinsky_impl,
+        "declared_config_backtrack_mode": params.config_declared_backtrack_mode,
+        "effective_backtrack_mode": params.effective_backtrack_mode,
+        "requested_horizon_days": params.requested_horizon_days,
     }
 
 

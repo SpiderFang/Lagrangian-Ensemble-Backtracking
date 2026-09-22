@@ -1378,3 +1378,95 @@ def test_plan_native_hour_major_segments_uses_workload_cost_model_when_grid_size
     wall_clock, max_cost = orch.estimate_total_wall_clock_seconds(costs, worker_count=8)
     assert wall_clock >= max_cost
     assert wall_clock > 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-17：native-run 必須核對計畫檔宣稱的回溯模式與實際執行環境是否一致
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_native_run_fails_closed_on_plan_backtrack_mode_mismatch(tmp_path, monkeypatch) -> None:
+    """計畫檔以 ``fixed_calendar_window`` 規劃，但執行環境沒有設定
+    ``LBT_NATIVE_BACKTRACK_MODE``（因此退回預設 ``full_horizon_from_deposition``）時，
+    ``native-run`` 必須在動用任何 ``--resource-provider`` 或執行任何工作單元之前就
+    fail closed，而不是讓每個工作單元的結果摘要貼上與計畫檔不符的模式標籤（見
+    ``cli.run_native_run`` 讀回計畫檔後的 ``backtrack_horizon`` 比對邏輯，以及
+    ``hour_major_provider.HourMajorProviderParams`` docstring 對這個 provenance
+    欄位的說明）。故意把 ``--resource-provider`` 指向一個不會回傳合法 factory 的
+    模組屬性，驗證 mismatch 檢查確實發生在匯入 resource provider 之前——若檢查
+    沒生效，測試會改成因為 provider 不合法而失敗，而不是預期的
+    ``BacktrackHorizonError``。
+    """
+
+    from lagrangian_backtracking import cli
+    from lagrangian_backtracking.native_runner.backtrack_horizon import BacktrackHorizonError
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(
+        plan_path,
+        units=[unit],
+        gap_checks=[],
+        summary=summary,
+        backtrack_mode_declaration={
+            "declared_config_backtrack_mode": "fixed_calendar_window",
+            "effective_backtrack_mode": "fixed_calendar_window",
+            "requested_horizon_days": 30.0,
+            "acknowledge_config_mode_mismatch": False,
+            "pre_window_unit_count": 0,
+            "arrival_manifest": None,
+        },
+    )
+
+    monkeypatch.delenv("LBT_NATIVE_BACKTRACK_MODE", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", raising=False)
+
+    with pytest.raises(BacktrackHorizonError):
+        cli.run_native_run(
+            [
+                str(plan_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--resource-provider",
+                "os.path:join",
+                "--worker-count",
+                "1",
+            ]
+        )
+
+
+def test_native_run_without_backtrack_horizon_field_is_unaffected(tmp_path, monkeypatch) -> None:
+    """WP-17 之前產生的舊計畫檔沒有 ``backtrack_horizon`` 欄位；新增的比對必須完全
+    跳過（不能對舊計畫檔 fail closed），行為與 WP-17 之前相同。這裡只驗證跳過本身
+    （不會拋出 ``BacktrackHorizonError``），不驗證完整執行成功——後續步驟仍需要真正
+    可用的 resource provider，不在本測試範圍。
+    """
+
+    from lagrangian_backtracking import cli
+    from lagrangian_backtracking.native_runner.backtrack_horizon import BacktrackHorizonError
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(plan_path, units=[unit], gap_checks=[], summary=summary)
+
+    monkeypatch.delenv("LBT_NATIVE_BACKTRACK_MODE", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", raising=False)
+
+    try:
+        cli.run_native_run(
+            [
+                str(plan_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--resource-provider",
+                "os.path:join",
+                "--worker-count",
+                "1",
+            ]
+        )
+    except BacktrackHorizonError:
+        pytest.fail("舊計畫檔（沒有 backtrack_horizon 欄位）不應該觸發 WP-17 的模式比對")
+    except Exception:
+        pass  # 其餘失敗（例如 provider 不合法）不是本測試要驗證的範圍。

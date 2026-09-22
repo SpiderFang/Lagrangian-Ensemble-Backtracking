@@ -40,6 +40,7 @@ from typing import Any, NoReturn
 import numpy as np
 from shapely.geometry import box
 
+from . import manifests
 from .aggregate_pipeline import _build_site_metric_centers, build_aggregate_release_payload
 from .aggregate_release import (
     validate_aggregate_release,
@@ -62,6 +63,8 @@ from .input_derivation import (
     validate_release_config,
 )
 from .models import ParticleState, VelocitySample
+from .native_runner import backtrack_horizon as native_backtrack_horizon
+from .native_runner import horizon_derivation as native_horizon_derivation
 from .native_runner import hour_major_provider as native_hour_major_provider
 from .native_runner import orchestrator as native_orchestrator
 from .native_runner import postprocess as native_postprocess
@@ -846,6 +849,34 @@ def _native_plan_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-backtrack-days", type=float, default=30.0)
     parser.add_argument(
+        "--backtrack-mode",
+        choices=tuple(native_backtrack_horizon.SUPPORTED_BACKTRACK_MODES),
+        default=None,
+        help=(
+            "WP-17：實際採用的回溯模式；省略時讀取 LBT_NATIVE_BACKTRACK_MODE 環境變數，"
+            "兩者都省略時預設 full_horizon_from_deposition（從沉底日起完整回溯 H 天，"
+            "PI 原話對應的正式模式）。fixed_calendar_window（固定日曆終點往前回溯 H 天）"
+            "是替代敏感度分析模式，須另外提供 --arrival-manifest 才能解析沉底年齡"
+        ),
+    )
+    parser.add_argument(
+        "--acknowledge-config-mode-mismatch",
+        action="store_true",
+        help=(
+            "設定檔 bed_residence_time.backtrack_mode 與 --backtrack-mode 實際採用值不同時，"
+            "預設 fail-closed 拒絕規劃；明確加上這個旗標才會放行（差異會寫進計畫檔）"
+        ),
+    )
+    parser.add_argument(
+        "--arrival-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "WP-17：fixed_calendar_window 模式需要的 arrival.json（含沉底 metadata）；"
+            "與 --config 搭配載入並驗證。full_horizon_from_deposition 模式不需要這個檔案"
+        ),
+    )
+    parser.add_argument(
         "--skip-gap-check",
         action="store_true",
         help="明確略過缺口安全檢查（例如合成資料試跑）；一律在輸出中標記，不靜默略過",
@@ -1038,6 +1069,58 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         region_to_flow_domain = json.loads(args.region_to_flow_domain.read_text(encoding="utf-8"))
 
     units = native_orchestrator.plan_native_work_units(table, region_to_flow_domain=region_to_flow_domain)
+
+    # WP-17：回溯模式明確化——在缺口檢查與排程摺疊之前，先把每個工作單元的有效回溯
+    # 時間、pre-window 判定解析好並烤進 NativeWorkUnit（見 backtrack_horizon.py 與
+    # orchestrator.resolve_native_work_unit_backtrack_horizons）。
+    effective_backtrack_mode = native_backtrack_horizon.resolve_backtrack_mode(
+        cli_backtrack_mode=args.backtrack_mode
+    )
+    config_declared_backtrack_mode: str | None = None
+    if args.config is not None:
+        plan_config = load_config(str(args.config), formal_release=False)
+        bed_residence_time = getattr(plan_config.scenarios, "bed_residence_time", None)
+        if bed_residence_time is not None:
+            config_declared_backtrack_mode = bed_residence_time.backtrack_mode
+    native_backtrack_horizon.require_mode_acknowledged_if_mismatched(
+        effective_backtrack_mode=effective_backtrack_mode,
+        config_declared_backtrack_mode=config_declared_backtrack_mode,
+        acknowledge_config_mode_mismatch=args.acknowledge_config_mode_mismatch,
+    )
+
+    arrivals_by_time_utc_ns: dict[int, Any] | None = None
+    maximum_age_days: int | None = None
+    sampling_seed: int | None = None
+    if effective_backtrack_mode == native_backtrack_horizon.BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW:
+        if args.arrival_manifest is None or args.config is None:
+            raise ValueError(
+                "--backtrack-mode fixed_calendar_window 必須同時提供 --config 與 --arrival-manifest，"
+                "才能解析每個到達時刻的沉底年齡（resolve_bed_residence_timing 需要完整 metadata）"
+            )
+        fixed_window_config = load_config(str(args.config), formal_release=False)
+        bed_residence_time = getattr(fixed_window_config.scenarios, "bed_residence_time", None)
+        if bed_residence_time is None:
+            raise ValueError(
+                "--config 沒有啟用 scenarios.bed_residence_time；fixed_calendar_window 模式"
+                "需要沉底年齡分層抽樣設定才有意義"
+            )
+        arrival_records = manifests.load_arrival_manifest(
+            args.arrival_manifest, fixed_window_config, formal=args.formal
+        )
+        arrivals_by_time_utc_ns = {int(record.time_utc_ns): record for record in arrival_records}
+        maximum_age_days = bed_residence_time.maximum_age_days
+        sampling_seed = bed_residence_time.sampling_seed
+
+    units = native_orchestrator.resolve_native_work_unit_backtrack_horizons(
+        units,
+        backtrack_mode=effective_backtrack_mode,
+        requested_horizon_days=args.max_backtrack_days,
+        arrivals_by_time_utc_ns=arrivals_by_time_utc_ns,
+        maximum_age_days=maximum_age_days,
+        sampling_seed=sampling_seed,
+    )
+    pre_window_unit_count = sum(1 for unit in units if unit.pre_window_deposition)
+
     summary = native_orchestrator.summarize_native_work_plan(units)
 
     gap_checks: tuple[native_orchestrator.ArrivalGapCheck, ...] = ()
@@ -1186,6 +1269,15 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         # 不需要 native-run 重新知道節點數／層數才能排序），見 run_native_run。
         manifest["extra"]["unit_costs"] = cost_model_report["segment_cost_seconds"]
 
+    backtrack_mode_declaration = {
+        "declared_config_backtrack_mode": config_declared_backtrack_mode,
+        "effective_backtrack_mode": effective_backtrack_mode,
+        "requested_horizon_days": args.max_backtrack_days,
+        "acknowledge_config_mode_mismatch": bool(args.acknowledge_config_mode_mismatch),
+        "pre_window_unit_count": pre_window_unit_count,
+        "arrival_manifest": str(args.arrival_manifest) if args.arrival_manifest is not None else None,
+    }
+
     native_orchestrator.write_native_plan_file(
         args.output,
         units=plan_units,
@@ -1193,6 +1285,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         summary=summary,
         manifest=manifest,
         hour_major_members=hour_major_members,
+        backtrack_mode_declaration=backtrack_mode_declaration,
     )
 
     unsafe = [check for check in gap_checks if not check.is_gap_safe]
@@ -1210,6 +1303,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         "unsafe_arrivals": [dataclasses.asdict(check) for check in unsafe],
         "segment_plan": [dataclasses.asdict(item) for item in segment_reports],
         "cost_model": cost_model_report,
+        "backtrack_horizon": backtrack_mode_declaration,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if report["is_gap_safe_ready"] else 2
@@ -1220,6 +1314,28 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
 
     args = _native_run_parser().parse_args(argv)
     units, payload = native_orchestrator.read_native_plan_file(args.plan)
+
+    # WP-17：計畫檔記錄了 native-plan 當初實際採用的回溯模式（見
+    # cli.run_native_plan_command 的 backtrack_mode_declaration）；這裡在真正執行
+    # 任何工作單元之前，先核對「這次 native-run 進程實際會採用的模式」
+    # （LBT_NATIVE_BACKTRACK_MODE，與每個 worker 行程 hour_major_provider._resolve_
+    # params 讀到的值同一套解析邏輯）是否與計畫檔一致。native-run 本身不會重新
+    # 規劃工作單元——每個 NativeWorkUnit 的 resolved_max_backtrack_seconds／
+    # pre_window_deposition 已經在 native-plan 階段依當時的模式烤進計畫檔——所以
+    # 這裡的檢查只防止「用一份用模式 A 規劃好的計畫檔，卻在寫進每個結果摘要的
+    # provenance 時貼上模式 B 的標籤」這種誤導；不做這個檢查，計算結果本身仍然
+    # 正確（因為已經烤進計畫檔），但誰都看不出來 provenance 標籤是錯的。
+    plan_backtrack_horizon = payload.get("backtrack_horizon")
+    if plan_backtrack_horizon is not None:
+        plan_effective_mode = plan_backtrack_horizon.get("effective_backtrack_mode")
+        run_effective_mode = native_backtrack_horizon.resolve_backtrack_mode(cli_backtrack_mode=None)
+        raw_ack = os.environ.get("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH")
+        acknowledge_mismatch = bool(raw_ack) and str(raw_ack).strip() not in ("0", "false", "False", "")
+        native_backtrack_horizon.require_mode_acknowledged_if_mismatched(
+            effective_backtrack_mode=run_effective_mode,
+            config_declared_backtrack_mode=plan_effective_mode,
+            acknowledge_config_mode_mismatch=acknowledge_mismatch,
+        )
 
     if not payload.get("is_gap_safe_ready", False) and not args.allow_unsafe_arrivals:
         report = {
@@ -1538,6 +1654,17 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
         type=Path,
         help="可選：正式設定 YAML 路徑，提供時輸出的離開紀錄會額外帶經緯度（由各站所屬" "區域投影反算）",
     )
+    parser.add_argument(
+        "--with-boundary-segments",
+        action="store_true",
+        help=(
+            "WP-17：另外依開放邊界分段（domain／local／open_boundary manifest）統計每站"
+            "（與每站×沉降速度）相對來源權重，寫出 boundary_entry_by_site.*／"
+            "boundary_entry_by_site_settling_velocity.*；需要同時提供 --config，且該設定的"
+            "邊界幾何 manifest 必須可載入，否則 fail closed（不靜默略過這個統計）"
+        ),
+    )
+    parser.add_argument("--formal", action="store_true", help="載入邊界幾何 manifest 時是否要求正式門檻")
     parser.add_argument("--trajectory-sample-size-per-group", type=int, default=24)
     parser.add_argument("--trajectory-sample-seed", type=int, default=0)
     parser.add_argument("--kde-grid-cell-count", type=int, default=64)
@@ -1588,9 +1715,18 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
     identity_table = load_particle_identity_table_npz(args.identity_table)
 
     lonlat_projector: native_postprocess.LonLatProjector | None = None
+    config = None
     if args.config is not None:
         config = load_config(str(args.config), formal_release=False)
         lonlat_projector = _build_native_lonlat_projector(config)
+
+    boundary_geometries = None
+    if args.with_boundary_segments:
+        if config is None:
+            raise ValueError("--with-boundary-segments 必須同時提供 --config")
+        boundary_geometries = manifests.load_boundary_geometries(
+            config, config_path=str(args.config), formal=args.formal
+        )
 
     postprocess_config = native_postprocess.PostprocessConfig(
         trajectory_sample_size_per_group=args.trajectory_sample_size_per_group,
@@ -1603,6 +1739,7 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output,
         config=postprocess_config,
         lonlat_projector=lonlat_projector,
+        boundary_geometries=boundary_geometries,
     )
 
     result_paths = sorted(Path(args.results_dir).glob("*.driver_result.npz"))
@@ -1620,6 +1757,103 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         "particle_count_total": manifest.particle_count_total,
         "status_counts": {str(k): v for k, v in manifest.status_counts.items()},
         "status_descriptions_zh": {str(k): v for k, v in manifest.status_descriptions_zh.items()},
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _native_derive_horizon_parser() -> argparse.ArgumentParser:
+    """建立 ``lbt native-derive-horizon`` parser（WP-17 任務 2：免重跑截斷推導）。
+
+    只讀取既有 ``*.driver_result.npz``，不建構任何網格、不呼叫任何 BayTrace 核心、
+    不查詢任何流場，純陣列切片，因此不需要 ``LBT_BAYTRACE_ROOT``。
+    """
+
+    parser = argparse.ArgumentParser(
+        description="由既有 full_horizon_from_deposition 結果截斷推導較短 (模式, H)，不重跑"
+    )
+    parser.add_argument(
+        "--source-results-dir", required=True, type=Path,
+        help="來源 *.driver_result.npz 所在目錄（必須是 full_horizon_from_deposition 的結果）",
+    )
+    parser.add_argument(
+        "--source-backtrack-mode",
+        required=True,
+        choices=tuple(native_backtrack_horizon.SUPPORTED_BACKTRACK_MODES),
+        help="來源結果實際採用的回溯模式；目前只接受 full_horizon_from_deposition",
+    )
+    parser.add_argument(
+        "--source-horizon-days", required=True, type=float,
+        help="來源結果的 H_src（天）；本命令不會從 .npz 檔重新推算，必須由呼叫端明示",
+    )
+    parser.add_argument(
+        "--target-backtrack-mode",
+        required=True,
+        choices=tuple(native_backtrack_horizon.SUPPORTED_BACKTRACK_MODES),
+    )
+    parser.add_argument(
+        "--target-horizon-days", required=True, type=float,
+        help="目標 H（天），必須 <= --source-horizon-days",
+    )
+    parser.add_argument(
+        "--arrival-manifest", type=Path, default=None,
+        help="target-backtrack-mode=fixed_calendar_window 時必須提供的 arrival.json",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=None,
+        help="target-backtrack-mode=fixed_calendar_window 時必須提供，用來讀取"
+        " bed_residence_time.maximum_age_days／sampling_seed 與驗證 arrival manifest",
+    )
+    parser.add_argument("--formal", action="store_true")
+    parser.add_argument("--output", required=True, type=Path, help="推導結果輸出目錄（必須不存在）")
+    return parser
+
+
+def run_native_derive_horizon_command(argv: Sequence[str] | None = None) -> int:
+    """由既有 ``full_horizon_from_deposition`` 結果截斷推導較短 ``(模式, H)``，見
+    ``native_runner.horizon_derivation`` 模組文件的正確性論證。"""
+
+    args = _native_derive_horizon_parser().parse_args(argv)
+
+    arrivals_by_time_utc_ns: dict[int, Any] | None = None
+    maximum_age_days: int | None = None
+    sampling_seed: int | None = None
+    if args.target_backtrack_mode == native_backtrack_horizon.BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW:
+        if args.arrival_manifest is None or args.config is None:
+            raise ValueError(
+                "--target-backtrack-mode fixed_calendar_window 必須同時提供 --config 與"
+                " --arrival-manifest，才能解析每個到達時刻的沉底年齡"
+            )
+        derive_config = load_config(str(args.config), formal_release=False)
+        bed_residence_time = getattr(derive_config.scenarios, "bed_residence_time", None)
+        if bed_residence_time is None:
+            raise ValueError("--config 沒有啟用 scenarios.bed_residence_time")
+        arrival_records = manifests.load_arrival_manifest(
+            args.arrival_manifest, derive_config, formal=args.formal
+        )
+        arrivals_by_time_utc_ns = {int(record.time_utc_ns): record for record in arrival_records}
+        maximum_age_days = bed_residence_time.maximum_age_days
+        sampling_seed = bed_residence_time.sampling_seed
+
+    manifest = native_horizon_derivation.derive_result_directory(
+        source_results_dir=args.source_results_dir,
+        output_dir=args.output,
+        source_backtrack_mode=args.source_backtrack_mode,
+        source_requested_horizon_days=args.source_horizon_days,
+        target_backtrack_mode=args.target_backtrack_mode,
+        target_requested_horizon_days=args.target_horizon_days,
+        arrivals_by_time_utc_ns=arrivals_by_time_utc_ns,
+        maximum_age_days=maximum_age_days,
+        sampling_seed=sampling_seed,
+    )
+    report = {
+        "output": str(args.output),
+        "unit_count": manifest["unit_count"],
+        "target_backtrack_mode": manifest["target_backtrack_mode"],
+        "target_requested_horizon_days": manifest["target_requested_horizon_days"],
+        "pre_window_unit_count": sum(
+            1 for u in manifest["units"].values() if u["pre_window_deposition"]
+        ),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
@@ -3321,6 +3555,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers.add_parser("native-run", parents=[_native_run_parser()], add_help=False)
     subparsers.add_parser("native-status", parents=[_native_status_parser()], add_help=False)
     subparsers.add_parser("native-postprocess", parents=[_native_postprocess_parser()], add_help=False)
+    subparsers.add_parser(
+        "native-derive-horizon", parents=[_native_derive_horizon_parser()], add_help=False
+    )
     parsed, remainder = parser.parse_known_args(argv)
     # 重新交給共用 handler 解析完整參數，確保獨立與整合 entry point 行為一致。
     command_argv = list(argv if argv is not None else sys.argv[1:])[1:]
@@ -3400,6 +3637,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_native_status(command_argv)
     if parsed.command == "native-postprocess":
         return run_native_postprocess_command(command_argv)
+    if parsed.command == "native-derive-horizon":
+        return run_native_derive_horizon_command(command_argv)
     parser.error(f"未知命令：{parsed.command}; 其餘參數={remainder}")
     return 2
 

@@ -360,7 +360,22 @@ class HourMajorUnitInput:
 
 @dataclass(frozen=True, slots=True)
 class HourMajorSettlingGroupInput:
-    """一個沉降速度分組的合併粒子輸入（可能來自多個到達時刻／測站）。"""
+    """一個沉降速度分組的合併粒子輸入（可能來自多個到達時刻／測站）。
+
+    ``max_backtrack_ns``：WP-17 新增，逐列（逐粒子）回溯時間上限（奈秒）。因為一個
+    分組可能合併多個到達時刻（見 ``arrival_time_utc_ns`` 的說明），而不同到達時刻
+    在 ``fixed_calendar_window`` 模式下可能有不同的沉底年齡、因而有不同的有效回溯
+    時間（``H - age``），所以這個欄位必須是逐列陣列，不能像 ``HourMajorConfig.
+    max_backtrack_seconds`` 一樣只是整個流場區域共用一個純量。值為 ``-1`` 表示
+    「這個單元沒有明示值」（即 WP-17 之前建構、或直接由測試建構、``resolved_max_
+    backtrack_seconds=None`` 的 ``NativeWorkUnit``）——``run_flow_domain_hour_major``
+    在每個小時的回溯上限檢查時，遇到 ``-1`` 才會退回讀取自己收到的
+    ``config.max_backtrack_seconds``（見該函式「步驟 1」），刻意不在
+    ``build_hour_major_domain_batch`` 這裡就烤進退回值：這個函式沒有 ``config``
+    參數，若在這裡就展開退回值，任何呼叫端忘記同步傳入 ``config.max_backtrack_
+    seconds`` 都會被靜默用錯的預設值（``HourMajorConfig()`` 的 class 預設 30 天）
+    覆蓋掉自己實際配置的值，而不是在明顯的地方壞掉。
+    """
 
     settling_velocity_mps: float
     x0_m: np.ndarray
@@ -368,6 +383,7 @@ class HourMajorSettlingGroupInput:
     z0_m: np.ndarray
     seed_hex: np.ndarray
     arrival_time_utc_ns: np.ndarray
+    max_backtrack_ns: np.ndarray
     interest_region_polygons: np.ndarray
     units: tuple[HourMajorUnitInput, ...]
 
@@ -401,18 +417,31 @@ def build_hour_major_domain_batch(
             ``y0_m``／``z0_m``／``seed_hex``）。
         units: 必須全部屬於同一個 ``flow_domain_id``，否則 fail-closed
             拒絕（不同流場區域的粒子必須分開呼叫
-            ``run_flow_domain_hour_major``，本函式不代為合併）。
+            ``run_flow_domain_hour_major``，本函式不代為合併）。呼叫端
+            不應該把 ``unit.pre_window_deposition=True`` 的單元傳進來
+            （見 ``hour_major_provider._run_unit_entrypoint``：這些單元
+            完全不進入小時主軸批次，改用
+            ``backward_driver.build_pre_window_deposition_result`` 直接
+            組出結果）；若真的傳入會 fail-closed 拒絕，避免默默把
+            pre-window 粒子當成一般粒子運算。
         interest_regions: ``{study_site_id: 關注區域多邊形}``，來自
             ``resources.DomainResources.interest_regions``；任何單元的
             ``study_site_id`` 不在這個對照表裡都會 fail-closed 拒絕。
 
     Raises:
         HourMajorError: ``units`` 為空、跨流場區域、到達時刻未精確落在
-            小時邊界，或缺少對應的關注區域多邊形。
+            小時邊界、含 pre-window 單元，或缺少對應的關注區域多邊形。
     """
 
     if not units:
         raise HourMajorError("units 不可為空")
+    for unit in units:
+        if unit.pre_window_deposition:
+            raise HourMajorError(
+                f"單元 {unit.unit_id} 是 pre_window_deposition（固定日曆回溯窗之外的沉底），"
+                "不可送入 build_hour_major_domain_batch；呼叫端必須先過濾掉這些單元，改用"
+                "backward_driver.build_pre_window_deposition_result 直接組出結果"
+            )
 
     domain_ids = {u.flow_domain_id for u in units}
     if len(domain_ids) != 1:
@@ -446,6 +475,7 @@ def build_hour_major_domain_batch(
         z0_parts: list[np.ndarray] = []
         seed_parts: list[np.ndarray] = []
         arrival_parts: list[np.ndarray] = []
+        max_backtrack_parts: list[np.ndarray] = []
         polygon_parts: list[np.ndarray] = []
         unit_inputs: list[HourMajorUnitInput] = []
         cursor = 0
@@ -457,6 +487,12 @@ def build_hour_major_domain_batch(
             z0_parts.append(table.z0_m[rows])
             seed_parts.append(table.seed_hex[rows])
             arrival_parts.append(np.full(n_unit, int(unit.arrival_time_utc_ns), dtype=np.int64))
+            unit_max_backtrack_ns = (
+                int(round(unit.resolved_max_backtrack_seconds * 1.0e9))
+                if unit.resolved_max_backtrack_seconds is not None
+                else -1
+            )
+            max_backtrack_parts.append(np.full(n_unit, unit_max_backtrack_ns, dtype=np.int64))
             polygon = interest_regions[unit.study_site_id]
             polygon_parts.append(np.full(n_unit, polygon, dtype=object))
             unit_inputs.append(
@@ -478,6 +514,7 @@ def build_hour_major_domain_batch(
                 z0_m=np.concatenate(z0_parts),
                 seed_hex=np.concatenate(seed_parts),
                 arrival_time_utc_ns=np.concatenate(arrival_parts),
+                max_backtrack_ns=np.concatenate(max_backtrack_parts),
                 interest_region_polygons=np.concatenate(polygon_parts),
                 units=tuple(unit_inputs),
             )
@@ -767,7 +804,10 @@ def run_flow_domain_hour_major(
     output_interval_ns = int(round(config.output_interval_seconds * 1.0e9))
     if output_interval_ns <= 0:
         raise HourMajorError("output_interval_seconds 必須是正值")
-    max_backtrack_ns = int(round(config.max_backtrack_seconds * 1.0e9))
+    # WP-17：``config.max_backtrack_seconds`` 只在分組的 ``max_backtrack_ns`` 陣列
+    # 有 ``-1`` sentinel（單元沒有明示 per-arrival 解析值）時才當退回值使用，見
+    # ``HourMajorSettlingGroupInput.max_backtrack_ns`` docstring 與步驟 1 的比較。
+    config_max_backtrack_ns = int(round(config.max_backtrack_seconds * 1.0e9))
 
     groups: list[_GroupState] = []
     current_utc = batch.max_arrival_time_utc_ns
@@ -835,7 +875,15 @@ def run_flow_domain_hour_major(
         for group in groups:
             elapsed_ns = group.inp.arrival_time_utc_ns - current_utc
             active = group.native_status == NATIVE_STATUS_ACTIVE
-            capped = active & group.released & (elapsed_ns >= max_backtrack_ns)
+            # WP-17：逐列比較（不是共用純量），讓 ``fixed_calendar_window`` 模式下
+            # 同一分組裡不同到達時刻（不同沉底年齡）各自在自己的有效回溯時間停止；
+            # ``-1`` sentinel（單元沒有明示解析值）退回這次呼叫收到的
+            # ``config.max_backtrack_seconds``，見 ``HourMajorSettlingGroupInput.
+            # max_backtrack_ns`` docstring。
+            unit_cap_ns = np.where(
+                group.inp.max_backtrack_ns >= 0, group.inp.max_backtrack_ns, config_max_backtrack_ns
+            )
+            capped = active & group.released & (elapsed_ns >= unit_cap_ns)
             if np.any(capped):
                 _record_departures(
                     group, np.flatnonzero(capped), status=NATIVE_STATUS_MAX_BACKTRACK, utc_ns=current_utc

@@ -216,7 +216,7 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 在 NFS 上，preview／figure 的 `.complete` 只表示該成果目錄已通過逐檔位元組、manifest、程式指紋與儲存閘門綁定，可供成果 reader 讀取；它不表示粒子 run 完成。run 的生命週期仍以 `run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
 
-`native_runner` 子套件另外提供 `lbt native-plan`／`lbt native-run`／`lbt native-status` 三個子命令，以工作單元（區域、到達時刻、沉降速度、`study_site_id`）為顆粒度做規劃、持續 worker 排程、續跑與失敗隔離，並以量測到的可用記憶體決定 worker 數；到達時刻的缺口安全檢查與重選重用既有 `select_arrival_times`，不是另一套規則。伺服器背景啟動入口見 `scripts/run_native_backtrack_server.sh`；完整工作單元模型、排程策略與已知限制見[native 逆向批次 orchestrator 操作契約](docs/operations/19_native_backward_batch_orchestrator.md)。此路徑目前只涵蓋排程與續跑，尚未整合波浪與後處理，不能取代既有 `run-formal-parallel` 正式母體流程。
+`native_runner` 子套件另外提供 `lbt native-plan`／`lbt native-run`／`lbt native-status`／`lbt native-postprocess`／`lbt native-derive-horizon` 五個子命令，以工作單元（區域、到達時刻、沉降速度、`study_site_id`）為顆粒度做規劃、持續 worker 排程、續跑與失敗隔離，並以量測到的可用記憶體決定 worker 數；到達時刻的缺口安全檢查與重選重用既有 `select_arrival_times`，不是另一套規則；波浪橋接與後處理（離開紀錄、邊界通量／進入統計、條件式來源足跡）皆已接線。`native-plan`／`native-run` 以 `--backtrack-mode`／`LBT_NATIVE_BACKTRACK_MODE`（`full_horizon_from_deposition` 或 `fixed_calendar_window`，預設前者）明確宣告本次實際採用的回溯模式，與設定檔 `bed_residence_time.backtrack_mode` 不一致時 fail closed，須明確加 `--acknowledge-config-mode-mismatch`／`LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1` 才放行；`native-derive-horizon` 可由既有 `full_horizon_from_deposition` 結果免重跑截斷推導出較短 `(模式, H)`。伺服器背景啟動入口見 `scripts/run_native_backtrack_server.sh`；完整工作單元模型、排程策略、回溯模式與已知限制見[native 逆向批次 orchestrator 操作契約](docs/operations/19_native_backward_batch_orchestrator.md)。此路徑仍是獨立於既有 `run-formal-parallel` 的排程／執行實作，不能取代既有正式母體流程。
 
 ## 6. 文件導覽
 
