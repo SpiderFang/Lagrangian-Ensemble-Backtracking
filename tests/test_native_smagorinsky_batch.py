@@ -22,6 +22,7 @@ from lagrangian_backtracking.native_runner.smagorinsky_batch import (
     SmagorinskyGridArrays,
     compute_smagorinsky_kh_field_numba,
     compute_smagorinsky_kh_field_reference,
+    prepare_smagorinsky_grid,
 )
 
 
@@ -266,3 +267,59 @@ def test_degenerate_zero_area_element_does_not_poison_neighbors(handles) -> None
 
     unaffected = np.array([i for i in range(n_nodes) if i not in affected_nodes])
     assert np.array_equal(baseline[:, unaffected], degenerate_result[:, unaffected])
+
+
+# ── 4. WP-16 任務 3：迴圈重排＋權重快取必須與「不快取」路徑逐位元相同 ──────
+
+
+def test_prepared_grid_cache_matches_uncached_bit_identical(handles) -> None:
+    """``prepared=None``（每次呼叫都重算 ascontiguousarray 轉換＋反距離權重，
+    WP-16 任務 3 新增這個參數前的唯一行為）與``prepared=prepare_smagorinsky_
+    grid(...)``（只算一次、重複傳入）必須逐位元相同——這是任務 3「快取只是
+    把同一組運算搬到只呼叫一次，不改變任何數值」的直接證明，兩種路徑內部
+    都是同一個外層 k、內層 i／e 的迴圈重排版本（見
+    ``test_reference_and_numba_agree_bit_identical`` 對純 Python 參考核心
+    的獨立交叉驗證，涵蓋迴圈重排本身的正確性）。多組規模、多組隨機流速，
+    降低「剛好在某個簡單案例碰巧一樣」的疑慮。
+    """
+
+    for nx, ny, nvrt, spacing_m in ((10, 10, 6, 150.0), (24, 24, 12, 100.0), (5, 5, 3, 80.0)):
+        driver_grid = _build_driver_grid(handles, nx=nx, ny=ny, nvrt=nvrt, spacing_m=spacing_m)
+        grid_arrays = _grid_arrays(driver_grid)
+        n_nodes = driver_grid.grid.grid_x.shape[0]
+        rng = np.random.default_rng(nx * 1000 + ny)
+        shape = (nvrt, n_nodes)
+        u2 = rng.uniform(-0.5, 0.5, size=shape)
+        v2 = rng.uniform(-0.5, 0.5, size=shape)
+
+        prepared = prepare_smagorinsky_grid(grid_arrays)
+        uncached = compute_smagorinsky_kh_field_numba(grid_arrays, u_field2=u2, v_field2=v2, horcon=0.2)
+        cached = compute_smagorinsky_kh_field_numba(
+            grid_arrays, u_field2=u2, v_field2=v2, horcon=0.2, prepared=prepared
+        )
+        assert np.array_equal(uncached, cached), (nx, ny, nvrt)
+
+        # 同一份 prepared 重複用在兩組不同流速上，彼此獨立、不互相污染
+        # （prepared 只含網格拓樸資訊，不含任何流場相關的中間狀態）。
+        u2b = rng.uniform(-0.5, 0.5, size=shape)
+        v2b = rng.uniform(-0.5, 0.5, size=shape)
+        cached_b = compute_smagorinsky_kh_field_numba(
+            grid_arrays, u_field2=u2b, v_field2=v2b, horcon=0.2, prepared=prepared
+        )
+        uncached_b = compute_smagorinsky_kh_field_numba(grid_arrays, u_field2=u2b, v_field2=v2b, horcon=0.2)
+        assert np.array_equal(uncached_b, cached_b), (nx, ny, nvrt, "second call")
+        assert not np.array_equal(cached, cached_b), "測試前提：兩組流速應該給出不同結果"
+
+
+def test_prepared_grid_weights_independent_of_horcon_and_velocity(handles) -> None:
+    """``prepare_smagorinsky_grid`` 算出的 ``weights``／``slm`` 只跟網格拓樸
+    有關，換 ``horcon``、換流速都不應該影響它們——這是「可以在網格建立時
+    算一次、跨全部小時與全部沉降分組重複使用」這個快取假設成立的前提。
+    """
+
+    driver_grid = _build_driver_grid(handles, nx=10, ny=10, nvrt=4, spacing_m=150.0)
+    grid_arrays = _grid_arrays(driver_grid)
+    prepared_a = prepare_smagorinsky_grid(grid_arrays)
+    prepared_b = prepare_smagorinsky_grid(grid_arrays)
+    assert np.array_equal(prepared_a.weights, prepared_b.weights)
+    assert np.array_equal(prepared_a.slm, prepared_b.slm)

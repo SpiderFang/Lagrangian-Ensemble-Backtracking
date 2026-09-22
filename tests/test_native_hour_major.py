@@ -860,3 +860,352 @@ def test_hour_major_numba_smagorinsky_impl_runs_and_matches_on_uniform_flow(driv
             results["numba"].unit_results[unit.unit_id],
             label=f"{unit.unit_id} (baytrace vs numba)",
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-16 任務 1：substep_policy（local_cfl／global_cfl）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_hour_major_substep_policy_global_cfl_matches_legacy_default_bit_identical(
+    driver_grid, handles
+) -> None:
+    """``substep_policy="global_cfl"`` 必須與 WP-16 新增這個欄位前的唯一行為
+    （即 ``run_backward_batch`` 一律使用的 ``estimate_substep_count``）逐位元
+    相同——這是「舊行為必須仍可用」驗收標準的直接測試，與
+    ``test_hour_major_diffusion_off_matches_standalone_per_unit`` 用同一組
+    合成情境，只是本測試明確傳入 ``substep_policy="global_cfl"``，不依賴
+    ``HourMajorConfig`` 的預設值恰好是什麼。
+    """
+
+    table, units, interest_regions, _t0 = _build_staggered_domain()
+    resolver = _make_resolver(driver_grid, u=0.03, v=-0.01)
+    config = hm.HourMajorConfig(
+        max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=False, master_seed=123,
+        substep_policy="global_cfl",
+    )
+
+    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, batch, config=config, forcing_resolver=resolver,
+    )
+
+    for unit in units:
+        standalone = _run_unit_standalone(
+            driver_grid, handles, table=table, unit=unit, hm_config=config, resolver=resolver,
+        )
+        _assert_results_bit_identical(result.unit_results[unit.unit_id], standalone, label=unit.unit_id)
+
+
+def test_hour_major_config_rejects_unknown_substep_policy(driver_grid, handles) -> None:
+    table, units, interest_regions, _t0 = _build_staggered_domain()
+    resolver = _make_resolver(driver_grid, u=0.02, v=0.0)
+    config = hm.HourMajorConfig(max_backtrack_seconds=1.0 * 3600.0, substep_policy="quantum_cfl")
+    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    with pytest.raises(hm.HourMajorError, match="substep_policy"):
+        hm.run_flow_domain_hour_major(driver_grid, handles, batch, config=config, forcing_resolver=resolver)
+
+
+def test_estimate_substep_count_local_cfl_matches_global_on_uniform_edge_grid(driver_grid) -> None:
+    """本檔案共用的合成網格是規則直角三角形網格，全部元素邊長相同，因此
+    「只看鄰域」與「看全網格」的最短邊必然相同；活動粒子子集、位置不同，
+    局部版本仍應與全域版本算出完全相同的 ``ndeltp``（不是巧合，是這個
+    網格本身邊長均勻的必然結果，見 ``estimate_substep_count_local_cfl``
+    docstring 對半徑保守性的論證）。
+    """
+
+    n_nodes = _n_nodes(driver_grid)
+    nvrt = int(driver_grid.schism_grid.nvrt)
+    u_field = np.full((nvrt, n_nodes), 0.05)
+    v_field = np.full((nvrt, n_nodes), -0.02)
+
+    spatial_index = bd.build_local_cfl_spatial_index(driver_grid)
+    rng = np.random.default_rng(2026)
+    active_x = rng.uniform(0.0, _DOMAIN_X, size=7)
+    active_y = rng.uniform(0.0, _DOMAIN_Y, size=7)
+
+    ndeltp_global = bd.estimate_substep_count(driver_grid, u_field, v_field, dt_max_seconds=30.0)
+    ndeltp_local = bd.estimate_substep_count_local_cfl(
+        driver_grid, u_field, v_field,
+        active_x=active_x, active_y=active_y, spatial_index=spatial_index,
+        dt_max_seconds=30.0,
+    )
+    assert ndeltp_local == ndeltp_global
+
+
+def test_estimate_substep_count_local_cfl_falls_back_to_dt_max_without_active_particles(driver_grid) -> None:
+    n_nodes = _n_nodes(driver_grid)
+    nvrt = int(driver_grid.schism_grid.nvrt)
+    u_field = np.full((nvrt, n_nodes), 5.0)  # 全網格極快的速度，若被用到 ndeltp 會爆炸大
+    v_field = np.zeros((nvrt, n_nodes))
+    spatial_index = bd.build_local_cfl_spatial_index(driver_grid)
+
+    ndeltp = bd.estimate_substep_count_local_cfl(
+        driver_grid, u_field, v_field,
+        active_x=np.zeros(0), active_y=np.zeros(0), spatial_index=spatial_index,
+        dt_seconds=3600.0, dt_max_seconds=30.0,
+    )
+    assert ndeltp == 120  # ceil(3600/30)，沒有活動粒子時只受 dt_max 限制
+
+
+def _build_mesh_with_tiny_edge(shift_m: float) -> NativeMesh:
+    """在 ``_build_mesh()`` 同一個 10x10 規則網格上，把角落節點 (9,9) 平移到
+    幾乎貼齊節點 (8,9)，人工製造一段極短邊（長度約 ``shift_m``），供
+    WP-16 任務 1「局部 CFL 忽略遠處極小元素、但不忽略鄰近的極小元素」測試
+    使用。其餘 98 個節點與三角化拓樸完全不變。
+    """
+
+    mesh = _build_mesh()
+    node_xy = mesh.node_xy.copy()
+    far_node = _node_index(8, 9)
+    near_node = _node_index(9, 9)
+    node_xy[near_node, 0] = node_xy[far_node, 0] + shift_m
+    node_xy[near_node, 1] = node_xy[far_node, 1]
+    return NativeMesh(
+        node_lon=mesh.node_lon, node_lat=mesh.node_lat, node_xy=node_xy,
+        source_depth_m=mesh.source_depth_m, source_node_bottom_index=mesh.source_node_bottom_index,
+        face_nodes_local=mesh.face_nodes_local, face_node_count=mesh.face_node_count,
+        source_face_global_index=mesh.source_face_global_index, bin_size_m=mesh.bin_size_m,
+    )
+
+
+@pytest.fixture(scope="module")
+def driver_grid_tiny_edge(handles: bd.BayTraceModuleHandles) -> bd.NativeBackwardDriverGrid:
+    mesh = _build_mesh_with_tiny_edge(shift_m=0.02)
+    n_nodes = mesh.node_xy.shape[0]
+    zcor_reference = np.zeros((n_nodes, _NVRT), dtype=np.float64)
+    zcor_reference[:, 0] = -_DP_M
+    zcor_reference[:, 1] = 0.0
+    eta_reference = np.zeros(n_nodes, dtype=np.float64)
+    grid = build_native_grid_arrays(mesh, zcor_reference=zcor_reference, eta_reference=eta_reference)
+    built = bd.build_native_backward_driver_grid(grid, handles, h0=0.0)
+    assert built.ic3_cross_check_ok
+    return built
+
+
+def test_estimate_substep_count_local_cfl_ignores_far_away_tiny_element(driver_grid_tiny_edge) -> None:
+    """節點 (9,9)／(8,9) 之間的極短邊（約 0.02 公尺）把全域版本的 ``ndeltp``
+    推到很大；活動粒子全部位於對角遠處角落（節點 (0,0) 附近）時，局部版本
+    的查詢半徑不該碰到這段極短邊，``ndeltp`` 應該遠小於全域版本、且仍然
+    遠大於 1（確認不是退化成完全不做 CFL 判斷）。
+    """
+
+    n_nodes = _n_nodes(driver_grid_tiny_edge)
+    nvrt = int(driver_grid_tiny_edge.schism_grid.nvrt)
+    u_field = np.full((nvrt, n_nodes), 0.02)
+    v_field = np.full((nvrt, n_nodes), 0.01)
+    spatial_index = bd.build_local_cfl_spatial_index(driver_grid_tiny_edge)
+
+    # 活動粒子集中在左下角，遠離右上角的極短邊（網格對角線約 2545 公尺）。
+    active_x = np.full(5, 50.0)
+    active_y = np.full(5, 50.0)
+
+    ndeltp_global = bd.estimate_substep_count(
+        driver_grid_tiny_edge, u_field, v_field, dt_max_seconds=30.0, cfl_number=0.5,
+    )
+    ndeltp_local = bd.estimate_substep_count_local_cfl(
+        driver_grid_tiny_edge, u_field, v_field,
+        active_x=active_x, active_y=active_y, spatial_index=spatial_index,
+        dt_max_seconds=30.0, cfl_number=0.5,
+    )
+
+    assert ndeltp_local < ndeltp_global / 10.0, (ndeltp_local, ndeltp_global)
+    assert ndeltp_local > 1
+    dtb_local = 3600.0 / ndeltp_local
+    assert dtb_local <= 30.0 * (1.0 + 1.0e-9)
+
+
+def test_estimate_substep_count_local_cfl_matches_global_near_tiny_element(driver_grid_tiny_edge) -> None:
+    """活動粒子就在極短邊旁邊時，局部版本必須偵測到這段極短邊，算出與全域
+    版本相同（或更大，因為查詢半徑外擴＋節點鄰域可能多算幾個更短的候選邊，
+    但不能更小）的 ``ndeltp``——這是局部 CFL 政策「不能漏掉真正危險的小
+    元素」這個安全性要求的直接測試。
+    """
+
+    n_nodes = _n_nodes(driver_grid_tiny_edge)
+    nvrt = int(driver_grid_tiny_edge.schism_grid.nvrt)
+    u_field = np.full((nvrt, n_nodes), 0.02)
+    v_field = np.full((nvrt, n_nodes), 0.01)
+    spatial_index = bd.build_local_cfl_spatial_index(driver_grid_tiny_edge)
+
+    tiny_edge_x = (_NX - 1) * _SPACING_M
+    tiny_edge_y = (_NY - 1) * _SPACING_M
+    active_x = np.full(5, tiny_edge_x)
+    active_y = np.full(5, tiny_edge_y)
+
+    ndeltp_global = bd.estimate_substep_count(
+        driver_grid_tiny_edge, u_field, v_field, dt_max_seconds=30.0, cfl_number=0.5,
+    )
+    ndeltp_local = bd.estimate_substep_count_local_cfl(
+        driver_grid_tiny_edge, u_field, v_field,
+        active_x=active_x, active_y=active_y, spatial_index=spatial_index,
+        dt_max_seconds=30.0, cfl_number=0.5,
+    )
+
+    assert ndeltp_local >= ndeltp_global
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-16 任務 1：局部 CFL 讓 ndeltp 落在 dt_max 下限時，與更細的 ndeltp
+# 相比，粒子最終位置是否仍然「統計等價」（RK4 對平滑流場的收斂性佐證）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_rk4_final_position_converged_at_dt_max_floor_for_smooth_field(driver_grid, handles) -> None:
+    """局部 CFL 政策在活動粒子遠離極小元素時，通常會落在 ``ndeltp=120``
+    （``dt_max_seconds=30`` 的下限）；本測試直接驗證：對一個空間平滑變化
+    （非常數）的流場，``ndeltp=120`` 算出的最終位置，與遠超過 CFL 需要的
+    ``ndeltp=4000``（對照全域版本在含極小元素網格上可能算出的量級，見
+    ``test_estimate_substep_count_local_cfl_ignores_far_away_tiny_element``
+    的實測比例）幾乎相同，差異遠小於粒子這一小時移動的距離——證明「局部
+    CFL 讓 ndeltp 變小」不會犧牲可觀察到的軌跡精度，只是省掉「CFL 條件
+    本來就用不到」的保守子步。
+    """
+
+    n_nodes = _n_nodes(driver_grid)
+    nvrt = int(driver_grid.schism_grid.nvrt)
+    grid_x = driver_grid.grid.grid_x
+    grid_y = driver_grid.grid.grid_y
+
+    # 空間平滑變化（非常數）流場：u/v 隨位置正弦變化，振幅與網格尺度相當，
+    # 確保子步數真的會影響 RK4 對非線性軌跡的積分精度，不是平凡的等速直線。
+    def _smooth_field(x, y):
+        u = 0.05 + 0.03 * np.sin(2.0 * np.pi * x / _DOMAIN_X)
+        v = 0.03 * np.cos(2.0 * np.pi * y / _DOMAIN_Y)
+        return u, v
+
+    u_node, v_node = _smooth_field(grid_x, grid_y)
+    u_field = np.tile(u_node, (nvrt, 1))
+    v_field = np.tile(v_node, (nvrt, 1))
+    w_field = np.zeros((nvrt, n_nodes))
+    eta = np.zeros(n_nodes)
+
+    composed = bd.ComposedFieldPair(
+        u_field1=u_field, v_field1=v_field, w_field1=w_field, eta_field1=eta,
+        u_field2=u_field, v_field2=v_field, w_field2=w_field,
+        node_is_dry=np.zeros(n_nodes, dtype=bool),
+        elem_is_dry=np.zeros(driver_grid.grid.elnode.shape[0], dtype=bool),
+        stokes_ok_fraction=1.0,
+    )
+
+    rng = np.random.default_rng(99)
+    n_particles = 6
+    x0 = rng.uniform(200.0, _DOMAIN_X - 200.0, size=n_particles)
+    y0 = rng.uniform(200.0, _DOMAIN_Y - 200.0, size=n_particles)
+
+    finals = {}
+    for ndeltp in (120, 4000):
+        pa = handles.particle_arrays_cls(n_particles)
+        pa.x[:] = x0
+        pa.y[:] = y0
+        pa.z[:] = -5.0
+        pa.status[:] = 0
+        not_found = bd.locate_initial_elements(
+            driver_grid, handles, pa,
+            eta_m=eta, u_current_mps=u_field, v_current_mps=v_field, w_current_mps=w_field,
+        )
+        assert not np.any(not_found)
+        dtb = 3600.0 / ndeltp
+        bd.mirror_rk4_substep_loop(
+            driver_grid, handles, pa,
+            ibf=-1, ndeltp=ndeltp, dtb=dtb, composed=composed, enable_diffusion=False,
+        )
+        finals[ndeltp] = (pa.x.copy(), pa.y.copy())
+
+    x_coarse, y_coarse = finals[120]
+    x_fine, y_fine = finals[4000]
+    displacement = np.hypot(x_coarse - x0, y_coarse - y0)
+    position_diff = np.hypot(x_coarse - x_fine, y_coarse - y_fine)
+    # RK4 是四階方法，dtb 相差超過 30 倍（30s vs 0.9s）時，離散化誤差差距
+    # 應該是好幾個數量級；用「相對於這一小時實際位移量的比例」當門檻，
+    # 避免與粒子移動速度、網格尺度綁死的絕對公尺數。
+    assert np.all(position_diff < 1.0e-3 * displacement), (position_diff, displacement)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-16 任務 2：substep_loop_impl（numba／python）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_hour_major_substep_loop_impl_python_matches_legacy_default_bit_identical(
+    driver_grid, handles
+) -> None:
+    """``substep_loop_impl="python"`` 必須與 WP-16 新增這個欄位前的唯一行為
+    （``mirror_rk4_substep_loop``）逐位元相同——「舊行為必須仍可用」的直接
+    測試，含擴散啟用（涉及計數器型亂數）與關注區域判定，不只是最簡單的
+    無擴散情境。
+    """
+
+    table, units, interest_regions, _t0 = _build_staggered_domain()
+    resolver = _make_resolver(driver_grid, u=0.02, v=0.01, kh=2.0e-4)
+    config = hm.HourMajorConfig(
+        max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=99,
+        substep_loop_impl="python",
+    )
+
+    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, batch, config=config, forcing_resolver=resolver,
+    )
+
+    for unit in units:
+        standalone = _run_unit_standalone(
+            driver_grid, handles, table=table, unit=unit, hm_config=config, resolver=resolver,
+        )
+        _assert_results_bit_identical(result.unit_results[unit.unit_id], standalone, label=unit.unit_id)
+
+
+def test_hour_major_config_rejects_unknown_substep_loop_impl(driver_grid, handles) -> None:
+    table, units, interest_regions, _t0 = _build_staggered_domain()
+    resolver = _make_resolver(driver_grid, u=0.02, v=0.0)
+    config = hm.HourMajorConfig(max_backtrack_seconds=1.0 * 3600.0, substep_loop_impl="quantum")
+    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    with pytest.raises(hm.HourMajorError, match="substep_loop_impl"):
+        hm.run_flow_domain_hour_major(driver_grid, handles, batch, config=config, forcing_resolver=resolver)
+
+
+def test_hour_major_substep_loop_impl_numba_statistically_equivalent_to_python(driver_grid, handles) -> None:
+    """WP-16 任務 2 的核心驗收：預設 ``substep_loop_impl="numba"`` 與
+    ``"python"`` 在較大規模（較多粒子、較多子步，提高踩到 Box-Muller ulp
+    差異的機率）下，最終粒子狀態、位置、departures 必須統計等價——不要求
+    逐位元相同（見 ``substep_numba.py`` 模組文件差異第 2、3 點），但差異
+    必須遠小於粒子實際移動量級，且離開關注區域的判定幾乎完全一致。
+    """
+
+    table, units, interest_regions, _t0 = _build_staggered_domain(n_per_unit=20)
+    resolver = _make_resolver(driver_grid, u=0.025, v=-0.015, kh=3.0e-4)
+    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+
+    results = {}
+    for impl in ("python", "numba"):
+        config = hm.HourMajorConfig(
+            max_backtrack_seconds=6.0 * 3600.0, enable_diffusion=True, master_seed=2026,
+            substep_loop_impl=impl, dt_max_seconds=5.0,  # 較小 dt_max → 較多子步，較容易踩到 ulp 差異
+        )
+        results[impl] = hm.run_flow_domain_hour_major(
+            driver_grid, handles, batch, config=config, forcing_resolver=resolver,
+        )
+
+    for unit in units:
+        py_result = results["python"].unit_results[unit.unit_id]
+        nb_result = results["numba"].unit_results[unit.unit_id]
+        assert py_result.hours_run == nb_result.hours_run, unit.unit_id
+        assert np.array_equal(py_result.row_particle_index, nb_result.row_particle_index)
+
+        displacement = np.hypot(
+            py_result.final_x_m - py_result.trajectory_x_m[0, :],
+            py_result.final_y_m - py_result.trajectory_y_m[0, :],
+        )
+        position_diff = np.hypot(
+            py_result.final_x_m - nb_result.final_x_m, py_result.final_y_m - nb_result.final_y_m
+        )
+        assert np.all(position_diff < 5.0e-2 * np.maximum(displacement, 1.0)), (
+            unit.unit_id, position_diff.max(), displacement.max(),
+        )
+
+        # 終止狀態碼（離開關注區域／回溯上限／數值失敗等）幾乎必須完全一致；
+        # 只允許極少數（因 ulp 差異剛好落在邊界判定附近）不一致。
+        status_mismatch = int(np.count_nonzero(py_result.final_status != nb_result.final_status))
+        assert status_mismatch <= max(1, int(0.05 * py_result.final_status.shape[0])), (
+            unit.unit_id, status_mismatch,
+        )

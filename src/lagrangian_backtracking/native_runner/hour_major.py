@@ -210,15 +210,18 @@ from .backward_driver import (
     ComposedFieldEndpoint,
     DepartureRecord,
     HourlyOverheadDiagnostics,
+    LocalCflSpatialIndex,
     NativeBackwardDriverGrid,
     SubstepDiagnostics,
     WaveFieldAtNodes,
     apply_settling_velocity,
+    build_local_cfl_spatial_index,
     compose_current_and_stokes_fields,
     compute_smagorinsky_kh_field,
     compute_wet_dry_flags,
     derive_particle_diffusion_seed_lo_hi_u64,
     estimate_substep_count,
+    estimate_substep_count_local_cfl,
     locate_initial_elements,
     mirror_rk4_substep_loop,
     particle_bed_z_levels,
@@ -227,6 +230,7 @@ from .backward_driver import (
 from .forcing_bridge import HourlyFieldPair, UnresolvedForcingGapError
 from .orchestrator import NativeWorkUnit
 from .particle_input import ParticleIdentityTable
+from .substep_numba import mirror_rk4_substep_loop_numba
 
 __all__ = [
     "HourMajorError",
@@ -284,6 +288,24 @@ class HourMajorConfig:
     # ``"baytrace"``＝透過 shim 呼叫 BayTrace 原版 ``_compute_smagorinsky_hf2``（需要與原版
     # 位元相同時使用）。專案決定：預設採運算最快的版本。
     smagorinsky_impl: str = "numba"
+    # WP-16 任務 1：CFL 子步數估計政策。
+    # ``"local_cfl"``（預設）＝``estimate_substep_count_local_cfl``，只看這一小時活動粒子
+    # 鄰域內的元素，對含極小近岸元素的網格遠比全網格版本省子步數（見最終報告量測）；仍保證
+    # ``dtb<=dt_max_seconds``，且行為與統計等價測試證明的舊行為一致（不是位元相同，因為
+    # ``ndeltp`` 本身通常會變小）。
+    # ``"global_cfl"``＝``estimate_substep_count``（WP-5 既有版本，完全未修改），用全網格
+    # 最大速度與最短邊，是本欄位新增前的唯一行為，與新增前逐位元相同，供需要與舊版本比對、
+    # 或不信任局部 CFL 假設的場景使用。
+    substep_policy: str = "local_cfl"
+    # WP-16 任務 2：子步迴圈實作。
+    # ``"numba"``（預設）＝``substep_numba.mirror_rk4_substep_loop_numba``，整個 ndeltp 迴圈
+    # （含計數器型亂數、水平擴散、關注區域判定、對 BayTrace 原版批次核心的呼叫）融合成單一
+    # ``@njit`` 呼叫，消除逐子步的 Python 直譯器開銷；與 ``"python"`` 統計等價但非位元相同
+    # （SplitMix64 整數部分位元相同，Box-Muller 的 log/cos/sin 與關注區域判定的射線法各有
+    # ulp 級／測度為零邊界情況的已知差異，見 substep_numba.py 模組文件與最終報告）。
+    # ``"python"``＝``backward_driver.mirror_rk4_substep_loop``（WP-5 既有版本，完全未修改），
+    # 本欄位新增前的唯一行為，與新增前逐位元相同。
+    substep_loop_impl: str = "numba"
 
 
 def hour_major_config_to_backward_driver_config(
@@ -761,6 +783,32 @@ def run_flow_domain_hour_major(
 
     composed_base_cache: MutableMapping[tuple[int, int], ComposedCurrentAndStokesFields] = {}
     smagorinsky_cache: MutableMapping[int, np.ndarray] = {}
+    # WP-16 任務 1：只跟網格拓樸有關，整個 run_flow_domain_hour_major 呼叫只建立一次，
+    # 跨全部小時重複傳入 estimate_substep_count_local_cfl，見該函式與 LocalCflSpatialIndex
+    # docstring。"global_cfl" 政策不需要這個索引，不建立（省下一次 KD-tree 建構成本）。
+    local_cfl_spatial_index: LocalCflSpatialIndex | None = None
+    if config.substep_policy == "local_cfl":
+        local_cfl_spatial_index = build_local_cfl_spatial_index(driver_grid)
+    elif config.substep_policy != "global_cfl":
+        raise HourMajorError(
+            f"substep_policy 必須是 'local_cfl' 或 'global_cfl'，收到 {config.substep_policy!r}"
+        )
+
+    # WP-16 任務 3：Smagorinsky 的反距離權重與網格陣列轉換只跟網格拓樸有關，
+    # 整個 run_flow_domain_hour_major 呼叫只準備一次，跨全部小時重複傳入
+    # compute_smagorinsky_kh_field，見 smagorinsky_batch.SmagorinskyPreparedGrid
+    # docstring。只在啟用擴散且採用 numba 實作時才需要建立。
+    smagorinsky_prepared_grid = None
+    if config.enable_diffusion and config.smagorinsky_impl == "numba":
+        from .smagorinsky_batch import SmagorinskyGridArrays, prepare_smagorinsky_grid
+
+        _sg = driver_grid.schism_grid
+        smagorinsky_prepared_grid = prepare_smagorinsky_grid(
+            SmagorinskyGridArrays(
+                elnode=_sg.elnode, area=_sg.area, dldxy=_sg.dldxy, nne=_sg.nne, indel=_sg.indel,
+                x=_sg.x, y=_sg.y, xctr=_sg.xctr, yctr=_sg.yctr,
+            )
+        )
     domain_overhead = HourlyOverheadDiagnostics()
     kernel_call_count = 0
 
@@ -846,7 +894,9 @@ def run_flow_domain_hour_major(
                     progress.trajectory_status.append(group.native_status[start:stop].copy())
 
             t0 = _time.perf_counter()
-            node_is_dry_check, _ = compute_wet_dry_flags(driver_grid, handles, eta_m=field_pair.eta_field1)
+            node_is_dry_check, elem_is_dry_check = compute_wet_dry_flags(
+                driver_grid, handles, eta_m=field_pair.eta_field1
+            )
             hour_overhead.time_wet_dry_check_s += _time.perf_counter() - t0
             gap_detected = False
             try:
@@ -913,6 +963,13 @@ def run_flow_domain_hour_major(
                         stokes_pool=stokes_pool,
                         stokes_worker_count=stokes_worker_count,
                         field1_reuse_candidate=reuse_candidate,
+                        # WP-15 任務 A.3：主迴圈剛才已經用同一個
+                        # field_pair.eta_field1 算過一次乾濕旗標（上面的
+                        # node_is_dry_check／elem_is_dry_check，用於未登錄
+                        # 缺口檢查），這裡直接重用，省下第二次全網格乾濕
+                        # 判定（見 compose_current_and_stokes_fields 的
+                        # precomputed_wet_dry_flags 參數 docstring）。
+                        precomputed_wet_dry_flags=(node_is_dry_check, elem_is_dry_check),
                     )
                     hour_overhead.time_compose_base_s += _time.perf_counter() - t0
                     hour_overhead.compose_base_cache_misses += 1
@@ -933,10 +990,31 @@ def run_flow_domain_hour_major(
                 prev_field2_identity = _field2_identity(field_pair, has_wave=has_wave)
 
                 t0 = _time.perf_counter()
-                ndeltp = estimate_substep_count(
-                    driver_grid, base.u_field1, base.v_field1,
-                    dt_seconds=3600.0, dt_max_seconds=config.dt_max_seconds, cfl_number=config.cfl_number,
-                )
+                if config.substep_policy == "local_cfl":
+                    assert local_cfl_spatial_index is not None  # 見上方建構區塊
+                    # WP-16 任務 1：同一小時內所有分組共用同一個 ndeltp（全域同步時鐘不變，
+                    # 見任務書），因此活動粒子位置要跨「全部」分組合併，不是只看某一個分組。
+                    active_x_parts = [g.pa.x[g.pa.status == 1] for g in groups]
+                    active_y_parts = [g.pa.y[g.pa.status == 1] for g in groups]
+                    active_x = (
+                        np.concatenate(active_x_parts) if active_x_parts else np.zeros(0, dtype=np.float64)
+                    )
+                    active_y = (
+                        np.concatenate(active_y_parts) if active_y_parts else np.zeros(0, dtype=np.float64)
+                    )
+                    ndeltp = estimate_substep_count_local_cfl(
+                        driver_grid, base.u_field1, base.v_field1,
+                        active_x=active_x, active_y=active_y,
+                        spatial_index=local_cfl_spatial_index,
+                        dt_seconds=3600.0, dt_max_seconds=config.dt_max_seconds,
+                        cfl_number=config.cfl_number,
+                    )
+                else:
+                    ndeltp = estimate_substep_count(
+                        driver_grid, base.u_field1, base.v_field1,
+                        dt_seconds=3600.0, dt_max_seconds=config.dt_max_seconds,
+                        cfl_number=config.cfl_number,
+                    )
                 hour_overhead.time_substep_count_s += _time.perf_counter() - t0
                 dtb = 3600.0 / ndeltp
                 hour_start_utc = current_utc
@@ -958,6 +1036,7 @@ def run_flow_domain_hour_major(
                             u_current_mps=u_smag, v_current_mps=v_smag,
                             horcon=config.horcon,
                             use_numba=config.smagorinsky_impl == "numba",
+                            smagorinsky_prepared_grid=smagorinsky_prepared_grid,
                         )
                         hour_overhead.time_smagorinsky_s += _time.perf_counter() - t0
                         hour_overhead.smagorinsky_cache_misses += 1
@@ -1266,6 +1345,67 @@ def _dispatch_departure_records(group: _GroupState, records: Sequence[DepartureR
                 break
 
 
+def _mirror_rk4_substep_loop_dispatch(
+    driver_grid: NativeBackwardDriverGrid,
+    handles: BayTraceModuleHandles,
+    pa: Any,
+    *,
+    config: HourMajorConfig,
+    ibf: int,
+    ndeltp: int,
+    dtb: float,
+    composed: Any,
+    enable_diffusion: bool,
+    hf1_field: np.ndarray | None,
+    hf2_field: np.ndarray | None,
+    particle_seed_lo: np.ndarray,
+    particle_seed_hi: np.ndarray,
+    particle_step_counter: np.ndarray,
+    native_status: np.ndarray,
+    substep_utc_ns: Callable[[int], int],
+    interest_region_polygons: np.ndarray,
+    departures: list[DepartureRecord],
+) -> SubstepDiagnostics:
+    """WP-16 任務 2：依 ``config.substep_loop_impl`` 選擇子步迴圈實作。
+
+    兩個呼叫端（``_run_group_hour`` 的「單次呼叫」與「拆成新到達／延續中
+    兩次呼叫」分支）共用同一個參數組合，這裡集中一次，避免兩處分岔各自
+    重複 if/else。
+    """
+
+    if config.substep_loop_impl == "python":
+        return mirror_rk4_substep_loop(
+            driver_grid, handles, pa,
+            ibf=ibf, ndeltp=ndeltp, dtb=dtb, composed=composed,
+            enable_diffusion=enable_diffusion,
+            hf1_field=hf1_field, hf2_field=hf2_field,
+            particle_seed_lo=particle_seed_lo,
+            particle_seed_hi=particle_seed_hi,
+            particle_step_counter=particle_step_counter,
+            native_status=native_status,
+            substep_utc_ns=substep_utc_ns,
+            interest_region_polygons=interest_region_polygons,
+            departures=departures,
+        )
+    if config.substep_loop_impl == "numba":
+        return mirror_rk4_substep_loop_numba(
+            driver_grid, handles, pa,
+            ibf=ibf, ndeltp=ndeltp, dtb=dtb, composed=composed,
+            enable_diffusion=enable_diffusion,
+            hf1_field=hf1_field, hf2_field=hf2_field,
+            particle_seed_lo=particle_seed_lo,
+            particle_seed_hi=particle_seed_hi,
+            particle_step_counter=particle_step_counter,
+            native_status=native_status,
+            substep_utc_ns=substep_utc_ns,
+            interest_region_polygons=interest_region_polygons,
+            departures=departures,
+        )
+    raise HourMajorError(
+        f"substep_loop_impl 必須是 'python' 或 'numba'，收到 {config.substep_loop_impl!r}"
+    )
+
+
 def _run_group_hour(
     driver_grid: NativeBackwardDriverGrid,
     handles: BayTraceModuleHandles,
@@ -1307,8 +1447,9 @@ def _run_group_hour(
         if config.enable_diffusion:
             hf1_now = group.prev_hf2 if prev_hf2_fresh else hf2_now
         departures: list[DepartureRecord] = []
-        mirror_rk4_substep_loop(
+        _mirror_rk4_substep_loop_dispatch(
             driver_grid, handles, group.pa,
+            config=config,
             ibf=-1, ndeltp=ndeltp, dtb=dtb, composed=composed,
             enable_diffusion=config.enable_diffusion,
             hf1_field=hf1_now, hf2_field=hf2_now,
@@ -1345,8 +1486,9 @@ def _run_group_hour(
         group.pa.status[other_active] = 0
         departures = []
         try:
-            mirror_rk4_substep_loop(
+            _mirror_rk4_substep_loop_dispatch(
                 driver_grid, handles, group.pa,
+                config=config,
                 ibf=-1, ndeltp=ndeltp, dtb=dtb, composed=composed,
                 enable_diffusion=config.enable_diffusion,
                 hf1_field=hf1_now, hf2_field=hf2_now,

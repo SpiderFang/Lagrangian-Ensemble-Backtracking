@@ -648,3 +648,65 @@ run --resource-provider` 的正式接線）依環境變數在每個 worker 子�
 `reports/WP-13.md`「任務 2」一節；`stokes_pool` 參數本身保留在
 `backward_driver.py`／`hour_major.py`，供未來有更安全的方式建立/取得子行程池（例如頂層
 建立、不巢狀在 worker 之內）時直接使用，不需要重新設計介面。
+
+## 9.11 WP-16：局部 CFL 子步政策與 Numba 融合子步迴圈
+
+完整設計理由、ULP／邊界量測數字與誠實揭露的限制見 `reports/WP-16.md`；本節只記錄對
+本文件既有操作介面與成本模型的影響。
+
+### 9.11.1 `HourMajorConfig` 新增兩個欄位（有安全預設、舊行為可切回）
+
+- `substep_policy: str = "local_cfl"`：子步數估計的空間範圍。`"local_cfl"`（新預設）只用
+  作用中粒子鄰近範圍（半徑＝本小時全網格最大速度 × 3600 秒 × 安全係數）內的最小邊長估計
+  子步數，而不是像舊版 `"global_cfl"` 一樣用**整個網格**的最小邊長（往往被單一個離岸邊很遠
+  的極小近岸元素拖累，逼出遠超實際需要的子步數）。`"global_cfl"` 保留、與 WP-16 之前逐位元
+  相同，供比較與除錯用。未知字串值 fail-closed 直接拋 `HourMajorError`。
+- `substep_loop_impl: str = "numba"`：子步迴圈的實作路徑。`"numba"`（新預設）把計數器型亂數
+  （SplitMix64＋Box-Muller）、水平擴散、interest region 點在多邊形內判定（`njit` 射線法取代
+  Shapely）、狀態更新等整段子步迴圈融合進單一 `njit` 函式（`substep_numba.py`）；`"python"`
+  保留舊版逐步呼叫路徑、與 WP-16 之前逐位元相同。未知字串值同樣 fail-closed。
+- 兩個新欄位互相獨立，可以任意組合（例如單獨測 `local_cfl`＋`python`
+  隔離子步數估計本身的效果，不受迴圈實作影響）。
+
+### 9.11.2 對 9.10.2 成本模型／`seconds_per_node_layer_hour` 校準的影響（需要重新校準）
+
+9.10.2 節的成本模型把每小時成本拆成「底場合成」（`seconds_per_node_layer_hour`，只跟節點
+×層數×小時數有關）與「粒子子步」（`seconds_per_particle_substep`，原本因為在舊有量測規模
+下佔比可忽略而刻意保留但不重要）兩項。WP-16 的量測（見 `reports/WP-16.md` 第 4 節）顯示：
+
+1. `seconds_per_node_layer_hour`（底場合成，含乾濕＋Stokes＋Smagorinsky）的**校準值本身
+   大致不受 WP-16 影響**——`compose_current_and_stokes_fields`／`compute_smagorinsky_kh_field`
+   沒有被本次工作包修改運算內容，只是 Smagorinsky 的記憶體存取順序與快取被優化（見 9.11.3），
+   在正式 56 核心伺服器上會比沙箱量到的略快，但量級不變。
+2. **`seconds_per_particle_substep` 這一項不能再視為可忽略**：在有真實近岸極細網格的區域
+   （近岸元素邊長可能只有 0.1-1 公尺量級），舊版 `global_cfl` 政策會把子步數逼到每小時數千
+   （沙箱重現到 4,250 子步/小時量級），子步迴圈成本因而主導整個小時成本（NE 67,600 節點
+   M=1 情境下，`global_cfl`＋Python 逐步路徑的子步迴圈本身佔了實測 80,816.90 ms/小時裡
+   絕大部分）。改成 `local_cfl`＋Numba 融合迴圈後，子步數大幅下降、迴圈本身也更快，底場合成
+   的固定開銷佔比因此從次要反而變成相對顯著（NE M=1 新版下約 22%，M=10 下約 4%，見
+   `reports/WP-16.md` 第 6 節），但**新版子步迴圈成本本身仍是總成本的主要部分**（92%，
+   NE M=10 量測），只是量級遠低於舊版。
+3. **正式部署前，9.10.2 節「用 `--seconds-per-node-layer-hour` 覆寫成伺服器上實測的常數」
+   這件事必須用新版（`local_cfl`＋`numba`）的組態重新量測**；用舊版量出的常數（若曾經量過）
+   會嚴重低估底場合成佔比、也不會反映新的子步數量級，因為新舊兩版的子步數差距可以達到
+   30-40 倍。`orchestrator.estimate_hour_major_unit_cost_seconds` 的
+   `seconds_per_particle_substep` 校準值同樣需要用新版量測值更新，本次工作包沒有把新常數
+   寫回 `orchestrator.py` 的預設值（範圍在 `hour_major.py`／`backward_driver.py`／
+   `smagorinsky_batch.py`，不在可編輯檔案清單內的 `orchestrator.py`），留給下一個接觸排程
+   成本模型的工作包處理，見 `reports/WP-16.md`「沒把握的部分」。
+
+### 9.11.3 Smagorinsky 記憶體存取順序與逐小時快取（不改變任何數值，只改快取與走訪順序）
+
+`smagorinsky_batch.py` 新增 `SmagorinskyPreparedGrid`／`prepare_smagorinsky_grid`：把節點
+反距離權重與網格陣列轉換從「每小時重算一次」改成「網格建立時算一次、小時迴圈內重複使用」，
+並把 `_smagorinsky_element_strain_numba`／`_smagorinsky_node_average_numba` 的內層迴圈順序從
+「每節點/元素內層跑 k（層數）」改成「外層跑 k、內層跑節點/元素」，配合陣列 `(nvrt, n)` 的
+C-order 記憶體佈局改善快取局部性。`hour_major.py` 在啟用擴散且 `smagorinsky_impl=="numba"`
+時，於小時迴圈開始前建立一次 `smagorinsky_prepared_grid`，往後每小時呼叫
+`compute_smagorinsky_kh_field` 時傳入複用。**逐位元驗證**：`prepared=None`（即時計算，行為
+與 WP-16 之前完全相同）與傳入預先建好的 `SmagorinskyPreparedGrid` 兩種路徑，在多種網格規模
+與隨機流場下輸出逐位元相同（`tests/test_native_smagorinsky_batch.py::
+test_prepared_grid_cache_matches_uncached_bit_identical`）。**已知限制**：`run_backward_batch`
+（第 1-8 節的逐工作單元路徑）目前**沒有**接上 `smagorinsky_prepared_grid` 快取，只有
+`run_flow_domain_hour_major`（小時主軸路徑）接了；逐工作單元路徑仍然每次呼叫都即時計算
+（`prepared=None` 的預設行為），數值不受影響，只是少了這個小節省。

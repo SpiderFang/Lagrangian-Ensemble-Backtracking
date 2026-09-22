@@ -65,6 +65,8 @@ from numba import njit
 
 __all__ = [
     "SmagorinskyGridArrays",
+    "SmagorinskyPreparedGrid",
+    "prepare_smagorinsky_grid",
     "compute_smagorinsky_kh_field_reference",
     "compute_smagorinsky_kh_field_numba",
 ]
@@ -203,67 +205,79 @@ def _smagorinsky_element_strain_numba(
     hvis_e_out: np.ndarray,
 ) -> None:
     """元素級應變率（原版 ``_compute_smagorinsky_hf2`` 步驟 1，
-    ``tracker.py`` 1397-1420 行）。逐元素、逐層計算，運算式與求和順序
+    ``tracker.py`` 1397-1420 行）。逐層、逐元素計算，運算式與求和順序
     （``u1*d0 + u2*d1 + u3*d2``，逐項相加，非另外分組）逐行對應原版。
+
+    WP-16 任務 3（記憶體存取順序）：外層改成 ``k``（垂直層）、內層
+    ``e``（元素），原因見 ``_smagorinsky_node_average_numba`` docstring
+    同一節的完整說明——``hvis_e_out`` 是 ``(nvrt, ne)`` C 順序陣列，外層
+    ``k`` 內層 ``e`` 讓對它的寫入在內層迴圈裡連續（stride 8 bytes），不是
+    每次疊代跳一個 ``ne`` 元素的長度（stride 約 ``ne*8`` bytes，在 ``ne``
+    很大時遠超過 CPU cache line、甚至 L1/L2 大小）。每個輸出值
+    ``hvis_e_out[k, e]`` 的運算式與加總順序完全不變（每個 ``(e,k)`` 組合
+    本來就是互相獨立的純量計算，不依賴其他組合算過沒有、算的順序為何），
+    因此與迴圈重排前的版本**逐位元相同**（不是「數值上等價」，是同一段
+    運算式换了一個跑的順序，見 ``tests/test_native_smagorinsky_batch.py``
+    的 ``test_loop_reorder_and_weight_cache_bit_identical_to_legacy_numba``）。
     """
 
     ne = elnode.shape[0]
     nvrt = u_field2.shape[0]
-    for e in range(ne):
-        n1 = elnode[e, 0]
-        n2 = elnode[e, 1]
-        n3 = elnode[e, 2]
-        area_abs = abs(area[e])
-        d00 = dldxy[0, 0, e]
-        d01 = dldxy[0, 1, e]
-        d10 = dldxy[1, 0, e]
-        d11 = dldxy[1, 1, e]
-        d20 = dldxy[2, 0, e]
-        d21 = dldxy[2, 1, e]
-        for k in range(nvrt):
-            u1 = u_field2[k, n1]
-            u2 = u_field2[k, n2]
-            u3 = u_field2[k, n3]
-            v1 = v_field2[k, n1]
-            v2 = v_field2[k, n2]
-            v3 = v_field2[k, n3]
-            dudx = u1 * d00 + u2 * d10 + u3 * d20
-            dudy = u1 * d01 + u2 * d11 + u3 * d21
-            dvdx = v1 * d00 + v2 * d10 + v3 * d20
-            dvdy = v1 * d01 + v2 * d11 + v3 * d21
+    n1 = elnode[:, 0]
+    n2 = elnode[:, 1]
+    n3 = elnode[:, 2]
+    area_abs = np.abs(area)
+    d00 = dldxy[0, 0, :]
+    d01 = dldxy[0, 1, :]
+    d10 = dldxy[1, 0, :]
+    d11 = dldxy[1, 1, :]
+    d20 = dldxy[2, 0, :]
+    d21 = dldxy[2, 1, :]
+    for k in range(nvrt):
+        for e in range(ne):
+            u1 = u_field2[k, n1[e]]
+            u2 = u_field2[k, n2[e]]
+            u3 = u_field2[k, n3[e]]
+            v1 = v_field2[k, n1[e]]
+            v2 = v_field2[k, n2[e]]
+            v3 = v_field2[k, n3[e]]
+            dudx = u1 * d00[e] + u2 * d10[e] + u3 * d20[e]
+            dudy = u1 * d01[e] + u2 * d11[e] + u3 * d21[e]
+            dvdx = v1 * d00[e] + v2 * d10[e] + v3 * d20[e]
+            dvdy = v1 * d01[e] + v2 * d11[e] + v3 * d21[e]
             strain = np.sqrt(dudx * dudx + dvdy * dvdy + 0.5 * (dudy + dvdx) ** 2)
-            hvis_e_out[k, e] = horcon * area_abs * strain
+            hvis_e_out[k, e] = horcon * area_abs[e] * strain
 
 
 @njit(cache=True)
-def _smagorinsky_node_average_numba(
+def _smagorinsky_node_weights_numba(
     nne: np.ndarray,
     indel: np.ndarray,
     x: np.ndarray,
     y: np.ndarray,
     xctr: np.ndarray,
     yctr: np.ndarray,
-    hvis_e: np.ndarray,
-    hf2_field_out: np.ndarray,
+    weights_out: np.ndarray,
+    slm_out: np.ndarray,
 ) -> None:
-    """節點級反距離加權平均（原版步驟 2，``tracker.py`` 1428-1441 行）。
+    """WP-16 任務 3：把原本每小時都在 ``_smagorinsky_node_average_numba``
+    內重算一次的反距離權重（``weights``）與其總和（``slm``），搬到只跟
+    網格拓樸有關的「準備」階段算一次——這兩者完全不依賴流場／時刻，見
+    模組 docstring 與 ``SmagorinskyPreparedGrid``。
 
-    這是原版效能瓶頸所在（``n_nodes * nvrt`` 個 Python 迴圈疊代、各自呼叫
-    一次極小陣列的 ``np.dot``），本函式把同一組運算式搬進 njit 迴圈，
-    權重計算與內積求和順序（``for j in range(nn): total += hvis_e[k,elem]
-    *weight[j]``，逐項循序相加）逐行對應原版 ``np.dot`` 想表達的內積定義；
-    **是否與原版 NumPy／BLAS 實際執行的求和順序逐位元相同，由呼叫端的
-    測試實測決定，本函式不自行假設**（見模組 docstring「位元相同性」
-    一節）。
+    運算式、疊代順序（``for j in range(nn)``，逐項計算＋累加 ``slm``）與
+    原本內嵌在 ``_smagorinsky_node_average_numba`` 裡的版本逐行相同，只是
+    搬到獨立函式、只呼叫一次；``weights_out`` 的 shape 是
+    ``(max_nei, n_nodes)``，未用到的列（``j>=nn``）保持呼叫端傳入的初始值
+    （呼叫端負責先歸零，見 ``prepare_smagorinsky_grid``），不會被讀取
+    （``_smagorinsky_node_average_numba`` 只讀 ``weights[:nn]``）。
     """
 
     n_nodes = x.shape[0]
-    nvrt = hvis_e.shape[0]
-    max_nei = indel.shape[0]
-    weights = np.empty(max_nei, dtype=np.float64)
     for i in range(n_nodes):
         nn = nne[i]
         if nn == 0:
+            slm_out[i] = 0.0
             continue
         xi = x[i]
         yi = y[i]
@@ -276,32 +290,102 @@ def _smagorinsky_node_average_numba(
             if rl < 1.0e-10:
                 rl = 1.0e-10
             w = 1.0 / rl
-            weights[j] = w
+            weights_out[j, i] = w
             slm += w
-        if slm > 0.0:
-            for k in range(nvrt):
-                total = 0.0
-                for j in range(nn):
-                    e = indel[j, i]
-                    total += hvis_e[k, e] * weights[j]
-                hf2_field_out[k, i] = total / slm
+        slm_out[i] = slm
 
 
-def compute_smagorinsky_kh_field_numba(
-    grid: SmagorinskyGridArrays,
-    *,
-    u_field2: np.ndarray,
-    v_field2: np.ndarray,
-    horcon: float,
-) -> np.ndarray:
-    """``compute_smagorinsky_kh_field_reference`` 的 Numba 批次版本，
-    參數與回傳語意完全相同，供 ``backward_driver.compute_smagorinsky_
-    kh_field`` 視測試結果決定要不要接線使用（見該函式 ``use_numba``
-    參數與模組層級「位元相同性」說明）。
+@njit(cache=True)
+def _smagorinsky_node_average_numba(
+    nne: np.ndarray,
+    indel: np.ndarray,
+    weights: np.ndarray,
+    slm: np.ndarray,
+    hvis_e: np.ndarray,
+    hf2_field_out: np.ndarray,
+) -> None:
+    """節點級反距離加權平均（原版步驟 2，``tracker.py`` 1428-1441 行）。
 
-    分兩個 ``@njit`` 函式呼叫（``_smagorinsky_element_strain_numba``／
-    ``_smagorinsky_node_average_numba``），對應原版的兩個步驟，中間的
-    ``hvis_e`` 中繼陣列由本函式配置、傳遞，呼叫端看不到這個細節。
+    這是原版效能瓶頸所在（``n_nodes * nvrt`` 個 Python 迴圈疊代、各自呼叫
+    一次極小陣列的 ``np.dot``），本函式把同一組運算式搬進 njit 迴圈，
+    內積求和順序（``for j in range(nn): total += hvis_e[k,elem]
+    *weight[j]``，逐項循序相加）逐行對應原版 ``np.dot`` 想表達的內積定義；
+    **是否與原版 NumPy／BLAS 實際執行的求和順序逐位元相同，由呼叫端的
+    測試實測決定，本函式不自行假設**（見模組 docstring「位元相同性」
+    一節，本節比較的對象是 BayTrace 原版）。
+
+    WP-16 任務 3（兩項優化，均與本函式重寫前的版本逐位元相同）：
+
+    1. **權重快取**：``weights``／``slm`` 改由呼叫端傳入（
+       ``_smagorinsky_node_weights_numba`` 只在網格建立時算一次），本函式
+       不再每次呼叫都重算——權重與 ``slm`` 只跟節點座標、元素形心座標、
+       鄰接關係有關，這些在整個 run 期間不會變，重算是純粹浪費。
+    2. **迴圈重排**：外層 ``k``（垂直層）、內層 ``i``（節點），原因是
+       ``hvis_e``／``hf2_field_out`` 都是 ``(nvrt, n_nodes)`` C 順序陣列：
+       若外層是 ``i``、內層是 ``k``（重排前的寫法），``hf2_field_out[k,i]``
+       在內層迴圈裡的寫入位置每次跳 ``n_nodes`` 個元素（stride 約
+       ``n_nodes*8`` bytes），對大網格（例如 67,593 節點）遠超過典型 CPU
+       cache line（64 bytes）甚至 L1/L2 cache 大小，每次寫入都可能是一次
+       cache miss；`hvis_e[k,e]` 的讀取同理受影響。外層 ``k``、內層 ``i``
+       讓這兩個陣列在內層迴圈裡的存取都連續，大幅降低記憶體頻寬需求
+       （多程序／多核心同時跑時尤其重要，見最終報告）。每個輸出值
+       ``hf2_field_out[k,i]`` 的運算式與加總順序完全不變（同一個 ``(k,i)``
+       組合的 ``total`` 累加序列與重排前逐項相同，只是「哪個組合先算」
+       這個跟輸出值本身完全無關的順序變了），因此是逐位元相同的重排，不是
+       近似或改變數值行為，見
+       ``tests/test_native_smagorinsky_batch.py`` 的
+       ``test_loop_reorder_and_weight_cache_bit_identical_to_legacy_numba``。
+    """
+
+    n_nodes = weights.shape[1]
+    nvrt = hvis_e.shape[0]
+    for k in range(nvrt):
+        for i in range(n_nodes):
+            nn = nne[i]
+            if nn == 0 or slm[i] <= 0.0:
+                continue
+            total = 0.0
+            for j in range(nn):
+                e = indel[j, i]
+                total += hvis_e[k, e] * weights[j, i]
+            hf2_field_out[k, i] = total / slm[i]
+
+
+@dataclass(frozen=True, slots=True)
+class SmagorinskyPreparedGrid:
+    """WP-16 任務 3：``compute_smagorinsky_kh_field_numba`` 的「準備後」快取。
+
+    全部欄位只跟網格拓樸有關（不含任何流場、時刻資訊），只需要在網格
+    建立後由 ``prepare_smagorinsky_grid`` 算一次；呼叫端（
+    ``backward_driver.compute_smagorinsky_kh_field``／``hour_major.py``）
+    應該在整個 run 開始時建立一次、跨全部小時重複傳入
+    ``compute_smagorinsky_kh_field_numba``，不要每小時重建（見模組
+    docstring 與最終報告「反距離權重與陣列轉換只在網格建立時算一次」的
+    量測）。
+
+    ``elnode``／``area``／``dldxy``／``nne``／``indel``／``x``／``y``／
+    ``xctr``／``yctr`` 是 ``SmagorinskyGridArrays`` 對應欄位轉成
+    njit 需要的 dtype／contiguous 版本（只做一次，避免每小時呼叫都重複
+    ``np.ascontiguousarray``）；``weights``／``slm`` 是
+    ``_smagorinsky_node_weights_numba`` 算出的反距離權重與其總和。
+    """
+
+    elnode: np.ndarray
+    area: np.ndarray
+    dldxy: np.ndarray
+    nne: np.ndarray
+    indel: np.ndarray
+    x: np.ndarray
+    y: np.ndarray
+    xctr: np.ndarray
+    yctr: np.ndarray
+    weights: np.ndarray
+    slm: np.ndarray
+
+
+def prepare_smagorinsky_grid(grid: SmagorinskyGridArrays) -> SmagorinskyPreparedGrid:
+    """把 ``SmagorinskyGridArrays`` 轉成 ``SmagorinskyPreparedGrid``，只依賴
+    網格拓樸，呼叫端只應該呼叫一次（見該類別 docstring）。
     """
 
     elnode = np.ascontiguousarray(grid.elnode[:, :3], dtype=np.int64)
@@ -313,16 +397,64 @@ def compute_smagorinsky_kh_field_numba(
     y = np.ascontiguousarray(grid.y, dtype=np.float64)
     xctr = np.ascontiguousarray(grid.xctr, dtype=np.float64)
     yctr = np.ascontiguousarray(grid.yctr, dtype=np.float64)
+
+    max_nei = indel.shape[0]
+    n_nodes = x.shape[0]
+    weights = np.zeros((max_nei, n_nodes), dtype=np.float64)
+    slm = np.zeros(n_nodes, dtype=np.float64)
+    _smagorinsky_node_weights_numba(nne, indel, x, y, xctr, yctr, weights, slm)
+
+    return SmagorinskyPreparedGrid(
+        elnode=elnode, area=area, dldxy=dldxy, nne=nne, indel=indel,
+        x=x, y=y, xctr=xctr, yctr=yctr, weights=weights, slm=slm,
+    )
+
+
+def compute_smagorinsky_kh_field_numba(
+    grid: SmagorinskyGridArrays,
+    *,
+    u_field2: np.ndarray,
+    v_field2: np.ndarray,
+    horcon: float,
+    prepared: SmagorinskyPreparedGrid | None = None,
+) -> np.ndarray:
+    """``compute_smagorinsky_kh_field_reference`` 的 Numba 批次版本，
+    參數與回傳語意完全相同，供 ``backward_driver.compute_smagorinsky_
+    kh_field`` 視測試結果決定要不要接線使用（見該函式 ``use_numba``
+    參數與模組層級「位元相同性」說明）。
+
+    分兩個 ``@njit`` 函式呼叫（``_smagorinsky_element_strain_numba``／
+    ``_smagorinsky_node_average_numba``），對應原版的兩個步驟，中間的
+    ``hvis_e`` 中繼陣列由本函式配置、傳遞，呼叫端看不到這個細節。
+
+    Args:
+        prepared: WP-16 任務 3 新增。``None``（預設）：完全不變，本函式
+            自己對 ``grid`` 做一次 ``ascontiguousarray`` 轉換＋權重計算
+            （與本參數新增前的唯一行為逐位元相同，只是每次呼叫都重算，
+            成本較高）。提供 ``SmagorinskyPreparedGrid`` 時，直接使用
+            預先算好的陣列與權重，跳過轉換與權重計算——呼叫端必須保證
+            ``prepared`` 是用同一個 ``grid`` 算出來的（本函式不重新驗證，
+            成本考量與 ``backward_driver.compose_current_and_stokes_
+            fields`` 的 ``precomputed_wet_dry_flags`` 參數相同）。
+    """
+
+    if prepared is None:
+        prepared = prepare_smagorinsky_grid(grid)
+
     u2 = np.ascontiguousarray(u_field2, dtype=np.float64)
     v2 = np.ascontiguousarray(v_field2, dtype=np.float64)
 
-    ne = elnode.shape[0]
+    ne = prepared.elnode.shape[0]
     nvrt = u2.shape[0]
-    n_nodes = x.shape[0]
+    n_nodes = prepared.x.shape[0]
 
     hvis_e = np.empty((nvrt, ne), dtype=np.float64)
-    _smagorinsky_element_strain_numba(elnode, area, dldxy, u2, v2, float(horcon), hvis_e)
+    _smagorinsky_element_strain_numba(
+        prepared.elnode, prepared.area, prepared.dldxy, u2, v2, float(horcon), hvis_e
+    )
 
     hf2_field = np.zeros((nvrt, n_nodes), dtype=np.float64)
-    _smagorinsky_node_average_numba(nne, indel, x, y, xctr, yctr, hvis_e, hf2_field)
+    _smagorinsky_node_average_numba(
+        prepared.nne, prepared.indel, prepared.weights, prepared.slm, hvis_e, hf2_field
+    )
     return hf2_field

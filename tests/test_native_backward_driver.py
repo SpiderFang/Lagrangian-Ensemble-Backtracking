@@ -537,6 +537,20 @@ def test_apply_settling_velocity_only_affects_effective_mask_layers() -> None:
     根柱子裡有些層無效、有些層有效」與「乾節點」這兩種邊界情況，所以這裡
     繞過完整網格與 RK4，直接對 ``apply_settling_velocity`` 做隔離單元
     測試，手工構造 ``kbp``／``node_is_dry`` 有變化的合成輸入。
+
+    WP-15 更新：``base`` 現在依 ``apply_settling_velocity`` 明訂的前提條件
+    （見該函式 docstring）先手工套用與 ``compose_current_and_stokes_fields``
+    相同的歸零規則再傳入——這才是本函式真正的合法輸入型態（唯一合法產生
+    ``ComposedCurrentAndStokesFields`` 的函式 ``compose_current_and_stokes_
+    fields`` 保證輸出滿足這個不變量）。WP-15 之前的版本刻意傳入**未歸零**
+    的 ``u_base``／``v_base``，用來測試 ``apply_settling_velocity`` 自己
+    「防禦性第二次歸零」的行為；WP-15 移除了這個防禦性重算（見
+    ``apply_settling_velocity`` docstring 的證明：只要輸入滿足不變量，
+    第二次歸零永遠是 no-op），因此本測試改成驗證「输入已經滿足不變量時，
+    輸出的有效／無效位置語意仍然正確」，這與原測試想驗證的物理行為
+    （乾點與海床以下層必須是 0）完全相同，只是不再依賴函式自己重新歸零
+    來達成。函式簽章仍接受 ``kbp`` 參數（相容性保留，內部已不使用），這裡
+    仍照樣傳入。
     """
 
     nvrt, nnode = 3, 4
@@ -550,11 +564,16 @@ def test_apply_settling_velocity_only_affects_effective_mask_layers() -> None:
     effective_mask = (np.arange(nvrt)[:, None] >= kbp[None, :]) & ~node_is_dry[None, :]
     below_wet = (np.arange(nvrt)[:, None] < kbp[None, :]) & ~node_is_dry[None, :]
 
-    # w/u/v 初始值故意設非零常數，這樣才能同時驗證「有效位置確實加了沉降」
-    # 與「無效位置維持防禦性歸零後的 0（而不是殘留原始值或原始值+沉降）」。
+    # w/u/v 初始值故意設非零常數，這樣才能驗證「有效位置確實加了沉降」；
+    # 無效位置（乾點、海床以下層）依 apply_settling_velocity 的前提條件，
+    # 在傳入前就必須已經是 0（與 compose_current_and_stokes_fields 的輸出
+    # 不變量一致）。
     w_base = np.full((nvrt, nnode), 0.3, dtype=np.float64)
     u_base = np.full((nvrt, nnode), 0.05, dtype=np.float64)
     v_base = np.full((nvrt, nnode), -0.02, dtype=np.float64)
+    for arr in (w_base, u_base, v_base):
+        arr[below_wet] = 0.0
+        arr[:, node_is_dry] = 0.0
 
     base = bd.ComposedCurrentAndStokesFields(
         u_field1=u_base.copy(),
@@ -588,9 +607,152 @@ def test_apply_settling_velocity_only_affects_effective_mask_layers() -> None:
         arr = getattr(composed, field_name)
         # u/v 不受沉降影響，有效位置必須維持原值。
         assert np.allclose(arr[effective_mask], base_arr[effective_mask])
-        # 但仍要套用同一套防禦性歸零：無效位置（海床以下、乾節點）必須是 0。
+        # 無效位置（海床以下、乾節點）本來就是 0（輸入不變量），輸出必須維持 0。
         assert np.all(arr[below_wet] == 0.0)
         assert np.all(arr[:, node_is_dry] == 0.0)
+
+
+def _legacy_apply_settling_velocity(
+    base: bd.ComposedCurrentAndStokesFields, settling_velocity_mps: float, *, kbp: np.ndarray
+) -> bd.ComposedFieldPair:
+    """WP-15 優化前 ``apply_settling_velocity`` 的逐行複製版本，只用於本檔案
+    的位元相同回歸測試，不是正式程式碼的一部分。刻意獨立於
+    ``backward_driver.py`` 保存，即使未來優化後的版本再被修改，這份「歷史
+    快照」仍能當作獨立的第三方比對基準。
+    """
+
+    settling = float(settling_velocity_mps)
+
+    w1 = np.array(base.w_field1_no_settling, dtype=np.float64, copy=True)
+    w2 = np.array(base.w_field2_no_settling, dtype=np.float64, copy=True)
+    w1[base.effective_mask] += settling
+    w2[base.effective_mask] += settling
+
+    u1 = np.array(base.u_field1, dtype=np.float64, copy=True)
+    v1 = np.array(base.v_field1, dtype=np.float64, copy=True)
+    u2 = np.array(base.u_field2, dtype=np.float64, copy=True)
+    v2 = np.array(base.v_field2, dtype=np.float64, copy=True)
+
+    def _zero(u_field, v_field, w_field):
+        nvrt_local = u_field.shape[0]
+        u_field[:, base.node_is_dry] = 0.0
+        v_field[:, base.node_is_dry] = 0.0
+        w_field[:, base.node_is_dry] = 0.0
+        layers = np.arange(nvrt_local)[:, None]
+        below_wet = (layers < kbp[None, :]) & ~base.node_is_dry[None, :]
+        u_field[below_wet] = 0.0
+        v_field[below_wet] = 0.0
+        w_field[below_wet] = 0.0
+
+    _zero(u1, v1, w1)
+    _zero(u2, v2, w2)
+
+    return bd.ComposedFieldPair(
+        u_field1=np.ascontiguousarray(u1),
+        v_field1=np.ascontiguousarray(v1),
+        w_field1=np.ascontiguousarray(w1),
+        eta_field1=base.eta_field1,
+        u_field2=np.ascontiguousarray(u2),
+        v_field2=np.ascontiguousarray(v2),
+        w_field2=np.ascontiguousarray(w2),
+        node_is_dry=base.node_is_dry,
+        elem_is_dry=base.elem_is_dry,
+        stokes_ok_fraction=base.stokes_ok_fraction,
+    )
+
+
+def test_apply_settling_velocity_matches_legacy_implementation_bit_identical() -> None:
+    """WP-15 任務 A.2 的核心位元相同證明：對大量隨機、但滿足
+    ``apply_settling_velocity`` 前提條件（乾點／海床以下層已歸零）的合成
+    輸入，優化後的實作與 ``_legacy_apply_settling_velocity``（WP-15 之前
+    的逐行複製版本）輸出必須逐位元相同。
+
+    覆蓋範圍：多組 ``(nvrt, nnode)`` 規模、隨機 ``kbp``、隨機乾濕分布、
+    正／負／零沉降速度、隨機 u/v/w 初值（含 NaN 以外的極端值），確保優化
+    不是「剛好在某個簡單案例碰巧一樣」。
+    """
+
+    rng = np.random.default_rng(20260922)
+    for nvrt, nnode in ((1, 1), (3, 4), (5, 17), (10, 50)):
+        for _trial in range(5):
+            kbp = rng.integers(0, nvrt + 1, size=nnode).astype(np.int64)
+            node_is_dry = rng.random(nnode) < 0.3
+            effective_mask = (np.arange(nvrt)[:, None] >= kbp[None, :]) & ~node_is_dry[None, :]
+            below_wet = (np.arange(nvrt)[:, None] < kbp[None, :]) & ~node_is_dry[None, :]
+
+            def _random_zeroed_field(
+                nvrt: int = nvrt, nnode: int = nnode, below_wet: np.ndarray = below_wet,
+                node_is_dry: np.ndarray = node_is_dry,
+            ) -> np.ndarray:
+                arr = rng.uniform(-5.0, 5.0, size=(nvrt, nnode))
+                arr[below_wet] = 0.0
+                arr[:, node_is_dry] = 0.0
+                return arr
+
+            u1, v1, w1 = _random_zeroed_field(), _random_zeroed_field(), _random_zeroed_field()
+            u2, v2, w2 = _random_zeroed_field(), _random_zeroed_field(), _random_zeroed_field()
+
+            base = bd.ComposedCurrentAndStokesFields(
+                u_field1=u1, v_field1=v1, w_field1_no_settling=w1,
+                eta_field1=rng.uniform(-1.0, 1.0, size=nnode),
+                u_field2=u2, v_field2=v2, w_field2_no_settling=w2,
+                node_is_dry=node_is_dry,
+                elem_is_dry=np.zeros(1, dtype=bool),
+                effective_mask=effective_mask,
+                stokes_ok_fraction=1.0,
+            )
+
+            for settling in (0.0, -0.001, 0.05, -12.3456789):
+                legacy = _legacy_apply_settling_velocity(base, settling, kbp=kbp)
+                optimized = bd.apply_settling_velocity(base, settling, kbp=kbp)
+                for field_name in (
+                    "u_field1", "v_field1", "w_field1", "u_field2", "v_field2", "w_field2",
+                ):
+                    assert np.array_equal(getattr(legacy, field_name), getattr(optimized, field_name)), (
+                        f"nvrt={nvrt} nnode={nnode} settling={settling} field={field_name}"
+                    )
+                assert np.array_equal(legacy.node_is_dry, optimized.node_is_dry)
+                assert np.array_equal(legacy.elem_is_dry, optimized.elem_is_dry)
+                assert legacy.stokes_ok_fraction == optimized.stokes_ok_fraction
+
+
+def test_apply_settling_velocity_shares_u_v_arrays_without_copy() -> None:
+    """WP-15 優化的關鍵不變量：``u_field1``／``v_field1``／``u_field2``／
+    ``v_field2`` 不需要複製，直接回傳 ``base`` 的陣列參考（多個沉降分組
+    安全共用同一份 ``base`` 而不互相污染，因為下游 kernel 只讀不寫，見
+    ``apply_settling_velocity`` docstring）；``w_field1``／``w_field2``
+    則必須是獨立新配置的陣列，不能與 ``base.w_field*_no_settling`` 共用
+    記憶體，否則不同沉降分組會互相覆寫對方的沉降貢獻。
+    """
+
+    nvrt, nnode = 3, 4
+    kbp = np.zeros(nnode, dtype=np.int64)
+    node_is_dry = np.zeros(nnode, dtype=bool)
+    effective_mask = np.ones((nvrt, nnode), dtype=bool)
+    base = bd.ComposedCurrentAndStokesFields(
+        u_field1=np.full((nvrt, nnode), 0.1), v_field1=np.full((nvrt, nnode), 0.2),
+        w_field1_no_settling=np.zeros((nvrt, nnode)),
+        eta_field1=np.zeros(nnode),
+        u_field2=np.full((nvrt, nnode), 0.3), v_field2=np.full((nvrt, nnode), 0.4),
+        w_field2_no_settling=np.zeros((nvrt, nnode)),
+        node_is_dry=node_is_dry, elem_is_dry=np.zeros(1, dtype=bool),
+        effective_mask=effective_mask, stokes_ok_fraction=1.0,
+    )
+
+    composed_a = bd.apply_settling_velocity(base, -0.01, kbp=kbp)
+    composed_b = bd.apply_settling_velocity(base, -0.02, kbp=kbp)
+
+    assert composed_a.u_field1 is base.u_field1
+    assert composed_a.v_field1 is base.v_field1
+    assert composed_a.u_field2 is base.u_field2
+    assert composed_a.v_field2 is base.v_field2
+    assert not np.shares_memory(composed_a.w_field1, base.w_field1_no_settling)
+    assert not np.shares_memory(composed_a.w_field2, base.w_field2_no_settling)
+
+    # 兩個不同沉降分組各自的 w 場必須彼此獨立，不因共用同一個 base 而互相污染。
+    assert np.allclose(composed_a.w_field1, -0.01)
+    assert np.allclose(composed_b.w_field1, -0.02)
+    assert np.allclose(composed_a.w_field1, -0.01)  # 再讀一次，確認上面沒有被 composed_b 覆寫
 
 
 def test_composed_velocity_all_four_rk4_stages_vs_wrong_k1_only_addition(driver_grid, handles) -> None:
@@ -1843,6 +2005,44 @@ def test_stokes_depth_threshold_none_is_bit_identical_to_original(driver_grid, h
     # 應該相等（沒有任何點被跳過）。
     assert base_default.stokes_points_evaluated == base_default.stokes_points_possible
     assert base_default.stokes_points_evaluated > 0
+
+
+def test_precomputed_wet_dry_flags_matches_internal_recompute_bit_identical(driver_grid, handles) -> None:
+    """WP-15 任務 A.3：``precomputed_wet_dry_flags`` 提供與同一份 ``eta_field1``
+    算出的旗標時，輸出必須與完全不傳這個參數（函式內部自己重算一次）逐位元
+    相同——這是 ``hour_major.py`` 主迴圈省下第二次全網格 ``compute_wet_dry_
+    flags`` 呼叫的安全性基礎（見該模組對此參數的呼叫點註解）。
+    """
+
+    n_nodes = _n_nodes(driver_grid)
+    field_pair = _uniform_field_pair(driver_grid, u1=0.02, v1=-0.01, ibf=-1, trat=0.0)
+    wave = bd.WaveFieldAtNodes(
+        significant_wave_height_m=np.full(n_nodes, 1.1),
+        peak_frequency_hz=np.full(n_nodes, 0.12),
+        direction_raw_deg=np.full(n_nodes, 60.0),
+        valid_mask_wave=np.ones(n_nodes, dtype=bool),
+        qc_flags=np.zeros(n_nodes, dtype=np.int64),
+    )
+
+    node_is_dry, elem_is_dry = bd.compute_wet_dry_flags(driver_grid, handles, eta_m=field_pair.eta_field1)
+
+    base_recompute = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, field_pair, wave_field1=wave, wave_field2=wave,
+    )
+    base_precomputed = bd.compose_current_and_stokes_fields(
+        driver_grid, handles, field_pair, wave_field1=wave, wave_field2=wave,
+        precomputed_wet_dry_flags=(node_is_dry, elem_is_dry),
+    )
+
+    for field_name in (
+        "u_field1", "v_field1", "w_field1_no_settling",
+        "u_field2", "v_field2", "w_field2_no_settling",
+        "node_is_dry", "elem_is_dry", "effective_mask",
+    ):
+        assert np.array_equal(getattr(base_recompute, field_name), getattr(base_precomputed, field_name)), (
+            field_name
+        )
+    assert base_recompute.stokes_ok_fraction == base_precomputed.stokes_ok_fraction
 
 
 def test_stokes_depth_threshold_rejects_out_of_range_values(driver_grid, handles) -> None:

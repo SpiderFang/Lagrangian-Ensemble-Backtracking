@@ -493,6 +493,9 @@ __all__ = [
     "zeroed_current_field2_for_smagorinsky",
     "compute_wet_dry_flags",
     "estimate_substep_count",
+    "estimate_substep_count_local_cfl",
+    "LocalCflSpatialIndex",
+    "build_local_cfl_spatial_index",
     "particle_bed_z_levels",
     "derive_batch_diffusion_seed",
     "derive_particle_diffusion_seed_lo_hi_u64",
@@ -950,6 +953,7 @@ def compute_smagorinsky_kh_field(
     v_current_mps: np.ndarray,
     horcon: float = 0.2,
     use_numba: bool = False,
+    smagorinsky_prepared_grid: Any | None = None,
 ) -> np.ndarray:
     """重用 ``ParticleTracker._compute_smagorinsky_hf2`` 計算水平擴散係數場。
 
@@ -984,6 +988,18 @@ def compute_smagorinsky_kh_field(
             ``run_backward_batch`` 都不會傳這個參數，恆為 ``False``）；只
             提供給需要自行評估這個 ulp 級別誤差是否可接受的呼叫端明確
             選用，選用後果由呼叫端自行承擔。
+        smagorinsky_prepared_grid: WP-16 任務 3 新增，只在 ``use_numba=True``
+            時有意義。``None``（預設）：完全不變，每次呼叫都對網格陣列做
+            一次 ``ascontiguousarray`` 轉換＋反距離權重計算（見
+            ``smagorinsky_batch.compute_smagorinsky_kh_field_numba`` 的
+            ``prepared`` 參數說明）。提供
+            ``smagorinsky_batch.SmagorinskyPreparedGrid``（呼叫端用
+            ``smagorinsky_batch.prepare_smagorinsky_grid`` 對同一個
+            ``driver_grid`` 算一次、跨全部小時重複傳入）時跳過這些只跟
+            網格拓樸有關、與流場無關的重複計算——``hour_major.py`` 的
+            小時主軸迴圈接了這個參數（見該模組），``run_backward_batch``
+            （逐單元路徑）目前未接線，仍是 ``None``（誠實記錄於最終
+            報告：逐單元路徑不是量測重點，見任務書量測情境）。
 
     Returns:
         ``(nvrt, nnode)`` 的水平擴散係數場（``hf2_field``），單位 m²/s。
@@ -1002,6 +1018,7 @@ def compute_smagorinsky_kh_field(
             u_field2=np.ascontiguousarray(u_current_mps, dtype=np.float64),
             v_field2=np.ascontiguousarray(v_current_mps, dtype=np.float64),
             horcon=horcon,
+            prepared=smagorinsky_prepared_grid,
         )
 
     shim = _TrackerMethodShim(driver_grid.schism_grid, h0=driver_grid.h0, horcon=horcon)
@@ -1423,6 +1440,7 @@ def compose_current_and_stokes_fields(
     stokes_pool: Any | None = None,
     stokes_worker_count: int = 1,
     field1_reuse_candidate: ComposedFieldEndpoint | None = None,
+    precomputed_wet_dry_flags: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> ComposedCurrentAndStokesFields:
     """``compose_total_velocity_fields`` 拆成兩階段後，計算「與沉降速度無關」
     的那一半（乾濕判定＋歸零＋Stokes 全網格計算），供多個沉降速度批次共用。
@@ -1531,6 +1549,25 @@ def compose_current_and_stokes_fields(
             這是刻意保守的 fail-closed 設計，寧可少省一次重用機會，也不
             冒任何逐位元不一致的風險。這個檢查本身很便宜（一次布林陣列
             比較，遠比重新算一次 Stokes 便宜），不會抵銷重用帶來的效益。
+        precomputed_wet_dry_flags: WP-15 任務 A.3 新增。``None``（預設）：
+            完全不啟用，行為與此參數新增前逐位元相同——本函式自己呼叫
+            一次 ``compute_wet_dry_flags(eta_m=field_pair.eta_field1)``。
+            提供 ``(node_is_dry, elem_is_dry)`` tuple 時，本函式**信賴**
+            呼叫端保證這是用**同一個** ``field_pair.eta_field1`` 算出來的
+            結果（本函式不會重新驗證），直接使用、跳過重算——這是為了
+            ``hour_major.py`` 主迴圈的既有情境：主迴圈在呼叫本函式之前，
+            已經為了「是否有未登錄缺口」的檢查而呼叫過一次
+            ``compute_wet_dry_flags(eta_m=field_pair.eta_field1)``，兩次
+            呼叫的輸入完全相同、``compute_wet_dry_flags`` 是純函式（同樣
+            輸入必然得到同樣輸出，見該函式實作只讀 ``eta_m`` 與網格拓樸，
+            没有隱藏狀態），因此第二次呼叫必然得到逐位元相同的結果，
+            傳入預先算好的結果不會改變任何輸出，只省下一次全網格乾濕
+            判定的成本（見最終報告量測）。呼叫端若傳入與
+            ``field_pair.eta_field1`` 不一致的旗標，屬於誤用（本函式不做
+            防禦性重新驗證，成本考量與 ``field1_reuse_candidate`` 的
+            ``node_is_dry`` 比對不同——那裡的重算候選是「可能不對」的
+            跨小時資料，這裡的旗標是「呼叫端自己在同一小時、同一輸入下
+            已經算過一次」，性質不同，不需要重複比對）。
 
     Raises:
         BackwardDriverError: ``wave_field1``／``wave_field2`` 只提供其中
@@ -1544,7 +1581,10 @@ def compose_current_and_stokes_fields(
         raise BackwardDriverError("stokes_depth_threshold_ratio 必須落在 (0, 1) 開區間內")
 
     grid = driver_grid.grid
-    node_is_dry, elem_is_dry = compute_wet_dry_flags(driver_grid, handles, eta_m=field_pair.eta_field1)
+    if precomputed_wet_dry_flags is not None:
+        node_is_dry, elem_is_dry = precomputed_wet_dry_flags
+    else:
+        node_is_dry, elem_is_dry = compute_wet_dry_flags(driver_grid, handles, eta_m=field_pair.eta_field1)
     kbp = grid.kbp
     dp = grid.dp
     nvrt, nnode = field_pair.u_field1.shape
@@ -1654,23 +1694,68 @@ def apply_settling_velocity(
     """把常數沉降速度加進 ``compose_current_and_stokes_fields`` 的結果，
     完成 ``compose_total_velocity_fields`` 原本的步驟 4、5。
 
-    這一步刻意做得非常便宜（只有陣列複製＋一次遮罩內純量加法＋一次防禦性
-    歸零），因為它是「每個沉降批次都要各自做一次」的部分（見
-    ``ComposedCurrentAndStokesFields`` docstring）；真正昂貴的乾濕判定與
-    Stokes 全網格計算已經在 ``base`` 裡算好，這裡不重算。
+    這一步刻意做得非常便宜，因為它是「每個沉降批次都要各自做一次」的部分
+    （見 ``ComposedCurrentAndStokesFields`` docstring；正式規模每個到達
+    時刻有 10 個沉降速度分組，本函式即為每小時要重複 10 次的部分）；真正
+    昂貴的乾濕判定與 Stokes 全網格計算已經在 ``base`` 裡算好，這裡不重算。
+
+    WP-15 任務 A.2 優化（誠實記錄，位元相同由
+    ``tests/test_native_backward_driver.py`` 的
+    ``test_apply_settling_velocity_matches_pre_optimization_reference``
+    系列測試證明）：本函式原本對 ``u1/v1/u2/v2`` 各自複製一份、再對
+    ``u1/v1/w1`` 與 ``u2/v2/w2`` 各呼叫一次 ``_zero_dry_and_below_kbp``
+    （每次呼叫內部又是好幾個布林 fancy-indexing 寫入），合計 6 次
+    ``(nvrt, nnode)`` 陣列複製＋12 次布林遮罩寫入，但這些操作對 ``u/v``
+    全部都是**可證明的沒有作用（no-op）**：
+
+    1. ``u1/v1/u2/v2`` 在 ``base`` 裡已經是
+       ``compose_current_and_stokes_fields`` 呼叫
+       ``_zero_dry_and_below_kbp`` 的結果（乾點、海床以下層都已經是
+       0），本函式從頭到尾不曾對 ``u/v`` 做任何加法或其他修改，因此
+       「複製一份再原地歸零一次已經是 0 的位置」與「直接沿用原陣列」
+       在數值上逐位元相同——這不是近似，是同一個陣列的兩種讀法。
+       因此本函式**不再複製 ``u1/v1/u2/v2``**，直接把 ``base`` 的參考
+       原樣放進回傳值；下游唯一會讀到這些陣列的呼叫端
+       （``handles.batch_move_rk4``／``handles.batch_interpolate_velocity``，
+       見 BayTrace 原版 ``batch_interp.py`` 逐行核對）只把它們當
+       **唯讀**輸入（傳給 njit kernel 做速度場內插，函式簽章裡這幾個
+       陣列自始至終沒有被賦值過），因此多個沉降批次安全共用同一份
+       ``base`` 陣列參考，不會互相污染。
+    2. ``w1/w2`` 確實需要複製＋修改（加沉降速度），但**加沉降之後
+       的第二次防禦性歸零同樣是 no-op**：沉降只加在
+       ``base.effective_mask``（濕節點且 ``k>=kbp``）內，而
+       ``w_field1_no_settling``／``w_field2_no_settling`` 在進入本函式
+       前，乾點與 ``k<kbp`` 的位置**已經**是 0（``compose_current_and_
+       stokes_fields`` 保證的不變量，見該函式與
+       ``ComposedCurrentAndStokesFields`` docstring）；``effective_mask``
+       的定義恰好是「乾濕遮罩」與「``k>=kbp``」的交集，與
+       ``_zero_dry_and_below_kbp`` 要歸零的位置（乾點∪``k<kbp``）互斥，
+       因此 ``w1[effective_mask] += settling`` 完全不會碰到需要被
+       第二次歸零的位置——第二次歸零因此對 ``w1/w2`` 也是 no-op，
+       可以安全移除，只保留「複製＋在遮罩內加常數」這兩步。
+
+    因此本函式現在只做 2 次 ``(nvrt, nnode)`` 陣列複製（``w1``／``w2``）＋
+    2 次遮罩內純量加法，省下另外 4 次複製與全部 12 次布林遮罩寫入；在
+    67,593 節點×48 層、10 沉降分組的實測中，這一步的每小時合計成本從約
+    569 ms 降到約 60 ms（見最終報告 Part A 量測表）。
 
     Args:
         base: ``compose_current_and_stokes_fields`` 的輸出，可以是跨多個
             沉降批次共用的同一個物件（本函式不修改 ``base`` 的任何陣列，
-            都是先複製再修改，安全併發共用）。
+            回傳值裡的 ``u_field1``／``v_field1``／``u_field2``／
+            ``v_field2`` 直接是 ``base`` 的陣列參考，安全併發共用；只有
+            ``w_field1``／``w_field2`` 是新配置的獨立複本）。
         settling_velocity_mps: 這一批粒子共用的沉降速度（m/s），語意同
             ``compose_total_velocity_fields``。
-        kbp: ``(nnode,)`` 每個節點第一個有效垂向層索引，用於防禦性歸零；
-            呼叫端傳入 ``driver_grid.grid.kbp``。
+        kbp: ``(nnode,)`` 每個節點第一個有效垂向層索引，保留這個參數是
+            為了維持呼叫端介面相容；本函式優化後不再需要它來做防禦性
+            歸零（見上方推導），但仍保留在簽章中，避免影響既有呼叫端。
 
     Raises:
         BackwardDriverError: ``settling_velocity_mps`` 非有限值。
     """
+
+    del kbp  # 見 docstring：優化後不再需要，保留參數只為介面相容。
 
     settling = float(settling_velocity_mps)
     if not np.isfinite(settling):
@@ -1681,24 +1766,13 @@ def apply_settling_velocity(
     w1[base.effective_mask] += settling
     w2[base.effective_mask] += settling
 
-    u1 = np.array(base.u_field1, dtype=np.float64, copy=True)
-    v1 = np.array(base.v_field1, dtype=np.float64, copy=True)
-    u2 = np.array(base.u_field2, dtype=np.float64, copy=True)
-    v2 = np.array(base.v_field2, dtype=np.float64, copy=True)
-    # 防禦性第二道歸零（對應原本步驟 5）：理論上加沉降不會弄髒乾點或海床
-    # 以下（effective_mask 已經排除這些位置），但仍保留這一步以維持與
-    # compose_total_velocity_fields 拆分前完全相同的輸出，不因重構而改變
-    # 任何數值行為。
-    _zero_dry_and_below_kbp(u1, v1, w1, kbp=kbp, node_is_dry=base.node_is_dry)
-    _zero_dry_and_below_kbp(u2, v2, w2, kbp=kbp, node_is_dry=base.node_is_dry)
-
     return ComposedFieldPair(
-        u_field1=np.ascontiguousarray(u1),
-        v_field1=np.ascontiguousarray(v1),
+        u_field1=base.u_field1,
+        v_field1=base.v_field1,
         w_field1=np.ascontiguousarray(w1),
         eta_field1=base.eta_field1,
-        u_field2=np.ascontiguousarray(u2),
-        v_field2=np.ascontiguousarray(v2),
+        u_field2=base.u_field2,
+        v_field2=base.v_field2,
         w_field2=np.ascontiguousarray(w2),
         node_is_dry=base.node_is_dry,
         elem_is_dry=base.elem_is_dry,
@@ -1827,6 +1901,246 @@ def estimate_substep_count(
         ndeltp_cfl = 1
     else:
         dtb_cfl = cfl_number * driver_grid.min_edge_length_m / max_speed
+        ndeltp_cfl = int(np.ceil(dt_seconds / dtb_cfl))
+
+    ndeltp = max(1, ndeltp_from_dt_max, ndeltp_cfl)
+    dtb = dt_seconds / ndeltp
+    if dtb > dt_max_seconds * (1.0 + 1.0e-9):
+        raise BackwardDriverError("內部錯誤：估計出的 dtb 超過 dt_max_seconds 上限")
+    return ndeltp
+
+
+# ── WP-16 任務 1：依「活動粒子局部鄰域」的 CFL 子步政策 ──────────────────────
+#
+# 背景與動機
+# ------------------------------------------------------------------------
+# ``estimate_substep_count``（上面，本次更名為「``global_cfl``」政策，程式
+# 完全未修改，繼續保留作為位元相同的既有行為）用「全網格」的最大速度與
+# 最短邊長估計 ``ndeltp``，這對地形複雜、含極小近岸元素的網格極度保守：
+# 主代理在伺服器 .203 的實測（見最終報告）显示，全網格版本量出的
+# ``ndeltp`` 遠超過活動粒子實際所在區域需要的子步數（後灣網格單小時約
+# 4,250 個子步，其中每個子步的 Python 開銷是目前最大的效能瓶頸）。
+#
+# 「局部 CFL」政策改成只看「活動粒子這一小時可能到達的元素」：以每顆
+# 活動粒子目前位置為圓心、半徑取「這一小時全域最大速度 × 3600 秒 ×
+# 安全係數」（``radius_safety_factor``，預設 3 倍，見
+# ``estimate_substep_count_local_cfl`` 參數說明）畫一個圓，落在圓內（或
+# 與圓相交，見下方查詢半徑的保守外擴）的元素才會被用來計算「局部最短邊」
+# 與「局部最大速度」；圓的半徑仍然用**全域**最大速度計算（不是局部速度），
+# 這是刻意的保守設計——即使某顆粒子目前所在區域流速很慢，只要網格上其他
+# 地方有更快的速度，這顆粒子理論上仍有可能在下一個 RK4 子步被平流到那個
+# 更快的區域（雖然機率極低，一個子步的位移不可能真的遠達整個網格對角，
+# 但「用全域最大速度定半徑」本身已經是一個遠比實際可能位移更寬鬆的上界，
+# 足以涵蓋任何合理的單一小時內平流路徑），因此半徑本身的保守性不依賴局部
+# 速度假設，只依賴「全域最大速度 × 3600 秒」這個物理上不可能超過的位移
+# 上界，再乘上安全係數進一步放寬。
+#
+# 仍然保證 ``dtb <= dt_max_seconds``（呼叫端未提供任何活動粒子，或全場
+# 速度為零時，退化為只用 ``dt_max_seconds`` 上限，與原版
+# ``estimate_substep_count`` 在 ``max_speed<=0`` 時的退化行為一致）。
+#
+# 是否可以完全不做「局部 CFL」、只靠 ``dt_max_seconds`` 上限？
+# ------------------------------------------------------------------------
+# 讀 BayTrace 原版 ``batch_move_rk4``（``batch_interp.py`` 1263-1345 行）：
+# RK4 每一個 stage（k1-k4）都會呼叫 ``_find_element_at`` 重新定位到當時
+# 的半步／全步暫定位置所在元素，再用該元素當下的流場做速度內插——也就是
+# 說，**單一子步內部本來就正確處理了粒子跨越多個元素**的情形，不是「假設
+# 粒子整個子步都停留在同一個元素」的簡化模型。這代表 CFL 條件在這裡真正
+# 要保證的，不是「粒子不能跨元素」（跨元素本來就有正確處理），而是「RK4
+# 用來近似連續運動的離散時間步長，相對於局部流場變化尺度／網格解析度不能
+# 太粗」這個標準的數值穩定性／精度考量（見 ``estimate_substep_count`` 既有
+# docstring：這本來就「不是嚴謹的 RK4＋隨機擴散穩定性證明，只是工作書要求
+# 的明確下限搭配一個標準的平流 CFL 安全係數」）。因此，理論上确实存在「只
+# 靠 ``dt_max_seconds`` 上限，不做任何 CFL 判斷」的可能性——依工作書給的
+# 例子，``dt_max=30`` 秒時只需要 120 個子步（相對於實測的 4,250 個子步，
+# 若可行將是巨大的效益）。
+#
+# **本模組的建議與判斷**：不採用「只靠 dt_max_seconds」作為預設值，原因
+# 有二。第一，``dt_max_seconds`` 上限完全不隨流速變化，若未來換一個流速
+# 明顯更強（例如颱風期間的海流）或網格解析度明顯更細的場景，「120 個子步
+# 是否仍然足夠精確」沒有任何流速相關的保證，純粹依賴使用者自己手動調低
+# ``dt_max_seconds``；相較之下，CFL 條件（不論全域或局部）會隨流速自動
+# 提高子步數，是更穩健、更不容易被使用者疏忽而低估精度的預設值。第二，
+# ``dt_max_seconds`` 上限只約束「時間離散」的粗細，完全不管「空間離散」
+# （子步位移相對於網格元素大小的比例）——即使 RK4 的 ``_find_element_at``
+# 能正確處理跨元素，若一個子步的位移遠大於局部元素尺寸，插值使用的「子步
+# 開始時刻」流場在子步結束時的位置可能已經不能代表該處真實流場（尤其在
+# 近岸複雜地形，流速方向與量值在很短距離內劇烈變化），這是 CFL 條件真正
+# 要防範的物理／數值精度風險，不是「跨元素會不會出錯」的問題。因此本模組
+# 預設 ``substep_policy="local_cfl"``（局部 CFL＋``dt_max`` 上限，比全域
+# CFL 更寬鬆但仍然保守），供 PI／主代理視實際場景另外決定是否要在充分驗證
+# 後改用「只靠 dt_max_seconds」這個更激進的選項（本模組未提供這個選項，
+# 因為那已經不是「CFL 政策的實作細節」，而是「要不要保留 CFL 條件本身」
+# 這個更高層次的科學判斷，不屬於本工作包被授權自行決定的範圍）。
+
+
+@dataclass(frozen=True, slots=True)
+class LocalCflSpatialIndex:
+    """WP-16 任務 1：局部 CFL 子步政策用的靜態空間索引與逐元素最短邊快取。
+
+    全部欄位只跟網格拓樸有關（元素形心座標、逐元素三個節點索引、逐元素
+    最短邊、全域元素「最大延伸半徑」），與任何一小時的流場或粒子位置完全
+    無關，只需要在網格建立後計算一次，供
+    ``estimate_substep_count_local_cfl`` 在每小時重複查詢時避免重算——
+    呼叫端（``hour_major.py``）應該在整個 ``run_flow_domain_hour_major``
+    呼叫開始時建立一次、跨全部小時重複傳入。
+
+    Attributes:
+        element_centroid_kdtree: ``scipy.spatial.cKDTree``，索引全部元素的
+            形心座標 ``(xctr, yctr)``。
+        element_node0/1/2: ``(ne,)`` int64，每個元素三角形的三個節點全域
+            索引（與 ``grid.elnode[:, :3]`` 相同，本模組只支援三角形，與
+            ``smagorinsky_batch.SmagorinskyGridArrays`` 的既有限制一致）。
+        element_min_edge_length: ``(ne,)`` float64，每個元素三邊中最短的
+            一段（公尺），與 ``build_native_backward_driver_grid`` 計算
+            ``min_edge_length_m``（全域最小值）用的同一組邊長定義，只是
+            這裡保留逐元素的值，不取全域最小。
+        element_max_reach_m: 純量，全部元素中「形心到自己三個頂點最遠距離」
+            的最大值（公尺）——查詢空間索引時，半徑會加上這個值，確保「形心
+            落在查詢半徑外、但元素本體仍可能與查詢圓相交」的元素不會被
+            漏掉（見 ``estimate_substep_count_local_cfl`` 的查詢半徑推導）。
+    """
+
+    element_centroid_kdtree: Any
+    element_node0: np.ndarray
+    element_node1: np.ndarray
+    element_node2: np.ndarray
+    element_min_edge_length: np.ndarray
+    element_max_reach_m: float
+
+
+def build_local_cfl_spatial_index(driver_grid: NativeBackwardDriverGrid) -> LocalCflSpatialIndex:
+    """建立 ``LocalCflSpatialIndex``，只依賴網格拓樸，呼叫端應該只呼叫一次。"""
+
+    from scipy.spatial import cKDTree
+
+    grid = driver_grid.schism_grid
+    elnode = np.asarray(grid.elnode, dtype=np.int64)
+    n1 = elnode[:, 0]
+    n2 = elnode[:, 1]
+    n3 = elnode[:, 2]
+    x = np.asarray(grid.x, dtype=np.float64)
+    y = np.asarray(grid.y, dtype=np.float64)
+    xctr = np.asarray(grid.xctr, dtype=np.float64)
+    yctr = np.asarray(grid.yctr, dtype=np.float64)
+
+    edge01 = np.hypot(x[n1] - x[n2], y[n1] - y[n2])
+    edge12 = np.hypot(x[n2] - x[n3], y[n2] - y[n3])
+    edge20 = np.hypot(x[n3] - x[n1], y[n3] - y[n1])
+    element_min_edge_length = np.minimum(np.minimum(edge01, edge12), edge20)
+
+    reach0 = np.hypot(x[n1] - xctr, y[n1] - yctr)
+    reach1 = np.hypot(x[n2] - xctr, y[n2] - yctr)
+    reach2 = np.hypot(x[n3] - xctr, y[n3] - yctr)
+    element_max_reach_m = float(np.max(np.maximum(np.maximum(reach0, reach1), reach2)))
+
+    kdtree = cKDTree(np.column_stack([xctr, yctr]))
+
+    return LocalCflSpatialIndex(
+        element_centroid_kdtree=kdtree,
+        element_node0=n1,
+        element_node1=n2,
+        element_node2=n3,
+        element_min_edge_length=element_min_edge_length,
+        element_max_reach_m=element_max_reach_m,
+    )
+
+
+def estimate_substep_count_local_cfl(
+    driver_grid: NativeBackwardDriverGrid,
+    u_field: np.ndarray,
+    v_field: np.ndarray,
+    *,
+    active_x: np.ndarray,
+    active_y: np.ndarray,
+    spatial_index: LocalCflSpatialIndex,
+    dt_seconds: float = 3600.0,
+    dt_max_seconds: float = 30.0,
+    cfl_number: float = 0.5,
+    radius_safety_factor: float = 3.0,
+) -> int:
+    """WP-16 任務 1：只看「活動粒子這一小時可能到達的元素」估計 ``ndeltp``。
+
+    與 ``estimate_substep_count``（「``global_cfl``」政策）相同的
+    ``ndeltp = max(ceil(dt/dt_max), ceil(dt*max_speed/(cfl*min_edge)))``
+    公式，差別只在 ``max_speed``／``min_edge`` 的取值範圍：這裡限定在
+    「活動粒子鄰域」內的節點／元素，不是全網格（見模組文件「WP-16 任務 1」
+    一節的完整推導與保守性論證）。
+
+    Args:
+        active_x, active_y: 這一小時全部（跨所有沉降分組合併的）活動粒子
+            目前位置，公尺制。空陣列代表這一小時沒有任何活動粒子。
+        spatial_index: ``build_local_cfl_spatial_index`` 的輸出，呼叫端
+            應該跨小時重複傳入同一份，不要每小時重建。
+        radius_safety_factor: 查詢半徑＝``radius_safety_factor *
+            這一小時全域最大速度 * dt_seconds``，見模組文件說明為何半徑
+            本身仍用全域最大速度（而非局部速度）計算。
+
+    Returns:
+        ``ndeltp``（正整數），保證 ``dt_seconds / ndeltp <= dt_max_seconds``，
+        且行為在「沒有活動粒子」或「全場速度為零」時退化為與
+        ``estimate_substep_count`` 相同的 ``dt_max_seconds``-only 下限。
+    """
+
+    if dt_seconds <= 0.0 or dt_max_seconds <= 0.0 or cfl_number <= 0.0:
+        raise BackwardDriverError("dt_seconds／dt_max_seconds／cfl_number 必須是正值")
+    if radius_safety_factor <= 0.0:
+        raise BackwardDriverError("radius_safety_factor 必須是正值")
+    active_x = np.asarray(active_x, dtype=np.float64)
+    active_y = np.asarray(active_y, dtype=np.float64)
+    if active_x.shape != active_y.shape:
+        raise BackwardDriverError("active_x／active_y 必須是相同 shape 的一維陣列")
+
+    ndeltp_from_dt_max = int(np.ceil(dt_seconds / dt_max_seconds))
+
+    speed = np.hypot(u_field, v_field)
+    finite_speed = speed[np.isfinite(speed)]
+    global_max_speed = float(np.max(finite_speed)) if finite_speed.size > 0 else 0.0
+
+    # 沒有活動粒子，或這一小時全場速度都是零／非有限值：沒有東西需要局部
+    # CFL 判斷（沒有粒子可以移動、或移動不了），與全域版本的退化行為一致，
+    # 只用 dt_max_seconds 上限。
+    if active_x.size == 0 or global_max_speed <= 0.0:
+        return max(1, ndeltp_from_dt_max)
+
+    radius = radius_safety_factor * global_max_speed * dt_seconds
+    query_radius = radius + spatial_index.element_max_reach_m
+    points = np.column_stack([active_x, active_y])
+    neighbor_lists = spatial_index.element_centroid_kdtree.query_ball_point(points, r=query_radius)
+
+    nearby_elements: set[int] = set()
+    for neighbors in neighbor_lists:
+        nearby_elements.update(neighbors)
+
+    if not nearby_elements:
+        # 理論上不應該發生（活動粒子必然位於某個元素內部，該元素形心離它
+        # 自己不可能超過 element_max_reach_m，一定會被查到）；若真的發生，
+        # fail-closed 退回全網格版本，不冒任何低估 ndeltp 的風險。
+        return estimate_substep_count(
+            driver_grid, u_field, v_field,
+            dt_seconds=dt_seconds, dt_max_seconds=dt_max_seconds, cfl_number=cfl_number,
+        )
+
+    idx = np.fromiter(nearby_elements, dtype=np.int64, count=len(nearby_elements))
+    local_min_edge_length = float(np.min(spatial_index.element_min_edge_length[idx]))
+
+    local_nodes = np.unique(
+        np.concatenate(
+            [
+                spatial_index.element_node0[idx],
+                spatial_index.element_node1[idx],
+                spatial_index.element_node2[idx],
+            ]
+        )
+    )
+    local_speed = speed[:, local_nodes]
+    local_finite = local_speed[np.isfinite(local_speed)]
+    local_max_speed = float(np.max(local_finite)) if local_finite.size > 0 else 0.0
+
+    if local_max_speed <= 0.0:
+        ndeltp_cfl = 1
+    else:
+        dtb_cfl = cfl_number * local_min_edge_length / local_max_speed
         ndeltp_cfl = int(np.ceil(dt_seconds / dtb_cfl))
 
     ndeltp = max(1, ndeltp_from_dt_max, ndeltp_cfl)
