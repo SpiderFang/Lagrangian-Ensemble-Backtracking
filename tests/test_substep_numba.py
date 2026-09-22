@@ -22,18 +22,34 @@ import os
 import numpy as np
 import pytest
 from shapely import contains_xy
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, MultiPolygon, Polygon
 
 from lagrangian_backtracking.mesh import NativeMesh
 from lagrangian_backtracking.native_runner import backward_driver as bd
 from lagrangian_backtracking.native_runner import build_native_grid_arrays
 from lagrangian_backtracking.native_runner.substep_numba import (
+    InterestRegionArrays,
     _counter_based_gaussian_pair_scalar,
-    _point_in_polygon_numba,
+    _point_in_geometry_numba,
     _splitmix64_finalize_scalar,
     mirror_rk4_substep_loop_numba,
     prepare_interest_region_arrays,
 )
+
+
+def _point_in_region(region: InterestRegionArrays, poly_idx: int, x: float, y: float) -> bool:
+    """測試輔助函式：呼叫 ``_point_in_geometry_numba`` 判定單點是否在
+    ``region``（``prepare_interest_region_arrays`` 的輸出）第 ``poly_idx``
+    個相異幾何內。"""
+
+    return bool(
+        _point_in_geometry_numba(
+            x, y,
+            region.ring_x, region.ring_y, region.ring_vertex_offsets,
+            region.subpoly_ring_offsets, region.poly_subpoly_offsets,
+            poly_idx,
+        )
+    )
 
 _NX = 10
 _NY = 10
@@ -247,18 +263,13 @@ def test_box_muller_scalar_vs_vectorized_ulp_difference_quantified() -> None:
 def test_point_in_polygon_matches_shapely_away_from_boundary() -> None:
     poly = Polygon([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
     region = prepare_interest_region_arrays(poly)
-    poly_x = region.poly_x[:, 0]
-    poly_y = region.poly_y[:, 0]
-    nvert = int(region.poly_nvert[0])
 
     rng = np.random.default_rng(4)
     n = 20_000
     xs = rng.uniform(-20.0, 120.0, size=n)
     ys = rng.uniform(-20.0, 120.0, size=n)
     shapely_result = contains_xy(poly, xs, ys)
-    numba_result = np.array(
-        [_point_in_polygon_numba(x, y, poly_x, poly_y, nvert) for x, y in zip(xs, ys, strict=True)]
-    )
+    numba_result = np.array([_point_in_region(region, 0, x, y) for x, y in zip(xs, ys, strict=True)])
     assert np.array_equal(shapely_result, numba_result)
 
 
@@ -270,9 +281,6 @@ def test_point_in_polygon_boundary_mismatch_is_only_on_exact_boundary() -> None:
 
     poly = Polygon([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
     region = prepare_interest_region_arrays(poly)
-    poly_x = region.poly_x[:, 0]
-    poly_y = region.poly_y[:, 0]
-    nvert = int(region.poly_nvert[0])
 
     rng = np.random.default_rng(5)
     n = 20_000
@@ -293,13 +301,128 @@ def test_point_in_polygon_boundary_mismatch_is_only_on_exact_boundary() -> None:
             bx[i], by[i] = 0.0 + eps[i], t[i]
 
     shapely_result = contains_xy(poly, bx, by)
-    numba_result = np.array(
-        [_point_in_polygon_numba(x, y, poly_x, poly_y, nvert) for x, y in zip(bx, by, strict=True)]
-    )
+    numba_result = np.array([_point_in_region(region, 0, x, y) for x, y in zip(bx, by, strict=True)])
     # 有微小（非零）浮點擾動時，點實際上不在邊界「恰好」上，兩種演算法
     # 應該完全一致；真正的分歧只在擾動剛好是 0（機率為零的事件，這裡的
     # 隨機擾動幾乎必然非零）。
     assert np.array_equal(shapely_result, numba_result)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4b. 含內環（洞）與 MultiPolygon：射線法 vs Shapely contains_xy 一致率量化
+#     （WP-16b：東北區關注區域多邊形含內環，見本模組差異第 3 點修正）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_point_in_polygon_with_single_hole_matches_shapely() -> None:
+    """一個外環＋一個內環（洞），洞內的點必須判定為「不在關注區域內」。"""
+
+    poly = Polygon(
+        [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+        holes=[[(30.0, 30.0), (70.0, 30.0), (70.0, 70.0), (30.0, 70.0)]],
+    )
+    region = prepare_interest_region_arrays(poly)
+
+    # 明確樣本點：洞內、外環內洞外（環狀區）、外環外。
+    assert _point_in_region(region, 0, 50.0, 50.0) is False  # 洞內
+    assert _point_in_region(region, 0, 10.0, 10.0) is True  # 環狀區
+    assert _point_in_region(region, 0, 150.0, 50.0) is False  # 外環外
+
+    rng = np.random.default_rng(8)
+    n = 20_000
+    xs = rng.uniform(-20.0, 120.0, size=n)
+    ys = rng.uniform(-20.0, 120.0, size=n)
+    shapely_result = contains_xy(poly, xs, ys)
+    numba_result = np.array([_point_in_region(region, 0, x, y) for x, y in zip(xs, ys, strict=True)])
+    assert np.array_equal(shapely_result, numba_result)
+
+
+def test_point_in_polygon_with_multiple_holes_matches_shapely() -> None:
+    """多個內環（洞）：點只要落在任一個洞內就不算在關注區域內。"""
+
+    poly = Polygon(
+        [(0.0, 0.0), (200.0, 0.0), (200.0, 200.0), (0.0, 200.0)],
+        holes=[
+            [(20.0, 20.0), (60.0, 20.0), (60.0, 60.0), (20.0, 60.0)],
+            [(120.0, 120.0), (160.0, 120.0), (160.0, 160.0), (120.0, 160.0)],
+        ],
+    )
+    region = prepare_interest_region_arrays(poly)
+
+    assert _point_in_region(region, 0, 40.0, 40.0) is False  # 洞一
+    assert _point_in_region(region, 0, 140.0, 140.0) is False  # 洞二
+    assert _point_in_region(region, 0, 100.0, 100.0) is True  # 兩洞之間
+
+    rng = np.random.default_rng(9)
+    n = 20_000
+    xs = rng.uniform(-20.0, 220.0, size=n)
+    ys = rng.uniform(-20.0, 220.0, size=n)
+    shapely_result = contains_xy(poly, xs, ys)
+    numba_result = np.array([_point_in_region(region, 0, x, y) for x, y in zip(xs, ys, strict=True)])
+    assert np.array_equal(shapely_result, numba_result)
+
+
+def test_point_in_multipolygon_matches_shapely() -> None:
+    """MultiPolygon（例如東北區兩個不相鄰測站關注區域合併定義）：點在任一
+    子多邊形內即算在幾何內；其中一個子多邊形含內環（模擬龜山島）。"""
+
+    poly_a = Polygon([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
+    poly_b = Polygon(
+        [(300.0, 300.0), (500.0, 300.0), (500.0, 500.0), (300.0, 500.0)],
+        holes=[[(350.0, 350.0), (450.0, 350.0), (450.0, 450.0), (350.0, 450.0)]],
+    )
+    multi = MultiPolygon([poly_a, poly_b])
+    region = prepare_interest_region_arrays(multi)
+
+    assert _point_in_region(region, 0, 50.0, 50.0) is True  # poly_a 內
+    assert _point_in_region(region, 0, 400.0, 400.0) is False  # poly_b 的洞內
+    assert _point_in_region(region, 0, 320.0, 320.0) is True  # poly_b 環狀區
+    assert _point_in_region(region, 0, 200.0, 200.0) is False  # 兩者之間，皆不在
+
+    rng = np.random.default_rng(10)
+    n = 20_000
+    xs = rng.uniform(-50.0, 550.0, size=n)
+    ys = rng.uniform(-50.0, 550.0, size=n)
+    shapely_result = contains_xy(multi, xs, ys)
+    numba_result = np.array([_point_in_region(region, 0, x, y) for x, y in zip(xs, ys, strict=True)])
+    assert np.array_equal(shapely_result, numba_result)
+
+
+def test_no_hole_polygon_ring_arrays_unchanged_by_hole_support() -> None:
+    """無洞多邊形（既有正式站點的常見情形）在支援內環後，扁平陣列表示
+    仍然只有一個外環、沒有多餘的內環項目，判定結果與加入內環支援前完全
+    相同（回歸測試，避免本次修正意外改變無洞多邊形的既有行為）。"""
+
+    poly = Polygon([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
+    region = prepare_interest_region_arrays(poly)
+
+    assert region.poly_subpoly_offsets.tolist() == [0, 1]
+    assert region.subpoly_ring_offsets.tolist() == [0, 1]
+    assert int(region.ring_vertex_offsets[-1]) == region.ring_x.shape[0] == 4
+
+    rng = np.random.default_rng(11)
+    n = 5_000
+    xs = rng.uniform(-20.0, 120.0, size=n)
+    ys = rng.uniform(-20.0, 120.0, size=n)
+    shapely_result = contains_xy(poly, xs, ys)
+    numba_result = np.array([_point_in_region(region, 0, x, y) for x, y in zip(xs, ys, strict=True)])
+    assert np.array_equal(shapely_result, numba_result)
+
+
+def test_prepare_interest_region_arrays_rejects_non_polygon_geometry() -> None:
+    """仍須拒絕非 Polygon／MultiPolygon 幾何（fail-closed），不因支援內環
+    而放寬到任意 Shapely 幾何型別。"""
+
+    line = LineString([(0.0, 0.0), (10.0, 10.0)])
+    with pytest.raises(bd.BackwardDriverError, match="只能是 Polygon 或 MultiPolygon"):
+        prepare_interest_region_arrays(line)
+
+
+def test_prepare_interest_region_arrays_rejects_empty_polygon() -> None:
+    """空多邊形仍須 fail-closed 拒絕，不能靜默產生沒有頂點的幾何。"""
+
+    with pytest.raises(bd.BackwardDriverError, match="空幾何"):
+        prepare_interest_region_arrays(Polygon())
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -412,6 +535,48 @@ def test_single_polygon_broadcasts_to_all_particles(driver_grid, handles) -> Non
     # segfault（pytest 行程存活就代表沒有越界存取）。
     assert len(departures) == 0
     assert np.all(native_status == bd.NATIVE_STATUS_ACTIVE)
+
+
+def test_fused_kernel_interest_region_with_hole_detects_departure(driver_grid, handles) -> None:
+    """端到端測試（WP-16b）：``mirror_rk4_substep_loop_numba`` 融合 kernel
+    在關注區域多邊形含內環（洞）時，能正確把落在洞內的粒子判定為「離開
+    關注區域」（``NATIVE_STATUS_LEFT_INTEREST_REGION``），把落在環狀區
+    （外環內、洞外）的粒子判定為「仍在關注區域內」——不只是測 njit 輔助
+    函式本身，而是驗證扁平陣列＋偏移一路穿過 kernel 呼叫參數沒有搬錯。
+    """
+
+    composed = _make_composed(driver_grid, u=0.0, v=0.0)  # 流速為 0，粒子原地不動
+    hole_cx, hole_cy = _DOMAIN_X / 2.0, _DOMAIN_Y / 2.0
+    poly = Polygon(
+        [(-1.0e6, -1.0e6), (1.0e6, -1.0e6), (1.0e6, 1.0e6), (-1.0e6, 1.0e6)],
+        holes=[
+            [
+                (hole_cx - 100.0, hole_cy - 100.0),
+                (hole_cx + 100.0, hole_cy - 100.0),
+                (hole_cx + 100.0, hole_cy + 100.0),
+                (hole_cx - 100.0, hole_cy + 100.0),
+            ]
+        ],
+    )
+    x0 = np.array([hole_cx, 300.0])  # 粒子 0：洞內；粒子 1：環狀區（洞外、大外環內）
+    y0 = np.array([hole_cy, 300.0])
+    pa = _make_pa(driver_grid, handles, x0=x0, y0=y0, z0=-5.0, composed=composed)
+
+    native_status = np.zeros(2, dtype=np.int32)
+    departures: list[bd.DepartureRecord] = []
+
+    def substep_utc(idt: int) -> int:
+        return 0
+
+    mirror_rk4_substep_loop_numba(
+        driver_grid, handles, pa, ibf=-1, ndeltp=5, dtb=10.0, composed=composed, enable_diffusion=False,
+        native_status=native_status, substep_utc_ns=substep_utc,
+        interest_region_polygon=poly, departures=departures,
+    )
+
+    assert {d.row_particle_index for d in departures} == {0}
+    assert native_status[0] == bd.NATIVE_STATUS_LEFT_INTEREST_REGION
+    assert native_status[1] == bd.NATIVE_STATUS_ACTIVE
 
 
 def test_legacy_rng_mode_not_supported(driver_grid, handles) -> None:

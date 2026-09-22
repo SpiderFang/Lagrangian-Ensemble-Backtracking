@@ -61,11 +61,15 @@ run 只編譯一次，不是每小時、每個分組都重新觸發 Numba JIT �
 3. **關注區域判定**：本模組用標準射線法（crossing-number algorithm，
    PNPOLY）取代 Shapely 的 ``contains_xy``。一般內部點兩者結果相同；
    點剛好落在多邊形邊界上時，兩種演算法對「邊界算不算內部」的浮點捨入
-   可能不同，見 ``_point_in_polygon_numba`` docstring 與測試檔的量化
-   比例（預期只在測度為零的邊界情況出現，不影響統計等價）。**已知限制**：
-   本模組的射線法只處理多邊形的外環（exterior ring），**不支援內環
-   （洞，interior holes）**；``prepare_interest_region_arrays`` 會在
-   偵測到任何一個多邊形有內環時直接拒絕（fail-closed），不會靜默算錯。
+   可能不同，見 ``_ray_cast_numba`` docstring 與測試檔的量化比例
+   （預期只在測度為零的邊界情況出現，不影響統計等價）。射線法支援含
+   內環（洞，interior holes，例如東北區關注區域內的龜山島）的 ``Polygon``
+   與 ``MultiPolygon``：判定「點在幾何內」＝「點在某個子多邊形的外環
+   （exterior ring）內，且不在該子多邊形任何一個內環內」，
+   ``MultiPolygon`` 則取其任一子多邊形滿足即可；語意與 Shapely
+   ``contains_xy`` 一致（邊界情況除外，同上）。``prepare_interest_region_
+   arrays`` 只在幾何不是 ``Polygon``／``MultiPolygon``、或幾何本身／其
+   任何子多邊形是空幾何時才 fail-closed 拒絕。
 4. **只支援計數器型擴散亂數**：``mirror_rk4_substep_loop`` 的「legacy／
    批次共用串流」（``rng`` 參數）模式在本模組**沒有**對應實作——
    ``hour_major.py``（本模組唯一的正式呼叫端）一律使用計數器型亂數，
@@ -96,7 +100,8 @@ from typing import Any
 
 import numpy as np
 from numba import njit
-from shapely.geometry import Polygon
+from shapely.geometry import MultiPolygon, Polygon
+from shapely.geometry.base import BaseGeometry
 
 from .backward_driver import (
     NATIVE_STATUS_LEFT_INTEREST_REGION,
@@ -162,70 +167,153 @@ def _counter_based_gaussian_pair_scalar(
 
 
 @njit(cache=True)
-def _point_in_polygon_numba(
-    x: float, y: float, poly_x: np.ndarray, poly_y: np.ndarray, nvert: int
-) -> bool:
-    """標準射線法（crossing-number，PNPOLY 演算法）點在多邊形內測試。
+def _ray_cast_numba(x: float, y: float, ring_x: np.ndarray, ring_y: np.ndarray) -> bool:
+    """標準射線法（crossing-number，PNPOLY 演算法）點在**單一環**內測試。
 
-    只看外環（``poly_x[:nvert]``／``poly_y[:nvert]``，呼叫端保證這是不含
-    重複收尾點的開放頂點序列），不支援內環，見模組文件差異第 3 點。與
-    Shapely ``contains_xy`` 在一般內部點結果相同，僅邊界上可能因浮點捨入
-    不同，由 ``tests/test_substep_numba.py`` 實測量化。
+    ``ring_x``／``ring_y`` 是同一個環（外環或內環皆可）的頂點座標（公尺），
+    呼叫端保證這是不含重複收尾點的開放頂點序列。與 Shapely 逐環判定在
+    一般內部點結果相同，僅邊界上可能因浮點捨入不同，由
+    ``tests/test_substep_numba.py`` 實測量化——本函式只判定「點在這個環
+    圍出的區域內」，不處理洞或多重多邊形，那是 ``_point_in_geometry_numba``
+    的責任。
     """
 
+    nvert = ring_x.shape[0]
     inside = False
     j = nvert - 1
     for i in range(nvert):
-        xi = poly_x[i]
-        yi = poly_y[i]
-        xj = poly_x[j]
-        yj = poly_y[j]
+        xi = ring_x[i]
+        yi = ring_y[i]
+        xj = ring_x[j]
+        yj = ring_y[j]
         if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
             inside = not inside
         j = i
     return inside
 
 
+@njit(cache=True)
+def _point_in_geometry_numba(
+    x: float,
+    y: float,
+    ring_x: np.ndarray,
+    ring_y: np.ndarray,
+    ring_vertex_offsets: np.ndarray,
+    subpoly_ring_offsets: np.ndarray,
+    poly_subpoly_offsets: np.ndarray,
+    poly_idx: int,
+) -> bool:
+    """點在（可能含內環的）``Polygon`` 或 ``MultiPolygon`` 內測試。
+
+    語意（與 Shapely ``contains_xy`` 一致，邊界情況除外，見模組文件差異
+    第 3 點）：一個幾何（``poly_idx`` 指定）由一個或多個「子多邊形」
+    （``MultiPolygon`` 的每個 ``geoms`` 元素，單一 ``Polygon`` 則只有一個）
+    組成；點在幾何內＝點在**任一**子多邊形內；點在子多邊形內＝點在該子
+    多邊形外環（exterior ring）內、且不在該子多邊形**任何一個**內環
+    （洞，interior ring）內。
+
+    四層扁平陣列＋偏移（``prepare_interest_region_arrays`` 建構，見該函式
+    docstring）：幾何 → 子多邊形（``poly_subpoly_offsets``）→ 環
+    （``subpoly_ring_offsets``，每個子多邊形範圍內第一個環固定是外環，
+    其餘是內環）→ 頂點（``ring_vertex_offsets``，索引進 ``ring_x``／
+    ``ring_y``）。用偏移而不是固定寬度 padding，是因為不同環的頂點數、
+    不同子多邊形的環數差異可能很大（例如東北關注區域的龜山島洞只有幾個
+    頂點，外環卻有數百個），padding 到最大值會浪費大量記憶體。
+    """
+
+    sp_start = poly_subpoly_offsets[poly_idx]
+    sp_end = poly_subpoly_offsets[poly_idx + 1]
+    for sp in range(sp_start, sp_end):
+        ring_start = subpoly_ring_offsets[sp]
+        ring_end = subpoly_ring_offsets[sp + 1]
+        ext_v_start = ring_vertex_offsets[ring_start]
+        ext_v_end = ring_vertex_offsets[ring_start + 1]
+        if not _ray_cast_numba(x, y, ring_x[ext_v_start:ext_v_end], ring_y[ext_v_start:ext_v_end]):
+            continue
+        in_hole = False
+        for r in range(ring_start + 1, ring_end):
+            v_start = ring_vertex_offsets[r]
+            v_end = ring_vertex_offsets[r + 1]
+            if _ray_cast_numba(x, y, ring_x[v_start:v_end], ring_y[v_start:v_end]):
+                in_hole = True
+                break
+        if not in_hole:
+            return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class InterestRegionArrays:
-    """把逐粒子 Shapely ``Polygon`` 陣列轉成 njit 可用的緊湊陣列表示。
+    """把逐粒子 Shapely ``Polygon``／``MultiPolygon`` 陣列轉成 njit 可用的
+    緊湊扁平陣列表示（四層：幾何 → 子多邊形 → 環 → 頂點，見
+    ``_point_in_geometry_numba`` docstring）。
 
-    多顆粒子常常共用同一個測站（同一個 ``Polygon`` 物件），本類別依
-    ``id(polygon)`` 去重，只保存**相異**多邊形的頂點，用 ``poly_id``
-    （``(n,)``）標出每顆粒子對應哪一個相異多邊形，避免對重複的多邊形
-    浪費記憶體與轉換成本。
+    多顆粒子常常共用同一個測站（同一個幾何物件），本類別依 ``id(polygon)``
+    去重，只保存**相異**幾何的頂點，用 ``poly_id``（``(n,)``）標出每顆
+    粒子對應哪一個相異幾何，避免對重複的幾何浪費記憶體與轉換成本。
     """
 
     poly_id: np.ndarray
-    """``(n,)`` int64，每顆粒子對應的相異多邊形索引。"""
-    poly_x: np.ndarray
-    poly_y: np.ndarray
-    """``(max_vertices, n_polygons)`` float64，外環頂點座標（公尺），
-    padding 部分的值不會被讀取（見 ``poly_nvert``）。"""
-    poly_nvert: np.ndarray
-    """``(n_polygons,)`` int64，每個相異多邊形實際的外環頂點數。"""
+    """``(n,)`` int64，每顆粒子對應的相異幾何索引。"""
+    ring_x: np.ndarray
+    ring_y: np.ndarray
+    """``(total_vertices,)`` float64，所有環（外環＋內環，跨全部相異幾何
+    與其子多邊形依序串接）的頂點座標（公尺），不含重複收尾點。個別環的
+    頂點範圍由 ``ring_vertex_offsets`` 標定。"""
+    ring_vertex_offsets: np.ndarray
+    """``(n_rings + 1,)`` int64，第 ``r`` 個環的頂點是
+    ``ring_x[ring_vertex_offsets[r]:ring_vertex_offsets[r+1]]``。"""
+    subpoly_ring_offsets: np.ndarray
+    """``(n_subpolygons + 1,)`` int64，第 ``sp`` 個子多邊形的環範圍
+    ``[subpoly_ring_offsets[sp], subpoly_ring_offsets[sp+1])`` 中，第一個
+    環固定是外環，其餘（若有）是內環（洞）。"""
+    poly_subpoly_offsets: np.ndarray
+    """``(n_polygons + 1,)`` int64，第 ``p`` 個相異幾何的子多邊形範圍
+    ``[poly_subpoly_offsets[p], poly_subpoly_offsets[p+1])``——單一
+    ``Polygon`` 只有一個子多邊形，``MultiPolygon`` 則對應其
+    ``geoms`` 逐一展開。"""
+
+
+def _append_ring_coords(
+    coords: np.ndarray, x_parts: list[np.ndarray], y_parts: list[np.ndarray], vertex_offsets: list[int]
+) -> None:
+    """把一個環（外環或內環）的收尾封閉座標，去除重複收尾點後，接到扁平
+    頂點陣列末端，並登記新的頂點偏移。"""
+
+    if coords.shape[0] > 1 and np.array_equal(coords[0], coords[-1]):
+        coords = coords[:-1]
+    x_parts.append(coords[:, 0])
+    y_parts.append(coords[:, 1])
+    vertex_offsets.append(vertex_offsets[-1] + coords.shape[0])
 
 
 def prepare_interest_region_arrays(
-    polygons_per_particle: np.ndarray | Polygon,
+    polygons_per_particle: np.ndarray | Polygon | MultiPolygon,
 ) -> InterestRegionArrays:
     """把 ``interest_region_polygon``（單一）或 ``interest_region_polygons``
     （逐粒子陣列）轉成 ``InterestRegionArrays``，只在每小時呼叫融合 kernel
-    前做一次（不是每個子步），見模組文件「本模組的解法」一節。
+    前做一次（不是每個子步），見模組文件「本模組的解法」一節。支援含內環
+    （洞，例如東北關注區域內的龜山島）的 ``Polygon`` 與 ``MultiPolygon``，
+    見模組文件差異第 3 點。
 
     Raises:
-        BackwardDriverError: 任何一個多邊形含內環（洞），本模組的射線法
-            實作不支援，fail-closed 拒絕而不是靜默算錯（見模組文件差異
-            第 3 點）。
+        BackwardDriverError: 任何一個幾何不是 ``Polygon``／``MultiPolygon``、
+            或幾何本身／其任一子多邊形是空幾何，fail-closed 拒絕而不是
+            靜默算錯。
     """
 
-    if isinstance(polygons_per_particle, Polygon):
+    if isinstance(polygons_per_particle, BaseGeometry):
+        # 單一幾何（``interest_region_polygon``）套用到全部粒子：即使不是
+        # Polygon／MultiPolygon（例如誤傳 LineString），也先包成長度 1 的
+        # 陣列送進下面共用的逐幾何檢查迴圈，才能給出正確的錯誤訊息，而不是
+        # 讓 0 維 ``np.asarray`` 在下面的陣列分支裡因為沒有 ``shape[0]``
+        # 而拋出跟本意無關的 IndexError。
         polygons = np.asarray([polygons_per_particle], dtype=object)
         poly_id = np.zeros(1, dtype=np.int64)
     else:
         polygons_per_particle = np.asarray(polygons_per_particle, dtype=object)
         n = polygons_per_particle.shape[0]
-        distinct: list[Polygon] = []
+        distinct: list[Polygon | MultiPolygon] = []
         distinct_ids: dict[int, int] = {}
         poly_id = np.empty(n, dtype=np.int64)
         for row in range(n):
@@ -239,34 +327,50 @@ def prepare_interest_region_arrays(
             poly_id[row] = idx
         polygons = np.asarray(distinct, dtype=object)
 
-    n_polygons = polygons.shape[0]
-    rings: list[np.ndarray] = []
+    ring_x_parts: list[np.ndarray] = []
+    ring_y_parts: list[np.ndarray] = []
+    ring_vertex_offsets: list[int] = [0]
+    subpoly_ring_offsets: list[int] = [0]
+    poly_subpoly_offsets: list[int] = [0]
+
     for poly in polygons:
-        if len(poly.interiors) > 0:
+        if isinstance(poly, MultiPolygon):
+            sub_polys = list(poly.geoms)
+        elif isinstance(poly, Polygon):
+            sub_polys = [poly]
+        else:
             raise BackwardDriverError(
-                "substep_numba 的射線法只支援單純多邊形（無內環／洞），"
-                "偵測到一個含內環的關注區域多邊形，fail-closed 拒絕"
+                "interest_region 幾何只能是 Polygon 或 MultiPolygon，"
+                f"偵測到 {type(poly).__name__}，fail-closed 拒絕"
             )
-        coords = np.asarray(poly.exterior.coords, dtype=np.float64)
-        # Shapely 的 exterior.coords 是收尾封閉環（首尾點相同），射線法用
-        # 不含重複收尾點的開放頂點序列，見 _point_in_polygon_numba。
-        if coords.shape[0] > 1 and np.array_equal(coords[0], coords[-1]):
-            coords = coords[:-1]
-        rings.append(coords)
+        if poly.is_empty or len(sub_polys) == 0:
+            raise BackwardDriverError("interest_region 多邊形是空幾何，fail-closed 拒絕")
+        for sub in sub_polys:
+            if sub.is_empty or len(sub.exterior.coords) == 0:
+                raise BackwardDriverError("interest_region 多邊形是空幾何，fail-closed 拒絕")
+            # Shapely 的 exterior／interior coords 是收尾封閉環（首尾點
+            # 相同），射線法用不含重複收尾點的開放頂點序列，見
+            # _ray_cast_numba；每個子多邊形的第一個環固定是外環，之後
+            # （若有）依序是內環（洞），語意見 _point_in_geometry_numba。
+            ext_coords = np.asarray(sub.exterior.coords, dtype=np.float64)
+            _append_ring_coords(ext_coords, ring_x_parts, ring_y_parts, ring_vertex_offsets)
+            for interior in sub.interiors:
+                int_coords = np.asarray(interior.coords, dtype=np.float64)
+                _append_ring_coords(int_coords, ring_x_parts, ring_y_parts, ring_vertex_offsets)
+            subpoly_ring_offsets.append(len(ring_vertex_offsets) - 1)
+        poly_subpoly_offsets.append(len(subpoly_ring_offsets) - 1)
 
-    max_vertices = max((ring.shape[0] for ring in rings), default=0)
-    if max_vertices == 0:
+    if len(ring_x_parts) == 0:
         raise BackwardDriverError("interest_region 多邊形沒有任何頂點")
-    poly_x = np.zeros((max_vertices, n_polygons), dtype=np.float64)
-    poly_y = np.zeros((max_vertices, n_polygons), dtype=np.float64)
-    poly_nvert = np.zeros(n_polygons, dtype=np.int64)
-    for col, ring in enumerate(rings):
-        nv = ring.shape[0]
-        poly_x[:nv, col] = ring[:, 0]
-        poly_y[:nv, col] = ring[:, 1]
-        poly_nvert[col] = nv
 
-    return InterestRegionArrays(poly_id=poly_id, poly_x=poly_x, poly_y=poly_y, poly_nvert=poly_nvert)
+    return InterestRegionArrays(
+        poly_id=poly_id,
+        ring_x=np.concatenate(ring_x_parts),
+        ring_y=np.concatenate(ring_y_parts),
+        ring_vertex_offsets=np.asarray(ring_vertex_offsets, dtype=np.int64),
+        subpoly_ring_offsets=np.asarray(subpoly_ring_offsets, dtype=np.int64),
+        poly_subpoly_offsets=np.asarray(poly_subpoly_offsets, dtype=np.int64),
+    )
 
 
 # ── njit 融合 kernel 工廠：見模組文件「BayTrace 原版批次核心怎麼在 njit
@@ -311,7 +415,9 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
         ibf, ndeltp, dtb, hdc, h0, enable_diffusion,
         hf1_field, hf2_field,
         particle_seed_lo, particle_seed_hi, particle_step_counter,
-        has_interest_region, poly_id, poly_x, poly_y, poly_nvert,
+        has_interest_region, poly_id,
+        region_ring_x, region_ring_y, region_ring_vertex_offsets,
+        region_subpoly_ring_offsets, region_poly_subpoly_offsets,
         native_status, substep_utc_ns_values,
         dep_row, dep_x, dep_y, dep_z, dep_utc_ns,
         needs_fallback,
@@ -409,8 +515,12 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
                     if p_status[ip] != 1:
                         continue
                     pid = poly_id[ip]
-                    nvert = poly_nvert[pid]
-                    inside = _point_in_polygon_numba(px[ip], py[ip], poly_x[:, pid], poly_y[:, pid], nvert)
+                    inside = _point_in_geometry_numba(
+                        px[ip], py[ip],
+                        region_ring_x, region_ring_y, region_ring_vertex_offsets,
+                        region_subpoly_ring_offsets, region_poly_subpoly_offsets,
+                        pid,
+                    )
                     if not inside:
                         dep_row[dep_count] = ip
                         dep_x[dep_count] = px[ip]
@@ -454,7 +564,7 @@ def mirror_rk4_substep_loop_numba(
     particle_step_counter: np.ndarray | None = None,
     native_status: np.ndarray | None = None,
     substep_utc_ns: Callable[[int], int] | None = None,
-    interest_region_polygon: Polygon | None = None,
+    interest_region_polygon: Polygon | MultiPolygon | None = None,
     interest_region_polygons: np.ndarray | None = None,
     departures: list[DepartureRecord] | None = None,
 ) -> SubstepDiagnostics:
@@ -524,23 +634,27 @@ def mirror_rk4_substep_loop_numba(
             interest_region_polygon if interest_region_polygon is not None else interest_region_polygons
         )
         if interest_region_polygon is not None:
-            # 單一多邊形套用到全部 n 顆粒子：prepare_interest_region_arrays
-            # 只看得到這一個 Polygon 物件，不知道粒子數，這裡才把 poly_id
-            # 廣播成 (n,)（全部指向唯一的相異多邊形索引 0）。
+            # 單一幾何套用到全部 n 顆粒子：prepare_interest_region_arrays
+            # 只看得到這一個 Polygon／MultiPolygon 物件，不知道粒子數，
+            # 這裡才把 poly_id 廣播成 (n,)（全部指向唯一的相異幾何索引 0）。
             poly_id = np.zeros(n, dtype=np.int64)
         else:
             poly_id = region_arrays.poly_id
-        poly_x = region_arrays.poly_x
-        poly_y = region_arrays.poly_y
-        poly_nvert = region_arrays.poly_nvert
+        region_ring_x = region_arrays.ring_x
+        region_ring_y = region_arrays.ring_y
+        region_ring_vertex_offsets = region_arrays.ring_vertex_offsets
+        region_subpoly_ring_offsets = region_arrays.subpoly_ring_offsets
+        region_poly_subpoly_offsets = region_arrays.poly_subpoly_offsets
         substep_utc_ns_values = np.asarray(
             [int(substep_utc_ns(idt)) for idt in range(1, ndeltp + 1)], dtype=np.int64
         )
     else:
         poly_id = np.zeros(n, dtype=np.int64)
-        poly_x = np.zeros((1, 1), dtype=np.float64)
-        poly_y = np.zeros((1, 1), dtype=np.float64)
-        poly_nvert = np.zeros(1, dtype=np.int64)
+        region_ring_x = np.zeros(0, dtype=np.float64)
+        region_ring_y = np.zeros(0, dtype=np.float64)
+        region_ring_vertex_offsets = np.zeros(1, dtype=np.int64)
+        region_subpoly_ring_offsets = np.zeros(1, dtype=np.int64)
+        region_poly_subpoly_offsets = np.zeros(1, dtype=np.int64)
         substep_utc_ns_values = np.zeros(max(ndeltp, 1), dtype=np.int64)
 
     dep_row = np.full(n, -1, dtype=np.int64)
@@ -564,7 +678,9 @@ def mirror_rk4_substep_loop_numba(
         int(ibf), int(ndeltp), float(dtb), float(hdc), float(driver_grid.h0), bool(enable_diffusion),
         hf1_arr, hf2_arr,
         seed_lo, seed_hi, step_counter,
-        bool(has_interest_region), poly_id, poly_x, poly_y, poly_nvert,
+        bool(has_interest_region), poly_id,
+        region_ring_x, region_ring_y, region_ring_vertex_offsets,
+        region_subpoly_ring_offsets, region_poly_subpoly_offsets,
         native_status if native_status is not None else np.zeros(n, dtype=np.int32),
         substep_utc_ns_values,
         dep_row, dep_x, dep_y, dep_z, dep_utc_ns,
