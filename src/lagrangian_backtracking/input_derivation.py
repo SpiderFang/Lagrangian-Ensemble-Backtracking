@@ -58,6 +58,8 @@ from .bed_residence import (
 from .config import (
     ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1,
     ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+    ARRIVAL_SELECTION_TIDAL_STRENGTH_WINDOW_HOURS_V2_DEFAULT,
     CURRENT_DESIGN_VERSION,
     FORMAL_DOMAIN_POLICY_EXPANDED_V1,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
@@ -3098,6 +3100,7 @@ def _select_arrivals_for_site(
     observation_years: Sequence[int] | None = None,
     replicates: int | None = None,
     selection_policy: str | None = None,
+    tidal_strength_window_hours: float | None = None,
     allow_gap_censored_anchor: bool = False,
 ) -> list[ArrivalTime]:
     """依版本化 observation policy 產生單站 48+2 arrival。
@@ -3109,6 +3112,11 @@ def _select_arrivals_for_site(
     通過 accepted-product 或 gap-safe gate。缺時截尾政策另外只要求 observation anchor
     本身 exact UTC、OCM/NWW finite；完整支援窗會由 gap manifest 列舉，runtime 在第一個
     缺口停止，不能在 selector 階段以零值或最近值補齊。
+
+    ``tidal_strength_window_hours`` 只服務
+    ``ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2``（潮汐強度判定時窗，省略時
+    selector 採 25 小時預設）；v1／legacy 明示此參數會被下游 selector fail closed，
+    保護既有 manifest 位元不變。
     """
 
     times = np.asarray(product.canonical.time_utc_ns, dtype=np.int64)
@@ -3151,6 +3159,7 @@ def _select_arrivals_for_site(
             observation_years=observation_years,
             replicates=replicates,
             selection_policy=selection_policy,
+            tidal_strength_window_hours=tidal_strength_window_hours,
         )
     except ValueError:
         if strict:
@@ -3167,7 +3176,10 @@ def _select_arrivals_for_site(
             for index in candidate_indices
         }
         years = sorted({item.year for item in datetimes.values()})
-        is_observation_policy = selection_policy == "observation_year_stratified_48_plus_2_v1"
+        is_observation_policy = selection_policy in {
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+        }
         if is_observation_policy:
             if observation_years is None:
                 raise
@@ -3196,7 +3208,9 @@ def _select_arrivals_for_site(
         selected: set[int] = set()
         records: list[ArrivalTime] = []
         if is_observation_policy:
-            selection_label = "observation_year_stratified_48_plus_2_v1"
+            # selection_policy 在此已確定是 V1 或 V2 的合法字串，直接沿用即可讓 label
+            # 與呼叫端明示的 policy 一致，不必為 v2 另外複製一份硬編碼字面值。
+            selection_label = selection_policy
             for year in years:
                 for season in ("DJF", "MAM", "JJA", "SON"):
                     cell = [
@@ -3340,7 +3354,7 @@ def _select_arrivals_for_site(
                         "selection_rank": len(records),
                         **(
                             {
-                                "selection_policy": "observation_year_stratified_48_plus_2_v1",
+                                "selection_policy": selection_policy,
                                 "observation_year": dt.year,
                                 "stratum_id": f"event/{event}",
                             }
@@ -3806,6 +3820,7 @@ def _select_arrivals_with_nww_metric_location(
     observation_years: Sequence[int] | None = None,
     replicates: int | None = None,
     selection_policy: str | None = None,
+    tidal_strength_window_hours: float | None = None,
     allow_gap_censored_anchor: bool = False,
     maximum_snap_distance_m: float | None = None,
 ) -> tuple[list[ArrivalTime], _SiteArrivalSelectionContext]:
@@ -3819,7 +3834,8 @@ def _select_arrivals_with_nww_metric_location(
     CLI 使用。current formal 若未傳入有限正的站點 core 半徑會立即拒絕；只有 legacy
     compatibility path 才可暫以歷史兩格尺度建立 binding。
 
-    ``observation_years``、``replicates`` 與 ``selection_policy`` 會原樣傳給單站
+    ``observation_years``、``replicates``、``selection_policy`` 與
+    ``tidal_strength_window_hours``（只服務 v2）會原樣傳給單站
     selector；metric location 的 anchor/cell-center 重試不得把新版 2025-only policy
     降級成舊兩年 policy。
     """
@@ -3876,6 +3892,7 @@ def _select_arrivals_with_nww_metric_location(
             observation_years=observation_years,
             replicates=replicates,
             selection_policy=selection_policy,
+            tidal_strength_window_hours=tidal_strength_window_hours,
             allow_gap_censored_anchor=allow_gap_censored_anchor,
         )
         binding = _nww_metric_location_binding(
@@ -5566,7 +5583,11 @@ def _arrival_payload(
             if bed_config is not None
             else (
                 ARRIVAL_SELECTION_METHOD_OBSERVATION_YEAR_ID
-                if observation_policy == "observation_year_stratified_48_plus_2_v1"
+                if observation_policy
+                in {
+                    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+                    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+                }
                 else ARRIVAL_SELECTION_METHOD_ID
             )
         )
@@ -5598,7 +5619,10 @@ def _arrival_payload(
             ),
             "event_supplement_count": int(selection_config.event_supplement_count),
         }
-        if observation_policy == "observation_year_stratified_48_plus_2_v1":
+        if observation_policy in {
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+        }:
             # manifests loader 會從這個 nested object 重播 forcing／observation 年份、
             # policy 與 replicate 契約；root 仍保留平坦欄位供舊工具讀取。
             provenance_extra["arrival_time_selection"] = {
@@ -5616,6 +5640,20 @@ def _arrival_payload(
                 ),
                 "core_count": int(selection_config.core_count),
                 "event_supplement_count": int(selection_config.event_supplement_count),
+                **(
+                    # WP-19：v2 的潮汐強度時窗是與 v1 唯一不同的分層依據；寫入 release
+                    # provenance 讓下游 manifest 稽核可直接核對窗長，不必反推每筆
+                    # arrival metadata。
+                    {
+                        "tidal_strength_window_hours": (
+                            float(selection_config.tidal_strength_window_hours)
+                            if selection_config.tidal_strength_window_hours is not None
+                            else ARRIVAL_SELECTION_TIDAL_STRENGTH_WINDOW_HOURS_V2_DEFAULT
+                        )
+                    }
+                    if observation_policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2
+                    else {}
+                ),
             }
     if pilot_selection is not None:
         provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
@@ -7269,6 +7307,9 @@ def build_input_derivatives(
     )
     selection_policy = arrival_selection.policy if arrival_selection is not None else None
     selection_replicates = arrival_selection.replicates if arrival_selection is not None else None
+    selection_tidal_strength_window_hours = (
+        arrival_selection.tidal_strength_window_hours if arrival_selection is not None else None
+    )
     sites_by_region: dict[str, list[str]] = {}
     for site in config.study_sites:
         sites_by_region.setdefault(site.analysis_region_id, []).append(site.study_site_id)
@@ -7313,6 +7354,7 @@ def build_input_derivatives(
                 observation_years=observation_years,
                 replicates=selection_replicates,
                 selection_policy=selection_policy,
+                tidal_strength_window_hours=selection_tidal_strength_window_hours,
                 allow_gap_censored_anchor=gap_censoring_enabled,
                 maximum_snap_distance_m=maximum_metric_snap_distance_m,
             )
@@ -9291,10 +9333,10 @@ def validate_release_config(
     if release_config is not None:
         expected_arrival_binding = _arrival_selection_release_binding(release_config)
         selection = release_config.arrival_time_selection
-        requires_arrival_binding = (
-            selection is not None
-            and selection.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1
-        )
+        requires_arrival_binding = selection is not None and selection.policy in {
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+        }
         raw_arrival_binding = binding.get("arrival_selection_binding")
         if raw_arrival_binding is None:
             if requires_arrival_binding:

@@ -218,7 +218,16 @@ DEFAULT_BACKTRACK_SUPPORT_DAYS = 7
 # 數量、observation 年份與 metadata 欄位的資料契約；寫入設定／manifest 後不可由
 # 呼叫端自行改用另一套選時算法。
 ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1 = "observation_year_stratified_48_plus_2_v1"
+# WP-19：v2 與 v1 分層數量相同，唯一差異是潮汐強度（分大小潮用）的判定時窗預設由
+# 14 天改為約一個潮日（25 小時，見 arrival_times 模組文件開頭的大小潮週期理由）。
+# v1／legacy 的既有 manifest 與 config hash 不受影響，只有明示採用 v2 才會生效。
+ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2 = "observation_year_stratified_48_plus_2_v2"
 ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1 = "two_years_stratified_48_plus_2_v1"
+
+# v2 潮汐強度時窗預設值（小時），與 arrival_times.DEFAULT_TIDAL_STRENGTH_WINDOW_HOURS_V2
+# 保持同一個數值來源；config 層另外保留一份常數，避免 schema 驗證訊息需要匯入
+# selector 模組造成循環相依。
+ARRIVAL_SELECTION_TIDAL_STRENGTH_WINDOW_HOURS_V2_DEFAULT = 25.0
 
 # arrival 的 NWW 波浪指標位置是獨立於實際受體的 metric proxy。現行正式政策先測試
 # 站點 anchor；若該 anchor 無法通過完整 48+2 exact-hour runtime selector，才在同一
@@ -759,6 +768,11 @@ class ArrivalTimeSelectionConfig(StrictModel):
     deterministic_tie_break: str
     northeast_pair_utc_when_coverage_allows: StrictBool
     decision_status: str
+    # WP-19：只有 v2 policy 使用的潮汐強度（分大小潮）判定時窗，單位小時；省略時
+    # selector 採 25 小時預設。v1／legacy 明示此欄位一律拒絕，避免誤以為它也會
+    # 改變 14 天長窗的既有 manifest 位元。normalized_payload 會在舊 YAML 未明示
+    # 此欄位時移除 Pydantic 補出的 None，維持既有 config hash。
+    tidal_strength_window_hours: float | None = None
 
     @model_validator(mode="after")
     def validate_selection_contract(self) -> ArrivalTimeSelectionConfig:
@@ -774,7 +788,22 @@ class ArrivalTimeSelectionConfig(StrictModel):
                 raise ValueError(
                     "arrival_time_selection.observation_years 必須是非空且不重複的年份"
                 )
-        if self.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1:
+        # tidal_strength_window_hours 只服務 v2；v1／legacy／未知 policy 明示此欄位
+        # 一律 fail closed，避免誤以為它同時改變既有 14 天長窗的 manifest 位元。
+        if self.tidal_strength_window_hours is not None:
+            if self.policy != ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2:
+                raise ValueError(
+                    "tidal_strength_window_hours 只有 "
+                    f"{ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2} 才接受覆寫"
+                )
+            if self.tidal_strength_window_hours <= 0:
+                raise ValueError(
+                    "arrival_time_selection.tidal_strength_window_hours 必須為正數"
+                )
+        if self.policy in {
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+        }:
             if self.core_count != 48:
                 raise ValueError(
                     "新版 observation arrival policy 的 core_count 必須固定為 48"
@@ -1179,7 +1208,10 @@ class ProjectConfig(StrictModel):
                 raise ValueError(
                     "arrival_time_selection.observation_years 必須是 inputs.years 的子集"
                 )
-        if selection.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1:
+        if selection.policy in {
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+        }:
             if self.design_version not in {
                 CURRENT_DESIGN_VERSION,
                 LEGACY_DESIGN_VERSION_OBSERVATION_2025,
@@ -1192,7 +1224,8 @@ class ProjectConfig(StrictModel):
         elif self.design_version == CURRENT_DESIGN_VERSION:
             raise ValueError(
                 f"{CURRENT_DESIGN_VERSION} 必須使用 "
-                f"{ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1}"
+                f"{ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1} 或 "
+                f"{ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2}"
             )
 
     def _validate_gap_censoring_contract(self) -> None:
@@ -1660,7 +1693,12 @@ class ProjectConfig(StrictModel):
             # 舊版兩年份 block 沒有新版 policy 欄位；只有來源 YAML 明示新版欄位時才
             # 將它們寫入 hash。這同時保留 legacy config 的 canonical bytes，並使新版
             # observation 年份／replicate policy 成為可稽核的設計邊界。
-            for field_name in ("policy", "observation_years", "replicates"):
+            for field_name in (
+                "policy",
+                "observation_years",
+                "replicates",
+                "tidal_strength_window_hours",
+            ):
                 if (
                     field_name in selection_payload
                     and field_name not in self.arrival_time_selection.model_fields_set

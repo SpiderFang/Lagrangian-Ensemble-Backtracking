@@ -10,6 +10,9 @@ import pytest
 import yaml
 
 from lagrangian_backtracking.config import (
+    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+    ARRIVAL_SELECTION_TIDAL_STRENGTH_WINDOW_HOURS_V2_DEFAULT,
     CURRENT_DESIGN_VERSION,
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
     GUISHAN_SOFT_PRIORITY_POLICY_ID,
@@ -269,6 +272,58 @@ def test_new_observation_years_must_be_nonempty_forcing_subset() -> None:
         payload["arrival_time_selection"]["observation_years"] = years
         with pytest.raises(ValueError, match="observation_years"):
             ProjectConfig.model_validate(payload)
+
+
+def _v2_arrival_selection_payload() -> dict:
+    """由範例 v1 區塊建立 v2 arrival_time_selection 變體，供 WP-19 schema 測試共用。"""
+
+    payload = _payload()
+    payload["arrival_time_selection"]["policy"] = ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2
+    return payload
+
+
+def test_v2_arrival_policy_is_accepted_under_current_design_version() -> None:
+    """CURRENT_DESIGN_VERSION 除 v1 外也必須接受新增的 v2 潮汐強度短窗 policy。"""
+
+    payload = _v2_arrival_selection_payload()
+    config = ProjectConfig.model_validate(payload)
+    assert config.arrival_time_selection is not None
+    assert config.arrival_time_selection.policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2
+    assert config.arrival_time_selection.tidal_strength_window_hours is None
+
+
+def test_v2_tidal_strength_window_hours_override_is_validated_and_hashed() -> None:
+    """v2 可由 config 明示覆寫潮汐強度窗長；只有明示欄位才進入 canonical config hash。"""
+
+    payload = _v2_arrival_selection_payload()
+    without_override = ProjectConfig.model_validate(payload).config_hash()
+
+    payload_with_override = deepcopy(payload)
+    payload_with_override["arrival_time_selection"]["tidal_strength_window_hours"] = (
+        ARRIVAL_SELECTION_TIDAL_STRENGTH_WINDOW_HOURS_V2_DEFAULT
+    )
+    config_with_override = ProjectConfig.model_validate(payload_with_override)
+    assert config_with_override.arrival_time_selection.tidal_strength_window_hours == pytest.approx(
+        ARRIVAL_SELECTION_TIDAL_STRENGTH_WINDOW_HOURS_V2_DEFAULT
+    )
+    # 明示覆寫即使數值等於預設值，仍是可稽核的設計決策，必須讓 canonical hash 與
+    # 省略欄位時不同，才能從 hash 反推「這次 run 是否明確鎖定窗長」。
+    assert config_with_override.config_hash() != without_override
+
+    payload_negative = deepcopy(payload)
+    payload_negative["arrival_time_selection"]["tidal_strength_window_hours"] = -1.0
+    with pytest.raises(ValueError, match="tidal_strength_window_hours"):
+        ProjectConfig.model_validate(payload_negative)
+
+
+def test_tidal_strength_window_hours_rejected_for_v1_config() -> None:
+    """v1 config 明示 tidal_strength_window_hours 必須立即失敗，保護既有 manifest 位元。"""
+
+    payload = _payload()
+    assert payload["arrival_time_selection"]["policy"] == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1
+    payload["arrival_time_selection"]["tidal_strength_window_hours"] = 25.0
+    with pytest.raises(ValueError, match="tidal_strength_window_hours"):
+        ProjectConfig.model_validate(payload)
 
 
 def test_receptor_candidate_domain_policy_is_versioned_and_core_aware() -> None:

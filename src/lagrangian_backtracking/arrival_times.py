@@ -1,9 +1,22 @@
 """由 2024–2025 forcing 衍生每站 48+2 到達時次的決定性 selector。
 
 核心 48 時次按年、季節、spring/neap proxy 與三個潮內相位完整分層。spring/neap 使用
-長窗潮位離差 RMS 的季節中位數分組；三相位分別最大正潮位導數、最小負導數與最小
-絕對導數。它們是可重現的潮位 proxy，不宣稱為現場三維最大漲／退潮流。另選全期
-local-domain 高波與強流各一時次，並要求與核心時次互異及具完整 backward window。
+「潮汐強度」（一段時窗內潮位離差的均方根，即 rolling RMS）的季節中位數分組；三相位
+分別最大正潮位導數、最小負導數與最小絕對導數。它們是可重現的潮位 proxy，不宣稱為
+現場三維最大漲／退潮流。另選全期 local-domain 高波與強流各一時次，並要求與核心
+時次互異及具完整 backward window。
+
+潮汐強度時窗長度（``rolling_window_hours``／v2 的 ``tidal_strength_window_hours``）
+直接決定 spring/neap 分類是否有意義：半日潮與全日潮的「大小潮週期」（spring-neap
+cycle，因太陽與月球引潮力相對相位變化造成潮差週期性增減）約 14.77 日（對應
+M2-S2 拍頻）或全日潮回歸週期約 13.66 日（K1-O1 拍頻）。若時窗長度恰好接近整個
+大小潮週期（例如舊版 ``ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1``／
+``ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1`` 採用的 14 天），該週期分量在時窗
+內幾乎被平均掉（可用 sinc 衰減因子估計，14 天窗對 14.77 天週期的衰減係數約
+0.054），使 rolling RMS 幾乎無法分辨大小潮，中位數切分退化為接近隨機分組。
+``ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2`` 改用約一個潮日（25 小時，涵蓋
+半日潮 12.42 小時週期與全日潮 23.93/25.82 小時週期各兩個循環）的短時窗，讓 RMS
+序列本身仍保留大小潮週期的振盪，中位數切分才能有效區分大潮／小潮。
 """
 
 from __future__ import annotations
@@ -30,10 +43,21 @@ SEASON_BY_MONTH = {
 }
 
 ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1 = "observation_year_stratified_48_plus_2_v1"
-"""新版只在明示 observation 年份選錨點的 48+2 分層政策。"""
+"""新版只在明示 observation 年份選錨點的 48+2 分層政策；潮汐強度沿用 14 天長窗
+（見模組文件開頭），spring/neap 分類準確度低，僅為相容既有 manifest 保留。"""
+
+ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2 = "observation_year_stratified_48_plus_2_v2"
+"""與 v1 分層結構相同（1 個 observation 年份 × 4 季 × 2 潮況 × 3 相位 × 2 replicate
+= 48，另加 2 事件），差異只在潮汐強度預設改用約一個潮日（25 小時）短時窗，可由
+``tidal_strength_window_hours`` 或 config 的
+``arrival_time_selection.tidal_strength_window_hours`` 覆寫；覆寫值與最終採用的
+窗長皆會寫入每筆 arrival metadata（``tidal_strength_window_hours``）。"""
 
 ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1 = "two_years_stratified_48_plus_2_v1"
 """未明示新版欄位時保留的兩 forcing 年份相容政策。"""
+
+DEFAULT_TIDAL_STRENGTH_WINDOW_HOURS_V2 = 25.0
+"""v2 policy 的潮汐強度時窗預設值（小時），約一個潮日，見模組文件開頭的理由。"""
 
 
 def _rolling_rms(values: np.ndarray, window: int) -> np.ndarray:
@@ -73,6 +97,7 @@ def select_arrival_times(
     backward_window_available: np.ndarray,
     design_version: str,
     rolling_window_hours: float = 24.0 * 14.0,
+    tidal_strength_window_hours: float | None = None,
     observation_years: tuple[int, ...] | list[int] | None = None,
     replicates: int | None = None,
     selection_policy: str | None = None,
@@ -93,6 +118,16 @@ def select_arrival_times(
     UTC 由早到晚排序，且每筆均從全域已選集合排除，因此同一 stratum 不會重複 UTC。
     缺值、域外與 gap-safe mask 仍由呼叫端先傳入 ``valid_forcing`` 與
     ``backward_window_available``；本函式不補值、不跨缺口外插。
+
+    ``rolling_window_hours`` 是 ``ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1``／
+    ``ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1`` 判定潮汐強度的固定時窗（預設
+    14 天），為保留既有 manifest 位元相同，此參數對這兩個政策維持原行為，不接受
+    ``tidal_strength_window_hours`` 覆寫。``ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2``
+    改以 ``tidal_strength_window_hours``（省略時預設
+    ``DEFAULT_TIDAL_STRENGTH_WINDOW_HOURS_V2``＝25 小時，約一個潮日）決定潮汐強度時窗；
+    只有 v2 才接受這個參數，其他政策明示傳入即視為設定錯誤並立即失敗，避免呼叫端
+    誤以為它同時影響 v1／legacy 而在不知情下改變既有 arrival identity。最終採用的
+    窗長會原樣寫入每筆 v2 arrival 的 ``metadata["tidal_strength_window_hours"]``。
     """
 
     time_values = np.asarray(time_utc_ns, dtype=np.int64)
@@ -111,16 +146,10 @@ def select_arrival_times(
     if nominal_seconds <= 0:
         raise ValueError("arrival selector nominal interval 無效")
     derivative = np.gradient(elevation, seconds)
-    window = max(int(round(rolling_window_hours * 3_600.0 / nominal_seconds)), 3)
-    tidal_strength = _rolling_rms(elevation, window)
-    datetimes = [datetime.fromtimestamp(int(value) / 1_000_000_000, tz=UTC) for value in time_values]
-    years = np.array([item.year for item in datetimes])
-    seasons = np.array([SEASON_BY_MONTH[item.month] for item in datetimes])
-    selected: set[int] = set()
-    records: list[ArrivalTime] = []
 
     # ``policy`` 是較短的外部 caller 參數別名；兩者同時出現時不能默默選一個，避免
-    # config 與 input builder 產生不同的 arrival identity。
+    # config 與 input builder 產生不同的 arrival identity。這段必須在潮汐強度時窗
+    # 決定前完成，因為 v2 的窗長預設值依 policy 而異。
     if policy is not None:
         if selection_policy is not None and selection_policy != policy:
             raise ValueError("arrival selector 的 policy 與 selection_policy 不可互相矛盾")
@@ -131,13 +160,45 @@ def select_arrival_times(
     ):
         raise ValueError("observation_years／replicates 必須搭配明示 selection policy")
 
-    is_observation_policy = selection_policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1
     if selection_policy not in {
         None,
         ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1,
         ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+        ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
     }:
         raise ValueError(f"不支援的 arrival selection policy：{selection_policy!r}")
+
+    is_v2_policy = selection_policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2
+    is_observation_policy = (
+        selection_policy == ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1 or is_v2_policy
+    )
+
+    # v1／legacy 的潮汐強度時窗必須維持既有預設（14 天）與既有 manifest 位元相同，
+    # 因此明示 ``tidal_strength_window_hours`` 卻搭配非 v2 policy 一律 fail closed，
+    # 避免呼叫端誤以為這個覆寫同時影響 v1／legacy 而在不知情下改變 arrival identity。
+    if is_v2_policy:
+        effective_tidal_strength_window_hours = (
+            DEFAULT_TIDAL_STRENGTH_WINDOW_HOURS_V2
+            if tidal_strength_window_hours is None
+            else float(tidal_strength_window_hours)
+        )
+        if effective_tidal_strength_window_hours <= 0:
+            raise ValueError("v2 的 tidal_strength_window_hours 必須為正數")
+    else:
+        if tidal_strength_window_hours is not None:
+            raise ValueError(
+                "tidal_strength_window_hours 只有 "
+                f"{ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2} 才接受覆寫"
+            )
+        effective_tidal_strength_window_hours = rolling_window_hours
+
+    window = max(int(round(effective_tidal_strength_window_hours * 3_600.0 / nominal_seconds)), 3)
+    tidal_strength = _rolling_rms(elevation, window)
+    datetimes = [datetime.fromtimestamp(int(value) / 1_000_000_000, tz=UTC) for value in time_values]
+    years = np.array([item.year for item in datetimes])
+    seasons = np.array([SEASON_BY_MONTH[item.month] for item in datetimes])
+    selected: set[int] = set()
+    records: list[ArrivalTime] = []
 
     def choose(candidates: np.ndarray, score: np.ndarray, *, maximize: bool) -> int:
         """依 score 與較早 UTC tie-break 選尚未使用的有限候選。"""
@@ -206,7 +267,9 @@ def select_arrival_times(
         # 由設定先明確決定分層總量，不能讓年數增加後悄悄產生超過 50 筆 arrival。
         if len(selected_years) != 1:
             raise ValueError("新版 observation arrival policy 目前必須指定恰好一個 observation 年份")
-        selection_label = ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1
+        # v1 沿用固定字面值等同 selection_policy 字串，metadata／identity 位元不變；
+        # v2 則直接使用 selection_policy，讓 identity fields 與 metadata 都能辨識新政策。
+        selection_label = selection_policy
         for year in selected_years:
             for season in ("DJF", "MAM", "JJA", "SON"):
                 cell = valid & (years == year) & (seasons == season) & np.isfinite(tidal_strength)
@@ -268,6 +331,15 @@ def select_arrival_times(
                                         "replicate_rank": replicate_rank,
                                         "replicate_rank_one_based": replicate_rank + 1,
                                         "stratum_id": stratum_id,
+                                        **(
+                                            {
+                                                "tidal_strength_window_hours": (
+                                                    effective_tidal_strength_window_hours
+                                                )
+                                            }
+                                            if is_v2_policy
+                                            else {}
+                                        ),
                                     },
                                 )
                             )
@@ -306,6 +378,15 @@ def select_arrival_times(
                         "selection_policy": selection_label,
                         "observation_year": int(years[index]),
                         "stratum_id": f"event/{event_name}",
+                        **(
+                            {
+                                "tidal_strength_window_hours": (
+                                    effective_tidal_strength_window_hours
+                                )
+                            }
+                            if is_v2_policy
+                            else {}
+                        ),
                     },
                 )
             )

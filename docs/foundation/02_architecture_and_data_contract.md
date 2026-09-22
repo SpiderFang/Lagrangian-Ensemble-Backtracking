@@ -331,12 +331,22 @@ arrival-time v1 root 與 receptor 相似，但固定使用 `manifest_kind: "arri
 恰含 `arrival_time_id`、`study_site_id`、`time_utc_ns`、`year`、`season`、`tide_class`、
 `phase_or_event`、`metadata`。`time_utc_ns` 必須是真正 integer，UTC year 必須等於
 `year`，season 只接受正式 selector 的 `DJF`／`MAM`／`JJA`／`SON`，ID 全案唯一且同站
-UTC 不重複。formal 除五站各 50、全案 250 外，每站還必須逐格符合以下 48+2 契約：
-`config.inputs.years` 的兩年 × 四個 season × `spring_proxy`／`neap_proxy` ×
-`fastest_rising`／`fastest_falling`／`slack_proxy` 各一筆，共 48 筆；另以
-`tide_class: "event"` 恰含 `high_wave_event` 與 `strong_current_event` 各一筆。pilot 可為
-config 站點的非空子集，不強制補齊 48+2，但所有 season label 仍須使用上述四值。相同 UTC
-可在不同站點各自出現。
+UTC 不重複。formal 除五站各 50、全案 250 外，每站還必須逐格符合以下 48+2 契約：現行
+`arrival_time_selection.policy`（`observation_year_stratified_48_plus_2_v1`／`_v2`）以
+`arrival_time_selection.observation_years` 指定的**單一** observation 年份為錨點——
+`config.inputs.years` 仍可包含用於 backward window 前置支援、但不作 arrival anchor 的
+額外年份（例如目前的 2024）——組成：1 個 observation 年份 × 四個 season ×
+`spring_proxy`／`neap_proxy` × `fastest_rising`／`fastest_falling`／`slack_proxy` ×
+`replicates`（現行固定為 2）＝ 48 筆；另以 `tide_class: "event"` 恰含 `high_wave_event` 與
+`strong_current_event` 各一筆。v1／v2 分層數量與欄位相同，唯一差異是判定 `spring_proxy`／
+`neap_proxy` 所用的潮汐強度時窗：v1 固定 14 天（為維持既有 manifest 位元相同）；v2 預設約
+一個潮日（25 小時，可由 `tidal_strength_window_hours` 覆寫），且會把採用的窗長寫入每筆
+metadata 的 `tidal_strength_window_hours`（見
+[08 設計基線第 7 節](08_design_baseline_and_derived_gates.md#7-每站點-50-個到達時間)）。
+只唯讀相容的舊版 `two_years_stratified_48_plus_2_v1` policy 才維持「`config.inputs.years`
+的兩年 × 四個 season × 兩潮況 × 三相位」各一筆、不含 replicate 的舊契約。pilot 可為 config
+站點的非空子集，不強制補齊 48+2，但所有 season label 仍須使用上述四值。相同 UTC 可在不同
+站點各自出現。
 
 現行 formal 的每筆 arrival metadata 另須保存 NWW metric proxy 的完整 binding：
 `metric_location_policy_id` 必須是

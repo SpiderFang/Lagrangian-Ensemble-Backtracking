@@ -576,6 +576,14 @@ scenarios:
 arrival_time_selection:
   # forcing 仍讀取 2024–2025；新版只在 2025 observation 年份選 anchor。2024 不作
   # arrival，而是支援最長 180 日的 observation 選時與沉底後 runtime window。
+  #
+  # WP-19：v1 的大小潮（spring/neap）分類使用 14 天潮汐強度判定時窗，已由正式 OCM
+  # 逐時驗證證實幾乎無法分辨大小潮（判定準確率僅約 0.49–0.56，等同隨機）；v1 在此
+  # 仍保留 14 天窗只是為了讓既有 manifest 位元相同，不代表這是建議設定。正式重新
+  # 產生到達時間 manifest 時應改用 observation_year_stratified_48_plus_2_v2（潮汐強度
+  # 時窗預設 25 小時，約一個潮日，可另以 tidal_strength_window_hours 覆寫），詳見
+  # docs/foundation/08_design_baseline_and_derived_gates.md 第 7 節與
+  # arrival_times 模組文件。
   policy: observation_year_stratified_48_plus_2_v1
   core_design: observation_year_by_four_seasons_by_replicate_spring_neap_by_three_tidal_phase_proxies
   core_count: 48

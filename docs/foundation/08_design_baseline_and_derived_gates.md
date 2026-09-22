@@ -9,6 +9,9 @@
 
 本文件記錄 2026-08-17 完成、2026-08-27 依研究主持人意見修訂，並於 2026-09-09 由 A 區範圍裁決更新的設計基線。原 `design_baseline_v2_non_rising_oca_proxy` 的十個非上浮材質／形狀代理、嚴格負沉降速度與物性限制仍沿用；本期 A 區幾何與 domain 身分改採 `design_baseline_v3_non_rising_a_v3_local20_20260909` 及 `formal_domain_policy=v3_local20km_20260909_v1`。使用者已明示沒有可再提供的單體物性資料，因此只有必須由 SERVER 實際資料、OCM 網格、現地樣本或先導試驗計算出的數值保留為「衍生閘門」。
 
+2026-09-23 依正式 OCM 逐時海面高程驗證結果修訂第 7 節：先前大小潮分類使用的 14 天潮汐強度判定時窗，因大小潮週期約 14.77 天而幾乎把整輪大小潮平均掉，導致分類近似隨機（詳見 `arrival_time_selection.policy=observation_year_stratified_48_plus_2_v2` 的
+``arrival_times`` 模組文件）；新增 `_v2` selector policy 改用約一個潮日（25 小時）的短窗，`_v1`／舊版兩年份 policy 仍保留 14 天窗以維持既有 manifest 位元相同。第 7 節文字同步更新，不再把農曆朔望當成分類依據本身，只作背景說明。
+
 本裁決的核心原則是：**四個 forcing flow domains 不等於四個情境統計單元**。貢寮與龜山島共用同一套東北台灣 OCM/NWW forcing，但兩者是獨立研究站點，各自具有 20 個受體、50 個到達時間與完整 `10×20×50` 情境矩陣。
 
 ## 2. 上游依據與版本
@@ -228,19 +231,57 @@ contact。只有另行登錄的 `bed_reflect`／再懸浮敏感度，才可將�
 
 ## 7. 每站點 50 個到達時間
 
-每站點使用固定且可重現的 `48+2` 設計：
+每站點使用固定且可重現的 `48+2` 設計。現行正式母體（`arrival_time_selection.policy` 為
+`observation_year_stratified_48_plus_2_v1`／`_v2`）以單一 observation 年份為錨點：
 
 ```text
-48 core = 2 years × 4 seasons × 2 spring/neap classes × 3 intra-tidal phases
+48 core = 1 observation year × 4 seasons × 2 spring/neap classes × 3 intra-tidal phases × 2 replicates
 2 extremes = 1 high-wave event + 1 strong-current event
 ```
 
-Spring/Neap classes:
-大潮(Spring tide)與小潮(Neap tide)是因太陽、地球與月球相對位置改變，引潮力相加或互相抵銷，導致水位落差(潮差)最大或最小的周期現象。
-大潮發生於農曆初一與十五前後(潮差最大)；小潮發生於農曆初七、八(上弦月)與二十二、二十三(下弦月)前後(潮差最小)。
+（唯讀相容的舊版兩年份 policy `two_years_stratified_48_plus_2_v1` 則是
+`2 years × 4 seasons × 2 classes × 3 phases`，每格 1 筆、不含 replicate；只供歷史 artifact
+載入，不是目前正式母體的規則。）
 
-intra-tidal phases:
-三個潮汐階段可根據當地潮位站或 OCM 海面高度資料，以固定且可重複的方法選出：潮位上升最快的時刻、下降最快的時刻，以及最接近漲退潮交替的時刻。這三個時刻只是用來區分潮汐階段，不能直接當作實測的最大漲潮流、最大退潮流或真正的轉流時刻。每一個 `year × season × spring/neap` 格子各選三個不同的 UTC 時間；若有多個候選時刻相同，依資料完整程度、離資料邊界的安全距離和時間先後順序決定，不使用隨機抽樣。
+### 7.1 Spring/Neap classes（大潮／小潮分類）
+
+**分類依據**：大潮（spring tide）與小潮（neap tide）是潮差（潮位變動幅度）隨大小潮週期
+（spring-neap cycle）週期性增減的現象；正式 selector 以「約一個潮日（25 小時，涵蓋半日潮
+12.42 小時週期與全日潮 23.93／25.82 小時週期各約兩個循環）內潮位離差的均方根（rolling
+RMS，稱為潮汐強度）」代表局地潮差大小，在每個 `year × season` 格子內以其中位數把候選時次
+切成大潮／小潮兩組，各組再各選 3 個潮內相位 × 2 個 replicate ＝ 6 筆（見 7.2）。
+
+**窗長是分類是否有效的關鍵、且有兩個版本並存**：半日潮（M2/S2 拍頻）與全日潮（K1/O1 回歸
+週期）的大小潮週期都約 13.7–14.8 天。`observation_year_stratified_48_plus_2_v1`（與舊版兩
+年份 policy）固定使用 14 天長窗；14 天窗幾乎等於整個大小潮週期，該週期分量在窗內幾乎被平均
+掉（sinc 衰減因子約 0.054），使 RMS 序列幾乎無法分辨大小潮，中位數切分接近隨機分組——已由
+正式 OCM 逐時海面高程五站驗證證實：14 天窗判定的大潮落在朔望（見下）附近的比例僅
+0.49–0.56，等同隨機。`observation_year_stratified_48_plus_2_v2` 改用約一個潮日（25 小時，
+可由 config 的 `arrival_time_selection.tidal_strength_window_hours` 覆寫）短窗，同一批驗證
+下判定準確率提升至 0.75–0.83。**v1 與舊版兩年份 policy 仍保留 14 天窗以維持既有 manifest
+位元相同**，只有明示採用 v2 才會啟用短窗；正式母體應優先採用 v2。
+
+**農曆朔望只作背景說明，不是分類依據本身**：大潮通常發生於農曆初一與十五前後（朔望，新月
+／滿月，太陽與月球引潮力相加）、小潮發生於農曆初七、八（上弦月）與二十二、二十三（下弦月）
+前後（引潮力部分抵銷）。這是半日潮站（M2/S2 拍頻）常見的物理對應，但 selector 本身不讀取
+農曆或天文星曆，只用潮位資料算出的潮汐強度分類。**南灣站以全日潮為主，大小潮強弱主要隨全日
+潮回歸週期（regression cycle，K1/O1 拍頻，約 13.66 天，與月球赤緯變化相關）調變**，其強弱
+週期與半日潮站的朔望對應關係較弱，不能直接套用「初一十五」的說法；`arrival_times` 模組文件
+與 WP-19 驗證的合成 K1+O1 序列已把這個差異列為獨立測試案例。
+
+### 7.2 intra-tidal phases（潮內相位代理）
+
+三個潮汐階段可根據當地潮位站或 OCM 海面高度資料，以固定且可重複的方法選出：潮位上升最快的
+時刻、下降最快的時刻，以及最接近漲退潮交替的時刻。這三個時刻只是用來區分潮汐階段，不能直接
+當作實測的最大漲潮流、最大退潮流或真正的轉流時刻；同時，因為變化率極值本身偏好發生在大潮期
+間，這個代理在分類本身不準確時（例如使用 14 天窗）容易讓兩組內選出的代表時刻都偏向大潮，這
+正是選用短窗才能讓 selector 真正發揮分層設計意圖的原因之一。每一個
+`observation_year × season × spring/neap` 格子各選三個不同的 UTC 時間，v1／v2 各再依固定
+score／UTC 排序取 2 個 replicate；若有多個候選時刻相同，依資料完整程度、離資料邊界的安全
+距離和時間先後順序決定，不使用隨機抽樣；候選不足時直接失敗，不得默默改用另一組或以最近值
+補齊。
+
+### 7.3 事件補充
 
 兩個事件補充時次分別由站點 local domain 的 NWW3 有效 `Hs` 與 OCM 三維流速代表統計量選取；兩者必須互異、未出現在核心 48 時次、且向前具有完整回溯 forcing 支撐。貢寮與龜山島在 coverage 允許時共用配對 UTC，以利隔離空間差異；每站點的潮況與極端標籤仍獨立計算。
 

@@ -26,7 +26,12 @@ from shapely.geometry import box, shape
 import lagrangian_backtracking.cli as cli
 import lagrangian_backtracking.input_derivation as input_derivation_module
 from lagrangian_backtracking.cli import main
-from lagrangian_backtracking.config import ProjectConfig, StudySiteConfig, resolve_flow_domain_id
+from lagrangian_backtracking.config import (
+    ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+    ProjectConfig,
+    StudySiteConfig,
+    resolve_flow_domain_id,
+)
 from lagrangian_backtracking.geometry import DomainProjection
 from lagrangian_backtracking.horizon_suite import build_horizon_suite, validate_horizon_suite
 from lagrangian_backtracking.input_derivation import (
@@ -1299,6 +1304,54 @@ def test_paired_a_clone_uses_guishan_metrics_and_rejects_shared_utc_gap(
             design_version="paired-test",
             strict=True,
         )
+
+
+def test_select_arrivals_for_site_threads_v2_tidal_strength_window_hours_override() -> None:
+    """WP-19：``_select_arrivals_for_site`` 必須把覆寫窗長原樣傳給底層 selector。
+
+    這裡只驗證工程接線（config／input builder 傳下來的 ``tidal_strength_window_hours``
+    確實抵達 ``select_arrival_times`` 並寫入每筆 metadata），不驗證潮汐強度的科學正確
+    性——那部分由 ``tests/test_arrival_times.py`` 的合成 M2+S2／K1+O1 序列驗證。
+    """
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    step = timedelta(hours=1)
+    count = 24 * 730
+    times = np.asarray(
+        [int((start + index * step).timestamp() * 1_000_000_000) for index in range(count)],
+        dtype=np.int64,
+    )
+    hours = np.arange(count, dtype=np.float64)
+    elevation = np.sin(2.0 * np.pi * hours / 12.4206012) + 0.4 * np.sin(
+        2.0 * np.pi * hours / 12.0 + 0.3
+    )
+    ocm_elevation = {int(times[index]): float(elevation[index]) for index in range(count)}
+    ocm_speed = {int(value): 1.0 for value in times}
+    nww_series = {int(value): 1.0 for value in times}
+    nww_series[int(times[5000])] = 8.0
+    ocm_speed[int(times[9000])] = 3.0
+    product = SimpleNamespace(canonical=SimpleNamespace(time_utc_ns=times))
+
+    records = input_derivation_module._select_arrivals_for_site(
+        site_id="test_site",
+        product=product,
+        nww_series=nww_series,
+        ocm_elevation=ocm_elevation,
+        ocm_speed=ocm_speed,
+        max_backtrack_days=7.0,
+        design_version="wp19-wiring-test",
+        expected_axis=times,
+        strict=True,
+        observation_years=[2025],
+        replicates=2,
+        selection_policy=ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+        tidal_strength_window_hours=30.0,
+        allow_gap_censored_anchor=True,
+    )
+
+    assert len(records) == 50
+    for item in records:
+        assert item.metadata["tidal_strength_window_hours"] == pytest.approx(30.0)
 
 
 def test_receptor_nww_reselection_prepares_one_pool_per_site_and_caches_support(
