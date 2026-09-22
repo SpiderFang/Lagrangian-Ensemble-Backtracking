@@ -336,9 +336,9 @@ class HourMajorProviderParams:
 
 
 def _env_smagorinsky_impl(env: Mapping[str, str]) -> str:
-    """``LBT_NATIVE_SMAGORINSKY_IMPL``：``baytrace``（預設，原版）或 ``numba``（統計等價的加速移植）。"""
+    """``LBT_NATIVE_SMAGORINSKY_IMPL``：``numba``（預設，統計等價的加速移植）或 ``baytrace``（原版）。"""
 
-    value = (env.get("LBT_NATIVE_SMAGORINSKY_IMPL") or "baytrace").strip().lower()
+    value = (env.get("LBT_NATIVE_SMAGORINSKY_IMPL") or "numba").strip().lower()
     if value not in {"baytrace", "numba"}:
         raise HourMajorProviderError(
             f"LBT_NATIVE_SMAGORINSKY_IMPL 只接受 baytrace 或 numba，收到 {value!r}"

@@ -278,11 +278,12 @@ class HourMajorConfig:
     master_seed: int = 0
     stokes_depth_threshold_ratio: float | None = None
     # 水平擴散係數（Smagorinsky，工作書式(10)）的計算實作：
-    # ``"baytrace"``（預設）＝透過 shim 呼叫 BayTrace 原版 ``_compute_smagorinsky_hf2``；
-    # ``"numba"``＝``smagorinsky_batch`` 的 Numba 移植，同一演算法、同一運算式，但浮點
-    # 加總順序不同，與原版差 1–2 個最後有效位元（相對誤差約 1e-16），屬統計等價而非
-    # 位元相同；速度快約 35 倍且幾乎不產生暫存陣列（多程序並跑時不再搶記憶體頻寬）。
-    smagorinsky_impl: str = "baytrace"
+    # ``"numba"``（預設）＝``smagorinsky_batch`` 的 Numba 移植，同一演算法、同一運算式，但浮點
+    # 加總順序不同，與原版差 1–2 個最後有效位元（真實東北網格實測最大相對差 7e-16），屬統計
+    # 等價而非位元相同；東北網格每小時 0.27 秒（原版 11.67 秒），且幾乎不產生暫存陣列。
+    # ``"baytrace"``＝透過 shim 呼叫 BayTrace 原版 ``_compute_smagorinsky_hf2``（需要與原版
+    # 位元相同時使用）。專案決定：預設採運算最快的版本。
+    smagorinsky_impl: str = "numba"
 
 
 def hour_major_config_to_backward_driver_config(
