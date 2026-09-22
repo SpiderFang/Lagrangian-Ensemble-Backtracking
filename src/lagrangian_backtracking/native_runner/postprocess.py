@@ -838,11 +838,19 @@ class PostprocessAccumulator:
         config: PostprocessConfig | None = None,
         lonlat_projector: LonLatProjector | None = None,
         boundary_geometries: Mapping[str, BoundaryGeometry] | None = None,
+        runtime_physics_case: Mapping[str, Any] | None = None,
     ) -> None:
         self._identity_table = identity_table
         self._config = config if config is not None else PostprocessConfig()
         self._lonlat_projector = lonlat_projector
         self._boundary_geometries = boundary_geometries
+        # WP-18：native-plan 計畫檔 ``physics_case`` 區塊的原樣副本（若呼叫端提供），
+        # 記錄本次結果實際採用的實驗案例（是否含 Stokes、擴散方法聲明）。與
+        # ``self._identity_table.experiment_case_id`` 是不同語意——後者是建立粒子
+        # 身分表時的字串標籤（seed 命名空間用），不保證等於實際執行時的物理設定；
+        # 兩者刻意分開命名，避免呼叫端把身分表標籤誤當成物理案例的證據。省略時
+        # （``None``）輸出 manifest 明確保存 ``None``，不臆測。
+        self._runtime_physics_case = dict(runtime_physics_case) if runtime_physics_case is not None else None
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1180,6 +1188,11 @@ class PostprocessAccumulator:
                     if self._boundary_geometries is not None
                     else None
                 ),
+                # WP-18：native-plan 計畫檔的實驗案例聲明（若呼叫端提供 --plan）。
+                # None 表示呼叫端未提供計畫檔，不代表「無 Stokes」，見
+                # PostprocessAccumulator.__init__ 對兩種 experiment_case_id 語意
+                # 差異的說明。
+                "runtime_physics_case": self._runtime_physics_case,
             },
             kde_bandwidth_method=(
                 "scipy.stats.gaussian_kde 預設 Scott 法則（factor = n**(-1/(d+4))，d=2），"

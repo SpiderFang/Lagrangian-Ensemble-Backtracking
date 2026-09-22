@@ -97,8 +97,18 @@ def _write_template(path: Path, *, support_days: int | None = None) -> bytes:
     return rendered
 
 
-def _write_bed_template(path: Path) -> bytes:
-    """建立正式 bed-residence config 樣板，驗證 180 日選時／90 日運算契約。"""
+def _write_bed_template(path: Path, *, both_modes: bool = True) -> bytes:
+    """建立正式 bed-residence config 樣板，驗證 180 日選時／90 日運算契約。
+
+    WP-18：``EXAMPLE_CONFIG`` 現在明示
+    ``formal_release_backtrack_modes: [full_horizon_from_deposition]``（依 PI 原話，
+    正式 release 以 full_horizon 為主）。``both_modes=True``（本 helper 既有呼叫端的
+    預設用法）明確覆寫成兩種模式都發布，讓既有「一次建置六份 release」的測試維持
+    原本的驗證範圍（``fixed_calendar_window`` 敏感度分析仍是保留、可選的能力，見
+    ``test_bed_suite_default_publishes_only_full_horizon_release``）；
+    ``both_modes=False`` 則保留 ``EXAMPLE_CONFIG`` 本身的單一模式預設，供驗證新
+    預設行為的測試使用。
+    """
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
@@ -106,6 +116,11 @@ def _write_bed_template(path: Path) -> bytes:
     payload["inputs"]["backtrack_support_days"] = 180
     payload["boundaries"]["max_backtrack_days"] = None
     payload["scenarios"]["bed_residence_time"]["runtime_horizon_support_days"] = None
+    if both_modes:
+        payload["scenarios"]["bed_residence_time"]["formal_release_backtrack_modes"] = [
+            "fixed_calendar_window",
+            "full_horizon_from_deposition",
+        ]
     rendered = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).encode("utf-8")
     path.write_bytes(rendered)
     return rendered
@@ -634,6 +649,53 @@ def test_bed_suite_builds_one_180_day_selection_mother_and_six_mode_releases(
         or "release_horizon_binding_invalid" in error
         for error in tamper_result["errors"]
     )
+
+
+def test_bed_suite_default_publishes_only_full_horizon_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP-18：未覆寫 ``both_modes`` 時，沿用 ``EXAMPLE_CONFIG`` 的正式預設。
+
+    依 PI 原話，正式 release 應以「從沉底當下回溯到完整地平線」
+    （``full_horizon_from_deposition``）為主；``fixed_calendar_window``
+    僅是保留、可選的敏感度分析模式，不應再是預設會一次建立六份 release 的一員。
+    本測試驗證 ``configs/lagrangian_backtracking.example.yaml`` 目前的
+    ``formal_release_backtrack_modes: [full_horizon_from_deposition]`` 會讓
+    horizon-suite 對每個 H 只登錄一份 release（H30/H60/H90 共三份），而非舊版六份；
+    且 manifest 中不再出現 ``fixed_calendar_window`` 的 release。
+    """
+
+    calls = _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "bed-template.yaml"
+    _write_bed_template(template, both_modes=False)
+    destination = tmp_path / "bed-suite"
+    result = horizon_suite.build_horizon_suite(
+        template,
+        [90, 30, 60],
+        destination,
+        tmp_path / "ocm",
+        tmp_path / "surface",
+        tmp_path / "nww",
+        formal=False,
+    )
+
+    modes = ("full_horizon_from_deposition",)
+    assert result["horizons_days"] == [30, 60, 90]
+    assert result["backtrack_modes"] == list(modes)
+    assert result["release_count"] == 3
+    assert len(calls["build"]) == 1
+    assert len(calls["create"]) == 3
+    assert {call["backtrack_mode_override"] for call in calls["create"]} == set(modes)
+
+    manifest, _ = _load_manifest(destination)
+    assert manifest["backtrack_modes"] == list(modes)
+    assert len(manifest["releases"]) == 3
+    for days in (30, 60, 90):
+        release_path = destination / "release-configs" / f"release-{days}d-full_horizon_from_deposition.yaml"
+        assert release_path.is_file()
+        fixed_window_path = destination / "release-configs" / f"release-{days}d-fixed_calendar_window.yaml"
+        assert not fixed_window_path.exists()
+    assert horizon_suite.validate_horizon_suite(destination, formal=False)["valid"] is True
 
 
 def test_resume_horizon_suite_reuses_preserved_partial_without_input_build(

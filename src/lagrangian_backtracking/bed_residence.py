@@ -9,6 +9,7 @@ metadata。五站共用同一組離散小時年齡；各站先按觀測 UTC 與�
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -30,14 +31,21 @@ __all__ = [
     "BED_RESIDENCE_SAMPLING_METHOD_ID",
     "BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID",
     "BED_RESIDENCE_SAMPLING_POLICY_ID",
+    "BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION",
+    "BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE",
+    "BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID",
     "BedResidenceAvailabilitySampling",
     "BedResidenceStratumRejectionAudit",
     "BedResidenceMode",
+    "BedResidenceAgeSamplingScope",
     "BedResidenceTiming",
+    "ParticleBedResidenceAgeSample",
     "apply_bed_residence_sampling",
+    "derive_bed_residence_particle_seed",
     "resolve_bed_residence_timing",
     "sample_bed_residence_age_hours",
     "sample_bed_residence_age_hours_conditioned_on_availability",
+    "sample_bed_residence_age_hours_for_particle",
     "sample_bed_residence_age_hours_gap_aware",
 ]
 
@@ -62,6 +70,22 @@ BED_RESIDENCE_SAMPLING_METHOD_ID: Final[str] = (
 # 此識別碼不可沿用 legacy method，否則 loader 無法區分「缺口拒絕抽樣」與舊向量。
 BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID: Final[str] = (
     "numpy_pcg64dxsm_stratum_rank_first_available_deposition_v1"
+)
+
+# WP-18：沉底年齡抽樣範圍（age_sampling_scope）——既有抽樣（每個觀測時刻抽一個
+# 年齡、同一到達時刻下全部情境與成員共用）與新增的逐粒子抽樣（每個情境×成員各自
+# 獨立抽一個年齡）。這個範圍字串只描述「年齡怎麼分配給粒子」，不是抽樣演算法本身
+# （演算法仍各自由 sampling_method_id 描述）。
+BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION: Final[str] = "per_observation"
+BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE: Final[str] = "per_particle"
+BedResidenceAgeSamplingScope = Literal["per_observation", "per_particle"]
+
+# 逐粒子抽樣不分層（沒有固定樣本數 50 的概念，一個粒子只需要一個年齡），改成對整段
+# 0..maximum_age_days*24 小時做一次 PCG64DXSM permutation、取第一個可用候選；與既有
+# 分層＋逐層 permutation 的演算法（BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_
+# METHOD_ID）刻意使用不同 method id，避免下游把兩種抽樣結果混淆。
+BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID: Final[str] = (
+    "numpy_pcg64dxsm_per_particle_full_range_rejection_v1"
 )
 
 _HOURS_PER_DAY: Final[int] = 24
@@ -858,4 +882,133 @@ def resolve_bed_residence_timing(
         effective_horizon_ns=effective_ns,
         earliest_forcing_time_utc_ns=earliest_ns,
         pre_window_deposition=pre_window,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-18：逐粒子（每個情境×成員各自獨立）沉底年齡抽樣。
+#
+# 與既有「每個觀測時刻共用一個年齡」（見上方 50 筆分層抽樣與
+# ``apply_bed_residence_sampling``）並存，由 config
+# ``bed_residence_time.age_sampling_scope`` 切換；預設仍是既有的
+# ``per_observation``，本節新增的函式只在明確選用 ``per_particle`` 時才會被
+# 呼叫，不改變既有抽樣的任何行為或輸出（見 ``sample_bed_residence_age_hours_
+# conditioned_on_availability``／``apply_bed_residence_sampling`` 的位元相同
+# 保證，本節完全不修改那兩個函式）。
+#
+# **範圍誠實揭露**：本節只提供「給定一個粒子身分與其到達時刻的觀測錨點，抽出這個
+# 粒子專屬沉底年齡」的抽樣原語（primitive），可獨立測試其分布、可重現性與可用性
+# 條件。把這個原語接進完整 native 管線（依粒子沉底時刻查詢 OCM 初始條件、native
+# 工作單元規劃與小時主軸批次改用逐粒子到達時刻分組）超出本工作包範圍，見
+# ``reports/WP-18.md`` 第 2 節「剩餘工作」的完整說明；本模組不假裝已經完成那些
+# 下游接線。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def derive_bed_residence_particle_seed(
+    *, master_seed: int, scenario_id: str, member_id: int
+) -> int:
+    """由主種子與粒子身分（``scenario_id``、``member_id``）衍生此粒子專屬的抽樣種子。
+
+    刻意與 ``scenarios.derive_member_seed`` 使用同一種「SHA-256 前 16 位元組轉
+    非負整數」手法（避免 Python 內建 hash 在不同程序間不穩定），但另外加入固定
+    角色標籤 ``"bed_residence_age_v1"`` 作為獨立的雜湊輸入，確保這個沉底年齡種子
+    與 ``derive_member_seed`` 產生的（用於平流／擴散等其他隨機量的）種子彼此獨立、
+    不會因為共用相同 ``(master_seed, scenario_id, member_id)`` 而產生相關性。同一個
+    ``(master_seed, scenario_id, member_id)`` 永遠得到同一個種子，因此同一粒子重跑
+    （相同 master seed、相同粒子身分）必定抽出同一個沉底年齡，滿足可重現要求。
+    """
+
+    master_seed = _strict_int(master_seed, label="master_seed", minimum=0)
+    member_id = _strict_int(member_id, label="member_id", minimum=0)
+    scenario_id = _nonempty_text(scenario_id, label="scenario_id")
+    fields = ["bed_residence_age_v1", str(master_seed), scenario_id, str(member_id)]
+    encoded = json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(encoded).digest()[:16], "big", signed=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ParticleBedResidenceAgeSample:
+    """單一粒子的逐粒子沉底年齡抽樣結果與拒絕稽核。
+
+    與 :class:`BedResidenceStratumRejectionAudit`（既有分層抽樣的每層稽核）語意
+    對應，但這裡只有一個粒子、一個候選序列，不再有「分層」或「observation rank」
+    的概念——``candidate_count`` 是整段 ``0..maximum_age_days*24`` 小時的全部候選
+    數，``rejected_age_hours`` 依 PCG64DXSM permutation 產生的嘗試順序保存，供
+    provenance 稽核。
+    """
+
+    age_hours: int
+    rejected_age_hours: tuple[int, ...]
+    candidate_count: int
+    sampling_method_id: str = BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID
+
+    def as_metadata(self) -> dict[str, object]:
+        """轉為 JSON manifest 可保存的純 Python mapping。"""
+
+        return {
+            "age_hours": self.age_hours,
+            "rejected_age_hours": list(self.rejected_age_hours),
+            "candidate_count": self.candidate_count,
+            "rejection_count": len(self.rejected_age_hours),
+            "sampling_method_id": self.sampling_method_id,
+        }
+
+
+def sample_bed_residence_age_hours_for_particle(
+    *,
+    observation_time_utc_ns: int,
+    available_time_ns: Iterable[int],
+    maximum_age_days: int,
+    seed: int,
+) -> ParticleBedResidenceAgeSample:
+    """為單一粒子抽出一個沉底年齡（整點小時），只接受沉底時刻有可用流場資料的年齡。
+
+    候選範圍與既有分層抽樣相同：``0`` 到 ``maximum_age_days * 24`` 小時（含兩端）。
+    這裡不分層——一個粒子只需要一個年齡，沒有「50 個分層各恰一個代表」的批次約束
+    ——改用 PCG64DXSM 對整段候選做一次無放回 permutation，依序嘗試直到找到「觀測
+    UTC 減去該年齡小時」落在呼叫端提供的 ``available_time_ns``（該粒子所屬流場
+    區域的 canonical exact-hour 可用時間集合）為止；全部候選都不可用時 fail closed
+    （不使用 nearest、linear、zero fill 或跨缺口外插）。
+
+    ``available_time_ns`` 刻意只要求呼叫端粒子自己所屬的流場區域可用，不像既有
+    ``sample_bed_residence_age_hours_conditioned_on_availability`` 那樣要求五站
+    同一個 observation rank 共同可用——逐粒子抽樣天生沒有「跨站共用同一個年齡」
+    的語意，每個粒子只需要自己看到的流場資料存在即可。
+    """
+
+    maximum_age_days = _strict_int(maximum_age_days, label="maximum_age_days", minimum=1)
+    seed = _strict_int(seed, label="seed", minimum=0)
+    observation_time_utc_ns = _strict_int(
+        observation_time_utc_ns, label="observation_time_utc_ns"
+    )
+    if not _INT64_MIN <= observation_time_utc_ns <= _INT64_MAX:
+        raise ValueError("observation_time_utc_ns 超出有號 64 位範圍")
+    if observation_time_utc_ns % _NANOSECONDS_PER_HOUR:
+        raise ValueError("observation_time_utc_ns 必須落在 exact-hour")
+
+    available_hours = _available_hour_set(
+        available_time_ns, site_id="particle", field_name="available_time_ns"
+    )
+
+    total_hours = maximum_age_days * _HOURS_PER_DAY + 1
+    generator = np.random.Generator(np.random.PCG64DXSM(seed))
+    candidates = tuple(
+        int(value)
+        for value in generator.permutation(np.arange(total_hours, dtype=np.int64))
+    )
+    rejected: list[int] = []
+    for age in candidates:
+        if (
+            observation_time_utc_ns - age * _NANOSECONDS_PER_HOUR
+        ) in available_hours:
+            return ParticleBedResidenceAgeSample(
+                age_hours=age,
+                rejected_age_hours=tuple(rejected),
+                candidate_count=len(candidates),
+            )
+        rejected.append(age)
+    raise ValueError(
+        "bed residence 逐粒子條件式抽樣無可用候選："
+        f"observation_time_utc_ns={observation_time_utc_ns}, candidate_count={len(candidates)}"
     )

@@ -81,7 +81,19 @@ WP-11 可修改檔案清單內，因此本模組退回 ``hour_major.HourMajorCon
   ``"0"``（預設）。設定檔宣稱的 ``bed_residence_time.backtrack_mode`` 與
   ``LBT_NATIVE_BACKTRACK_MODE`` 實際採用值不一致時，預設 fail-closed 拒絕啟動
   （見 ``backtrack_horizon.require_mode_acknowledged_if_mismatched``）；只有明確
-  設成 ``"1"`` 才會放行，且這個承認狀態本身也會寫進每個結果摘要。
+  設成 ``"1"`` 才會放行，且這個承認狀態本身也會寫進每個結果摘要。這同一個環境
+  變數也用於核對 WP-18 實驗案例（見下）與計畫檔是否一致，不另外新增一個
+  「承認」旗標。
+- ``LBT_NATIVE_EXPERIMENT_CASE``（WP-18 新增）：``"finite_depth_stokes"``
+  （預設，含有限水深 Stokes 漂移）或 ``"no_stokes"``（只有流，完全不讀波浪
+  資料）；亦可為 ``runtime.EXPERIMENT_CASE_SPECS`` 其他已登錄案例（此時
+  ``include_stokes`` 由該案例的 ``ExperimentCaseSpec.include_stokes`` 決定，
+  但擴散仍固定用 Smagorinsky，不採用該案例的 ``diffusion_kind``）。見
+  ``physics_case.py`` 模組文件。
+- ``LBT_NATIVE_REQUIRE_WAVE_DATA``（WP-18 新增）：``"1"``／``"0"``（預設）。
+  ``"1"`` 時，``include_stokes=True`` 但 NWW3 波浪資料缺漏會直接 fail-closed，
+  不再靜默退化成沒有 Stokes（見 ``production_wiring.build_domain_resources``
+  的 ``require_wave_data`` 參數）。
 - ``LBT_NATIVE_CHECKPOINT_ROOT``：提供時，每個切段排程單元各自在其下建立
   一個以 ``unit_id`` 命名的子目錄當 ``hour_major`` 的 ``checkpoint_dir``；
   省略時不做 checkpoint（中斷後整段必須從頭重算）。
@@ -258,6 +270,7 @@ from .hour_major import (
 )
 from .orchestrator import NativeWorkUnit, NativeWorkUnitSpec
 from .particle_input import ParticleIdentityTable, load_particle_identity_table_npz
+from .physics_case import resolve_physics_case
 from .resources import DomainResources
 
 __all__ = [
@@ -357,6 +370,16 @@ class HourMajorProviderParams:
     config_declared_backtrack_mode: str | None = None
     requested_horizon_days: float = 30.0
     test_force_interrupt_after_hours: int | None = None
+    # WP-18：實際採用的實驗案例（見 physics_case.py）。``include_stokes=False``
+    # （``no_stokes``）時 ``_build_worker_resources_entrypoint`` 會把它傳給
+    # ``production_wiring.make_domain_resources_factory``，讓該區域完全不讀波浪
+    # 資料；``require_wave_data`` 只在 ``include_stokes=True`` 時有意義，見該
+    # 函式 docstring。預設值維持 WP-18 之前「永遠嘗試 Stokes、資料缺漏時靜默
+    # 退化」的既有行為，不破壞既有呼叫端。
+    experiment_case_id: str = "finite_depth_stokes"
+    include_stokes: bool = True
+    diffusion_method: str = "smagorinsky_workbook_eq10"
+    require_wave_data: bool = False
 
 
 def _env_smagorinsky_impl(env: Mapping[str, str]) -> str:
@@ -404,6 +427,13 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
             env, "LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", default=False
         ),
     )
+    # WP-18：實驗案例明確化——與上面的回溯模式核對同一個理由，native-run 這一步
+    # 不重新規劃工作單元，但每個 worker 都要知道這次實際要不要建構波浪解析器
+    # （見 physics_case.py／production_wiring.build_domain_resources 的
+    # include_stokes 參數）。
+    resolved_physics_case = resolve_physics_case(cli_experiment_case_id=None, env=dict(env))
+    require_wave_data = _env_flag(env, "LBT_NATIVE_REQUIRE_WAVE_DATA", default=False)
+
     dt_max_seconds = (
         config.integration.dt_max_seconds
         if config.integration.dt_max_seconds is not None
@@ -449,6 +479,10 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         test_force_interrupt_after_hours=_env_optional_int(
             env, "LBT_NATIVE_TEST_FORCE_INTERRUPT_AFTER_HOURS"
         ),
+        experiment_case_id=resolved_physics_case.experiment_case_id,
+        include_stokes=resolved_physics_case.include_stokes,
+        diffusion_method=resolved_physics_case.diffusion_method,
+        require_wave_data=require_wave_data,
     )
 
 
@@ -496,7 +530,10 @@ def _build_worker_resources_entrypoint(
             "hour_major_provider 只能執行 --schedule hour-major（或切段）產生的計畫檔"
         )
     domain_resources_factory = production_wiring.make_domain_resources_factory(
-        params.config_path, formal=params.formal
+        params.config_path,
+        formal=params.formal,
+        include_stokes=params.include_stokes,
+        require_wave_data=params.require_wave_data,
     )
     return HourMajorWorkerResources(
         params=params,
@@ -713,6 +750,15 @@ def _run_unit_entrypoint(
             "bed_residence_age_hours": unit.bed_residence_age_hours,
         }
 
+    def _physics_case_provenance() -> dict[str, Any]:
+        # WP-18：每個結果摘要都記錄實際採用的實驗案例，避免事後只看摺疊後的
+        # 排程單元猜不出這批結果到底有沒有 Stokes（見 physics_case.py）。
+        return {
+            "experiment_case_id": params.experiment_case_id,
+            "include_stokes": params.include_stokes,
+            "diffusion_method": params.diffusion_method,
+        }
+
     for unit in pre_window_units:
         table = resources.identity_table
         driver_result = build_pre_window_deposition_result(
@@ -729,6 +775,7 @@ def _run_unit_entrypoint(
             "final_status_counts": _status_counts(driver_result.final_status),
             "result_npz": str(result_npz_path(results_dir, unit.unit_id)),
             **_unit_horizon_provenance(unit),
+            **_physics_case_provenance(),
         }
 
     if not runnable_units:
@@ -748,6 +795,7 @@ def _run_unit_entrypoint(
             "declared_config_backtrack_mode": params.config_declared_backtrack_mode,
             "effective_backtrack_mode": params.effective_backtrack_mode,
             "requested_horizon_days": params.requested_horizon_days,
+            **_physics_case_provenance(),
         }
 
     batch = build_hour_major_domain_batch(
@@ -825,6 +873,7 @@ def _run_unit_entrypoint(
             "final_status_counts": _status_counts(driver_result.final_status),
             "result_npz": str(result_npz_path(results_dir, unit.unit_id)),
             **_unit_horizon_provenance(unit),
+            **_physics_case_provenance(),
         }
 
     return {
@@ -841,6 +890,7 @@ def _run_unit_entrypoint(
         "declared_config_backtrack_mode": params.config_declared_backtrack_mode,
         "effective_backtrack_mode": params.effective_backtrack_mode,
         "requested_horizon_days": params.requested_horizon_days,
+        **_physics_case_provenance(),
     }
 
 

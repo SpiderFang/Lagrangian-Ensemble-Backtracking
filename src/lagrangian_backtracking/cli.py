@@ -67,6 +67,7 @@ from .native_runner import backtrack_horizon as native_backtrack_horizon
 from .native_runner import horizon_derivation as native_horizon_derivation
 from .native_runner import hour_major_provider as native_hour_major_provider
 from .native_runner import orchestrator as native_orchestrator
+from .native_runner import physics_case as native_physics_case
 from .native_runner import postprocess as native_postprocess
 from .native_runner import production_wiring as native_production_wiring
 from .native_runner.backward_driver import load_baytrace_modules
@@ -877,6 +878,28 @@ def _native_plan_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--experiment-case",
+        choices=tuple(EXPERIMENT_CASE_SPECS),
+        default=None,
+        help=(
+            "WP-18：實際採用的實驗案例；省略時讀取 LBT_NATIVE_EXPERIMENT_CASE 環境變數，"
+            "兩者都省略時預設 finite_depth_stokes（含有限水深 Stokes 漂移，保留 WP-18 之前"
+            "「只要波浪資料存在就用」的既有行為）。no_stokes 只有流：完全不讀取波浪資料、"
+            "不計算 Stokes 漂移。兩種案例的擴散都固定採 Smagorinsky（工作書式 (10)，"
+            "horcon=0.2），與 EXPERIMENT_CASE_SPECS 的常數擴散（constant_kh_m2ps）舊選項"
+            "無關，見 native_runner.physics_case 模組文件"
+        ),
+    )
+    parser.add_argument(
+        "--require-wave-data",
+        action="store_true",
+        help=(
+            "只在 --experiment-case finite_depth_stokes（或省略、採用其預設值）時有意義："
+            "NWW3 波浪資料缺漏時 fail-closed，不再靜默退化成沒有 Stokes。建議正式規劃一律"
+            "加上，避免波浪資料缺漏被默默忽略"
+        ),
+    )
+    parser.add_argument(
         "--skip-gap-check",
         action="store_true",
         help="明確略過缺口安全檢查（例如合成資料試跑）；一律在輸出中標記，不靜默略過",
@@ -1088,6 +1111,19 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         acknowledge_config_mode_mismatch=args.acknowledge_config_mode_mismatch,
     )
 
+    # WP-18：實驗案例明確化（見 physics_case.py 模組文件）——決定本次規劃是否含
+    # Stokes 漂移；兩種案例都固定用 Smagorinsky 工作書式 (10) 擴散，與舊登錄表
+    # 的常數擴散選項無關。
+    resolved_physics_case = native_physics_case.resolve_physics_case(
+        cli_experiment_case_id=args.experiment_case
+    )
+    physics_case_declaration = {
+        "experiment_case_id": resolved_physics_case.experiment_case_id,
+        "include_stokes": resolved_physics_case.include_stokes,
+        "diffusion_method": resolved_physics_case.diffusion_method,
+        "require_wave_data": bool(args.require_wave_data),
+    }
+
     arrivals_by_time_utc_ns: dict[int, Any] | None = None
     maximum_age_days: int | None = None
     sampling_seed: int | None = None
@@ -1286,6 +1322,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         manifest=manifest,
         hour_major_members=hour_major_members,
         backtrack_mode_declaration=backtrack_mode_declaration,
+        physics_case_declaration=physics_case_declaration,
     )
 
     unsafe = [check for check in gap_checks if not check.is_gap_safe]
@@ -1304,6 +1341,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         "segment_plan": [dataclasses.asdict(item) for item in segment_reports],
         "cost_model": cost_model_report,
         "backtrack_horizon": backtrack_mode_declaration,
+        "physics_case": physics_case_declaration,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if report["is_gap_safe_ready"] else 2
@@ -1325,17 +1363,40 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
     # 這裡的檢查只防止「用一份用模式 A 規劃好的計畫檔，卻在寫進每個結果摘要的
     # provenance 時貼上模式 B 的標籤」這種誤導；不做這個檢查，計算結果本身仍然
     # 正確（因為已經烤進計畫檔），但誰都看不出來 provenance 標籤是錯的。
+    # 同一個「承認」環境變數同時涵蓋 WP-17 回溯模式與 WP-18 實驗案例兩種不一致，
+    # 不另外新增第二個旗標（見 hour_major_provider.py 模組文件「環境變數契約」）。
+    raw_ack = os.environ.get("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH")
+    acknowledge_mismatch = bool(raw_ack) and str(raw_ack).strip() not in ("0", "false", "False", "")
+
     plan_backtrack_horizon = payload.get("backtrack_horizon")
     if plan_backtrack_horizon is not None:
         plan_effective_mode = plan_backtrack_horizon.get("effective_backtrack_mode")
         run_effective_mode = native_backtrack_horizon.resolve_backtrack_mode(cli_backtrack_mode=None)
-        raw_ack = os.environ.get("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH")
-        acknowledge_mismatch = bool(raw_ack) and str(raw_ack).strip() not in ("0", "false", "False", "")
         native_backtrack_horizon.require_mode_acknowledged_if_mismatched(
             effective_backtrack_mode=run_effective_mode,
             config_declared_backtrack_mode=plan_effective_mode,
             acknowledge_config_mode_mismatch=acknowledge_mismatch,
         )
+
+    # WP-18：計畫檔記錄了 native-plan 當初實際採用的實驗案例（是否含 Stokes、擴散
+    # 方法聲明）；這裡同樣在執行任何工作單元之前核對本次 native-run 進程實際會
+    # 採用的案例（LBT_NATIVE_EXPERIMENT_CASE，與每個 worker 行程
+    # hour_major_provider._resolve_params 讀到的值同一套解析邏輯）是否與計畫檔
+    # 一致，理由與上面 backtrack_horizon 的核對相同：native-run 不重新規劃，
+    # 只是避免結果摘要貼上與計畫檔不符的實驗案例標籤。
+    plan_physics_case = payload.get("physics_case")
+    if plan_physics_case is not None:
+        plan_experiment_case_id = plan_physics_case.get("experiment_case_id")
+        run_experiment_case_id = native_physics_case.resolve_experiment_case_id(
+            cli_experiment_case_id=None
+        )
+        if run_experiment_case_id != plan_experiment_case_id and not acknowledge_mismatch:
+            raise native_physics_case.PhysicsCaseError(
+                f"計畫檔實驗案例 experiment_case_id={plan_experiment_case_id!r} 與本次 "
+                f"native-run 實際採用的 LBT_NATIVE_EXPERIMENT_CASE={run_experiment_case_id!r} "
+                "不一致，拒絕默默執行。請明確設定 LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1 "
+                "承認此差異，或改用與計畫檔一致的實驗案例"
+            )
 
     if not payload.get("is_gap_safe_ready", False) and not args.allow_unsafe_arrivals:
         report = {
@@ -1665,6 +1726,17 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--formal", action="store_true", help="載入邊界幾何 manifest 時是否要求正式門檻")
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        default=None,
+        help=(
+            "WP-18：可選，native-plan 產生的計畫檔路徑；提供時把其中 physics_case "
+            "區塊（實際採用的實驗案例、是否含 Stokes、擴散方法聲明）原樣寫進本次"
+            "後處理 manifest 的 config.runtime_physics_case，供人工稽核與避免與"
+            "另一種實驗案例的結果混用。省略時該欄位為 null，不代表結果沒有 Stokes"
+        ),
+    )
     parser.add_argument("--trajectory-sample-size-per-group", type=int, default=24)
     parser.add_argument("--trajectory-sample-seed", type=int, default=0)
     parser.add_argument("--kde-grid-cell-count", type=int, default=64)
@@ -1728,6 +1800,11 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
             config, config_path=str(args.config), formal=args.formal
         )
 
+    runtime_physics_case: Mapping[str, Any] | None = None
+    if args.plan is not None:
+        _plan_units, plan_payload = native_orchestrator.read_native_plan_file(args.plan)
+        runtime_physics_case = plan_payload.get("physics_case")
+
     postprocess_config = native_postprocess.PostprocessConfig(
         trajectory_sample_size_per_group=args.trajectory_sample_size_per_group,
         trajectory_sample_seed=args.trajectory_sample_seed,
@@ -1740,6 +1817,7 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         config=postprocess_config,
         lonlat_projector=lonlat_projector,
         boundary_geometries=boundary_geometries,
+        runtime_physics_case=runtime_physics_case,
     )
 
     result_paths = sorted(Path(args.results_dir).glob("*.driver_result.npz"))

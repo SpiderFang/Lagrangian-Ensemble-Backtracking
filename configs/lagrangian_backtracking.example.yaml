@@ -497,11 +497,18 @@ boundaries:
 
 scenarios:
   # 正式樣板啟用可重現的隨機沉底年齡；horizon-suite 以同一組 50 個年齡套用五站，
-  # 一次建立母體，再為 H30/H60/H90 × 兩種回溯模式登錄六份 release。
+  # 一次建立母體。依 PI 原話，正式（formal）release 以「從沉底當下回溯到完整地平線」
+  # （full_horizon_from_deposition）為主，故 backtrack_mode 預設改為此模式，且
+  # formal_release_backtrack_modes 明示只發布這一種模式，horizon-suite 因而為
+  # H30/H60/H90 各建立一份、共三份 release（而非舊版的六份）。
+  # fixed_calendar_window（固定行事曆窗）保留為可選的敏感度分析模式，未被刪除；
+  # 如需比較兩種模式，須在需要時另行於 formal_release_backtrack_modes 明示兩者。
   bed_residence_time:
-    backtrack_mode: fixed_calendar_window
+    backtrack_mode: full_horizon_from_deposition
     supported_backtrack_modes:
       - fixed_calendar_window
+      - full_horizon_from_deposition
+    formal_release_backtrack_modes:
       - full_horizon_from_deposition
     maximum_age_days: 90
     sample_count_per_site: 50

@@ -24,6 +24,8 @@ from shapely.geometry import Polygon
 
 from .accelerated import PHYSICS_KERNEL_BACKEND_NUMPY_V1
 from .bed_residence import (
+    BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION,
+    BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
@@ -629,6 +631,25 @@ class BedResidenceTimeConfig(StrictModel):
         "record_pre_window_deposition_without_transport"
     ]
     runtime_horizon_support_days: StrictInt | None
+    # WP-18 新增：既有抽樣（每個觀測時刻共用一個年齡，全部情境與成員共用）與新增的
+    # 逐粒子抽樣（每個情境×成員各自獨立抽一個年齡）並存，由此欄位切換。預設
+    # ``per_observation`` 保留現行行為，位元相同；未明示此欄位的舊 YAML 由
+    # ``normalized_payload`` 移除這個 Pydantic 補上的預設值，不改變既有 config hash
+    # （見該函式對 ``availability_conditioning_policy`` 的相同處理方式）。
+    age_sampling_scope: Literal["per_observation", "per_particle"] = (
+        BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION
+    )
+    # WP-18 新增：horizon-suite 實際要發布哪些回溯模式的 release（不是「支援」哪些
+    # 模式——那仍由 supported_backtrack_modes 鎖死兩種都要登錄）。省略時
+    # horizon_suite._suite_support_contract 維持既有「兩種模式都發布」行為，保護
+    # 已發布 suite 的 manifest 驗證不受影響（見該函式與 docs 14 第 3.1.1 節）；依
+    # PI 原話，本期正式範例明示只發布 ``["full_horizon_from_deposition"]``，
+    # ``fixed_calendar_window`` 保留為需要修改 template 才會一併發布的敏感度分析
+    # 選項。未明示此欄位的舊 YAML 由 ``normalized_payload`` 移除 Pydantic 補上的
+    # ``None``，不改變既有 config hash。
+    formal_release_backtrack_modes: tuple[
+        Literal["fixed_calendar_window", "full_horizon_from_deposition"], ...
+    ] | None = None
 
     @model_validator(mode="after")
     def validate_bed_residence_contract(self) -> BedResidenceTimeConfig:
@@ -682,6 +703,29 @@ class BedResidenceTimeConfig(StrictModel):
             raise ValueError(
                 "scenarios.bed_residence_time.runtime_horizon_support_days 必須為正整數或 null"
             )
+        if self.age_sampling_scope not in {
+            BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION,
+            BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE,
+        }:
+            raise ValueError(
+                "scenarios.bed_residence_time.age_sampling_scope 不支援；"
+                "必須是 per_observation 或 per_particle"
+            )
+        if self.formal_release_backtrack_modes is not None:
+            modes = self.formal_release_backtrack_modes
+            if not modes:
+                raise ValueError(
+                    "scenarios.bed_residence_time.formal_release_backtrack_modes 不可為空清單"
+                )
+            if len(set(modes)) != len(modes):
+                raise ValueError(
+                    "scenarios.bed_residence_time.formal_release_backtrack_modes 不可重複"
+                )
+            if any(mode not in self.supported_backtrack_modes for mode in modes):
+                raise ValueError(
+                    "scenarios.bed_residence_time.formal_release_backtrack_modes 的每個模式"
+                    "都必須列於 supported_backtrack_modes"
+                )
         return self
 
 
@@ -1577,6 +1621,25 @@ class ProjectConfig(StrictModel):
                 and "availability_conditioning_policy" not in bed_model.model_fields_set
             ):
                 del bed_payload["availability_conditioning_policy"]
+            # WP-18：age_sampling_scope 是新增的 optional 欄位（預設
+            # per_observation）。舊 YAML 沒有它時，Pydantic 的 default 不可改變既有
+            # config hash；只有來源 YAML 明示此欄位才進 canonical payload。
+            if (
+                bed_model is not None
+                and "age_sampling_scope" in bed_payload
+                and "age_sampling_scope" not in bed_model.model_fields_set
+            ):
+                del bed_payload["age_sampling_scope"]
+            # WP-18：formal_release_backtrack_modes 是新增的 optional 欄位（預設
+            # None，horizon_suite 解讀成「兩種模式都發布」，即既有行為）。舊 YAML
+            # 沒有它時，Pydantic 的 None default 不可改變既有 config hash；只有來源
+            # YAML 明示此欄位（包括明示 null）才進 canonical payload。
+            if (
+                bed_model is not None
+                and "formal_release_backtrack_modes" in bed_payload
+                and "formal_release_backtrack_modes" not in bed_model.model_fields_set
+            ):
+                del bed_payload["formal_release_backtrack_modes"]
         if isinstance(scenarios_payload, dict) and self.design_version != CURRENT_DESIGN_VERSION:
             # random receptor policy 是本期 current formal 的新契約；舊 v2／v3 設定即使
             # 由新版範例複製後殘留這些 extra key，也不能讓歷史 config hash 改變，或讓

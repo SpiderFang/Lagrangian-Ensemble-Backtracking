@@ -407,6 +407,83 @@ def test_build_domain_resources_without_wave_data(
     assert resources.provenance["nww_months_used"] == ()
 
 
+def test_build_domain_resources_include_stokes_false_never_reads_nww_env(
+    wiring_config, ocm_and_nww_roots
+) -> None:
+    """WP-18：``include_stokes=False``（``no_stokes`` 案例）必須完全不讀取
+    ``NWW_ANALYSIS_ROOT`` 環境變數——即使它根本沒有設定，也不能因為「缺少必要
+    環境變數」而失敗，這是「只有流」案例「完全不讀波浪資料」的直接證據。"""
+
+    baytrace_root = _require_baytrace_root()
+    _config, config_path = wiring_config
+    ocm_root, _nww_root, _grid = ocm_and_nww_roots
+    env = {"OCM_NATIVE_ROOT": str(ocm_root), "LBT_BAYTRACE_ROOT": baytrace_root}
+
+    resources = pw.build_domain_resources(
+        config_path, "A", env=env, formal=True, include_stokes=False
+    )
+
+    assert resources.wave_resolver_factory is None
+    assert resources.provenance["wave_data_available"] is False
+    assert resources.provenance["include_stokes"] is False
+    assert resources.provenance["nww_analysis_root"] is None
+    assert resources.provenance["nww_months_used"] == ()
+
+
+def test_build_domain_resources_include_stokes_true_still_works_like_default(
+    wiring_config, ocm_and_nww_roots
+) -> None:
+    """``include_stokes=True``（預設，對應 ``finite_depth_stokes``）必須與省略此
+    參數時完全一致，確認新參數沒有改變既有預設行為。"""
+
+    baytrace_root = _require_baytrace_root()
+    _config, config_path = wiring_config
+    ocm_root, nww_root, _grid = ocm_and_nww_roots
+    env = {
+        "OCM_NATIVE_ROOT": str(ocm_root),
+        "NWW_ANALYSIS_ROOT": str(nww_root),
+        "LBT_BAYTRACE_ROOT": baytrace_root,
+    }
+
+    resources = pw.build_domain_resources(
+        config_path, "A", env=env, formal=True, include_stokes=True
+    )
+
+    assert resources.wave_resolver_factory is not None
+    assert resources.provenance["wave_data_available"] is True
+    assert resources.provenance["include_stokes"] is True
+
+
+def test_build_domain_resources_require_wave_data_fails_closed_on_missing_data(
+    wiring_config, ocm_and_nww_roots, tmp_path: Path
+) -> None:
+    """WP-18：``finite_depth_stokes`` 案例明確要求 ``require_wave_data=True`` 時，
+    波浪資料缺漏必須 fail-closed，不得默默退化成沒有 Stokes——這是本工作包修正
+    「流＋波浪時波浪資料缺漏必須依既有缺值政策處理，不得默默退化成只有流」的
+    直接證據。省略 ``require_wave_data``（預設 ``False``）時維持既有寬容行為，
+    見上面 ``test_build_domain_resources_without_wave_data``。"""
+
+    baytrace_root = _require_baytrace_root()
+    _config, config_path = wiring_config
+    ocm_root, _nww_root, _grid = ocm_and_nww_roots
+    empty_nww_root = tmp_path / "empty_nww_analysis"
+    env = {
+        "OCM_NATIVE_ROOT": str(ocm_root),
+        "NWW_ANALYSIS_ROOT": str(empty_nww_root),
+        "LBT_BAYTRACE_ROOT": baytrace_root,
+    }
+
+    with pytest.raises(pw.WiringError):
+        pw.build_domain_resources(
+            config_path,
+            "A",
+            env=env,
+            formal=True,
+            include_stokes=True,
+            require_wave_data=True,
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 四、make_domain_resources_factory：pickle 往返與真正 spawn 子程序呼叫
 # ══════════════════════════════════════════════════════════════════════════

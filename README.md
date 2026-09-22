@@ -180,7 +180,7 @@ current design 的 horizon-suite release 會同時寫入 `inputs.ocm_gap_safe_ar
 
 未啟用隨機沉底的 legacy generic 流程仍以 `inputs.backtrack_support_days` 作為執行回溯上限。正式範例已登錄 random bed residence：若同一母體涵蓋 H30/H60/H90，`inputs.backtrack_support_days=180` 是 observation 選時包絡（H90 + 最長 90 日沉底年齡），而 `bed_residence_time.runtime_horizon_support_days=90` 與 `boundaries.max_backtrack_days=90` 是沉底後執行支援。不能把 180 誤當作粒子回溯天數；正式 30／60／90 多模式應用 `horizon-suite-create`，一次建母體，不逐 horizon 重跑 `inputs-build`。詳見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)與[CLI 參考](docs/operations/cli_reference.md)。
 
-### 5.1 隨機沉底與一次建立六份回溯設定
+### 5.1 隨機沉底與一次建立正式回溯設定
 
 正式 H30/H60/H90、M=10 的 common-input source template 為
 [`configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml`](configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml)。它
@@ -190,6 +190,27 @@ current design 的 horizon-suite release 會同時寫入 `inputs.ocm_gap_safe_ar
 仍保留 null placeholder，不能直接執行正式批次。`fixed_calendar_window` 以固定日曆窗扣除沉底年齡；
 窗前沉底記為 `pre_window_deposition`，不讀流場資料，也不進來源比例有效分母；
 `full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
+
+**WP-18（依 PI 原話變更）**：正式範例的 `backtrack_mode` 預設已改為
+`full_horizon_from_deposition`，且明示 `formal_release_backtrack_modes:
+[full_horizon_from_deposition]`，故 `horizon-suite-create` 對正式範例只發布
+**H30/H60/H90 各一份、共三份** release，而非舊版的六份。`fixed_calendar_window`
+仍列於 `supported_backtrack_modes`，保留為可選的敏感度分析模式，未被刪除；
+如需同時比較兩種模式，可在自己的 config 明示
+`formal_release_backtrack_modes: [fixed_calendar_window, full_horizon_from_deposition]`
+取回六份 release 的舊行為。舊版（本欄位加入前）已建置的六份 suite 產物不受此變更影響，
+仍可用 `horizon-suite-validate` 正常驗證。
+
+**WP-18（新增：沉底年齡抽樣範圍開關，僅完成抽樣原語與 schema，尚未全線接通）**：
+`scenarios.bed_residence_time.age_sampling_scope` 新增 `per_observation`（預設，
+既有行為不變：每個觀測時刻抽一個年齡，同觀測時刻下所有情境／成員共用、50 站間共用
+rank）與 `per_particle`（每個情境×成員各自獨立抽樣，由主 seed 與粒子身分決定、可重現）
+兩個值；省略此欄位維持舊版位元相同結果與 config hash。`per_particle` 目前只完成
+`bed_residence.py` 的抽樣函式（`derive_bed_residence_particle_seed`、
+`sample_bed_residence_age_hours_for_particle`）與設定驗證／provenance 記錄，**尚未接
+到下游**：逐粒子初始條件重建（依各自沉底時刻由 OCM 反查初始狀態）與 native 工作單元
+規劃／hour-major 批次分組（避免到達時刻數量爆炸）仍待後續工作包完成，詳見
+`reports/WP-18.md`。
 
 template 只把下列已核定的執行 scalar 具體化，H30/H60/H90 的支援日數、release horizon 與步數由
 horizon-suite 產生：
@@ -201,9 +222,9 @@ horizon-suite 產生：
 | `scenarios` | `members_per_scenario=10`；`master_seed=20260916` |
 | `execution` | `ocm_interpolation_backend=numba_ocm_v1`；`physics_kernel_backend=numba_cpu_v1`；`shard_scenario_count=100`；`checkpoint_interval_sweeps=10000`；`active_chunk_size=100` |
 
-`horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation 選時包絡為 180 日，沉底後 gap-censored 執行支援上限為 90 日，再發布兩種模式共六份 release。六份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及[CLI 參考](docs/operations/cli_reference.md)。
+`horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation 選時包絡為 180 日，沉底後 gap-censored 執行支援上限為 90 日，再依 template 的 `formal_release_backtrack_modes`（省略時為兩種模式共六份；正式範例現為只發布 `full_horizon_from_deposition` 共三份）發布對應份數的 release。各份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及[CLI 參考](docs/operations/cli_reference.md)。
 
-若建立過程中留下 exact preserved `.partial-*`，可使用 `horizon-suite-resume`。它會唯讀核對 source-template、common-config、artifact closure、來源 config hash 與三個流場根目錄，在新的 owned partial 重建六份 release；不修改原 partial，且 manifest 仍記錄 `input_build_count=1` 與不含絕對路徑的 recovery source fingerprint。destination 必須不存在，日數必須與 common config／preserved manifest 一致；此命令絕不再次呼叫 `inputs-build`。
+若建立過程中留下 exact preserved `.partial-*`，可使用 `horizon-suite-resume`。它會唯讀核對 source-template、common-config、artifact closure、來源 config hash 與三個流場根目錄，在新的 owned partial 重建各份 release；不修改原 partial，且 manifest 仍記錄 `input_build_count=1` 與不含絕對路徑的 recovery source fingerprint。destination 必須不存在，日數必須與 common config／preserved manifest 一致；此命令絕不再次呼叫 `inputs-build`。
 
 新版母體的 manifest 另外保存 `forcing_years=[2024, 2025]`、`observation_years=[2025]`、arrival policy 與每個季節×潮況×相位的兩個 `replicate_rank`；formal loader 會確認每站 48 個核心 strata 加 2 個事件，且不接受舊兩年份 population 與新版 policy 混用。2024 只提供 2025 observation 的前置流場資料，不會被誤報為 arrival anchor。
 
@@ -217,6 +238,8 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 在 NFS 上，preview／figure 的 `.complete` 只表示該成果目錄已通過逐檔位元組、manifest、程式指紋與儲存閘門綁定，可供成果 reader 讀取；它不表示粒子 run 完成。run 的生命週期仍以 `run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
 
 `native_runner` 子套件另外提供 `lbt native-plan`／`lbt native-run`／`lbt native-status`／`lbt native-postprocess`／`lbt native-derive-horizon` 五個子命令，以工作單元（區域、到達時刻、沉降速度、`study_site_id`）為顆粒度做規劃、持續 worker 排程、續跑與失敗隔離，並以量測到的可用記憶體決定 worker 數；到達時刻的缺口安全檢查與重選重用既有 `select_arrival_times`，不是另一套規則；波浪橋接與後處理（離開紀錄、邊界通量／進入統計、條件式來源足跡）皆已接線。`native-plan`／`native-run` 以 `--backtrack-mode`／`LBT_NATIVE_BACKTRACK_MODE`（`full_horizon_from_deposition` 或 `fixed_calendar_window`，預設前者）明確宣告本次實際採用的回溯模式，與設定檔 `bed_residence_time.backtrack_mode` 不一致時 fail closed，須明確加 `--acknowledge-config-mode-mismatch`／`LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1` 才放行；`native-derive-horizon` 可由既有 `full_horizon_from_deposition` 結果免重跑截斷推導出較短 `(模式, H)`。伺服器背景啟動入口見 `scripts/run_native_backtrack_server.sh`；完整工作單元模型、排程策略、回溯模式與已知限制見[native 逆向批次 orchestrator 操作契約](docs/operations/19_native_backward_batch_orchestrator.md)。此路徑仍是獨立於既有 `run-formal-parallel` 的排程／執行實作，不能取代既有正式母體流程。
+
+**WP-18（新增：native 實驗案例選擇）**：`native-plan`／`native-run` 新增 `--experiment-case`／`LBT_NATIVE_EXPERIMENT_CASE`（沿用 `runtime.EXPERIMENT_CASE_SPECS` 既有登錄名稱，預設 `finite_depth_stokes`）明確宣告本次是否納入 Stokes 漂移：`no_stokes`（純海流）會完全跳過波浪資料讀取與 Stokes 計算；`finite_depth_stokes`（海流＋波浪，有限水深 Stokes 漂移）在波浪資料缺漏時依既有缺值政策 fail closed，不會靜默退化為純海流。實驗案例會寫入 plan 檔、每份結果摘要與後處理 manifest，且與設定檔宣告不一致時同樣須 `--acknowledge-config-mode-mismatch` 才放行，兩種案例的產物不得混入同一輸出目錄或同一份統計。**擴散方法與 legacy registry 的差異**：無論選哪個實驗案例，native pipeline 一律使用工作手冊 eq.(10) 的 Smagorinsky 擴散（對應 BayTrace `horcon=0.2`、空間變化係數），不提供 legacy `EXPERIMENT_CASE_SPECS` 中的常數擴散（`constant_kh_m2ps`）選項；此固定選擇會以 `diffusion_method=smagorinsky_workbook_eq10` 寫入 provenance，避免與 legacy 常數擴散結果混淆比較。
 
 ## 6. 文件導覽
 

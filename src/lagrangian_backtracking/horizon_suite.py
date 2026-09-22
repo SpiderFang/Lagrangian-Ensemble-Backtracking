@@ -5,8 +5,22 @@
 ``build_input_derivatives`` 建立 ``common-input``，最後以同一批到達時刻、受體、
 材質與 dynamic initial-condition 產生每個 release YAML。bed-residence 設計以
 ``最大 horizon + 最大沉底年齡`` 建立 observation 選時包絡，再將同一母體註冊為
-``fixed_calendar_window`` 與 ``full_horizon_from_deposition`` 兩種 release；因此
-30／60／90 日、雙模式共六份 release 不必重跑昂貴的 input-build。
+``fixed_calendar_window``／``full_horizon_from_deposition`` 其中一種或兩種
+release；同一批已建好的 common-input 不必因為多發布一種模式而重跑昂貴的
+input-build。
+
+**WP-18（依 PI 原話變更）**：正式回溯必須從沉底日起完整回溯 H 天，對應
+``full_horizon_from_deposition``；``fixed_calendar_window``（固定日曆終點往前
+回溯 H 天）是前一位開發者設計、PI 原話未要求的替代敏感度分析模式。因此本期
+正式 template（``configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml``／
+``.example.yaml``）明示 ``scenarios.bed_residence_time.formal_release_backtrack_
+modes: [full_horizon_from_deposition]``，suite 預設只發布 30/60/90 日共三份
+``full_horizon_from_deposition`` release；``fixed_calendar_window`` 需要另外在
+template 明示（``formal_release_backtrack_modes`` 含兩種模式）才會一併發布成
+六份，作為敏感度分析，見 :func:`_suite_support_contract`。**省略此欄位的舊
+template／已發布的舊 suite 不受影響**：``_suite_support_contract`` 對缺欄位維持
+WP-18 之前「兩種模式都發布」的既有行為，因此舊 suite 的 manifest 重新驗證結果
+與 WP-18 之前完全相同，不會被本次變更判定失效。
 
 本模組不讀取 raw NetCDF、不以零值或最近值補真正缺口；缺時仍由既有 gap-safe
 validator 與版本化重建政策決定是否可用。共同母體通過只代表輸入與設定契約已通過，
@@ -485,6 +499,36 @@ def _bed_residence_settings(payload: Mapping[str, Any]) -> Mapping[str, Any] | N
     return bed
 
 
+def _resolve_formal_release_backtrack_modes(bed: Mapping[str, Any]) -> tuple[str, ...]:
+    """決定本次 suite 實際要發布哪些回溯模式的 release（WP-18 新增）。
+
+    ``formal_release_backtrack_modes`` 省略（``None``）時回傳兩種模式都發布，
+    與 WP-18 之前的既有行為完全相同——這是保護「舊 template／已發布舊 suite 的
+    manifest 重新驗證不受影響」的關鍵：本函式只依賴 template 本身的內容（deep
+    copy 進 common-input／common-config 後仍是同一份 payload），不依賴任何
+    CLI 旗標或執行期狀態，因此 builder 與 validator 永遠能各自從同一份
+    ``source-template.yaml`` 快照獨立重算出相同結果。明示此欄位時只接受
+    ``supported_backtrack_modes`` 的非空、不重複子集（``BedResidenceTimeConfig``
+    已在 config 層驗證過，這裡對來自 raw YAML dict 的呼叫路徑再驗證一次，不能
+    只信任型別已驗證過的呼叫端）。
+    """
+
+    raw = bed.get("formal_release_backtrack_modes")
+    if raw is None:
+        return _BED_RESIDENCE_MODES
+    if not isinstance(raw, list) or not raw:
+        raise HorizonSuiteError(
+            "bed residence formal_release_backtrack_modes 必須是非空模式清單"
+        )
+    modes = tuple(raw)
+    if len(set(modes)) != len(modes) or any(mode not in _BED_RESIDENCE_MODES for mode in modes):
+        raise HorizonSuiteError(
+            "bed residence formal_release_backtrack_modes 只能是 "
+            f"{_BED_RESIDENCE_MODES} 的不重複子集"
+        )
+    return modes
+
+
 def _suite_support_contract(
     payload: Mapping[str, Any], maximum_horizon: int
 ) -> tuple[int, int, tuple[str, ...]]:
@@ -492,7 +536,9 @@ def _suite_support_contract(
 
     legacy template 的 inputs support 等於最大 horizon，且每個 horizon 只有一份 release。
     bed-residence template 則把最大隨機沉底年齡加在最長回溯期之前，因此一次 build
-    同時覆蓋兩個模式；runtime support 仍等於最長 release horizon，並固定發布兩種具名模式。
+    可以同時覆蓋一或兩個模式；runtime support 仍等於最長 release horizon。實際要
+    發布哪些具名模式由 :func:`_resolve_formal_release_backtrack_modes` 決定（WP-18
+    新增，見該函式與本模組文件開頭「WP-18」一節）。
     """
 
     bed = _bed_residence_settings(payload)
@@ -506,7 +552,8 @@ def _suite_support_contract(
         raise HorizonSuiteError("bed residence supported_backtrack_modes 必須登錄兩種固定模式且順序一致")
     if bed.get("backtrack_mode") not in _BED_RESIDENCE_MODES:
         raise HorizonSuiteError("bed residence template backtrack_mode 未登錄")
-    return maximum_horizon + maximum_age, maximum_horizon, _BED_RESIDENCE_MODES
+    publish_modes = _resolve_formal_release_backtrack_modes(bed)
+    return maximum_horizon + maximum_age, maximum_horizon, publish_modes
 
 
 def maximum_step_count_for_horizon(days: Any, dt_min_seconds: Any) -> int:

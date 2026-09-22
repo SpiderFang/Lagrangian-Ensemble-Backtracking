@@ -241,11 +241,15 @@ def test_example_config_has_fixed_scientific_counts() -> None:
     assert config.execution.active_chunk_size is None
     assert config.execution.max_resident_forcing_months == 2
     bed = config.normalized_payload()["scenarios"]["bed_residence_time"]
-    assert bed["backtrack_mode"] == "fixed_calendar_window"
+    # WP-18：依 PI 原話，正式 release 預設改以 full_horizon_from_deposition
+    # （從沉底當下回溯到完整地平線）為主；fixed_calendar_window（固定行事曆窗）
+    # 保留為可選的敏感度分析模式，未被刪除，見 supported_backtrack_modes。
+    assert bed["backtrack_mode"] == "full_horizon_from_deposition"
     assert bed["supported_backtrack_modes"] == [
         "fixed_calendar_window",
         "full_horizon_from_deposition",
     ]
+    assert bed["formal_release_backtrack_modes"] == ["full_horizon_from_deposition"]
     assert bed["maximum_age_days"] == 90
     assert bed["sample_count_per_site"] == 50
     assert bed["sampling_seed"] == 20260916
@@ -446,6 +450,110 @@ def test_bed_residence_config_rejects_unregistered_contract_values(
     payload = _payload()
     block = _bed_residence_block()
     block[field] = value
+    payload["scenarios"]["bed_residence_time"] = block
+    with pytest.raises(ValueError):
+        ProjectConfig.model_validate(payload)
+
+
+def test_bed_residence_age_sampling_scope_defaults_and_omission_keeps_hash() -> None:
+    """WP-18：省略 ``age_sampling_scope`` 時預設 ``per_observation``，且不得因為這個
+    新增欄位改變既有（未明示此欄位）設定的 canonical hash。"""
+
+    payload = _payload()
+    payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    with_field = ProjectConfig.model_validate(payload)
+    assert with_field.scenarios.bed_residence_time.age_sampling_scope == "per_observation"
+    assert "age_sampling_scope" not in with_field.normalized_payload()["scenarios"]["bed_residence_time"]
+
+    without_field = ProjectConfig.model_validate(deepcopy(payload))
+    assert with_field.config_hash() == without_field.config_hash()
+
+
+def test_bed_residence_age_sampling_scope_per_particle_enters_hash_when_explicit() -> None:
+    """明示 ``age_sampling_scope: per_particle`` 時必須被接受、寫入 canonical payload，
+    且產生與 per_observation（無論明示與否）不同的 config hash。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["age_sampling_scope"] = "per_particle"
+    payload["scenarios"]["bed_residence_time"] = block
+    config = ProjectConfig.model_validate(payload)
+    assert config.scenarios.bed_residence_time.age_sampling_scope == "per_particle"
+    assert config.normalized_payload()["scenarios"]["bed_residence_time"]["age_sampling_scope"] == (
+        "per_particle"
+    )
+
+    default_payload = _payload()
+    default_payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    default_config = ProjectConfig.model_validate(default_payload)
+    assert config.config_hash() != default_config.config_hash()
+
+
+def test_bed_residence_age_sampling_scope_rejects_unregistered_value() -> None:
+    payload = _payload()
+    block = _bed_residence_block()
+    block["age_sampling_scope"] = "per_flow_domain"
+    payload["scenarios"]["bed_residence_time"] = block
+    with pytest.raises(ValueError):
+        ProjectConfig.model_validate(payload)
+
+
+def test_formal_release_backtrack_modes_defaults_and_omission_keeps_hash() -> None:
+    """WP-18：省略 ``formal_release_backtrack_modes`` 時為 ``None``（沿用
+    horizon-suite 既有「兩種模式都發布」的舊行為），且不得因為這個新增欄位改變
+    既有（未明示此欄位）設定的 canonical hash。"""
+
+    payload = _payload()
+    payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    with_field = ProjectConfig.model_validate(payload)
+    assert with_field.scenarios.bed_residence_time.formal_release_backtrack_modes is None
+    assert "formal_release_backtrack_modes" not in with_field.normalized_payload()["scenarios"][
+        "bed_residence_time"
+    ]
+
+    without_field = ProjectConfig.model_validate(deepcopy(payload))
+    assert with_field.config_hash() == without_field.config_hash()
+
+
+def test_formal_release_backtrack_modes_explicit_enters_hash_and_restricts_publication() -> None:
+    """明示 ``formal_release_backtrack_modes`` 時必須被接受、寫入 canonical payload，
+    且產生與省略（``None``）時不同的 config hash——這是 horizon-suite 判斷正式
+    release 要發布幾份的唯一依據（依 PI 原話，正式改以 full_horizon_from_deposition
+    為主）。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["formal_release_backtrack_modes"] = ["full_horizon_from_deposition"]
+    payload["scenarios"]["bed_residence_time"] = block
+    config = ProjectConfig.model_validate(payload)
+    assert config.scenarios.bed_residence_time.formal_release_backtrack_modes == (
+        "full_horizon_from_deposition",
+    )
+    assert config.normalized_payload()["scenarios"]["bed_residence_time"][
+        "formal_release_backtrack_modes"
+    ] == ["full_horizon_from_deposition"]
+
+    default_payload = _payload()
+    default_payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    default_config = ProjectConfig.model_validate(default_payload)
+    assert config.config_hash() != default_config.config_hash()
+
+
+def test_formal_release_backtrack_modes_rejects_empty_duplicate_and_unsupported() -> None:
+    """空清單、重複值與未列於 ``supported_backtrack_modes`` 的模式都必須拒絕。"""
+
+    for invalid in ([], ["full_horizon_from_deposition", "full_horizon_from_deposition"]):
+        payload = _payload()
+        block = _bed_residence_block()
+        block["formal_release_backtrack_modes"] = invalid
+        payload["scenarios"]["bed_residence_time"] = block
+        with pytest.raises(ValueError):
+            ProjectConfig.model_validate(payload)
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["supported_backtrack_modes"] = ["fixed_calendar_window"]
+    block["formal_release_backtrack_modes"] = ["full_horizon_from_deposition"]
     payload["scenarios"]["bed_residence_time"] = block
     with pytest.raises(ValueError):
         ProjectConfig.model_validate(payload)

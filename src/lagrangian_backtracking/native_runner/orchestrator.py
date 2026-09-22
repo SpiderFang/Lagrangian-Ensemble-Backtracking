@@ -2400,6 +2400,7 @@ def write_native_plan_file(
     manifest: Mapping[str, Any] | None = None,
     hour_major_members: Mapping[str, Sequence[NativeWorkUnit]] | None = None,
     backtrack_mode_declaration: Mapping[str, Any] | None = None,
+    physics_case_declaration: Mapping[str, Any] | None = None,
 ) -> None:
     """把規劃結果（工作單元、缺口檢查、規模摘要、manifest）寫成單一 JSON 計畫檔。
 
@@ -2439,6 +2440,11 @@ def write_native_plan_file(
         # 避免 native-run／native-postprocess 只看到摺疊後的工作單元、猜不出到底用了
         # 哪個回溯模式（見 backtrack_horizon.py 模組文件）。
         payload["backtrack_horizon"] = dict(backtrack_mode_declaration)
+    if physics_case_declaration is not None:
+        # WP-18：把「實際採用的實驗案例（是否含 Stokes）與擴散方法聲明」寫進計畫檔，
+        # 與 backtrack_horizon 同一層級；native-run／native-postprocess 與人工稽核
+        # 都應該從這裡讀，不必回頭猜測本次規劃有沒有讀波浪資料。
+        payload["physics_case"] = dict(physics_case_declaration)
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(output_path, payload)

@@ -10,13 +10,16 @@ from lagrangian_backtracking.bed_residence import (
     BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_POLICY_ID,
     BED_RESIDENCE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
     apply_bed_residence_sampling,
+    derive_bed_residence_particle_seed,
     resolve_bed_residence_timing,
     sample_bed_residence_age_hours,
     sample_bed_residence_age_hours_conditioned_on_availability,
+    sample_bed_residence_age_hours_for_particle,
 )
 from lagrangian_backtracking.gap_policy import (
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
@@ -383,4 +386,140 @@ def test_conversion_rejects_pilot_metadata_and_duplicate_deposition_times() -> N
             sampling_seed=_SEED,
             maximum_age_days=_MAX_AGE_DAYS,
             design_version="design-test-v1",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-18：逐粒子（per_particle）沉底年齡抽樣原語。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _observation_utc_ns() -> int:
+    return int(datetime(2025, 10, 31, 6, tzinfo=UTC).timestamp()) * 1_000_000_000
+
+
+def _available_every_nth_hour(observation_ns: int, *, step: int, max_age_days: int) -> set[int]:
+    """建立「觀測時刻往前每隔 step 小時才可用」的合成 canonical available-time set。"""
+
+    return {
+        observation_ns - age * _HOUR_NS
+        for age in range(0, max_age_days * 24 + 1, step)
+    }
+
+
+def test_derive_bed_residence_particle_seed_is_deterministic_and_particle_specific() -> None:
+    """相同粒子身分永遠得到相同種子；不同 scenario 或 member 得到不同種子。"""
+
+    seed_a = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-a", member_id=0
+    )
+    seed_a_again = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-a", member_id=0
+    )
+    seed_b_member = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-a", member_id=1
+    )
+    seed_b_scenario = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-b", member_id=0
+    )
+    assert seed_a == seed_a_again
+    assert seed_a != seed_b_member
+    assert seed_a != seed_b_scenario
+    assert isinstance(seed_a, int) and seed_a >= 0
+
+
+def test_derive_bed_residence_particle_seed_independent_of_member_seed_stream() -> None:
+    """沉底年齡種子刻意與 ``scenarios.derive_member_seed`` 使用的種子流不同，
+    避免兩種隨機量（沉底年齡 vs. 平流／擴散）彼此相關。"""
+
+    from lagrangian_backtracking.scenarios import derive_member_seed
+
+    bed_seed = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-a", member_id=0
+    )
+    member_seed = derive_member_seed(
+        master_seed=_SEED,
+        scenario_id="scenario-a",
+        experiment_case_id="finite_depth_stokes",
+        member_id=0,
+    )
+    assert bed_seed != member_seed
+
+
+def test_sample_for_particle_is_reproducible_and_respects_availability() -> None:
+    observation_ns = _observation_utc_ns()
+    available = _available_every_nth_hour(observation_ns, step=3, max_age_days=_MAX_AGE_DAYS)
+    seed = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-a", member_id=0
+    )
+
+    first = sample_bed_residence_age_hours_for_particle(
+        observation_time_utc_ns=observation_ns,
+        available_time_ns=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        seed=seed,
+    )
+    second = sample_bed_residence_age_hours_for_particle(
+        observation_time_utc_ns=observation_ns,
+        available_time_ns=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        seed=seed,
+    )
+    assert first.age_hours == second.age_hours
+    assert first.rejected_age_hours == second.rejected_age_hours
+    assert first.sampling_method_id == BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID
+    assert 0 <= first.age_hours <= _MAX_AGE_DAYS * 24
+    assert first.age_hours % 3 == 0
+    assert (observation_ns - first.age_hours * _HOUR_NS) in available
+    for rejected_age in first.rejected_age_hours:
+        assert (observation_ns - rejected_age * _HOUR_NS) not in available
+
+
+def test_sample_for_particle_different_particles_can_get_different_ages() -> None:
+    """不同粒子（不同 seed）在同一個可用性條件下不必抽到同一個年齡——這是「以量取勝」
+    需求（PI 原話）成立的前提：粒子彼此獨立，不是全部共用同一個年齡。"""
+
+    observation_ns = _observation_utc_ns()
+    available = set(range(0, _MAX_AGE_DAYS * 24 + 1))
+    available = {observation_ns - age * _HOUR_NS for age in available}
+
+    ages = set()
+    for member_id in range(20):
+        seed = derive_bed_residence_particle_seed(
+            master_seed=_SEED, scenario_id="scenario-a", member_id=member_id
+        )
+        sample = sample_bed_residence_age_hours_for_particle(
+            observation_time_utc_ns=observation_ns,
+            available_time_ns=available,
+            maximum_age_days=_MAX_AGE_DAYS,
+            seed=seed,
+        )
+        ages.add(sample.age_hours)
+    assert len(ages) > 1, "20 個不同粒子的種子抽出的年齡不應該全部相同"
+
+
+def test_sample_for_particle_fails_closed_when_nothing_available() -> None:
+    observation_ns = _observation_utc_ns()
+    seed = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-a", member_id=0
+    )
+    with pytest.raises(ValueError, match="無可用候選"):
+        sample_bed_residence_age_hours_for_particle(
+            observation_time_utc_ns=observation_ns,
+            available_time_ns=set(),
+            maximum_age_days=_MAX_AGE_DAYS,
+            seed=seed,
+        )
+
+
+def test_sample_for_particle_rejects_non_exact_hour_observation() -> None:
+    seed = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="scenario-a", member_id=0
+    )
+    with pytest.raises(ValueError, match="exact-hour"):
+        sample_bed_residence_age_hours_for_particle(
+            observation_time_utc_ns=_observation_utc_ns() + 1,
+            available_time_ns={_observation_utc_ns()},
+            maximum_age_days=_MAX_AGE_DAYS,
+            seed=seed,
         )

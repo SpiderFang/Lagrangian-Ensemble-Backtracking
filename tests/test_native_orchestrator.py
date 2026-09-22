@@ -1470,3 +1470,106 @@ def test_native_run_without_backtrack_horizon_field_is_unaffected(tmp_path, monk
         pytest.fail("舊計畫檔（沒有 backtrack_horizon 欄位）不應該觸發 WP-17 的模式比對")
     except Exception:
         pass  # 其餘失敗（例如 provider 不合法）不是本測試要驗證的範圍。
+
+
+def test_write_native_plan_file_round_trips_physics_case_declaration(tmp_path) -> None:
+    """WP-18：計畫檔的 ``physics_case`` 區塊必須原樣寫入並可讀回，供 native-run／
+    native-postprocess 與人工稽核核對本次規劃實際採用的實驗案例。"""
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    declaration = {
+        "experiment_case_id": "no_stokes",
+        "include_stokes": False,
+        "diffusion_method": "smagorinsky_workbook_eq10",
+        "require_wave_data": False,
+    }
+    orch.write_native_plan_file(
+        plan_path,
+        units=[unit],
+        gap_checks=[],
+        summary=summary,
+        physics_case_declaration=declaration,
+    )
+    _units, payload = orch.read_native_plan_file(plan_path)
+    assert payload["physics_case"] == declaration
+
+
+def test_native_run_fails_closed_on_plan_physics_case_mismatch(tmp_path, monkeypatch) -> None:
+    """計畫檔以 ``no_stokes`` 規劃，但執行環境沒有設定 ``LBT_NATIVE_EXPERIMENT_CASE``
+    （因此退回預設 ``finite_depth_stokes``）時，``native-run`` 必須在動用任何
+    ``--resource-provider`` 或執行任何工作單元之前就 fail closed，理由與
+    ``test_native_run_fails_closed_on_plan_backtrack_mode_mismatch`` 相同，只是換成
+    WP-18 新增的實驗案例比對（見 ``cli.run_native_run`` 讀回計畫檔後的
+    ``physics_case`` 比對邏輯）。"""
+
+    from lagrangian_backtracking import cli
+    from lagrangian_backtracking.native_runner.physics_case import PhysicsCaseError
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(
+        plan_path,
+        units=[unit],
+        gap_checks=[],
+        summary=summary,
+        physics_case_declaration={
+            "experiment_case_id": "no_stokes",
+            "include_stokes": False,
+            "diffusion_method": "smagorinsky_workbook_eq10",
+            "require_wave_data": False,
+        },
+    )
+
+    monkeypatch.delenv("LBT_NATIVE_EXPERIMENT_CASE", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_BACKTRACK_MODE", raising=False)
+
+    with pytest.raises(PhysicsCaseError):
+        cli.run_native_run(
+            [
+                str(plan_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--resource-provider",
+                "os.path:join",
+                "--worker-count",
+                "1",
+            ]
+        )
+
+
+def test_native_run_without_physics_case_field_is_unaffected(tmp_path, monkeypatch) -> None:
+    """WP-18 之前產生的舊計畫檔沒有 ``physics_case`` 欄位；新增的比對必須完全跳過
+    （不能對舊計畫檔 fail closed），行為與 WP-18 之前相同。"""
+
+    from lagrangian_backtracking import cli
+    from lagrangian_backtracking.native_runner.physics_case import PhysicsCaseError
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(plan_path, units=[unit], gap_checks=[], summary=summary)
+
+    monkeypatch.delenv("LBT_NATIVE_EXPERIMENT_CASE", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_BACKTRACK_MODE", raising=False)
+
+    try:
+        cli.run_native_run(
+            [
+                str(plan_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--resource-provider",
+                "os.path:join",
+                "--worker-count",
+                "1",
+            ]
+        )
+    except PhysicsCaseError:
+        pytest.fail("舊計畫檔（沒有 physics_case 欄位）不應該觸發 WP-18 的實驗案例比對")
+    except Exception:
+        pass  # 其餘失敗（例如 provider 不合法）不是本測試要驗證的範圍。

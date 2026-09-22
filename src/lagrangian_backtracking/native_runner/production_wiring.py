@@ -402,6 +402,8 @@ def build_domain_resources(
     env: Mapping[str, str] = os.environ,
     config_path: str | Path | None = None,
     formal: bool = True,
+    include_stokes: bool = True,
+    require_wave_data: bool = False,
 ) -> DomainResources:
     """依正式設定與已驗收產品，建出一個流場區域逆向追蹤所需的全部唯讀資源。
 
@@ -450,6 +452,21 @@ def build_domain_resources(
             本身是路徑時忽略此參數（一律以它為準）。
         formal: 是否使用正式（而非 pilot）上游產品識別碼與完整站點覆蓋要求，
             透傳給 ``resolve_flow_domain_id``／``load_boundary_geometries``。
+        include_stokes: WP-18 新增。對應 ``runtime.EXPERIMENT_CASE_SPECS`` 的
+            實驗案例選擇（``finite_depth_stokes``＝``True``、``no_stokes``＝
+            ``False``）。``False`` 時完全不讀取 ``NWW_ANALYSIS_ROOT`` 環境變數、
+            不探測任何 NWW3 目錄或月份，回傳的 ``wave_resolver_factory`` 固定
+            為 ``None``——這是「只有流」案例「完全不讀波浪資料」的唯一保證點；
+            預設 ``True`` 保留 WP-18 之前「只要資料存在就用」的既有行為，不破壞
+            既有呼叫端。
+        require_wave_data: WP-18 新增。僅在 ``include_stokes=True`` 時有意義；
+            ``True`` 時若 NWW3 分析產品目錄不存在、沒有可用月份或缺時，直接
+            ``WiringError`` fail-closed，不再像既有預設行為那樣把
+            ``wave_resolver_factory`` 靜默設成 ``None``。native-plan／native-run
+            在使用者明確選擇 ``finite_depth_stokes`` 案例時會傳入 ``True``，
+            確保「流＋波浪」案例的波浪資料缺漏依既有缺值政策 fail-closed，
+            不會默默退化成「只有流」。預設 ``False`` 保留既有寬容行為，供未指定
+            實驗案例的既有呼叫端使用。
 
     Returns:
         ``resources.DomainResources``。
@@ -518,45 +535,65 @@ def build_domain_resources(
     )
     available_lo_ns, available_hi_ns = probe_forcing_reader.available_time_range_utc_ns
 
-    nww_native_root = Path(
-        _require_env(env, config.inputs.nww_analysis_root_env, purpose="NWW3 分析產品 root")
-    )
-    nww_flow_root = nww_native_root / flow_domain_id
-    nww_grid_dir = nww_flow_root / "grid"
     wave_resolver_factory: Callable[[], Callable[[int], Any]] | None = None
+    nww_native_root: Path | None = None
     nww_months: list[str] = []
-    if nww_grid_dir.is_dir() and (nww_flow_root / "months").is_dir():
-        try:
-            nww_months = _year_window_months(nww_flow_root / "months", config.inputs.years)
-        except WiringError:
-            nww_months = []
-    if nww_months:
-        nww_month_dirs = {month_id: str(nww_flow_root / "months" / month_id) for month_id in nww_months}
+    if include_stokes:
+        # ``include_stokes=False``（``no_stokes`` 案例）完全不執行這個區塊：
+        # 不讀 NWW_ANALYSIS_ROOT 環境變數、不探測任何 NWW3 目錄，滿足「只有流」
+        # 案例「完全不讀波浪資料」的要求，而不只是「讀了但不算 Stokes」。
+        nww_native_root = Path(
+            _require_env(env, config.inputs.nww_analysis_root_env, purpose="NWW3 分析產品 root")
+        )
+        nww_flow_root = nww_native_root / flow_domain_id
+        nww_grid_dir = nww_flow_root / "grid"
+        if nww_grid_dir.is_dir() and (nww_flow_root / "months").is_dir():
+            try:
+                nww_months = _year_window_months(nww_flow_root / "months", config.inputs.years)
+            except WiringError:
+                if require_wave_data:
+                    raise
+                nww_months = []
+        elif require_wave_data:
+            raise WiringError(
+                f"experiment case 要求 finite_depth_stokes（含 Stokes 漂移），但缺少 NWW3 "
+                f"分析產品目錄：{nww_grid_dir}；依既有缺值政策 fail-closed，不得默默退化成 "
+                "no_stokes"
+            )
+        if nww_months:
+            nww_month_dirs = {
+                month_id: str(nww_flow_root / "months" / month_id) for month_id in nww_months
+            }
 
-        def wave_resolver_factory() -> Callable[[int], Any]:
-            """每個工作程序各自呼叫一次，取得自己的波浪場解析器。"""
+            def wave_resolver_factory() -> Callable[[int], Any]:
+                """每個工作程序各自呼叫一次，取得自己的波浪場解析器。"""
 
-            reader = NativeWaveBridgeReader(
+                reader = NativeWaveBridgeReader(
+                    grid_dir=nww_grid_dir,
+                    month_dirs=nww_month_dirs,
+                    node_lon=mesh.node_lon,
+                    node_lat=mesh.node_lat,
+                )
+                return reader.as_wave_field_resolver()
+
+            probe_wave_reader = NativeWaveBridgeReader(
                 grid_dir=nww_grid_dir,
                 month_dirs=nww_month_dirs,
                 node_lon=mesh.node_lon,
                 node_lat=mesh.node_lat,
             )
-            return reader.as_wave_field_resolver()
-
-        probe_wave_reader = NativeWaveBridgeReader(
-            grid_dir=nww_grid_dir,
-            month_dirs=nww_month_dirs,
-            node_lon=mesh.node_lon,
-            node_lat=mesh.node_lat,
-        )
-        wave_lo_ns, wave_hi_ns = probe_wave_reader.available_time_range_utc_ns
-        available_lo_ns = max(available_lo_ns, wave_lo_ns)
-        available_hi_ns = min(available_hi_ns, wave_hi_ns)
-        if available_lo_ns > available_hi_ns:
+            wave_lo_ns, wave_hi_ns = probe_wave_reader.available_time_range_utc_ns
+            available_lo_ns = max(available_lo_ns, wave_lo_ns)
+            available_hi_ns = min(available_hi_ns, wave_hi_ns)
+            if available_lo_ns > available_hi_ns:
+                raise WiringError(
+                    f"{flow_domain_id} 的 OCM 與 NWW3 可用時間範圍沒有交集：OCM="
+                    f"[{probe_forcing_reader.available_time_range_utc_ns}]，NWW3=[{wave_lo_ns},{wave_hi_ns}]"
+                )
+        elif require_wave_data:
             raise WiringError(
-                f"{flow_domain_id} 的 OCM 與 NWW3 可用時間範圍沒有交集：OCM="
-                f"[{probe_forcing_reader.available_time_range_utc_ns}]，NWW3=[{wave_lo_ns},{wave_hi_ns}]"
+                f"experiment case 要求 finite_depth_stokes（含 Stokes 漂移），但 {nww_flow_root} "
+                "沒有可用月份；依既有缺值政策 fail-closed，不得默默退化成 no_stokes"
             )
 
     boundary_bundle = load_boundary_geometries(config, config_path=resolved_config_path, formal=formal)
@@ -593,9 +630,11 @@ def build_domain_resources(
             "由 backward_driver.compute_smagorinsky_kh_field 從本次運算合成後的流速直接算出；"
             "NativeForcingBridgeReader 以 load_diffusivity=False 建立，不讀取 diffusivity.npy"
         ),
-        "nww_analysis_root": str(nww_native_root),
+        "nww_analysis_root": str(nww_native_root) if nww_native_root is not None else None,
         "nww_months_used": tuple(nww_months),
         "wave_data_available": wave_resolver_factory is not None,
+        "include_stokes": include_stokes,
+        "require_wave_data": require_wave_data,
         "interest_region_definition": (
             "boundaries.BoundaryGeometry.own_local_domain（local-domain manifest 投影後的"
             "站點 local polygon），與既有正向追蹤 runtime 共用同一份幾何定義"
@@ -617,7 +656,12 @@ def build_domain_resources(
 
 
 def _domain_resources_factory_entrypoint(
-    config_path: str, env: dict[str, str], formal: bool, domain_id: str
+    config_path: str,
+    env: dict[str, str],
+    formal: bool,
+    include_stokes: bool,
+    require_wave_data: bool,
+    domain_id: str,
 ) -> DomainResources:
     """``make_domain_resources_factory`` 綁定後、實際被排程器呼叫的模組層級函式。
 
@@ -629,7 +673,14 @@ def _domain_resources_factory_entrypoint(
     名稱，因此工作程序不需要與主程序共享任何記憶體）。
     """
 
-    return build_domain_resources(config_path, domain_id, env=env, formal=formal)
+    return build_domain_resources(
+        config_path,
+        domain_id,
+        env=env,
+        formal=formal,
+        include_stokes=include_stokes,
+        require_wave_data=require_wave_data,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -677,6 +728,8 @@ def make_domain_resources_factory(
     *,
     env: Mapping[str, str] | None = None,
     formal: bool = True,
+    include_stokes: bool = True,
+    require_wave_data: bool = False,
 ) -> DomainResourcesFactory:
     """回傳可直接交給排程器（``--resource-provider``）使用、可 pickle 的資源工廠。
 
@@ -695,6 +748,10 @@ def make_domain_resources_factory(
             ``os.environ``（複製而非直接引用，確保之後修改
             ``os.environ`` 不會影響已建立的工廠）。
         formal: 透傳給每次 ``build_domain_resources`` 呼叫。
+        include_stokes: 透傳給每次 ``build_domain_resources`` 呼叫（WP-18 新增，
+            見該函式 docstring）。
+        require_wave_data: 透傳給每次 ``build_domain_resources`` 呼叫（WP-18
+            新增，見該函式 docstring）。
 
     Returns:
         ``resources.DomainResourcesFactory``；可安全地在 ``multiprocessing``
@@ -707,7 +764,14 @@ def make_domain_resources_factory(
             "（無法安全 pickle 給 spawn 工作程序，見本函式 docstring）"
         )
     env_dict = dict(env) if env is not None else dict(os.environ)
-    return functools.partial(_domain_resources_factory_entrypoint, str(config_path), env_dict, formal)
+    return functools.partial(
+        _domain_resources_factory_entrypoint,
+        str(config_path),
+        env_dict,
+        formal,
+        include_stokes,
+        require_wave_data,
+    )
 
 
 # ── 二、正式粒子身分表 ────────────────────────────────────────────────────

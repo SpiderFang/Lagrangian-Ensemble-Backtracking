@@ -164,15 +164,30 @@ build／validator 仍必須拒絕；新版 gap-censored suite 會保留相同缺
 第一個向後缺口與起點連續可追時數寫入 evidence。只有 deposition exact-hour 起點缺資料或 policy
 不完整才拒絕，不能用零值、最近值、跨缺口內插或未登錄外插繞過。
 
-兩個 `backtrack_mode` 均由正式範例明確登錄，release 時只切換該欄位：
+`supported_backtrack_modes` 登錄兩個 `backtrack_mode`，release 時只切換該欄位：
 
 - `fixed_calendar_window`：固定日曆終點往前回溯 H 日，實際漂流期間為 `H - age`；若沉底早於該研究窗，保留 `pre_window_deposition` outcome，不建立 forcing 運算。
 - `full_horizon_from_deposition`：從隨機 deposition UTC 再向前完整回溯 H 日；實際 H 仍可能因物理邊界、資料或數值失敗提前終止。
 
+**WP-18（依 PI 原話變更）**：正式（formal）release 的預設模式改為
+`full_horizon_from_deposition`——即「從沉底當下回溯到完整地平線」，而不是固定日曆窗。
+正式範例改以 `scenarios.bed_residence_time.formal_release_backtrack_modes:
+[full_horizon_from_deposition]` 明示只發布這一種模式；`fixed_calendar_window` 仍保留在
+`supported_backtrack_modes`，作為可選的敏感度分析模式，未被刪除。若需要同時比較兩種模式
+（例如敏感度分析），可在該站點或研究的 config 明示
+`formal_release_backtrack_modes: [fixed_calendar_window, full_horizon_from_deposition]`
+以取回舊版「兩者都發布」的行為。`horizon-suite.py` 的 `_suite_support_contract` 只由
+template 內容（`formal_release_backtrack_modes` 是否存在、以及其值）決定要發布幾種模式；
+省略此欄位時預設兩者都發布，確保新增此欄位前既已建置的 suite 仍可通過
+`validate_horizon_suite` 的 zero-trust 重新推導，不因程式碼層級的預設值改變而失效。
+
 pre-window 成員保留在固定的 total 情境／成員 outcome 分母並單獨計數；它不是資料缺口或數值失敗，且不得貢獻來源 numerator。它從有效來源比例的 valid denominator 排除，避免把沒有研究窗內漂流歷程的粒子當作有效來源樣本。所有相對權重仍只能稱為「條件式來源足跡」或「相對來源權重」，不得稱絕對來源機率或因果歸因。
 
-common-input 完成後，suite 由這一份共同母體產生 **六份** release config：H30、H60、H90 各
-配 `fixed_calendar_window`、`full_horizon_from_deposition`。每份 release 的
+common-input 完成後，suite 由這一份共同母體產生 release config：依 template 的
+`formal_release_backtrack_modes`（省略時為兩種模式）與 H30/H60/H90 的乘積決定份數；正式
+範例現在只登錄 `full_horizon_from_deposition`，故 H30/H60/H90 各一份、共 **三份**
+release；若明示兩種模式則仍為 **六份**（H30/H60/H90 各配
+`fixed_calendar_window`、`full_horizon_from_deposition`）。每份 release 的
 `boundaries.max_backtrack_days` 等於其 H；步數依 common config 有限正值
 `integration.dt_min_seconds` 計算 `ceil(H * 86400 / dt_min_seconds) + 1`，不得因較短 horizon
 省略。release config、validation 與 manifest record 的檔名／路徑均帶 mode，release hash/binding
@@ -203,8 +218,8 @@ release。輸出拓撲固定包含：
 ├── source-template.yaml       # 原始 template 的保存副本
 ├── common-config.yaml         # 180 日 observation selection／90 日 runtime support
 ├── common-input/              # 唯一一次 inputs-build 的 immutable input artifacts
-├── release-configs/           # H30/H60/H90 × 兩種 mode，共六份 release config
-├── validations/               # common input 與六份 mode-specific release validator JSON
+├── release-configs/           # H30/H60/H90 × formal_release_backtrack_modes 指定的模式數
+├── validations/               # common input 與各 mode-specific release validator JSON
 ├── horizon-suite-manifest.json        # suite 模式、日數、拓撲、來源與 artifact hash
 ├── horizon-suite-manifest.json.sha256 # manifest 位元組的 SHA-256 binding
 ├── horizon-suite-publication.json     # immutable 發布完成 marker
@@ -233,9 +248,10 @@ fingerprint、策略識別碼／版本與 native 或 NFS 方法，不含任何�
 `lbt horizon-suite-validate` 固定讀取 suite 內的 `common-input/`，並可明示三個 accepted roots。
 省略 roots 時只驗 suite 內 artifact closure，不代表重新核對 accepted source bytes 或 canonical UTC
 axis；正式或移機驗收必須明示三個 roots。唯讀 validator 會重建 expected payload，核對
-selection_support=180/runtime_support=90、一次 build、完整六份 H×mode topology、各 release 日數／
-步數／mode、支援 binding、共同 identities 與 artifact hash；不能只相信 manifest 自述。六份 config
-hash 因 H 與 mode 不同而不同，共同母體及 artifacts 必須完全一致。
+selection_support=180/runtime_support=90、一次 build、完整 H×mode topology（份數由 template 的
+`formal_release_backtrack_modes` 決定，省略時為六份、明示單一模式時為三份）、各 release 日數／
+步數／mode、支援 binding、共同 identities 與 artifact hash；不能只相信 manifest 自述。各 release
+config hash 因 H 與 mode 不同而不同，共同母體及 artifacts 必須完全一致。
 公開 validator 另要求 `horizon-suite-publication.json` 及其 sidecar，並核對 marker 的
 manifest fingerprint、schema、publication policy／version 與方法。新 schema 不允許無 marker
 的目錄以正式或 pilot CLI 通過；未發布 partial 只由 builder 透過私有 gate 驗證。
@@ -243,7 +259,7 @@ artifact／release 的 legacy schema 相容性不會放寬本 suite schema `1.1.
 舊 suite 若沒有 marker，必須重新發布或走明示 recovery，不得直接視為成功。
 
 這個流程只保證可稽核的設計母體與設定綁定，不是每粒子的固定存活時間。粒子仍可因海岸、域外、
-資料缺口或數值狀態停止，不能把六份設定都通過解讀為每粒子實際走滿 H。正式 accepted inputs 限
+資料缺口或數值狀態停止，不能把各份 release 設定都通過解讀為每粒子實際走滿 H。正式 accepted inputs 限
 OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3 schema 1 `nww3_analysis`；raw NetCDF
 與 transfer archive 不得進入 suite。
 
@@ -267,8 +283,9 @@ uv run lbt horizon-suite-validate \
 
 若建置在發布前中斷而保留 exact `.partial-*`，可在確認原 partial 未被改寫後，以新的
 destination 執行 recovery。recovery 會唯讀重驗 source-template、common-config、common-input
-closure、來源 config hash 與三個 accepted roots，複製已驗證的 common-input，再重建六份
-release、validation 與 manifest；它不呼叫 `inputs-build`，不修改或刪除原 partial，也拒絕
+closure、來源 config hash 與三個 accepted roots，複製已驗證的 common-input，再依 template 的
+`formal_release_backtrack_modes` 重建各份 release、validation 與 manifest；它不呼叫
+`inputs-build`，不修改或刪除原 partial，也拒絕
 symlink、tampering、既有 destination 或日數不一致：
 
 ```bash

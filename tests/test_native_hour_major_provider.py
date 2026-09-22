@@ -961,3 +961,91 @@ def test_native_plan_reports_cost_model_when_grid_sizes_provided(two_domain_env:
     # cost_model 欄位必須明確是 None，不能用任何臆測值頂替。
     _units, payload_k2 = orch.read_native_plan_file(two_domain_env["plan_k2_path"])
     assert "manifest" in payload_k2
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 六、WP-18：實驗案例（no_stokes／finite_depth_stokes）端對端驗收
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_no_stokes_experiment_case_end_to_end_skips_wave_data(
+    two_domain_env, baytrace_root, numba_cache_dir, tmp_path_factory
+) -> None:
+    """``--experiment-case no_stokes`` 從 native-plan 到 native-run 全程串起來後，
+    每個結果摘要都必須標示 ``include_stokes=False``、``wave_data_available`` 為
+    ``None``（整段落在 pre-window 的排程單元）或 ``False``（實際跑過 hour-major
+    的排程單元），即使 ``two_domain_env`` 的合成資料本來就有可用的 NWW3 波浪
+    產品（見 ``clean_k1_run``／``clean_k2_run`` 在同一份資料下 ``wave_data_
+    available=True`` 的既有預設行為，於本測試最後一併對照驗證，確認新增的
+    ``--experiment-case`` 沒有改變預設行為）。"""
+
+    base = tmp_path_factory.mktemp("no_stokes_plan")
+    region_to_flow_domain_path = base / "region_to_flow_domain.json"
+    region_to_flow_domain_path.write_text(
+        json.dumps({"A": _FLOW_DOMAIN_A, "B": _FLOW_DOMAIN_B}), encoding="utf-8"
+    )
+    plan_path = base / "plan_no_stokes.json"
+    rc = cli.run_native_plan_command(
+        [
+            "--identity-table",
+            str(two_domain_env["identity_path"]),
+            "--region-to-flow-domain",
+            str(region_to_flow_domain_path),
+            "--output",
+            str(plan_path),
+            "--schedule",
+            "hour-major-segmented",
+            "--segments",
+            "1",
+            "--skip-gap-check",
+            "--experiment-case",
+            "no_stokes",
+        ]
+    )
+    assert rc == 0
+    _units, plan_payload = orch.read_native_plan_file(plan_path)
+    assert plan_payload["physics_case"]["experiment_case_id"] == "no_stokes"
+    assert plan_payload["physics_case"]["include_stokes"] is False
+
+    env_base = _base_env(two_domain_env, baytrace_root)
+    env_base["LBT_NATIVE_EXPERIMENT_CASE"] = "no_stokes"
+    run = _run_clean_native_run(env_base, plan_path, numba_cache_dir, tmp_path_factory, "no_stokes")
+
+    result_paths = sorted(run["output_dir"].glob("*.result.json"))
+    assert result_paths, "native-run 沒有寫出任何 *.result.json 結果摘要"
+    for result_path in result_paths:
+        summary = json.loads(result_path.read_text(encoding="utf-8"))
+        assert summary["include_stokes"] is False
+        assert summary["experiment_case_id"] == "no_stokes"
+        assert summary["wave_data_available"] in (None, False)
+        for member_summary in summary.get("member_summaries", {}).values():
+            assert member_summary["include_stokes"] is False
+            assert member_summary["experiment_case_id"] == "no_stokes"
+
+    # 對照組：同一份合成資料下，預設（finite_depth_stokes）案例的既有結果摘要
+    # 必須是 wave_data_available=True，證明 no_stokes 的差異確實來自案例選擇，
+    # 不是合成資料本身就沒有波浪產品。
+    default_result_paths = clean_k1_run_output_result_paths(
+        two_domain_env, baytrace_root, numba_cache_dir, tmp_path_factory
+    )
+    assert default_result_paths
+    default_summary = json.loads(default_result_paths[0].read_text(encoding="utf-8"))
+    assert default_summary["wave_data_available"] is True
+    assert default_summary["include_stokes"] is True
+    assert default_summary["experiment_case_id"] == "finite_depth_stokes"
+
+
+def clean_k1_run_output_result_paths(two_domain_env, baytrace_root, numba_cache_dir, tmp_path_factory):
+    """獨立跑一次預設案例的 K=1 native-run，回傳其 ``*.result.json`` 路徑清單。
+
+    不直接重用 ``clean_k1_run`` fixture：該 fixture 是 module 作用域、可能已被
+    其他測試以不同 ``LBT_NATIVE_EXPERIMENT_CASE`` 環境跑過，這裡改成獨立呼叫，
+    確保對照組明確在「未設定 LBT_NATIVE_EXPERIMENT_CASE」（即預設
+    ``finite_depth_stokes``）下執行，不受測試執行順序影響。
+    """
+
+    env_base = _base_env(two_domain_env, baytrace_root)
+    run = _run_clean_native_run(
+        env_base, two_domain_env["plan_k1_path"], numba_cache_dir, tmp_path_factory, "default_case_control"
+    )
+    return sorted(run["output_dir"].glob("*.result.json"))
