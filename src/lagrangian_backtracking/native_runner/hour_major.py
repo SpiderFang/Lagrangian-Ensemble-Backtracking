@@ -277,6 +277,12 @@ class HourMajorConfig:
     deposition_tolerance_m: float = 0.5
     master_seed: int = 0
     stokes_depth_threshold_ratio: float | None = None
+    # 水平擴散係數（Smagorinsky，工作書式(10)）的計算實作：
+    # ``"baytrace"``（預設）＝透過 shim 呼叫 BayTrace 原版 ``_compute_smagorinsky_hf2``；
+    # ``"numba"``＝``smagorinsky_batch`` 的 Numba 移植，同一演算法、同一運算式，但浮點
+    # 加總順序不同，與原版差 1–2 個最後有效位元（相對誤差約 1e-16），屬統計等價而非
+    # 位元相同；速度快約 35 倍且幾乎不產生暫存陣列（多程序並跑時不再搶記憶體頻寬）。
+    smagorinsky_impl: str = "baytrace"
 
 
 def hour_major_config_to_backward_driver_config(
@@ -950,6 +956,7 @@ def run_flow_domain_hour_major(
                             driver_grid, handles,
                             u_current_mps=u_smag, v_current_mps=v_smag,
                             horcon=config.horcon,
+                            use_numba=config.smagorinsky_impl == "numba",
                         )
                         hour_overhead.time_smagorinsky_s += _time.perf_counter() - t0
                         hour_overhead.smagorinsky_cache_misses += 1

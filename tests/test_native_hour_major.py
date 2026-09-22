@@ -834,3 +834,29 @@ def _DOMAIN_X_LARGE(driver_grid: bd.NativeBackwardDriverGrid) -> float:
 
 def _DOMAIN_Y_LARGE(driver_grid: bd.NativeBackwardDriverGrid) -> float:
     return float(driver_grid.grid.grid_y.max() - driver_grid.grid.grid_y.min())
+
+
+def test_hour_major_numba_smagorinsky_impl_runs_and_matches_on_uniform_flow(driver_grid, handles) -> None:
+    """``smagorinsky_impl="numba"`` 接線可用；均勻流場應變率為零，兩種實作結果應完全相同。
+
+    非均勻流場下兩者差 1–2 個最後有效位元（統計等價），由
+    ``tests/test_native_smagorinsky_batch.py`` 與伺服器真實資料比對驗證。
+    """
+
+    table, units, interest_regions, _t0 = _build_staggered_domain()
+    resolver = _make_resolver(driver_grid, u=0.02, v=0.01, kh=2.0e-4)
+    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    results = {}
+    for impl in ("baytrace", "numba"):
+        config = hm.HourMajorConfig(
+            max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=99, smagorinsky_impl=impl,
+        )
+        results[impl] = hm.run_flow_domain_hour_major(
+            driver_grid, handles, batch, config=config, forcing_resolver=resolver,
+        )
+    for unit in units:
+        _assert_results_bit_identical(
+            results["baytrace"].unit_results[unit.unit_id],
+            results["numba"].unit_results[unit.unit_id],
+            label=f"{unit.unit_id} (baytrace vs numba)",
+        )

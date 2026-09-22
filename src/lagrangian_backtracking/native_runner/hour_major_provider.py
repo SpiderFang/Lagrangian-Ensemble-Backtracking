@@ -335,6 +335,17 @@ class HourMajorProviderParams:
     test_force_interrupt_after_hours: int | None = None
 
 
+def _env_smagorinsky_impl(env: Mapping[str, str]) -> str:
+    """``LBT_NATIVE_SMAGORINSKY_IMPL``：``baytrace``（預設，原版）或 ``numba``（統計等價的加速移植）。"""
+
+    value = (env.get("LBT_NATIVE_SMAGORINSKY_IMPL") or "baytrace").strip().lower()
+    if value not in {"baytrace", "numba"}:
+        raise HourMajorProviderError(
+            f"LBT_NATIVE_SMAGORINSKY_IMPL 只接受 baytrace 或 numba，收到 {value!r}"
+        )
+    return value
+
+
 def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
     """從環境變數解析出 :class:`HourMajorProviderParams`（見模組文件環境變數契約）。"""
 
@@ -374,6 +385,7 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         ),
         master_seed=int(master_seed),
         stokes_depth_threshold_ratio=_env_optional_float(env, "LBT_NATIVE_STOKES_DEPTH_THRESHOLD_RATIO"),
+        smagorinsky_impl=_env_smagorinsky_impl(env),
     )
     return HourMajorProviderParams(
         config_path=config_path,
@@ -716,6 +728,8 @@ def _run_unit_entrypoint(
         "domain_hours_walked": int(run_result.domain_hours_walked),
         "domain_kernel_call_count": int(run_result.domain_kernel_call_count),
         "wave_data_available": wave_resolver is not None,
+        # 每個排程單元都記錄實際使用的 Smagorinsky 實作，後處理與報告可據此區分。
+        "smagorinsky_impl": params.hour_major_config.smagorinsky_impl,
     }
 
 
