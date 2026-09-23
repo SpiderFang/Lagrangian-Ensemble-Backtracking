@@ -7,7 +7,7 @@
 
 ## 1. 文件地位
 
-本文件記錄 2026-08-17 完成、2026-08-27 依研究主持人意見修訂，並於 2026-09-09 由 A 區範圍裁決更新的設計基線。原 `design_baseline_v2_non_rising_oca_proxy` 的十個非上浮材質／形狀代理、嚴格負沉降速度與物性限制仍沿用；本期 A 區幾何與 domain 身分改採 `design_baseline_v3_non_rising_a_v3_local20_20260909` 及 `formal_domain_policy=v3_local20km_20260909_v1`。使用者已明示沒有可再提供的單體物性資料，因此只有必須由 SERVER 實際資料、OCM 網格、現地樣本或先導試驗計算出的數值保留為「衍生閘門」。
+本文件記錄 2026-08-17 完成、2026-08-27 依研究主持人指示（取消上升、對應材質與形狀）修訂，並於 2026-09-09 由 A 區範圍裁決更新的設計基線。原 `design_baseline_v2_non_rising_oca_proxy` 的十個非上浮材質／形狀代理、嚴格負沉降速度與物性限制仍沿用；本期 A 區幾何與 domain 身分改採 `design_baseline_v3_non_rising_a_v3_local20_20260909` 及 `formal_domain_policy=v3_local20km_20260909_v1`。使用者已明示沒有可再提供的單體物性資料，因此只有必須由 SERVER 實際資料、OCM 網格、現地樣本或先導試驗計算出的數值保留為「衍生閘門」。
 
 2026-09-23 依正式 OCM 逐時海面高程驗證結果修訂第 7 節：先前大小潮分類使用的 14 天潮汐強度判定時窗，因大小潮週期約 14.77 天而幾乎把整輪大小潮平均掉，導致分類近似隨機（詳見 `arrival_time_selection.policy=observation_year_stratified_48_plus_2_v2` 的
 ``arrival_times`` 模組文件）；新增 `_v2` selector policy 改用約一個潮日（25 小時）的短窗，`_v1`／舊版兩年份 policy 仍保留 14 天窗以維持既有 manifest 位元相同。第 7 節文字同步更新，不再把農曆朔望當成分類依據本身，只作背景說明。
@@ -235,7 +235,7 @@ contact。只有另行登錄的 `bed_reflect`／再懸浮敏感度，才可將�
 `observation_year_stratified_48_plus_2_v1`／`_v2`）以單一 observation 年份為錨點：
 
 ```text
-48 core = 1 observation year × 4 seasons × 2 spring/neap classes × 3 intra-tidal phases × 2 replicates
+48 core = 1 observation year (2025) × 4 seasons × 2 spring/neap classes × 3 intra-tidal phases × 2 replicates
 2 extremes = 1 high-wave event + 1 strong-current event
 ```
 
