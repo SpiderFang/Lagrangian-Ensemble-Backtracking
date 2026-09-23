@@ -27,6 +27,7 @@ import importlib
 import json
 import math
 import os
+import shlex
 import stat
 import sys
 import tempfile
@@ -64,6 +65,7 @@ from .input_derivation import (
 )
 from .models import ParticleState, VelocitySample
 from .native_runner import backtrack_horizon as native_backtrack_horizon
+from .native_runner import figures as native_figures
 from .native_runner import horizon_derivation as native_horizon_derivation
 from .native_runner import hour_major_provider as native_hour_major_provider
 from .native_runner import orchestrator as native_orchestrator
@@ -1960,6 +1962,62 @@ def run_native_derive_horizon_command(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _native_figures_parser() -> argparse.ArgumentParser:
+    """建立 ``lbt native-figures`` parser（WP-21：native 正式成果圖表管線）。
+
+    只讀 ``native-postprocess`` 已寫出的 Parquet／CSV 與呼叫端明示的 CRS84 海岸
+    GeoJSON；不讀 forcing、不重新積分、不改寫任何輸入。``--output-dir`` 必須是
+    尚不存在的全新目錄，見 ``native_runner.figures`` 模組文件。
+    """
+
+    parser = argparse.ArgumentParser(description="由 native 後處理輸出獨立繪製每站八張正式成果圖")
+    parser.add_argument(
+        "--postprocess-dir", required=True, type=Path, help="native-postprocess 輸出目錄（只讀）"
+    )
+    parser.add_argument(
+        "--coastline", required=True, type=Path, help="CRS84 FeatureCollection 海岸 GeoJSON（只讀）"
+    )
+    parser.add_argument("--output-dir", required=True, type=Path, help="圖表輸出目錄（必須尚不存在）")
+    parser.add_argument(
+        "--sites", nargs="+", default=None, help="只輸出指定站點（預設輸出資料中全部站點）"
+    )
+    parser.add_argument(
+        "--font-path", type=Path, default=None,
+        help="可選：自備中文字型檔；省略時呼叫 resolve_cjk_font()，找不到合格字型時圖面改用英文標籤",
+    )
+    parser.add_argument(
+        "--max-trajectories-per-site", type=int, default=24,
+        help="水平總覽／局部／深度年齡三張圖共用的代表軌跡樣本上限",
+    )
+    parser.add_argument("--dpi", type=int, default=150, help="輸出 PNG 解析度")
+    return parser
+
+
+def run_native_figures_command(argv: Sequence[str] | None = None) -> int:
+    """執行一次 native-figures：讀 native 後處理輸出，畫每站八張正式成果圖。"""
+
+    args = _native_figures_parser().parse_args(argv)
+    command_argv = list(argv if argv is not None else sys.argv[1:])
+    command = shlex.join(["lbt", "native-figures", *command_argv])
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=args.postprocess_dir,
+        coastline_path=args.coastline,
+        output_dir=args.output_dir,
+        sites=tuple(args.sites) if args.sites is not None else None,
+        font_path=args.font_path,
+        max_trajectories_per_site=args.max_trajectories_per_site,
+        dpi=args.dpi,
+    )
+    output_dir = native_figures.build_native_figures(config, command=command)
+    report = {
+        "output_dir": str(output_dir),
+        "figure_stems": list(native_figures.FIGURE_STEMS),
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _report_spec_create_parser() -> argparse.ArgumentParser:
     """建立 report spec parser，所有 renderer／抽樣研究值都必須明示。
 
@@ -3659,6 +3717,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers.add_parser(
         "native-derive-horizon", parents=[_native_derive_horizon_parser()], add_help=False
     )
+    subparsers.add_parser("native-figures", parents=[_native_figures_parser()], add_help=False)
     parsed, remainder = parser.parse_known_args(argv)
     # 重新交給共用 handler 解析完整參數，確保獨立與整合 entry point 行為一致。
     command_argv = list(argv if argv is not None else sys.argv[1:])[1:]
@@ -3740,6 +3799,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_native_postprocess_command(command_argv)
     if parsed.command == "native-derive-horizon":
         return run_native_derive_horizon_command(command_argv)
+    if parsed.command == "native-figures":
+        return run_native_figures_command(command_argv)
     parser.error(f"未知命令：{parsed.command}; 其餘參數={remainder}")
     return 2
 

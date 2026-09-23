@@ -885,3 +885,20 @@ uv run lbt native-postprocess \
 
 依 AGENTS.md 用語，以上全部統計一律稱「相對來源權重」，不稱絕對來源機率或因果歸因。
 無穿越粒子落入某個分組時，統計表輸出明確定義 schema 的空表，不拋例外。
+
+## 9.14 WP-18：native 實驗案例選擇與固定擴散方法
+
+`native-plan`／`native-run` 新增 `--experiment-case`／`LBT_NATIVE_EXPERIMENT_CASE`（沿用
+`runtime.EXPERIMENT_CASE_SPECS` 既有登錄名稱，預設 `finite_depth_stokes`）明確宣告本次是否
+納入 Stokes 漂移：`no_stokes`（純海流）會完全跳過波浪資料讀取與 Stokes 計算；
+`finite_depth_stokes`（海流＋波浪，有限水深 Stokes 漂移）在波浪資料缺漏時依既有缺值政策
+fail closed，不會靜默退化為純海流。實驗案例會寫入 plan 檔、每份結果摘要與後處理
+manifest，且與設定檔宣告不一致時同樣須 `--acknowledge-config-mode-mismatch` 才放行（語意
+同第 1 節的 `--backtrack-mode` 不一致檢查），兩種案例的產物不得混入同一輸出目錄或同一份
+統計。
+
+**擴散方法與 legacy registry 的差異**：無論選哪個實驗案例，native pipeline 一律使用工作
+手冊 eq.(10) 的 Smagorinsky 擴散（對應 BayTrace `horcon=0.2`、空間變化係數），不提供 legacy
+`EXPERIMENT_CASE_SPECS` 中的常數擴散（`constant_kh_m2ps`）選項；此固定選擇會以
+`diffusion_method=smagorinsky_workbook_eq10` 寫入 provenance，避免與 legacy 常數擴散結果
+混淆比較。

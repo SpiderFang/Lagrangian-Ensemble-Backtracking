@@ -183,6 +183,16 @@ template 內容（`formal_release_backtrack_modes` 是否存在、以及其值�
 
 pre-window 成員保留在固定的 total 情境／成員 outcome 分母並單獨計數；它不是資料缺口或數值失敗，且不得貢獻來源 numerator。它從有效來源比例的 valid denominator 排除，避免把沒有研究窗內漂流歷程的粒子當作有效來源樣本。所有相對權重仍只能稱為「條件式來源足跡」或「相對來源權重」，不得稱絕對來源機率或因果歸因。
 
+**WP-18（新增：沉底年齡抽樣範圍開關，僅完成抽樣原語與 schema，尚未全線接通）**：
+`scenarios.bed_residence_time.age_sampling_scope` 新增 `per_observation`（預設，既有行為
+不變：每個觀測時刻抽一個年齡，同觀測時刻下所有情境／成員共用、五站間共用 rank）與
+`per_particle`（每個情境×成員各自獨立抽樣，由主 seed 與粒子身分決定、可重現）兩個值；
+省略此欄位維持舊版位元相同結果與 config hash。`per_particle` 目前只完成
+`bed_residence.py` 的抽樣函式（`derive_bed_residence_particle_seed`、
+`sample_bed_residence_age_hours_for_particle`）與設定驗證／provenance 記錄，**尚未接到
+下游**：逐粒子初始條件重建（依各自沉底時刻由 OCM 反查初始狀態）與 native 工作單元規劃／
+hour-major 批次分組（避免到達時刻數量爆炸）仍待後續工作包完成，詳見 `reports/WP-18.md`。
+
 common-input 完成後，suite 由這一份共同母體產生 release config：依 template 的
 `formal_release_backtrack_modes`（省略時為兩種模式）與 H30/H60/H90 的乘積決定份數；正式
 範例現在只登錄 `full_horizon_from_deposition`，故 H30/H60/H90 各一份、共 **三份**

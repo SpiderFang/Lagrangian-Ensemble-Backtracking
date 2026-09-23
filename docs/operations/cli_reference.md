@@ -644,6 +644,13 @@ uv run lbt benchmark-report "$LBT_OUTPUT_ROOT/runs/$RUN_ID" \
 是唯讀介面。benchmark 只報工程資源量測，不是科學結果。`RUNNING`、`PAUSED`、`FAILED`
 若要繼續都必須明示 `--resume`；`COMPLETE` 不重跑。
 
+`run-reconcile` 在取得 run 排他鎖後，每次操作只完整讀取一次情境表與進度、驗證一次
+checkpoint run 目錄結構，並建立該次操作的不可變分片索引。每個分片的範圍／hash、
+checkpoint binding／checksum、孤立世代／重放與輸出驗證均保留；採認狀態時仍在 progress
+鎖內重讀最新進度。快照不跨操作保存，worker 與只讀 `validate_run` 路徑維持原有驗證。此項
+改善移除大量分片的重複讀取，不改變數值、seed、設定或 checkpoint／輸出契約；需採認多片
+狀態時仍有逐次進度發布成本。
+
 新分片統計以 `forcing_cache_stats_semantics: invocation_delta_v1` 標示增量語意。
 `benchmark-report` 的 `forcing_cache_stats_precise` 只說明快取計數是否具備完整且可
 加總的紀錄，與 run 完整性驗證的 `valid` 分開判讀。若含歷史未標記或不可用的量測，

@@ -62,3 +62,8 @@ data/time_reconstruction_literature/*
 .DS_Store
 *.swp
 *.tmp
+
+# 子代理工作包提示與報告（開發過程紀錄，不進版本庫）
+.agent_prompts/
+.agent_logs/
+reports/

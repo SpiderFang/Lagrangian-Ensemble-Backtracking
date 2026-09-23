@@ -125,3 +125,100 @@ H30/M1完整計畫的一個明示分片做一次掃描並保存檢查點，不�
 | 分片／續跑 metadata 與 counter delta | `src/lagrangian_backtracking/run_control.py` |
 | 確定性 task 與既有生命週期 | `advection.py`、`engine.py`、`production.py` |
 | 原版 CPU、OCM frame 與批次轉接 | `baytrace_native_cpu.py`、`baytrace_ocm_adapter.py`、`baytrace_batch_advection.py` |
+
+## Q4 展示子集入口與場快取容量
+
+固定五站純流100顆展示使用 `scripts/run_current100_subset.py --help`：先由既有
+`run-create --run-kind formal --experiment-case no_stokes` 建立新的完整計畫，再把
+新／來源工作區、設定、forcing、checkpoint、NFS scratch／log／cache、儲存驗證快照及
+`--expected-commit` 交給腳本。預設僅準備；經核准加 `--execute` 才以五個持續 `run-worker`
+各跑兩片。腳本固定選取 gongliao、guishan、hsinchu、lienchiang、nanwan 各站最早指定鋁材
+的全部20受體，各站到達UTC與ID記入新log session的 `demo-manifest.json`；不同站不宣稱同時
+間配對，不改原計畫／seed／dt／H30／沉降／擴散。五項thread限制均為1，MemAvailable低於
+30GiB或不可觀測時停止，對本次子程序SIGINT等待300秒再有界收尾。`events.jsonl` 記錄PID、
+CPU累積秒、RSS、步數、checkpoint序列及逐站原版完成證據；工程例外使子集失敗，真實資料QC
+原樣保留。整機elapsed直接使用單一操作程序時鐘，不能相加worker時間。僅100選取子集可完成，
+完整50,000情境run仍未完成，不呼叫全量aggregate或以圖宣稱正式成果。
+
+同一100顆子集續跑時，沿用上述參數及原 `--workspace`／`--checkpoint-root`，明示加
+`--resume --execute`。預設仍只接受全未啟動的新工作區；續跑僅放行固定十片的合法狀態，
+其餘4,990片必須維持 `PLANNED`／零步數。原run計畫、seed與檢查點繫結不改寫，新程式commit、
+實際來源、初始十片進度與revision另存新log session。既有CLI `--resume` 負責片鎖下的檢查點
+還原與完成輸出驗證，不重算已驗證完成片、不先執行全run reconcile。此選項**不略過**既有
+CLI／runtime的全run歷史驗證，因此啟動仍可能耗時；不能將setup當成粒子推進。切換前必須確認
+舊operator與workers均已退出，不能同片雙寫；本腳本不代替操作者停止其他invocation。
+
+純流逐站出圖：`build_completed_subset_preview.py --current100-site SITE` 配合該站兩個
+`--shard`，在該站20顆完成後輸出四張PNG，沿用完整單片輸出驗證；站名取目前設定，五站到達UTC
+分別標示。尚未完成時可用 `build_current100_checkpoint_preview.py --run RUN --checkpoint-root
+CHECKPOINT --config CONFIG --project-root CODE --site SITE --output NEW_OUTPUT` 讀取該站目前
+已發布checkpoint，先提供水平／垂向未完成軌跡圖與位置快照。只畫已保存粒子，分母明示已保存
+數／站20／總選取100；不補線、不縮短H30、不將當前末端或資料QC當成來源認定。圖檔與快照須放
+在新的成果目錄，不改運算checkout或原run。
+
+已審兩站岸界40顆入口 `run_native_coast40_subset.py` 的完整命令與限制見
+[已審模型岸界](reviewed_native_coast.md)。原版場快取的runtime容量可成對明示
+`LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES` 與 `LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES`；兩者皆未
+設定仍為2場／512MiB。值須為ASCII十進位正整數，最高64場／4GiB；只設其一、空值、負數、
+小數或超限皆拒絕。這只是執行記憶體配置，不更改物理設定、原版RK4、粒子順序、批次分組、
+seed、dt或run plan。固定100入口 `run_current100_subset.py` 與已審兩站岸界40顆入口
+`run_native_coast40_subset.py` 明示覆寫20場／4294967296 bytes，將實際環境與容量記入新
+session `demo-manifest.json` 的 `frame_cache_limits`；resolver report沿用實際上限與建場、
+淘汰計數。五worker場快取合計上限20GiB，但常駐場快取上限**不是程序RSS上限**，建場暫存、
+forcing與檢查點另占記憶體；仍須保留MemAvailable30GiB安全停止及五項單執行緒限制。不得無
+條件將這個配置套到56worker或50k；其他入口未設上述環境即維持原容量。
+
+## 有界唯讀步進診斷
+
+OCM原版轉接建場採節點／層批次遮罩與向量化拓樸檢核，保留原sigma算式與
+NumPy弱純量dtype捨入，不更動PI核心、RK4、步長、種子或停止條件。底部未使用層
+仍重複首個有效層，所有有限值／單調／範圍／重建／索引／方向／面積gate保留，
+四邊形第二三角形獨立檢核；不同錯誤同時發生仍回報原節點／元素順序的首個理由。
+`tests/baytrace_scalar_reference.py`保存向量化前逐節點／元素參考，
+由混合float32／float64逐陣列bitwise與拒絕理由測試核對，不能據此宣稱已排除全部效能瓶頸。
+
+`scripts/diagnose_failure_points_readonly.py` 僅用於一至五個既有失敗點的唯讀比對：
+依原事件座標／UTC及固定代提示，呼叫原速度取樣器、帶／不帶提示的定位，以及
+全部三角形包圍盒候選的既有精確定位；只量測投影與邊界距離，不自行分類或外插。
+以 `--spec` 指定已核對的乾淨模型版本與原run／事件／狀態路徑，`--output` 必須是
+獨立NFS操作目錄；只建一個診斷子程序，180秒硬限及30GiB可用記憶體門檻。
+不建立執行批次、不推進、不消耗亂數、不寫原進度，結果不是正式成果。
+規格JSON的新欄位 `checkpoint_dir`、`expected_sequence`、`expected_point_count`
+必須成套指定；序號為正整數，點數為1..5整數，布林值、文字與浮點數皆拒絕。
+舊規格僅含 `checkpoint62` 時仍固定第62代／五點；新舊欄位混用拒絕。
+原十粒子分片、描述檔序號／分片、compact狀態SHA、事件粒子唯一且屬於request與
+狀態、位置與UTC精確相等的檢核均保留；全面候選精驗容差仍為1e-10。
+結果分開保存模型版本與 `diagnostic_script_commit`／腳本SHA，不能將診斷工具
+更新誤認為現行數值模型版本切換，也不以水平取樣不支援自行決定停止分類。
+
+`scripts/diagnose_batch_readonly.py` 只在新的獨立程序記憶體中重現指定純流分片，
+不是正式計算或成果。必須明示 `--project-root`、`--expected-commit`、`--workspace`、
+`--config`、`--checkpoint-root`、`--ocm-native-root`、`--ocm-reconstruction-root`、
+`--shard-id` 與唯一 `--output`（位於 NFS operations 的診斷目錄）；
+有檢查點時另外明示 `--checkpoint`。使用原版本環境的 Python 啟動獨立腳本，
+不將腳本複製進計算 checkout。原 BayTrace 根目錄由既有 `LBT_BAYTRACE_ROOT` 保留。
+
+另明示獨立工具環境的 `--py-spy` 絕對路徑。最多 `--max-sweeps 1000`，
+`--timeout-seconds` 限120–180秒；py-spy直接啟動新診斷Python，以祖先權限每秒5次
+非停止式預設採樣60秒並保存 `profile.raw`；`--profiling-seconds` 可指定30–150整數秒，
+且須不超過 `--timeout-seconds` 減20秒，預留採樣落盤及清理時間。較長單次重現可用
+`--setup-validation startup --profiling-seconds 150 --timeout-seconds 180 --max-sweeps 1000`，
+仍不能超過180秒硬上限；命令與來源紀錄保存實際採樣秒數。
+不附加既有worker、不sudo或改系統權限，
+也不混用faulthandler/cProfile。每10次掃描彙總已完成步數與年齡。保留原種子、檢查點亂數、
+步長、物理及批次平流器，不呼叫控制器執行／恢復／調和流程，也不發布軌跡或新檢查點。
+`--setup-validation startup`（原預設）使用既有私有啟動驗證能力，保留不可變繫結與
+路徑檢核，不掃全批歷史；明示檢查點的單片鏈仍由既有載入器驗證。
+`--setup-validation full` 則不傳私有能力，完整走公開控制器預設的static歷史驗證；
+這是驗證路徑的有界比較，不另外重複CLI handler的前置掃描，也不能據此先宣告停滯原因。
+兩模式皆記錄setup起訖、建構／恢復、每10次步進與模組來源，硬時限及唯讀限制相同。
+來源紀錄分開保存模型commit／目錄與腳本路徑／SHA；startup明示
+`diagnostic_startup_bindings_only=true`、`full_history_validation_not_performed=true`。
+full啟動時只標記已要求完整驗證，是否完成必須以`setup_complete`判讀，不能由採樣器
+退出碼推斷。所有模式均`formal_result=false`，不改原worker驗證政策或PI BayTrace原始碼。
+所有暫存與快取另置診斷目錄、五種執行緒限制均為1；採樣完成或硬逾時只清理診斷自建群組。
+`provenance.json`、`pid.json`、`numerical-pid.json`、`stdout.jsonl`、`stacks.stderr`、
+`profile.raw`、`result.json` 是診斷證據；採樣失敗不得冒稱已定位卡點。
+每10次掃描的摘要另保存cache hits/misses、frame builds/evictions、cached bytes及
+native completed/fallback/group-size程序累計統計；快取容量不因向量化而調整。
+原進度可能由既有worker正常更新，不能把它當成診斷寫入。

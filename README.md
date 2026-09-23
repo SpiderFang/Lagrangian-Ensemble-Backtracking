@@ -6,22 +6,7 @@
 
 > 目前定位：工程執行流程、輸入／輸出契約與測試已可供持續維護；這不代表全期真資料批次或正式科學成果已完成。
 
-可選的[已審模型岸界](docs/development/reviewed_native_coast.md)只覆蓋南灣主缺支援區的
-原生交界與連江指定112邊內孔，以首次碰岸停止，不反射、不把底圖升為物理輸入。
-已審兩站40顆重算使用 `scripts/run_native_coast40_subset.py`，預設僅核對準備；
-只有另獲啟動授權後才加 `--execute`。入口固定來源／目標plan與岸界SHA，保留完整
-驗證、工作區級操作者互斥、逐片鎖、30GiB守護與300秒收尾；不接受任意站數或resume，
-不改原100入口契約、不擴完整50k。詳細命令與待验限制見上述契約文件。
-完成站點使用同版 `build_completed_subset_preview.py --current100-site SITE` 擷取兩片
-最終輸出；可選岸界manifest及其間接來源均納入擷取／渲染前後SHA，四份geometry
-canonical完整比對，不移除第四綁定。圖與來源清冊明示原100同受體重算替代，
-每站20顆、不新增40或混合A/B分母；底圖只作顯示。繪圖程式commit與原模型plan
-commit分開保存：`model_plan_commit` 必須讀取 `plan.code_provenance.git_commit`，
-並以 `model_code_provenance` 原樣保存來源；輸出清冊的 `run_metadata.code_commit`
-不是計畫頂層欄位，缺欄不得改填operator或plot版本。修正後的隔離繪圖部署及產圖仍需各次主審GO。
-沒有 `geometry.native_coast_manifest` 時原行為與雜湊不變；有設定則新增來源／投影／
-岸界版本綁定，不能接續舊版本checkpoint。其餘網格空洞與品質失敗仍待查，七點幾何
-測試不等於H30真資料重算或完整科學驗收。C2僅隔離實作／靜態artifact，C3切換尚待核准。
+可選的[已審模型岸界](docs/development/reviewed_native_coast.md)只覆蓋南灣主缺支援區的原生交界與連江指定112邊內孔，以首次碰岸停止；完整範圍、已審兩站40顆重算入口與 C2／C3 核准狀態見該文件，本頁不重複列出細節。
 
 ## 1. 用途與目前狀態
 
@@ -57,7 +42,7 @@ commit分開保存：`model_plan_commit` 必須讀取 `plan.code_provenance.git_
 
 所有本專案沉降速度均為負值、物理方向以向上為正；不允許上升物性，也不對完全沉沒物體加入風壓效應。缺少密度、阻力、再懸浮參數時，不宣稱已完成沉積—再懸浮動力。
 
-貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。本期 A 區不南擴，沿用 `northeast_taiwan_common_cache_v3` 的 bbox `[121.306315,122.793685,24.600844,25.499156]`，以 anchor 半徑 12.5 km 的受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`，最外層停止邊界維持原 A 區設定。龜山島另有核定的 soft-priority 走廊；它只在同一 12.5 km core 的 persistent-wet 候選中優先選點，不足五點時回到同一 core，且不取代 OCM／NWW 支援閘門。原先 25 km 基準、35 km 敏感度與南向擴張屬歷史規劃，移出本期；不自行加入 15 km 或 23 km case。舊 25 km 幾何、manifest、shard 與 hash 不沿用，必須依新規範重建。A 區正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`，沿用工程試跑已採用的逐四階 Runge-Kutta 法（RK4）階段資料支援嚴格檢查：OCM 或 NWW3 在實際查詢位置／時間無有效支援時立即停止，保留 `data_gap` 等原始狀態，不以零值、最近值或擴張資料域補齊。既有 24 小時、20 情境產物只屬 DEMO；正式 30 天仍須由完整四區五站 `inputs-build` 重新建立 100 個受體、250 個到達時刻、5,000 個初始配對及其逐筆 gap-safe 時間證據。舊 `formal_domain_policy=expanded_domain_v1` 只保留舊設定相容讀取，不是本期 A 範圍。
+貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。A 區沿用 `northeast_taiwan_common_cache_v3`、以 anchor 半徑 12.5 km 受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`；龜山島另有核定的 soft-priority 走廊，只在同一 12.5 km core 的 persistent-wet 候選中優先選點。A 區正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`：OCM 或 NWW3 在實際查詢位置／時間無有效支援時立即停止，保留 `data_gap` 等原始狀態，不以零值、最近值或擴張資料域補齊。完整範圍歷史沿革、既有 24 小時 DEMO 產物邊界與正式 30 天重建需求見[全部可得資料與時間重建](docs/operations/10_available_data_time_reconstruction_and_a_expansion.md)。
 
 每個受體×到達配對的實際初始深度來自到達 UTC 的已驗證動態紀錄；不以模板深度代替所有到達時間。投影座標、公尺距離、步長限制、統計網格與軌跡計算使用公尺制座標，圖面可將公尺座標轉為經緯度顯示，但經緯度不進入粒子物理運算。
 
@@ -74,15 +59,9 @@ commit分開保存：`model_plan_commit` 必須讀取 `plan.code_provenance.git_
 
 受體×到達配對的實際深度與三維初始條件來自到達 UTC 的 OCM 原生動態紀錄；OCM surface 只負責到達時間篩選，不代表配對的來源深度或三維流場資料。
 
-月份目錄只是產品分割與延遲載入的索引；執行階段會依每個 OCM／NWW3 產品實際的 `time_utc_ns`，在必要時從相鄰月份尋找 before／after 時間端點。預設模式（`continuous_time_fallback=false`）在相鄰月份時間軸連續且未超過產品允許的最大時間間隔時才進行合法時間內插；真正的時間缺口仍回傳 `TIME_GAP`，不以零值、最近值或外插補齊。OCM 與 NWW3 各依自身時間軸選取端點，因此同一查詢時刻可使用不同月份的原始資料，並在保留物理欄位後完成 Stokes 合成。
+月份目錄只是產品分割與延遲載入的索引；執行階段會依每個 OCM／NWW3 產品實際的 `time_utc_ns`，在必要時從相鄰月份尋找 before／after 時間端點並完成合法時間內插；真正的時間缺口仍回傳 `TIME_GAP`，不以零值、最近值或外插補齊。若明示啟用 execution-priority 的 `continuous_time_fallback=true`，只放寬純時間可用性、在已知短缺口採有效 before／after 內插並完整記錄來源、偏移秒數與策略識別碼；乾點、域外、垂向不支援、無效物理或非有限場仍照原規則失敗。完整條件、正式運算設定的 `execution.max_resident_forcing_months` 與稽核欄位見[CLI 參考](docs/operations/cli_reference.md)。
 
-若執行者明確啟用 execution-priority 的 `continuous_time_fallback=true`，則只放寬「純時間可用性」：OCM 先使用觀測與核准重建合併後的時間軸；查詢落在連續缺口、整月缺失或全期時間軸前後時，會在全期已存在的有效時間列中選取最近端點，等距時固定取較早者；仍可取得兩側端點且缺口屬短缺口時，採有效的 before／after 線性內插。每次 fallback 都保留來源、目標／實際 UTC、偏移秒數與 `execution_priority_continuous_time_v1` 策略識別碼，供內部稽核使用；不需要重新執行 `inputs-build`，也不改寫既有 input artifact。乾面、域外、垂向不支援、波浪不支援、無效物理或非有限局部場仍照原規則失敗，且預設模式的 fail-closed 行為與 hash 不變。此執行策略不把條件式來源足跡升格為絕對來源機率或獨立驗證。
-
-正式運算設定的 `execution.max_resident_forcing_months` 應至少為 `2`（對應 manager constructor 的 `max_resident_months=2`），讓跨月兩端常駐並避免邊界 stage 反覆重載；設定為 `1` 仍維持數值正確性，但只適合記憶體受限測試或低頻取樣，可能產生月界 I/O thrash。同月安全查詢直接沿用 `CombinedMonthForcing`；暖機後 cache stats 的普通 no-Stokes sample 只增加一次 OCM hit，Stokes sample 再增加一次 NWW hit，跨月、月尾或可能有 halo duplicate 時才記錄必要的 endpoint 探查命中。
-
-OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾住 query z；針對移動海面，若固定 z 在某一個 before／after 端點高於該端點最高有限 `zcor`，端點可使用最高有效層的速度、垂向速度與 Kz，表示 OCM 最上層控制體的 surface hold。這不是任意最近值外插，也不把 top `zcor` 當成物理海面。所有海面上界查詢共用 `models.py` 的 `SURFACE_BOUNDARY_TOLERANCE_M = 5e-6 m`：只有 `z - eta` 不超過 5 微米時才先夾回 query-time `eta`，讓 endpoint top-layer 支援與 Stokes profile 使用同一表面；超過此尺度仍回傳 `VERTICAL_UNSUPPORTED`／保留原有失敗 QC。這個 5 微米尺度是為涵蓋 checkpoint-8 最大約 `3.367686e-6 m` 的海面邊界定位數值殘差（含浮點與積分／內插）而設，遠小於 OCM 垂向物理層距，並非可任意放大的物理緩衝。海床與「海床高於海面」的既有 1 微米幾何契約維持不變；乾點、缺值、域外與時間缺口也不因海面容差取得通行權。Smagorinsky 水平 current 取樣共用同一端點支援與 query-time 幾何範圍檢查。此為工程取樣政策與單元測試契約，不代表已完成真實資料的科學驗證。
-
-上述 5 微米仍是一般環境取樣介面（`forcing API`）的唯一海面上界容許尺度，不因四階 Runge-Kutta 法（RK4）的中間點越界而放大。新竹 24 小時 r3 曾在 `dt_min=0.1 s` 的 k4 觀察約 `z-eta=10.37e-6 m` 上越；r4 又在 k2 觀察三筆約 `2.27583e-4` 至 `2.37189e-4 m` 的明確上越。r4 顯示步首參考樣本可先由一般取樣器依 5 微米契約判定有效，但移動 eta 到 k2 時已下降；若引擎再要求步首嚴格 `z<=eta`，反而會否定同一集中契約。故步首資格要求參考樣本有效，且 `z` 位於 `bed-1e-6 m` 至 `eta+5e-6 m`；eta／bed 相容性也沿用既有 1 微米契約。這只承接已驗證的步首微米級邊界位置，不會放寬失敗中間點：k2／k3／k4 仍須回傳精確 `VERTICAL_UNSUPPORTED` 且 `z>eta`，並只在下一次自適應折半會低於 `dt_min` 時建立一次性的中間點垂向速度包裝器（`SurfaceStageVelocityProvider`）。包裝器以 `z_reflected=2*eta-z` 將該深度鏡射進實際水柱，再於相同 x、y、世界協調時間（UTC）重查；鏡射點仍須嚴格位於 `[bed,eta]`。重查若為乾點、域外、時間缺口、缺值、組合品質旗標或其他無效狀態，整步維持封閉式失敗。只有完整確定性 RK4 成功後才消耗一次布朗運動（Brownian）亂數，最終提議位置仍交由一般海面／海床解析器處理。單獨的中間點上越不會建立終點事件，也未擴張軌跡／事件資料格式；這是反射數值邊界條件，不表示粒子可存在於海面以上，亦不代表 r4 已完成修正後重跑驗收。
+OCM 垂向取樣、移動海面附近的微米級容差（`SURFACE_BOUNDARY_TOLERANCE_M`）與 RK4 中間點越界時的一次性鏡射重查（`SurfaceStageVelocityProvider`）屬集中定義的工程取樣契約，只承接已驗證的步首邊界位置，不放寬失敗中間點；完整數值、限制與逐步驗證見[架構與資料契約](docs/foundation/02_architecture_and_data_contract.md)與[科學方法與驗證](docs/foundation/03_scientific_method_and_validation.md)。
 
 ### Observation 速度紀錄
 
@@ -97,7 +76,7 @@ OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾�
 | Stokes 水平 | `stokes_u_mps`、`stokes_v_mps` | NWW3 衍生的水平 Stokes drift |
 | 沉降 | `settling_w_mps` | 以向上為正的垂向沉降速度；本專案沉降為負 |
 
-`total_u = ocm_u + stokes_u`、`total_v = ocm_v + stokes_v`、`total_w = ocm_w + settling_w`，由明定容差驗證。Stokes 垂向與沉降水平不屬於欄位，不能假造。`CombinedMonthForcing` 的正式有效樣本提供完整分項；明確關閉 Stokes 可記有效的 0，自然海況計算結果也可能是有效的 0，但缺少 NWW3 波浪資料必須保留缺值並帶非零 QC，不能記成 0。只有總速度的 synthetic callback 標為 `total_only`，不代表 OCM／NWW3 來源；`not_sampled`、缺值與無效狀態分開保存。
+`total_u = ocm_u + stokes_u`、`total_v = ocm_v + stokes_v`、`total_w = ocm_w + settling_w`，由明定容差驗證。Stokes 垂向與沉降水平不屬於欄位，不能假造。`CombinedMonthForcing` 的正式有效樣本提供完整分項；明確關閉 Stokes 可記有效的 0，缺少 NWW3 波浪資料必須保留缺值並帶非零 QC，不能記成 0。
 
 ### 版本與舊格式相容性
 
@@ -106,9 +85,9 @@ OCM native 的垂向取樣在一般水柱內仍要求有效 `zcor` 上下層夾�
 | trajectory shard | `3.0.0`：固定位置、狀態、事件、環境與速度資料檔；實際產品含 `.npy`、`.parquet`、`.json`，並有 dtype／count／checksum 驗證器 | `1.0.0`、`2.0.0` 可唯讀；舊欄位沒有速度資料，不自動補速度。正式報告可使用 v2 或 v3，v1 不得作正式垂向驗證證據；同一執行混用 v2／v3 保守拒絕 |
 | execution checkpoint | 新 writer 固定 `3.1.0`：以 `immutable history segments` 追加觀測／事件列，`compact_state.json.gz` 與 `history_segment.json.gz` 使用 deterministic gzip 保存 current／history；manifest 綁定壓縮檔 `st_size`、SHA-256 與解壓後 JSON 大小，完整 `checkpoint.json` SHA-256 chain 綁定 generation、provenance 與資料內容；已終止粒子的 current 與 history 在後代逐欄凍結 | loader 保留 `3.0.0` 未壓縮拓撲，允許 3.0→3.1 混合 chain；`2.0.0`／`2.1.0`／`2.2.0` 以固定舊欄位集合唯讀遷移；禁止 3.1 降回 3.0／2.x；舊目錄不原地升級；schema 3 仍逐次更新共享 `progress.lock` |
 
-缺值與版本界線是驗證證據的一部分：舊成果不會自動升格為含速度的新成果，synthetic／pilot 也不會升格為正式科學證據；事件與狀態保留 `DATA_GAP`、`NUMERICAL_FAILURE`、邊界事件、可用性與失敗原因，無效取樣必須有非零 QC，不能用靜水或終止位置掩蓋失敗查詢。trajectory shard 與 checkpoint 都是不可覆寫、以檔案大小／SHA-256 驗證的工程產品；checkpoint 只保存可恢復的粒子狀態、觀測、事件、triangle hint 與 RNG，大型流場資料、網格與幾何由相同來源綁定的 request factory 重建。
+缺值與版本界線是驗證證據的一部分：舊成果不會自動升格為含速度的新成果，synthetic／pilot 也不會升格為正式科學證據；事件與狀態保留 `DATA_GAP`、`NUMERICAL_FAILURE`、邊界事件、可用性與失敗原因，無效取樣必須有非零 QC，不能用靜水或終止位置掩蓋失敗查詢。
 
-輸出分析前應先確認 manifest 的執行身分、schema、來源綁定、粒子／觀測／事件計數與 checksum，再解讀位置、停止類型或統計比例；不同版本、研究站點或實驗案例不能只因欄位名稱相同就直接合併。`observations.csv` 的速度欄位若為空，代表該點沒有可證明的同點速度資料，不表示靜水；有效的 0 可來自明確的 `no_stokes` 或自然海況計算結果，缺波浪、無效或未取樣情形必須依狀態與 QC 判讀，不能用 0 代替。
+輸出分析前應先確認 manifest 的執行身分、schema、來源綁定、粒子／觀測／事件計數與 checksum，再解讀位置、停止類型或統計比例；不同版本、研究站點或實驗案例不能只因欄位名稱相同就直接合併。
 
 ## 4. 快速安裝與 synthetic smoke
 
@@ -161,85 +140,19 @@ synthetic tests 先做工程 round-trip、KDE available／低樣本、PNG metada
 
 ## 5. 實際資料與 SERVER 使用入口
 
-正式執行所需根目錄由環境變數或 CLI 參數注入，例如 `OCM_NATIVE_ROOT`、`OCM_RECONSTRUCTION_ROOT`、`OCM_SURFACE_ROOT`、`NWW_ANALYSIS_ROOT`、`LBT_OUTPUT_ROOT`、`LBT_SCRATCH_ROOT` 與 `LBT_CHECKPOINT_ROOT`。SERVER 的結果儲存契約固定以 `/data/LBT` 為單一 `LBT_RESULT_NFS_ROOT`；execution package、run workspace、checkpoint、scratch、log、aggregate、report、視覺化成果與 UV／Matplotlib／XDG／temporary cache 都必須位於該 NFS mount 的嚴格子目錄。`/home` 只保留已追蹤的主專案功能模組、乾淨 checkout 與既有 `.venv`。tracked SERVER runner 會在任何 batch 寫入前檢查路徑、mount identity、剩餘空間、寫入、原子改名與跨程序鎖，失敗即停止。實際資料依序執行唯讀 `preflight` → OCM reconstruction patch 建置／驗證（若 release 採核准重建）→ strict `inputs-build`／`inputs-validate` → release 設定來源綁定 → `run-create` → `run-shard`／checkpoint resume → `run-reconcile` → `validate-run` → aggregate／report validator；完整參數與外置 checkpoint root 規則見[CLI 參考](docs/operations/cli_reference.md)，容量、鎖、部署與資料同步見[SERVER 執行手冊](docs/operations/06_server_runbook_plan.md)及[Git 部署與資料同步手冊](docs/operations/git_deployment_and_data_sync.md)。
+正式執行所需根目錄由環境變數或 CLI 參數注入，例如 `OCM_NATIVE_ROOT`、`OCM_RECONSTRUCTION_ROOT`、`OCM_SURFACE_ROOT`、`NWW_ANALYSIS_ROOT`、`LBT_OUTPUT_ROOT`、`LBT_SCRATCH_ROOT` 與 `LBT_CHECKPOINT_ROOT`。SERVER 的結果儲存契約固定以 `/data/LBT` 為單一 `LBT_RESULT_NFS_ROOT`，容量、鎖、部署與資料同步見[SERVER 執行手冊](docs/operations/06_server_runbook_plan.md)及[Git 部署與資料同步手冊](docs/operations/git_deployment_and_data_sync.md)。實際資料依序執行唯讀 `preflight` → OCM reconstruction patch 建置／驗證（若採核准重建）→ strict `inputs-build`／`inputs-validate` → release 設定來源綁定 → `run-create` → `run-shard`／checkpoint resume → `run-reconcile` → `validate-run` → aggregate／report validator；完整參數見[CLI 參考](docs/operations/cli_reference.md)。
 
-OCM 重建建置器只讀上游 schema 3 cache，並在另一個 NFS 目錄發布缺失 UTC rows；不改寫原始月份。它只重建具雙側 exact support 的 419 個內部缺時；`2024-01-01 00:00 UTC` 因沒有左側支援，維持流場起始邊界。月份陣列、逐列方法來源、局部不可用格點、來源與網格 fingerprint、設定及 SHA-256 都記錄在 patch manifest；執行階段僅在 config 明示核准 reconstruction policy 且 manifest/root 完整綁定時掛載。預設 fail-closed 模式下未登錄缺口仍回傳 `data_gap`；只有明示 execution-priority 時，純時間缺口才依連續時間策略取樣，物理／空間失敗仍不放寬。四區一次建置與 `--resume` 命令見[全部可得資料與時間重建](docs/operations/10_available_data_time_reconstruction_and_a_expansion.md#45-四區稀疏-patch-建置操作)。
+OCM 重建建置器只讀上游 schema 3 cache，在另一個 NFS 目錄發布缺失 UTC rows，不改寫原始月份；預設 fail-closed 模式下未登錄缺口仍回傳 `data_gap`，只有明示核准 reconstruction policy 時才依連續時間策略取樣缺時，物理／空間失敗仍不放寬。四區建置操作與 gap-safe／gap-reconstruction manifest 綁定見[全部可得資料與時間重建](docs/operations/10_available_data_time_reconstruction_and_a_expansion.md#45-四區稀疏-patch-建置操作)。
 
-current design 的 horizon-suite release 會同時寫入 `inputs.ocm_gap_safe_arrival_manifest` 與 `inputs.ocm_gap_reconstruction_manifest`，兩者故意指向同一份 `common-input/ocm_gap_safe_arrival.json`：前者供 schema／artifact closure 驗證，後者是執行階段採用核准重建支援契約的不可變 common-input 證據。實際四區重建 patch 的 domain manifest／root index 仍位於外部 `OCM_RECONSTRUCTION_ROOT`，不會被寫入 release config；legacy 或未啟用核准 reconstruction policy 的設定不會新增第二個綁定。
+本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit；未完成儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式批次。正式完整母體效能工作線、`run-worker`／`run-formal-parallel` 的 dynamic worker 佇列設計、`physics_kernel_backend`／`ocm_interpolation_backend` 後端選擇、Numba cache 契約與 `--defer-full-validation` 延後驗收旗標完整規則見[效能改善工作線](docs/operations/16_performance_improvement_tracks.md)與[CLI 參考](docs/operations/cli_reference.md)。
 
-正式 release 若 template 的 `forcing.ocm.wetdry_semantics_decision_status` 仍為 `derived_pending_server_preflight`，只有 current design 在正式 `validate_input_derivatives(..., formal=True)` 通過，且 dynamic initial-condition manifest 每列確認 `wetdry_elem_value=0`、`wetdry_semantics_id=schism_wetdry_elem_0_wet_1_dry` 時，才衍生為 `approved`。release approval 會保存方法識別碼、列數、相對 artifact reference 與 raw/canonical SHA-256；legacy、其他 pending 狀態或證據不一致時維持 fail closed。
+龜山島單站 30 天工程測速的分片順序、外部監測、checkpoint／resume、耗時解讀與 `--random-stream-id` common-random-number 工程控制見[單站 H30 工程測速操作契約](docs/operations/17_engineering_window_benchmark.md)；checkpoint segment、故障恢復、`checkpoint_bytes`／`checkpoint_active_bytes` 容量語意見[checkpoint segment 操作契約](docs/operations/18_checkpoint_segment_storage.md)。
 
-本機 Git 是開發來源；SERVER 只部署核定且可追溯的 commit。Git checkout／`.venv` 與 `/data` 上的上游大型資料、execution package、執行工作區、trajectory、checkpoint、scratch 及發佈輸出分開管理；部署同步需核對 commit、已追蹤檔案、checksum、dirty flag、seed 與輸入清單。未完成該次儲存檢查與科學 preflight 前，不啟動五站 `50,000×M` 正式 batch。
-效能改善以[正式完整母體效能工作線](docs/operations/16_performance_improvement_tracks.md)推進。首批提供 `run-worker` 接續執行同 run 的指定分片並重用流場管理器、正常步首速度樣本重用，以及 OCM 表面資料的少量格點取值；使用方法見[CLI 參考](docs/operations/cli_reference.md)。正式完整母體使用 `run-formal-parallel`：coordinator 依固定 run plan 順序建立「一片一個 dispatch unit」的中央佇列，先啟動 `min(worker_count, eligible_shard_count)` 個 persistent child；每個 child 建立一次 controller／必要的 JIT 與 `forcing` cache，完成一片後回報結果，再由同一個 process 從中央佇列接下一片，直到所有非 COMPLETE shard 派發完畢。`--resume` 會先排除既有 COMPLETE shard；assignment artifact 保存 eligible 順序、CPU affinity、動態政策與每片唯一 dispatch ID，不再宣稱每個 worker 預先綁定固定多片。這個 work-conserving 設計消除固定分組造成的尾端 CPU 閒置，並避免每片重新啟動 Python／Numba 的 warm-up 成本；不改 run plan、scenario／particle ID、seed、checkpoint 或科學輸出。`worker_count` 代表同時存活的 persistent child／併發上限，不只是靜態分組數。完整完成仍須本次派發 summary、全 shard lifecycle、child exit 與 `validate-run --require-complete` 同時通過；不做舊／新版倍率 A/B 比較，也不把局部試跑當完整成果。實際正式執行仍須先通過版本化輸入、乾淨 deployment provenance、SERVER NFS 儲存檢查與科學驗證；runner 還會即時核對本次 `scratch_root` 的 NFS source，避免誤用其他掛載點的 PASS 快照。設定可明示 `execution.physics_kernel_backend: numpy_v1` 或 `numba_cpu_v1`，OCM 內層插值另可明示 `execution.ocm_interpolation_backend: numpy_v1` 或 `numba_ocm_v1`。後端版本會進入設定與 run 身分；省略欄位的舊設定仍沿用 NumPy。Numba dispatcher 目前使用 `cache=False`，每個 persistent worker 會在自己程序內呼叫 `warmup_numba_backend()` 一次，編譯結果只留在該程序記憶體，不能宣稱跨程序磁碟 cache 重用。若設定了 Numba backend，`NUMBA_CACHE_DIR` 仍必須明示為通過儲存檢查的 scratch 子目錄，並在匯入加速模組前設定；這是安全路徑契約，不代表目前核心會寫入 `.nbc`／`.nbi`。若已由執行負責人明示接受「先運算、完整驗收後補」政策，可在同一 dynamic priority 命令加上 `--defer-full-validation`；旗標預設關閉且只能與 `--execution-priority` 一起使用，parent／child 僅延後全 run trajectory payload／歷代 checkpoint 掃描，仍保留 immutable binding、設定／輸入／scenario／seed、forcing／storage／memory gate 及 assigned shard 的 checkpoint、restore、output、hash、lock 檢查。狀態寫在 log session 的 `validation-status.json`，不寫入 run workspace；運算完成只回報 `status=COMPUTE_COMPLETE_VALIDATION_DEFERRED`、`valid=false`。未補驗前不得稱正式成果，須另行執行 `uv run lbt validate-run "$WORKSPACE" --checkpoint-root "$LBT_CHECKPOINT_ROOT" --require-complete`，只有 `valid=true` 才可進入正式完成、聚合、成果圖與報告；`validate-run` 沒有 deferred／skip 選項，原有 `validate_run` 語意不變。
+正式範例登錄 random bed residence：`inputs.backtrack_support_days=180` 是 observation 選時包絡，`bed_residence_time.runtime_horizon_support_days=90` 與 `boundaries.max_backtrack_days=90` 是沉底後執行支援，不可混為粒子回溯天數；正式 H30/H60/H90、M=10 的 common-input source template 為[`configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml`](configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml)，固定最大沉底年齡 90 日、五站共用 50 個分層隨機整點小時與 seed `20260916`，只供 `horizon-suite-create --backtrack-days 30 60 90 --formal-release` 一次建立共同母體。正式範例的 `backtrack_mode` 預設為 `full_horizon_from_deposition`，只發布 H30/H60/H90 各一份共三份 release；`fixed_calendar_window` 仍保留為可選敏感度模式。沉底年齡抽樣範圍開關（`age_sampling_scope`）、`horizon-suite-resume`、新版母體 `forcing_years`／`replicate_rank` 母體規範等完整契約見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)。
 
-時間步長的終點容錯由 engine 層負責：若距離 `max_age` 或流場起始時刻只剩小於 `dt_min_seconds` 的正值，仍執行一次精確到終點的最後短步；該短步不計入一般 `minimum_clamp_count`，且不越過時間邊界。若單粒子的速度尺度或其他 time-step input 不合法，則記錄 `NUMERICAL_FAILURE`、`failure_reason=time_step_evaluation_error` 與 `failure_stage=limits` 後停止該粒子，保留診斷並讓同一 shard 的其他粒子繼續；SamplingError 仍依原本的 `DATA_GAP`／數值失敗分類保存。
+ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)；A 區使用 `no_stokes`，B／C／D 使用 `finite_depth_stokes`，不能宣稱同設定比較。在 NFS 上，preview／figure 的 `.complete` 只表示成果目錄已通過驗證可供 reader 讀取，不表示粒子 run 完成；run 生命週期仍以 `run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
 
-龜山島單站 30 天工程測速的分片順序、外部監測、checkpoint／resume 與耗時解讀見[單站 H30 工程測速操作契約](docs/operations/17_engineering_window_benchmark.md)。該測速僅量測實際步進成本、資料讀寫與準備時間，不能升格為正式研究成果或改寫五站完整情境契約。checkpoint 的 segment 操作、故障恢復與容量指標見[checkpoint segment 操作契約](docs/operations/18_checkpoint_segment_storage.md)。工程配對若需讓 `no_stokes` 與 `finite_depth_stokes` 在相同 scenario、master seed、member 下共用可重現的擴散亂數，請在 `scripts/run_engineering_window.py run` 明示非空 `--random-stream-id <ID>`；ID 只替換 seed 導出案例命名空間，兩個 run 仍保留各自 `experiment_case_id`、`particle_id`、物理 request 與輸出，並由 execution checkpoint schema `3.1.0` 保存含 ID 的 `binding`／segment chain。省略時維持原案例 seed；resume stream 變更、空白或非字串均 fail-closed。這只是 common-random-number 工程控制，不代表物理案例具有相同軌跡或可合併其條件式來源足跡。
-
-持續 worker 的快取計數按分片執行增量保存，續跑合併已保存增量，避免共用管理器的累計次數被報告重複相加；常駐位元組等狀態量以樣本最大值呈現。checkpoint 的 `checkpoint_bytes` 表示每次新 generation 的 lifetime logical bytes-written，`checkpoint_active_bytes` 表示目前所有保留 generation、`latest.json` 與 checkpoint 資料檔的已發布普通檔案 `st_size` 邏輯長度加總；它不包含目錄與 NFS 配置空間，不能取代 `du`／`df` 儲存閘門。兩者不可混為同一種容量。歷史缺少計數語意或量測不完整的紀錄須保留限制說明，不能作為精確總量。
-
-未啟用隨機沉底的 legacy generic 流程仍以 `inputs.backtrack_support_days` 作為執行回溯上限。正式範例已登錄 random bed residence：若同一母體涵蓋 H30/H60/H90，`inputs.backtrack_support_days=180` 是 observation 選時包絡（H90 + 最長 90 日沉底年齡），而 `bed_residence_time.runtime_horizon_support_days=90` 與 `boundaries.max_backtrack_days=90` 是沉底後執行支援。不能把 180 誤當作粒子回溯天數；正式 30／60／90 多模式應用 `horizon-suite-create`，一次建母體，不逐 horizon 重跑 `inputs-build`。詳見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)與[CLI 參考](docs/operations/cli_reference.md)。
-
-### 5.1 隨機沉底與一次建立正式回溯設定
-
-正式 H30/H60/H90、M=10 的 common-input source template 為
-[`configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml`](configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml)。它
-固定最大沉底年齡 90 日、五站共用 50 個分層隨機整點小時與 seed `20260916`；只供
-`horizon-suite-create --backtrack-days 30 60 90 --formal-release` 一次建立共同母體，
-不是已完成科學驗證的 approved release。`configs/lagrangian_backtracking.example.yaml`
-仍保留 null placeholder，不能直接執行正式批次。`fixed_calendar_window` 以固定日曆窗扣除沉底年齡；
-窗前沉底記為 `pre_window_deposition`，不讀流場資料，也不進來源比例有效分母；
-`full_horizon_from_deposition` 則從隨機沉底日再向前完整追蹤 H 日。
-
-**WP-18（依 PI 原話變更）**：正式範例的 `backtrack_mode` 預設已改為
-`full_horizon_from_deposition`，且明示 `formal_release_backtrack_modes:
-[full_horizon_from_deposition]`，故 `horizon-suite-create` 對正式範例只發布
-**H30/H60/H90 各一份、共三份** release，而非舊版的六份。`fixed_calendar_window`
-仍列於 `supported_backtrack_modes`，保留為可選的敏感度分析模式，未被刪除；
-如需同時比較兩種模式，可在自己的 config 明示
-`formal_release_backtrack_modes: [fixed_calendar_window, full_horizon_from_deposition]`
-取回六份 release 的舊行為。舊版（本欄位加入前）已建置的六份 suite 產物不受此變更影響，
-仍可用 `horizon-suite-validate` 正常驗證。
-
-**WP-18（新增：沉底年齡抽樣範圍開關，僅完成抽樣原語與 schema，尚未全線接通）**：
-`scenarios.bed_residence_time.age_sampling_scope` 新增 `per_observation`（預設，
-既有行為不變：每個觀測時刻抽一個年齡，同觀測時刻下所有情境／成員共用、50 站間共用
-rank）與 `per_particle`（每個情境×成員各自獨立抽樣，由主 seed 與粒子身分決定、可重現）
-兩個值；省略此欄位維持舊版位元相同結果與 config hash。`per_particle` 目前只完成
-`bed_residence.py` 的抽樣函式（`derive_bed_residence_particle_seed`、
-`sample_bed_residence_age_hours_for_particle`）與設定驗證／provenance 記錄，**尚未接
-到下游**：逐粒子初始條件重建（依各自沉底時刻由 OCM 反查初始狀態）與 native 工作單元
-規劃／hour-major 批次分組（避免到達時刻數量爆炸）仍待後續工作包完成，詳見
-`reports/WP-18.md`。
-
-template 只把下列已核定的執行 scalar 具體化，H30/H60/H90 的支援日數、release horizon 與步數由
-horizon-suite 產生：
-
-| 區段 | 核定 scalar |
-|---|---|
-| `physics` | `constant_kh_m2ps=0.4429482105965188`；`constant_kz_m2ps=0.0013526236792521886` |
-| `integration` | `output_interval_seconds=300`；`dt_min_seconds=0.1`；`dt_max_seconds=30` |
-| `scenarios` | `members_per_scenario=10`；`master_seed=20260916` |
-| `execution` | `ocm_interpolation_backend=numba_ocm_v1`；`physics_kernel_backend=numba_cpu_v1`；`shard_scenario_count=100`；`checkpoint_interval_sweeps=10000`；`active_chunk_size=100` |
-
-`horizon-suite-create` 對 H30/H60/H90 只執行一次 strict `inputs-build`：共同 observation 選時包絡為 180 日，沉底後 gap-censored 執行支援上限為 90 日，再依 template 的 `formal_release_backtrack_modes`（省略時為兩種模式共六份；正式範例現為只發布 `full_horizon_from_deposition` 共三份）發布對應份數的 release。各份設定共用受體、時刻、材質、初始條件與 artifact fingerprints；horizon、mode、步數預算及綁定分開保存。正式命令、schema 1.0/1.1 隔離、不可變發布、驗證與失敗復原規則見[輸入衍生契約](docs/operations/14_input_derivation_and_release_contract.md#31-通用回溯支援與共同比較母體)及[CLI 參考](docs/operations/cli_reference.md)。
-
-若建立過程中留下 exact preserved `.partial-*`，可使用 `horizon-suite-resume`。它會唯讀核對 source-template、common-config、artifact closure、來源 config hash 與三個流場根目錄，在新的 owned partial 重建各份 release；不修改原 partial，且 manifest 仍記錄 `input_build_count=1` 與不含絕對路徑的 recovery source fingerprint。destination 必須不存在，日數必須與 common config／preserved manifest 一致；此命令絕不再次呼叫 `inputs-build`。
-
-新版母體的 manifest 另外保存 `forcing_years=[2024, 2025]`、`observation_years=[2025]`、arrival policy 與每個季節×潮況×相位的兩個 `replicate_rank`；formal loader 會確認每站 48 個核心 strata 加 2 個事件，且不接受舊兩年份 population 與新版 policy 混用。2024 只提供 2025 observation 的前置流場資料，不會被誤報為 arrival anchor。
-
-正式新版 arrival 母體只以 2025 作 observation anchor，流場資料仍完整讀取 2024–2025；因此最早的 2025-01-01 observation 往前 180 日約落在 2024-07-05，不需要把 2024 早季當作 observation strata，也不需另補 2023 前置流場資料。180/90 仍是待驗證的資料支援契約，不是已完成 SERVER 或 `inputs-build` 的證據；若 accepted product 在 2024-07-05 前仍有缺時，legacy strict preflight/build 會 fail closed；明示 `observed_gap_censored_stop_at_first_gap_v1` 的 bed-residence build 則保留缺口清單並依第一缺口截尾契約產生 `data_gap` 可稽核紀錄。兩者都不能用最近值、零值或未登錄外插繞過。正式執行前須由當次流場清冊與對應 gap-safe／gap-censored 證據完成驗證；本次不宣稱已在 SERVER 執行，也不把 design_pending template 稱為 approved release。
-
-Suite 發布優先使用同一 parent 目錄的 native exclusive rename；只有檔案系統明確回報不支援時，才使用 `nfs_two_phase_copy_v1`。fallback 先以 parent dirfd 的不可覆寫 `mkdir` 保留 destination basename，再以 no-follow 普通檔／目錄白名單複製、逐檔與目錄 `fsync`，最後建立不可覆寫的 `horizon-suite-publication.json` 及 sidecar。marker 綁定 manifest fingerprint、策略識別碼／版本與發布方法，不記錄絕對路徑；無 marker 的 reserved destination 一律不算正式成果，必須人工選新 destination 或明確清理。
-正式輸入的每個月份、UTC 時間軸、schema、單位／方向、mask、缺時形狀、geometry、容量與權限，都應在當次 preflight 留下可機讀紀錄；已知時間缺口只能採核准重建、legacy 缺口安全到達視窗，或本期版本化的第一缺口截尾政策，執行流程不臨時外插，不以最近值或零值補資料。
-
-ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)。四區的明示 pilot registry 共用 `2024-01-02T01:00:00Z`、24 小時回溯與 25 個逐時節點；A 區必須同時選貢寮與龜山島，B／C／D 則各自選單站。既有試跑仍須以 `pilot-matrix-validate` 檢查共同設定；目前 A 使用 `no_stokes`，B／C／D 使用 `finite_depth_stokes`，因此不能把它們宣稱為同設定比較或正式研究結果。
-
-在 NFS 上，preview／figure 的 `.complete` 只表示該成果目錄已通過逐檔位元組、manifest、程式指紋與儲存閘門綁定，可供成果 reader 讀取；它不表示粒子 run 完成。run 的生命週期仍以 `run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
-
-`native_runner` 子套件另外提供 `lbt native-plan`／`lbt native-run`／`lbt native-status`／`lbt native-postprocess`／`lbt native-derive-horizon` 五個子命令，以工作單元（區域、到達時刻、沉降速度、`study_site_id`）為顆粒度做規劃、持續 worker 排程、續跑與失敗隔離，並以量測到的可用記憶體決定 worker 數；到達時刻的缺口安全檢查與重選重用既有 `select_arrival_times`，不是另一套規則；波浪橋接與後處理（離開紀錄、邊界通量／進入統計、條件式來源足跡）皆已接線；`native-postprocess --with-boundary-segments` 另可依 `--azimuth-sector-count`／`--boundary-arc-segment-count` 把每站判定所屬的開放邊界線再細分成方位扇區／沿邊界弧長位置分段，統計各分段的相對來源權重（見 docs/operations/19 第 9.13 節）。`native-plan`／`native-run` 以 `--backtrack-mode`／`LBT_NATIVE_BACKTRACK_MODE`（`full_horizon_from_deposition` 或 `fixed_calendar_window`，預設前者）明確宣告本次實際採用的回溯模式，與設定檔 `bed_residence_time.backtrack_mode` 不一致時 fail closed，須明確加 `--acknowledge-config-mode-mismatch`／`LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1` 才放行；`native-derive-horizon` 可由既有 `full_horizon_from_deposition` 結果免重跑截斷推導出較短 `(模式, H)`。伺服器背景啟動入口見 `scripts/run_native_backtrack_server.sh`；完整工作單元模型、排程策略、回溯模式與已知限制見[native 逆向批次 orchestrator 操作契約](docs/operations/19_native_backward_batch_orchestrator.md)。此路徑仍是獨立於既有 `run-formal-parallel` 的排程／執行實作，不能取代既有正式母體流程。
-
-**WP-18（新增：native 實驗案例選擇）**：`native-plan`／`native-run` 新增 `--experiment-case`／`LBT_NATIVE_EXPERIMENT_CASE`（沿用 `runtime.EXPERIMENT_CASE_SPECS` 既有登錄名稱，預設 `finite_depth_stokes`）明確宣告本次是否納入 Stokes 漂移：`no_stokes`（純海流）會完全跳過波浪資料讀取與 Stokes 計算；`finite_depth_stokes`（海流＋波浪，有限水深 Stokes 漂移）在波浪資料缺漏時依既有缺值政策 fail closed，不會靜默退化為純海流。實驗案例會寫入 plan 檔、每份結果摘要與後處理 manifest，且與設定檔宣告不一致時同樣須 `--acknowledge-config-mode-mismatch` 才放行，兩種案例的產物不得混入同一輸出目錄或同一份統計。**擴散方法與 legacy registry 的差異**：無論選哪個實驗案例，native pipeline 一律使用工作手冊 eq.(10) 的 Smagorinsky 擴散（對應 BayTrace `horcon=0.2`、空間變化係數），不提供 legacy `EXPERIMENT_CASE_SPECS` 中的常數擴散（`constant_kh_m2ps`）選項；此固定選擇會以 `diffusion_method=smagorinsky_workbook_eq10` 寫入 provenance，避免與 legacy 常數擴散結果混淆比較。
+`native_runner` 子套件另外提供 `lbt native-plan`／`lbt native-run`／`lbt native-status`／`lbt native-postprocess`／`lbt native-derive-horizon` 五個子命令，以工作單元（區域、到達時刻、沉降速度、`study_site_id`）為顆粒度做規劃、持續 worker 排程、續跑與失敗隔離；`--backtrack-mode`、`--experiment-case`（`no_stokes`／`finite_depth_stokes`，固定使用工作手冊 eq.(10) Smagorinsky 擴散）與設定檔不一致時 fail closed，須明示 `--acknowledge-config-mode-mismatch` 才放行。`native-postprocess --with-boundary-segments` 可依方位扇區／沿邊界弧長位置細分邊界進入統計。伺服器背景啟動入口見 `scripts/run_native_backtrack_server.sh`；完整工作單元模型、排程策略、實驗案例契約與已知限制見[native 逆向批次 orchestrator 操作契約](docs/operations/19_native_backward_batch_orchestrator.md)。此路徑是獨立於既有 `run-formal-parallel` 的排程／執行實作，不能取代既有正式母體流程。
 
 ## 6. 文件導覽
 
@@ -253,41 +166,13 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 ### BayTrace 原版 CPU 批次（Q4）
 
-純流逐站出圖：`build_completed_subset_preview.py --current100-site SITE` 配合該站兩個 `--shard`，在該站20顆完成後輸出四張PNG，沿用完整單片輸出驗證；站名取目前設定，五站到達UTC分別標示。尚未完成時可用 `build_current100_checkpoint_preview.py --run RUN --checkpoint-root CHECKPOINT --config CONFIG --project-root CODE --site SITE --output NEW_OUTPUT` 讀取該站目前已發布checkpoint，先提供水平／垂向未完成軌跡圖與位置快照。只畫已保存粒子，分母明示已保存數／站20／總選取100；不補線、不縮短H30、不將當前末端或資料QC當成來源認定。圖檔與快照須放在新的成果目錄，不改運算checkout或原run。
+明示 `execution.advection_backend: baytrace_native_cpu_v1` 時，執行環境對純流／流波均設定 `require_native=True`，直接執行 PI 原版 BayTrace CPU RK4／內插核心；未支援的場資料轉接拋出可恢復工程例外，不藉粒子數值失敗早停宣稱完成，真實資料 QC 保留原分類。有限水深波浪採 `finite_depth_node_fields_v1`，與舊粒子逐階段取樣波浪參數有離散差異，不宣稱軌跡完全等價。原版場快取、固定五站100顆／已審兩站岸界40顆展示入口、`run-reconcile` 排他鎖與逐分片索引改善、以及僅供既有失敗點唯讀比對的 `diagnose_failure_points_readonly.py`／`diagnose_batch_readonly.py` 診斷腳本，完整命令、環境變數與限制見[BayTrace CPU 對照](docs/development/baytrace_native_cpu_comparison.md)；已審兩站岸界40顆入口另見[已審模型岸界](docs/development/reviewed_native_coast.md)。
 
-固定五站純流100顆展示使用 `scripts/run_current100_subset.py --help`：先由既有 `run-create --run-kind formal --experiment-case no_stokes` 建立新的完整計畫，再把新／來源工作區、設定、forcing、checkpoint、NFS scratch／log／cache、儲存驗證快照及 `--expected-commit` 交給腳本。預設僅準備；經核准加 `--execute` 才以五個持續 `run-worker` 各跑兩片。腳本固定選取 gongliao、guishan、hsinchu、lienchiang、nanwan 各站最早指定鋁材的全部20受體，各站到達UTC與ID記入新log session的 `demo-manifest.json`；不同站不宣稱同時間配對，不改原計畫／seed／dt／H30／沉降／擴散。五項thread限制均為1，MemAvailable低於30GiB或不可觀測時停止，對本次子程序SIGINT等待300秒再有界收尾。`events.jsonl` 記錄PID、CPU累積秒、RSS、步數、checkpoint序列及逐站原版完成證據；工程例外使子集失敗，真實資料QC原樣保留。整機elapsed直接使用單一操作程序時鐘，不能相加worker時間。僅100選取子集可完成，完整50,000情境run仍未完成，不呼叫全量aggregate或以圖宣稱正式成果。
-
-同一100顆子集續跑時，沿用上述參數及原 `--workspace`／`--checkpoint-root`，明示加 `--resume --execute`。預設仍只接受全未啟動的新工作區；續跑僅放行固定十片的合法狀態，其餘4,990片必須維持 `PLANNED`／零步數。原run計畫、seed與檢查點繫結不改寫，新程式commit、實際來源、初始十片進度與revision另存新log session。既有CLI `--resume` 負責片鎖下的檢查點還原與完成輸出驗證，不重算已驗證完成片、不先執行全run reconcile。此選項**不略過**既有CLI／runtime的全run歷史驗證，因此啟動仍可能耗時；不能將setup當成粒子推進。切換前必須確認舊operator與workers均已退出，不能同片雙寫；本腳本不代替操作者停止其他invocation。
-
-`run-reconcile` 在取得 run 排他鎖後，每次操作只完整讀取一次情境表與進度、驗證一次 checkpoint run 目錄結構，並建立該次操作的不可變分片索引。每個分片的範圍／hash、checkpoint binding／checksum、孤立世代／重放與輸出驗證均保留；採認狀態時仍在 progress 鎖內重讀最新進度。快照不跨操作保存，worker 與只讀 `validate_run` 路徑維持原有驗證。此項改善移除大量分片的重複讀取，不改變數值、seed、設定或 checkpoint／輸出契約；需採認多片狀態時仍有逐次進度發布成本。
-
-明示 `execution.advection_backend: baytrace_native_cpu_v1` 時，runtime 對純流／流波均設定 `require_native=True`。未支援的場資料轉接拋出可恢復工程例外，不能藉粒子數值失敗早停宣稱完成；真實資料 QC 保留原分類。報告分列原版嘗試／成功／拒絕步數、拒絕理由與群組大小直方圖，逐片保存計數增量；僅有正的 native 步數不足以通過驗收，尚須真實推進、零工程拒絕／舊核心補算及原版來源與批次證據。舊後端、步長、擴散、亂數與 checkpoint 契約維持原樣；流波可用性需由對應轉接測試確認。
-
-有限水深波浪採 `finite_depth_node_fields_v1`：以既有有限水深公式先在OCM兩端UTC的濕節點／垂向層組成總u/v，再用原版內插及RK4，沉降只加入一次。這與舊粒子／RK4 stage取樣有離散差異，不能宣稱軌跡完全等價；512MiB場快取上限也不是整個程序RSS上限。`scripts/run_native_wave_trial.py --help` 提供新正式H30/M1波浪計畫的單片一次掃描小試，保留原H30／dt／seed、靜態及逐片驗證，並以獨立程序群組與30GiB可用記憶體保護取得可續跑檢查點、來源與原版計數。小試通過不等於完整計算或科學驗收；其操作腳本可放NFS package並保存SHA，數值checkout保持核准commit乾淨不變。
-
-原版場快取的runtime容量可成對明示 `LBT_BAYTRACE_FRAME_CACHE_MAX_FRAMES` 與
-`LBT_BAYTRACE_FRAME_CACHE_MAX_BYTES`；兩者皆未設定仍為2場／512MiB。值須為ASCII
-十進位正整數，最高64場／4GiB；只設其一、空值、負數、小數或超限皆拒絕。
-這只是執行記憶體配置，不更改物理設定、原版RK4、粒子順序、批次分組、seed、dt或run plan。
-固定100入口 `run_current100_subset.py` 與已審兩站岸界40顆入口
-`run_native_coast40_subset.py` 明示覆寫20場／4294967296 bytes，
-將實際環境與容量記入新session `demo-manifest.json` 的 `frame_cache_limits`；
-resolver report沿用實際上限與建場／淘汰計數。五worker場快取合計上限20GiB，
-但常駐場快取上限**不是程序RSS上限**，建場暫存、forcing與檢查點另占記憶體；
-仍須保留MemAvailable30GiB安全停止及五項單執行緒限制。不得無條件將這個配置
-套到56worker或50k；其他入口未設上述環境即維持原容量。
-
-來源根目錄用 `LBT_BAYTRACE_ROOT`，外部快取用 `NUMBA_CACHE_DIR`；缺少來源或 OCM frame resolver 會明確失敗。啟用方式、限制與詳細測速表見[BayTrace CPU 對照](docs/development/baytrace_native_cpu_comparison.md)。
-
-相關繁中註解檔案：`advection.py`、`engine.py`、`production.py`、`config.py`、`runtime.py`、`run_control.py`；完整分工見上述文件。
-
-最新 synthetic no-Stokes 生命週期測速：`128×16×3` 為 1.500／0.578 秒、`512×16×3` 為 6.194／2.341 秒，最大誤差為 0／`8.88e-16 m`，比較通過，約 2.6 倍。
-
-結果涵蓋完整 `ProductionBatch` 生命週期但不含完整 SERVER I/O／真實流場驗證；NWW Stokes 與未支援形狀仍走既有舊路徑。歷史 direct-core 的 139 倍不可外推為完整執行速度。
+最新 synthetic no-Stokes 生命週期測速：`128×16×3` 為 1.500／0.578 秒、`512×16×3` 為 6.194／2.341 秒，最大誤差為 0／`8.88e-16 m`，比較通過，約 2.6 倍；結果涵蓋完整 `ProductionBatch` 生命週期但不含完整 SERVER I/O／真實流場驗證，歷史 direct-core 的 139 倍不可外推為完整執行速度。
 
 ## 7. 開發檢查與交付界線
 
-每次變更送審前至少檢查相關 pytest、Ruff、`git diff --check`、schema／checksum 資料拓撲與文件相對連結。新增模組時同步 architecture-map catalog；架構圖的產生與檢查應使用既有產生器及固定輸出流程。
+每次變更送審前至少檢查相關 pytest、Ruff、`git diff --check`、schema／checksum 資料拓撲與文件相對連結。新增模組時同步 architecture-map catalog；架構圖的產生與檢查應使用既有產生器及固定輸出流程。OCM 原版轉接建場的節點／層批次遮罩、向量化拓樸檢核與唯讀步進診斷工具（`diagnose_failure_points_readonly.py`、`diagnose_batch_readonly.py`）完整規則見[BayTrace CPU 對照](docs/development/baytrace_native_cpu_comparison.md)。
 
 測試結果要區分核心物理不變性、checkpoint／I/O round-trip、下游相容性與正式驗證證據。前兩者通過不能代替後兩者；報告中的有效分母與缺值狀態也不能由測試樣本外推到全期真資料。
 
@@ -297,61 +182,6 @@ resolver report沿用實際上限與建場／淘汰計數。五worker場快取�
 
 閱讀順序建議是先看本頁的限制，再看資料契約與科學方法，最後依 CLI 參考或 SERVER 執行手冊操作。歷史 audit、Phase／Slice 文件可追溯決策，但不得用其中的舊「下一步」句子推定今天的部署或資料狀態。
 
-### 有界唯讀步進診斷
-
-OCM原版轉接建場採節點／層批次遮罩與向量化拓樸檢核，保留原sigma算式與
-NumPy弱純量dtype捨入，不更動PI核心、RK4、步長、種子或停止條件。底部未使用層
-仍重複首個有效層，所有有限值／單調／範圍／重建／索引／方向／面積gate保留，
-四邊形第二三角形獨立檢核；不同錯誤同時發生仍回報原節點／元素順序的首個理由。
-`tests/baytrace_scalar_reference.py`保存向量化前逐節點／元素參考，
-由混合float32／float64逐陣列bitwise與拒絕理由測試核對，不能據此宣稱已排除全部效能瓶頸。
-
-`scripts/diagnose_failure_points_readonly.py` 僅用於一至五個既有失敗點的唯讀比對：
-依原事件座標／UTC及固定代提示，呼叫原速度取樣器、帶／不帶提示的定位，以及
-全部三角形包圍盒候選的既有精確定位；只量測投影與邊界距離，不自行分類或外插。
-以 `--spec` 指定已核對的乾淨模型版本與原run／事件／狀態路徑，`--output` 必須是
-獨立NFS操作目錄；只建一個診斷子程序，180秒硬限及30GiB可用記憶體門檻。
-不建立執行批次、不推進、不消耗亂數、不寫原進度，結果不是正式成果。
-規格JSON的新欄位 `checkpoint_dir`、`expected_sequence`、`expected_point_count`
-必須成套指定；序號為正整數，點數為1..5整數，布林值、文字與浮點數皆拒絕。
-舊規格僅含 `checkpoint62` 時仍固定第62代／五點；新舊欄位混用拒絕。
-原十粒子分片、描述檔序號／分片、compact狀態SHA、事件粒子唯一且屬於request與
-狀態、位置與UTC精確相等的檢核均保留；全面候選精驗容差仍為1e-10。
-結果分開保存模型版本與 `diagnostic_script_commit`／腳本SHA，不能將診斷工具
-更新誤認為現行數值模型版本切換，也不以水平取樣不支援自行決定停止分類。
-
-`scripts/diagnose_batch_readonly.py` 只在新的獨立程序記憶體中重現指定純流分片，
-不是正式計算或成果。必須明示 `--project-root`、`--expected-commit`、`--workspace`、
-`--config`、`--checkpoint-root`、`--ocm-native-root`、`--ocm-reconstruction-root`、
-`--shard-id` 與唯一 `--output`（位於 NFS operations 的診斷目錄）；
-有檢查點時另外明示 `--checkpoint`。使用原版本環境的 Python 啟動獨立腳本，
-不將腳本複製進計算 checkout。原 BayTrace 根目錄由既有 `LBT_BAYTRACE_ROOT` 保留。
-
-另明示獨立工具環境的 `--py-spy` 絕對路徑。最多 `--max-sweeps 1000`，
-`--timeout-seconds` 限120–180秒；py-spy直接啟動新診斷Python，以祖先權限每秒5次
-非停止式預設採樣60秒並保存 `profile.raw`；`--profiling-seconds` 可指定30–150整數秒，
-且須不超過 `--timeout-seconds` 減20秒，預留採樣落盤及清理時間。較長單次重現可用
-`--setup-validation startup --profiling-seconds 150 --timeout-seconds 180 --max-sweeps 1000`，
-仍不能超過180秒硬上限；命令與來源紀錄保存實際採樣秒數。
-不附加既有worker、不sudo或改系統權限，
-也不混用faulthandler/cProfile。每10次掃描彙總已完成步數與年齡。保留原種子、檢查點亂數、
-步長、物理及批次平流器，不呼叫控制器執行／恢復／調和流程，也不發布軌跡或新檢查點。
-`--setup-validation startup`（原預設）使用既有私有啟動驗證能力，保留不可變繫結與
-路徑檢核，不掃全批歷史；明示檢查點的單片鏈仍由既有載入器驗證。
-`--setup-validation full` 則不傳私有能力，完整走公開控制器預設的static歷史驗證；
-這是驗證路徑的有界比較，不另外重複CLI handler的前置掃描，也不能據此先宣告停滯原因。
-兩模式皆記錄setup起訖、建構／恢復、每10次步進與模組來源，硬時限及唯讀限制相同。
-來源紀錄分開保存模型commit／目錄與腳本路徑／SHA；startup明示
-`diagnostic_startup_bindings_only=true`、`full_history_validation_not_performed=true`。
-full啟動時只標記已要求完整驗證，是否完成必須以`setup_complete`判讀，不能由採樣器
-退出碼推斷。所有模式均`formal_result=false`，不改原worker驗證政策或PI BayTrace原始碼。
-所有暫存與快取另置診斷目錄、五種執行緒限制均為1；採樣完成或硬逾時只清理診斷自建群組。
-`provenance.json`、`pid.json`、`numerical-pid.json`、`stdout.jsonl`、`stacks.stderr`、
-`profile.raw`、`result.json` 是診斷證據；採樣失敗不得冒稱已定位卡點。
-每10次掃描的摘要另保存cache hits/misses、frame builds/evictions、cached bytes及
-native completed/fallback/group-size程序累計統計；快取容量不因向量化而調整。
-原進度可能由既有worker正常更新，不能把它當成診斷寫入。
-
 ## 8. 方法與不採用範圍
 
 1. 本專案沿用 BayTrace 可對應的工程思路：CPU SoA／batch／chunk、每粒子可重現亂數、triangle hint、可暫停 engine 與可驗證 I/O；不承諾整包 tracker output 的格式或物理範圍，也不把 BayTrace 的工程參照當成本案科學驗證。
@@ -360,8 +190,8 @@ native completed/fallback/group-size程序累計統計；快取容量不因向�
 
 ## 9. B 區海岸預覽（既有示範）
 
-`scripts/build_pilot_coastline_preview.py` 可對既有 B 區 r2 preview 重繪海岸總覽與 H1–H5 局部圖；它只讀 preview CSV／JSON、已核對幾何與海岸 GeoJSON，不讀流場資料或重跑模型。`build_pilot_preview.py` 的來源入口接受既有 `pilot_exact`，或通過嚴格單站／單到達／單材質／全情境全選閘門的 `run_kind=pilot`、`scenario_selection.mode=full`；後者仍受 source／selected count/hash、無 sampling strata、本站受體一對一及粒子／觀測容量上限限制，不能用於 generic multi-site/full formal run。既有示範保存 20 粒子、203 筆模型紀錄，仍只是工程／展示資料。
+`scripts/build_pilot_coastline_preview.py` 可對既有 B 區 r2 preview 重繪海岸總覽與 H1–H5 局部圖；它只讀 preview CSV／JSON、已核對幾何與海岸 GeoJSON，不讀流場資料或重跑模型。既有示範保存 20 粒子、203 筆模型紀錄，仍只是工程／展示資料。
 
-預設 `legacy` 保留兩張水平 PNG；`--style baytrace` 另輸出水平圖、`depth_age.png`、`terminal_counts.png`、README 與 manifest，並拒絕覆寫既有輸出目錄。BayTrace 圖面契約 `1.3.0` 讓水平總覽、局部軌跡、垂向軌跡與停止統計共用停止狀態名稱，其中 `numerical_failure` 一律顯示為「數值失敗停止」；特定取樣原因僅保存在診斷欄位，不改寫圖例。呈現參照是 BayTrace v4.7.2 套件 `scripts/analyze_cases.py` 的 `plot_case`；本專案的垂向與停止診斷是額外內容，不擴張 BayTrace 語意。完整命令、來源與限制見[單站 pilot 計畫的獨立海岸底圖重繪](docs/operations/pilot_run_plan.md#獨立海岸底圖重繪)。這些計畫、腳本與測試是持久化的 pilot／補圖入口；補圖不改原 preview 的資料、圖層或採樣序列，只在新的 sibling output directory 產生圖檔與 manifest，局部圖保留實際公尺刻度與 panel identity，缺值留空，不能以海岸圖的完整性替代軌跡／流場資料 QC。若 geometry manifest 為 `status=generated`，BayTrace reader 只在 preview 已完整驗證並有 `.complete`、summary 明示 `run_kind=pilot` 且 `selection_mode` 為 `pilot_exact` 或受限 `full` 時放行；兩份 domain/open 的 canonical hash、站點／region／flow owner 與外框仍須全數通過。此情況的 figure manifest／README 會標示 `geometry_release_status=generated` 與 `engineering_only=true`，表示工程試跑圖面，不是 approved 正式 geometry、來源機率或因果歸因結果；既有 approved 路徑維持原相容性。
+預設 `legacy` 保留兩張水平 PNG；`--style baytrace` 另輸出水平圖、`depth_age.png`、`terminal_counts.png`、README 與 manifest，並拒絕覆寫既有輸出目錄；呈現參照是 BayTrace v4.7.2 套件 `scripts/analyze_cases.py` 的 `plot_case`，垂向與停止診斷是本專案額外內容。補圖不改原 preview 的資料、圖層或採樣序列，只在新的 sibling output directory 產生圖檔與 manifest；若 geometry manifest 為 `status=generated`，圖面會標示 `engineering_only=true`，不是 approved 正式 geometry 或來源結論。完整命令、來源、放行條件與限制見[單站 pilot 計畫的獨立海岸底圖重繪](docs/operations/pilot_run_plan.md#獨立海岸底圖重繪)。
 
 舊文件中的 Phase／Slice 名稱是設計脈絡，不是自動更新的現在狀態；若與本頁、[實作狀態](docs/implementation_status.md)、程式碼或當次紀錄不一致，以較新的可驗證程式／manifest／測試證據為準，無法確認的 SERVER 事實只引用現場紀錄。本頁不保存 SERVER 密碼、私有絕對路徑、未提交的大型資料或模型結果；實際部署依已授權環境的唯讀盤點與核准流程辦理。
