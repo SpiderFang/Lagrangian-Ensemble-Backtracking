@@ -544,6 +544,35 @@ def test_bed_residence_age_sampling_scope_per_particle_enters_hash_when_explicit
     assert config.config_hash() != default_config.config_hash()
 
 
+def test_bed_residence_age_sampling_scope_per_member_enters_hash_when_explicit() -> None:
+    """WP-27：明示 ``age_sampling_scope: per_member`` 時必須被接受、寫入 canonical
+    payload，且產生與 per_observation、per_particle 都不同的 config hash——三種
+    抽樣範圍必須彼此可由 config hash 區分，不得因為都是「新增的抽樣範圍」而共用
+    同一組 canonical 表示。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["age_sampling_scope"] = "per_member"
+    payload["scenarios"]["bed_residence_time"] = block
+    config = ProjectConfig.model_validate(payload)
+    assert config.scenarios.bed_residence_time.age_sampling_scope == "per_member"
+    assert config.normalized_payload()["scenarios"]["bed_residence_time"]["age_sampling_scope"] == (
+        "per_member"
+    )
+
+    default_payload = _payload()
+    default_payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    default_config = ProjectConfig.model_validate(default_payload)
+    assert config.config_hash() != default_config.config_hash()
+
+    particle_payload = _payload()
+    particle_block = _bed_residence_block()
+    particle_block["age_sampling_scope"] = "per_particle"
+    particle_payload["scenarios"]["bed_residence_time"] = particle_block
+    particle_config = ProjectConfig.model_validate(particle_payload)
+    assert config.config_hash() != particle_config.config_hash()
+
+
 def test_bed_residence_age_sampling_scope_rejects_unregistered_value() -> None:
     payload = _payload()
     block = _bed_residence_block()

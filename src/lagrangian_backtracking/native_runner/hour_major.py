@@ -189,7 +189,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +200,7 @@ from .backward_driver import (
     NATIVE_STATUS_ACTIVE,
     NATIVE_STATUS_DEPOSITED,
     NATIVE_STATUS_FORCING_MISSING,
+    NATIVE_STATUS_LEFT_FLOW_DOMAIN,
     NATIVE_STATUS_MAX_BACKTRACK,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_STRANDED,
@@ -211,6 +212,7 @@ from .backward_driver import (
     DepartureRecord,
     HourlyOverheadDiagnostics,
     LocalCflSpatialIndex,
+    LocalDomainFirstExitRecord,
     NativeBackwardDriverGrid,
     SubstepDiagnostics,
     WaveFieldAtNodes,
@@ -385,11 +387,38 @@ class HourMajorSettlingGroupInput:
     arrival_time_utc_ns: np.ndarray
     max_backtrack_ns: np.ndarray
     interest_region_polygons: np.ndarray
+    local_region_polygons: np.ndarray
+    """WP-23 新增。``(n,)`` object 陣列，每顆粒子所屬測站自己的 local domain
+    （``own_local_domain``）多邊形；語意與 ``interest_region_polygons``
+    （WP-23 起代表 flow domain）對應但用途不同，見
+    ``backward_driver.mirror_rk4_substep_loop`` 的 ``local_region_polygons``
+    參數。``local_equals_flow_mask`` 為真的列，這裡仍然填有效多邊形物件
+    （與該列的 flow domain 相同，保持陣列型別穩定），但**不會**被子步迴圈
+    實際判定——``_new_group_state`` 把這些列的 ``local_first_exit_pending``
+    初始值設成 ``False``，子步迴圈的 check_mask 天生就會跳過它們（見該
+    docstring），終止時改由 ``_finalize_unit_result`` 對它們的 flow-exit
+    ``DepartureRecord`` 回填 ``also_local_domain_first_exit=True``。"""
+    local_equals_flow_mask: np.ndarray
+    """WP-23 新增。``(n,)`` bool 陣列，每顆粒子所屬測站的 local domain 是否與
+    flow domain 相同（``resources.DomainResources.local_equals_flow``）。一個
+    ``HourMajorUnitInput`` 對應單一測站，因此同一個單元底下的列這個值必為
+    常數。"""
     units: tuple[HourMajorUnitInput, ...]
 
     @property
     def particle_count(self) -> int:
         return int(self.x0_m.shape[0])
+
+    @property
+    def needs_local_domain_check(self) -> bool:
+        """這個分組裡是否至少有一顆粒子屬於 ``local_equals_flow=False`` 的測站
+        （目前是貢寮／龜山島）。為假時（例如整個分組全部來自新竹／南灣／
+        連江）呼叫端應該完全不傳遞 local domain 相關參數給子步迴圈——不是
+        傳一個「反正也不會命中」的陣列，是刻意完全不啟用那段程式碼路徑，
+        確保這三站在新程式下的行為與 WP-23 之前逐位元等價（見
+        ``reports/WP-23.md`` 等價性論證一節）。"""
+
+        return bool(np.any(~self.local_equals_flow_mask))
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +438,8 @@ def build_hour_major_domain_batch(
     units: Sequence[NativeWorkUnit],
     *,
     interest_regions: Mapping[str, Polygon],
+    local_domains: Mapping[str, Polygon],
+    local_equals_flow: Mapping[str, bool],
 ) -> HourMajorDomainBatch:
     """把同一個流場區域的一批 ``NativeWorkUnit`` 轉成小時主軸輸入。
 
@@ -424,13 +455,25 @@ def build_hour_major_domain_batch(
             ``backward_driver.build_pre_window_deposition_result`` 直接
             組出結果）；若真的傳入會 fail-closed 拒絕，避免默默把
             pre-window 粒子當成一般粒子運算。
-        interest_regions: ``{study_site_id: 關注區域多邊形}``，來自
-            ``resources.DomainResources.interest_regions``；任何單元的
-            ``study_site_id`` 不在這個對照表裡都會 fail-closed 拒絕。
+        interest_regions: ``{study_site_id: flow domain 開放邊界多邊形}``
+            （WP-23 起固定語意，見 ``resources.DomainResources.
+            interest_regions`` docstring），來自
+            ``resources.DomainResources.interest_regions``；離開此多邊形
+            即終止。任何單元的 ``study_site_id`` 不在這個對照表裡都會
+            fail-closed 拒絕。
+        local_domains: WP-23 新增。``{study_site_id: 該測站自己的 local
+            domain 多邊形（own_local_domain）}``，來自
+            ``resources.DomainResources.local_domains``；離開此多邊形是
+            **非終止**事件，只記錄、不停止（見
+            ``backward_driver.LocalDomainFirstExitRecord``）。
+        local_equals_flow: WP-23 新增。``{study_site_id: 該測站 local
+            domain 是否與 flow domain 相同}``，來自
+            ``resources.DomainResources.local_equals_flow``。
 
     Raises:
         HourMajorError: ``units`` 為空、跨流場區域、到達時刻未精確落在
-            小時邊界、含 pre-window 單元，或缺少對應的關注區域多邊形。
+            小時邊界、含 pre-window 單元，或缺少對應的關注區域／local
+            domain 多邊形。
     """
 
     if not units:
@@ -460,6 +503,11 @@ def build_hour_major_domain_batch(
             raise HourMajorError(
                 f"單元 {unit.unit_id} 的測站 {unit.study_site_id!r} 沒有對應的關注區域多邊形"
             )
+        if unit.study_site_id not in local_domains or unit.study_site_id not in local_equals_flow:
+            raise HourMajorError(
+                f"單元 {unit.unit_id} 的測站 {unit.study_site_id!r} 沒有對應的 local domain "
+                "多邊形或 local_equals_flow 旗標（WP-23 起 fail-closed 必要）"
+            )
 
     by_settling: dict[float, list[NativeWorkUnit]] = {}
     for unit in units:
@@ -477,6 +525,8 @@ def build_hour_major_domain_batch(
         arrival_parts: list[np.ndarray] = []
         max_backtrack_parts: list[np.ndarray] = []
         polygon_parts: list[np.ndarray] = []
+        local_polygon_parts: list[np.ndarray] = []
+        local_equals_flow_parts: list[np.ndarray] = []
         unit_inputs: list[HourMajorUnitInput] = []
         cursor = 0
         for unit in group_units:
@@ -495,6 +545,11 @@ def build_hour_major_domain_batch(
             max_backtrack_parts.append(np.full(n_unit, unit_max_backtrack_ns, dtype=np.int64))
             polygon = interest_regions[unit.study_site_id]
             polygon_parts.append(np.full(n_unit, polygon, dtype=object))
+            local_polygon = local_domains[unit.study_site_id]
+            local_polygon_parts.append(np.full(n_unit, local_polygon, dtype=object))
+            local_equals_flow_parts.append(
+                np.full(n_unit, bool(local_equals_flow[unit.study_site_id]), dtype=bool)
+            )
             unit_inputs.append(
                 HourMajorUnitInput(
                     unit_id=unit.unit_id,
@@ -516,6 +571,8 @@ def build_hour_major_domain_batch(
                 arrival_time_utc_ns=np.concatenate(arrival_parts),
                 max_backtrack_ns=np.concatenate(max_backtrack_parts),
                 interest_region_polygons=np.concatenate(polygon_parts),
+                local_region_polygons=np.concatenate(local_polygon_parts),
+                local_equals_flow_mask=np.concatenate(local_equals_flow_parts),
                 units=tuple(unit_inputs),
             )
         )
@@ -542,6 +599,12 @@ class _UnitProgress:
     trajectory_z: list[np.ndarray] = field(default_factory=list)
     trajectory_status: list[np.ndarray] = field(default_factory=list)
     departures: list[DepartureRecord] = field(default_factory=list)
+    local_departures: list[LocalDomainFirstExitRecord] = field(default_factory=list)
+    """WP-23 新增：這個單元底下、``local_equals_flow=False`` 的粒子首次離開
+    自己 local domain 的非終止事件。``local_equals_flow=True`` 的單元這裡
+    永遠是空 list——那些單元的 local 首次離開改由 ``departures`` 對應那筆
+    ``DepartureRecord.also_local_domain_first_exit=True`` 表達，見
+    ``_finalize_unit_result``。"""
 
 
 @dataclass
@@ -556,6 +619,13 @@ class _GroupState:
     particle_seed_hi: np.ndarray | None
     particle_step_counter: np.ndarray | None
     deposit_streak: np.ndarray
+    local_first_exit_pending: np.ndarray
+    """WP-23 新增。``(n,)`` bool，跨小時持續傳入子步迴圈的持久陣列（語意見
+    ``backward_driver.mirror_rk4_substep_loop`` 同名參數）。初始值是
+    ``~inp.local_equals_flow_mask``：``local_equals_flow=True`` 的列一開始
+    就是 ``False``（不需要 local 判定，子步迴圈的 check_mask 天生跳過），
+    ``local_equals_flow=False`` 的列初始為 ``True``，離開自己 local domain
+    後被子步迴圈翻成 ``False``（全程只翻一次）。"""
     prev_hf2: np.ndarray | None = None
     prev_hf2_utc_ns: int | None = None
     units: dict[str, _UnitProgress] = field(default_factory=dict)
@@ -595,6 +665,7 @@ def _new_group_state(
         particle_seed_hi=particle_seed_hi,
         particle_step_counter=particle_step_counter,
         deposit_streak=np.zeros(n, dtype=np.int64),
+        local_first_exit_pending=~inp.local_equals_flow_mask,
         units=units,
     )
 
@@ -645,8 +716,37 @@ def _finalize_unit_result(group: _GroupState, progress: _UnitProgress) -> Backwa
     if not progress.trajectory_utc:
         raise HourMajorError(f"單元 {info.unit_id} 從未被排入任何一個小時，這是內部錯誤")
     start, stop = info.start, info.stop
+
+    # WP-23：一個單元只對應單一測站，因此 local_equals_flow 在這個列區間內
+    # 必為常數——用 all()／any() 都應該得到相同答案，這裡用 all() 並在不一致
+    # 時 fail-closed，防止 build_hour_major_domain_batch 未來被改壞、悄悄把
+    # 不同測站的列混進同一個單元卻沒被發現。
+    unit_local_equals_flow_slice = group.inp.local_equals_flow_mask[start:stop]
+    if bool(np.all(unit_local_equals_flow_slice)) != bool(np.any(unit_local_equals_flow_slice)):
+        raise HourMajorError(
+            f"單元 {info.unit_id} 底下的列 local_equals_flow 不一致，這違反「一個單元只屬於"
+            "單一測站」的假設，是內部錯誤"
+        )
+    unit_local_equals_flow = (
+        bool(unit_local_equals_flow_slice[0]) if unit_local_equals_flow_slice.size > 0 else True
+    )
+
+    departures = list(progress.departures)
+    if unit_local_equals_flow:
+        # local domain 與 flow domain 是同一個多邊形：這個單元底下不會（也不應該）
+        # 產生獨立的 LocalDomainFirstExitRecord（group.local_first_exit_pending
+        # 對這些列從一開始就是 False，子步迴圈天生跳過），改對每一筆 flow-exit
+        # 終止事件回填 also_local_domain_first_exit=True，語意與
+        # run_backward_batch 的同名分支完全對應。
+        departures = [
+            replace(record, also_local_domain_first_exit=True)
+            if record.status == NATIVE_STATUS_LEFT_FLOW_DOMAIN
+            else record
+            for record in departures
+        ]
+
     departure_by_row: dict[int, DepartureRecord] = {}
-    for record in progress.departures:
+    for record in departures:
         departure_by_row[record.row_particle_index] = record
     n_unit = int(info.row_particle_index.shape[0])
     final_utc_ns = np.full(n_unit, progress.trajectory_utc[-1], dtype=np.int64)
@@ -664,10 +764,11 @@ def _finalize_unit_result(group: _GroupState, progress: _UnitProgress) -> Backwa
         trajectory_y_m=np.stack(progress.trajectory_y, axis=0),
         trajectory_z_m=np.stack(progress.trajectory_z, axis=0),
         trajectory_status=np.stack(progress.trajectory_status, axis=0),
-        departures=tuple(progress.departures),
+        departures=tuple(departures),
         diagnostics=SubstepDiagnostics(),
         overhead_diagnostics=HourlyOverheadDiagnostics(),
         hours_run=progress.hours_run,
+        local_domain_departures=tuple(progress.local_departures),
     )
 
 
@@ -1393,6 +1494,35 @@ def _dispatch_departure_records(group: _GroupState, records: Sequence[DepartureR
                 break
 
 
+def _dispatch_local_departure_records(
+    group: _GroupState, records: Sequence[LocalDomainFirstExitRecord]
+) -> None:
+    """``_dispatch_departure_records`` 的 local domain 版本（WP-23 新增）。
+
+    把子步迴圈回傳的 ``LocalDomainFirstExitRecord``（非終止：離開自己站點
+    local domain）依所屬單元拆開，換算成該單元自己陣列裡的局部列位置。
+    只會收到 ``local_equals_flow=False`` 測站的粒子——``local_equals_flow=
+    True`` 的列因為 ``group.local_first_exit_pending`` 從一開始就是
+    ``False``，子步迴圈的 check_mask 根本不會命中它們（見
+    ``HourMajorSettlingGroupInput.local_region_polygons`` docstring）。
+    """
+
+    for record in records:
+        row = record.row_particle_index
+        for progress in group.units.values():
+            if progress.info.start <= row < progress.info.stop:
+                progress.local_departures.append(
+                    LocalDomainFirstExitRecord(
+                        row_particle_index=row - progress.info.start,
+                        x_m=record.x_m,
+                        y_m=record.y_m,
+                        z_m=record.z_m,
+                        utc_ns=record.utc_ns,
+                    )
+                )
+                break
+
+
 def _mirror_rk4_substep_loop_dispatch(
     driver_grid: NativeBackwardDriverGrid,
     handles: BayTraceModuleHandles,
@@ -1413,12 +1543,21 @@ def _mirror_rk4_substep_loop_dispatch(
     substep_utc_ns: Callable[[int], int],
     interest_region_polygons: np.ndarray,
     departures: list[DepartureRecord],
+    local_region_polygons: np.ndarray | None = None,
+    local_first_exit_pending: np.ndarray | None = None,
+    local_departures: list[LocalDomainFirstExitRecord] | None = None,
 ) -> SubstepDiagnostics:
     """WP-16 任務 2：依 ``config.substep_loop_impl`` 選擇子步迴圈實作。
 
     兩個呼叫端（``_run_group_hour`` 的「單次呼叫」與「拆成新到達／延續中
     兩次呼叫」分支）共用同一個參數組合，這裡集中一次，避免兩處分岔各自
     重複 if/else。
+
+    ``local_region_polygons``／``local_first_exit_pending``／
+    ``local_departures``（WP-23 新增）三者要嘛全部是 ``None``（這個分組完全
+    不含 ``local_equals_flow=False`` 的測站，見
+    ``HourMajorSettlingGroupInput.needs_local_domain_check``），要嘛全部有值；
+    呼叫端負責維持這個不變量，本函式只原樣透傳給底層子步迴圈。
     """
 
     if config.substep_loop_impl == "python":
@@ -1434,6 +1573,9 @@ def _mirror_rk4_substep_loop_dispatch(
             substep_utc_ns=substep_utc_ns,
             interest_region_polygons=interest_region_polygons,
             departures=departures,
+            local_region_polygons=local_region_polygons,
+            local_first_exit_pending=local_first_exit_pending,
+            local_departures=local_departures,
         )
     if config.substep_loop_impl == "numba":
         return mirror_rk4_substep_loop_numba(
@@ -1448,6 +1590,9 @@ def _mirror_rk4_substep_loop_dispatch(
             substep_utc_ns=substep_utc_ns,
             interest_region_polygons=interest_region_polygons,
             departures=departures,
+            local_region_polygons=local_region_polygons,
+            local_first_exit_pending=local_first_exit_pending,
+            local_departures=local_departures,
         )
     raise HourMajorError(
         f"substep_loop_impl 必須是 'python' 或 'numba'，收到 {config.substep_loop_impl!r}"
@@ -1490,11 +1635,14 @@ def _run_group_hour(
         group.prev_hf2 is not None and group.prev_hf2_utc_ns == hour_start_utc + _HOUR_NS
     )
 
+    needs_local = group.inp.needs_local_domain_check
+
     if newly_mask is None and continuing_mask is None:
         hf1_now = None
         if config.enable_diffusion:
             hf1_now = group.prev_hf2 if prev_hf2_fresh else hf2_now
         departures: list[DepartureRecord] = []
+        local_departures: list[LocalDomainFirstExitRecord] = []
         _mirror_rk4_substep_loop_dispatch(
             driver_grid, handles, group.pa,
             config=config,
@@ -1508,8 +1656,13 @@ def _run_group_hour(
             substep_utc_ns=_substep_utc_ns,
             interest_region_polygons=group.inp.interest_region_polygons,
             departures=departures,
+            local_region_polygons=group.inp.local_region_polygons if needs_local else None,
+            local_first_exit_pending=group.local_first_exit_pending if needs_local else None,
+            local_departures=local_departures if needs_local else None,
         )
         _dispatch_departure_records(group, departures)
+        if needs_local:
+            _dispatch_local_departure_records(group, local_departures)
         return 1
 
     calls = 0
@@ -1533,6 +1686,7 @@ def _run_group_hour(
             saved_fields.update(_snapshot_fields(group.pa, other_rows, _DIFFUSIVITY_FIELDS))
         group.pa.status[other_active] = 0
         departures = []
+        local_departures = []
         try:
             _mirror_rk4_substep_loop_dispatch(
                 driver_grid, handles, group.pa,
@@ -1547,11 +1701,16 @@ def _run_group_hour(
                 substep_utc_ns=_substep_utc_ns,
                 interest_region_polygons=group.inp.interest_region_polygons,
                 departures=departures,
+                local_region_polygons=group.inp.local_region_polygons if needs_local else None,
+                local_first_exit_pending=group.local_first_exit_pending if needs_local else None,
+                local_departures=local_departures if needs_local else None,
             )
         finally:
             group.pa.status[other_active] = saved_status
             _restore_fields(group.pa, other_rows, saved_fields)
         _dispatch_departure_records(group, departures)
+        if needs_local:
+            _dispatch_local_departure_records(group, local_departures)
         calls += 1
     return calls
 
@@ -1648,7 +1807,11 @@ def save_hour_major_checkpoint(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     meta: dict[str, Any] = {
-        "checkpoint_kind": "hour_major_domain_checkpoint_v1",
+        # WP-23：從 v1 升到 v2，新增 local_first_exit_pending／local_departures；
+        # 舊版 v1 checkpoint 是在終止邊界誤用 local domain 的程式下寫出的，粒子
+        # 可能已經在 local domain 邊界被錯誤截斷，續跑沒有意義，見
+        # load_hour_major_checkpoint 的明確拒絕與 reports/WP-23.md。
+        "checkpoint_kind": "hour_major_domain_checkpoint_v2",
         "current_utc_ns": int(current_utc),
         "master_hours_walked": int(master_hours_walked),
         "groups": [],
@@ -1662,6 +1825,7 @@ def save_hour_major_checkpoint(
         npz_payload["native_status"] = group.native_status
         npz_payload["released"] = group.released
         npz_payload["deposit_streak"] = group.deposit_streak
+        npz_payload["local_first_exit_pending"] = group.local_first_exit_pending
         has_diffusion_state = group.particle_seed_lo is not None
         if has_diffusion_state:
             npz_payload["particle_seed_lo"] = group.particle_seed_lo
@@ -1692,6 +1856,16 @@ def save_hour_major_checkpoint(
                             "utc_ns": d.utc_ns,
                         }
                         for d in progress.departures
+                    ],
+                    "local_departures": [
+                        {
+                            "row_particle_index": d.row_particle_index,
+                            "x_m": d.x_m,
+                            "y_m": d.y_m,
+                            "z_m": d.z_m,
+                            "utc_ns": d.utc_ns,
+                        }
+                        for d in progress.local_departures
                     ],
                     "has_trajectory": bool(progress.trajectory_x),
                 }
@@ -1734,7 +1908,14 @@ def load_hour_major_checkpoint(
     if not meta_path.is_file():
         return None
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    if meta.get("checkpoint_kind") != "hour_major_domain_checkpoint_v1":
+    if meta.get("checkpoint_kind") == "hour_major_domain_checkpoint_v1":
+        raise HourMajorError(
+            f"{meta_path} 是 WP-23 之前的 v1 checkpoint（終止邊界誤用 local domain，"
+            "而非 flow domain）；此 checkpoint 裡的粒子可能已經在站點 local domain "
+            "邊界被錯誤截斷，語意不正確，續跑沒有意義，請刪除 checkpoint 目錄後"
+            "重新從頭跑（見 reports/WP-23.md），fail-closed 拒絕"
+        )
+    if meta.get("checkpoint_kind") != "hour_major_domain_checkpoint_v2":
         raise HourMajorError(f"{meta_path} 不是本模組的 checkpoint 格式")
     if len(meta["groups"]) != len(batch.groups):
         raise HourMajorError("checkpoint 的沉降速度分組數與目前輸入不一致，拒絕續跑")
@@ -1754,6 +1935,7 @@ def load_hour_major_checkpoint(
             native_status = npz["native_status"].astype(np.int32).copy()
             released = npz["released"].astype(bool).copy()
             deposit_streak = npz["deposit_streak"].astype(np.int64).copy()
+            local_first_exit_pending = npz["local_first_exit_pending"].astype(bool).copy()
 
             particle_seed_lo = particle_seed_hi = particle_step_counter = None
             if group_meta["has_diffusion_state"]:
@@ -1799,6 +1981,16 @@ def load_hour_major_checkpoint(
                     )
                     for d in unit_meta["departures"]
                 ]
+                local_departures = [
+                    LocalDomainFirstExitRecord(
+                        row_particle_index=int(d["row_particle_index"]),
+                        x_m=float(d["x_m"]),
+                        y_m=float(d["y_m"]),
+                        z_m=float(d["z_m"]),
+                        utc_ns=int(d["utc_ns"]),
+                    )
+                    for d in unit_meta["local_departures"]
+                ]
                 units[unit_info.unit_id] = _UnitProgress(
                     info=unit_info,
                     finished=bool(unit_meta["finished"]),
@@ -1810,6 +2002,7 @@ def load_hour_major_checkpoint(
                     trajectory_z=trajectory_z,
                     trajectory_status=trajectory_status,
                     departures=departures,
+                    local_departures=local_departures,
                 )
 
         groups.append(
@@ -1822,6 +2015,7 @@ def load_hour_major_checkpoint(
                 particle_seed_hi=particle_seed_hi,
                 particle_step_counter=particle_step_counter,
                 deposit_streak=deposit_streak,
+                local_first_exit_pending=local_first_exit_pending,
                 prev_hf2=prev_hf2,
                 prev_hf2_utc_ns=prev_hf2_utc_ns,
                 units=units,

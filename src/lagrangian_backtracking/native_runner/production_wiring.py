@@ -19,10 +19,10 @@
    ``forcing_bridge.NativeForcingBridgeReader``、``wave_bridge.NativeWaveBridgeReader``、
    ``manifests.load_scenario_inputs``、``runner.plan_scenario_shards``、
    ``particle_input.build_particle_identity_table``。
-2. 不重新定義「關注區域」是什麼——直接重用既有
+2. 不重新定義「關注區域」與「local domain」是什麼——直接重用既有
    ``manifests.load_boundary_geometries`` 算出的
-   ``BoundaryGeometry.own_local_domain``（見下方「關注區域定義」一節的完整說明
-   與理由）。
+   ``BoundaryGeometry.flow_domain``／``own_local_domain``（見下方「關注區域定義」
+   一節的完整說明與理由，含 WP-23 裁決後的現行定義）。
 3. 不重新發明缺口分類或到達時刻重選規則——``preflight_native_inputs`` 只呼叫既有
    ``forcing_bridge.inventory_forcing_gaps`` 與
    ``orchestrator.derive_backward_window_available``。
@@ -53,26 +53,43 @@
 都會在對應目錄找不到時丟出清楚指出路徑的 ``WiringError``，而不會嘗試用其他佈局
 猜測，也不會用空資料頂替。
 
-關注區域（``interest_regions``）定義的選擇與理由
-----------------------------------------------------
-``resources.DomainResources.interest_regions`` 要求「測站識別碼 → 關注區域多邊形」，
-且工作書規定「逆向追蹤持續到粒子完全離開其所屬測站的關注區域為止」。專案中唯一
-已經定義、已經驗證過、且與「測站的局部作業範圍」語意一致的既有多邊形，是
-``manifests.load_boundary_geometries`` 回傳的
-``boundaries.BoundaryGeometry.own_local_domain``——它是 local-domain manifest（
-``geometry.local_domain_manifest``）中每個測站自己的多邊形，投影到該測站所屬流場
-的 AEQD 公尺座標。該多邊形本身可能是測站 12.5 km 受體核心衍生的 local domain，
-也可能等於整個 flow domain（``local_equals_flow=true`` 的站點），依各站在既有
-local-domain manifest 中的既定定義而異；本模組不重新推導這個定義，只原樣重用它，
-理由是：(1) 它已經被既有正向追蹤 runtime（``runtime.py``／``boundaries.py``）用
-作「粒子離開這個範圍即視為離開研究站點作業範圍」的同一個語意；(2) 工作書要求
-「完全離開所屬測站的關注區域」，而不是「離開整個流場區域」——若改用
-``flow_domain``（``BoundaryGeometry.flow_domain``）會讓貢寮／龜山島共用同一個
-過大的 A 區關注區域，稀釋掉「各站各自何時離開」這個工作書要求的判定粒度。
-**誠實揭露**：本模組沒有另外驗證「local domain 就是工作書撰寫時心裡想的『關注
-區域』」這件事在科學上是否恰當——這是既有幾何 pipeline 的既定定義，本工作包
-只負責重用，若研究團隊認為關注區域應該是另一個尚未存在的多邊形，需要另外決策
-並可能修改 ``manifests.py`` 或提供新的 manifest，不是本模組能片面決定的事。
+關注區域（``interest_regions``）定義的選擇與理由（WP-23 裁決後現行版本）
+----------------------------------------------------------------------------
+**現行裁決（WP-23，研究團隊已確認）**：``resources.DomainResources.interest_regions``
+語意固定是**終止邊界＝flow domain 開放邊界**（``boundaries.BoundaryGeometry.
+flow_domain``）——逆向追蹤持續到粒子完全離開所屬流場區域為止才停止，同一流場
+區域內所有測站共用同一個多邊形（例如 A 區的貢寮／龜山島）。「離開自己站點的
+local domain（``own_local_domain``）」改為**非終止**事件，另外記在
+``DomainResources.local_domains``（見 ``resources.py`` 該欄位 docstring）與驅動層
+的 ``backward_driver.LocalDomainFirstExitRecord``／
+``BackwardDriverResult.local_domain_departures``，粒子離開 local domain 後仍繼續
+回溯，不受影響。``DomainResources.local_equals_flow`` 標出哪些站點的兩種幾何相同
+（目前新竹／南灣／連江），供呼叫端 fail-closed 判斷要不要把 local domain 另外
+當成獨立幾何傳給驅動層。
+
+**這曾經是什麼樣子、為什麼曾經選 local domain（歷史，已被推翻）**：WP-23 之前，
+本模組把 ``interest_regions[site]`` 填成 ``own_local_domain``，理由是「工作書要求
+『完全離開所屬測站的關注區域』，而不是『離開整個流場區域』；若改用 flow_domain
+會讓貢寮／龜山島共用同一個過大的 A 區關注區域，稀釋掉『各站各自何時離開』的判定
+粒度」。這個理由對新竹／南灣／連江三站沒有影響（local domain 與 flow domain
+相同），但對貢寮／龜山島是**錯的**：正式 M=1 成果因此顯示這兩站的粒子在站點
+20 km local domain 邊界就停止回溯，而不是在兩站共用的 A 區 flow domain 最外圍
+開放邊界停止，導致這兩站的邊界方位統計回答的是「從哪個方向進入 20 km 局部海域」，
+與其他三站「從哪個方向進入 flow domain」語意不同、不可比較（見
+``docs/foundation/08_design_baseline_and_derived_gates.md`` 第 8 節、
+``docs/development/05_decisions_and_risks.md`` D008，兩份文件明文規定
+``local_domain_first_exit`` 只記錄、``flow_domain_open_exit`` 才停止）。研究團隊
+確認後，WP-23 把終止邊界改回 flow domain、local domain 首次離開改成非終止記錄，
+即本節開頭的現行裁決。
+
+**這兩個多邊形都不是本模組自行推導**：兩者都直接重用
+``manifests.load_boundary_geometries`` 回傳的 ``boundaries.BoundaryGeometry``（
+local-domain manifest 投影到該測站所屬流場的 AEQD 公尺座標），本模組只依裁決
+結果決定要把哪個欄位放進 ``DomainResources`` 的哪個屬性，不重新定義任何幾何。
+**誠實揭露**：本模組沒有另外驗證這兩個多邊形在科學上是否恰當——這是既有幾何
+pipeline 的既定定義，本工作包只負責依裁決正確重用，若研究團隊未來認為需要另一個
+尚未存在的多邊形，需要另外決策並可能修改 ``manifests.py`` 或提供新的 manifest，
+不是本模組能片面決定的事。
 
 月份選擇政策：「磁碟上找得到什麼就用什麼」，完整度檢查交給 preflight
 ----------------------------------------------------------------------
@@ -601,13 +618,27 @@ def build_domain_resources(
     if not sites_in_domain:
         raise WiringError(f"config.study_sites 沒有任何站點屬於分析區域 {domain_id!r}")
     interest_regions: dict[str, Any] = {}
+    local_domains: dict[str, Any] = {}
+    local_equals_flow: dict[str, bool] = {}
     for site in sites_in_domain:
         if site.study_site_id not in boundary_bundle:
             raise WiringError(
-                f"boundary geometry bundle 缺少站點 {site.study_site_id!r} 的關注區域多邊形；"
+                f"boundary geometry bundle 缺少站點 {site.study_site_id!r} 的邊界幾何；"
                 "請確認 local domain manifest 已涵蓋此站"
             )
-        interest_regions[site.study_site_id] = boundary_bundle[site.study_site_id].own_local_domain
+        geometry = boundary_bundle[site.study_site_id]
+        # WP-23：終止邊界固定為 flow domain 開放邊界（裁決見模組 docstring「關注區域
+        # 定義」一節），local domain 只用於非終止的 local_domain_first_exit 記錄；
+        # 兩種幾何都必須存在才收下這個站點，缺任一個 fail-closed，不用另一個頂替
+        # （避免像本次修正前那樣，靜默把 local domain 誤當成終止邊界）。
+        if geometry.flow_domain is None or geometry.own_local_domain is None:
+            raise WiringError(
+                f"boundary geometry bundle 對站點 {site.study_site_id!r} 缺少 "
+                "flow_domain 或 own_local_domain 任一幾何，fail-closed 拒絕"
+            )
+        interest_regions[site.study_site_id] = geometry.flow_domain
+        local_domains[site.study_site_id] = geometry.own_local_domain
+        local_equals_flow[site.study_site_id] = bool(geometry.local_equals_flow)
 
     provenance: dict[str, Any] = {
         "config_sha256": config.config_hash(),
@@ -636,9 +667,20 @@ def build_domain_resources(
         "include_stokes": include_stokes,
         "require_wave_data": require_wave_data,
         "interest_region_definition": (
-            "boundaries.BoundaryGeometry.own_local_domain（local-domain manifest 投影後的"
-            "站點 local polygon），與既有正向追蹤 runtime 共用同一份幾何定義"
+            "WP-23 起：boundaries.BoundaryGeometry.flow_domain（流場區域開放邊界，"
+            "終止用；同一流場區域內各站共用同一個多邊形）。"
+            "local_domain_definition 另外記錄非終止的 own_local_domain 語意，"
+            "兩者不可混用，見 native_runner/production_wiring.py 模組 docstring "
+            "「關注區域定義」一節（WP-23 修正前這裡誤填 own_local_domain，"
+            "已被研究團隊裁決推翻）"
         ),
+        "local_domain_definition": (
+            "boundaries.BoundaryGeometry.own_local_domain（local-domain manifest 投影後的"
+            "站點 local polygon）；WP-23 起只用於非終止的 local_domain_first_exit 記錄，"
+            "與既有正向追蹤 runtime 共用同一份幾何定義。local_equals_flow=true 的站點"
+            "（新竹／南灣／連江）此多邊形與 flow_domain 相同"
+        ),
+        "local_equals_flow": dict(local_equals_flow),
         "geometry_manifest_file_sha256": dict(boundary_bundle.file_sha256),
         "geometry_manifest_canonical_sha256": dict(boundary_bundle.canonical_component_hashes),
     }
@@ -648,6 +690,8 @@ def build_domain_resources(
         mesh=mesh,
         driver_grid=driver_grid,
         interest_regions=interest_regions,
+        local_domains=local_domains,
+        local_equals_flow=local_equals_flow,
         forcing_resolver_factory=forcing_resolver_factory,
         wave_resolver_factory=wave_resolver_factory,
         available_utc_range_ns=(available_lo_ns, available_hi_ns),

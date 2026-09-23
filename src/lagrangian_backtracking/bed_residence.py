@@ -33,7 +33,9 @@ __all__ = [
     "BED_RESIDENCE_SAMPLING_POLICY_ID",
     "BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION",
     "BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE",
+    "BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER",
     "BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID",
+    "BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID",
     "BedResidenceAvailabilitySampling",
     "BedResidenceStratumRejectionAudit",
     "BedResidenceMode",
@@ -42,10 +44,12 @@ __all__ = [
     "ParticleBedResidenceAgeSample",
     "apply_bed_residence_sampling",
     "derive_bed_residence_particle_seed",
+    "derive_bed_residence_member_seed",
     "resolve_bed_residence_timing",
     "sample_bed_residence_age_hours",
     "sample_bed_residence_age_hours_conditioned_on_availability",
     "sample_bed_residence_age_hours_for_particle",
+    "sample_bed_residence_age_hours_for_member",
     "sample_bed_residence_age_hours_gap_aware",
 ]
 
@@ -72,13 +76,17 @@ BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID: Final[str] = (
     "numpy_pcg64dxsm_stratum_rank_first_available_deposition_v1"
 )
 
-# WP-18：沉底年齡抽樣範圍（age_sampling_scope）——既有抽樣（每個觀測時刻抽一個
-# 年齡、同一到達時刻下全部情境與成員共用）與新增的逐粒子抽樣（每個情境×成員各自
-# 獨立抽一個年齡）。這個範圍字串只描述「年齡怎麼分配給粒子」，不是抽樣演算法本身
-# （演算法仍各自由 sampling_method_id 描述）。
+# WP-18／WP-27：沉底年齡抽樣範圍（age_sampling_scope）——既有抽樣（每個觀測時刻
+# 抽一個年齡、同一到達時刻下全部情境與成員共用）、WP-18 新增的逐粒子抽樣（每個
+# 情境×成員各自獨立抽一個年齡，但因初始條件重建與工作單元規劃未接線，只有原語
+# 可用）、以及 WP-27 新增的折衷抽樣「per_member」（每個站點×到達時刻×系集成員
+# 各自獨立抽一個年齡，同一成員內全部材質與受體共用這個年齡）。這個範圍字串只描述
+# 「年齡怎麼分配給粒子」，不是抽樣演算法本身（演算法仍各自由 sampling_method_id
+# 描述）。
 BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION: Final[str] = "per_observation"
 BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE: Final[str] = "per_particle"
-BedResidenceAgeSamplingScope = Literal["per_observation", "per_particle"]
+BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER: Final[str] = "per_member"
+BedResidenceAgeSamplingScope = Literal["per_observation", "per_particle", "per_member"]
 
 # 逐粒子抽樣不分層（沒有固定樣本數 50 的概念，一個粒子只需要一個年齡），改成對整段
 # 0..maximum_age_days*24 小時做一次 PCG64DXSM permutation、取第一個可用候選；與既有
@@ -86,6 +94,16 @@ BedResidenceAgeSamplingScope = Literal["per_observation", "per_particle"]
 # METHOD_ID）刻意使用不同 method id，避免下游把兩種抽樣結果混淆。
 BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID: Final[str] = (
     "numpy_pcg64dxsm_per_particle_full_range_rejection_v1"
+)
+
+# WP-27：per_member 抽樣沿用與逐粒子抽樣完全相同的演算法（整段候選一次 PCG64DXSM
+# permutation、依序嘗試第一個可用候選），差別只在於呼叫端傳入的身分粒度（見
+# ``derive_bed_residence_member_seed``：keyed by 站點＋到達時刻＋成員，不含材質與
+# 受體）。刻意保留獨立 method id，讓下游 provenance 能區分「這個年齡是逐粒子獨立
+# 抽出」還是「這個年齡是一個成員內全部材質與受體共用」，不會把兩種抽樣範圍的結果
+# 誤判成同一種資料契約。
+BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID: Final[str] = (
+    "numpy_pcg64dxsm_per_member_full_range_rejection_v1"
 )
 
 _HOURS_PER_DAY: Final[int] = 24
@@ -1010,5 +1028,122 @@ def sample_bed_residence_age_hours_for_particle(
         rejected.append(age)
     raise ValueError(
         "bed residence 逐粒子條件式抽樣無可用候選："
+        f"observation_time_utc_ns={observation_time_utc_ns}, candidate_count={len(candidates)}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-27：per_member（每站點×到達時刻×系集成員獨立抽樣，成員內共用）沉底年齡抽樣。
+#
+# 背景（PI 需求與折衷設計，詳見 ``reports/WP-27.md`` 第 1、2 節）：PI 要求「沉底
+# 多久」本身也應是隨機變數，不應該對同一個到達（觀測）事件的全部系集成員都套用
+# 同一個年齡（那正是既有 per_observation 的行為，年齡與到達時刻完全綁定）。完整的
+# per_particle（每個情境×成員各自獨立）在 WP-18 已提供抽樣原語，但下游初始條件
+# 重建與工作單元規劃因規模（相異沉底時刻暴增到「情境數×成員數」量級）與資料契約
+# 因素未接線。per_member 是研究團隊裁決的折衷：把「獨立抽樣」的粒度從「情境×成員」
+# 粗化為「站點×到達時刻×成員」——同一個 (study_site_id, arrival_time_id,
+# member_id) 下，全部材質與全部受體（即同一到達事件、同一成員的全部粒子）共用同一
+# 個抽出的年齡，但不同成員彼此獨立。相異沉底時刻數因此是「每站 50 個到達時刻 × M
+# 個成員」，而不是「情境數 × 成員數」（情境數已含材質與受體，通常是到達時刻數的
+# 10×20=200 倍），讓工作單元規劃與 hour-major 分段的規模維持在可控範圍（見
+# ``reports/WP-27.md`` 第 1 節的合成資料量測）。
+#
+# **範圍誠實揭露**：本節同樣只提供抽樣原語（給定站點、到達時刻與成員身分，抽出
+# 這個 (站點, 到達時刻, 成員) 專屬沉底年齡），可獨立測試其分布、可重現性與可用性
+# 條件。把這個原語接進完整 native 管線——包括把 ``Scenario``／``RunUnit`` 的到達
+# 時刻從「情境固定值」改成「依成員解析」、OCM receptor×arrival 初始條件從
+# 「(receptor_id, arrival_time_id)」擴充成含 member 維度的 50×M×20 筆重建，以及
+# ``production_wiring.build_formal_identity_table`` 的初始位置查詢改依成員解析
+# ——超出本工作包安全範圍，見 ``reports/WP-27.md`` 第 3 節完整說明；本模組不假裝
+# 已經完成那些下游接線。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def derive_bed_residence_member_seed(
+    *, master_seed: int, study_site_id: str, arrival_time_id: str, member_id: int
+) -> int:
+    """由主種子與「站點×到達時刻×成員」身分衍生 per_member 抽樣專屬種子。
+
+    刻意不以 ``scenario_id`` 為輸入（那是材質×受體×到達時刻的完整交叉身分），而是
+    直接用 ``study_site_id``／``arrival_time_id``／``member_id`` 三者，確保同一個
+    到達事件、同一個成員底下，不論哪個材質或哪個受體查詢這個種子，都得到完全相同的
+    結果——這正是「同一成員內全部材質與受體共用一個年齡」的來源。角色標籤
+    ``"bed_residence_age_per_member_v1"`` 與 ``derive_bed_residence_particle_seed``
+    使用的 ``"bed_residence_age_v1"``、``scenarios.derive_member_seed`` 使用的角色
+    標籤都不同，確保三種種子流互相獨立，不會因為共用 ``(master_seed, ...)`` 而產生
+    非預期的跨隨機量相關性。同一身分重跑必得同一年齡，滿足可重現要求。
+    """
+
+    master_seed = _strict_int(master_seed, label="master_seed", minimum=0)
+    member_id = _strict_int(member_id, label="member_id", minimum=0)
+    study_site_id = _nonempty_text(study_site_id, label="study_site_id")
+    arrival_time_id = _nonempty_text(arrival_time_id, label="arrival_time_id")
+    fields = [
+        "bed_residence_age_per_member_v1",
+        str(master_seed),
+        study_site_id,
+        arrival_time_id,
+        str(member_id),
+    ]
+    encoded = json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(encoded).digest()[:16], "big", signed=False)
+
+
+def sample_bed_residence_age_hours_for_member(
+    *,
+    observation_time_utc_ns: int,
+    available_time_ns: Iterable[int],
+    maximum_age_days: int,
+    seed: int,
+) -> ParticleBedResidenceAgeSample:
+    """為單一「站點×到達時刻×成員」抽出一個沉底年齡（整點小時），供該成員內全部
+    材質與受體共用。
+
+    候選範圍、可用性條件與抽樣演算法與
+    :func:`sample_bed_residence_age_hours_for_particle` 完全相同（整段
+    ``0..maximum_age_days*24`` 小時做一次 PCG64DXSM 無放回 permutation，依序嘗試
+    直到「觀測 UTC 減去年齡」落在 ``available_time_ns`` 為止；全部候選都不可用時
+    fail closed，不使用 nearest、linear、zero fill 或跨缺口外插）——唯一差異是回傳
+    的 ``sampling_method_id`` 固定為
+    :data:`BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID`，讓下游 provenance 能區分
+    這個年齡的分配粒度是「成員」而不是「粒子」。呼叫端必須傳入
+    :func:`derive_bed_residence_member_seed` 衍生的 seed，才能保證同一到達事件、
+    同一成員底下不同材質／受體的粒子查到相同結果。
+    """
+
+    maximum_age_days = _strict_int(maximum_age_days, label="maximum_age_days", minimum=1)
+    seed = _strict_int(seed, label="seed", minimum=0)
+    observation_time_utc_ns = _strict_int(
+        observation_time_utc_ns, label="observation_time_utc_ns"
+    )
+    if not _INT64_MIN <= observation_time_utc_ns <= _INT64_MAX:
+        raise ValueError("observation_time_utc_ns 超出有號 64 位範圍")
+    if observation_time_utc_ns % _NANOSECONDS_PER_HOUR:
+        raise ValueError("observation_time_utc_ns 必須落在 exact-hour")
+
+    available_hours = _available_hour_set(
+        available_time_ns, site_id="member", field_name="available_time_ns"
+    )
+
+    total_hours = maximum_age_days * _HOURS_PER_DAY + 1
+    generator = np.random.Generator(np.random.PCG64DXSM(seed))
+    candidates = tuple(
+        int(value)
+        for value in generator.permutation(np.arange(total_hours, dtype=np.int64))
+    )
+    rejected: list[int] = []
+    for age in candidates:
+        if (
+            observation_time_utc_ns - age * _NANOSECONDS_PER_HOUR
+        ) in available_hours:
+            return ParticleBedResidenceAgeSample(
+                age_hours=age,
+                rejected_age_hours=tuple(rejected),
+                candidate_count=len(candidates),
+                sampling_method_id=BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID,
+            )
+        rejected.append(age)
+    raise ValueError(
+        "bed residence per_member 條件式抽樣無可用候選："
         f"observation_time_utc_ns={observation_time_utc_ns}, candidate_count={len(candidates)}"
     )

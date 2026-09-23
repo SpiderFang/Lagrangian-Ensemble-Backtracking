@@ -341,6 +341,19 @@ def test_build_domain_resources_basic_correctness(wiring_config, ocm_and_nww_roo
         assert polygon.is_valid
         assert polygon.area > 0.0
 
+    # WP-23：A 區（貢寮／龜山島）的 local domain 與 flow domain 不同——兩站的
+    # interest_regions（終止用）必須是同一個共用的 flow domain 多邊形物件，
+    # local_domains（非終止 local 首次離開記錄用）則各自不同且明顯小於它；
+    # local_equals_flow 必須是 False，不得誤判成三站等價的情況。
+    assert set(resources.local_domains) == {"gongliao", "guishan"}
+    assert set(resources.local_equals_flow) == {"gongliao", "guishan"}
+    for site_id in ("gongliao", "guishan"):
+        assert resources.local_equals_flow[site_id] is False
+        assert resources.local_domains[site_id].is_valid
+        assert resources.local_domains[site_id].area > 0.0
+        assert resources.local_domains[site_id].area < resources.interest_regions[site_id].area
+    assert resources.interest_regions["gongliao"].equals(resources.interest_regions["guishan"])
+
     lo_ns, hi_ns = resources.available_utc_range_ns
     assert lo_ns == _hour_ns(0)
     assert hi_ns == _hour_ns(47)
@@ -369,7 +382,9 @@ def test_build_domain_resources_basic_correctness(wiring_config, ocm_and_nww_roo
     assert provenance["ocm_reconstruction_attempted"] is False
     assert provenance["ocm_reconstruction_root"] is None
     assert len(provenance["mesh_sha256"]) == 64
-    assert "own_local_domain" in provenance["interest_region_definition"]
+    assert "flow_domain" in provenance["interest_region_definition"]
+    assert "own_local_domain" in provenance["local_domain_definition"]
+    assert provenance["local_equals_flow"] == {"gongliao": False, "guishan": False}
     assert provenance["config_sha256"] == config.config_hash()
 
 
@@ -799,6 +814,12 @@ def _wiring_e2e_build_worker_resources(worker_id: int) -> dict[str, Any]:
         "forcing_resolver": resources.forcing_resolver_factory(),
         "wave_resolver": wave_resolver,
         "interest_region_polygon": resources.interest_regions[_WIRING_E2E_SITE_ID],
+        "local_equals_flow": resources.local_equals_flow[_WIRING_E2E_SITE_ID],
+        "local_domain_polygon": (
+            None
+            if resources.local_equals_flow[_WIRING_E2E_SITE_ID]
+            else resources.local_domains[_WIRING_E2E_SITE_ID]
+        ),
     }
 
 
@@ -843,8 +864,14 @@ def _wiring_e2e_run_unit(resources: dict[str, Any], spec: orch.NativeWorkUnitSpe
         forcing_resolver=resources["forcing_resolver"],
         interest_region_polygon=resources["interest_region_polygon"],
         wave_field_resolver=resources["wave_resolver"],
+        local_equals_flow=resources["local_equals_flow"],
+        local_domain_polygon=resources["local_domain_polygon"],
     )
-    return {"particle_count": int(indices.size), "hours_run": int(result.hours_run)}
+    return {
+        "particle_count": int(indices.size),
+        "hours_run": int(result.hours_run),
+        "local_domain_departure_count": len(result.local_domain_departures),
+    }
 
 
 def test_end_to_end_backward_batch_via_build_domain_resources(

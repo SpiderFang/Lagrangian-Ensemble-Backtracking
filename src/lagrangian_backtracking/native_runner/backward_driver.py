@@ -169,7 +169,7 @@ import sys
 import threading
 import types
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -471,6 +471,7 @@ def _evaluate_finite_depth_stokes_given_wave_number(
 __all__ = [
     "BackwardDriverError",
     "NATIVE_STATUS_ACTIVE",
+    "NATIVE_STATUS_LEFT_FLOW_DOMAIN",
     "NATIVE_STATUS_LEFT_INTEREST_REGION",
     "NATIVE_STATUS_MAX_BACKTRACK",
     "NATIVE_STATUS_STRANDED",
@@ -503,6 +504,8 @@ __all__ = [
     "counter_based_gaussian_pairs",
     "SubstepDiagnostics",
     "HourlyOverheadDiagnostics",
+    "DepartureRecord",
+    "LocalDomainFirstExitRecord",
     "mirror_rk4_substep_loop",
     "BackwardDriverConfig",
     "BackwardDriverResult",
@@ -527,11 +530,29 @@ __all__ = [
 NATIVE_STATUS_ACTIVE = 0
 """仍在追蹤中，尚未終止（對應 ``ParticleStatus.ACTIVE``）。"""
 
-NATIVE_STATUS_LEFT_INTEREST_REGION = 1
-"""已離開關注區域（``own_local_domain``），逆向追蹤在此正常結束。"""
+NATIVE_STATUS_LEFT_FLOW_DOMAIN = 1
+"""已離開流場區域（``flow_domain``）開放邊界，逆向追蹤在此正常結束。
+
+WP-23 修正：此狀態碼過去誤把「離開站點 local domain（``own_local_domain``）」
+當成終止條件（貢寮／龜山島因此在 20 km local domain 邊界就被錯誤截斷，而不是在
+共用的 A 區 flow domain 開放邊界）。裁決後（見
+``docs/foundation/08_design_baseline_and_derived_gates.md`` 第 8 節與
+``docs/development/05_decisions_and_risks.md`` D008）：終止一律以 ``flow_domain``
+開放邊界為準；「離開 ``own_local_domain``」改成**非終止**事件，見
+``LocalDomainFirstExitRecord`` 與 ``BackwardDriverResult.local_domain_departures``。
+對新竹／南灣／連江三站（``local_equals_flow=True``），local domain 與 flow domain
+是同一個多邊形，離開的當下同時觸發本狀態碼**並**在該筆 ``DepartureRecord`` 標記
+``also_local_domain_first_exit=True``，避免重複計數（詳見模組文件「WP-23：
+local domain 與 flow domain 的兩階段終止語意」一節）。"""
+
+NATIVE_STATUS_LEFT_INTEREST_REGION = NATIVE_STATUS_LEFT_FLOW_DOMAIN
+"""``NATIVE_STATUS_LEFT_FLOW_DOMAIN`` 的舊名別名，避免打破既有匯入；新程式碼請改用
+新名稱，語意見該常數的 docstring（WP-23 之前這裡的語意其實是「離開 own_local_domain」，
+WP-23 之後語意已改為「離開 flow_domain」——舊名保留但語意已變更，這正是 WP-23 要
+修正的問題本身，故不建議新程式碼繼續使用舊名）。"""
 
 NATIVE_STATUS_MAX_BACKTRACK = 2
-"""回溯超過設定上限（預設 30 天）仍未離開關注區域，強制停止。"""
+"""回溯超過設定上限（預設 30 天）仍未離開流場區域，強制停止。"""
 
 NATIVE_STATUS_STRANDED = 3
 """擱淺上岸：粒子目前所在元素被 BayTrace 乾濕判定標記為乾。"""
@@ -556,8 +577,8 @@ NATIVE_STATUS_PRE_WINDOW_DEPOSITION = 7
 
 NATIVE_STATUS_DESCRIPTIONS: dict[int, str] = {
     NATIVE_STATUS_ACTIVE: "仍在追蹤中，尚未終止。",
-    NATIVE_STATUS_LEFT_INTEREST_REGION: "已離開關注區域（own_local_domain），正常結束。",
-    NATIVE_STATUS_MAX_BACKTRACK: "回溯已達設定上限，粒子仍在關注區域內，強制停止。",
+    NATIVE_STATUS_LEFT_FLOW_DOMAIN: "已離開流場區域（flow_domain）開放邊界，正常結束。",
+    NATIVE_STATUS_MAX_BACKTRACK: "回溯已達設定上限，粒子仍在流場區域內，強制停止。",
     NATIVE_STATUS_STRANDED: "擱淺上岸：所在元素被判定為乾。",
     NATIVE_STATUS_DEPOSITED: "沉底：下沉行為粒子持續停留在海床附近。",
     NATIVE_STATUS_FORCING_MISSING: "流場缺值：本小時濕節點出現未登錄缺值，該批粒子在此停止。",
@@ -2595,10 +2616,47 @@ class HourlyOverheadDiagnostics:
 
 @dataclass(frozen=True, slots=True)
 class DepartureRecord:
-    """一顆粒子離開追蹤（因任何終止原因）時的位置、時刻與狀態碼。"""
+    """一顆粒子離開追蹤（因任何終止原因）時的位置、時刻與狀態碼。
+
+    ``also_local_domain_first_exit``（WP-23 新增）：只有在這筆記錄的
+    ``status == NATIVE_STATUS_LEFT_FLOW_DOMAIN`` **且**這顆粒子所屬測站的
+    local domain 與 flow domain 相同（``local_equals_flow=True``，目前是新竹／
+    南灣／連江）時才可能是 ``True``——代表「離開 flow domain」與「離開 local
+    domain」是同一次穿越，依規格只寫這一筆事件、不得另外產生
+    ``LocalDomainFirstExitRecord``。對貢寮／龜山島（``local_equals_flow=False``），
+    這個欄位恆為 ``False``；local 首次離開一律另外記在
+    ``BackwardDriverResult.local_domain_departures``。此欄位由呼叫端
+    （``run_backward_batch``／``hour_major.run_flow_domain_hour_major``）在收集完
+    ``departures`` 後依站點身分回填，子步迴圈本身不知道這個站點層級的事實。
+    """
 
     row_particle_index: int
     status: int
+    x_m: float
+    y_m: float
+    z_m: float
+    utc_ns: int
+    also_local_domain_first_exit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LocalDomainFirstExitRecord:
+    """一顆粒子首次離開自己站點 local domain（``own_local_domain``）的非終止事件。
+
+    WP-23 新增。只適用於 local domain 與 flow domain 不同的測站（目前是貢寮、
+    龜山島）；離開後粒子**不終止**、繼續回溯，因此本記錄與
+    ``DepartureRecord``（終止事件）是兩個獨立的資料流，一顆粒子最多各出現一次
+    （local 一次、flow 一次），彼此互不覆蓋。``local_equals_flow=True`` 的測站
+    （新竹／南灣／連江）不會產生這個記錄——那些站點的「離開 local domain」與
+    「離開 flow domain」是同一次穿越，直接由 ``DepartureRecord.
+    also_local_domain_first_exit=True`` 表達，避免重複計數。
+    欄位語意與 ``DepartureRecord`` 對應（位置為公尺制運算座標，``utc_ns`` 是
+    離開當下的 UTC 奈秒）；backward age、所屬邊界分段與弧長位置由後處理層
+    （``postprocess.py``）依 ``arrival_time_utc_ns`` 與 ``BoundaryGeometry.
+    own_local_open_boundary`` 另行推導，本記錄本身不重複保存這些可衍生欄位。
+    """
+
+    row_particle_index: int
     x_m: float
     y_m: float
     z_m: float
@@ -2627,6 +2685,10 @@ def mirror_rk4_substep_loop(
     interest_region_polygon: Polygon | None = None,
     interest_region_polygons: np.ndarray | None = None,
     departures: list[DepartureRecord] | None = None,
+    local_region_polygon: Polygon | None = None,
+    local_region_polygons: np.ndarray | None = None,
+    local_first_exit_pending: np.ndarray | None = None,
+    local_departures: list[LocalDomainFirstExitRecord] | None = None,
 ) -> SubstepDiagnostics:
     """鏡像 ``ParticleTracker.batch_update_particles`` 的子步迴圈（passive＋RK4）。
 
@@ -2657,11 +2719,23 @@ def mirror_rk4_substep_loop(
     - STEP 3 INTERPOLATE（1622 行）：呼叫未修改的
       ``handles.batch_interpolate_velocity``，更新 ``pa.u/v/w`` 供下一個
       子步的 k1 使用。
-    - 每個子步結束後（若提供 ``interest_region_polygon`` 或
-      ``interest_region_polygons``）：以 Shapely 2.0 向量化 ``contains_xy``
-      一次判斷全部作用中粒子是否仍在關注區域內（不對任何粒子逐一建立
-      Shapely 物件），新離開者記錄 ``DepartureRecord`` 並停用
-      （``pa.status=0``、``native_status=NATIVE_STATUS_LEFT_INTEREST_REGION``）。
+    - 每個子步結束後，依序做兩層邊界判定（WP-23：兩層語意不同，local 在前、
+      flow 在後，見模組文件「WP-23：local domain 與 flow domain 的兩階段
+      終止語意」一節）：
+      1. 若提供 ``local_region_polygon``／``local_region_polygons``：以
+         Shapely 2.0 向量化 ``contains_xy`` 判斷「尚未記錄過首次離開」
+         （``local_first_exit_pending`` 為真）且仍作用中的粒子是否仍在自己
+         站點的 local domain 內；新離開者記錄 ``LocalDomainFirstExitRecord``
+         並把 ``local_first_exit_pending`` 該列改為假——**不終止**，粒子
+         （``pa.status``）不變、``native_status`` 不變。
+      2. 若提供 ``interest_region_polygon``／``interest_region_polygons``
+         （WP-23 起代表 flow domain 開放邊界）：以同一種向量化方式判斷全部
+         作用中粒子是否仍在流場區域內，新離開者記錄 ``DepartureRecord`` 並
+         停用（``pa.status=0``、``native_status=NATIVE_STATUS_LEFT_FLOW_DOMAIN``）。
+      因為 local domain 幾何上是 flow domain 的子集，正常情況下第 1 層一定
+      早於（或至少不晚於）第 2 層對同一顆粒子觸發；若某一步同時滿足兩層
+      條件（例如子步位移很大），兩個事件仍會在同一子步各自正確記錄一次，
+      互不覆蓋。
 
     Args:
         pa: 真正的（未修改的）``ParticleArrays`` 執行個體，``x/y/z/u/v/w/
@@ -2683,23 +2757,27 @@ def mirror_rk4_substep_loop(
             這是 WP-9 小時主軸排程使用的模式，讓合併批次的擴散序列與批次
             組成、列序、worker 數完全無關（見模組文件「計數器型擴散亂數」
             一節）。
-        native_status: ``(n,)`` int32，本函式只在偵測到離開關注區域時
-            寫入 ``NATIVE_STATUS_LEFT_INTEREST_REGION``；其餘終止原因由
+        native_status: ``(n,)`` int32，本函式只在偵測到離開流場區域時
+            寫入 ``NATIVE_STATUS_LEFT_FLOW_DOMAIN``；其餘終止原因由
             呼叫端（``run_backward_batch``）在小時邊界另行判定。提供
             ``interest_region_polygon``／``interest_region_polygons`` 時
             必須同時提供本參數。
         substep_utc_ns: 給定子步索引 ``idt``（``1..ndeltp``），回傳該子步
-            結束時對應的 UTC 奈秒，供 ``DepartureRecord.utc_ns`` 使用；
-            提供 ``interest_region_polygon``／``interest_region_polygons``
-            時必須同時提供。
-        interest_region_polygon: **單一**關注區域多邊形，套用到全部 ``n``
-            顆粒子——適用於「整批粒子共用同一個測站」的既有逐單元路徑
-            （``run_backward_batch``）。與 ``interest_region_polygons``
-            互斥。
+            結束時對應的 UTC 奈秒，供 ``DepartureRecord.utc_ns``／
+            ``LocalDomainFirstExitRecord.utc_ns`` 使用；提供
+            ``interest_region_polygon``／``interest_region_polygons``
+            或 ``local_region_polygon``／``local_region_polygons`` 任一者
+            時都必須同時提供。
+        interest_region_polygon: **單一**流場區域（flow domain）開放邊界
+            多邊形，套用到全部 ``n`` 顆粒子——適用於「整批粒子共用同一個
+            測站」的既有逐單元路徑（``run_backward_batch``）。離開此多邊形
+            即終止（WP-23 起語意固定是 flow domain，不是 local domain，
+            見模組文件）。與 ``interest_region_polygons`` 互斥。
         interest_region_polygons: ``(n,)`` 的 Shapely ``Polygon`` object
-            陣列，**逐列**指定每顆粒子自己的關注區域——適用於 WP-9
+            陣列，**逐列**指定每顆粒子自己的流場區域邊界——適用於 WP-9
             小時主軸排程「同一次 kernel 呼叫混合多個測站的粒子」的情境
-            （見 ``hour_major.py``）。Shapely 2.0 的向量化函式（例如
+            （見 ``hour_major.py``）。同一個 flow domain 內的不同站點通常
+            填同一個多邊形物件。Shapely 2.0 的向量化函式（例如
             ``contains_xy``）支援「geometry 引數本身也是與座標陣列等長的
             object 陣列」，逐點配對計算，因此這裡對每個粒子使用正確多邊形
             的計算結果，與「把每個測站的粒子分開、各自呼叫一次
@@ -2707,6 +2785,26 @@ def mirror_rk4_substep_loop(
             計算，不受同一次呼叫還有哪些其他點／多邊形影響），可以安全
             合併呼叫而不改變任何一顆粒子的判定結果。與
             ``interest_region_polygon`` 互斥。
+        local_region_polygon, local_region_polygons: WP-23 新增，語意與
+            ``interest_region_polygon``／``interest_region_polygons`` 對應，
+            但幾何是每個測站**自己的** local domain（``own_local_domain``），
+            離開時**不終止**、只記錄一次 ``LocalDomainFirstExitRecord``
+            （見 ``local_first_exit_pending``）。``local_equals_flow=True``
+            的測站（新竹／南灣／連江）不應傳入這兩個參數（由呼叫端在收集
+            ``departures`` 後改用 ``DepartureRecord.
+            also_local_domain_first_exit`` 表達，見 ``run_backward_batch``）。
+            兩者互斥；提供任一者時必須同時提供 ``local_first_exit_pending``
+            與 ``substep_utc_ns``。
+        local_first_exit_pending: ``(n,)`` bool，**呼叫端配置並跨小時持續
+            傳入的持久陣列**（初始值全 ``True``）；本函式只在偵測到「該列
+            仍為 ``True``、且該粒子仍作用中、且已離開自己的 local domain」
+            時把該列改成 ``False`` 並記一筆 ``LocalDomainFirstExitRecord``，
+            確保同一顆粒子的 local 首次離開全程只記錄一次。提供
+            ``local_region_polygon``／``local_region_polygons`` 時必須同時
+            提供本參數。
+        local_departures: 若提供，本函式會把每個 local domain 首次離開事件
+            以 ``LocalDomainFirstExitRecord`` 附加到這個 list（呼叫端負責
+            跨小時累積，行為與既有 ``departures`` 完全對應）。
 
     Returns:
         ``SubstepDiagnostics``，這個小時的效能拆解。
@@ -2724,6 +2822,15 @@ def mirror_rk4_substep_loop(
         raise BackwardDriverError(
             "提供 interest_region_polygon／interest_region_polygons 時必須同時提供 "
             "native_status 與 substep_utc_ns"
+        )
+    if local_region_polygon is not None and local_region_polygons is not None:
+        raise BackwardDriverError("local_region_polygon 與 local_region_polygons 只能擇一提供")
+    if (local_region_polygon is not None or local_region_polygons is not None) and (
+        local_first_exit_pending is None or substep_utc_ns is None
+    ):
+        raise BackwardDriverError(
+            "提供 local_region_polygon／local_region_polygons 時必須同時提供 "
+            "local_first_exit_pending 與 substep_utc_ns"
         )
     if enable_diffusion:
         if hf1_field is None or hf2_field is None:
@@ -2871,6 +2978,41 @@ def mirror_rk4_substep_loop(
         )
         diag.time_interpolate_s += _time.perf_counter() - t0
 
+        if local_region_polygon is not None or local_region_polygons is not None:
+            t0 = _time.perf_counter()
+            # WP-23：local domain 判定必須在 flow domain 判定「之前」，並且只
+            # 看「仍作用中、且尚未記錄過 local 首次離開」的粒子（不能只用
+            # active_mask，否則同一顆粒子每個子步都會重覆命中）；離開時只翻轉
+            # local_first_exit_pending、完全不動 pa.status／native_status，這是
+            # 「記錄但不終止」與下面 flow domain 判定「記錄並終止」的唯一差異。
+            check_mask = (pa.status == 1) & local_first_exit_pending
+            if np.any(check_mask):
+                inside = np.ones(n, dtype=bool)
+                if local_region_polygon is not None:
+                    inside[check_mask] = contains_xy(
+                        local_region_polygon, pa.x[check_mask], pa.y[check_mask]
+                    )
+                else:
+                    inside[check_mask] = contains_xy(
+                        local_region_polygons[check_mask], pa.x[check_mask], pa.y[check_mask]
+                    )
+                left_local_now = check_mask & ~inside
+                if np.any(left_local_now):
+                    local_utc_ns = int(substep_utc_ns(idt))
+                    if local_departures is not None:
+                        for row in np.flatnonzero(left_local_now):
+                            local_departures.append(
+                                LocalDomainFirstExitRecord(
+                                    row_particle_index=int(row),
+                                    x_m=float(pa.x[row]),
+                                    y_m=float(pa.y[row]),
+                                    z_m=float(pa.z[row]),
+                                    utc_ns=local_utc_ns,
+                                )
+                            )
+                    local_first_exit_pending[left_local_now] = False
+            diag.time_interest_check_s += _time.perf_counter() - t0
+
         if interest_region_polygon is not None or interest_region_polygons is not None:
             t0 = _time.perf_counter()
             active_mask = pa.status == 1
@@ -2892,14 +3034,14 @@ def mirror_rk4_substep_loop(
                             departures.append(
                                 DepartureRecord(
                                     row_particle_index=int(row),
-                                    status=NATIVE_STATUS_LEFT_INTEREST_REGION,
+                                    status=NATIVE_STATUS_LEFT_FLOW_DOMAIN,
                                     x_m=float(pa.x[row]),
                                     y_m=float(pa.y[row]),
                                     z_m=float(pa.z[row]),
                                     utc_ns=utc_ns,
                                 )
                             )
-                    native_status[left_now] = NATIVE_STATUS_LEFT_INTEREST_REGION
+                    native_status[left_now] = NATIVE_STATUS_LEFT_FLOW_DOMAIN
                     pa.status[left_now] = 0
             diag.time_interest_check_s += _time.perf_counter() - t0
 
@@ -3044,6 +3186,14 @@ class BackwardDriverResult:
     未在其中出現、且 ``hours_run`` 未達 ``max_backtrack_seconds`` 就結束
     （理論上不會發生，因為主迴圈只在全部粒子都終止或觸及上限才結束）的
     情況不應存在，可作為驗收時的一致性檢查。
+
+    ``local_domain_departures``（WP-23 新增）是**非終止**事件：只記錄
+    ``local_equals_flow=False`` 的測站（目前是貢寮、龜山島）首次離開自己
+    local domain 的位置與時刻，一顆粒子至多出現一次，且與 ``departures``
+    互不重疊（一顆粒子可以同時出現在兩邊：local 一次、flow 一次）。
+    ``local_equals_flow=True`` 的測站（新竹／南灣／連江）不會在這裡出現，
+    改由 ``departures`` 對應那筆 ``DepartureRecord`` 的
+    ``also_local_domain_first_exit=True`` 表達，見該欄位 docstring。
     """
 
     row_particle_index: np.ndarray
@@ -3061,6 +3211,7 @@ class BackwardDriverResult:
     diagnostics: SubstepDiagnostics
     overhead_diagnostics: HourlyOverheadDiagnostics
     hours_run: int
+    local_domain_departures: tuple[LocalDomainFirstExitRecord, ...] = ()
 
 
 _HOUR_NS = 3_600_000_000_000
@@ -3141,6 +3292,8 @@ def run_backward_batch(
     config: BackwardDriverConfig,
     forcing_resolver: Callable[[int], HourlyFieldPair],
     interest_region_polygon: Polygon,
+    local_equals_flow: bool = True,
+    local_domain_polygon: Polygon | None = None,
     wave_field_resolver: Callable[[int], WaveFieldAtNodes] | None = None,
     composed_base_cache: MutableMapping[tuple[int, int], ComposedCurrentAndStokesFields] | None = None,
     smagorinsky_cache: MutableMapping[int, np.ndarray] | None = None,
@@ -3158,8 +3311,23 @@ def run_backward_batch(
             ``HourlyFieldPair``；正式用途應綁定一個 ``ibf=-1`` 的
             ``NativeForcingBridgeReader.resolve``，測試可用合成函式替代
             （見模組文件「已知限制」第 2 點與測試檔）。
-        interest_region_polygon: 關注區域（``own_local_domain``），公尺制
-            座標，與網格同一投影。
+        interest_region_polygon: 流場區域（``flow_domain``）開放邊界，公尺制
+            座標，與網格同一投影；離開此多邊形即終止（WP-23 起固定語意，
+            見模組文件「WP-23」一節）。這批粒子必須全部屬於同一個測站
+            （``run_backward_batch`` 是逐單元路徑）。
+        local_equals_flow: 這批粒子所屬測站的 local domain 是否與 flow domain
+            相同（``boundaries.BoundaryGeometry.local_equals_flow``，目前新竹／
+            南灣／連江為 ``True``，貢寮／龜山島為 ``False``）。``True`` 時
+            ``local_domain_polygon`` 必須是 ``None``（local 首次離開與 flow
+            開放邊界離開是同一次穿越，直接在對應 ``DepartureRecord`` 標記
+            ``also_local_domain_first_exit=True``，不呼叫子步迴圈的 local
+            檢查）；``False`` 時必須提供 ``local_domain_polygon``，fail-closed
+            拒絕漏傳（避免默默把貢寮／龜山島當成 local==flow 處理）。
+        local_domain_polygon: 這批粒子所屬測站自己的 local domain
+            （``own_local_domain``），公尺制座標；只在 ``local_equals_flow=
+            False`` 時提供，離開時記錄非終止的 ``LocalDomainFirstExitRecord``
+            （見 ``BackwardDriverResult.local_domain_departures``），粒子繼續
+            回溯直到真正離開 ``interest_region_polygon``（flow domain）。
         wave_field_resolver: 給定目標 UTC 奈秒，回傳該時刻已內插到追蹤
             網格節點的波浪場；``None`` 時完全不啟用 Stokes（見模組文件
             「已知限制」第 2 點：目前沒有 NWW3→節點的橋接模組）。
@@ -3193,6 +3361,16 @@ def run_backward_batch(
 
     if config.arrival_time_utc_ns <= 0:
         raise BackwardDriverError("arrival_time_utc_ns 必須是正值 UTC 奈秒")
+    if local_equals_flow and local_domain_polygon is not None:
+        raise BackwardDriverError(
+            "local_equals_flow=True 時 local domain 與 flow domain 是同一個多邊形，"
+            "不可另外提供 local_domain_polygon（fail-closed，避免兩份幾何不小心不一致）"
+        )
+    if not local_equals_flow and local_domain_polygon is None:
+        raise BackwardDriverError(
+            "local_equals_flow=False 時必須提供 local_domain_polygon，fail-closed 拒絕："
+            "這代表呼叫端沒有正確辨識這個測站是貢寮／龜山島這類 local≠flow 的站點"
+        )
 
     n = int(np.asarray(soa.x).shape[0])
     pa = handles.particle_arrays_cls(n)
@@ -3209,6 +3387,10 @@ def run_backward_batch(
 
     native_status = np.full(n, NATIVE_STATUS_ACTIVE, dtype=np.int32)
     departures: list[DepartureRecord] = []
+    local_departures: list[LocalDomainFirstExitRecord] = []
+    local_first_exit_pending = (
+        np.ones(n, dtype=bool) if local_domain_polygon is not None else None
+    )
     total_diag = SubstepDiagnostics()
     total_overhead = HourlyOverheadDiagnostics()
 
@@ -3444,6 +3626,9 @@ def run_backward_batch(
             substep_utc_ns=_substep_utc_ns,
             interest_region_polygon=interest_region_polygon,
             departures=departures,
+            local_region_polygon=local_domain_polygon,
+            local_first_exit_pending=local_first_exit_pending,
+            local_departures=local_departures if local_domain_polygon is not None else None,
         )
         total_diag.add(diag)
         total_overhead.add(hour_overhead)
@@ -3509,6 +3694,19 @@ def run_backward_batch(
             trajectory_status.append(native_status.copy())
             next_output_utc -= output_interval_ns
 
+    if local_equals_flow:
+        # WP-23：local domain 與 flow domain 是同一個多邊形時，「離開 flow
+        # domain」這個終止事件本身就是「離開 local domain」——不呼叫子步迴圈
+        # 的 local 檢查（上面 local_domain_polygon 恆為 None），改在這裡對
+        # 每一筆 flow-exit 終止事件回填 also_local_domain_first_exit=True，
+        # 避免另外產生一筆重複的 LocalDomainFirstExitRecord。
+        departures = [
+            replace(record, also_local_domain_first_exit=True)
+            if record.status == NATIVE_STATUS_LEFT_FLOW_DOMAIN
+            else record
+            for record in departures
+        ]
+
     departure_by_row: dict[int, DepartureRecord] = {}
     for record in departures:
         departure_by_row[record.row_particle_index] = record
@@ -3532,4 +3730,5 @@ def run_backward_batch(
         diagnostics=total_diag,
         overhead_diagnostics=total_overhead,
         hours_run=hours_run,
+        local_domain_departures=tuple(local_departures),
     )

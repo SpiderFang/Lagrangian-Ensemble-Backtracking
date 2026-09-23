@@ -104,14 +104,32 @@ from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from .backward_driver import (
-    NATIVE_STATUS_LEFT_INTEREST_REGION,
+    NATIVE_STATUS_LEFT_FLOW_DOMAIN,
     BackwardDriverError,
     BayTraceModuleHandles,
     ComposedFieldPair,
     DepartureRecord,
+    LocalDomainFirstExitRecord,
     NativeBackwardDriverGrid,
     SubstepDiagnostics,
 )
+
+
+def _empty_region_arrays(
+    n: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """沒有提供任何區域（``has_interest_region``／``has_local_region`` 皆假）時，
+    仍要餵給 njit kernel 型別穩定的空陣列（kernel 內部不會讀取這些內容，
+    但 numba 需要看到與「有提供」分支完全相同的 dtype／維度才能共用同一份
+    編譯後的機器碼，見模組文件「本模組的解法」一節）。"""
+
+    poly_id = np.zeros(n, dtype=np.int64)
+    ring_x = np.zeros(0, dtype=np.float64)
+    ring_y = np.zeros(0, dtype=np.float64)
+    ring_vertex_offsets = np.zeros(1, dtype=np.int64)
+    subpoly_ring_offsets = np.zeros(1, dtype=np.int64)
+    poly_subpoly_offsets = np.zeros(1, dtype=np.int64)
+    return poly_id, ring_x, ring_y, ring_vertex_offsets, subpoly_ring_offsets, poly_subpoly_offsets
 
 __all__ = [
     "InterestRegionArrays",
@@ -401,7 +419,7 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
     batch_interpolate_velocity = handles.batch_interpolate_velocity
     batch_interpolate_diffusivity = handles.batch_interpolate_diffusivity
 
-    native_status_left_interest_region = np.int32(NATIVE_STATUS_LEFT_INTEREST_REGION)
+    native_status_left_flow_domain = np.int32(NATIVE_STATUS_LEFT_FLOW_DOMAIN)
 
     @njit(cache=False)
     def _kernel(
@@ -418,13 +436,19 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
         has_interest_region, poly_id,
         region_ring_x, region_ring_y, region_ring_vertex_offsets,
         region_subpoly_ring_offsets, region_poly_subpoly_offsets,
+        has_local_region, local_poly_id,
+        local_region_ring_x, local_region_ring_y, local_region_ring_vertex_offsets,
+        local_region_subpoly_ring_offsets, local_region_poly_subpoly_offsets,
+        local_first_exit_pending,
         native_status, substep_utc_ns_values,
         dep_row, dep_x, dep_y, dep_z, dep_utc_ns,
+        local_dep_row, local_dep_x, local_dep_y, local_dep_z, local_dep_utc_ns,
         needs_fallback,
     ):
         n = px.shape[0]
         n_grid_nodes = grid_x.shape[0]
         dep_count = 0
+        local_dep_count = 0
         fail_substep = -1
         fail_count = 0
         zero_diff_field = np.zeros((nvrt, n_grid_nodes), dtype=np.float64)
@@ -509,6 +533,32 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
                 p_u, p_v, p_w,
             )
 
+            if has_local_region:
+                # WP-23：local domain 判定必須排在 flow domain 判定之前，且
+                # 只看「仍作用中、且尚未記錄過首次離開」（local_first_exit_
+                # pending[ip]）的粒子；離開時只翻轉 pending 旗標、記一筆非
+                # 終止事件，完全不動 p_status／native_status——這是與下面
+                # flow domain 判定「記錄並終止」的唯一差異。
+                local_utc_ns = substep_utc_ns_values[idt - 1]
+                for ip in range(n):
+                    if p_status[ip] != 1 or not local_first_exit_pending[ip]:
+                        continue
+                    lpid = local_poly_id[ip]
+                    local_inside = _point_in_geometry_numba(
+                        px[ip], py[ip],
+                        local_region_ring_x, local_region_ring_y, local_region_ring_vertex_offsets,
+                        local_region_subpoly_ring_offsets, local_region_poly_subpoly_offsets,
+                        lpid,
+                    )
+                    if not local_inside:
+                        local_dep_row[local_dep_count] = ip
+                        local_dep_x[local_dep_count] = px[ip]
+                        local_dep_y[local_dep_count] = py[ip]
+                        local_dep_z[local_dep_count] = pz[ip]
+                        local_dep_utc_ns[local_dep_count] = local_utc_ns
+                        local_dep_count += 1
+                        local_first_exit_pending[ip] = False
+
             if has_interest_region:
                 utc_ns = substep_utc_ns_values[idt - 1]
                 for ip in range(n):
@@ -528,7 +578,7 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
                         dep_z[dep_count] = pz[ip]
                         dep_utc_ns[dep_count] = utc_ns
                         dep_count += 1
-                        native_status[ip] = native_status_left_interest_region
+                        native_status[ip] = native_status_left_flow_domain
                         # pa.status（BayTrace 原版粒子狀態，1=作用中）的 0 代表
                         # 「不再作用中」；與 NATIVE_STATUS_ACTIVE（native_status
                         # 語意下的「仍在追蹤中」）恰好都是整數 0 純屬巧合，兩個
@@ -540,7 +590,7 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
                 y0[ip] = py[ip]
                 z0[ip] = pz[ip]
 
-        return dep_count, fail_substep, fail_count
+        return dep_count, local_dep_count, fail_substep, fail_count
 
     _KERNEL_CACHE[cache_key] = _kernel
     return _kernel
@@ -567,6 +617,10 @@ def mirror_rk4_substep_loop_numba(
     interest_region_polygon: Polygon | MultiPolygon | None = None,
     interest_region_polygons: np.ndarray | None = None,
     departures: list[DepartureRecord] | None = None,
+    local_region_polygon: Polygon | MultiPolygon | None = None,
+    local_region_polygons: np.ndarray | None = None,
+    local_first_exit_pending: np.ndarray | None = None,
+    local_departures: list[LocalDomainFirstExitRecord] | None = None,
 ) -> SubstepDiagnostics:
     """``mirror_rk4_substep_loop`` 的 WP-16 任務 2 融合版本：整個子步迴圈
     （含對 BayTrace 原版批次核心的呼叫）跑在單一 ``@njit`` 呼叫裡，見模組
@@ -574,6 +628,15 @@ def mirror_rk4_substep_loop_numba(
     透過 ``HourMajorConfig.substep_loop_impl`` 切換；已知差異見模組文件
     「與原版行為的已知差異」一節，最重要的是**只支援計數器型擴散亂數**
     （不支援 ``rng`` 參數）。
+
+    WP-23：``local_region_polygon``／``local_region_polygons``／
+    ``local_first_exit_pending``／``local_departures`` 四個參數與
+    ``mirror_rk4_substep_loop`` 的同名參數語意完全對應（見該函式
+    docstring）——``interest_region_*`` 系列 WP-23 起代表 **flow domain**
+    開放邊界（離開即終止），``local_region_*`` 系列代表每顆粒子自己站點
+    的 **local domain**（``own_local_domain``，離開時只記錄、不終止）。
+    兩層判定在融合 kernel 內部依相同順序（local 先於 flow）執行，見
+    ``build_fused_substep_kernel`` 內的 ``_kernel`` 實作。
 
     Returns:
         ``SubstepDiagnostics``，``time_move_s`` 是整個融合 kernel 呼叫的
@@ -591,6 +654,14 @@ def mirror_rk4_substep_loop_numba(
         raise BackwardDriverError(
             "提供 interest_region_polygon／interest_region_polygons 時必須同時提供 "
             "native_status 與 substep_utc_ns"
+        )
+    if local_region_polygon is not None and local_region_polygons is not None:
+        raise BackwardDriverError("local_region_polygon 與 local_region_polygons 只能擇一提供")
+    has_local_region = local_region_polygon is not None or local_region_polygons is not None
+    if has_local_region and (local_first_exit_pending is None or substep_utc_ns is None):
+        raise BackwardDriverError(
+            "提供 local_region_polygon／local_region_polygons 時必須同時提供 "
+            "local_first_exit_pending 與 substep_utc_ns"
         )
     if enable_diffusion:
         if hf1_field is None or hf2_field is None:
@@ -629,6 +700,8 @@ def mirror_rk4_substep_loop_numba(
         seed_hi = np.zeros(n, dtype=np.uint64)
         step_counter = np.zeros(n, dtype=np.int64)
 
+    needs_utc_ns_values = has_interest_region or has_local_region
+
     if has_interest_region:
         region_arrays = prepare_interest_region_arrays(
             interest_region_polygon if interest_region_polygon is not None else interest_region_polygons
@@ -645,16 +718,37 @@ def mirror_rk4_substep_loop_numba(
         region_ring_vertex_offsets = region_arrays.ring_vertex_offsets
         region_subpoly_ring_offsets = region_arrays.subpoly_ring_offsets
         region_poly_subpoly_offsets = region_arrays.poly_subpoly_offsets
+    else:
+        (
+            poly_id, region_ring_x, region_ring_y,
+            region_ring_vertex_offsets, region_subpoly_ring_offsets, region_poly_subpoly_offsets,
+        ) = _empty_region_arrays(n)
+
+    if has_local_region:
+        local_arrays = prepare_interest_region_arrays(
+            local_region_polygon if local_region_polygon is not None else local_region_polygons
+        )
+        if local_region_polygon is not None:
+            local_poly_id = np.zeros(n, dtype=np.int64)
+        else:
+            local_poly_id = local_arrays.poly_id
+        local_region_ring_x = local_arrays.ring_x
+        local_region_ring_y = local_arrays.ring_y
+        local_region_ring_vertex_offsets = local_arrays.ring_vertex_offsets
+        local_region_subpoly_ring_offsets = local_arrays.subpoly_ring_offsets
+        local_region_poly_subpoly_offsets = local_arrays.poly_subpoly_offsets
+    else:
+        (
+            local_poly_id, local_region_ring_x, local_region_ring_y,
+            local_region_ring_vertex_offsets, local_region_subpoly_ring_offsets,
+            local_region_poly_subpoly_offsets,
+        ) = _empty_region_arrays(n)
+
+    if needs_utc_ns_values:
         substep_utc_ns_values = np.asarray(
             [int(substep_utc_ns(idt)) for idt in range(1, ndeltp + 1)], dtype=np.int64
         )
     else:
-        poly_id = np.zeros(n, dtype=np.int64)
-        region_ring_x = np.zeros(0, dtype=np.float64)
-        region_ring_y = np.zeros(0, dtype=np.float64)
-        region_ring_vertex_offsets = np.zeros(1, dtype=np.int64)
-        region_subpoly_ring_offsets = np.zeros(1, dtype=np.int64)
-        region_poly_subpoly_offsets = np.zeros(1, dtype=np.int64)
         substep_utc_ns_values = np.zeros(max(ndeltp, 1), dtype=np.int64)
 
     dep_row = np.full(n, -1, dtype=np.int64)
@@ -663,9 +757,24 @@ def mirror_rk4_substep_loop_numba(
     dep_z = np.zeros(n, dtype=np.float64)
     dep_utc_ns = np.zeros(n, dtype=np.int64)
 
+    local_dep_row = np.full(n, -1, dtype=np.int64)
+    local_dep_x = np.zeros(n, dtype=np.float64)
+    local_dep_y = np.zeros(n, dtype=np.float64)
+    local_dep_z = np.zeros(n, dtype=np.float64)
+    local_dep_utc_ns = np.zeros(n, dtype=np.int64)
+
+    # ``local_first_exit_pending`` 由呼叫端配置並跨小時持續傳入（見
+    # ``mirror_rk4_substep_loop`` docstring 同名參數）；沒有 local domain
+    # 判定時仍要餵一個型別穩定的陣列給 kernel，但 kernel 不會讀寫它
+    # （``has_local_region`` 為假時整段判定被跳過）。
+    local_pending_arg = (
+        local_first_exit_pending if local_first_exit_pending is not None
+        else np.zeros(n, dtype=bool)
+    )
+
     elem_is_dry_i64 = np.ascontiguousarray(composed.elem_is_dry, dtype=np.int64)
 
-    dep_count, fail_substep, fail_count = kernel(
+    dep_count, local_dep_count, fail_substep, fail_count = kernel(
         pa.x, pa.y, pa.z, pa.u, pa.v, pa.w, pa.x_prev, pa.y_prev, pa.element, pa.status, pa.inbr, pa.rnds,
         pa.dhfx, pa.dhfy, pa.dhfz, pa.grdx, pa.grdy, pa.grdz, pa.wind_x, pa.wind_y,
         x0, y0, z0,
@@ -681,9 +790,14 @@ def mirror_rk4_substep_loop_numba(
         bool(has_interest_region), poly_id,
         region_ring_x, region_ring_y, region_ring_vertex_offsets,
         region_subpoly_ring_offsets, region_poly_subpoly_offsets,
+        bool(has_local_region), local_poly_id,
+        local_region_ring_x, local_region_ring_y, local_region_ring_vertex_offsets,
+        local_region_subpoly_ring_offsets, local_region_poly_subpoly_offsets,
+        local_pending_arg,
         native_status if native_status is not None else np.zeros(n, dtype=np.int32),
         substep_utc_ns_values,
         dep_row, dep_x, dep_y, dep_z, dep_utc_ns,
+        local_dep_row, local_dep_x, local_dep_y, local_dep_z, local_dep_utc_ns,
         needs_fallback,
     )
 
@@ -699,11 +813,23 @@ def mirror_rk4_substep_loop_numba(
             departures.append(
                 DepartureRecord(
                     row_particle_index=int(dep_row[i]),
-                    status=NATIVE_STATUS_LEFT_INTEREST_REGION,
+                    status=NATIVE_STATUS_LEFT_FLOW_DOMAIN,
                     x_m=float(dep_x[i]),
                     y_m=float(dep_y[i]),
                     z_m=float(dep_z[i]),
                     utc_ns=int(dep_utc_ns[i]),
+                )
+            )
+
+    if local_departures is not None and local_dep_count > 0:
+        for i in range(local_dep_count):
+            local_departures.append(
+                LocalDomainFirstExitRecord(
+                    row_particle_index=int(local_dep_row[i]),
+                    x_m=float(local_dep_x[i]),
+                    y_m=float(local_dep_y[i]),
+                    z_m=float(local_dep_z[i]),
+                    utc_ns=int(local_dep_utc_ns[i]),
                 )
             )
 

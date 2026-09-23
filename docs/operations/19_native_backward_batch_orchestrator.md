@@ -19,10 +19,25 @@
 (analysis_region_id, arrival_time_utc_ns, settling_velocity_mps, study_site_id)
 ```
 
-之所以保留 `study_site_id`，是因為貢寮與龜山島雖然共用 A 區流場資料，但各自有獨立的
-`interest_region_polygon`（own local domain），而 `run_backward_batch` 要求同一次呼叫
-內只能有一個 interest region；把 `study_site_id` 拆開可以避免把兩站粒子混進同一次呼叫
-而破壞其中一站的局部邊界語意。
+之所以保留 `study_site_id`，是因為 `backward_driver.run_backward_batch` 同一次呼叫只能
+接受**一個** `local_domain_polygon`（WP-23 裁決後的現行語意，見下方說明），而貢寮與
+龜山島雖然共用同一個 A 區 `interest_region_polygon`（終止邊界固定用 flow domain 開放
+邊界，即 `flow_domain_open_exit`；兩站共用同一個多邊形），卻各自有獨立的 20 km local
+domain。把 `study_site_id` 拆開，是為了讓每次呼叫都能餵進正確站點自己的
+`local_domain_polygon`，避免把兩站粒子混進同一次呼叫而弄錯其中一站的 local 首次離開
+（`local_domain_first_exit`，非終止，只記錄不停止）判定。
+
+**WP-23 裁決（研究團隊已確認，取代本節原本「各站各自獨立 interest region」的舊描述）**：
+貢寮／龜山島正式 M=1 成果曾經在 20 km local domain 邊界就停止回溯，而不是在兩站共用的
+A 區 flow domain 最外圍開放邊界停止，導致這兩站的邊界方位統計與新竹／南灣／連江三站
+（local domain 與 flow domain 相同，即 `local_equals_flow=True`）語意不同、不可跨站
+比較。研究團隊裁決後，終止一律改回以 flow domain 開放邊界為準；離開 local domain 改成
+非終止事件，只記錄（`backward_driver.LocalDomainFirstExitRecord`／
+`BackwardDriverResult.local_domain_departures`）、不停止積分。詳見
+`docs/foundation/08_design_baseline_and_derived_gates.md` 第 8 節、
+`docs/development/05_decisions_and_risks.md` D008，以及
+`native_runner/production_wiring.py` 模組 docstring「關注區域（`interest_regions`）
+定義的選擇與理由」一節的完整討論（含歷史上為何曾經選 local domain、以及推翻的理由）。
 
 排程／forcing 重用鍵值則刻意更粗：
 

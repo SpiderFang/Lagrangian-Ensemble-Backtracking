@@ -24,6 +24,7 @@ from shapely.geometry import Polygon
 
 from .accelerated import PHYSICS_KERNEL_BACKEND_NUMPY_V1
 from .bed_residence import (
+    BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
     BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION,
     BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
@@ -640,12 +641,19 @@ class BedResidenceTimeConfig(StrictModel):
         "record_pre_window_deposition_without_transport"
     ]
     runtime_horizon_support_days: StrictInt | None
-    # WP-18 新增：既有抽樣（每個觀測時刻共用一個年齡，全部情境與成員共用）與新增的
-    # 逐粒子抽樣（每個情境×成員各自獨立抽一個年齡）並存，由此欄位切換。預設
-    # ``per_observation`` 保留現行行為，位元相同；未明示此欄位的舊 YAML 由
-    # ``normalized_payload`` 移除這個 Pydantic 補上的預設值，不改變既有 config hash
-    # （見該函式對 ``availability_conditioning_policy`` 的相同處理方式）。
-    age_sampling_scope: Literal["per_observation", "per_particle"] = (
+    # WP-18 新增：既有抽樣（每個觀測時刻共用一個年齡，全部情境與成員共用）與逐粒子
+    # 抽樣（每個情境×成員各自獨立抽一個年齡）並存，由此欄位切換。WP-27 再新增
+    # ``per_member``（每個站點×到達時刻×系集成員各自獨立抽一個年齡，同一成員內
+    # 全部材質與受體共用；折衷於 per_observation 與 per_particle 之間，詳見
+    # ``bed_residence.py`` WP-27 章節與 ``reports/WP-27.md``）。**誠實狀態**：
+    # ``per_particle``／``per_member`` 目前都只有抽樣原語（見 ``bed_residence.py``）
+    # 通過驗證，尚未接線進 ``native_runner`` 的初始條件重建與工作單元規劃，接受
+    # 這個設定值不代表正式管線能真的執行；此欄位只負責契約層驗收，接線狀態見
+    # 各自的 WP 報告。預設 ``per_observation`` 保留現行行為，位元相同；未明示
+    # 此欄位的舊 YAML 由 ``normalized_payload`` 移除這個 Pydantic 補上的預設值，
+    # 不改變既有 config hash（見該函式對 ``availability_conditioning_policy``
+    # 的相同處理方式）。
+    age_sampling_scope: Literal["per_observation", "per_particle", "per_member"] = (
         BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION
     )
     # WP-18 新增：horizon-suite 實際要發布哪些回溯模式的 release（不是「支援」哪些
@@ -715,10 +723,11 @@ class BedResidenceTimeConfig(StrictModel):
         if self.age_sampling_scope not in {
             BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_OBSERVATION,
             BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE,
+            BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
         }:
             raise ValueError(
                 "scenarios.bed_residence_time.age_sampling_scope 不支援；"
-                "必須是 per_observation 或 per_particle"
+                "必須是 per_observation、per_particle 或 per_member"
             )
         if self.formal_release_backtrack_modes is not None:
             modes = self.formal_release_backtrack_modes

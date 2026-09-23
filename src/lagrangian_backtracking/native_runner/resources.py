@@ -41,9 +41,32 @@ class DomainResources:
         ``backward_driver.NativeBackwardDriverGrid``（或同欄位物件）；由 ``mesh`` 與靜態
         垂向資訊一次建立，交給 BayTrace 核心使用。
     interest_regions:
-        「測站識別碼 → 關注區域多邊形（Shapely ``Polygon``，公尺座標）」。工作書規定逆向
-        追蹤持續到粒子完全離開其所屬測站的關注區域為止；同一區域的不同測站有各自的
-        多邊形，所以驅動層必須依每顆粒子的測站選用對應多邊形。
+        「測站識別碼 → 流場區域（flow domain）開放邊界多邊形（Shapely ``Polygon``，公尺
+        座標）」。**WP-23 起語意固定為終止邊界**：逆向追蹤持續到粒子完全離開所屬流場
+        區域為止才停止（見
+        ``docs/foundation/08_design_baseline_and_derived_gates.md`` 第 8 節、
+        ``docs/development/05_decisions_and_risks.md`` D008）。同一個流場區域（例如 A 區
+        的貢寮／龜山島）內所有測站共用同一個多邊形物件；``local_domains`` 不同的測站才
+        各自不同。欄位名稱沿用「interest_regions」是歷史命名（WP-23 之前這裡誤放
+        ``own_local_domain``，正是本次要修正的問題本身），語意已改變，新程式碼請依這份
+        docstring 理解，不要望文生義。
+    local_domains:
+        WP-23 新增。「測站識別碼 → 該測站自己 local domain 多邊形（``own_local_domain``，
+        Shapely ``Polygon``，公尺座標）」。只用於**非終止**的「local domain 首次離開」
+        記錄（見 ``backward_driver.LocalDomainFirstExitRecord``），粒子離開此多邊形後
+        仍繼續回溯直到離開 ``interest_regions`` 對應的 flow domain。``local_equals_flow``
+        為真的測站，這裡仍會填入與 ``interest_regions`` 相同的多邊形物件（不是 ``None``），
+        但呼叫端（``hour_major_provider.py``／``run_backward_batch``）必須依
+        ``local_equals_flow`` 判斷是否要把它當成獨立幾何傳給驅動層（``local_equals_flow=
+        True`` 時不得另外傳入，否則會被 ``run_backward_batch`` fail-closed 拒絕，見該函式
+        docstring）——本欄位本身不做這層過濾，是刻意讓呼叫端保留完整資訊自行判斷。
+    local_equals_flow:
+        WP-23 新增。「測站識別碼 → 該測站的 local domain 是否與 flow domain 相同
+        （``boundaries.BoundaryGeometry.local_equals_flow``）」。目前新竹／南灣／連江為
+        ``True``（local domain 與 flow domain 是同一個多邊形，只有一次終止事件，同時具
+        雙重語意）；貢寮／龜山島為 ``False``（local 首次離開與 flow 終止離開是兩個獨立
+        時刻的事件）。呼叫端 fail-closed 依此決定要不要把 ``local_domains`` 的幾何傳給
+        ``run_backward_batch``／小時主軸排程。
     forcing_resolver_factory:
         無參數函式，回傳「給定 UTC 奈秒 → ``forcing_bridge.HourlyFieldPair``」的解析器，
         且必須是逆向（``ibf=-1``）設定。每個工作程序各自呼叫一次，取得自己的解析器與
@@ -63,6 +86,8 @@ class DomainResources:
     mesh: Any
     driver_grid: Any
     interest_regions: Mapping[str, Any]
+    local_domains: Mapping[str, Any]
+    local_equals_flow: Mapping[str, bool]
     forcing_resolver_factory: Callable[[], Callable[[int], Any]]
     wave_resolver_factory: Callable[[], Callable[[int], Any]] | None
     available_utc_range_ns: tuple[int, int]

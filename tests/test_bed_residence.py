@@ -10,15 +10,18 @@ from lagrangian_backtracking.bed_residence import (
     BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID,
     BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_POLICY_ID,
     BED_RESIDENCE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
     apply_bed_residence_sampling,
+    derive_bed_residence_member_seed,
     derive_bed_residence_particle_seed,
     resolve_bed_residence_timing,
     sample_bed_residence_age_hours,
     sample_bed_residence_age_hours_conditioned_on_availability,
+    sample_bed_residence_age_hours_for_member,
     sample_bed_residence_age_hours_for_particle,
 )
 from lagrangian_backtracking.gap_policy import (
@@ -164,6 +167,75 @@ def test_age_sampler_is_reproducible_unique_and_stratified_for_all_sites() -> No
         key.replace("guishan", "gongliao"): value
         for key, value in age_by_anchor_b.items()
     }
+
+
+def test_age_sampler_legacy_output_is_bit_identical_to_known_golden_vector() -> None:
+    """WP-27 硬要求：``per_member`` 開發過程不得改動 ``per_observation`` 既有結果。
+
+    本測試把 ``sample_bed_residence_age_hours``（既有 legacy 抽樣核心，仍是
+    ``age_sampling_scope=per_observation`` 在未啟用缺口條件式抽樣時唯一使用的
+    函式）在固定 ``(maximum_age_days=90, sample_count=50, seed=_SEED)`` 下的輸出，
+    與一組寫死的「黃金值」（於 WP-27 開工前、確認 WP-27 完全沒有修改本函式任何
+    一行程式碼時算出並貼進本檔）逐一比對。任何未來重構若不慎改動這個函式的演算法
+    （即使只是內部呼叫順序或型別轉換），本測試會直接失敗，而不必依賴「目測 diff」
+    來確認 per_observation 位元相同——這是本工作包對「既有結果必須位元相同」
+    這個硬要求的直接證據，而不只是「我們沒有動這段程式碼」的口頭宣稱。
+    """
+
+    golden_ages = (
+        779, 2041, 1030, 1556, 1329, 640, 1248, 1742, 1660, 836,
+        1947, 480, 1356, 1387, 663, 226, 949, 1943, 194, 1459,
+        964, 80, 2100, 900, 351, 1179, 411, 1620, 1848, 2151,
+        1124, 746, 461, 543, 341, 1539, 149, 1294, 566, 1867,
+        1726, 277, 694, 1785, 1106, 1045, 2005, 1484, 105, 26,
+    )
+    ages = sample_bed_residence_age_hours(
+        maximum_age_days=_MAX_AGE_DAYS,
+        sample_count=_SAMPLE_COUNT,
+        seed=_SEED,
+    )
+    assert ages == golden_ages
+
+
+def test_age_sampler_conditioned_output_is_bit_identical_to_known_golden_vector() -> None:
+    """同上，但鎖定正式管線實際使用的缺口條件式抽樣核心
+    ``sample_bed_residence_age_hours_conditioned_on_availability``（重用
+    ``test_gap_aware_age_sampler_rejects_unavailable_candidates_and_audits_each_stratum``
+    完全相同的合成五站可用性設定），確保 WP-27 也沒有更動這個函式的任何一行。
+    """
+
+    base_ns = int(datetime(2025, 10, 31, tzinfo=UTC).timestamp()) * 1_000_000_000
+    observation_times = {
+        site_id: tuple(base_ns + rank * 500 * _HOUR_NS for rank in range(_SAMPLE_COUNT))
+        for site_id in ("gongliao", "guishan", "hsinchu", "houwan", "lienchiang")
+    }
+    total_hours = _MAX_AGE_DAYS * 24 + 1
+    allowed_by_stratum = {
+        index: index * total_hours // _SAMPLE_COUNT
+        for index in range(_SAMPLE_COUNT)
+    }
+    available = {
+        site_id: {
+            observation_ns - allowed_by_stratum[stratum] * _HOUR_NS
+            for stratum, observation_ns in enumerate(observation_times[site_id])
+        }
+        for site_id in observation_times
+    }
+    sampled = sample_bed_residence_age_hours_conditioned_on_availability(
+        observation_times_by_site=observation_times,
+        available_time_ns_by_site=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        sample_count=_SAMPLE_COUNT,
+        seed=_SEED,
+    )
+    golden_age_hours = (
+        0, 43, 86, 129, 172, 216, 259, 302, 345, 388,
+        432, 475, 518, 561, 605, 648, 691, 734, 777, 821,
+        864, 907, 950, 994, 1037, 1080, 1123, 1166, 1210, 1253,
+        1296, 1339, 1383, 1426, 1469, 1512, 1555, 1599, 1642, 1685,
+        1728, 1772, 1815, 1858, 1901, 1944, 1988, 2031, 2074, 2117,
+    )
+    assert sampled.age_hours == golden_age_hours
 
 
 def test_gap_aware_age_sampler_rejects_unavailable_candidates_and_audits_each_stratum() -> None:
@@ -518,6 +590,275 @@ def test_sample_for_particle_rejects_non_exact_hour_observation() -> None:
     )
     with pytest.raises(ValueError, match="exact-hour"):
         sample_bed_residence_age_hours_for_particle(
+            observation_time_utc_ns=_observation_utc_ns() + 1,
+            available_time_ns={_observation_utc_ns()},
+            maximum_age_days=_MAX_AGE_DAYS,
+            seed=seed,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-27：per_member（每站點×到達時刻×系集成員獨立抽樣，成員內共用）抽樣原語測試。
+# 這裡只測試 ``bed_residence.py`` 新增的抽樣原語本身（見該模組 WP-27 章節「範圍
+# 誠實揭露」）；下游 native 管線尚未接線，見 ``reports/WP-27.md`` 第 3 節。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_derive_bed_residence_member_seed_is_deterministic_and_member_specific() -> None:
+    """相同 (站點, 到達時刻, 成員) 身分永遠得到相同種子；改動任一個身分欄位都必須
+    得到不同種子，確保「同一到達事件、不同成員」互相獨立。"""
+
+    seed_a = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-00",
+        member_id=0,
+    )
+    seed_a_again = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-00",
+        member_id=0,
+    )
+    seed_other_member = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-00",
+        member_id=1,
+    )
+    seed_other_arrival = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-01",
+        member_id=0,
+    )
+    seed_other_site = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="guishan",
+        arrival_time_id="gongliao-observation-00",
+        member_id=0,
+    )
+    assert seed_a == seed_a_again
+    assert seed_a != seed_other_member
+    assert seed_a != seed_other_arrival
+    assert seed_a != seed_other_site
+    assert isinstance(seed_a, int) and seed_a >= 0
+
+
+def test_derive_bed_residence_member_seed_shared_across_material_and_receptor() -> None:
+    """核心折衷設計：``derive_bed_residence_member_seed`` 的簽章刻意不接受
+    ``scenario_id``、``receptor_id`` 或材質身分，只接受站點×到達時刻×成員。這代表
+    「同一個到達事件、同一個成員、不同材質或不同受體」在呼叫端組出的 seed 必然相同
+    ——不需要额外協調，光是函式簽章本身就保證了「成員內全部材質與受體共用同一個
+    年齡」這個 per_member 定義的資料契約，不會因為呼叫端傳錯 scenario 身分而破功。
+    這裡用兩個「假裝來自不同材質、不同受體的 scenario」但共用同一個
+    (site, arrival, member) 三元組的呼叫，驗證兩者確實得到位元相同的種子與年齡。
+    """
+
+    kwargs = dict(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-07",
+        member_id=3,
+    )
+    seed_material_x_receptor_a = derive_bed_residence_member_seed(**kwargs)
+    seed_material_y_receptor_b = derive_bed_residence_member_seed(**kwargs)
+    assert seed_material_x_receptor_a == seed_material_y_receptor_b
+
+    observation_ns = _observation_utc_ns()
+    available = set(range(0, _MAX_AGE_DAYS * 24 + 1))
+    available = {observation_ns - age * _HOUR_NS for age in available}
+    sample_a = sample_bed_residence_age_hours_for_member(
+        observation_time_utc_ns=observation_ns,
+        available_time_ns=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        seed=seed_material_x_receptor_a,
+    )
+    sample_b = sample_bed_residence_age_hours_for_member(
+        observation_time_utc_ns=observation_ns,
+        available_time_ns=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        seed=seed_material_y_receptor_b,
+    )
+    assert sample_a.age_hours == sample_b.age_hours
+
+
+def test_derive_bed_residence_member_seed_independent_of_particle_and_member_seed_streams() -> None:
+    """per_member 種子刻意與 ``derive_bed_residence_particle_seed``（per_particle
+    角色標籤 ``"bed_residence_age_v1"``）及 ``scenarios.derive_member_seed``
+    （平流／擴散角色）使用不同角色標籤，確保三種隨機量彼此獨立，不會因為共用
+    ``(master_seed, ...)`` 而產生非預期的跨隨機量相關性。"""
+
+    from lagrangian_backtracking.scenarios import derive_member_seed
+
+    member_scope_seed = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-00",
+        member_id=0,
+    )
+    particle_scope_seed = derive_bed_residence_particle_seed(
+        master_seed=_SEED, scenario_id="gongliao-observation-00", member_id=0
+    )
+    advection_seed = derive_member_seed(
+        master_seed=_SEED,
+        scenario_id="gongliao-observation-00",
+        experiment_case_id="finite_depth_stokes",
+        member_id=0,
+    )
+    assert member_scope_seed != particle_scope_seed
+    assert member_scope_seed != advection_seed
+
+
+def test_sample_for_member_is_reproducible_and_respects_availability() -> None:
+    observation_ns = _observation_utc_ns()
+    available = _available_every_nth_hour(observation_ns, step=3, max_age_days=_MAX_AGE_DAYS)
+    seed = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-00",
+        member_id=0,
+    )
+
+    first = sample_bed_residence_age_hours_for_member(
+        observation_time_utc_ns=observation_ns,
+        available_time_ns=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        seed=seed,
+    )
+    second = sample_bed_residence_age_hours_for_member(
+        observation_time_utc_ns=observation_ns,
+        available_time_ns=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        seed=seed,
+    )
+    assert first.age_hours == second.age_hours
+    assert first.rejected_age_hours == second.rejected_age_hours
+    assert first.sampling_method_id == BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID
+    assert 0 <= first.age_hours <= _MAX_AGE_DAYS * 24
+    assert first.age_hours % 3 == 0
+    assert (observation_ns - first.age_hours * _HOUR_NS) in available
+    for rejected_age in first.rejected_age_hours:
+        assert (observation_ns - rejected_age * _HOUR_NS) not in available
+
+
+def test_sample_for_member_different_members_can_get_different_ages() -> None:
+    """不同成員（不同 seed）在同一個到達事件、同一個可用性條件下不必抽到同一個
+    年齡——這正是 per_member 相對 per_observation 拿回的「去相關」性質：PI 要求
+    「沉底多久」本身是隨機變數，不應該對同一個到達事件的全部系集成員都套用同一個
+    年齡。"""
+
+    observation_ns = _observation_utc_ns()
+    available = set(range(0, _MAX_AGE_DAYS * 24 + 1))
+    available = {observation_ns - age * _HOUR_NS for age in available}
+
+    ages = set()
+    for member_id in range(10):
+        seed = derive_bed_residence_member_seed(
+            master_seed=_SEED,
+            study_site_id="gongliao",
+            arrival_time_id="gongliao-observation-00",
+            member_id=member_id,
+        )
+        sample = sample_bed_residence_age_hours_for_member(
+            observation_time_utc_ns=observation_ns,
+            available_time_ns=available,
+            maximum_age_days=_MAX_AGE_DAYS,
+            seed=seed,
+        )
+        ages.add(sample.age_hours)
+    assert len(ages) > 1, "10 個系集成員抽出的年齡不應該全部相同"
+
+
+def test_sample_for_member_ages_spread_across_full_range_not_clustered() -> None:
+    """WP-27 驗收要求之一：per_member 的年齡分布需檢驗。這裡對很多個
+    (站點, 到達時刻, 成員) 三元組各抽一次年齡，確認抽出的年齡涵蓋 0～90 日範圍的
+    大部分區段，不會因為種子推導方式不當而聚集在一小段區間（那會表示年齡與到達
+    時刻仍然存在非預期的相關性，違背 PI「去相關」的要求）。"""
+
+    observation_ns = _observation_utc_ns()
+    available = set(range(0, _MAX_AGE_DAYS * 24 + 1))
+    available = {observation_ns - age * _HOUR_NS for age in available}
+
+    ages: list[int] = []
+    for site_id in ("gongliao", "guishan", "hsinchu", "houwan", "lienchiang"):
+        for observation_index in range(10):
+            for member_id in range(10):
+                seed = derive_bed_residence_member_seed(
+                    master_seed=_SEED,
+                    study_site_id=site_id,
+                    arrival_time_id=f"{site_id}-observation-{observation_index:02d}",
+                    member_id=member_id,
+                )
+                sample = sample_bed_residence_age_hours_for_member(
+                    observation_time_utc_ns=observation_ns,
+                    available_time_ns=available,
+                    maximum_age_days=_MAX_AGE_DAYS,
+                    seed=seed,
+                )
+                ages.append(sample.age_hours)
+
+    total_hours = _MAX_AGE_DAYS * 24 + 1
+    quartile = total_hours // 4
+    occupied_quartiles = {min(age // quartile, 3) for age in ages}
+    assert occupied_quartiles == {0, 1, 2, 3}, (
+        f"500 個抽樣年齡應涵蓋 0-90 日的四個四分位區間，實際只涵蓋 {occupied_quartiles}"
+    )
+    assert len(set(ages)) > len(ages) // 2, "500 個抽樣年齡的相異值比例過低，疑似種子推導有誤"
+
+
+def test_sample_for_member_availability_conditioning_rejects_and_records_candidates() -> None:
+    """可用性條件（沿用與 per_particle 完全相同的規則）：只接受「沉底時刻有可用流場
+    資料」的年齡，被跳過的候選必須逐一保存在 ``rejected_age_hours``。"""
+
+    observation_ns = _observation_utc_ns()
+    available = _available_every_nth_hour(observation_ns, step=5, max_age_days=_MAX_AGE_DAYS)
+    seed = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-12",
+        member_id=4,
+    )
+    sample = sample_bed_residence_age_hours_for_member(
+        observation_time_utc_ns=observation_ns,
+        available_time_ns=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        seed=seed,
+    )
+    assert sample.age_hours % 5 == 0
+    assert sample.candidate_count == _MAX_AGE_DAYS * 24 + 1
+    for rejected_age in sample.rejected_age_hours:
+        assert rejected_age % 5 != 0 or (
+            observation_ns - rejected_age * _HOUR_NS
+        ) not in available
+
+
+def test_sample_for_member_fails_closed_when_nothing_available() -> None:
+    observation_ns = _observation_utc_ns()
+    seed = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-00",
+        member_id=0,
+    )
+    with pytest.raises(ValueError, match="無可用候選"):
+        sample_bed_residence_age_hours_for_member(
+            observation_time_utc_ns=observation_ns,
+            available_time_ns=set(),
+            maximum_age_days=_MAX_AGE_DAYS,
+            seed=seed,
+        )
+
+
+def test_sample_for_member_rejects_non_exact_hour_observation() -> None:
+    seed = derive_bed_residence_member_seed(
+        master_seed=_SEED,
+        study_site_id="gongliao",
+        arrival_time_id="gongliao-observation-00",
+        member_id=0,
+    )
+    with pytest.raises(ValueError, match="exact-hour"):
+        sample_bed_residence_age_hours_for_member(
             observation_time_utc_ns=_observation_utc_ns() + 1,
             available_time_ns={_observation_utc_ns()},
             maximum_age_days=_MAX_AGE_DAYS,

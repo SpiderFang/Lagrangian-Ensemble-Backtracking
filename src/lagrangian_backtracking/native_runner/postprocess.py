@@ -27,7 +27,8 @@
 
 科學語意（依 AGENTS.md 與工作書）
 ------------------------------------
-- 只有 ``NATIVE_STATUS_LEFT_INTEREST_REGION``（成功穿越關注區域邊界）的離開點
+- 只有 ``NATIVE_STATUS_LEFT_FLOW_DOMAIN``（成功穿越**流場區域（flow domain）**
+  最外圍開放邊界，見下方「WP-23：終止邊界改為 flow domain」一節）的離開點
   才會進入條件式來源足跡（式 (11)）的核密度估計；其餘六種終止原因（達回溯
   上限、擱淺、沉底、流場缺值、數值失敗、固定日曆回溯窗之外的沉底
   ``pre_window_deposition``，見 WP-17）是不同的資料狀態，一律分開列出人數與
@@ -149,6 +150,68 @@ WP-17 的分段表對每站只會有一列、相對來源權重恆為 1，答不
   ``boundary_flux_by_site`` 的 ``total_particle_count`` 定義，不另立新分母。這張
   表**不需要** ``boundary_geometries``，永遠輸出。
 
+WP-23：終止邊界改為 flow domain、新增 local domain 首次離開統計
+------------------------------------------------------------------
+研究團隊裁決（見 ``docs/foundation/08_design_baseline_and_derived_gates.md``
+第 8 節、``docs/development/05_decisions_and_risks.md`` D008）：**終止一律以
+流場區域（flow domain）最外圍開放邊界為準**；離開站點自己的 local domain
+（``own_local_domain``）**不再是終止事件**，只記錄「首次離開的位置與時刻」、
+粒子繼續回溯。驅動層（``backward_driver.run_backward_batch``／
+``hour_major.run_flow_domain_hour_major``）已經把這個裁決接好：
+``interest_region_polygon``（本模組沿用既有欄名 ``crossed_interest_region_
+boundary``）現在**對全部五站都填 flow domain**，不再是貢寮／龜山島填 local
+domain、新竹／南灣／連江填 flow domain 的舊行為——這代表**本模組既有的主表
+（``departures.parquet``、``boundary_entry_by_site*``、``boundary_summary_
+by_site``、KDE 條件式來源足跡）不需要任何程式碼變更就已經是 flow domain
+語意**，五站可以直接互相比較，這正是 WP-23 要修的原始問題（貢寮／龜山島以前
+回答的是「從哪個方向進入 20 km local domain」，與其他三站「從哪個方向進入
+flow domain」語意不同、不可比較）。
+
+本模組真正新增的是**另一組獨立的產品**，來源是 ``BackwardDriverResult.
+local_domain_departures``（``LocalDomainFirstExitRecord`` 的 tuple，**非終止**
+事件，只有 ``local_equals_flow=False`` 的測站——目前是貢寮、龜山島——才會有
+內容；``local_equals_flow=True`` 的測站——新竹、南灣、連江——local domain 與
+flow domain 是同一條邊界，「離開 local domain」與「離開 flow domain」是同一次
+穿越，由 ``departures.parquet`` 那一列的 ``also_local_domain_first_exit=True``
+表達，**不會、也不應該**在下面兩張新表裡重複出現一列）：
+
+- ``local_domain_departures.parquet``：每顆「曾經離開自己站點 local domain」
+  的粒子一列（只有貢寮、龜山島會有列；新竹／南灣／連江因為
+  ``also_local_domain_first_exit`` 已經在主表表達過，這裡不重複寫入）。
+  欄位刻意一律用 ``local_first_exit_*``／``local_boundary_*``／
+  ``local_departure_azimuth_*`` 前綴（呼叫端一眼就能與主表的
+  ``departure_*``／``boundary_*`` 欄位分開，不會誤把「首次離開 local domain」
+  當成「終止」）；``local_boundary_segment_id``／``local_boundary_
+  classification_distance_m``（重用既有 ``classify_boundary_segment``，見該
+  函式 docstring——它本來就是「離開點分別到 ``own_local_open_boundary``／
+  ``flow_open_boundary`` 兩條線取較近者」，local domain 首次離開點理論上必然
+  離 ``own_local_open_boundary`` 最近，套用同一個函式不需要另寫邏輯）與
+  ``local_departure_azimuth_deg`` 等三個方位扇區欄位（重用既有
+  ``classify_azimuth_sector``，原點與主表同一份 ``_site_receptor_centers``）、
+  ``local_boundary_arc_segment_index``／``local_boundary_arc_length_position_m``
+  （重用既有 ``classify_boundary_arc_position``）只在提供 ``boundary_
+  geometries`` 時才有值，其餘情況一律明確 ``null``，與主表同一套「缺值不可用
+  零值頂替」規則。
+- ``local_domain_first_exit_summary_by_site.{parquet,csv}``：每站一列（風格比照
+  ``boundary_summary_by_site``），欄位包含 ``local_equals_flow``（來源
+  ``BoundaryGeometry.local_equals_flow``，只在提供 ``boundary_geometries`` 且
+  該站有登錄時才有值，否則明確 ``null``，見下方 ``local_first_exit_source``
+  欄位說明「不明」的情況）、``total_particle_count``（分母定義與
+  ``boundary_summary_by_site`` 相同）、``local_first_exit_particle_count``／
+  ``fraction_local_first_exit``（分子依 ``local_equals_flow`` 分兩種來源：
+  ``local_equals_flow=False`` 時數 ``local_domain_departures.parquet`` 這個站
+  的列數；``local_equals_flow=True`` 時數 ``departures.parquet`` 裡
+  ``also_local_domain_first_exit=True`` 的列數——這兩個分子在物理上代表同一件
+  事「這顆粒子曾經離開過自己的 local domain」，只是紀錄它的資料列位置不同，
+  **不是同一顆粒子被算兩次**）、``local_first_exit_source``（字串欄，明確標出
+  這一列的分子是從哪個來源算出來的：``"local_domain_departures"``／
+  ``"same_as_flow_domain_departure"``／``"unknown_local_equals_flow"``——最後
+  一種只在完全沒有提供 ``boundary_geometries``、因此不知道這個站
+  ``local_equals_flow`` 為何時出現，此時分子退回「``local_domain_departures``
+  列數 ＋ ``also_local_domain_first_exit=True`` 列數」兩者相加，因為兩個來源
+  對同一顆粒子互斥、不會重疊，見 ``PostprocessAccumulator.add_batch`` 的
+  fail-closed 一致性檢查）。
+
 不做的事（誠實揭露）
 ----------------------
 1. 本模組不知道也不假設任何 ``(lon, lat) ↔ (x, y)`` 的投影方式；``lonlat_projector``
@@ -176,6 +239,13 @@ WP-17 的分段表對每站只會有一列、相對來源權重恆為 1，答不
    而 native_runner 目前沒有潮汐分類的產出；勉強塞一個假的 ``tide_class`` 只是
    為了呼叫既有函式而捏造不存在的資料，因此本模組改為獨立撰寫一個更簡單、
    不需要潮汐分層的同精神版本，並在此明確揭露這個設計選擇的取捨。
+5. **local domain 首次離開沒有比照 WP-20 另外輸出方位扇區／弧段細分統計表**
+   （即沒有 ``local_domain_entry_by_site_azimuth_sector`` 之類的表）——理由與
+   上面第 2 點同一精神：``local_domain_departures.parquet`` 已經含
+   ``local_departure_azimuth_deg``／``local_boundary_arc_segment_index`` 等
+   原始分類欄位，目前唯一有這個非終止事件的兩站（貢寮、龜山島）粒子數遠小於
+   主表的五站規模，若確實需要方位／弧段細分，應由 report 層直接從這份原始表
+   聚合，而不是在 WP-23 這個縮小範圍的子任務裡再造一組平行表。
 """
 
 from __future__ import annotations
@@ -208,7 +278,7 @@ from .backward_driver import (
     NATIVE_STATUS_DEPOSITED,
     NATIVE_STATUS_DESCRIPTIONS,
     NATIVE_STATUS_FORCING_MISSING,
-    NATIVE_STATUS_LEFT_INTEREST_REGION,
+    NATIVE_STATUS_LEFT_FLOW_DOMAIN,
     NATIVE_STATUS_MAX_BACKTRACK,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
@@ -221,6 +291,7 @@ __all__ = [
     "PostprocessError",
     "NON_CROSSING_STATUS_CATEGORY_ZH",
     "DEPARTURE_TABLE_SCHEMA",
+    "LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA",
     "LonLatProjector",
     "PostprocessConfig",
     "KDE_STATUS_AVAILABLE",
@@ -270,7 +341,7 @@ NON_CROSSING_STATUS_CATEGORY_ZH: Mapping[int, str] = MappingProxyType(
 ``backward_driver.NATIVE_STATUS_*`` 狀態碼，供邊界通量統計表的欄位命名與人類
 可讀報告使用；刻意不包含 ``NATIVE_STATUS_ACTIVE``（正式輸出不應出現尚在追蹤中
 的粒子，出現即代表上游 run 未完整結束，見 ``PostprocessAccumulator.add_batch``
-的檢查）與 ``NATIVE_STATUS_LEFT_INTEREST_REGION``（成功穿越，不屬於「未穿越」
+的檢查）與 ``NATIVE_STATUS_LEFT_FLOW_DOMAIN``（成功穿越，不屬於「未穿越」
 分類）。``NATIVE_STATUS_PRE_WINDOW_DEPOSITION``（WP-17 新增）與其餘五種狀態不同
 的地方是：它不代表運算過程中發生了什麼（不是資料缺口、也不是數值失敗），而是
 這顆粒子的沉底時刻本身就落在 ``fixed_calendar_window`` 模式的研究窗之外，因此
@@ -279,7 +350,7 @@ result``）；把它與其餘五種一起列在「未穿越」分類，只是沿
 慣例，不代表把它與資料缺口或數值失敗混為同一種資料品質問題。"""
 
 _FLUX_STATUS_ORDER: tuple[int, ...] = (
-    NATIVE_STATUS_LEFT_INTEREST_REGION,
+    NATIVE_STATUS_LEFT_FLOW_DOMAIN,
     *_NON_CROSSING_STATUS_CODES,
 )
 """邊界通量統計表固定的狀態欄位順序：第一欄永遠是成功穿越，其餘六欄依
@@ -312,6 +383,7 @@ DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
         pa.field("final_status_code", pa.int32(), nullable=False),
         pa.field("final_status_description_zh", pa.string(), nullable=False),
         pa.field("crossed_interest_region_boundary", pa.bool_(), nullable=False),
+        pa.field("also_local_domain_first_exit", pa.bool_(), nullable=False),
         pa.field("departure_x_m", pa.float64(), nullable=False),
         pa.field("departure_y_m", pa.float64(), nullable=False),
         pa.field("departure_z_m", pa.float64(), nullable=False),
@@ -348,7 +420,64 @@ DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
 是離開點在其已判定所屬開放邊界線上的弧長分段與弧長位置（公尺，見
 ``classify_boundary_arc_position``）。這五欄與 ``boundary_segment_id`` 同樣只在
 ``boundary_geometries`` 有提供且該列成功穿越邊界時才有值，其餘情況一律明確
-``null``。"""
+``null``。``also_local_domain_first_exit``（WP-23 新增，恆有值、不是可選欄位）
+原樣複製 ``DepartureRecord.also_local_domain_first_exit``：只有這一列同時滿足
+``crossed_interest_region_boundary=True`` 且該站 ``local_equals_flow=True``
+（目前是新竹／南灣／連江）時才可能是 ``True``，代表這一列同時是「離開 flow
+domain 終止」與「首次離開 local domain」兩件事，因此**不會**、也不應該在
+``local_domain_departures.parquet`` 另外出現一列，見該表 docstring 與模組
+docstring「WP-23」一節。"""
+
+
+LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
+    [
+        pa.field("particle_id", pa.string(), nullable=False),
+        pa.field("scenario_id", pa.string(), nullable=False),
+        pa.field("member_id", pa.int32(), nullable=False),
+        pa.field("study_site_id", pa.string(), nullable=False),
+        pa.field("analysis_region_id", pa.string(), nullable=False),
+        pa.field("receptor_id", pa.string(), nullable=False),
+        pa.field("material_id", pa.string(), nullable=False),
+        pa.field("arrival_time_id", pa.string(), nullable=False),
+        pa.field("arrival_time_utc_ns", pa.int64(), nullable=False),
+        pa.field("settling_velocity_mps", pa.float64(), nullable=False),
+        pa.field("season", pa.string(), nullable=False),
+        pa.field("depth_quartile", pa.int8(), nullable=False),
+        pa.field("row_particle_index", pa.int64(), nullable=False),
+        pa.field("local_first_exit_x_m", pa.float64(), nullable=False),
+        pa.field("local_first_exit_y_m", pa.float64(), nullable=False),
+        pa.field("local_first_exit_z_m", pa.float64(), nullable=False),
+        pa.field("local_first_exit_lon_deg", pa.float64(), nullable=True),
+        pa.field("local_first_exit_lat_deg", pa.float64(), nullable=True),
+        pa.field("local_first_exit_utc_ns", pa.int64(), nullable=False),
+        pa.field("local_first_exit_backtrack_duration_seconds", pa.float64(), nullable=False),
+        pa.field("local_boundary_segment_id", pa.string(), nullable=True),
+        pa.field("local_boundary_classification_distance_m", pa.float64(), nullable=True),
+        pa.field("local_departure_azimuth_deg", pa.float64(), nullable=True),
+        pa.field("local_departure_azimuth_sector_index", pa.int32(), nullable=True),
+        pa.field("local_departure_azimuth_sector_name", pa.string(), nullable=True),
+        pa.field("local_boundary_arc_segment_index", pa.int32(), nullable=True),
+        pa.field("local_boundary_arc_length_position_m", pa.float64(), nullable=True),
+    ]
+)
+"""WP-23 新增：每顆「曾經首次離開自己站點 local domain」粒子一列的**非終止**事件表
+（``local_domain_departures.parquet``）。只有 ``local_equals_flow=False`` 的測站
+（目前是貢寮、龜山島）才會出現在這張表——``local_equals_flow=True`` 的測站（新竹／
+南灣／連江）的「local 首次離開」與「flow 終止」是同一次穿越，已經在
+``departures.parquet`` 那一列用 ``also_local_domain_first_exit=True`` 表達過，這裡
+不重複寫入（見模組 docstring「WP-23」一節、``PostprocessAccumulator.add_batch`` 的
+一致性檢查）。欄位刻意一律加 ``local_`` 前綴，與 ``DEPARTURE_TABLE_SCHEMA`` 的
+``departure_*``／``boundary_*`` 欄位一眼可辨，避免被誤讀為終止事件。
+``local_first_exit_x_m``／``y_m``／``z_m`` 是離開 local domain 當下的公尺制運算
+座標；``local_first_exit_lon_deg``／``lat_deg`` 只在提供 ``lonlat_projector`` 時才
+有值，只作資料交換與圖面顯示用途。``local_first_exit_backtrack_duration_seconds``
+是 ``(arrival_time_utc_ns - local_first_exit_utc_ns) / 1e9``，恆為非負值。
+``local_boundary_segment_id``／``local_boundary_classification_distance_m``（重用
+``classify_boundary_segment``）、``local_departure_azimuth_deg`` 等三個方位扇區欄位
+（重用 ``classify_azimuth_sector``）、``local_boundary_arc_segment_index``／
+``local_boundary_arc_length_position_m``（重用 ``classify_boundary_arc_position``）
+只在建構時提供 ``boundary_geometries`` 時才有值，其餘情況一律明確 ``null``，與
+``DEPARTURE_TABLE_SCHEMA`` 同一套「缺值不可用零值頂替」規則。"""
 
 
 LonLatProjector = Callable[[np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]
@@ -1429,7 +1558,7 @@ def _flux_table_for_grouping(
     for status_position, status_code in enumerate(_FLUX_STATUS_ORDER):
         count_column = counts[:, status_position].astype(np.int64)
         fraction_column = count_column.astype(np.float64) / totals.astype(np.float64)
-        suffix = "crossed" if status_code == NATIVE_STATUS_LEFT_INTEREST_REGION else f"status_{status_code}"
+        suffix = "crossed" if status_code == NATIVE_STATUS_LEFT_FLOW_DOMAIN else f"status_{status_code}"
         columns[f"count_{suffix}"] = pa.array(count_column)
         columns[f"fraction_{suffix}"] = pa.array(fraction_column)
     return pa.table(columns)
@@ -1503,6 +1632,29 @@ class PostprocessAccumulator:
         self._final_z_m = np.full(n, np.nan, dtype=np.float64)
         self._final_utc_ns = np.zeros(n, dtype=np.int64)
 
+        # WP-23：local domain 首次離開（非終止事件）。``self._local_first_exit_seen``
+        # 是「這顆粒子曾經離開過自己站點 local domain」的旗標，不分事件實際記錄在
+        # ``local_domain_departures.parquet``（local_equals_flow=False）還是折疊進
+        # ``departures.parquet`` 的 ``also_local_domain_first_exit=True``
+        # （local_equals_flow=True）——見模組 docstring「WP-23」一節。
+        # ``self._local_equals_flow_by_site`` 只在提供 ``boundary_geometries`` 且
+        # 該站有登錄時才會有內容，供 manifest 與統計表使用；未知的站保持缺席
+        # （查詢時用 ``.get(site)`` 回傳 ``None``，不是 fail-closed 的理由——一個
+        # 站是否 local_equals_flow 只在需要分類 local 首次離開事件時才要求登錄，
+        # 見 ``_write_local_domain_departure_batch``）。
+        self._local_first_exit_seen = np.zeros(n, dtype=bool)
+        self._local_equals_flow_by_site: dict[str, bool] = {}
+        if self._boundary_geometries is not None:
+            # 權威來源優先預先登記：只要 boundary_geometries 有提供且該站有登錄，
+            # 就不需要等到 add_batch 觀察到資料才知道這個站是不是
+            # local_equals_flow——沒有任何 local／flow 穿越事件的站（例如樣本太
+            # 小、剛好全部觸及回溯上限）也能在 manifest／統計表正確揭露。
+            for site in np.unique(identity_table.study_site_id):
+                site_id = str(site)
+                geometry = self._boundary_geometries.get(site_id)
+                if geometry is not None:
+                    self._local_equals_flow_by_site[site_id] = bool(geometry.local_equals_flow)
+
         self._season = _seasons_for_arrival(identity_table)
         self._depth_quartile = _assign_depth_quartile(
             identity_table, bin_count=self._config.depth_quartile_count
@@ -1522,6 +1674,12 @@ class PostprocessAccumulator:
         departure_path = self._output_dir / "departures.parquet"
         self._departure_path = departure_path
         self._departure_writer = pq.ParquetWriter(str(departure_path), DEPARTURE_TABLE_SCHEMA)
+
+        local_departure_path = self._output_dir / "local_domain_departures.parquet"
+        self._local_departure_path = local_departure_path
+        self._local_departure_writer = pq.ParquetWriter(
+            str(local_departure_path), LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA
+        )
 
     # -- 批次寫入 ---------------------------------------------------------
 
@@ -1586,6 +1744,41 @@ class PostprocessAccumulator:
                     f"final_status={status_value} 不一致"
                 )
 
+        # WP-23：local domain 首次離開（非終止事件）與 also_local_domain_first_exit
+        # 的一致性檢查，同樣必須在任何寫入動作之前全部通過（理由同上）。兩個來源
+        # 對同一顆粒子互斥：``also_local_domain_first_exit=True``（local_equals_
+        # flow=True 的測站）與出現在 ``local_domain_departures``
+        # （local_equals_flow=False 的測站）不可能同時成立，任一顆粒子最多只有
+        # 一種「local 首次離開」的記錄方式。
+        also_local_flag_by_row: dict[int, bool] = {
+            int(rows[int(record.row_particle_index)]): bool(record.also_local_domain_first_exit)
+            for record in result.departures
+        }
+        local_rows_global: list[int] = []
+        local_seen_rows: set[int] = set()
+        for local_record in result.local_domain_departures:
+            local_index = int(local_record.row_particle_index)
+            if local_index < 0 or local_index >= rows.size:
+                raise PostprocessError(
+                    f"批次 {batch_id!r} 的 LocalDomainFirstExitRecord 局部列位置 {local_index} "
+                    f"超出批次範圍 0..{rows.size - 1}"
+                )
+            global_row = int(rows[local_index])
+            if global_row in local_seen_rows:
+                raise PostprocessError(
+                    f"批次 {batch_id!r} 對同一顆粒子回報了超過一筆 LocalDomainFirstExitRecord"
+                )
+            local_seen_rows.add(global_row)
+            if also_local_flag_by_row.get(global_row, False):
+                raise PostprocessError(
+                    f"批次 {batch_id!r} 的粒子 {global_row} 同時出現在 local_domain_departures 與 "
+                    "departures 的 also_local_domain_first_exit=True——這兩者分別代表 "
+                    "local_equals_flow=False 與 True 兩種互斥情況，不可能同時發生，違反 WP-23 "
+                    "local 首次離開「一顆粒子至多一筆」的契約"
+                )
+            local_rows_global.append(global_row)
+        self._check_local_equals_flow_consistency(batch_id, local_rows_global, also_local_flag_by_row)
+
         # 到這裡才真正寫入內部狀態，確保上面任何一項檢查失敗時，這個批次完全
         # 不會留下部分寫入的痕跡（seen 陣列與已終止的 parquet writer 沒有回滾
         # 機制，因此驗證必須在任何寫入動作之前全部通過）。
@@ -1595,8 +1788,14 @@ class PostprocessAccumulator:
         self._final_y_m[rows] = np.asarray(result.final_y_m, dtype=np.float64)
         self._final_z_m[rows] = np.asarray(result.final_z_m, dtype=np.float64)
         self._final_utc_ns[rows] = np.asarray(result.final_utc_ns, dtype=np.int64)
+        if local_rows_global:
+            self._local_first_exit_seen[np.asarray(local_rows_global, dtype=np.int64)] = True
+        also_local_rows_global = [row for row, flag in also_local_flag_by_row.items() if flag]
+        if also_local_rows_global:
+            self._local_first_exit_seen[np.asarray(also_local_rows_global, dtype=np.int64)] = True
 
         self._write_departure_batch(rows, final_status, result)
+        self._write_local_domain_departure_batch(rows, result)
         self._update_trajectory_samples(rows, result)
         self._update_kde_points(rows, final_status)
 
@@ -1607,6 +1806,51 @@ class PostprocessAccumulator:
                 fingerprint_sha256=compute_batch_result_fingerprint(result),
             )
         )
+
+    def _check_local_equals_flow_consistency(
+        self,
+        batch_id: str,
+        local_rows_global: list[int],
+        also_local_flag_by_row: dict[int, bool],
+    ) -> None:
+        """驗證這批粒子的 local_equals_flow 歸類與 ``boundary_geometries``（若有
+        提供）宣告的一致，並把新觀察到的站點登記進 ``self._local_equals_flow_by_
+        site``（WP-23）。
+
+        ``self._local_equals_flow_by_site`` 的權威來源是 ``BoundaryGeometry.
+        local_equals_flow``（``__init__`` 已對 ``identity_table`` 出現過的每一站
+        預先登記過）；本方法只用來 fail-closed 偵測「資料本身觀察到的
+        local_equals_flow 事實」與「boundary_geometries 宣告」互相矛盾的情況
+        （例如 boundary_geometries 宣告某站 local_equals_flow=True，驅動層卻對
+        這一站的粒子回報了 ``LocalDomainFirstExitRecord``——代表兩邊設定不同步，
+        不應該靜默接受）。沒有提供 ``boundary_geometries``、或該站未登錄時，改以
+        資料本身推斷並登記，純粹是盡力而為的補充資訊（供 manifest／統計表
+        使用），不是驗證。
+        """
+
+        identity = self._identity_table
+        for global_row in local_rows_global:
+            site_id = str(identity.study_site_id[global_row])
+            declared = self._local_equals_flow_by_site.get(site_id)
+            if declared is True:
+                raise PostprocessError(
+                    f"批次 {batch_id!r} 的站點 {site_id!r} 在 boundary_geometries 宣告 "
+                    "local_equals_flow=True，但粒子卻出現在 local_domain_departures（只有 "
+                    "local_equals_flow=False 的測站才應該有這個非終止事件），設定與資料不同步"
+                )
+            self._local_equals_flow_by_site.setdefault(site_id, False)
+        for global_row, flag in also_local_flag_by_row.items():
+            if not flag:
+                continue
+            site_id = str(identity.study_site_id[global_row])
+            declared = self._local_equals_flow_by_site.get(site_id)
+            if declared is False:
+                raise PostprocessError(
+                    f"批次 {batch_id!r} 的站點 {site_id!r} 在 boundary_geometries 宣告 "
+                    "local_equals_flow=False，但粒子卻帶有 also_local_domain_first_exit=True"
+                    "（只有 local_equals_flow=True 的測站才應該有這個標記），設定與資料不同步"
+                )
+            self._local_equals_flow_by_site.setdefault(site_id, True)
 
     def _write_departure_batch(
         self, rows: np.ndarray, final_status: np.ndarray, result: BackwardDriverResult
@@ -1621,8 +1865,16 @@ class PostprocessAccumulator:
             raise PostprocessError("出現離開時刻晚於到達時刻的粒子，違反逆向追蹤的時間方向")
         backtrack_seconds = np.maximum(backtrack_seconds, 0.0)
 
-        crossed = final_status == NATIVE_STATUS_LEFT_INTEREST_REGION
+        crossed = final_status == NATIVE_STATUS_LEFT_FLOW_DOMAIN
         status_desc = np.array([_describe_status(code) for code in final_status.tolist()], dtype=object)
+
+        # WP-23：``DepartureRecord.row_particle_index`` 是批次內的局部位置 0..n-1，
+        # 與 ``rows``／``final_status`` 同一套局部索引（``add_batch`` 已經驗證過
+        # 兩者一一對應），因此可以直接依局部索引寫回，不需要再轉一次全域列位置。
+        also_local_first_exit = np.zeros(rows.size, dtype=bool)
+        for record in result.departures:
+            if record.also_local_domain_first_exit:
+                also_local_first_exit[int(record.row_particle_index)] = True
 
         final_x = np.asarray(result.final_x_m, dtype=np.float64)
         final_y = np.asarray(result.final_y_m, dtype=np.float64)
@@ -1722,6 +1974,7 @@ class PostprocessAccumulator:
             "final_status_code": pa.array(final_status),
             "final_status_description_zh": pa.array(status_desc, type=pa.string()),
             "crossed_interest_region_boundary": pa.array(crossed),
+            "also_local_domain_first_exit": pa.array(also_local_first_exit),
             "departure_x_m": pa.array(final_x),
             "departure_y_m": pa.array(final_y),
             "departure_z_m": pa.array(final_z),
@@ -1740,6 +1993,128 @@ class PostprocessAccumulator:
         }
         table = pa.table(columns, schema=DEPARTURE_TABLE_SCHEMA)
         self._departure_writer.write_table(table)
+
+    def _write_local_domain_departure_batch(self, rows: np.ndarray, result: BackwardDriverResult) -> None:
+        """把這一批粒子的 local domain 首次離開（非終止事件）寫進
+        ``local_domain_departures.parquet``（一次一批，串流寫入不緩存全表，
+        WP-23 新增）。
+
+        只處理 ``result.local_domain_departures``；``local_equals_flow=True`` 的
+        測站不會在這裡出現任何列（那些站的「local 首次離開」已經折疊進
+        ``departures.parquet`` 那一列的 ``also_local_domain_first_exit=True``，
+        見模組 docstring「WP-23」一節與 ``LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA``
+        docstring）。沒有任何 local 事件時直接返回，不寫入空表（與
+        ``ParquetWriter`` 串流寫入的既有慣例一致：只在真的有列時才呼叫
+        ``write_table``）。
+        """
+
+        local_records = result.local_domain_departures
+        if not local_records:
+            return
+
+        identity = self._identity_table
+        local_global_rows = np.asarray(
+            [int(rows[int(record.row_particle_index)]) for record in local_records], dtype=np.int64
+        )
+        arrival_utc = identity.arrival_time_utc_ns[local_global_rows]
+        local_utc = np.asarray([int(record.utc_ns) for record in local_records], dtype=np.int64)
+        backtrack_seconds = (arrival_utc - local_utc).astype(np.float64) / 1.0e9
+        if np.any(backtrack_seconds < -1.0e-6):
+            raise PostprocessError("出現 local 首次離開時刻晚於到達時刻的粒子，違反逆向追蹤的時間方向")
+        backtrack_seconds = np.maximum(backtrack_seconds, 0.0)
+
+        local_x = np.asarray([float(record.x_m) for record in local_records], dtype=np.float64)
+        local_y = np.asarray([float(record.y_m) for record in local_records], dtype=np.float64)
+        local_z = np.asarray([float(record.z_m) for record in local_records], dtype=np.float64)
+
+        if self._lonlat_projector is not None:
+            lon, lat = self._lonlat_projector(
+                identity.study_site_id[local_global_rows], local_x, local_y
+            )
+            lon_array = pa.array(np.asarray(lon, dtype=np.float64))
+            lat_array = pa.array(np.asarray(lat, dtype=np.float64))
+        else:
+            lon_array = pa.array([None] * local_global_rows.size, type=pa.float64())
+            lat_array = pa.array([None] * local_global_rows.size, type=pa.float64())
+
+        # WP-23：local domain 首次離開的邊界分段／方位扇區／弧段分類，重用既有
+        # WP-17／WP-20 的分類函式（不重寫邏輯，見 LOCAL_DOMAIN_DEPARTURE_TABLE_
+        # SCHEMA docstring）——與 _write_departure_batch 的對應區塊唯一差異是這裡
+        # 不需要 crossed 遮罩（每一列本來就是一次離開 local domain 的事件）。
+        n_local = int(local_global_rows.size)
+        segment_ids: list[str | None] = [None] * n_local
+        segment_distances: list[float | None] = [None] * n_local
+        azimuth_degs: list[float | None] = [None] * n_local
+        sector_indices: list[int | None] = [None] * n_local
+        sector_names: list[str | None] = [None] * n_local
+        arc_indices: list[int | None] = [None] * n_local
+        arc_positions_m: list[float | None] = [None] * n_local
+        if self._boundary_geometries is not None:
+            site_ids = identity.study_site_id[local_global_rows]
+            sector_count = self._config.azimuth_sector_count
+            arc_segment_count = self._config.boundary_arc_segment_count
+            for local_index in range(n_local):
+                site_id = str(site_ids[local_index])
+                geometry = self._boundary_geometries.get(site_id)
+                if geometry is None:
+                    raise PostprocessError(
+                        f"boundary_geometries 缺少站點 {site_id!r} 的邊界幾何，"
+                        "無法分類這顆已離開 local domain 的粒子"
+                    )
+                x_m = float(local_x[local_index])
+                y_m = float(local_y[local_index])
+                segment_id, distance_m = classify_boundary_segment(x_m, y_m, geometry)
+                segment_ids[local_index] = segment_id
+                segment_distances[local_index] = distance_m
+
+                center = self._site_receptor_centers.get(site_id)
+                if center is not None:
+                    sector_index, azimuth_deg, sector_name = classify_azimuth_sector(
+                        x_m, y_m, center[0], center[1], sector_count=sector_count
+                    )
+                    azimuth_degs[local_index] = azimuth_deg
+                    sector_indices[local_index] = sector_index
+                    sector_names[local_index] = sector_name
+
+                arc_result = classify_boundary_arc_position(
+                    x_m, y_m, segment_id, geometry, arc_segment_count=arc_segment_count
+                )
+                if arc_result is not None:
+                    arc_index, arc_s_m, _length_m = arc_result
+                    arc_indices[local_index] = arc_index
+                    arc_positions_m[local_index] = arc_s_m
+
+        columns = {
+            "particle_id": pa.array(identity.particle_id[local_global_rows]),
+            "scenario_id": pa.array(identity.scenario_id[local_global_rows]),
+            "member_id": pa.array(identity.member_id[local_global_rows]),
+            "study_site_id": pa.array(identity.study_site_id[local_global_rows]),
+            "analysis_region_id": pa.array(identity.analysis_region_id[local_global_rows]),
+            "receptor_id": pa.array(identity.receptor_id[local_global_rows]),
+            "material_id": pa.array(identity.material_id[local_global_rows]),
+            "arrival_time_id": pa.array(identity.arrival_time_id[local_global_rows]),
+            "arrival_time_utc_ns": pa.array(arrival_utc),
+            "settling_velocity_mps": pa.array(identity.settling_velocity_mps[local_global_rows]),
+            "season": pa.array(self._season[local_global_rows]),
+            "depth_quartile": pa.array(self._depth_quartile[local_global_rows]),
+            "row_particle_index": pa.array(local_global_rows),
+            "local_first_exit_x_m": pa.array(local_x),
+            "local_first_exit_y_m": pa.array(local_y),
+            "local_first_exit_z_m": pa.array(local_z),
+            "local_first_exit_lon_deg": lon_array,
+            "local_first_exit_lat_deg": lat_array,
+            "local_first_exit_utc_ns": pa.array(local_utc),
+            "local_first_exit_backtrack_duration_seconds": pa.array(backtrack_seconds),
+            "local_boundary_segment_id": pa.array(segment_ids, type=pa.string()),
+            "local_boundary_classification_distance_m": pa.array(segment_distances, type=pa.float64()),
+            "local_departure_azimuth_deg": pa.array(azimuth_degs, type=pa.float64()),
+            "local_departure_azimuth_sector_index": pa.array(sector_indices, type=pa.int32()),
+            "local_departure_azimuth_sector_name": pa.array(sector_names, type=pa.string()),
+            "local_boundary_arc_segment_index": pa.array(arc_indices, type=pa.int32()),
+            "local_boundary_arc_length_position_m": pa.array(arc_positions_m, type=pa.float64()),
+        }
+        table = pa.table(columns, schema=LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA)
+        self._local_departure_writer.write_table(table)
 
     def _update_trajectory_samples(self, rows: np.ndarray, result: BackwardDriverResult) -> None:
         """對這一批每顆粒子計算抽樣優先序，更新兩種分組方案各自的保留集合。"""
@@ -1774,7 +2149,7 @@ class PostprocessAccumulator:
     def _update_kde_points(self, rows: np.ndarray, final_status: np.ndarray) -> None:
         """把這一批成功穿越邊界的離開座標點，累加進對應分組的暫存清單。"""
 
-        crossed_mask = final_status == NATIVE_STATUS_LEFT_INTEREST_REGION
+        crossed_mask = final_status == NATIVE_STATUS_LEFT_FLOW_DOMAIN
         if not np.any(crossed_mask):
             return
         identity = self._identity_table
@@ -1806,6 +2181,7 @@ class PostprocessAccumulator:
         """
 
         self._departure_writer.close()
+        self._local_departure_writer.close()
 
         if not np.all(self._seen):
             missing = int(np.count_nonzero(~self._seen))
@@ -1820,6 +2196,7 @@ class PostprocessAccumulator:
             raise PostprocessError("各狀態計數總和與粒子總數不一致，這是嚴重的內部錯誤")
 
         self._write_flux_tables()
+        self._write_local_domain_first_exit_summary_table()
         kde_summary = self._write_kde_products()
         self._write_trajectory_samples()
 
@@ -1886,6 +2263,26 @@ class PostprocessAccumulator:
                 # PostprocessAccumulator.__init__ 對兩種 experiment_case_id 語意
                 # 差異的說明。
                 "runtime_physics_case": self._runtime_physics_case,
+                # WP-23：終止邊界改為 flow domain 之後，兩種「離開」定義不再相同，
+                # 在 manifest 明確記錄差異與哪些站是 local_equals_flow，不能只靠
+                # 表格欄名讓使用者自己猜（見模組 docstring「WP-23」一節）。
+                "flow_domain_termination_definition": (
+                    "departures.parquet／boundary_entry_by_site*／boundary_summary_by_site／"
+                    "條件式來源足跡 KDE：final_status==NATIVE_STATUS_LEFT_FLOW_DOMAIN 才算「成功穿越」"
+                    "（crossed_interest_region_boundary=True），即離開流場區域（flow domain）最外圍"
+                    "開放邊界時終止追蹤（backward_driver 狀態碼 1，見該模組 WP-23 docstring）。五站"
+                    "皆同一定義，可直接互相比較。"
+                ),
+                "local_domain_first_exit_definition": (
+                    "local_domain_departures.parquet：非終止事件，記錄粒子首次離開自己站點 "
+                    "own_local_domain（局部分析區）的位置與時刻，粒子繼續回溯，不影響 final_status。"
+                    "只有 local_equals_flow=False 的測站（依 local_equals_flow_by_site）才會有內容；"
+                    "local_equals_flow=True 的測站，這個事件與上面的 flow domain 終止事件是同一次"
+                    "穿越，改由 departures.parquet 該列 also_local_domain_first_exit=True 表達，"
+                    "不重複出現在 local_domain_departures.parquet（見 local_domain_first_exit_"
+                    "summary_by_site.parquet 的 local_first_exit_source 欄位，逐站標出分子來源）。"
+                ),
+                "local_equals_flow_by_site": dict(self._local_equals_flow_by_site),
             },
             kde_bandwidth_method=(
                 "scipy.stats.gaussian_kde 預設 Scott 法則（factor = n**(-1/(d+4))，d=2），"
@@ -2056,6 +2453,66 @@ class PostprocessAccumulator:
                 {f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields)
             )
         _write_table_with_csv(summary_table, self._output_dir, "boundary_summary_by_site")
+
+    def _write_local_domain_first_exit_summary_table(self) -> None:
+        """輸出每站一列的 local domain 首次離開統計總表（WP-23 新增），風格比照
+        ``_write_site_summary_table``。
+
+        分母（``total_particle_count``）與 ``boundary_summary_by_site`` 同一定義
+        （這一站全部粒子數，不分終止原因）；分子（``local_first_exit_particle_
+        count``）依這一站是否 ``local_equals_flow`` 分兩種互斥來源計數，見
+        ``local_first_exit_source`` 欄位與模組 docstring「WP-23」一節——不論來源
+        為何，這個數字回答的都是同一個問題：「這一站有多少顆粒子曾經離開過自己的
+        local domain」，兩種來源對同一顆粒子不會重疊（``add_batch`` 的
+        ``_check_local_equals_flow_consistency`` 與互斥性檢查已經保證這一點）。
+        不需要 ``boundary_geometries`` 就能輸出（``local_equals_flow`` 未知時退回
+        ``"unknown_local_equals_flow"``，分子改用「兩個來源相加」，因為此時無法
+        單獨確認任一來源的排他性歸屬，但兩者本身仍然互斥，相加不會重複計數），
+        因此在 ``finalize`` 中無條件呼叫。
+        """
+
+        sites = self._identity_table.study_site_id
+        unique_sites = np.unique(sites)
+        rows: list[dict[str, Any]] = []
+        for site in unique_sites:
+            site_id = str(site)
+            site_mask = sites == site
+            total = int(np.count_nonzero(site_mask))
+            local_first_exit_count = int(np.count_nonzero(self._local_first_exit_seen & site_mask))
+            local_equals_flow = self._local_equals_flow_by_site.get(site_id)
+            if local_equals_flow is True:
+                source = "same_as_flow_domain_departure"
+            elif local_equals_flow is False:
+                source = "local_domain_departures"
+            else:
+                source = "unknown_local_equals_flow"
+            rows.append(
+                {
+                    "study_site_id": site_id,
+                    "local_equals_flow": local_equals_flow,
+                    "total_particle_count": total,
+                    "local_first_exit_particle_count": local_first_exit_count,
+                    "fraction_local_first_exit": (
+                        float(local_first_exit_count) / float(total) if total else float("nan")
+                    ),
+                    "local_first_exit_source": source,
+                }
+            )
+        if rows:
+            summary_table = pa.Table.from_pylist(rows)
+        else:
+            fields = [
+                pa.field("study_site_id", pa.string()),
+                pa.field("local_equals_flow", pa.bool_()),
+                pa.field("total_particle_count", pa.int64()),
+                pa.field("local_first_exit_particle_count", pa.int64()),
+                pa.field("fraction_local_first_exit", pa.float64()),
+                pa.field("local_first_exit_source", pa.string()),
+            ]
+            summary_table = pa.table(
+                {f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields)
+            )
+        _write_table_with_csv(summary_table, self._output_dir, "local_domain_first_exit_summary_by_site")
 
     def _write_kde_products(self) -> dict[str, dict[str, Any]]:
         """對兩種分組（各站；各站×沉降速度）建立條件式來源足跡並寫成 Parquet。

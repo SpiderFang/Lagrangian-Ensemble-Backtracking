@@ -799,7 +799,11 @@ def _run_unit_entrypoint(
         }
 
     batch = build_hour_major_domain_batch(
-        resources.identity_table, runnable_units, interest_regions=domain_resources.interest_regions
+        resources.identity_table,
+        runnable_units,
+        interest_regions=domain_resources.interest_regions,
+        local_domains=domain_resources.local_domains,
+        local_equals_flow=domain_resources.local_equals_flow,
     )
 
     checkpoint_dir: str | None = None

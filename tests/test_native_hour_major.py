@@ -196,6 +196,28 @@ _BIG_POLYGON = Polygon(
 )
 
 
+def _flow_only_kwargs(interest_regions: dict[str, Polygon]) -> dict[str, object]:
+    """WP-23：把既有測試的 ``interest_regions`` 轉成
+    ``build_hour_major_domain_batch`` 現在要求的三個關鍵字參數。
+
+    本檔案絕大多數測試驗證的是小時主軸排程本身（鏡像等價、批次組成無關性、
+    checkpoint 續跑等），不是 WP-23 新增的 local domain 語意，所以一律把
+    ``local_equals_flow`` 設成 ``True``、``local_domains`` 填成與
+    ``interest_regions`` 相同的多邊形物件——這對應
+    ``resources.DomainResources`` 對新竹／南灣／連江（local domain＝flow
+    domain）的填法，讓這些既有測試在新程式下維持與 WP-23 之前逐位元等價的
+    行為（``local_first_exit_pending`` 從一開始就是 ``False``，子步迴圈的
+    check_mask 天生跳過 local 判定）。真正測試 local domain 非終止語意的
+    案例見 ``test_hour_major_local_domain_*`` 系列，那裡會顯式傳入
+    ``local_equals_flow=False`` 與獨立的 local 多邊形。
+    """
+
+    return {
+        "local_domains": dict(interest_regions),
+        "local_equals_flow": {site_id: True for site_id in interest_regions},
+    }
+
+
 def _make_unit(
     *, unit_id: str, region: str, domain: str, site: str, arrival_utc: int, settling: float, rows: np.ndarray,
 ) -> NativeWorkUnit:
@@ -273,6 +295,21 @@ def _assert_results_bit_identical(
         assert da.status == db.status
         assert da.x_m == db.x_m and da.y_m == db.y_m and da.z_m == db.z_m
         assert da.utc_ns == db.utc_ns
+        assert da.also_local_domain_first_exit == db.also_local_domain_first_exit, (
+            f"{label}: row {da.row_particle_index} 的 also_local_domain_first_exit 不同"
+        )
+    # WP-23：local domain 首次離開（非終止）事件也要逐列位元比對，不只比對終止事件。
+    assert len(a.local_domain_departures) == len(b.local_domain_departures), (
+        f"{label}: local_domain_departures 數量不同"
+    )
+    for la, lb in zip(
+        sorted(a.local_domain_departures, key=lambda d: d.row_particle_index),
+        sorted(b.local_domain_departures, key=lambda d: d.row_particle_index),
+        strict=True,
+    ):
+        assert la.row_particle_index == lb.row_particle_index
+        assert la.x_m == lb.x_m and la.y_m == lb.y_m and la.z_m == lb.z_m
+        assert la.utc_ns == lb.utc_ns
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -338,7 +375,9 @@ def test_hour_major_diffusion_off_matches_standalone_per_unit(driver_grid, handl
         max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=False, master_seed=123,
     )
 
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
     )
@@ -363,7 +402,9 @@ def test_hour_major_diffusion_on_matches_standalone_per_unit(driver_grid, handle
         max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=99,
     )
 
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
     )
@@ -405,7 +446,9 @@ def test_hour_major_endpoint_reuse_matches_standalone_and_reports_hits(driver_gr
         max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=2026,
     )
 
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config,
         forcing_resolver=resolver, wave_field_resolver=wave_resolver,
@@ -436,18 +479,22 @@ def test_hour_major_diffusion_on_batch_composition_invariance(driver_grid, handl
         max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=99,
     )
 
-    batch_all = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch_all = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result_all = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch_all, config=config, forcing_resolver=resolver,
     )
 
-    batch_alone = hm.build_hour_major_domain_batch(table, [unit_a0], interest_regions=interest_regions)
+    batch_alone = hm.build_hour_major_domain_batch(
+        table, [unit_a0], interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result_alone = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch_alone, config=config, forcing_resolver=resolver,
     )
 
     batch_pair = hm.build_hour_major_domain_batch(
-        table, [unit_a0, unit_b0], interest_regions=interest_regions
+        table, [unit_a0, unit_b0], interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
     )
     result_pair = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch_pair, config=config, forcing_resolver=resolver,
@@ -500,7 +547,8 @@ def test_hour_major_multi_station_polygons_matches_separate_calls(driver_grid, h
     config = hm.HourMajorConfig(max_backtrack_seconds=4.0 * 3600.0, enable_diffusion=False, master_seed=1)
 
     batch = hm.build_hour_major_domain_batch(
-        table, [unit_small, unit_big], interest_regions=interest_regions
+        table, [unit_small, unit_big], interest_regions=interest_regions,
+        **_flow_only_kwargs(interest_regions),
     )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
@@ -529,6 +577,159 @@ def test_hour_major_multi_station_polygons_matches_separate_calls(driver_grid, h
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# WP-23：local domain（非終止記錄）與 flow domain（終止）分離語意——合成幾何測試
+#
+# 三種站點型態混在同一個小時主軸分組裡一次驗證：
+#   SUBSET：local domain 是 flow domain 的真子集，粒子應先產生非終止的
+#           LocalDomainFirstExitRecord（local_domain_departures），之後才在
+#           更外圍的 flow domain 邊界產生終止的 DepartureRecord
+#           （status=NATIVE_STATUS_LEFT_FLOW_DOMAIN，also_local_domain_
+#           first_exit=False）。
+#   EQ：    local_equals_flow=True，local domain 與 flow domain 是同一個多
+#           邊形物件，只能產生一筆終止事件，該事件的
+#           also_local_domain_first_exit 必須是 True，且不得另外出現在
+#           local_domain_departures。
+#   CAP：   local_equals_flow=True 但多邊形夠大，回溯上限先觸發（不離開任何
+#           邊界）——確認 local_equals_flow=True 站點在沒有離開事件時完全不
+#           受影響，且不會意外產生 local_domain_departures。
+# 三個單元的小時主軸結果分別與各自單獨呼叫 run_backward_batch 做位元比對，
+# 確保合併批次不會互相污染彼此的 local domain 判定。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_hour_major_local_domain_subset_and_equals_flow_mixed_batch(driver_grid, handles) -> None:
+    t0 = 23_000 * _HOUR_NS
+    n = 2
+
+    def _square(half_width: float) -> Polygon:
+        cx, cy = _DOMAIN_X / 2.0, _DOMAIN_Y / 2.0
+        return Polygon(
+            [
+                (cx - half_width, cy - half_width), (cx + half_width, cy - half_width),
+                (cx + half_width, cy + half_width), (cx - half_width, cy + half_width),
+            ]
+        )
+
+    # SUBSET：local 40 m ⊂ flow 121 m，兩者是不同的多邊形物件。flow 半寬
+    # 刻意不取 120（＝80 個 1.5 m 子步整數倍，u=0.05 m/s、dtb=30 s 時粒子軌跡
+    # 會恰好落在邊界上），避免撞上 `substep_numba.py` 模組文件「與原版行為的
+    # 已知差異」第 3 點誠實記載、且 `tests/test_substep_numba.py`
+    # （`test_point_in_polygon_boundary_mismatch_is_only_on_exact_boundary`／
+    # `test_diffusion_and_interest_region_matches_python_loop_statistically`）
+    # 已經量化過的邊界重合問題：座標恰好落在多邊形邊界上時，射線法
+    # （numba）與 Shapely ``contains_xy``（python）對「邊界算不算內部」的
+    # 浮點捨入慣例可能不同，屬預期中、測度為零的邊界情況，不是 WP-23 新增
+    # 的 local domain 判定本身的錯誤——已用最小重現腳本驗證：半寬 120 時
+    # numba／python 兩條路徑各自都能正確判定離開（local 首次離開事件逐位元
+    # 相同），差異只出現在 flow domain 那筆終止事件恰好卡在邊界的子步；半寬
+    # 121 時兩條路徑逐位元相同。
+    subset_local_polygon = _square(40.0)
+    subset_flow_polygon = _square(121.0)
+    # EQ：local_equals_flow=True，local 與 flow 是同一個多邊形物件（80 m）。
+    eq_polygon = _square(80.0)
+    # CAP：local_equals_flow=True，多邊形夠大，在下面的 max_backtrack 內不會離開。
+    cap_polygon = _BIG_POLYGON
+
+    x0 = np.full(3 * n, _DOMAIN_X / 2.0)
+    y0 = np.full(3 * n, _DOMAIN_Y / 2.0)
+    z0 = np.full(3 * n, -5.0)
+    row_ids = np.arange(3 * n, dtype=np.int64)
+    table = _FakeIdentityTable(x0_m=x0, y0_m=y0, z0_m=z0, seed_hex=_seed_hex_for(row_ids))
+
+    unit_subset = _make_unit(
+        unit_id="SUBSET_UNIT", region="R", domain="D", site="SUBSET", arrival_utc=t0, settling=0.0,
+        rows=row_ids[0:n],
+    )
+    unit_eq = _make_unit(
+        unit_id="EQ_UNIT", region="R", domain="D", site="EQ", arrival_utc=t0, settling=0.0,
+        rows=row_ids[n:2 * n],
+    )
+    unit_cap = _make_unit(
+        unit_id="CAP_UNIT", region="R", domain="D", site="CAP", arrival_utc=t0, settling=0.0,
+        rows=row_ids[2 * n:3 * n],
+    )
+
+    interest_regions = {"SUBSET": subset_flow_polygon, "EQ": eq_polygon, "CAP": cap_polygon}
+    local_domains = {"SUBSET": subset_local_polygon, "EQ": eq_polygon, "CAP": cap_polygon}
+    local_equals_flow = {"SUBSET": False, "EQ": True, "CAP": True}
+
+    resolver = _make_resolver(driver_grid, u=0.05, v=0.0)
+    config = hm.HourMajorConfig(max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=False, master_seed=7)
+
+    batch = hm.build_hour_major_domain_batch(
+        table, [unit_subset, unit_eq, unit_cap], interest_regions=interest_regions,
+        local_domains=local_domains, local_equals_flow=local_equals_flow,
+    )
+    result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, batch, config=config, forcing_resolver=resolver,
+    )
+
+    subset_result = result.unit_results["SUBSET_UNIT"]
+    eq_result = result.unit_results["EQ_UNIT"]
+    cap_result = result.unit_results["CAP_UNIT"]
+
+    # SUBSET：兩顆粒子都應該先產生非終止的 local 首次離開記錄，之後才在 flow
+    # domain 邊界終止；兩個事件都必須存在，且 local 早於 flow。
+    assert np.all(subset_result.final_status == bd.NATIVE_STATUS_LEFT_FLOW_DOMAIN)
+    assert len(subset_result.local_domain_departures) == n
+    local_dep_by_row = {d.row_particle_index: d for d in subset_result.local_domain_departures}
+    flow_dep_by_row = {d.row_particle_index: d for d in subset_result.departures}
+    assert set(local_dep_by_row) == set(range(n))
+    assert set(flow_dep_by_row) == set(range(n))
+    for row in range(n):
+        # 這是逆向（backward）積分：utc_ns 隨著回溯過程單調遞減，越晚離開（走
+        # 越遠）的事件 utc_ns 越小。local domain（40 m）比 flow domain（121 m）
+        # 先被離開，所以 local 事件的 utc_ns 必須「比較大」（比較接近到達時刻）。
+        assert local_dep_by_row[row].utc_ns > flow_dep_by_row[row].utc_ns
+        assert flow_dep_by_row[row].also_local_domain_first_exit is False
+
+    # EQ：local domain 與 flow domain 相同，只能有一筆終止事件，且必須標記
+    # also_local_domain_first_exit=True；不得另外出現在 local_domain_departures。
+    assert np.all(eq_result.final_status == bd.NATIVE_STATUS_LEFT_FLOW_DOMAIN)
+    assert len(eq_result.departures) == n
+    assert all(d.also_local_domain_first_exit is True for d in eq_result.departures)
+    assert len(eq_result.local_domain_departures) == 0
+
+    # CAP：多邊形夠大、在回溯上限內不會離開邊界——確認 local_equals_flow=True
+    # 且從未離開邊界的站點完全不受 WP-23 新增邏輯影響，不會憑空冒出 local
+    # 首次離開事件。注意：`departures`（`DepartureRecord`）記錄的是「任何終止
+    # 原因」（見其 docstring），達回溯上限（`NATIVE_STATUS_MAX_BACKTRACK`）本
+    # 身就是一種終止，因此每顆粒子仍然會有一筆 `DepartureRecord`——這是既有、
+    # WP-23 之前就有的行為（`postprocess.py` 也依賴這個不變量：每顆非 ACTIVE
+    # 的粒子都必須對應一筆 `DepartureRecord`，否則視為資料不一致而報錯）。這裡
+    # 真正該驗的是：狀態碼是 MAX_BACKTRACK 而不是 LEFT_FLOW_DOMAIN、且完全沒有
+    # local 事件（不論是 `also_local_domain_first_exit` 或
+    # `local_domain_departures`）。
+    assert np.all(cap_result.final_status == bd.NATIVE_STATUS_MAX_BACKTRACK)
+    assert len(cap_result.departures) == n
+    assert all(d.status == bd.NATIVE_STATUS_MAX_BACKTRACK for d in cap_result.departures)
+    assert all(d.also_local_domain_first_exit is False for d in cap_result.departures)
+    assert len(cap_result.local_domain_departures) == 0
+
+    # 逐站與獨立呼叫 run_backward_batch 位元比對，確保混合批次不會互相污染。
+    for unit, polygon, local_equals, local_polygon in (
+        (unit_subset, subset_flow_polygon, False, subset_local_polygon),
+        (unit_eq, eq_polygon, True, None),
+        (unit_cap, cap_polygon, True, None),
+    ):
+        rows = unit.particle_row_indices
+        soa = _FakeSoa(
+            x=table.x0_m[rows].copy(), y=table.y0_m[rows].copy(), z=table.z0_m[rows].copy(),
+            row_particle_index=rows.copy(),
+        )
+        driver_config = hm.hour_major_config_to_backward_driver_config(
+            config, arrival_time_utc_ns=unit.arrival_time_utc_ns, settling_velocity_mps=0.0
+        )
+        standalone = bd.run_backward_batch(
+            driver_grid, handles, soa,
+            seed_hex_values=list(table.seed_hex[rows]), config=driver_config,
+            forcing_resolver=resolver, interest_region_polygon=polygon,
+            local_equals_flow=local_equals, local_domain_polygon=local_polygon,
+        )
+        _assert_results_bit_identical(result.unit_results[unit.unit_id], standalone, label=unit.unit_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 驗收 4：回溯上限精確觸發
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -547,7 +748,9 @@ def test_hour_major_max_backtrack_triggers_at_exact_hour(driver_grid, handles) -
     resolver = _make_resolver(driver_grid, u=0.0, v=0.0)
     config = hm.HourMajorConfig(max_backtrack_seconds=2.0 * 3600.0, enable_diffusion=False, master_seed=0)
 
-    batch = hm.build_hour_major_domain_batch(table, [unit], interest_regions={"S1": _BIG_POLYGON})
+    batch = hm.build_hour_major_domain_batch(
+        table, [unit], interest_regions={"S1": _BIG_POLYGON}, **_flow_only_kwargs({"S1": _BIG_POLYGON})
+    )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
     )
@@ -592,7 +795,8 @@ def test_hour_major_per_unit_resolved_max_backtrack_seconds_override(driver_grid
     config = hm.HourMajorConfig(max_backtrack_seconds=10.0 * 3600.0, enable_diffusion=False, master_seed=0)
 
     batch = hm.build_hour_major_domain_batch(
-        table, [short_unit, long_unit], interest_regions={"S1": _BIG_POLYGON}
+        table, [short_unit, long_unit], interest_regions={"S1": _BIG_POLYGON},
+        **_flow_only_kwargs({"S1": _BIG_POLYGON}),
     )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
@@ -621,7 +825,9 @@ def test_build_hour_major_domain_batch_rejects_pre_window_units(driver_grid, han
         pre_window_deposition=True,
     )
     with pytest.raises(hm.HourMajorError):
-        hm.build_hour_major_domain_batch(table, [unit], interest_regions={"S1": _BIG_POLYGON})
+        hm.build_hour_major_domain_batch(
+            table, [unit], interest_regions={"S1": _BIG_POLYGON}, **_flow_only_kwargs({"S1": _BIG_POLYGON})
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -635,7 +841,9 @@ def test_hour_major_releases_exactly_at_own_arrival_hour(driver_grid, handles) -
     resolver = _make_resolver(driver_grid, u=0.02, v=0.0)
     config = hm.HourMajorConfig(max_backtrack_seconds=1.0 * 3600.0, enable_diffusion=False, master_seed=0)
 
-    batch = hm.build_hour_major_domain_batch(table, [unit_a0, unit_a1], interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, [unit_a0, unit_a1], interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
     )
@@ -667,13 +875,17 @@ def test_hour_major_checkpoint_resume_bit_identical(driver_grid, handles, tmp_pa
         max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=42,
     )
 
-    batch_full = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch_full = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result_full = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch_full, config=config, forcing_resolver=resolver,
     )
 
     checkpoint_dir = tmp_path / "hm_checkpoint"
-    batch_partial = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch_partial = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     partial = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch_partial, config=config, forcing_resolver=resolver,
         checkpoint_dir=checkpoint_dir, checkpoint_every_hours=1, _max_master_hours=1,
@@ -681,7 +893,9 @@ def test_hour_major_checkpoint_resume_bit_identical(driver_grid, handles, tmp_pa
     assert partial.domain_hours_walked == 1
     assert (checkpoint_dir / "meta.json").is_file()
 
-    batch_resume = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch_resume = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result_resumed = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch_resume, config=config, forcing_resolver=resolver,
         checkpoint_dir=checkpoint_dir, checkpoint_every_hours=1,
@@ -729,13 +943,17 @@ def test_hour_major_stokes_pool_matches_sequential_bit_identical(driver_grid, ha
         max_backtrack_seconds=3.0 * 3600.0, enable_diffusion=True, master_seed=7,
     )
 
-    batch_sequential = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch_sequential = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result_sequential = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch_sequential, config=config,
         forcing_resolver=resolver, wave_field_resolver=wave_resolver,
     )
 
-    batch_parallel = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch_parallel = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     with ProcessPoolExecutor(max_workers=2) as pool:
         result_parallel = hm.run_flow_domain_hour_major(
             driver_grid, handles, batch_parallel, config=config,
@@ -850,7 +1068,9 @@ def test_hour_major_performance_vs_per_unit_path(handles, members_per_scenario) 
     interest_regions = {"S1": _BIG_POLYGON}
 
     # ── 新路徑：一次 run_flow_domain_hour_major 呼叫 ──────────────────────
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     t0 = _time.perf_counter()
     hour_major_result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
@@ -915,7 +1135,9 @@ def test_hour_major_numba_smagorinsky_impl_runs_and_matches_on_uniform_flow(driv
 
     table, units, interest_regions, _t0 = _build_staggered_domain()
     resolver = _make_resolver(driver_grid, u=0.02, v=0.01, kh=2.0e-4)
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     results = {}
     for impl in ("baytrace", "numba"):
         config = hm.HourMajorConfig(
@@ -955,7 +1177,9 @@ def test_hour_major_substep_policy_global_cfl_matches_legacy_default_bit_identic
         substep_policy="global_cfl",
     )
 
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
     )
@@ -971,7 +1195,9 @@ def test_hour_major_config_rejects_unknown_substep_policy(driver_grid, handles) 
     table, units, interest_regions, _t0 = _build_staggered_domain()
     resolver = _make_resolver(driver_grid, u=0.02, v=0.0)
     config = hm.HourMajorConfig(max_backtrack_seconds=1.0 * 3600.0, substep_policy="quantum_cfl")
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     with pytest.raises(hm.HourMajorError, match="substep_policy"):
         hm.run_flow_domain_hour_major(driver_grid, handles, batch, config=config, forcing_resolver=resolver)
 
@@ -1213,7 +1439,9 @@ def test_hour_major_substep_loop_impl_python_matches_legacy_default_bit_identica
         substep_loop_impl="python",
     )
 
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     result = hm.run_flow_domain_hour_major(
         driver_grid, handles, batch, config=config, forcing_resolver=resolver,
     )
@@ -1229,7 +1457,9 @@ def test_hour_major_config_rejects_unknown_substep_loop_impl(driver_grid, handle
     table, units, interest_regions, _t0 = _build_staggered_domain()
     resolver = _make_resolver(driver_grid, u=0.02, v=0.0)
     config = hm.HourMajorConfig(max_backtrack_seconds=1.0 * 3600.0, substep_loop_impl="quantum")
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
     with pytest.raises(hm.HourMajorError, match="substep_loop_impl"):
         hm.run_flow_domain_hour_major(driver_grid, handles, batch, config=config, forcing_resolver=resolver)
 
@@ -1244,7 +1474,9 @@ def test_hour_major_substep_loop_impl_numba_statistically_equivalent_to_python(d
 
     table, units, interest_regions, _t0 = _build_staggered_domain(n_per_unit=20)
     resolver = _make_resolver(driver_grid, u=0.025, v=-0.015, kh=3.0e-4)
-    batch = hm.build_hour_major_domain_batch(table, units, interest_regions=interest_regions)
+    batch = hm.build_hour_major_domain_batch(
+        table, units, interest_regions=interest_regions, **_flow_only_kwargs(interest_regions)
+    )
 
     results = {}
     for impl in ("python", "numba"):
@@ -1329,7 +1561,8 @@ def test_derive_horizon_matches_direct_run_bit_identical_under_global_cfl(driver
         substep_policy="global_cfl",
     )
     source_batch = hm.build_hour_major_domain_batch(
-        table, [unit_small, unit_big], interest_regions=interest_regions
+        table, [unit_small, unit_big], interest_regions=interest_regions,
+        **_flow_only_kwargs(interest_regions),
     )
     source_result = hm.run_flow_domain_hour_major(
         driver_grid, handles, source_batch, config=source_config, forcing_resolver=resolver,
@@ -1354,7 +1587,8 @@ def test_derive_horizon_matches_direct_run_bit_identical_under_global_cfl(driver
     unit_small_direct = dataclasses.replace(unit_small, resolved_max_backtrack_seconds=3.0 * 3600.0)
     unit_big_direct = dataclasses.replace(unit_big, resolved_max_backtrack_seconds=3.0 * 3600.0)
     direct_batch = hm.build_hour_major_domain_batch(
-        table, [unit_small_direct, unit_big_direct], interest_regions=interest_regions
+        table, [unit_small_direct, unit_big_direct], interest_regions=interest_regions,
+        **_flow_only_kwargs(interest_regions),
     )
     direct_result = hm.run_flow_domain_hour_major(
         driver_grid, handles, direct_batch, config=target_config, forcing_resolver=resolver,

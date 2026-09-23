@@ -31,6 +31,7 @@ from lagrangian_backtracking.native_runner.backward_driver import (
     BackwardDriverResult,
     DepartureRecord,
     HourlyOverheadDiagnostics,
+    LocalDomainFirstExitRecord,
     SubstepDiagnostics,
 )
 from lagrangian_backtracking.native_runner.particle_input import ParticleIdentityTable
@@ -115,9 +116,15 @@ def _make_result(
     final_z_m: list[float] | None = None,
     final_utc_ns: list[int] | None = None,
     departures: list[DepartureRecord] | None = None,
+    local_domain_departures: list[LocalDomainFirstExitRecord] | None = None,
     n_samples: int = 2,
 ) -> BackwardDriverResult:
-    """建立測試用的合成 ``BackwardDriverResult``，departures 依 final_status 自動配對。"""
+    """建立測試用的合成 ``BackwardDriverResult``，departures 依 final_status 自動配對。
+
+    ``local_domain_departures``（WP-23）預設 ``None`` -> 空 tuple，維持既有呼叫端
+    （不涉及 local domain 的測試）100% 不變的行為；只有 WP-23 新增的測試才會
+    明確傳入。
+    """
 
     n = len(rows)
     if final_x_m is None:
@@ -164,6 +171,7 @@ def _make_result(
         diagnostics=SubstepDiagnostics(),
         overhead_diagnostics=HourlyOverheadDiagnostics(),
         hours_run=n_samples,
+        local_domain_departures=tuple(local_domain_departures) if local_domain_departures else (),
     )
 
 
@@ -765,8 +773,14 @@ def test_streaming_merge_scale_500000_particles_memory_and_time(tmp_path):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def _make_boundary_geometry(site_id: str):
-    """建一個最小合法 ``BoundaryGeometry``：東側是開放水域線，其餘視為海岸線。"""
+def _make_boundary_geometry(site_id: str, *, local_equals_flow: bool = False):
+    """建一個最小合法 ``BoundaryGeometry``：東側是開放水域線，其餘視為海岸線。
+
+    ``local_equals_flow``（WP-23）預設 ``False``（沿用既有測試的隱含假設：
+    local 40 m ⊂ flow 500 m，兩條開放邊界線是不同的線）；WP-23 新增的測試會
+    明確傳入 ``True`` 代表「新竹／南灣／連江」這類 local domain 與 flow domain
+    相同的測站。
+    """
 
     from shapely.geometry import LineString, box
 
@@ -779,6 +793,7 @@ def _make_boundary_geometry(site_id: str):
         foreign_local_domains={},
         own_local_open_boundary=LineString([(100.0, -100.0), (100.0, 100.0)]),
         flow_open_boundary=LineString([(500.0, -500.0), (500.0, 500.0)]),
+        local_equals_flow=local_equals_flow,
         own_local_boundary_segment_id=f"{site_id}_local_open_boundary",
         flow_boundary_segment_id="flow_open_boundary",
     )
@@ -1193,3 +1208,297 @@ def test_boundary_summary_by_site_matches_flux_definition(tmp_path) -> None:
     assert summary_row["fraction_deposited"] == pytest.approx(
         flux_row[f"fraction_status_{NATIVE_STATUS_DEPOSITED}"]
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-23：終止邊界改為 flow domain；local domain 首次離開（非終止事件）另外出表
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_local_domain_departures_written_for_local_not_equals_flow_site(tmp_path) -> None:
+    """local_equals_flow=False 的測站（例如貢寮／龜山島）：一顆粒子先產生非終止的
+    ``LocalDomainFirstExitRecord``（記錄在 local_domain_departures.parquet），
+    之後才在 flow domain 邊界終止（記錄在 departures.parquet，
+    also_local_domain_first_exit 必須是 False）。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0"],
+        study_site_id=["siteA"],
+        settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION],
+        final_x_m=[480.0],
+        final_y_m=[0.0],
+        final_utc_ns=[_JAN_2024_UTC_NS - 2 * _HOUR_NS],
+        local_domain_departures=[
+            LocalDomainFirstExitRecord(
+                row_particle_index=0, x_m=100.0, y_m=0.0, z_m=-5.0,
+                utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            )
+        ],
+    )
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path,
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA", local_equals_flow=False)},
+    )
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+
+    assert manifest.config["local_equals_flow_by_site"] == {"siteA": False}
+
+    local_rows = pq.read_table(tmp_path / "local_domain_departures.parquet").to_pylist()
+    assert len(local_rows) == 1
+    row = local_rows[0]
+    assert row["row_particle_index"] == 0
+    assert row["study_site_id"] == "siteA"
+    assert row["local_first_exit_x_m"] == pytest.approx(100.0)
+    assert row["local_first_exit_utc_ns"] == _JAN_2024_UTC_NS - _HOUR_NS
+    assert row["local_first_exit_backtrack_duration_seconds"] == pytest.approx(_HOUR_NS / 1.0e9)
+    # 離開點就在 own_local_open_boundary 線上（東側），應該分類到本站 local 分段。
+    assert row["local_boundary_segment_id"] == "siteA_local_open_boundary"
+    assert row["local_boundary_classification_distance_m"] == pytest.approx(0.0, abs=1.0e-9)
+    assert row["local_first_exit_lon_deg"] is None  # 未提供 lonlat_projector
+
+    departures = pq.read_table(tmp_path / "departures.parquet").to_pylist()
+    assert len(departures) == 1
+    assert departures[0]["crossed_interest_region_boundary"] is True
+    assert departures[0]["also_local_domain_first_exit"] is False
+
+    summary_rows = {
+        r["study_site_id"]: r
+        for r in pq.read_table(
+            tmp_path / "local_domain_first_exit_summary_by_site.parquet"
+        ).to_pylist()
+    }
+    assert summary_rows["siteA"]["local_equals_flow"] is False
+    assert summary_rows["siteA"]["local_first_exit_particle_count"] == 1
+    assert summary_rows["siteA"]["fraction_local_first_exit"] == pytest.approx(1.0)
+    assert summary_rows["siteA"]["local_first_exit_source"] == "local_domain_departures"
+
+
+def test_local_equals_flow_site_reuses_flow_departure_without_duplicating(tmp_path) -> None:
+    """local_equals_flow=True 的測站（例如新竹／南灣／連江）：local 首次離開與 flow
+    終止是同一次穿越，只能有一筆 ``DepartureRecord``（``also_local_domain_first_
+    exit=True``），不得在 ``local_domain_departures.parquet`` 另外出現一列。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0", "p1"],
+        study_site_id=["siteB", "siteB"],
+        settling_velocity_mps=[-0.001, -0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 2,
+    )
+    departures = [
+        DepartureRecord(
+            row_particle_index=0, status=NATIVE_STATUS_LEFT_INTEREST_REGION,
+            x_m=100.0, y_m=0.0, z_m=-5.0, utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            also_local_domain_first_exit=True,
+        ),
+        DepartureRecord(
+            row_particle_index=1, status=NATIVE_STATUS_MAX_BACKTRACK,
+            x_m=0.0, y_m=0.0, z_m=-5.0, utc_ns=_JAN_2024_UTC_NS - 2 * _HOUR_NS,
+            also_local_domain_first_exit=False,
+        ),
+    ]
+    result = _make_result(
+        rows=[0, 1],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION, NATIVE_STATUS_MAX_BACKTRACK],
+        departures=departures,
+    )
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path,
+        boundary_geometries={"siteB": _make_boundary_geometry("siteB", local_equals_flow=True)},
+    )
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+
+    assert manifest.config["local_equals_flow_by_site"] == {"siteB": True}
+
+    local_rows = pq.read_table(tmp_path / "local_domain_departures.parquet").to_pylist()
+    assert local_rows == []  # local_equals_flow=True：不重複寫入
+
+    summary_rows = {
+        r["study_site_id"]: r
+        for r in pq.read_table(
+            tmp_path / "local_domain_first_exit_summary_by_site.parquet"
+        ).to_pylist()
+    }
+    # 只有 p0（also_local_domain_first_exit=True）算一次；p1（MAX_BACKTRACK，
+    # 從未離開 local domain）不計入分子，但仍計入分母。
+    assert summary_rows["siteB"]["local_equals_flow"] is True
+    assert summary_rows["siteB"]["total_particle_count"] == 2
+    assert summary_rows["siteB"]["local_first_exit_particle_count"] == 1
+    assert summary_rows["siteB"]["fraction_local_first_exit"] == pytest.approx(0.5)
+    assert summary_rows["siteB"]["local_first_exit_source"] == "same_as_flow_domain_departure"
+
+
+def test_local_domain_departures_without_boundary_geometries_have_null_classification(
+    tmp_path,
+) -> None:
+    """沒有提供 ``boundary_geometries`` 時，local_domain_departures.parquet 仍然
+    記錄位置與時刻，但分類欄位一律明確 ``null``（不得以任何分段代碼頂替）。
+    ``local_equals_flow`` 雖然沒有 ``boundary_geometries`` 可查，但這個站的粒子
+    確實出現在 ``local_domain_departures`` 裡，資料本身已經能明確推斷這個站是
+    ``local_equals_flow=False``（見 ``_check_local_equals_flow_consistency``
+    docstring：沒有提供 boundary_geometries 時改以資料本身推斷並登記）。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteA"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_MAX_BACKTRACK],
+        local_domain_departures=[
+            LocalDomainFirstExitRecord(
+                row_particle_index=0, x_m=100.0, y_m=0.0, z_m=-5.0,
+                utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            )
+        ],
+    )
+    accumulator = PostprocessAccumulator(identity, output_dir=tmp_path)
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+
+    assert manifest.config["local_equals_flow_by_site"] == {"siteA": False}
+
+    local_rows = pq.read_table(tmp_path / "local_domain_departures.parquet").to_pylist()
+    assert len(local_rows) == 1
+    assert local_rows[0]["local_boundary_segment_id"] is None
+    assert local_rows[0]["local_boundary_classification_distance_m"] is None
+    assert local_rows[0]["local_departure_azimuth_deg"] is None
+
+    summary_rows = {
+        r["study_site_id"]: r
+        for r in pq.read_table(
+            tmp_path / "local_domain_first_exit_summary_by_site.parquet"
+        ).to_pylist()
+    }
+    assert summary_rows["siteA"]["local_equals_flow"] is False
+    assert summary_rows["siteA"]["local_first_exit_source"] == "local_domain_departures"
+    assert summary_rows["siteA"]["local_first_exit_particle_count"] == 1
+
+
+def test_local_domain_first_exit_summary_unknown_when_no_evidence_and_no_geometry(tmp_path) -> None:
+    """沒有提供 ``boundary_geometries``、且這個站的粒子完全沒有任何 local 首次
+    離開的證據（既沒有 local_domain_departures，也沒有 also_local_domain_first_
+    exit=True）時，``local_equals_flow`` 真的無法判斷，統計表必須誠實列出
+    ``"unknown_local_equals_flow"``，不得臆測，分子維持 0（不是缺值，是「目前
+    這批粒子裡沒有任何一顆離開過 local domain」）。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteA"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(rows=[0], final_status=[NATIVE_STATUS_MAX_BACKTRACK])
+    accumulator = PostprocessAccumulator(identity, output_dir=tmp_path)
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+
+    assert manifest.config["local_equals_flow_by_site"] == {}
+    assert pq.read_table(tmp_path / "local_domain_departures.parquet").to_pylist() == []
+
+    summary_rows = {
+        r["study_site_id"]: r
+        for r in pq.read_table(
+            tmp_path / "local_domain_first_exit_summary_by_site.parquet"
+        ).to_pylist()
+    }
+    assert summary_rows["siteA"]["local_equals_flow"] is None
+    assert summary_rows["siteA"]["local_first_exit_source"] == "unknown_local_equals_flow"
+    assert summary_rows["siteA"]["local_first_exit_particle_count"] == 0
+
+
+def test_local_domain_departures_and_also_local_flag_cannot_both_be_true(tmp_path) -> None:
+    """同一顆粒子不能同時出現在 local_domain_departures 又帶
+    also_local_domain_first_exit=True——這兩者分別代表 local_equals_flow=False
+    與 True 兩種互斥情況，一致性檢查必須 fail-closed。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteA"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    departures = [
+        DepartureRecord(
+            row_particle_index=0, status=NATIVE_STATUS_LEFT_INTEREST_REGION,
+            x_m=480.0, y_m=0.0, z_m=-5.0, utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            also_local_domain_first_exit=True,
+        ),
+    ]
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION],
+        departures=departures,
+        local_domain_departures=[
+            LocalDomainFirstExitRecord(
+                row_particle_index=0, x_m=100.0, y_m=0.0, z_m=-5.0,
+                utc_ns=_JAN_2024_UTC_NS - 2 * _HOUR_NS,
+            )
+        ],
+    )
+    accumulator = PostprocessAccumulator(identity, output_dir=tmp_path)
+    with pytest.raises(PostprocessError):
+        accumulator.add_batch("batch-0", result)
+
+
+def test_local_domain_departures_declared_equals_flow_conflict_fails_closed(tmp_path) -> None:
+    """boundary_geometries 宣告某站 local_equals_flow=True，但資料卻對這一站的
+    粒子回報了 LocalDomainFirstExitRecord（只有 local_equals_flow=False 的測站
+    才應該有這個非終止事件）：設定與資料不同步，必須 fail-closed。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteB"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION],
+        local_domain_departures=[
+            LocalDomainFirstExitRecord(
+                row_particle_index=0, x_m=100.0, y_m=0.0, z_m=-5.0,
+                utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            )
+        ],
+    )
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path,
+        boundary_geometries={"siteB": _make_boundary_geometry("siteB", local_equals_flow=True)},
+    )
+    with pytest.raises(PostprocessError):
+        accumulator.add_batch("batch-0", result)
+
+
+def test_local_domain_departures_missing_boundary_geometry_for_site_fails_closed(tmp_path) -> None:
+    """提供了 boundary_geometries（非 None）但缺少某一站的登錄，該站卻有
+    local_domain_departures：與既有 departures.parquet 的 fail-closed 慣例一致
+    （見 test_boundary_geometries_missing_site_fails_closed）。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteC"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_MAX_BACKTRACK],
+        local_domain_departures=[
+            LocalDomainFirstExitRecord(
+                row_particle_index=0, x_m=100.0, y_m=0.0, z_m=-5.0,
+                utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            )
+        ],
+    )
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path,
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA")},
+    )
+    with pytest.raises(PostprocessError):
+        accumulator.add_batch("batch-0", result)

@@ -31,12 +31,32 @@ manifest。舊版管線的任何行為都不因本模組存在而改變。
 無法從離開紀錄表重建、且本模組必須讀取的**幾何**，是開放邊界折線本身的實際
 座標，來自 ``boundary_arc_segments_geometry_by_site``。
 
-本模組因此只要求六個輸入存在：``departures.parquet``、
+本模組因此只要求八個輸入存在：``departures.parquet``、
 ``trajectory_samples_by_site.parquet``、``kde_by_site.parquet``、
-``boundary_summary_by_site``、``boundary_arc_segments_geometry_by_site``
-（兩者皆可以是 ``.parquet`` 或 ``.csv``，優先讀 ``.parquet``）、
-``manifest.json``（``postprocess.py`` 自己輸出的執行紀錄，供讀取方位扇區數、
-弧段數等設定）。缺少任一者一律 fail-closed，不静默略過。
+``boundary_summary_by_site``、``boundary_arc_segments_geometry_by_site``、
+``local_domain_departures.parquet``、``local_domain_first_exit_summary_by_site``
+（``boundary_summary_by_site``／``boundary_arc_segments_geometry_by_site``／
+``local_domain_first_exit_summary_by_site`` 皆可以是 ``.parquet`` 或 ``.csv``，
+優先讀 ``.parquet``；``local_domain_departures.parquet`` 只接受 Parquet，理由同
+``departures.parquet``）、``manifest.json``（``postprocess.py`` 自己輸出的執行
+紀錄，供讀取方位扇區數、弧段數等設定）。缺少任一者一律 fail-closed，不静默略過。
+
+WP-23：停止邊界與 local domain 首次離開的雙重語意
+----------------------------------------------------
+研究團隊裁決（見 ``AGENTS.md``、``docs/development/05_decisions_and_risks.md``
+D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local domain 是非終止
+事件，只記錄、粒子繼續回溯**。``departures.parquet`` 的
+``crossed_interest_region_boundary``／終止標記因此**已經是 flow domain 語意**，
+五站可以直接互相比較；本模組另外從 ``local_domain_departures.parquet``（僅
+``local_equals_flow=False`` 的測站——目前是貢寮、龜山島——才有列）與
+``departures.parquet`` 的 ``also_local_domain_first_exit``（僅
+``local_equals_flow=True`` 的測站——新竹、南灣、連江——才可能為
+``True``，代表這一列同時是 local 首次離開與 flow 終止）取得 local 首次離開的
+位置，在水平總覽／局部兩張圖上用**另一種標記**畫出，並在圖例與副標明確區分
+「local domain 邊界（記錄用，非終止）」與「flow domain 邊界（終止邊界）」。
+``local_equals_flow=True`` 的站點兩者是同一次穿越，圖上只畫一個標記（沿用
+終止標記本身），不另外疊加 local 標記，避免造成「同一顆粒子被畫了兩次」的
+錯覺。
 
 經緯度還原（無 domain manifest 輸入下的投影復原）
 --------------------------------------------------
@@ -476,6 +496,14 @@ class TrajectorySample:
     越負越深）排序後的序位（1 起算），**只用來分色與畫圖，不代表固定物理水層**
     ——native 後處理沒有保留 ``vertical_id``（見 ``postprocess`` 模組 docstring
     第 3 點揭露），序位只是「這批代表粒子裡，這顆的起始深度排第幾」。
+
+    ``local_first_exit_lon_deg``／``lat_deg``（WP-23 新增）是這顆粒子**首次離開
+    自己站點 local domain**（非終止，粒子當時仍繼續回溯）的經緯度；只有
+    ``local_equals_flow=False`` 的測站（目前是貢寮、龜山島）且這顆粒子確實有對應
+    ``local_domain_departures.parquet`` 列時才有值，其餘一律 ``None``——
+    ``local_equals_flow=True`` 的測站（新竹／南灣／連江）不需要這兩個欄位，因為
+    那個事件與終止事件是同一個點，直接沿用終止標記即可，見模組 docstring
+    「WP-23」一節。
     """
 
     particle_id: str
@@ -488,6 +516,8 @@ class TrajectorySample:
     lat_deg: np.ndarray
     rank_index: int
     rank_total: int
+    local_first_exit_lon_deg: float | None = None
+    local_first_exit_lat_deg: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,6 +530,20 @@ class SiteData:
     ``None`` 表示 ``kde_by_site`` 沒有這一站的列（理論上不應發生，
     ``PostprocessAccumulator`` 對每個處理過的站一定會有一列，但仍保守處理避免
     對不存在的鍵盲目索引）。
+
+    以下四個欄位是 WP-23 新增，皆來自 ``local_domain_first_exit_summary_by_site``：
+    ``local_equals_flow`` 為 ``True``／``False``／``None``（``None``＝
+    ``postprocess.py`` 執行時沒有提供 ``boundary_geometries``，無法判定，見該表
+    ``local_first_exit_source="unknown_local_equals_flow"``）；
+    ``local_first_exit_particle_count``／``local_first_exit_fraction`` 是這一站
+    「曾經離開過自己 local domain」的粒子數與佔全站比例，分子依 ``local_equals_
+    flow`` 取自兩種互斥來源之一（見 ``postprocess`` 模組 docstring「WP-23」一節），
+    不是本模組自行推算；``local_departures_by_row`` 是
+    ``row_particle_index -> local_domain_departures.parquet`` 該列欄位 dict 的
+    對照，只有 ``local_equals_flow=False`` 的測站才會非空（``local_equals_
+    flow=True`` 的測站，這個事件已經是 ``departures.parquet`` 該列
+    ``also_local_domain_first_exit=True``，不會出現在 local_domain_departures，
+    對照表本身就是空的，不代表資料缺漏）。
     """
 
     site_id: str
@@ -512,6 +556,10 @@ class SiteData:
     arc_segments_by_boundary: Mapping[str, tuple[Mapping[str, Any], ...]]
     azimuth_sector_count: int
     boundary_arc_segment_count: int
+    local_equals_flow: bool | None
+    local_first_exit_particle_count: int
+    local_first_exit_fraction: float
+    local_departures_by_row: Mapping[int, Mapping[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,6 +580,7 @@ _DEPARTURE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "final_status_code",
     "final_status_description_zh",
     "crossed_interest_region_boundary",
+    "also_local_domain_first_exit",
     "departure_lon_deg",
     "departure_lat_deg",
     "departure_x_m",
@@ -599,6 +648,33 @@ _ARC_GEOMETRY_REQUIRED_COLUMNS: tuple[str, ...] = (
     "end_lat_deg",
     "midpoint_lon_deg",
     "midpoint_lat_deg",
+)
+
+# ── WP-23：local domain 首次離開（非終止事件）相關兩張表的必要欄位 ──────────
+
+_LOCAL_DEPARTURE_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "study_site_id",
+    "row_particle_index",
+    "local_first_exit_x_m",
+    "local_first_exit_y_m",
+    "local_first_exit_lon_deg",
+    "local_first_exit_lat_deg",
+    "local_departure_azimuth_sector_index",
+    "local_departure_azimuth_sector_name",
+    "local_boundary_segment_id",
+)
+"""``local_domain_departures.parquet``（``postprocess.LOCAL_DOMAIN_DEPARTURE_TABLE_
+SCHEMA``）只有 ``local_equals_flow=False`` 的測站（目前是貢寮、龜山島）才會有列；
+本模組只取繪圖需要的欄位子集，不要求呼叫端提供 ``material_id``／``season`` 等與
+繪圖無關的分類欄位。"""
+
+_LOCAL_SUMMARY_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "study_site_id",
+    "local_equals_flow",
+    "total_particle_count",
+    "local_first_exit_particle_count",
+    "fraction_local_first_exit",
+    "local_first_exit_source",
 )
 
 
@@ -672,6 +748,7 @@ def _build_trajectory_samples(
     site_id: str,
     max_count: int,
     projection: DomainProjection,
+    local_departures_by_row: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[TrajectorySample, ...]:
     """建立一站的代表軌跡樣本：換算年齡與經緯度、依 ``particle_id`` 取固定子集、
     再依起始深度排序賦予色階序位（見 :class:`TrajectorySample` docstring）。
@@ -679,9 +756,15 @@ def _build_trajectory_samples(
     ``departure_lookup`` 是 ``row_particle_index -> (receptor_id, final_status_code,
     final_status_description_zh)`` 的對照，來自同一批離開紀錄；若某個代表粒子的
     ``row_particle_index`` 查不到對應離開紀錄，代表兩張表不是同一次後處理輸出，
-    直接 fail-closed，不用任何預設值頂替終止狀態。
+    直接 fail-closed，不用任何預設值頂替終止狀態。``local_departures_by_row``
+    （WP-23 新增，預設空 dict）是同一站的 ``row_particle_index -> local_domain_
+    departures.parquet`` 列欄位 dict 對照；查得到就把該筆代表粒子的 local domain
+    首次離開經緯度填進 :class:`TrajectorySample`，查不到（多數情況，因為只有
+    ``local_equals_flow=False`` 的測站才會有內容，且代表粒子只是全站的一個子集）
+    保持 ``None``，不是錯誤。
     """
 
+    local_departures_by_row = local_departures_by_row or {}
     n = trajectory_site_table.num_rows
     if n == 0:
         return ()
@@ -713,6 +796,15 @@ def _build_trajectory_samples(
             raise FiguresError(f"{site_id} 站代表粒子 {particle_ids[i]} 的軌跡樣本是空陣列")
         age_hours = (float(utc_ns[0]) - utc_ns.astype(np.float64)) / 3.6e12
         lon_deg, lat_deg = projection.unproject(x_m, y_m)
+        local_record = local_departures_by_row.get(row_particle_index)
+        local_first_exit_lon_deg: float | None = None
+        local_first_exit_lat_deg: float | None = None
+        if local_record is not None:
+            raw_lon = local_record["local_first_exit_lon_deg"]
+            raw_lat = local_record["local_first_exit_lat_deg"]
+            if raw_lon is not None and raw_lat is not None:
+                local_first_exit_lon_deg = float(raw_lon)
+                local_first_exit_lat_deg = float(raw_lat)
         prepared.append(
             (
                 float(z_m[0]),
@@ -725,6 +817,8 @@ def _build_trajectory_samples(
                     "z_m": z_m,
                     "lon_deg": lon_deg,
                     "lat_deg": lat_deg,
+                    "local_first_exit_lon_deg": local_first_exit_lon_deg,
+                    "local_first_exit_lat_deg": local_first_exit_lat_deg,
                 },
             )
         )
@@ -757,6 +851,44 @@ def _build_summary_row(summary_table: pa.Table, site_id: str) -> dict[str, Any]:
     return {name: matched.column(name)[0].as_py() for name in _SUMMARY_REQUIRED_COLUMNS}
 
 
+def _build_local_departures_by_row(
+    local_table: pa.Table, site_id: str
+) -> dict[int, dict[str, Any]]:
+    """把一站的 ``local_domain_departures.parquet`` 列攤平成
+    ``row_particle_index -> 欄位 dict`` 對照（見 :class:`SiteData` docstring）。
+
+    ``local_equals_flow=True`` 的測站在這張表裡完全沒有列，回傳空 dict——這是
+    預期行為，不是缺漏（見 ``postprocess`` 模組 docstring「WP-23」一節），呼叫端
+    不應對空字典視為錯誤。
+    """
+
+    mask = pc.equal(local_table.column("study_site_id"), site_id)
+    matched = local_table.filter(mask)
+    result: dict[int, dict[str, Any]] = {}
+    for index in range(matched.num_rows):
+        row = {name: matched.column(name)[index].as_py() for name in _LOCAL_DEPARTURE_REQUIRED_COLUMNS}
+        result[int(row["row_particle_index"])] = row
+    return result
+
+
+def _build_local_summary_row(summary_table: pa.Table, site_id: str) -> dict[str, Any]:
+    """讀 ``local_domain_first_exit_summary_by_site`` 這一站的一列。
+
+    ``postprocess.py`` 的 ``_write_local_domain_first_exit_summary_table`` 在
+    ``finalize()`` 無條件呼叫，對每個處理過的站一定會有一列（即使
+    ``local_equals_flow`` 未知），因此這裡與 ``_build_summary_row`` 一樣，找不到
+    就 fail-closed，不用任何預設值頂替。
+    """
+
+    mask = pc.equal(summary_table.column("study_site_id"), site_id)
+    matched = summary_table.filter(mask)
+    if matched.num_rows == 0:
+        raise FiguresError(f"local_domain_first_exit_summary_by_site 沒有 {site_id} 站的列")
+    if matched.num_rows > 1:
+        raise FiguresError(f"local_domain_first_exit_summary_by_site 對 {site_id} 有超過一列，資料不一致")
+    return {name: matched.column(name)[0].as_py() for name in _LOCAL_SUMMARY_REQUIRED_COLUMNS}
+
+
 def _build_arc_segments(
     arc_table: pa.Table, site_id: str
 ) -> dict[str, tuple[dict[str, Any], ...]]:
@@ -777,7 +909,7 @@ def _build_arc_segments(
 def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInputs:
     """讀取並核對一次 native-figures 執行的全部輸入，回傳每站已就緒的繪圖資料。
 
-    只讀取模組 docstring 列出的六個必要輸入與呼叫端的海岸 GeoJSON；不讀取
+    只讀取模組 docstring 列出的八個必要輸入與呼叫端的海岸 GeoJSON；不讀取
     forcing、不重新積分、不改寫任何檔案。任何必要欄位缺席、``--sites`` 指定了
     資料中不存在的站、或投影中心無法一致反解，都在這裡 fail-closed，不進入
     繪圖階段。
@@ -800,6 +932,18 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
     _require_columns(summary_table, _SUMMARY_REQUIRED_COLUMNS, "boundary_summary_by_site")
     arc_table, arc_path = _read_table_any(postprocess_dir, "boundary_arc_segments_geometry_by_site")
     _require_columns(arc_table, _ARC_GEOMETRY_REQUIRED_COLUMNS, "boundary_arc_segments_geometry_by_site")
+    local_departures_table, local_departures_path = _require_strict_parquet(
+        postprocess_dir, "local_domain_departures"
+    )
+    _require_columns(
+        local_departures_table, _LOCAL_DEPARTURE_REQUIRED_COLUMNS, "local_domain_departures.parquet"
+    )
+    local_summary_table, local_summary_path = _read_table_any(
+        postprocess_dir, "local_domain_first_exit_summary_by_site"
+    )
+    _require_columns(
+        local_summary_table, _LOCAL_SUMMARY_REQUIRED_COLUMNS, "local_domain_first_exit_summary_by_site"
+    )
 
     available_sites = _site_ids_in_table(departures_table)
     if not available_sites:
@@ -858,6 +1002,8 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
             lon[:sample_size], lat[:sample_size], x_m[:sample_size], y_m[:sample_size]
         )
 
+        local_departures_by_row = _build_local_departures_by_row(local_departures_table, site_id)
+
         site_trajectory_table = _filter_site(trajectory_table, site_id)
         trajectories = _build_trajectory_samples(
             site_trajectory_table,
@@ -865,6 +1011,7 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
             site_id=site_id,
             max_count=config.max_trajectories_per_site,
             projection=projection,
+            local_departures_by_row=local_departures_by_row,
         )
 
         summary_row = _build_summary_row(summary_table, site_id)
@@ -875,6 +1022,8 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
                 f"{total_particle_count} 與 departures.parquet 實際列數"
                 f"{departure_arrays['final_status_code'].size} 不一致"
             )
+
+        local_summary_row = _build_local_summary_row(local_summary_table, site_id)
 
         sites.append(
             SiteData(
@@ -888,6 +1037,10 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
                 arc_segments_by_boundary=_build_arc_segments(arc_table, site_id),
                 azimuth_sector_count=azimuth_sector_count,
                 boundary_arc_segment_count=boundary_arc_segment_count,
+                local_equals_flow=local_summary_row["local_equals_flow"],
+                local_first_exit_particle_count=int(local_summary_row["local_first_exit_particle_count"]),
+                local_first_exit_fraction=float(local_summary_row["fraction_local_first_exit"]),
+                local_departures_by_row=local_departures_by_row,
             )
         )
 
@@ -898,6 +1051,8 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
         kde_path.name: kde_path,
         summary_path.name: summary_path,
         arc_path.name: arc_path,
+        local_departures_path.name: local_departures_path,
+        local_summary_path.name: local_summary_path,
         "coastline": config.coastline_path,
     }
     sources_before = _snapshot_sources(source_paths)
@@ -1053,6 +1208,81 @@ def _status_counts(departures: Mapping[str, np.ndarray]) -> dict[int, int]:
 # ── 共用版面元件（標題兩行、副標、底部紅字警語、排他落檔）───────────────────
 
 
+def _boundary_kind(base_boundary_segment_id: str) -> str:
+    """回傳一條開放邊界線是 ``"local"``（站點 local domain，記錄用、非終止）、
+    ``"flow"``（flow domain，終止邊界）還是 ``"other"``（無法辨識的命名）。
+
+    判斷依據是 ``manifests.py``／``production_wiring.py`` 既有命名慣例：
+    ``f"{site_id}_local_open_boundary"``／``f"{flow_domain_id}_flow_open_boundary"``
+    （見 ``src/lagrangian_backtracking/manifests.py`` 建構 ``BoundaryGeometry`` 處），
+    與 ``postprocess.classify_boundary_segment`` 判別「離開點屬於哪一條線」時看的
+    是同一組後綴，不是本模組另創的規則。``local_equals_flow=True`` 的測站（新竹／
+    南灣／連江）兩條線座標完全相同但識別碼不同，仍會各自回傳 ``"local"``／
+    ``"flow"``——繪圖層因此會疊出兩條重疊但線型不同的線，視覺上剛好呈現「這兩條
+    邊界其實是同一條」，不需要特殊判斷去跳過其中一條。
+    """
+
+    if base_boundary_segment_id.endswith("_local_open_boundary"):
+        return "local"
+    if base_boundary_segment_id.endswith("_flow_open_boundary"):
+        return "flow"
+    return "other"
+
+
+# 水平總覽／局部／條件式來源足跡三張圖共用的邊界線樣式：flow domain（終止邊界）
+# 維持既有藍色虛線；local domain（記錄用、非終止）改用橘色點線，避免與既有
+# 「開放邊界＝終止」的視覺記憶混淆；無法辨識類別的線退回灰色點劃線，仍畫出來
+# 不隱藏，只是明確標示「未知類別」。
+_BOUNDARY_LINE_STYLE_BY_KIND: Mapping[str, Mapping[str, Any]] = {
+    "flow": {"color": "#174a70", "linewidth": 1.4, "linestyle": "--"},
+    "local": {"color": "#b35806", "linewidth": 1.3, "linestyle": ":"},
+    "other": {"color": "#666666", "linewidth": 1.0, "linestyle": "-."},
+}
+
+# local domain 首次離開（非終止事件）的標記樣式：空心菱形，邊框色與 local 邊界線
+# 同色，讓「這個標記」與「哪條邊界」在視覺上互相對應；刻意用空心（不像終止標記
+# 那樣實心）強調「粒子在這裡沒有停止，仍繼續回溯」。
+_LOCAL_FIRST_EXIT_MARKER_STYLE: Mapping[str, Any] = {
+    "marker": "D",
+    "markersize": 6.5,
+    "markerfacecolor": "none",
+    "markeredgecolor": "#b35806",
+    "markeredgewidth": 1.4,
+}
+
+
+def _local_flow_semantics_caption(site: SiteData, t: _Labeler) -> str:
+    """回傳水平總覽／局部兩張圖共用的副標第三行：說明 local／flow 兩種邊界與
+    標記的差異（WP-23 要求「副標或圖說註明兩者的差別」，見模組 docstring）。
+
+    依 ``site.local_equals_flow`` 給三種文字之一：``True``（同一次穿越，圖上
+    只有一個標記）、``False``（兩個事件、兩個標記）、``None``（未知，僅提示
+    「本次 postprocess 未提供 boundary_geometries，無法判定」，不臆測）。
+    """
+
+    if site.local_equals_flow is True:
+        return t.t(
+            "local domain 與 flow domain 邊界相同：離開 local domain＝離開 flow domain，"
+            "圖上只有一個終止標記，不另畫 local 首次離開標記。",
+            "local domain equals flow domain here: leaving local = leaving flow. "
+            "Only one termination marker is drawn (no separate local-exit marker).",
+        )
+    if site.local_equals_flow is False:
+        return t.t(
+            "空心菱形＝首次離開 local domain（僅記錄，粒子當時仍繼續回溯）；"
+            "實心終止標記＝離開 flow domain 開放邊界（真正停止處）。兩者是不同時刻、不同位置的事件。",
+            "Open diamond = first exit from local domain (recorded only, tracking continued). "
+            "Filled terminal marker = exit from the flow-domain open boundary (actual stop). "
+            "These are two distinct events at different times and locations.",
+        )
+    return t.t(
+        "本次後處理未提供 boundary_geometries，無法判定 local domain 與 flow domain 是否相同"
+        "（local_equals_flow 未知），圖上不畫 local 首次離開標記。",
+        "This postprocess run did not provide boundary_geometries, so local_equals_flow is "
+        "unknown; no local-exit marker is drawn.",
+    )
+
+
 def _resolve_dashed_open_boundary_lines(site: SiteData) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """由弧段幾何重建每條開放邊界折線的經緯度點序列（依 arc_segment_index 排序，
     以「首段起點＋各段終點」連成整條折線，不插入任何未登錄的額外點）。"""
@@ -1153,10 +1383,15 @@ def _plot_horizontal_overview(
     ax.set_facecolor("#eaf3f8")
     _land_lonlat_patches(land_geometries)(ax)
     boundary_lines = _resolve_dashed_open_boundary_lines(site)
-    for lon, lat in boundary_lines.values():
-        ax.plot(lon, lat, color="#174a70", linewidth=1.4, linestyle="--", zorder=2)
+    boundary_kinds_present: set[str] = set()
+    for base_id, (lon, lat) in boundary_lines.items():
+        kind = _boundary_kind(base_id)
+        boundary_kinds_present.add(kind)
+        style = _BOUNDARY_LINE_STYLE_BY_KIND[kind]
+        ax.plot(lon, lat, zorder=2, **style)
 
     cmap = plt.get_cmap("viridis")
+    any_local_marker = False
     for sample in site.trajectories:
         color = cmap(0.0 if sample.rank_total <= 1 else (sample.rank_index - 1) / (sample.rank_total - 1))
         ax.plot(sample.lon_deg, sample.lat_deg, color=color, linewidth=1.0, alpha=0.85, zorder=4)
@@ -1164,6 +1399,16 @@ def _plot_horizontal_overview(
             sample.lon_deg[0], sample.lat_deg[0], marker="o", markersize=5.2, markerfacecolor="#1a9850",
             markeredgecolor="white", markeredgewidth=0.6, linestyle="None", zorder=6,
         )
+        # local domain 首次離開（非終止）：只有 local_equals_flow=False 的測站、
+        # 且這顆代表粒子確實有對應紀錄時才畫；與下面的終止標記是兩個不同事件
+        # （見 _local_flow_semantics_caption），local_equals_flow=True 的測站
+        # 這兩個欄位恆為 None，不會多畫一個重疊標記。
+        if sample.local_first_exit_lon_deg is not None and sample.local_first_exit_lat_deg is not None:
+            any_local_marker = True
+            ax.plot(
+                sample.local_first_exit_lon_deg, sample.local_first_exit_lat_deg,
+                linestyle="None", zorder=6.5, **_LOCAL_FIRST_EXIT_MARKER_STYLE,
+            )
         marker = _STATUS_MARKERS.get(sample.final_status_code, "X")
         color_end = _STATUS_COLORS.get(sample.final_status_code, "#d62728")
         ax.plot(
@@ -1191,9 +1436,41 @@ def _plot_horizontal_overview(
     handles = [
         Line2D([], [], marker="o", color="#1a9850", markerfacecolor="#1a9850", linestyle="None",
                label=t.t("回溯起點（受體到達位置）", "Backtrack start (receptor arrival)")),
-        Line2D([], [], color="#174a70", linestyle="--", linewidth=1.4,
-               label=t.t("開放邊界（工程生成幾何）", "Open boundary (engineering geometry)")),
     ]
+    if "flow" in boundary_kinds_present:
+        handles.append(
+            Line2D(
+                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
+                label=t.t("flow domain 開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
+            )
+        )
+    if "local" in boundary_kinds_present:
+        handles.append(
+            Line2D(
+                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["local"],
+                label=t.t(
+                    "local domain 開放邊界（記錄用，非終止）",
+                    "Local-domain open boundary (record only, non-terminal)",
+                ),
+            )
+        )
+    if "other" in boundary_kinds_present:
+        handles.append(
+            Line2D(
+                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["other"],
+                label=t.t("未分類開放邊界", "Unclassified open boundary"),
+            )
+        )
+    if any_local_marker:
+        handles.append(
+            Line2D(
+                [], [], linestyle="None", **_LOCAL_FIRST_EXIT_MARKER_STYLE,
+                label=t.t(
+                    "local domain 首次離開（非終止，繼續回溯）",
+                    "First exit from local domain (non-terminal, tracking continued)",
+                ),
+            )
+        )
     for code in _STATUS_ORDER:
         handles.append(
             Line2D(
@@ -1203,7 +1480,8 @@ def _plot_horizontal_overview(
             )
         )
     fig.legend(
-        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.06), ncol=3, prop=font, frameon=True
+        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.05), ncol=4, prop=font, frameon=True,
+        fontsize=8,
     )
 
     _add_two_line_title(
@@ -1211,12 +1489,16 @@ def _plot_horizontal_overview(
         t.t(f"水平軌跡總覽｜{site.site_label_zh}", f"Horizontal overview | {site.site_id}"),
         _site_subtitle(site, t, extra=t.t("｜線色：代表粒子起始深度序位（淺→深）", "")),
     )
+    fig.text(
+        0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
+        fontproperties=font, fontsize=8, wrap=True,
+    )
     _add_disclaimer(fig, t, font)
     # 改用 subplots_adjust 明確指定邊界，不用 tight_layout：tight_layout 與
     # ax.set_aspect(..., adjustable="box") 併用時，在某些「經緯度範圍很扁」的
     # 站點（例如本圖含寬闊 flow_open_boundary 外框）會於內部多重繪製階段留下
     # 殘影（已實測，圖例列會疊到一個淡灰色殘影字元），改用固定邊界可穩定避免。
-    fig.subplots_adjust(left=0.08, bottom=0.26, right=0.97, top=0.87)
+    fig.subplots_adjust(left=0.08, bottom=0.30, right=0.97, top=0.84)
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
@@ -1243,7 +1525,18 @@ def _plot_horizontal_local(
     # 局部圖用經緯度平移到以起點群平均為原點，再乘上等距修正因子換成近似公尺，
     # 只為了「局部放大好讀」，不是新的座標系統——最終仍以度為單位標軸。
     ax.set_facecolor("#eaf3f8")
+    boundary_lines = _resolve_dashed_open_boundary_lines(site)
+    boundary_kinds_present: set[str] = set()
+    for base_id, (lon, lat) in boundary_lines.items():
+        kind = _boundary_kind(base_id)
+        boundary_kinds_present.add(kind)
+        style = _BOUNDARY_LINE_STYLE_BY_KIND[kind]
+        # flow domain 邊界通常遠在局部圖視窗之外（局部圖只依代表粒子範圍縮放，
+        # 不強制含入邊界，見下方 span 計算只用軌跡點），畫出來只是讓視窗剛好
+        # 涵蓋到時能看見；不在範圍內時 matplotlib 自動裁掉，不影響軸範圍。
+        ax.plot(lon - x0, lat - y0, zorder=2, **style)
     cmap = plt.get_cmap("viridis")
+    any_local_marker = False
     all_lon: list[float] = []
     all_lat: list[float] = []
     for sample in site.trajectories:
@@ -1254,6 +1547,12 @@ def _plot_horizontal_local(
             markerfacecolor="#1a9850", markeredgecolor="white", markeredgewidth=0.7,
             linestyle="None", zorder=6,
         )
+        if sample.local_first_exit_lon_deg is not None and sample.local_first_exit_lat_deg is not None:
+            any_local_marker = True
+            ax.plot(
+                sample.local_first_exit_lon_deg - x0, sample.local_first_exit_lat_deg - y0,
+                linestyle="None", zorder=6.5, **_LOCAL_FIRST_EXIT_MARKER_STYLE,
+            )
         marker = _STATUS_MARKERS.get(sample.final_status_code, "X")
         color_end = _STATUS_COLORS.get(sample.final_status_code, "#d62728")
         ax.plot(
@@ -1276,13 +1575,55 @@ def _plot_horizontal_local(
                   fontproperties=font)
     ax.grid(color="white", linewidth=0.8)
 
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D([], [], marker="o", color="#1a9850", markerfacecolor="#1a9850", linestyle="None",
+               label=t.t("回溯起點（受體到達位置）", "Backtrack start (receptor arrival)")),
+    ]
+    if "flow" in boundary_kinds_present:
+        handles.append(
+            Line2D(
+                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
+                label=t.t("flow domain 開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
+            )
+        )
+    if "local" in boundary_kinds_present:
+        handles.append(
+            Line2D(
+                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["local"],
+                label=t.t(
+                    "local domain 開放邊界（記錄用，非終止）",
+                    "Local-domain open boundary (record only, non-terminal)",
+                ),
+            )
+        )
+    if any_local_marker:
+        handles.append(
+            Line2D(
+                [], [], linestyle="None", **_LOCAL_FIRST_EXIT_MARKER_STYLE,
+                label=t.t(
+                    "local domain 首次離開（非終止，繼續回溯）",
+                    "First exit from local domain (non-terminal, tracking continued)",
+                ),
+            )
+        )
+    fig.legend(
+        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.045), ncol=2, prop=font, frameon=True,
+        fontsize=8,
+    )
+
     _add_two_line_title(
         fig, t, font,
         t.t(f"水平局部放大｜{site.site_label_zh}", f"Horizontal local view | {site.site_id}"),
         _site_subtitle(site, t),
     )
+    fig.text(
+        0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
+        fontproperties=font, fontsize=8, wrap=True,
+    )
     _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.02, bottom=0.12, right=0.98, top=0.90)
+    fig.subplots_adjust(left=0.05, bottom=0.24, right=0.98, top=0.84)
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
@@ -1436,11 +1777,8 @@ def _short_boundary_label(base_boundary_segment_id: str) -> str:
     ``boundary_arc_segments_geometry_by_site`` 原始表格中，未遺失任何資訊。
     """
 
-    if base_boundary_segment_id.endswith("_local_open_boundary"):
-        return "local"
-    if base_boundary_segment_id.endswith("_flow_open_boundary"):
-        return "flow"
-    return base_boundary_segment_id
+    kind = _boundary_kind(base_boundary_segment_id)
+    return kind if kind in ("local", "flow") else base_boundary_segment_id
 
 
 def _plot_boundary_arc_segments(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int) -> None:
@@ -1605,8 +1943,9 @@ def _plot_source_footprint_kde(
 
     _land_lonlat_patches(land_geometries)(ax)
     boundary_lines = _resolve_dashed_open_boundary_lines(site)
-    for lon, lat in boundary_lines.values():
-        ax.plot(lon, lat, color="#174a70", linewidth=1.4, linestyle="--", zorder=6)
+    for base_id, (lon, lat) in boundary_lines.items():
+        style = _BOUNDARY_LINE_STYLE_BY_KIND[_boundary_kind(base_id)]
+        ax.plot(lon, lat, zorder=6, **style)
 
     if site.kde is not None and site.kde["status"] == "available":
         x_centers = np.asarray(site.kde["x_centers_m"], dtype=np.float64)
@@ -1754,18 +2093,45 @@ _README_TEMPLATE = """\
 
 {site_list}
 
+## WP-23：兩種開放邊界與兩種「離開」事件（請先讀，影響前兩張圖）
+
+研究團隊裁決（`AGENTS.md`、`docs/development/05_decisions_and_risks.md`
+D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local domain 是非終止
+事件，只記錄、粒子繼續回溯**。因此每站可能有兩條開放邊界線，圖上用不同線型
+區分：
+
+- **flow domain 開放邊界**（藍色虛線）：真正的終止邊界，粒子離開這條線才停止
+  回溯，`terminal_counts.png` 等圖的「穿越開放邊界（正常結束）」指的就是這裡。
+- **local domain 開放邊界**（橘色點線）：只是記錄用，粒子離開這條線後仍繼續
+  回溯，不影響 `final_status_code`。
+
+對應地，粒子的終點標記（依 `final_status_code` 著色的實心標記）永遠畫在 flow
+domain 邊界上；若這顆代表粒子還有一筆「首次離開 local domain」的紀錄
+（`local_domain_departures.parquet` 或 `departures.parquet` 的
+`also_local_domain_first_exit=True`），會另外疊一個**空心橘色菱形**標記非終止
+事件。若某站 `local_equals_flow=True`（目前是新竹、南灣、連江——local domain
+與 flow domain 是同一個多邊形），兩個事件是同一次穿越，圖上只會看到一個標記
+（終止標記本身），不會另外畫空心菱形；若 `local_equals_flow=False`（目前是
+貢寮、龜山島），兩個標記通常出現在軌跡上不同位置。詳細語意見每張圖下方的
+「local domain 與 flow domain 的差別」副標文字。
+
 ## 每站八張圖
 
 各站資料夾（`<site_id>/`）內固定輸出以下八張 PNG，圖面標題、副標與底部紅字警語
 與本 README 一致：
 
 1. `horizontal_overview.png`：代表粒子水平軌跡總覽（經緯度顯示，涵蓋整個 flow
-   domain 範圍）。資料來源：`trajectory_samples_by_site`（軌跡座標、狀態）、
-   `departures.parquet`（起訖狀態對照）、`boundary_arc_segments_geometry_by_site`
-   （開放邊界折線）。綠點＝回溯起點（受體到達位置）；終點依 `final_status_code`
-   用不同顏色與標記形狀表示；線色依代表粒子起始深度序位（淺→深）。
+   domain 範圍），**同時畫出 local domain 與 flow domain 兩條開放邊界**（見上
+   一節）。資料來源：`trajectory_samples_by_site`（軌跡座標、狀態）、
+   `departures.parquet`（起訖狀態對照，含 `also_local_domain_first_exit`）、
+   `local_domain_departures.parquet`（local 首次離開位置）、
+   `boundary_arc_segments_geometry_by_site`（開放邊界折線）。綠點＝回溯起點
+   （受體到達位置）；flow domain 終點依 `final_status_code` 用不同顏色與標記
+   形狀表示；空心橘色菱形＝local domain 首次離開（非終止）；線色依代表粒子
+   起始深度序位（淺→深）。
 2. `horizontal_local.png`：受體附近局部放大，座標為經緯度相對代表粒子回溯起點
-   平均位置的偏移量。資料來源同上。
+   平均位置的偏移量，**同樣疊 local／flow 兩條開放邊界與 local 首次離開標記**
+   （舊版本圖完全不畫邊界，WP-23 起新增）。資料來源同上。
 3. `depth_age.png`：深度（`z_m`，海面為 0、向上為正）對回溯時齡（小時）曲線，
    顏色依代表粒子的垂向抽樣序位分色——**序位不代表固定物理水層**，native 後
    處理沒有保留原始的 `vertical_id`。資料來源：`trajectory_samples_by_site`。
@@ -1806,11 +2172,21 @@ _README_TEMPLATE = """\
   domain／open manifest，因此不畫閉合陸域邊界，只畫開放水域邊界。
 - 深度—時齡曲線的「序位」只是同一批代表粒子按起始深度排序後的名次，同一序位
   在不同站、不同受體之間**不對應同一水層**。
+- `boundary_azimuth_rose.png`／`boundary_arc_segments.png` 目前只呈現 flow
+  domain 語意的相對來源權重；local domain 首次離開的方位／弧段分布**尚未**
+  另外出圖，只能從 `local_domain_departures.parquet`（或
+  `local_domain_first_exit_summary_by_site` 的 `fraction_local_first_exit`）
+  自行查閱。
 
 ## 輸入來源
 
 見 `manifest.json` 的 `inputs_sha256_before`／`inputs_sha256_after`（相同代表本
-批繪圖沒有改動任何輸入檔）與 `output_png_sha256`（每張 PNG 的 SHA-256）。
+批繪圖沒有改動任何輸入檔）與 `output_png_sha256`（每張 PNG 的 SHA-256）；八個
+必要輸入表見本模組 docstring（`departures.parquet`、
+`trajectory_samples_by_site.parquet`、`kde_by_site.parquet`、
+`boundary_summary_by_site`、`boundary_arc_segments_geometry_by_site`、
+`local_domain_departures.parquet`、`local_domain_first_exit_summary_by_site`、
+`manifest.json`）。
 
 ## 重建指令
 

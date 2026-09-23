@@ -55,6 +55,12 @@ _PARTICLES_PER_SITE = 24
 _CROSSED_PER_SITE = 16  # 前 16 顆穿越邊界，剛好對應 16 個方位扇區各一顆
 _SETTLING_VELOCITIES_MPS = (-0.001, -0.01, -0.1)
 
+# WP-23：兩站分別模擬 local_equals_flow 的兩種真實情況——``site_a`` 比照
+# 貢寮／龜山島（local ⊂ flow，local 首次離開另外出表）、``site_b`` 比照
+# 新竹／南灣／連江（local 與 flow 相同，同一次穿越只用 also_local_domain_
+# first_exit 旗標表達）。兩站混在同一份合成後處理目錄裡，兩種語意同時測到。
+_SITE_LOCAL_EQUALS_FLOW: dict[str, bool] = {"site_a": False, "site_b": True}
+
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
@@ -74,6 +80,7 @@ def _build_site_departures(site_id: str, row_index_start: int) -> tuple[dict[str
     """
 
     center_lon, center_lat = _SITE_CENTERS[site_id]
+    local_equals_flow = _SITE_LOCAL_EQUALS_FLOW[site_id]
     projection = DomainProjection(center_lon, center_lat)
     rng = np.random.default_rng(abs(hash(site_id)) % (2**32))
 
@@ -99,6 +106,8 @@ def _build_site_departures(site_id: str, row_index_start: int) -> tuple[dict[str
     boundary_arc_segment_index: list[int | None] = []
     boundary_arc_length_position_m: list[float | None] = []
 
+    also_local_domain_first_exit: list[bool] = []
+
     for i in range(n):
         particle_id.append(f"{site_id}_p{i:03d}")
         study_site_id.append(site_id)
@@ -112,6 +121,10 @@ def _build_site_departures(site_id: str, row_index_start: int) -> tuple[dict[str
             final_status_code.append(NATIVE_STATUS_LEFT_INTEREST_REGION)
             final_status_description_zh.append(NATIVE_STATUS_DESCRIPTIONS[NATIVE_STATUS_LEFT_INTEREST_REGION])
             crossed.append(True)
+            # WP-23：只有 local_equals_flow=True 的站（this 是「local 首次離開」
+            # 與「flow 終止」同一次穿越的旗標），此時這一列不會另外出現在
+            # local_domain_departures.parquet（見 _build_local_departure_rows）。
+            also_local_domain_first_exit.append(local_equals_flow)
             azimuth_sector_index.append(sector_index)
             azimuth_sector_name.append(COMPASS_16_SECTOR_NAMES[sector_index])
             base_id = f"{site_id}_local_open_boundary" if i % 2 == 0 else f"{site_id}_flow_open_boundary"
@@ -124,6 +137,7 @@ def _build_site_departures(site_id: str, row_index_start: int) -> tuple[dict[str
             final_status_code.append(status_code)
             final_status_description_zh.append(NATIVE_STATUS_DESCRIPTIONS[status_code])
             crossed.append(False)
+            also_local_domain_first_exit.append(False)
             azimuth_sector_index.append(None)
             azimuth_sector_name.append(None)
             boundary_segment_id.append(None)
@@ -138,6 +152,7 @@ def _build_site_departures(site_id: str, row_index_start: int) -> tuple[dict[str
         "final_status_code": final_status_code,
         "final_status_description_zh": final_status_description_zh,
         "crossed_interest_region_boundary": crossed,
+        "also_local_domain_first_exit": also_local_domain_first_exit,
         "departure_lon_deg": lon_deg.tolist(),
         "departure_lat_deg": lat_deg.tolist(),
         "departure_x_m": x_m.tolist(),
@@ -152,6 +167,91 @@ def _build_site_departures(site_id: str, row_index_start: int) -> tuple[dict[str
         "boundary_arc_length_position_m": boundary_arc_length_position_m,
     }
     return columns, projection
+
+
+def _build_local_departure_rows(site_id: str, departures: dict[str, list]) -> list[dict[str, object]]:
+    """造 ``local_domain_departures.parquet`` 的列：只有 ``local_equals_flow=False``
+    的站（本檔案是 ``site_a``）才有內容，每個成功穿越 flow domain 的粒子一列，
+    模擬「先離開 local domain（記錄），再離開 flow domain（終止）」——離開 local
+    domain 的位置刻意取離開 flow domain位置的一半（回溯起點方向），確保兩個事件
+    在圖上是不同的點，能驗證 figures.py 畫出兩個不同標記。
+    """
+
+    if _SITE_LOCAL_EQUALS_FLOW[site_id]:
+        return []
+    rows: list[dict[str, object]] = []
+    for i, crossed in enumerate(departures["crossed_interest_region_boundary"]):
+        if not crossed:
+            continue
+        x_m = departures["departure_x_m"][i] * 0.5
+        y_m = departures["departure_y_m"][i] * 0.5
+        rows.append(
+            {
+                "particle_id": departures["particle_id"][i],
+                "scenario_id": "synthetic_scenario",
+                "member_id": 0,
+                "study_site_id": site_id,
+                "analysis_region_id": site_id,
+                "receptor_id": departures["receptor_id"][i],
+                "material_id": "synthetic_material",
+                "arrival_time_id": "t0",
+                "arrival_time_utc_ns": 1_700_000_000_000_000_000,
+                "settling_velocity_mps": departures["settling_velocity_mps"][i],
+                "season": "synthetic_season",
+                "depth_quartile": 0,
+                "row_particle_index": departures["row_particle_index"][i],
+                "local_first_exit_x_m": x_m,
+                "local_first_exit_y_m": y_m,
+                "local_first_exit_z_m": 0.0,
+                "local_first_exit_lon_deg": None,
+                "local_first_exit_lat_deg": None,
+                "local_first_exit_utc_ns": 1_699_999_996_400_000_000,
+                "local_first_exit_backtrack_duration_seconds": 3600.0,
+                "local_boundary_segment_id": f"{site_id}_local_open_boundary",
+                "local_boundary_classification_distance_m": 0.0,
+                "local_departure_azimuth_deg": float(departures["departure_azimuth_sector_index"][i] or 0)
+                * 22.5,
+                "local_departure_azimuth_sector_index": departures["departure_azimuth_sector_index"][i],
+                "local_departure_azimuth_sector_name": departures["departure_azimuth_sector_name"][i],
+                "local_boundary_arc_segment_index": departures["boundary_arc_segment_index"][i],
+                "local_boundary_arc_length_position_m": departures["boundary_arc_length_position_m"][i],
+            }
+        )
+    return rows
+
+
+def _fill_local_first_exit_lonlat(
+    rows: list[dict[str, object]], projection: DomainProjection
+) -> list[dict[str, object]]:
+    """把 :func:`_build_local_departure_rows` 造出的公尺座標投影回經緯度，
+    分兩步是因為投影中心要等 ``_build_site_departures`` 算完才知道。"""
+
+    for row in rows:
+        lon, lat = projection.unproject(row["local_first_exit_x_m"], row["local_first_exit_y_m"])
+        row["local_first_exit_lon_deg"] = float(lon)
+        row["local_first_exit_lat_deg"] = float(lat)
+    return rows
+
+
+def _build_local_summary_row(site_id: str, departures: dict[str, list]) -> dict[str, object]:
+    """造 ``local_domain_first_exit_summary_by_site.parquet`` 這一站的一列。"""
+
+    local_equals_flow = _SITE_LOCAL_EQUALS_FLOW[site_id]
+    total = len(departures["particle_id"])
+    if local_equals_flow:
+        count = sum(1 for v in departures["also_local_domain_first_exit"] if v)
+        source = "same_as_flow_domain_departure"
+    else:
+        count = sum(1 for v in departures["crossed_interest_region_boundary"] if v)
+        source = "local_domain_departures"
+    return {
+        "study_site_id": site_id,
+        "local_equals_flow": local_equals_flow,
+        "total_particle_count": total,
+        "local_first_exit_particle_count": count,
+        "fraction_local_first_exit": count / total if total else float("nan"),
+        "local_first_exit_source": source,
+    }
 
 
 def _build_trajectory_rows(
@@ -309,6 +409,8 @@ def _write_synthetic_postprocess_dir(
     kde_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
     arc_rows: list[dict[str, object]] = []
+    local_departure_rows: list[dict[str, object]] = []
+    local_summary_rows: list[dict[str, object]] = []
 
     row_index_start = 0
     for site_id in sites:
@@ -324,6 +426,10 @@ def _write_synthetic_postprocess_dir(
         kde_rows.append(_build_kde_row(site_id))
         summary_rows.append(_build_summary_row(site_id, departures))
         arc_rows.extend(_build_arc_geometry_rows(site_id, projection))
+        local_departure_rows.extend(
+            _fill_local_first_exit_lonlat(_build_local_departure_rows(site_id, departures), projection)
+        )
+        local_summary_rows.append(_build_local_summary_row(site_id, departures))
 
     pq.write_table(pa.table(all_departures), postprocess_dir / "departures.parquet")
     pq.write_table(pa.table(all_trajectories), postprocess_dir / "trajectory_samples_by_site.parquet")
@@ -331,6 +437,29 @@ def _write_synthetic_postprocess_dir(
     pq.write_table(pa.Table.from_pylist(summary_rows), postprocess_dir / "boundary_summary_by_site.parquet")
     pq.write_table(
         pa.Table.from_pylist(arc_rows), postprocess_dir / "boundary_arc_segments_geometry_by_site.parquet"
+    )
+    if local_departure_rows:
+        local_departure_table = pa.Table.from_pylist(local_departure_rows)
+    else:
+        # 全部站點都 local_equals_flow=True 時這張表沒有任何列，但欄位仍須齊全，
+        # 否則 figures.py 的 _require_columns 會 fail-closed（見該檔 docstring）。
+        local_departure_table = pa.table(
+            {name: [] for name in [
+                "particle_id", "scenario_id", "member_id", "study_site_id", "analysis_region_id",
+                "receptor_id", "material_id", "arrival_time_id", "arrival_time_utc_ns",
+                "settling_velocity_mps", "season", "depth_quartile", "row_particle_index",
+                "local_first_exit_x_m", "local_first_exit_y_m", "local_first_exit_z_m",
+                "local_first_exit_lon_deg", "local_first_exit_lat_deg", "local_first_exit_utc_ns",
+                "local_first_exit_backtrack_duration_seconds", "local_boundary_segment_id",
+                "local_boundary_classification_distance_m", "local_departure_azimuth_deg",
+                "local_departure_azimuth_sector_index", "local_departure_azimuth_sector_name",
+                "local_boundary_arc_segment_index", "local_boundary_arc_length_position_m",
+            ]}
+        )
+    pq.write_table(local_departure_table, postprocess_dir / "local_domain_departures.parquet")
+    pq.write_table(
+        pa.Table.from_pylist(local_summary_rows),
+        postprocess_dir / "local_domain_first_exit_summary_by_site.parquet",
     )
 
     manifest = {
@@ -520,3 +649,128 @@ def test_manifest_sha256_matches_actual_files(tmp_path: Path, synthetic_inputs: 
     for relative_name, record in manifest["output_png_sha256"].items():
         png_path = output_dir / relative_name
         assert record["sha256"] == _sha256_file(png_path), f"output sha256 mismatch: {relative_name}"
+
+
+# ── WP-23：local domain 首次離開（非終止事件）與 flow domain 終止的雙重語意 ──
+
+
+def test_boundary_kind_classifies_local_flow_and_unknown_suffixes() -> None:
+    """``_boundary_kind`` 是繪圖層唯一判斷「這條線是 local 還是 flow」的地方，
+    依據跟 ``manifests.py`` 建構 ``BoundaryGeometry`` 時完全相同的既有命名慣例。
+    """
+
+    assert native_figures._boundary_kind("gongliao_local_open_boundary") == "local"
+    assert native_figures._boundary_kind("area_a_flow_open_boundary") == "flow"
+    assert native_figures._boundary_kind("coastline") == "other"
+
+
+def test_local_equals_flow_false_site_populates_local_first_exit_fields(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """``site_a``（本檔案模擬 local ⊂ flow，比照貢寮／龜山島）：
+    ``local_equals_flow=False``、``local_departures_by_row`` 非空、且至少一顆
+    代表粒子的 ``TrajectorySample.local_first_exit_lon/lat`` 有值（非終止標記
+    有東西可畫）。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    inputs = native_figures.load_native_figures_inputs(config)
+    site_a = next(s for s in inputs.sites if s.site_id == "site_a")
+
+    assert site_a.local_equals_flow is False
+    assert site_a.local_first_exit_particle_count == _CROSSED_PER_SITE
+    assert site_a.local_first_exit_fraction == pytest.approx(_CROSSED_PER_SITE / _PARTICLES_PER_SITE)
+    assert len(site_a.local_departures_by_row) == _CROSSED_PER_SITE
+
+    samples_with_local_marker = [
+        s for s in site_a.trajectories
+        if s.local_first_exit_lon_deg is not None and s.local_first_exit_lat_deg is not None
+    ]
+    assert samples_with_local_marker, "site_a 應該至少有一顆代表粒子帶 local 首次離開標記"
+    for sample in samples_with_local_marker:
+        # 造合成資料時 local 首次離開位置刻意取終止點的一半（回溯起點方向），
+        # 兩者不應該是同一個點，否則兩種標記在圖上會重疊而失去意義。
+        assert (sample.local_first_exit_lon_deg, sample.local_first_exit_lat_deg) != (
+            sample.lon_deg[-1], sample.lat_deg[-1],
+        )
+
+
+def test_local_equals_flow_true_site_has_no_separate_local_departures(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """``site_b``（本檔案模擬 local＝flow，比照新竹／南灣／連江）：
+    ``local_equals_flow=True``、``local_departures_by_row`` 必須是空的（該事件
+    已經用 ``also_local_domain_first_exit`` 表達，不會另外出現一列），且沒有任何
+    代表粒子帶 local 首次離開標記（避免同一次穿越在圖上被畫成兩個點）。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    inputs = native_figures.load_native_figures_inputs(config)
+    site_b = next(s for s in inputs.sites if s.site_id == "site_b")
+
+    assert site_b.local_equals_flow is True
+    assert site_b.local_departures_by_row == {}
+    assert site_b.local_first_exit_particle_count == _CROSSED_PER_SITE
+
+    also_local_flags = site_b.departures["also_local_domain_first_exit"]
+    crossed_flags = site_b.departures["crossed_interest_region_boundary"]
+    assert int(also_local_flags.sum()) == _CROSSED_PER_SITE
+    assert bool((also_local_flags <= crossed_flags).all())  # 旗標只可能在穿越那一列為真
+
+    for sample in site_b.trajectories:
+        assert sample.local_first_exit_lon_deg is None
+        assert sample.local_first_exit_lat_deg is None
+
+
+def test_missing_local_domain_departures_table_fails_closed(tmp_path: Path) -> None:
+    postprocess_dir = _write_synthetic_postprocess_dir(tmp_path)
+    coastline_path = _write_synthetic_coastline(tmp_path)
+    (postprocess_dir / "local_domain_departures.parquet").unlink()
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    with pytest.raises(native_figures.FiguresError, match="local_domain_departures"):
+        native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+
+def test_missing_also_local_domain_first_exit_column_fails_closed(tmp_path: Path) -> None:
+    postprocess_dir = _write_synthetic_postprocess_dir(tmp_path)
+    coastline_path = _write_synthetic_coastline(tmp_path)
+
+    departures_path = postprocess_dir / "departures.parquet"
+    table = pq.read_table(departures_path)
+    table = table.drop(["also_local_domain_first_exit"])
+    pq.write_table(table, departures_path)
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    with pytest.raises(native_figures.FiguresError, match="also_local_domain_first_exit"):
+        native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+
+def test_all_eight_figures_still_produced_with_mixed_local_equals_flow_sites(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """本檔案的合成目錄本身就混了 local_equals_flow=False（site_a）／True
+    （site_b）兩種站，完整跑一次八張圖確保新增的邊界分色、local 標記與副標
+    邏輯不會讓任何一張圖整個畫圖失敗（成功產出即代表 matplotlib 呼叫序列
+    沒有拋例外；圖面內容正確性另由上面兩個 SiteData 欄位測試把關）。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    for site_id in ("site_a", "site_b"):
+        for stem in ("horizontal_overview", "horizontal_local"):
+            png_path = output_dir / site_id / f"{stem}.png"
+            assert png_path.is_file()
+            assert png_path.stat().st_size > 0
