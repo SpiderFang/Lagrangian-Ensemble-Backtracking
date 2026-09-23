@@ -259,6 +259,7 @@ from .backward_driver import (
     BayTraceModuleHandles,
     DepartureRecord,
     HourlyOverheadDiagnostics,
+    LocalDomainFirstExitRecord,
     SubstepDiagnostics,
     build_pre_window_deposition_result,
     load_baytrace_modules,
@@ -591,6 +592,23 @@ def save_backward_driver_result_npz(path: str | Path, result: BackwardDriverResu
     值（見 ``hour_major`` 模組文件「分批粒度」一節），本函式仍誠實寫入
     （而非省略），避免讀回時對欄位是否存在做特殊判斷。
 
+    WP-23 修補（見 ``reports/WP-23-fix.md``）：原本的實作只序列化
+    ``BackwardDriverResult`` 的「舊」欄位，把兩個 WP-23 新增的欄位整個
+    漏接——``DepartureRecord.also_local_domain_first_exit`` 沒有跟著
+    ``departure_*`` 並排陣列一起寫出、``local_domain_departures``
+    （``LocalDomainFirstExitRecord`` 的 tuple）完全沒有寫進 payload。這兩個
+    欄位在記憶體內都是正確的（單元測試只驗過記憶體物件，沒有驗過這條
+    npz 往返，因此沒抓到），但正式伺服器寫檔後這兩份資料就永久遺失，
+    ``native-postprocess`` 讀回的每一站 ``local_first_exit_particle_count``
+    因此全部變成 0。修補後：
+
+    - ``departure_also_local_first_exit``：與 ``departure_row`` 等長對齊的
+      bool 陣列，逐列複製 ``DepartureRecord.also_local_domain_first_exit``。
+    - ``local_departure_row``／``local_departure_x_m``／``local_departure_y_m``／
+      ``local_departure_z_m``／``local_departure_utc_ns``／
+      ``n_local_departures``：``local_domain_departures`` 攤平成的並排陣列，
+      命名跟隨既有 ``departure_*``／``n_departures`` 的慣例。
+
     寫入方式：先寫到帶亂數後綴的暫存路徑，再以 ``os.replace`` 原子改名，
     與 ``orchestrator._atomic_write_json`` 相同的「不留半寫檔案」原則。
     """
@@ -609,6 +627,20 @@ def save_backward_driver_result_npz(path: str | Path, result: BackwardDriverResu
     departure_y = np.array([d.y_m for d in result.departures], dtype=np.float64)
     departure_z = np.array([d.z_m for d in result.departures], dtype=np.float64)
     departure_utc = np.array([d.utc_ns for d in result.departures], dtype=np.int64)
+    departure_also_local_first_exit = np.array(
+        [bool(d.also_local_domain_first_exit) for d in result.departures], dtype=bool
+    )
+
+    n_local_departures = len(result.local_domain_departures)
+    local_departure_row = np.array(
+        [d.row_particle_index for d in result.local_domain_departures], dtype=np.int64
+    )
+    local_departure_x = np.array([d.x_m for d in result.local_domain_departures], dtype=np.float64)
+    local_departure_y = np.array([d.y_m for d in result.local_domain_departures], dtype=np.float64)
+    local_departure_z = np.array([d.z_m for d in result.local_domain_departures], dtype=np.float64)
+    local_departure_utc = np.array(
+        [d.utc_ns for d in result.local_domain_departures], dtype=np.int64
+    )
 
     payload = {
         "row_particle_index": np.asarray(result.row_particle_index, dtype=np.int64),
@@ -628,7 +660,14 @@ def save_backward_driver_result_npz(path: str | Path, result: BackwardDriverResu
         "departure_y_m": departure_y,
         "departure_z_m": departure_z,
         "departure_utc_ns": departure_utc,
+        "departure_also_local_first_exit": departure_also_local_first_exit,
         "n_departures": np.asarray(n_departures, dtype=np.int64),
+        "local_departure_row": local_departure_row,
+        "local_departure_x_m": local_departure_x,
+        "local_departure_y_m": local_departure_y,
+        "local_departure_z_m": local_departure_z,
+        "local_departure_utc_ns": local_departure_utc,
+        "n_local_departures": np.asarray(n_local_departures, dtype=np.int64),
         "hours_run": np.asarray(int(result.hours_run), dtype=np.int64),
     }
     with tmp_path.open("wb") as handle:
@@ -637,10 +676,26 @@ def save_backward_driver_result_npz(path: str | Path, result: BackwardDriverResu
 
 
 def load_backward_driver_result_npz(path: str | Path) -> BackwardDriverResult:
-    """讀回 :func:`save_backward_driver_result_npz` 寫出的 ``.npz``。"""
+    """讀回 :func:`save_backward_driver_result_npz` 寫出的 ``.npz``。
+
+    向後相容（WP-23 修補新增）：WP-23 之前寫出的舊結果檔（例如 run01）沒有
+    ``departure_also_local_first_exit``／``local_departure_*``／
+    ``n_local_departures`` 這幾個欄位——這不是「未知」，而是那些檔案寫出
+    當下 WP-23 的 local domain 追蹤功能根本還不存在，語意上等於「這個
+    單元沒有任何 local 首次離開事件」，因此缺欄位時分別退回
+    ``also_local_domain_first_exit=False``（逐列）與空的
+    ``local_domain_departures`` tuple，不得因為欄位不存在就整個讀取失敗；
+    下游 ``postprocess.py`` 對「這一站的 ``local_equals_flow`` 本身未知」
+    另有專門的 ``unknown_local_equals_flow`` 語意，兩者是不同層次的
+    「未知」，不要混用。
+    """
 
     with np.load(str(path), allow_pickle=False) as npz:
         n_departures = int(npz["n_departures"])
+        has_also_local = "departure_also_local_first_exit" in npz.files
+        also_local_flags = (
+            npz["departure_also_local_first_exit"] if has_also_local else None
+        )
         departures = tuple(
             DepartureRecord(
                 row_particle_index=int(npz["departure_row"][i]),
@@ -649,9 +704,28 @@ def load_backward_driver_result_npz(path: str | Path) -> BackwardDriverResult:
                 y_m=float(npz["departure_y_m"][i]),
                 z_m=float(npz["departure_z_m"][i]),
                 utc_ns=int(npz["departure_utc_ns"][i]),
+                also_local_domain_first_exit=(
+                    bool(also_local_flags[i]) if also_local_flags is not None else False
+                ),
             )
             for i in range(n_departures)
         )
+
+        if "n_local_departures" in npz.files:
+            n_local_departures = int(npz["n_local_departures"])
+            local_domain_departures = tuple(
+                LocalDomainFirstExitRecord(
+                    row_particle_index=int(npz["local_departure_row"][i]),
+                    x_m=float(npz["local_departure_x_m"][i]),
+                    y_m=float(npz["local_departure_y_m"][i]),
+                    z_m=float(npz["local_departure_z_m"][i]),
+                    utc_ns=int(npz["local_departure_utc_ns"][i]),
+                )
+                for i in range(n_local_departures)
+            )
+        else:
+            local_domain_departures = ()
+
         return BackwardDriverResult(
             row_particle_index=np.asarray(npz["row_particle_index"], dtype=np.int64),
             final_status=np.asarray(npz["final_status"], dtype=np.int32),
@@ -668,6 +742,7 @@ def load_backward_driver_result_npz(path: str | Path) -> BackwardDriverResult:
             diagnostics=SubstepDiagnostics(),
             overhead_diagnostics=HourlyOverheadDiagnostics(),
             hours_run=int(npz["hours_run"]),
+            local_domain_departures=local_domain_departures,
         )
 
 

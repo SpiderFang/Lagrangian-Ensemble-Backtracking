@@ -1502,3 +1502,235 @@ def test_local_domain_departures_missing_boundary_geometry_for_site_fails_closed
     )
     with pytest.raises(PostprocessError):
         accumulator.add_batch("batch-0", result)
+
+
+# ── WP-23 修補：npz 持久化往返端對端測試 ─────────────────────────────────────
+#
+# 背景：WP-23 上線後，正式伺服器上發現 ``BackwardDriverResult.local_domain_
+# departures`` 與 ``DepartureRecord.also_local_domain_first_exit`` 在記憶體中
+# 都正確（以上單元測試全部只用記憶體物件直接餵給 ``PostprocessAccumulator.
+# add_batch``，完全沒有經過任何檔案），但 ``hour_major_provider.
+# save_backward_driver_result_npz`` 序列化成 ``.npz`` 時把這兩個新欄位整個
+# 漏接，導致正式後處理讀回的每一站 ``local_first_exit_particle_count`` 全部
+# 是 0（見 reports/WP-23-fix.md）。以下測試刻意插入
+# ``save_backward_driver_result_npz`` → ``load_backward_driver_result_npz``
+# 這一次完整的檔案往返，才呼叫 ``add_batch``，直接對應「跑完 → 寫檔 → 讀回 →
+# 後處理」這條正式管線，才能真正抓到這類「單元測試只驗記憶體物件」的漏洞。
+
+
+def test_npz_roundtrip_preserves_local_domain_departures_for_local_not_equals_flow_site(
+    tmp_path,
+) -> None:
+    """端對端：``local_equals_flow=False`` 站（例如貢寮／龜山島）的
+    ``LocalDomainFirstExitRecord`` 經過 ``save_backward_driver_result_npz`` →
+    ``load_backward_driver_result_npz`` 往返後，後處理算出的
+    ``local_first_exit_particle_count`` 必須是 1（不是 0）。
+
+    修補前的失敗方式：``save_backward_driver_result_npz`` 沒有寫出任何
+    ``local_departure_*``／``n_local_departures`` 欄位，讀回的
+    ``BackwardDriverResult.local_domain_departures`` 因此永遠是空 tuple，
+    這裡的斷言會失敗在 ``local_first_exit_particle_count == 0``
+    （而不是預期的 1）。
+    """
+
+    from lagrangian_backtracking.native_runner import hour_major_provider as hmp
+
+    identity = _make_identity_table(
+        particle_ids=["p0"],
+        study_site_id=["siteA"],
+        settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION],
+        final_x_m=[480.0],
+        final_y_m=[0.0],
+        final_utc_ns=[_JAN_2024_UTC_NS - 2 * _HOUR_NS],
+        local_domain_departures=[
+            LocalDomainFirstExitRecord(
+                row_particle_index=0, x_m=100.0, y_m=0.0, z_m=-5.0,
+                utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            )
+        ],
+    )
+
+    npz_path = tmp_path / "unit-0.driver_result.npz"
+    hmp.save_backward_driver_result_npz(npz_path, result)
+    roundtripped = hmp.load_backward_driver_result_npz(npz_path)
+
+    # 往返後的物件必須與寫入前完全一致，這是能正確後處理的前提。
+    assert len(roundtripped.local_domain_departures) == 1
+    local_record = roundtripped.local_domain_departures[0]
+    assert local_record.row_particle_index == 0
+    assert local_record.x_m == pytest.approx(100.0)
+    assert local_record.y_m == pytest.approx(0.0)
+    assert local_record.z_m == pytest.approx(-5.0)
+    assert local_record.utc_ns == _JAN_2024_UTC_NS - _HOUR_NS
+    assert len(roundtripped.departures) == 1
+    assert roundtripped.departures[0].also_local_domain_first_exit is False
+
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path / "postprocess_out",
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA", local_equals_flow=False)},
+    )
+    accumulator.add_batch("batch-0", roundtripped)
+    accumulator.finalize()
+
+    local_rows = pq.read_table(
+        tmp_path / "postprocess_out" / "local_domain_departures.parquet"
+    ).to_pylist()
+    assert len(local_rows) == 1
+    assert local_rows[0]["row_particle_index"] == 0
+
+    summary_rows = {
+        r["study_site_id"]: r
+        for r in pq.read_table(
+            tmp_path / "postprocess_out" / "local_domain_first_exit_summary_by_site.parquet"
+        ).to_pylist()
+    }
+    assert summary_rows["siteA"]["local_equals_flow"] is False
+    assert summary_rows["siteA"]["local_first_exit_particle_count"] == 1
+    assert summary_rows["siteA"]["local_first_exit_source"] == "local_domain_departures"
+
+
+def test_npz_roundtrip_preserves_also_local_domain_first_exit_for_local_equals_flow_site(
+    tmp_path,
+) -> None:
+    """端對端：``local_equals_flow=True`` 站（例如新竹／南灣／連江）的
+    ``DepartureRecord.also_local_domain_first_exit=True`` 經過
+    ``save_backward_driver_result_npz`` → ``load_backward_driver_result_npz``
+    往返後仍然是 ``True``，後處理算出的 ``local_first_exit_particle_count``
+    必須是 1（不是 0）。
+
+    修補前的失敗方式：``departure_also_local_first_exit`` 完全沒有寫進
+    ``.npz``，讀回的每一筆 ``DepartureRecord.also_local_domain_first_exit``
+    都退回 dataclass 預設值 ``False``，這裡的斷言會失敗。
+    """
+
+    from lagrangian_backtracking.native_runner import hour_major_provider as hmp
+
+    identity = _make_identity_table(
+        particle_ids=["p0", "p1"],
+        study_site_id=["siteB", "siteB"],
+        settling_velocity_mps=[-0.001, -0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 2,
+    )
+    departures = [
+        DepartureRecord(
+            row_particle_index=0, status=NATIVE_STATUS_LEFT_INTEREST_REGION,
+            x_m=100.0, y_m=0.0, z_m=-5.0, utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+            also_local_domain_first_exit=True,
+        ),
+        DepartureRecord(
+            row_particle_index=1, status=NATIVE_STATUS_MAX_BACKTRACK,
+            x_m=0.0, y_m=0.0, z_m=-5.0, utc_ns=_JAN_2024_UTC_NS - 2 * _HOUR_NS,
+            also_local_domain_first_exit=False,
+        ),
+    ]
+    result = _make_result(
+        rows=[0, 1],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION, NATIVE_STATUS_MAX_BACKTRACK],
+        departures=departures,
+    )
+
+    npz_path = tmp_path / "unit-0.driver_result.npz"
+    hmp.save_backward_driver_result_npz(npz_path, result)
+    roundtripped = hmp.load_backward_driver_result_npz(npz_path)
+
+    by_row = {d.row_particle_index: d for d in roundtripped.departures}
+    assert by_row[0].also_local_domain_first_exit is True
+    assert by_row[1].also_local_domain_first_exit is False
+    assert roundtripped.local_domain_departures == ()
+
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path / "postprocess_out",
+        boundary_geometries={"siteB": _make_boundary_geometry("siteB", local_equals_flow=True)},
+    )
+    accumulator.add_batch("batch-0", roundtripped)
+    accumulator.finalize()
+
+    local_rows = pq.read_table(
+        tmp_path / "postprocess_out" / "local_domain_departures.parquet"
+    ).to_pylist()
+    assert local_rows == []  # local_equals_flow=True：不重複寫入
+
+    summary_rows = {
+        r["study_site_id"]: r
+        for r in pq.read_table(
+            tmp_path / "postprocess_out" / "local_domain_first_exit_summary_by_site.parquet"
+        ).to_pylist()
+    }
+    assert summary_rows["siteB"]["local_equals_flow"] is True
+    assert summary_rows["siteB"]["local_first_exit_particle_count"] == 1
+    assert summary_rows["siteB"]["fraction_local_first_exit"] == pytest.approx(0.5)
+    assert summary_rows["siteB"]["local_first_exit_source"] == "same_as_flow_domain_departure"
+
+
+def test_npz_roundtrip_backward_compatible_with_pre_wp23_result_file(tmp_path) -> None:
+    """向後相容：WP-23 之前（run01 等）寫出的舊 ``.npz`` 沒有
+    ``local_departure_*``／``departure_also_local_first_exit`` 欄位，讀回不得
+    崩潰，且語意是「這個單元沒有任何 local 首次離開事件」（那個功能寫出當下
+    還不存在），不是「未知」——``postprocess.py`` 對「這一站 local_equals_flow
+    本身未知」另有專門語意（``unknown_local_equals_flow``），這裡驗證的是
+    npz 讀回層級的相容性，不涉及那個分類。
+
+    做法：直接用 ``save_backward_driver_result_npz`` 目前的邏輯手造一份「去掉
+    WP-23 新欄位」的 npz（模擬 run01 的舊格式），確認讀回不拋例外、且兩個新
+    欄位分別退回空 tuple／``False``，餵給後處理後 ``local_first_exit_
+    particle_count`` 是 0（沒有證據，不是因為讀取失敗被默默吃掉）。
+    """
+
+    from lagrangian_backtracking.native_runner import hour_major_provider as hmp
+
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteA"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_MAX_BACKTRACK],
+    )
+
+    npz_path = tmp_path / "unit-0.driver_result.npz"
+    hmp.save_backward_driver_result_npz(npz_path, result)
+
+    # 模擬 run01：把目前版本寫出的 npz 讀回，去掉 WP-23 新增的欄位後重新存檔，
+    # 得到一份與修補前的正式舊結果檔欄位完全相同的「舊格式」檔案。
+    with np.load(str(npz_path), allow_pickle=False) as npz:
+        legacy_payload = {
+            key: npz[key]
+            for key in npz.files
+            if key
+            not in (
+                "departure_also_local_first_exit",
+                "local_departure_row",
+                "local_departure_x_m",
+                "local_departure_y_m",
+                "local_departure_z_m",
+                "local_departure_utc_ns",
+                "n_local_departures",
+            )
+        }
+    legacy_path = tmp_path / "legacy-unit-0.driver_result.npz"
+    np.savez(str(legacy_path), **legacy_payload)
+
+    roundtripped = hmp.load_backward_driver_result_npz(legacy_path)
+    assert roundtripped.local_domain_departures == ()
+    assert all(not d.also_local_domain_first_exit for d in roundtripped.departures)
+
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path / "postprocess_out",
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA", local_equals_flow=False)},
+    )
+    accumulator.add_batch("batch-0", roundtripped)
+    accumulator.finalize()
+
+    summary_rows = {
+        r["study_site_id"]: r
+        for r in pq.read_table(
+            tmp_path / "postprocess_out" / "local_domain_first_exit_summary_by_site.parquet"
+        ).to_pylist()
+    }
+    assert summary_rows["siteA"]["local_first_exit_particle_count"] == 0
+    assert summary_rows["siteA"]["local_first_exit_source"] == "local_domain_departures"
