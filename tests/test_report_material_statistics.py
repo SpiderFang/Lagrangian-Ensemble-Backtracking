@@ -393,24 +393,32 @@ def test_product_direct_validation_rejects_inconsistent_ratio() -> None:
 
 
 def test_baseline_material_contract_keeps_ten_negative_speed_proxies() -> None:
-    """報告統計修正不得改變十類基線、速度格點或漁具代理速度。"""
+    """報告統計修正不得改變十類基線、速度格點或漁具代理速度。
+
+    WP-35（2026-09-24／25）把十個速度由 provisional 敏感度格點改為
+    ``data/settling_velocity_derivation/results.csv`` 推導出的定案值；此處的固定值
+    比對同步更新為新定案值，但比對「十類基線與漁具代理速度不被報告統計修正意外
+    改動」的原始意圖不變——見
+    ``tests/test_scenarios.py::test_baseline_behaviors_match_settling_velocity_derivation_source``
+    對這些新值與推導來源的機器強制比對。
+    """
 
     validate_non_rising_behaviors(BASELINE_BEHAVIORS)
     assert len(BASELINE_BEHAVIORS) == 10
     assert tuple(item.settling_velocity_mps for item in BASELINE_BEHAVIORS) == (
-        -0.0001,
-        -0.0002,
-        -0.0005,
-        -0.001,
-        -0.002,
-        -0.005,
-        -0.010,
-        -0.020,
-        -0.050,
-        -0.100,
+        -0.0359,
+        -0.0684,
+        -0.0384,
+        -0.0142,
+        -0.0434,
+        -0.0782,
+        -0.128,
+        -0.132,
+        -0.301,
+        -0.472,
     )
     fishing_gear = next(
         item for item in BASELINE_BEHAVIORS if item.material_id == FISHING_GEAR_MATERIAL_ID
     )
-    assert fishing_gear.settling_velocity_mps == -0.002
+    assert fishing_gear.settling_velocity_mps == -0.0434
     assert all(item.settling_velocity_mps < 0.0 for item in BASELINE_BEHAVIORS)

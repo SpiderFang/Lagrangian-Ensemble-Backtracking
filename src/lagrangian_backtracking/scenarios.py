@@ -12,7 +12,9 @@ iOcean 類別作名稱銜接，但速度是待校準的敏感度格點，不是�
 與圖表必須以 ``settling_velocity_mps`` 數值或極慢／慢／中／快分群為主詞呈現，
 ``oca_category_zh`` 只能作附註，不得單獨作為「材質來自某方向」之類表述的主詞；本模組
 仍保留十個 iOcean 類別名稱一對一綁定，是為了保持可稽核的情境識別碼與既有 manifest
-位元相同，不代表這十個名稱在目前 M=1 的成果中彼此可分辨。
+位元相同，不代表這十個名稱在目前 M=1 的成果中彼此可分辨。2026-09-24／25 改版後的
+新值仍全數落在該診斷所指的快沉降區間（十值皆 ≥ 0.01 m/s），因此上述「彼此統計上不可
+分辨」的警語在改版後依然成立，不因換算新的力平衡推導值而自動失效。
 """
 
 from __future__ import annotations
@@ -25,13 +27,31 @@ from hashlib import sha256
 
 @dataclass(frozen=True, slots=True)
 class Behavior:
-    """一種具名海廢材質／形狀條件及其暫定沉降速度。
+    """一種具名海廢材質／形狀條件及其沉降速度。
 
     ``oca_category_zh`` 只保存 iOcean 清除統計使用的分類名稱；官方頁面沒有單體密度、
     尺寸、形狀因子或終端速度，因此 ``settling_velocity_mps`` 仍是研究設計的負值敏感度
     格點。``applicability_condition_zh`` 用來防止把保麗龍、木材或密閉瓶罐等原本可能浮水
     的物件無條件納入：只有已吸水、進水、生物附著或其他原因使其完全沉沒且向下運動時，
     才符合本基線。輸出 material manifest 時會完整保留這些限制與證據等級。
+
+    2026-09-24／25 改版（見
+    ``claude/decision-20260924-十檔沉降速度定案與重算交辦.md``）新增三個欄位，記錄
+    ``settling_velocity_mps``（該類 6 個解的幾何平均代表值）在推導來源中實際涵蓋的
+    速度範圍：
+
+    * ``settling_velocity_slow_bound_mps``：該類推導區間中絕對值最小者（沉得最慢），
+      仍是負值。
+    * ``settling_velocity_fast_bound_mps``：該類推導區間中絕對值最大者（沉得最快），
+      仍是負值。
+    * ``derivation_source``：可稽核推導來源的相對路徑（固定為
+      ``data/settling_velocity_derivation/results.csv``）。
+
+    這三個欄位刻意不用 ``min``／``max`` 命名，因為速度是負值：絕對值最大（沉得最快）
+    在數值上反而最小。若照數值大小稱呼 ``min``／``max``，任何依「min <= max」直覺寫的
+    檢查都會把 ``fast_bound``（數值較小）誤判成下界、``slow_bound``（數值較大）誤判成
+    上界，方向恰好相反。正確的數值關係固定是
+    ``fast_bound <= settling_velocity_mps <= slow_bound``（三者皆為負值）。
     """
 
     material_id: str
@@ -43,6 +63,9 @@ class Behavior:
     applicability_condition_zh: str
     calibration_status: str
     evidence_grade: str
+    settling_velocity_slow_bound_mps: float
+    settling_velocity_fast_bound_mps: float
+    derivation_source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,110 +162,140 @@ BASELINE_BEHAVIORS: tuple[Behavior, ...] = (
         "保麗龍",
         "發泡聚苯乙烯（EPS）",
         "吸水或生物附著之多孔不規則碎塊",
-        -0.0001,
+        -0.0359,
         "sinking",
         "限已吸水或生物附著、整體仍完全沉沒且呈負浮力者",
-        "provisional_proxy",
-        "C_conditional_biofouling_mechanism",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.00527,
+        -0.15006,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_wood_waterlogged_elongated",
         "竹木",
         "竹材或木材",
         "水浸飽和之細長枝條或片狀木屑",
-        -0.0002,
+        -0.0684,
         "sinking",
         "限水浸後整體密度已高於周圍海水者",
-        "provisional_proxy",
-        "D_no_transferable_item_velocity",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.01350,
+        -0.23115,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_wastepaper_folded_fiber",
         "廢紙",
         "吸水纖維材料",
         "濕潤摺疊紙片或纖維團",
-        -0.0005,
+        -0.0384,
         "sinking",
         "固定形狀與速度，不模擬持續解體、溶散或團聚",
-        "provisional_proxy",
-        "D_no_transferable_item_velocity",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.00661,
+        -0.16236,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_nonrecyclable_flexible_sheet",
         "其他/不可回收",
         "混合塑膠或複合包材",
         "進水薄膜、軟片或皺摺包裝片",
-        -0.001,
+        -0.0142,
         "sinking",
         "只作異質類別的條件代理，不解讀為類別平均物性",
-        "provisional_proxy",
-        "C_shape_framework_only",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.00090,
+        -0.10772,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_fishinggear_open_mesh_bundle",
         "廢漁網漁具",
         "尼龍、聚乙烯或混合漁具材料",
         "網片、繩索或繩結纖維束",
-        -0.002,
+        -0.0434,
         "sinking",
         "不顯式解析網目開孔、纏繞、展開與姿態變化",
-        "provisional_proxy",
-        "C_fragment_and_fiber_range_overlap",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.00795,
+        -0.22341,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_pet_waterfilled_bottle",
         "寶特瓶",
         "聚對苯二甲酸乙二酯（PET）",
         "進水或壓扁之中空瓶體",
-        -0.005,
+        -0.0782,
         "sinking",
         "只納入已進水且向下運動者；密閉含氣瓶體必須排除",
-        "provisional_proxy",
-        "C_pet_fragment_range_shape_mismatch",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.05630,
+        -0.13353,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_other_recyclable_irregular_fragment",
         "其他/可回收",
         "混合可回收塑膠、橡膠或複合材料",
         "不規則片塊或零組件",
-        -0.010,
+        -0.128,
         "sinking",
         "只作異質類別代理；正式校準前應再依材質與形狀分群",
-        "provisional_proxy",
-        "D_heterogeneous_category",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.04300,
+        -0.34474,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_aluminum_crushed_cylinder",
         "鋁罐",
         "鋁合金",
         "進水壓扁之薄壁中空圓筒",
-        -0.020,
+        -0.132,
         "sinking",
         "只納入已進水或壓扁者；密閉含氣罐體必須排除",
-        "provisional_proxy",
-        "B_material_order_D_can_velocity",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.10787,
+        -0.17528,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_steel_rigid_cylinder",
         "鐵罐",
         "鋼鐵或鍍錫鋼板",
         "進水之剛性圓筒或金屬片",
-        -0.050,
+        -0.301,
         "sinking",
         "姿態、開口、塗層與腐蝕效應尚未顯式解析",
-        "provisional_proxy",
-        "B_material_order_D_can_velocity",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.23780,
+        -0.42735,
+        "data/settling_velocity_derivation/results.csv",
     ),
     Behavior(
         "oca_glass_bottle_or_fragment",
         "玻璃瓶",
         "玻璃",
         "進水瓶體或緻密銳角碎片",
-        -0.100,
+        -0.472,
         "sinking",
         "完整瓶與碎片幾何差異留待樣本量測校準",
-        "provisional_proxy",
-        "D_no_transferable_item_velocity",
+        "derived_uncalibrated",
+        "B_force_balance_derived_representative_geometry",
+        -0.19542,
+        -0.92040,
+        "data/settling_velocity_derivation/results.csv",
     ),
 )
 

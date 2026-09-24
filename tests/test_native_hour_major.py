@@ -27,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import time as _time
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -1353,6 +1354,253 @@ def test_estimate_substep_count_local_cfl_matches_global_near_tiny_element(drive
     )
 
     assert ndeltp_local >= ndeltp_global
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-34：``estimate_substep_count_local_cfl`` 的 ``query_ball_point`` 記憶體
+# 剖析與修正（見 reports/WP-34.md 完整數字）。
+#
+# 背景：``query_ball_point`` 對一整批活動粒子座標一次查詢時，scipy 會把
+# 「每顆粒子自己查到的鄰近元素索引」各自組成一個獨立 Python list，``n`` 顆
+# 粒子的 list 同時存活，尖峰記憶體與活動粒子數成正比——這是正式規模
+# （M=10、500,000 顆粒子）在伺服器上 OOM 的根本原因。修正把查詢切成固定
+# 大小（``_LOCAL_CFL_QUERY_CHUNK_SIZE``）的小批次，逐批查詢、逐批把結果併入
+# 集合後立刻捨棄暫時 list，讓尖峰記憶體只跟「一個小批次的鄰近元素數」成
+# 正比，與活動粒子總數無關。下面兩個測試分別驗證「輸出仍然逐位元相同」與
+# 「尖峰記憶體不再隨活動粒子數線性增加」。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _build_regular_grid_mesh_for_memory_probe(
+    nx: int, ny: int, *, spacing_m: float, dp_m: float = 20.0
+) -> NativeMesh:
+    """比照 ``tests/test_native_backward_driver.py`` 的
+    ``_build_regular_grid_mesh``：全程向量化建構規則三角網格，供 WP-34 的
+    記憶體剖析測試使用一個比模組共用的 10x10 網格更大（因此更接近真實網格
+    「查詢半徑內元素數很多」這個現象）、但仍然在 CI 可接受時間內建好的網格。
+    刻意不 import 那個檔案的同名函式，避免讓兩個測試檔互相依賴彼此的內部
+    實作（見該檔案同名函式的完整註解，兩者邏輯逐行相同）。
+    """
+
+    n_nodes = nx * ny
+    node_xy = np.zeros((n_nodes, 2), dtype=np.float64)
+    ii, jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="xy")
+    node_xy[:, 0] = (ii * spacing_m).ravel()
+    node_xy[:, 1] = (jj * spacing_m).ravel()
+    dp = np.full(n_nodes, dp_m, dtype=np.float64)
+
+    idx = np.arange(n_nodes).reshape(ny, nx)
+    n00 = idx[:-1, :-1].ravel()
+    n10 = idx[:-1, 1:].ravel()
+    n11 = idx[1:, 1:].ravel()
+    n01 = idx[1:, :-1].ravel()
+    triangles = np.concatenate(
+        [np.stack([n00, n10, n11], axis=1), np.stack([n00, n11, n01], axis=1)], axis=0
+    )
+    n_faces = triangles.shape[0]
+    face_nodes_local = np.full((n_faces, 4), -1, dtype=np.int64)
+    face_nodes_local[:, :3] = triangles
+    face_node_count = np.full(n_faces, 3, dtype=np.int64)
+
+    return NativeMesh(
+        node_lon=np.linspace(120.0, 120.2, n_nodes),
+        node_lat=np.linspace(24.0, 24.2, n_nodes),
+        node_xy=node_xy,
+        source_depth_m=dp,
+        source_node_bottom_index=np.zeros(n_nodes, dtype=np.int64),
+        face_nodes_local=face_nodes_local,
+        face_node_count=face_node_count,
+        source_face_global_index=np.arange(n_faces, dtype=np.int64),
+        bin_size_m=400.0,
+    )
+
+
+@pytest.fixture(scope="module")
+def driver_grid_memory_probe(handles: bd.BayTraceModuleHandles) -> bd.NativeBackwardDriverGrid:
+    """WP-34 專用、比模組共用 ``driver_grid`` 大上不少的合成網格（63x63＝
+    3,969 節點、約 7,688 個元素、20 垂向層）。刻意選這個規模：夠大到「查詢
+    半徑內元素數以千計」這個真實現象能重現（模組共用的 10x10 網格只有 162
+    個元素，太小以致於修正前後的差異不明顯，見本節開頭說明），又小到建構
+    與後續查詢仍能在 CI 的合理時間內跑完（實測建構 <1 秒，見
+    ``reports/WP-34.md`` 效能章節）。"""
+
+    mesh = _build_regular_grid_mesh_for_memory_probe(63, 63, spacing_m=150.0)
+    n_nodes = mesh.node_xy.shape[0]
+    nvrt = 20
+    sigma_1d = np.linspace(-1.0, 0.0, nvrt)
+    zcor_reference = sigma_1d[None, :] * mesh.source_depth_m[:, None]
+    eta_reference = np.zeros(n_nodes, dtype=np.float64)
+    grid = build_native_grid_arrays(mesh, zcor_reference=zcor_reference, eta_reference=eta_reference)
+    built = bd.build_native_backward_driver_grid(grid, handles, h0=0.0)
+    assert built.ic3_cross_check_ok
+    return built
+
+
+def test_estimate_substep_count_local_cfl_chunked_query_matches_unchunked_bit_identical(
+    driver_grid_memory_probe,
+) -> None:
+    """WP-34 修正的位元相同性驗收：把查詢切成
+    ``_LOCAL_CFL_QUERY_CHUNK_SIZE``（32）大小的小批次逐批查詢＋聯集，
+    與「一次把全部活動粒子座標傳給 ``query_ball_point``」（修正前的寫法，
+    這裡直接照抄原始邏輯做對照組，不依賴 git 歷史）比較，活動粒子數刻意
+    取遠大於一個 chunk（900 顆），確保測試真的跨越多個 chunk 邊界，不是
+    只測到「剛好一個 chunk 打完」這種退化成跟修正前完全一樣呼叫方式的
+    情況。
+    """
+
+    driver_grid = driver_grid_memory_probe
+    n_nodes = _n_nodes(driver_grid)
+    nvrt = int(driver_grid.schism_grid.nvrt)
+    spatial_index = bd.build_local_cfl_spatial_index(driver_grid)
+
+    rng = np.random.default_rng(340228)
+    domain_extent = 62 * 150.0
+
+    def _unchunked_reference(u_field, v_field, active_x, active_y, *, dt_max_seconds, cfl_number):
+        """修正前的寫法：一次呼叫 ``query_ball_point``，不分批。直接照抄
+        ``backward_driver.estimate_substep_count_local_cfl`` 在 WP-34 之前
+        的邏輯，只是把「取得 nearby_elements 集合」以外的部分原封不動，
+        確保這個對照組跟現在的函式共用同一套下游公式（``local_min_edge_
+        length``／``local_max_speed``／``ndeltp``），只有「怎麼查
+        nearby_elements」這一步不同。"""
+
+        dt_seconds = 3600.0
+        ndeltp_from_dt_max = int(np.ceil(dt_seconds / dt_max_seconds))
+        speed = np.hypot(u_field, v_field)
+        finite_speed = speed[np.isfinite(speed)]
+        global_max_speed = float(np.max(finite_speed)) if finite_speed.size > 0 else 0.0
+        if active_x.size == 0 or global_max_speed <= 0.0:
+            return max(1, ndeltp_from_dt_max)
+        radius = 3.0 * global_max_speed * dt_seconds
+        query_radius = radius + spatial_index.element_max_reach_m
+        points = np.column_stack([active_x, active_y])
+        neighbor_lists = spatial_index.element_centroid_kdtree.query_ball_point(points, r=query_radius)
+        nearby_elements: set[int] = set()
+        for neighbors in neighbor_lists:
+            nearby_elements.update(neighbors)
+        if not nearby_elements:
+            return bd.estimate_substep_count(
+                driver_grid, u_field, v_field, dt_max_seconds=dt_max_seconds, cfl_number=cfl_number,
+            )
+        idx = np.fromiter(nearby_elements, dtype=np.int64, count=len(nearby_elements))
+        local_min_edge_length = float(np.min(spatial_index.element_min_edge_length[idx]))
+        local_nodes = np.unique(
+            np.concatenate(
+                [
+                    spatial_index.element_node0[idx],
+                    spatial_index.element_node1[idx],
+                    spatial_index.element_node2[idx],
+                ]
+            )
+        )
+        local_speed = speed[:, local_nodes]
+        local_finite = local_speed[np.isfinite(local_speed)]
+        local_max_speed = float(np.max(local_finite)) if local_finite.size > 0 else 0.0
+        if local_max_speed <= 0.0:
+            ndeltp_cfl = 1
+        else:
+            dtb_cfl = cfl_number * local_min_edge_length / local_max_speed
+            ndeltp_cfl = int(np.ceil(dt_seconds / dtb_cfl))
+        return max(1, ndeltp_from_dt_max, ndeltp_cfl)
+
+    for trial, (n_particles, max_speed, dt_max, cfl) in enumerate(
+        [
+            (900, 0.05, 30.0, 0.5),  # 半徑遠小於整個網格：只有部分元素會被查到
+            (500, 0.9, 10.0, 0.3),   # 半徑接近／超過整個網格：幾乎全部元素都會被查到
+            (150, 0.4, 60.0, 0.9),   # 跨過多個 chunk 邊界（chunk=32 時 150 顆跨 32/64/96/128 共 4 個邊界）
+        ]
+    ):
+        u_field = np.full((nvrt, n_nodes), max_speed / (2.0 ** 0.5))
+        v_field = np.full((nvrt, n_nodes), max_speed / (2.0 ** 0.5))
+        active_x = rng.uniform(0.0, domain_extent, size=n_particles)
+        active_y = rng.uniform(0.0, domain_extent, size=n_particles)
+
+        ndeltp_reference = _unchunked_reference(
+            u_field, v_field, active_x, active_y, dt_max_seconds=dt_max, cfl_number=cfl,
+        )
+        ndeltp_chunked = bd.estimate_substep_count_local_cfl(
+            driver_grid, u_field, v_field,
+            active_x=active_x, active_y=active_y, spatial_index=spatial_index,
+            dt_max_seconds=dt_max, cfl_number=cfl,
+        )
+        assert ndeltp_chunked == ndeltp_reference, (
+            f"trial {trial}: n_particles={n_particles} 分批查詢與不分批查詢的 ndeltp 不同 "
+            f"({ndeltp_chunked} vs {ndeltp_reference})，違反 WP-34 位元相同性要求"
+        )
+
+
+def test_estimate_substep_count_local_cfl_peak_memory_bounded_by_chunk_not_particle_count(
+    driver_grid_memory_probe,
+) -> None:
+    """WP-34 記憶體回歸測試：``estimate_substep_count_local_cfl`` 單次呼叫的
+    ``tracemalloc`` 峰值配置量，門檻訂在「與 chunk 大小同量級的常數」，
+    不隨活動粒子數線性增加——這正是 WP-34 修正前後的關鍵差異（修正前峰值
+    與活動粒子數成正比，見 ``reports/WP-34.md`` 剖析章節；4,000 節點網格、
+    2,000 顆活動粒子的量測峰值高達 602 MB，且隨粒子數線性增加）。
+
+    門檻訂定依據：本測試網格（63x63＝3,969 節點、約 7,688 個元素）用大流速
+    （2.0 m/s，半徑遠超網格對角線，逼近「全部元素都在查詢半徑內」的最壞
+    情況）驅動查詢，實測修正後單次呼叫峰值在活動粒子數 500／2,000／
+    6,000 顆之間幾乎不變（40.25／40.27／40.34 MB，見
+    ``reports/WP-34.md`` 「回歸測試門檻訂定依據」一節的完整量測輸出）——
+    粒子數增加 12 倍，峰值只增加約 0.2%，直接證明峰值已經與 chunk 大小
+    （``_LOCAL_CFL_QUERY_CHUNK_SIZE=32``）同量級、不再隨活動粒子數線性
+    增加。門檻訂為 60 MB（相對實測 40.3 MB 保留約 1.5 倍餘裕，吸收不同
+    測試機器 tracemalloc 記帳開銷的雜訊），修正前同量級網格在 2,000 顆
+    粒子就已經測到 602 MB（見 ``reports/WP-34.md`` 剖析章節），60 MB 門檻
+    仍然足以攔住「又退化回一次查完全部粒子」這種回歸。刻意用「單次函式
+    呼叫的峰值是否為常數」而不是「整個小時主軸批次跑完的總記憶體」當斷言
+    對象，因為這個函式呼叫是 WP-34 唯一實際定位到的根因；用整個批次的
+    總記憶體斷言，在本測試用的小型合成網格（元素數遠小於正式規模）上
+    訊號會被其他正常、隨小時數增加的軌跡取樣記憶體稀釋，門檻會很難訂得
+    有意義。
+    """
+
+    driver_grid = driver_grid_memory_probe
+    n_nodes = _n_nodes(driver_grid)
+    nvrt = int(driver_grid.schism_grid.nvrt)
+    spatial_index = bd.build_local_cfl_spatial_index(driver_grid)
+
+    # 刻意用大流速把查詢半徑推到遠超網格對角線，逼近「不管粒子在哪裡，
+    # 幾乎全部元素都在查詢半徑內」的最壞情況——這是修正前峰值最大、
+    # 最能凸顯「與活動粒子數成正比」問題的情境。
+    u_field = np.full((nvrt, n_nodes), 2.0 / (2.0 ** 0.5))
+    v_field = np.full((nvrt, n_nodes), 2.0 / (2.0 ** 0.5))
+    domain_extent = 62 * 150.0
+    rng = np.random.default_rng(9101)
+
+    peak_per_n: dict[int, int] = {}
+    for n_particles in (500, 2000, 6000):
+        active_x = rng.uniform(0.0, domain_extent, size=n_particles)
+        active_y = rng.uniform(0.0, domain_extent, size=n_particles)
+
+        tracemalloc.stop()
+        tracemalloc.start(5)
+        bd.estimate_substep_count_local_cfl(
+            driver_grid, u_field, v_field,
+            active_x=active_x, active_y=active_y, spatial_index=spatial_index,
+            dt_max_seconds=30.0, cfl_number=0.5,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        peak_per_n[n_particles] = peak
+
+    _PEAK_BYTES_LIMIT = 60 * 1024 * 1024  # 60 MB，訂定依據見本函式 docstring
+    for n_particles, peak in peak_per_n.items():
+        assert peak < _PEAK_BYTES_LIMIT, (
+            f"n_particles={n_particles} 時 estimate_substep_count_local_cfl 單次呼叫峰值 "
+            f"{peak / 1e6:.1f} MB 超過 {_PEAK_BYTES_LIMIT / 1e6:.0f} MB 門檻——peak 應該只跟 "
+            "chunk 大小同量級，不該隨活動粒子數線性增加（WP-34 回歸）"
+        )
+
+    # 額外檢查方向性：6,000 顆粒子時的峰值不該比 500 顆時明顯放大（實測應
+    # 該幾乎是 1.0，見本函式 docstring 的實測數字；門檻訂為 2.0 保留餘裕，
+    # 但仍然遠遠攔得住「跟粒子數成正比放大數十倍」這種修正失效的訊號）。
+    ratio = peak_per_n[6000] / max(peak_per_n[500], 1)
+    assert ratio < 2.0, (
+        f"peak(6000顆)/peak(500顆)={ratio:.2f}，比例過大，像是又退化回跟活動粒子數"
+        "成正比的舊行為（WP-34 回歸）"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════

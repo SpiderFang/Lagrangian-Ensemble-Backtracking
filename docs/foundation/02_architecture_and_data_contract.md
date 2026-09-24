@@ -238,8 +238,10 @@ OCM 與 NWW3 缺值政策分開：
 | `settling_velocity_mps` | z positive-up；正式 v2 僅接受嚴格負值，零值與正值在設定驗證階段拒絕 |
 | `behavior_class` | 正式 v2 固定為 `sinking`；通用引擎的其他類別不屬於本情境矩陣 |
 | `applicability_condition_zh` | 說明吸水、進水或生物附著等納入條件；未轉為負浮力的物件必須排除 |
-| `calibration_status`, `evidence_grade` | 目前為 `provisional_proxy`，另記 B／C／D 證據等級與可外推限制 |
-| `classification_source`, `velocity_source` | 分開記錄官方分類來源與研究敏感度格點來源，禁止把清除統計誤作速度量測 |
+| `calibration_status`, `evidence_grade` | WP-35（2026-09-24／25，D023）起為 `derived_uncalibrated`／`B_force_balance_derived_representative_geometry`：由密度、尺寸、投影面積與阻力係數上下界之力平衡方程式推導，但仍未經現場沉降實測或樣本量測校準；舊版 `provisional_proxy` 只存在於既有 artifact |
+| `classification_source`, `velocity_source` | 分開記錄官方分類來源與研究速度推導來源，禁止把清除統計誤作速度量測 |
+| `settling_velocity_slow_bound_mps`, `settling_velocity_fast_bound_mps` | WP-35 新增；該類推導區間中絕對值最小／最大者（皆為負值，刻意不叫 min/max，因絕對值最大者數值反而最小），恆滿足 `fast_bound <= settling_velocity_mps <= slow_bound` |
+| `derivation_source` | WP-35 新增；固定為 `data/settling_velocity_derivation/results.csv`，供來源一致性測試重算比對 |
 
 ### 7.2 Receptor manifest
 

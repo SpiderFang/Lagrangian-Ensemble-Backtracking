@@ -329,92 +329,122 @@ physics:
         oca_category_zh: 保麗龍
         material_family_zh: 發泡聚苯乙烯（EPS）
         representative_shape_zh: 吸水或生物附著之多孔不規則碎塊
-        settling_velocity_mps: -0.0001
+        settling_velocity_mps: -0.0359
         behavior_class: sinking
         applicability_condition_zh: 限已吸水或生物附著、整體仍完全沉沒且呈負浮力者
-        calibration_status: provisional_proxy
-        evidence_grade: C_conditional_biofouling_mechanism
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.00527
+        settling_velocity_fast_bound_mps: -0.15006
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_wood_waterlogged_elongated
         oca_category_zh: 竹木
         material_family_zh: 竹材或木材
         representative_shape_zh: 水浸飽和之細長枝條或片狀木屑
-        settling_velocity_mps: -0.0002
+        settling_velocity_mps: -0.0684
         behavior_class: sinking
         applicability_condition_zh: 限水浸後整體密度已高於周圍海水者
-        calibration_status: provisional_proxy
-        evidence_grade: D_no_transferable_item_velocity
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.01350
+        settling_velocity_fast_bound_mps: -0.23115
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_wastepaper_folded_fiber
         oca_category_zh: 廢紙
         material_family_zh: 吸水纖維材料
         representative_shape_zh: 濕潤摺疊紙片或纖維團
-        settling_velocity_mps: -0.0005
+        settling_velocity_mps: -0.0384
         behavior_class: sinking
         applicability_condition_zh: 固定形狀與速度，不模擬持續解體、溶散或團聚
-        calibration_status: provisional_proxy
-        evidence_grade: D_no_transferable_item_velocity
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.00661
+        settling_velocity_fast_bound_mps: -0.16236
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_nonrecyclable_flexible_sheet
         oca_category_zh: 其他/不可回收
         material_family_zh: 混合塑膠或複合包材
         representative_shape_zh: 進水薄膜、軟片或皺摺包裝片
-        settling_velocity_mps: -0.001
+        settling_velocity_mps: -0.0142
         behavior_class: sinking
         applicability_condition_zh: 只作異質類別的條件代理，不解讀為類別平均物性
-        calibration_status: provisional_proxy
-        evidence_grade: C_shape_framework_only
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.00090
+        settling_velocity_fast_bound_mps: -0.10772
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_fishinggear_open_mesh_bundle
         oca_category_zh: 廢漁網漁具
         material_family_zh: 尼龍、聚乙烯或混合漁具材料
         representative_shape_zh: 網片、繩索或繩結纖維束
-        settling_velocity_mps: -0.002
+        settling_velocity_mps: -0.0434
         behavior_class: sinking
         applicability_condition_zh: 不顯式解析網目開孔、纏繞、展開與姿態變化
-        calibration_status: provisional_proxy
-        evidence_grade: C_fragment_and_fiber_range_overlap
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.00795
+        settling_velocity_fast_bound_mps: -0.22341
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_pet_waterfilled_bottle
         oca_category_zh: 寶特瓶
         material_family_zh: 聚對苯二甲酸乙二酯（PET）
         representative_shape_zh: 進水或壓扁之中空瓶體
-        settling_velocity_mps: -0.005
+        settling_velocity_mps: -0.0782
         behavior_class: sinking
         applicability_condition_zh: 只納入已進水且向下運動者；密閉含氣瓶體必須排除
-        calibration_status: provisional_proxy
-        evidence_grade: C_pet_fragment_range_shape_mismatch
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.05630
+        settling_velocity_fast_bound_mps: -0.13353
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_other_recyclable_irregular_fragment
         oca_category_zh: 其他/可回收
         material_family_zh: 混合可回收塑膠、橡膠或複合材料
         representative_shape_zh: 不規則片塊或零組件
-        settling_velocity_mps: -0.010
+        settling_velocity_mps: -0.128
         behavior_class: sinking
         applicability_condition_zh: 只作異質類別代理；正式校準前應再依材質與形狀分群
-        calibration_status: provisional_proxy
-        evidence_grade: D_heterogeneous_category
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.04300
+        settling_velocity_fast_bound_mps: -0.34474
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_aluminum_crushed_cylinder
         oca_category_zh: 鋁罐
         material_family_zh: 鋁合金
         representative_shape_zh: 進水壓扁之薄壁中空圓筒
-        settling_velocity_mps: -0.020
+        settling_velocity_mps: -0.132
         behavior_class: sinking
         applicability_condition_zh: 只納入已進水或壓扁者；密閉含氣罐體必須排除
-        calibration_status: provisional_proxy
-        evidence_grade: B_material_order_D_can_velocity
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.10787
+        settling_velocity_fast_bound_mps: -0.17528
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_steel_rigid_cylinder
         oca_category_zh: 鐵罐
         material_family_zh: 鋼鐵或鍍錫鋼板
         representative_shape_zh: 進水之剛性圓筒或金屬片
-        settling_velocity_mps: -0.050
+        settling_velocity_mps: -0.301
         behavior_class: sinking
         applicability_condition_zh: 姿態、開口、塗層與腐蝕效應尚未顯式解析
-        calibration_status: provisional_proxy
-        evidence_grade: B_material_order_D_can_velocity
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.23780
+        settling_velocity_fast_bound_mps: -0.42735
+        derivation_source: data/settling_velocity_derivation/results.csv
       - material_id: oca_glass_bottle_or_fragment
         oca_category_zh: 玻璃瓶
         material_family_zh: 玻璃
         representative_shape_zh: 進水瓶體或緻密銳角碎片
-        settling_velocity_mps: -0.100
+        settling_velocity_mps: -0.472
         behavior_class: sinking
         applicability_condition_zh: 完整瓶與碎片幾何差異留待樣本量測校準
-        calibration_status: provisional_proxy
-        evidence_grade: D_no_transferable_item_velocity
+        calibration_status: derived_uncalibrated
+        evidence_grade: B_force_balance_derived_representative_geometry
+        settling_velocity_slow_bound_mps: -0.19542
+        settling_velocity_fast_bound_mps: -0.92040
+        derivation_source: data/settling_velocity_derivation/results.csv
 
   horizontal_diffusion:
     # 常數 Kh 是解析／統計 reference；Smagorinsky 需通過空變 K 與 well-mixed 測試。

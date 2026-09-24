@@ -125,6 +125,11 @@ _MATERIAL_RECORD_KEYS = frozenset(
         "applicability_condition_zh",
         "calibration_status",
         "evidence_grade",
+        # 2026-09-24／25 改版（WP-35）新增：可稽核推導區間的慢／快界與來源，見
+        # ``scenarios.Behavior`` docstring 對「不用 min/max 命名」的說明。
+        "settling_velocity_slow_bound_mps",
+        "settling_velocity_fast_bound_mps",
+        "derivation_source",
     }
 )
 _RECEPTOR_ROOT_KEYS = frozenset(
@@ -573,6 +578,24 @@ def _load_material_document(
         )
         values = {field: _nonempty_string(row[field], f"{label}.{field}") for field in text_fields}
         velocity = _finite_float(row["settling_velocity_mps"], f"{label}.settling_velocity_mps")
+        # WP-35：慢／快界一律是負值有限數值，且刻意不叫 min/max——絕對值最大（沉得
+        # 最快）在數值上反而最小，因此正確方向固定是
+        # fast_bound <= settling_velocity_mps <= slow_bound（三者皆為負）。載入端在
+        # 這裡強制檢核方向，避免壞掉的推導資料悄悄通過。
+        slow_bound = _finite_float(
+            row["settling_velocity_slow_bound_mps"], f"{label}.settling_velocity_slow_bound_mps"
+        )
+        fast_bound = _finite_float(
+            row["settling_velocity_fast_bound_mps"], f"{label}.settling_velocity_fast_bound_mps"
+        )
+        derivation_source = _nonempty_string(row["derivation_source"], f"{label}.derivation_source")
+        if slow_bound >= 0.0 or fast_bound >= 0.0:
+            raise ValueError(f"{label} 的沉降速度慢／快界必須嚴格小於 0")
+        if not (fast_bound <= velocity <= slow_bound):
+            raise ValueError(
+                f"{label} 的沉降速度必須滿足 fast_bound <= settling_velocity_mps <= "
+                "slow_bound（皆為負值，絕對值最大者數值最小）"
+            )
         behaviors.append(
             Behavior(
                 material_id=values["material_id"],
@@ -584,6 +607,9 @@ def _load_material_document(
                 applicability_condition_zh=values["applicability_condition_zh"],
                 calibration_status=values["calibration_status"],
                 evidence_grade=values["evidence_grade"],
+                settling_velocity_slow_bound_mps=slow_bound,
+                settling_velocity_fast_bound_mps=fast_bound,
+                derivation_source=derivation_source,
             )
         )
     try:
@@ -626,6 +652,9 @@ def _load_material_document(
                         "applicability_condition_zh": "applicability_condition_zh",
                         "calibration_status": "calibration_status",
                         "evidence_grade": "evidence_grade",
+                        "settling_velocity_slow_bound_mps": "settling_velocity_slow_bound_mps",
+                        "settling_velocity_fast_bound_mps": "settling_velocity_fast_bound_mps",
+                        "derivation_source": "derivation_source",
                     }[field],
                 )
                 if actual_value != expected_value:

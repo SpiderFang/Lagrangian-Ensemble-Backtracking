@@ -747,7 +747,7 @@ def test_omitted_backtrack_support_keeps_legacy_hash() -> None:
     """明確移除新欄位的舊 fixture 維持歷史 hash 與 normalized payload 語意。"""
 
     config = ProjectConfig.model_validate(_legacy_example_payload())
-    assert config.config_hash() == "cf9dd4951d01708a69aa516189aa431754900feca65b2787c0ffa3bd36836c3a"
+    assert config.config_hash() == "8b6b1b92c66c7fe05e01d80fd53cdae6ae907bdd674951c1b3f99183b708026d"
     assert "backtrack_support_days" not in config.normalized_payload()["inputs"]
     assert "bed_residence_time" not in config.normalized_payload()["scenarios"]
 
@@ -758,7 +758,7 @@ def test_omitted_ocm_interpolation_backend_keeps_numpy_and_current_hash() -> Non
     config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.ocm_interpolation_backend == "numpy_v1"
     assert "ocm_interpolation_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "cf9dd4951d01708a69aa516189aa431754900feca65b2787c0ffa3bd36836c3a"
+    assert config.config_hash() == "8b6b1b92c66c7fe05e01d80fd53cdae6ae907bdd674951c1b3f99183b708026d"
 
 
 def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
@@ -767,7 +767,7 @@ def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
     config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.physics_kernel_backend == "numpy_v1"
     assert "physics_kernel_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "cf9dd4951d01708a69aa516189aa431754900feca65b2787c0ffa3bd36836c3a"
+    assert config.config_hash() == "8b6b1b92c66c7fe05e01d80fd53cdae6ae907bdd674951c1b3f99183b708026d"
 
 
 @pytest.mark.parametrize("backend", ["numpy_v1", "numba_cpu_v1"])
@@ -857,7 +857,7 @@ def test_legacy_config_hash_preserves_omitted_policy_semantics() -> None:
 
     config = ProjectConfig.model_validate(_legacy_hash_payload())
     assert config.config_hash() == (
-        "d28846c08e372e9870985dc3c783f621f7360a0220e906c7d56fdb8f0c6215d8"
+        "c43d100bc8c7d1011b4fc98c7ec8dab4b0bf4f215dbdde2107ddcb4d62112209"
     )
     assert config.domains[0].formal_domain_policy == "expanded_domain_v1"
     assert "formal_domain_policy" not in config.domains[0].model_fields_set

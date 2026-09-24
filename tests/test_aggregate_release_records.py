@@ -216,6 +216,9 @@ def _scenario_inputs_fixture() -> ScenarioInputs:
         applicability_condition_zh="已吸水且完全沉沒",
         calibration_status="provisional",
         evidence_grade="C",
+        settling_velocity_slow_bound_mps=-0.3,
+        settling_velocity_fast_bound_mps=-0.7,
+        derivation_source="data/settling_velocity_derivation/results.csv",
     )
     behavior_b = Behavior(
         material_id="material-b",
@@ -227,6 +230,9 @@ def _scenario_inputs_fixture() -> ScenarioInputs:
         applicability_condition_zh="已進水且完全沉沒",
         calibration_status="screening",
         evidence_grade="D",
+        settling_velocity_slow_bound_mps=-0.15,
+        settling_velocity_fast_bound_mps=-0.35,
+        derivation_source="data/settling_velocity_derivation/results.csv",
     )
     receptor_a = Receptor(
         receptor_id="receptor-a",

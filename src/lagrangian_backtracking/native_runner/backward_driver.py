@@ -2131,6 +2131,88 @@ def build_local_cfl_spatial_index(driver_grid: NativeBackwardDriverGrid) -> Loca
     )
 
 
+# WP-34：``query_ball_point`` 一次查詢的粒子數上限，見
+# ``_query_nearby_elements_chunked`` docstring 的完整記憶體剖析與取捨。
+_LOCAL_CFL_QUERY_CHUNK_SIZE = 32
+
+
+def _query_nearby_elements_chunked(
+    spatial_index: LocalCflSpatialIndex, points: np.ndarray, query_radius: float
+) -> set[int]:
+    """對 ``points`` 分批呼叫 ``cKDTree.query_ball_point``，回傳聯集元素索引。
+
+    WP-34 記憶體剖析發現（見 ``reports/WP-34.md`` 完整數字）：這個函式取代
+    前的寫法是一次把**全部**活動粒子的座標疊成 ``(n, 2)`` 陣列，整批傳給
+    ``query_ball_point``。scipy 對批次查詢的實作，會先把「每一顆粒子自己
+    查到的鄰近元素索引」各自組成一個獨立的 Python ``list``，再把 ``n`` 個
+    這種 list 一次全部裝進一個 ``dtype=object`` 的回傳陣列——**在回傳之前，
+    這 ``n`` 份 list 全部同時存活**。當查詢半徑（``radius_safety_factor *
+    全域最大流速 * 3600 秒``，見本函式呼叫端 docstring）大到足以涵蓋網格
+    一大部分元素時（近岸精細網格＋正常量級的流速，實測即可發生，見
+    WP-34 報告），單一活動粒子的鄰近元素 list 本身就可能有數千到數萬個
+    元素；``n`` 顆活動粒子的 list 同時存活，總量是「單顆粒子的鄰近元素數」
+    乘以「活動粒子數」，因此**尖峰記憶體與活動粒子數成正比**——這正是
+    WP-34 量到的啟動尖峰（每顆粒子約 5.5 MB 暫時配置）與跑滿全程後 glibc
+    malloc arena 無法完全歸還、逐小時累積成的穩態膨脹（每顆粒子約 1.6 MB）
+    共同的根本原因（詳見 ``reports/WP-34.md`` 剖析章節，兩個現象在
+    ``tracemalloc``／``resource.getrusage`` 的直接量測下都精確指到
+    ``cKDTree.query_ball_point`` 這一行）。
+
+    修法：把 ``points`` 切成每批最多 ``_LOCAL_CFL_QUERY_CHUNK_SIZE`` 顆粒子
+    的小批次，逐批呼叫 ``query_ball_point``、把這一批的結果併入
+    ``nearby_elements`` 集合後立刻捨棄這一批的暫時 list，讓 Python 的參照
+    計數在下一批查詢前就把記憶體還給配置器——尖峰記憶體因此從「與活動
+    粒子數成正比」降到「與一個小批次（至多 ``_LOCAL_CFL_QUERY_CHUNK_SIZE``
+    顆）的鄰近元素數成正比」，與活動粒子總數無關（實測見 WP-34 報告的
+    位元相同與記憶體比較章節）。
+
+    位元相同性論證：對同一個 ``(x, y)`` 座標與同一個 ``query_radius``，
+    scipy 的 KD-tree 搜尋是純粹依座標與半徑決定的確定性演算法，同一顆
+    粒子不論是單獨查詢、還是跟其他粒子一起整批查詢，查到的鄰近元素索引
+    集合必然相同（不同粒子之間的查詢互相獨立，沒有互相影響的邏輯）；
+    因此把查詢切成多個批次，最終聯集出的 ``nearby_elements`` 集合與「一次
+    查完全部粒子」完全相同。這個函式回傳值只會被拿去算
+    ``np.min``／``np.unique``／``np.max``（見呼叫端），三者都與輸入陣列的
+    元素順序無關，只與集合內容有關，所以就算不同批次大小、不同 Python
+    ``set`` 疊代順序，最終算出的 ``local_min_edge_length``／
+    ``local_max_speed``／``ndeltp`` 仍然逐位元相同（本函式改動前後的等價
+    性由 ``tests/test_native_hour_major.py`` 的
+    ``test_estimate_substep_count_local_cfl_chunked_query_matches_unchunked_bit_identical``
+    直接比對兩種寫法在同一組合成資料上的輸出證明）。
+
+    ``_LOCAL_CFL_QUERY_CHUNK_SIZE`` 的取值取捨：太大則尖峰記憶體退化回
+    接近原本的整批查詢；太小則 Python 層迴圈呼叫次數變多、per-call 的
+    固定開銷（scipy C 擴充的呼叫邊界、``set.update`` 的 Python 迴圈）會
+    墊高總耗時。32 是目前採用的批次大小（取捨說明見 ``reports/WP-34.md`` 第 6 節
+    「``_LOCAL_CFL_QUERY_CHUNK_SIZE = 32`` 的取捨說明」）；這是經驗值，不是理論
+    最佳值；若未來正式規模的量測顯示這個值需要調整，只需要改這一個常數，
+    不影響任何數值結果（見上方位元相同性論證）。
+
+    沿革（原本的已知不一致，現已修正）：``tests/test_native_hour_major.py`` 裡這兩個
+    測試的 docstring 與部分敘述文字曾經仍寫著「``_LOCAL_CFL_QUERY_CHUNK_SIZE``
+    （128）」，與本模組實際採用的 32 不符（測試斷言本身——位元相同性、記憶體峰值
+    上限 60 MB——並未寫死 128 這個數字，所以這個落差當時不影響測試的正確性，只是
+    敘述文字過期）。WP-36 第一版依規格範疇僅修改本檔案的 docstring，未同步更正測試
+    檔案裡的敘述文字；經協調者事後授權，已回頭把 ``tests/test_native_hour_major.py``
+    裡對應的四處文字（不含任何斷言、參數或測試資料）更正為與 32 一致，詳見
+    ``reports/WP-36.md`` 1.3 節的逐行對照與重跑輸出、``reports/WP-34.md``。
+    """
+
+    nearby_elements: set[int] = set()
+    total_elements = spatial_index.element_min_edge_length.shape[0]
+    n_points = points.shape[0]
+    for start in range(0, n_points, _LOCAL_CFL_QUERY_CHUNK_SIZE):
+        chunk = points[start : start + _LOCAL_CFL_QUERY_CHUNK_SIZE]
+        neighbor_lists = spatial_index.element_centroid_kdtree.query_ball_point(chunk, r=query_radius)
+        for neighbors in neighbor_lists:
+            nearby_elements.update(neighbors)
+        # 已經涵蓋全部元素：後面的批次不可能再貢獻新的元素索引，提早結束
+        # 省下剩餘批次的查詢成本；只影響耗時，不影響最終集合內容。
+        if len(nearby_elements) >= total_elements:
+            break
+    return nearby_elements
+
+
 def estimate_substep_count_local_cfl(
     driver_grid: NativeBackwardDriverGrid,
     u_field: np.ndarray,
@@ -2191,11 +2273,7 @@ def estimate_substep_count_local_cfl(
     radius = radius_safety_factor * global_max_speed * dt_seconds
     query_radius = radius + spatial_index.element_max_reach_m
     points = np.column_stack([active_x, active_y])
-    neighbor_lists = spatial_index.element_centroid_kdtree.query_ball_point(points, r=query_radius)
-
-    nearby_elements: set[int] = set()
-    for neighbors in neighbor_lists:
-        nearby_elements.update(neighbors)
+    nearby_elements = _query_nearby_elements_chunked(spatial_index, points, query_radius)
 
     if not nearby_elements:
         # 理論上不應該發生（活動粒子必然位於某個元素內部，該元素形心離它

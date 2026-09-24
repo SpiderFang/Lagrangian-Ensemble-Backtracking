@@ -286,6 +286,9 @@ def _single_behavior() -> Behavior:
         applicability_condition_zh="僅供測試",
         calibration_status="pilot",
         evidence_grade="test",
+        settling_velocity_slow_bound_mps=-0.1,
+        settling_velocity_fast_bound_mps=-0.3,
+        derivation_source="data/settling_velocity_derivation/results.csv",
     )
 
 

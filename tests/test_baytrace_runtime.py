@@ -83,7 +83,7 @@ def test_advection_backend_default_preserves_old_hash_and_explicit_token_enters_
     payload = config_tests._legacy_example_payload()
     assert isinstance(payload, dict)
     old = ProjectConfig.model_validate(payload)
-    old_hash = "cf9dd4951d01708a69aa516189aa431754900feca65b2787c0ffa3bd36836c3a"
+    old_hash = "8b6b1b92c66c7fe05e01d80fd53cdae6ae907bdd674951c1b3f99183b708026d"
 
     assert old.execution.advection_backend == ADVECTION_BACKEND_LBT_STAGE_RK4_V1
     assert "advection_backend" not in old.normalized_payload()["execution"]

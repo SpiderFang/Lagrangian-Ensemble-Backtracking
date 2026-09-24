@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import csv
+import math
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +18,8 @@ from lagrangian_backtracking.scenarios import (
     validate_baseline_coverage,
     validate_non_rising_behaviors,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 SITES = {
     "gongliao": "A",
@@ -96,6 +101,72 @@ def test_rejects_zero_or_rising_baseline_velocity(invalid_velocity: float) -> No
     invalid = (replace(BASELINE_BEHAVIORS[0], settling_velocity_mps=invalid_velocity),)
     with pytest.raises(ValueError, match="嚴格小於 0"):
         validate_non_rising_behaviors(invalid)
+
+
+def _round_to_3_significant_figures(value: float) -> float:
+    """把正值四捨五入到三位有效數字，對應 WP-35 定案值「取三位有效數字」的規則。
+
+    有效數字從第一個非零位數開始算，因此對 ``0.005274`` 這種前導零很多的小數，
+    三位有效數字是 ``0.00527``，不是固定小數位數的四捨五入。
+    """
+
+    if value == 0.0:
+        return 0.0
+    exponent = math.floor(math.log10(abs(value)))
+    factor = 10.0 ** (2 - exponent)
+    return round(value * factor) / factor
+
+
+def test_baseline_behaviors_match_settling_velocity_derivation_source() -> None:
+    """WP-35 來源一致性測試：BASELINE_BEHAVIORS 的十個定案值必須可由推導來源重算。
+
+    直接讀 ``data/settling_velocity_derivation/results.csv``（稽核來源、本工作包不得
+    修改），逐 ``class_id`` 收集該類全部 3 個情境 × 2 個阻力係數界的 6 個沉降速度解，
+    重算幾何平均（取三位有效數字）與最小／最大值，並與 ``BASELINE_BEHAVIORS`` 對應
+    索引的 ``settling_velocity_mps``、``settling_velocity_slow_bound_mps``、
+    ``settling_velocity_fast_bound_mps`` 比對，讓「報告上的數字就是程式算出來的」
+    成為機器強制、日後不會悄悄漂移的檢查。
+
+    類別對應刻意用 CSV 的 ``class_id``（1–10，對應 ``BASELINE_BEHAVIORS`` 索引
+    0–9），不用中文類別名稱：CSV 使用全形斜線的「其他／不可回收」，若用中文名稱比對
+    很容易因全形／半形斜線不一致而誤判失敗或誤判通過。
+    """
+
+    csv_path = ROOT / "data" / "settling_velocity_derivation" / "results.csv"
+    # 檔案帶 UTF-8 BOM（一般編輯器與試算表另存出來的常見型態），必須用
+    # utf-8-sig 開啟，否則第一欄欄名會被誤讀成 "﻿class_id" 而抓不到值。
+    solutions_by_class_id: dict[int, list[float]] = {}
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            class_id = int(row["class_id"])
+            solutions_by_class_id.setdefault(class_id, []).extend(
+                (float(row["w_lo_ms"]), float(row["w_hi_ms"]))
+            )
+
+    assert len(solutions_by_class_id) == 10
+    assert set(solutions_by_class_id) == set(range(1, 11))
+
+    for class_id, solutions in solutions_by_class_id.items():
+        assert len(solutions) == 6, f"class_id={class_id} 應有 3 情境 x 2 界＝6 個解"
+        behavior = BASELINE_BEHAVIORS[class_id - 1]
+
+        geometric_mean = math.prod(solutions) ** (1.0 / len(solutions))
+        expected_representative = _round_to_3_significant_figures(geometric_mean)
+        assert expected_representative == pytest.approx(
+            abs(behavior.settling_velocity_mps), rel=1e-9
+        ), f"class_id={class_id} 代表值與 results.csv 重算不符"
+
+        # CSV 原始值只有五位小數，慢／快界比對前先做相同的四捨五入，避免浮點尾數
+        # 造成假性不一致。
+        assert round(min(solutions), 5) == pytest.approx(
+            abs(behavior.settling_velocity_slow_bound_mps), abs=1e-9
+        ), f"class_id={class_id} slow_bound 與 results.csv min 不符"
+        assert round(max(solutions), 5) == pytest.approx(
+            abs(behavior.settling_velocity_fast_bound_mps), abs=1e-9
+        ), f"class_id={class_id} fast_bound 與 results.csv max 不符"
+
+        source_path = ROOT / behavior.derivation_source
+        assert source_path.is_file(), f"derivation_source 指向的檔案不存在：{source_path}"
 
 
 def test_seed_is_stable_and_member_specific() -> None:

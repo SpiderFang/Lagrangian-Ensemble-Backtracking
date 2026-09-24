@@ -133,6 +133,14 @@
   identity 與 normalized fraction 分層，不得把 random draw rank 命名為 `near_bed` 或其他物理層。
   其餘九類與所有 random vertical draws 仍以相同尺度完整保留於比較／補充產品。這是研究注意力
   排序，不是將漁具數量或任一 draw 設定為先驗權重；`near_bed` 僅可出現在歷史／legacy pilot 報告。
+
+  > **2026-09-25 附註（WP-36）**：本段所引用的 `-0.002 m/s`／「中」群，是撰寫本節當時
+  > （D006 十檔舊格點）的設定，本段文字保留不改以維持沿革可追溯性。`oca_fishinggear_
+  > open_mesh_bundle` 的沉降速度已於 2026-09-25（D023／WP-35）由 `data/settling_velocity_
+  > derivation/` 的力平衡推導取代為 `-0.0434 m/s`（`calibration_status=derived_uncalibrated`），
+  > 新十檔格點與「極慢／慢／中／快」分群邊界見
+  > [設計基線文件第 6 節](../foundation/08_design_baseline_and_derived_gates.md)；日後正式產圖
+  > 實作本段規則時，應以新格點與新分群為準，不應沿用本段例句裡的舊數值與舊分群標籤。
 - 各類至少並列首次海床接觸 member count/fraction 與 deposited member count/fraction；`BED_CONTACT` 的多次事件以 member 去重，基線不要求 repeated-contact 欄位。海面接觸只表示亂流擴散造成的反射事件，不得解讀為材料具有上浮速度。
 - 深度分布使用 depth–time heatmap 或 quantile ribbon，明示 z positive-up、深度／HAB 基準及水深變化。
 - 不具再懸浮參數時，圖名只能使用 contact/deposition-under-assumed-policy，不能宣稱完整底床沉積動力；`deposit_on_first_contact_and_stop` 會使足跡系統性偏向較近來源，caption 須揭露此假設。
