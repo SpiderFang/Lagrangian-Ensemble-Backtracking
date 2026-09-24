@@ -834,6 +834,24 @@ uv run lbt native-derive-horizon \
 的比例都能在同一張表的 `total_particle_count` 分母下正確呈現，且 pre-window 不貢獻任何
 穿越分子。所有表同時輸出 Parquet（正式資料契約）與 CSV（人可讀）兩種格式。
 
+**WP-29 修正（終止事件的邊界歸屬標籤五站不一致）**：正式成果審查發現，
+`local_equals_flow=True` 的三站（新竹／南灣／連江）`own_local_open_boundary` 與
+`flow_open_boundary` 其實是同一個多邊形的開放水域線（只是在開放邊界幾何 manifest
+裡登記成不同名稱的分段），`classify_boundary_segment` 原本無條件把兩條候選線一起比
+最短距離，對兩條幾何重合的線這個比較結果被浮點雜訊或排序穩定性任意決定（實測固定
+落在 `own_local` 這一邊），導致同一種物理事件（離開 flow domain 開放邊界而終止）在
+不同站被貼上兩種不同名稱的標籤（貢寮／龜山島標到 flow 名稱、新竹／南灣／連江卻標到
+各自的 local 名稱），數值（穿越次數、相對來源權重）本身正確，只有標籤不一致。修法：
+`classify_boundary_segment` 在比距離之前先依 `geometry.local_equals_flow` 決定候選
+集合——`True` 時只把 `flow_open_boundary` 納入候選，`own_local_open_boundary` 完全
+不參與比較，確保**終止事件的邊界歸屬名稱在五站之間一律是 flow domain 開放邊界**；
+`local_equals_flow=False`（貢寮／龜山島）與 `local_domain_departures.parquet`
+（只涵蓋這兩站的非終止「local 首次離開」事件）的候選集合與行為完全不受影響。這一站
+local 與 flow 邊界是同一個幾何的事實仍完整保留：`boundary_arc_segments_geometry_by_site`
+仍對每站同時登記兩條線各自的弧段幾何，`boundary_summary_by_site`／`local_domain_
+first_exit_summary_by_site` 也都保留 `local_equals_flow` 欄位可查。詳見
+`postprocess.classify_boundary_segment` docstring與 `reports/WP-29.md`。
+
 ## 9.13 WP-20：開放邊界再細分（方位扇區／沿邊界弧長位置）與每站總表
 
 ### 9.13.1 背景

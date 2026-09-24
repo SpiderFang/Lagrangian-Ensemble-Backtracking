@@ -2387,12 +2387,34 @@ def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case_label: str)
             "departure_azimuth_sector_index 與 departure_azimuth_sector_name。"
         )
     elif stem == "boundary_arc_segments":
-        arc_count = sum(len(rows) for rows in site.arc_segments_by_boundary.values())
+        # WP-29：boundary_arc_segments_geometry_by_site 對每站同時登記終止邊界
+        # （flow domain 開放邊界）與 local domain 開放邊界各自的弧段幾何，但只有
+        # 終止邊界那一組弧段會有非零的相對來源權重——粒子的終止事件（穿越開放
+        # 邊界）一律歸屬到 flow domain 開放邊界（見 postprocess.classify_
+        # boundary_segment docstring「候選集合先依 local_equals_flow 決定」一
+        # 節），local domain 開放邊界那一組弧段純粹是保留給地圖畫線用的幾何
+        # 參照，不對應任何穿越次數。舊圖說籠統寫「本站共 40 段弧段」，把兩組
+        # 20 段混在一起講，容易被誤讀成「權重分布在 40 個弧段上」；這裡改成
+        # 分別列出終止邊界與 local 邊界各自的段數，精確對應資料實際登記的內容。
+        terminal_ids = [
+            base_id for base_id in site.arc_segments_by_boundary if _boundary_kind(base_id) == "flow"
+        ]
+        reference_ids = [
+            base_id for base_id in site.arc_segments_by_boundary if _boundary_kind(base_id) != "flow"
+        ]
+        terminal_count = sum(len(site.arc_segments_by_boundary[base_id]) for base_id in terminal_ids)
+        reference_count = sum(len(site.arc_segments_by_boundary[base_id]) for base_id in reference_ids)
         body = (
-            f"開放邊界弧段相對來源權重，本站共 {arc_count} 段弧段，依權重色階著色並以長條圖 "
-            "並列比較。相對來源權重＝該弧段成功穿越次數除以全站成功穿越開放邊界的總次數。"
-            "資料來源：boundary_arc_segments_geometry_by_site 的弧段幾何與 "
-            "departures.parquet 的 boundary_segment_id、boundary_arc_segment_index。"
+            f"終止邊界（flow domain 開放邊界）依權重色階著色，共 {terminal_count} 段弧段，"
+            "並以長條圖並列比較相對來源權重；相對來源權重＝該弧段成功穿越次數除以全站成功"
+            "穿越開放邊界的總次數，只計在終止邊界的弧段上。"
+            f"boundary_arc_segments_geometry_by_site 另外登記 local domain 開放邊界的弧段"
+            f"幾何（共 {reference_count} 段），純供地圖疊線的地理參照，權重恆為 0、不計入"
+            "終止統計；local_equals_flow=True 的測站這條 local 邊界與上面的終止邊界是同一個"
+            "幾何（見 boundary_summary_by_site 的 local_equals_flow 欄位），local_equals_"
+            "flow=False 的測站則是各自站點獨立的 local domain 邊界。資料來源："
+            "boundary_arc_segments_geometry_by_site 的弧段幾何與 departures.parquet 的 "
+            "boundary_segment_id、boundary_arc_segment_index。"
         )
     elif stem == "source_footprint_kde":
         body = (

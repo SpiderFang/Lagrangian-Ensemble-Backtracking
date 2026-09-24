@@ -814,6 +814,203 @@ def test_boundary_segment_classification_picks_nearest_open_line() -> None:
     assert distance_m == pytest.approx(20.0, abs=1.0e-9)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# WP-29：修正 local_equals_flow=True 站點終止事件的邊界歸屬標籤不一致
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_boundary_segment_classification_local_equals_flow_true_excludes_own_local_candidate() -> None:
+    """WP-29 核心修法：``local_equals_flow=True`` 時，``own_local_open_boundary``
+    完全不參與最短距離比較，即使離開點精確落在 ``own_local`` 線上（距離 0）、
+    離 ``flow`` 線還有 400 m，仍然必須分類到 ``flow_boundary_segment_id``。
+
+    這裡刻意讓兩條線的距離差很大（不是幾何重合的退化情況），用來證明修法是
+    「先依 ``local_equals_flow`` 收斂候選集合，``own_local`` 直接出局」，不是
+    「剛好沒有觸發那個浮點誤差或排序穩定性造成的 tie」——修補前（WP-17）的
+    程式碼在這個輸入下會回傳 ``siteC_local_open_boundary``（見下一個測試的
+    對照組），是本任務要修的臭蟲最直接的反例。
+    """
+
+    from lagrangian_backtracking.native_runner.postprocess import classify_boundary_segment
+
+    geometry = _make_boundary_geometry("siteC", local_equals_flow=True)
+    segment_id, distance_m = classify_boundary_segment(100.0, 0.0, geometry)
+    assert segment_id == "flow_open_boundary"
+    assert distance_m == pytest.approx(400.0, abs=1.0e-9)
+
+
+def test_boundary_segment_classification_local_equals_flow_false_unaffected() -> None:
+    """對照組：``local_equals_flow=False``（貢寮／龜山島）行為完全不變——同一個
+    離開點、同一份幾何，只把 ``local_equals_flow`` 從 ``True`` 換成 ``False``，
+    分類結果換回 WP-17 原本的「兩條都比距離、取較近者」，證明 WP-29 修法只影響
+    ``local_equals_flow=True`` 的站，不影響貢寮／龜山島既有行為。
+    """
+
+    from lagrangian_backtracking.native_runner.postprocess import classify_boundary_segment
+
+    geometry = _make_boundary_geometry("siteC", local_equals_flow=False)
+    segment_id, distance_m = classify_boundary_segment(100.0, 0.0, geometry)
+    assert segment_id == "siteC_local_open_boundary"
+    assert distance_m == pytest.approx(0.0, abs=1.0e-9)
+
+
+def _make_boundary_geometry_with_coincident_open_boundary(site_id: str, *, local_equals_flow: bool):
+    """建一個 ``own_local_open_boundary`` 與 ``flow_open_boundary`` 是**同一個**
+    shapely 物件（座標逐位元相同）的 ``BoundaryGeometry``，重現診斷報告描述的
+    「新竹／南灣／連江」情境：local domain 與 flow domain 的開放邊界其實是同一條
+    線，只是登記成兩個不同名稱的分段。
+
+    共用同一個物件確保 ``point.distance(...)`` 對兩個名稱算出來的距離逐位元
+    相同（不只是數值上接近），因此可以用「同一份幾何，只把 ``local_equals_flow``
+    從 ``True`` 切到 ``False``」這一個位元的差異，精確重現修補前（WP-17，任何
+    ``local_equals_flow`` 都不特殊處理）的候選比較邏輯：``local_equals_flow=
+    False`` 時 ``own_local`` 與 ``flow`` 都進候選，兩者距離逐位元相同，
+    ``list.sort`` 的穩定排序保留先插入者（``own_local``），與診斷報告對新竹／
+    南灣／連江實際觀察到的行為（恆定分類到 local 名稱）完全一致；
+    ``local_equals_flow=True`` 則是 WP-29 修補後的新行為。兩次呼叫除了
+    ``local_equals_flow``（與由它決定的候選集合）以外，其餘設定完全相同，因此
+    比較兩次的統計輸出就能證明修法只換了標籤字串，沒有換任何數值。
+    """
+
+    from shapely.geometry import LineString, box
+
+    from lagrangian_backtracking.boundaries import BoundaryGeometry
+
+    shared_open_boundary = LineString([(500.0, -500.0), (500.0, 500.0)])
+    domain = box(-500.0, -500.0, 500.0, 500.0)
+    return BoundaryGeometry(
+        own_local_domain=domain,
+        flow_domain=domain,
+        foreign_local_domains={},
+        own_local_open_boundary=shared_open_boundary,
+        flow_open_boundary=shared_open_boundary,
+        local_equals_flow=local_equals_flow,
+        own_local_boundary_segment_id=f"{site_id}_local_open_boundary",
+        flow_boundary_segment_id="flow_open_boundary",
+    )
+
+
+def test_local_equals_flow_relabeling_preserves_crossed_counts_and_relative_weights(tmp_path) -> None:
+    """WP-29 硬要求的逐值證明：修法只能換標籤字串，不能換任何穿越次數或相對
+    來源權重的數值。
+
+    做法：對同一批合成離開點（座標完全相同、只沿共用開放邊界線分散到 4 個不同
+    弧段），分別用 ``local_equals_flow=False``（重現修補前恆定選到 local 名稱
+    的行為）與 ``local_equals_flow=True``（修補後）各跑一次完整的
+    ``PostprocessAccumulator``，其餘輸入（粒子數、座標、狀態碼）逐位元相同。
+    比對兩次輸出的 ``boundary_entry_by_site_arc_segment.parquet``：兩次的
+    ``base_boundary_segment_id`` 必須分別恆定是 local／flow 名稱（不會同一次
+    執行內部就分裂成兩種名稱，這正是診斷報告描述的「五站不一致」問題的最小
+    重現），但依 ``arc_segment_index`` 對齊後，``crossed_count``、
+    ``relative_source_weight_within_group`` 與弧段中點座標必須逐值相同。
+    """
+
+    n = 6
+    identity = _make_identity_table(
+        particle_ids=[f"p{i}" for i in range(n)],
+        study_site_id=["siteD"] * n,
+        settling_velocity_mps=[-0.001] * n,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * n,
+    )
+    # 開放邊界線是 x=500、y 從 -500 到 500（長 1000 m）；預設 20 段、每段 50 m，
+    # 弧長位置＝y_m-(-500)。下面四個 y_m 值分別落在弧段 0／9／15／19，其中弧段
+    # 0 與 15 各有兩顆粒子，驗證計數不是只對「有沒有非零」敏感，連「數幾顆」都
+    # 逐值相同。
+    final_y_values = [-490.0, -490.0, -50.0, 250.0, 250.0, 480.0]
+    result = _make_result(
+        rows=list(range(n)),
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION] * n,
+        final_x_m=[500.0] * n,
+        final_y_m=final_y_values,
+    )
+
+    def _run(local_equals_flow: bool) -> list[dict]:
+        out_dir = tmp_path / f"local_equals_flow_{local_equals_flow}"
+        geometry = _make_boundary_geometry_with_coincident_open_boundary(
+            "siteD", local_equals_flow=local_equals_flow
+        )
+        accumulator = PostprocessAccumulator(
+            identity, output_dir=out_dir, boundary_geometries={"siteD": geometry},
+        )
+        accumulator.add_batch("batch-0", result)
+        accumulator.finalize()
+        return pq.read_table(out_dir / "boundary_entry_by_site_arc_segment.parquet").to_pylist()
+
+    old_style_rows = _run(local_equals_flow=False)  # 重現修補前恆定的 local 標籤
+    new_style_rows = _run(local_equals_flow=True)  # WP-29 修補後
+
+    # 修補前全部落在 local 名稱、修補後全部落在 flow 名稱：這就是「同一種物理
+    # 事件在五站間被貼上不同名稱標籤」問題本身，也是本任務要修的東西。
+    assert {row["base_boundary_segment_id"] for row in old_style_rows} == {"siteD_local_open_boundary"}
+    assert {row["base_boundary_segment_id"] for row in new_style_rows} == {"flow_open_boundary"}
+
+    old_by_arc = {row["arc_segment_index"]: row for row in old_style_rows}
+    new_by_arc = {row["arc_segment_index"]: row for row in new_style_rows}
+    assert set(old_by_arc) == set(new_by_arc) == {0, 9, 15, 19}
+    for arc_index in old_by_arc:
+        old_row = old_by_arc[arc_index]
+        new_row = new_by_arc[arc_index]
+        assert new_row["crossed_count"] == old_row["crossed_count"]
+        assert new_row["relative_source_weight_within_group"] == pytest.approx(
+            old_row["relative_source_weight_within_group"]
+        )
+        assert new_row["midpoint_x_m"] == pytest.approx(old_row["midpoint_x_m"])
+        assert new_row["midpoint_y_m"] == pytest.approx(old_row["midpoint_y_m"])
+
+    assert old_by_arc[0]["crossed_count"] == new_by_arc[0]["crossed_count"] == 2
+    assert old_by_arc[15]["crossed_count"] == new_by_arc[15]["crossed_count"] == 2
+    assert old_by_arc[9]["crossed_count"] == new_by_arc[9]["crossed_count"] == 1
+    assert old_by_arc[19]["crossed_count"] == new_by_arc[19]["crossed_count"] == 1
+    assert sum(row["crossed_count"] for row in new_style_rows) == n
+    assert sum(row["crossed_count"] for row in old_style_rows) == n
+
+
+def test_local_domain_departures_unaffected_by_wp29_for_local_equals_flow_false_site(tmp_path) -> None:
+    """WP-29 任務要求 2：``local_domain_departures.parquet``（貢寮／龜山島的
+    local 首次離開，``local_equals_flow=False``）不受這次修法影響——它們的
+    ``own_local_open_boundary`` 本來就是唯一有意義的候選（首次離開 local domain
+    的位置理論上必然離自己 local domain 邊界最近，見
+    ``postprocess._write_local_domain_departure_batch`` docstring），WP-29 的
+    候選收斂規則只在 ``geometry.local_equals_flow=True`` 時才會生效，這裡驗證
+    ``local_boundary_segment_id`` 仍然一如既往地分類到 ``own_local`` 名稱。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0"], study_site_id=["siteA"], settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    local_records = [
+        LocalDomainFirstExitRecord(
+            row_particle_index=0, x_m=100.0, y_m=0.0, z_m=-5.0,
+            utc_ns=_JAN_2024_UTC_NS - _HOUR_NS,
+        ),
+    ]
+    result = _make_result(
+        rows=[0],
+        final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION],
+        final_x_m=[480.0],
+        final_y_m=[0.0],
+        local_domain_departures=local_records,
+    )
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path,
+        boundary_geometries={"siteA": _make_boundary_geometry("siteA", local_equals_flow=False)},
+    )
+    accumulator.add_batch("batch-0", result)
+    accumulator.finalize()
+
+    local_rows = pq.read_table(tmp_path / "local_domain_departures.parquet").to_pylist()
+    assert len(local_rows) == 1
+    # 離開點就落在 own_local_open_boundary 上（距離 0），與終止事件（分類到
+    # flow_open_boundary，因為 (480, 0) 離 flow 線比較近）是兩個不同的分類結果，
+    # 互不影響，正是 WP-23 裁決＋WP-29 修法要維持的行為。
+    assert local_rows[0]["local_boundary_segment_id"] == "siteA_local_open_boundary"
+    assert local_rows[0]["local_boundary_classification_distance_m"] == pytest.approx(0.0, abs=1.0e-9)
+
+    departures = pq.read_table(tmp_path / "departures.parquet").to_pylist()
+    assert departures[0]["boundary_segment_id"] == "flow_open_boundary"
+
+
 def test_boundary_geometries_populate_departure_columns_and_entry_tables(tmp_path) -> None:
     n = 4
     identity = _make_identity_table(

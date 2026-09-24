@@ -186,9 +186,13 @@ flow domain 是同一條邊界，「離開 local domain」與「離開 flow doma
   ``departure_*``／``boundary_*`` 欄位分開，不會誤把「首次離開 local domain」
   當成「終止」）；``local_boundary_segment_id``／``local_boundary_
   classification_distance_m``（重用既有 ``classify_boundary_segment``，見該
-  函式 docstring——它本來就是「離開點分別到 ``own_local_open_boundary``／
-  ``flow_open_boundary`` 兩條線取較近者」，local domain 首次離開點理論上必然
-  離 ``own_local_open_boundary`` 最近，套用同一個函式不需要另寫邏輯）與
+  函式 docstring——它把 ``own_local_open_boundary`` 也納入候選、與
+  ``flow_open_boundary`` 一起比距離取較近者，local domain 首次離開點理論上
+  必然離 ``own_local_open_boundary`` 最近，套用同一個函式不需要另寫邏輯；
+  WP-29 起 ``classify_boundary_segment`` 只在 ``local_equals_flow=True`` 時才會
+  把 ``own_local_open_boundary`` 排除在候選之外，這張表只對 ``local_equals_
+  flow=False`` 的貢寮／龜山島兩站有列，因此不受 WP-29 那個排除規則影響，行為
+  與 WP-23 當時完全一致）與
   ``local_departure_azimuth_deg`` 等三個方位扇區欄位（重用既有
   ``classify_azimuth_sector``，原點與主表同一份 ``_site_receptor_centers``）、
   ``local_boundary_arc_segment_index``／``local_boundary_arc_length_position_m``
@@ -214,6 +218,39 @@ flow domain 是同一條邊界，「離開 local domain」與「離開 flow doma
   列數 ＋ ``also_local_domain_first_exit=True`` 列數」兩者相加，因為兩個來源
   對同一顆粒子互斥、不會重疊，見 ``PostprocessAccumulator.add_batch`` 的
   fail-closed 一致性檢查）。
+
+WP-29：修正終止事件的邊界歸屬標籤在五站間不一致
+------------------------------------------------------
+正式成果（run02）審查發現：``boundary_entry_by_site_arc_segment`` 等表的
+``base_boundary_segment_id``（終止事件被判定所屬的開放邊界名稱）在五站之間不
+一致——貢寮／龜山島標到 ``{flow_domain}_flow_open_boundary``，新竹／連江／
+南灣卻標到 ``{site}_local_open_boundary``。三站的數值（穿越次數、相對來源
+權重）本身完全正確，問題只在標籤：這三站 ``local_equals_flow=True``，
+``own_local_open_boundary`` 與 ``flow_open_boundary`` 其實是同一個多邊形的
+開放水域線，只是在開放邊界幾何 manifest 裡各自登記成不同名稱的分段；
+WP-17 的 ``classify_boundary_segment`` 原本無條件讓兩條候選線一起比最短距離，
+對兩條幾何重合的線，比較結果被浮點雜訊或 ``list.sort`` 的排序穩定性任意決定
+（實測固定落在 ``own_local`` 這一邊），導致同一種物理事件（離開 flow domain
+開放邊界而終止）在不同站被貼上兩種不同名稱的標籤，容易在報告審查時被誤讀為
+「五站的終止邊界定義不一致」。
+
+修法：``classify_boundary_segment`` 在比距離之前，先依
+``geometry.local_equals_flow`` 決定候選集合——``True`` 時只把
+``flow_open_boundary`` 納入候選，``own_local_open_boundary`` 不參與距離比較
+（見該函式 docstring 完整說明）。這個修法**只改變貼哪個名稱的標籤**，完全不
+改變「這個離開點是否成功穿越關注區域邊界」的判定（那由 ``final_status``
+決定）與任何穿越次數／相對來源權重的統計數字；貢寮／龜山島
+（``local_equals_flow=False``）的候選集合完全不受影響，``local_domain_
+departures.parquet``（只涵蓋這兩站的非終止「local 首次離開」事件）也不受
+影響。「這一站的 local 與 flow 邊界其實是同一個幾何」這件事不會因為只留一個
+候選而遺失：``boundary_arc_segments_geometry_by_site`` 仍然對每站同時登記
+``own_local_open_boundary``／``flow_open_boundary`` 兩條線各自的弧段幾何（各
+``boundary_arc_segment_count`` 段，預設每條 20 段），``local_domain_first_
+exit_summary_by_site``／``boundary_summary_by_site`` 也都保留
+``local_equals_flow`` 欄位，讀者可以由此查出這一站的兩條邊界是同一個幾何，
+不是被這個修法悄悄丟棄的資訊；``native_runner.figures`` 的弧段圖圖說也已同步
+改寫，明確區分「終止邊界（20 段，有權重）」與「幾何表另含的 local 邊界
+（20 段，供地理參照、恆為零權重）」，不再籠統寫「本站共 40 段弧段」。
 
 不做的事（誠實揭露）
 ----------------------
@@ -930,19 +967,48 @@ def classify_boundary_segment(
     ``backward_driver.mirror_rk4_substep_loop`` 與 ``substep_numba`` 的關注區域
     判定），不是離開瞬間與 ``own_local_domain`` 邊界的精確交點；因此這裡**不能**
     重用既有 ``boundaries._open_boundary_crossing``（它要求輸入點幾乎剛好落在
-    邊界線上，預設容忍度只有 ``1e-6`` 公尺）。本函式改用「離開點分別到
-    ``own_local_open_boundary``／``flow_open_boundary`` 兩條開放水域線的最短
-    直線距離，取較近者」這個較粗但穩健的啟發式；沒有開放邊界線可比對的站點
-    （理論上不應發生，``own_local_open_boundary`` 缺席會由呼叫端的
+    邊界線上，預設容忍度只有 ``1e-6`` 公尺）。本函式改用「離開點到候選開放水域
+    線的最短直線距離，取較近者」這個較粗但穩健的啟發式；沒有開放邊界線可比對的
+    站點（理論上不應發生，``own_local_open_boundary`` 缺席會由呼叫端的
     ``manifests.load_boundary_geometries`` 更早拒絕）回傳
     ``geometry.coastline_segment_id``。
+
+    **候選集合先依 ``local_equals_flow`` 決定，才做距離比較（WP-29）**：
+    ``geometry.local_equals_flow=False``（貢寮／龜山島）時，
+    ``own_local_open_boundary``／``flow_open_boundary`` 是兩條**不同**的線，
+    兩者都拿來比距離、取較近者，這是本函式原本（WP-17）的行為，沒有改變。
+    ``geometry.local_equals_flow=True``（新竹／南灣／連江）時，
+    ``own_local_open_boundary`` 與 ``flow_open_boundary`` 是**同一個多邊形**的
+    開放水域線（``manifests.load_boundary_geometries`` 在建構 ``BoundaryGeometry``
+    前已經驗證過 ``own_local_domain.equals(flow_domain)``），只是在開放邊界幾何
+    manifest 裡各自登記成不同名稱的分段；這種情況下**只把 ``flow_open_boundary``
+    納入候選**，``own_local_open_boundary`` 完全不參與距離比較。原因：離開點對
+    兩條「幾何重合」的線的最短距離理論上相等，實際計算出的浮點數值只受浮點誤差
+    影響、彼此極為接近，不足以保證每次比較的勝負穩定；若仍讓兩者一起比距離、取
+    較近者，比較結果會被這個與物理無關的浮點雜訊或 ``list.sort`` 的穩定排序
+    （同分時保留先插入者）任意決定，導致同一種物理事件（離開 flow domain 開放
+    邊界而終止）在不同站點被貼上兩種不同名稱的邊界標籤（``{站}_local_open_
+    boundary`` 或 ``{flow_domain}_flow_open_boundary``），審查時容易被誤讀為
+    「五站的終止邊界定義不一致」。先依 ``local_equals_flow``
+    收斂候選集合，確保**終止事件的邊界歸屬名稱在五站之間一致（一律是 flow
+    domain 開放邊界）**，且完全不改變「這個離開點是否成功穿越關注區域邊界」
+    這個判定本身（那由 ``final_status`` 決定，本函式不參與），也不改變任何
+    穿越次數或相對來源權重的統計——本函式只決定**貼哪個名稱的標籤**，不是
+    重新計算誰穿越了邊界。這一站的 local domain 與 flow domain 幾何相同這件事
+    本身仍完整保留在輸出裡，不會因為只留一個候選就資訊遺失：
+    ``boundary_arc_segments_geometry_by_site`` 對每站仍然同時登記
+    ``own_local_open_boundary``／``flow_open_boundary`` 兩條線的幾何（見
+    ``_named_open_boundary_lines``），``local_domain_first_exit_summary_by_site``
+    與 ``boundary_summary_by_site`` 也都保留 ``local_equals_flow`` 欄位，讀者
+    可以由此得知這一站的兩條邊界其實是同一個幾何，不是被本函式悄悄丟棄的
+    資訊。
 
     這個分類**不會**判斷離開點是不是真的離開海岸（``NATIVE_STATUS_STRANDED``
     走的是完全不同、以網格乾濕元素判定的路徑，不會呼叫本函式）；它只回答「這個
     已經確定成功穿越關注區域邊界的離開點，比較靠近哪一段開放邊界」。回傳的
     ``distance_m``（離開點到判定分段的直線距離）保留在輸出表中，供使用者評估
-    這個啟發式在特定站點的典型誤差量級——距離越大，代表離開點離任何一段開放
-    邊界線都比較遠（例如剛好在兩條線的交角附近，或一次子步位移特別大），分類
+    這個啟發式在特定站點的典型誤差量級——距離越大，代表離開點離判定分段所屬的
+    開放邊界線比較遠（例如剛好在兩條線的交角附近，或一次子步位移特別大），分類
     結果的可信度也越低；本函式不對這個距離設任何拒絕門檻，是否要在下游報告中
     排除高距離的分類，留給使用者依實際量測到的距離分布決定。
 
@@ -952,7 +1018,11 @@ def classify_boundary_segment(
 
     point = Point(float(x_m), float(y_m))
     candidates: list[tuple[str, float]] = []
-    if geometry.own_local_open_boundary is not None:
+    # WP-29：local_equals_flow=True 的站點，own_local_open_boundary 與
+    # flow_open_boundary 是同一個多邊形的開放水域線，不納入 own_local 候選，
+    # 避免兩條幾何重合的線互相比距離時被浮點雜訊或排序穩定性任意決定歸屬
+    # （見本函式 docstring「候選集合先依 local_equals_flow 決定」一節）。
+    if not geometry.local_equals_flow and geometry.own_local_open_boundary is not None:
         candidates.append(
             (geometry.own_local_boundary_segment_id, float(point.distance(geometry.own_local_open_boundary)))
         )
@@ -1016,9 +1086,21 @@ def classify_azimuth_sector(
 def _named_open_boundary_lines(geometry: BoundaryGeometry) -> list[tuple[str, Any]]:
     """回傳這個站已命名、非空的開放邊界線 ``(boundary_segment_id, geometry)`` 清單。
 
-    最多兩條（``own_local_open_boundary``／``flow_open_boundary``），與
-    ``classify_boundary_segment`` 判定「離開點最靠近哪一條」時考慮的候選集合完全
-    一致，確保沿邊界弧長細分只會對「離開點確實被分類到的那一條線」計算弧長位置。
+    最多兩條（``own_local_open_boundary``／``flow_open_boundary``），**一律都回傳**，
+    不依 ``geometry.local_equals_flow`` 篩選——這裡回答的是「這個站總共有哪些命名
+    開放邊界線的幾何」，供 :func:`_reference_radius_m`（扇區代表座標的顯示半徑）與
+    :func:`_build_arc_segment_geometries`（``boundary_arc_segments_geometry_by_site``
+    幾何表）使用，兩者都需要看到全部命名邊界線本身，與「離開點實際被分類到哪一條」
+    無關。
+
+    WP-17／WP-20 時期這個候選集合與 ``classify_boundary_segment`` 判定「離開點
+    最靠近哪一條」時考慮的候選集合完全一致；WP-29 修法後兩者**不再相同**：
+    ``classify_boundary_segment`` 在 ``local_equals_flow=True`` 時只把
+    ``flow_open_boundary`` 納入距離比較的候選（見該函式 docstring），但本函式仍然
+    兩條都回傳——``boundary_arc_segments_geometry_by_site`` 因此對每個
+    ``local_equals_flow=True`` 的站仍然同時登記 local／flow 兩條線各自的弧段幾何
+    （見模組 docstring「WP-29」一節），這是刻意保留的地理參照，不是資訊遺失，
+    也不是本函式沒有跟上修法；只是它的用途不需要跟著改。
     """
 
     lines: list[tuple[str, Any]] = []
