@@ -134,7 +134,7 @@ legacy 因環境欄位不可用而拒絕此預覽，不改一般讀取器的舊�
 
 輸出固定為三張 PNG、`particles.csv`、`observations.csv`、`summary.json`、繁中
 `README.md` 及 `manifest.json`。水平圖以來源 AEQD 等距方位投影公尺座標呈現總覽與
-每個水平受體局部面板；不推測海岸、不放大位移。current formal 深度圖依
+每個水平受體局部面板；不臆測海岸、不放大位移。current formal 深度圖依
 `random_vertical_draw_0..3` 與各自的 normalized fraction 完整保留，random rank
 不代表物理水層；歷史 pilot 若在輸入中明示 `near_bed` 才可依舊契約優先呈現。
 海面 eta、海床 bed、粒子 z 取既存實值、公尺正向上；缺值留空。

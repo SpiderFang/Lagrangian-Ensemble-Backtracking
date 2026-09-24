@@ -1107,6 +1107,129 @@ def test_stopping_conditions_and_status_codes_are_distinct(driver_grid, handles)
     assert len(set(descriptions.values())) == len(descriptions)
 
 
+def test_bed_reflect_default_bit_identical_and_sensitivity_case_never_deposits(
+    driver_grid, handles
+) -> None:
+    """WP-26：``bed_reflect`` 敏感度案例的兩個硬要求都要證明，不能只宣稱。
+
+    1. 省略／明示 ``bed_reflect=False`` 必須對同一批輸入產生逐位元相同的
+       ``BackwardDriverResult``（含 ``departures``／``bed_reflect_events``），
+       這是現行 ``deposit_on_first_contact_and_stop`` 基線的位元相同回歸測試。
+    2. ``bed_reflect=True`` 時，本應在第 3 小時沉底的粒子改為不終止、留在
+       ``NATIVE_STATUS_ACTIVE``，並在原本會沉底的那個小時記一筆非終止的
+       ``BedReflectEventRecord``（不進入 ``departures``），直到觸及回溯上限
+       才停止——語意上與海面反射相同（不終止、事件被記錄），差異只在於本
+       模組刻意不改寫原版 ``batch_clamp_z``，見模組文件「WP-26」一節。
+    """
+
+    arrival_utc = 6_000 * _HOUR_NS
+    bed_z_m = -_DP_M  # 均勻水深網格：particle_bed_z_levels 對這個網格恆為 -DP_M。
+
+    def resolver(target_utc_ns: int) -> HourlyFieldPair:
+        hi = target_utc_ns
+        lo = target_utc_ns - _HOUR_NS
+        # 水平流速為零：粒子水平位置不變，只由沉降速度驅動垂向運動，讓
+        # 「是否沉底」是這個測試裡唯一會變動的終止條件，排除離開關注區域、
+        # 擱淺等其他終止原因的干擾。
+        return _uniform_field_pair(
+            driver_grid, u1=0.0, v1=0.0, ibf=-1, trat=0.0,
+            time_before_utc_ns=hi, time_after_utc_ns=lo,
+        )
+
+    interest_polygon = Polygon([(-1.0e6, -1.0e6), (1.0e6, -1.0e6), (1.0e6, 1.0e6), (-1.0e6, 1.0e6)])
+
+    n = 1
+    x0 = np.array([_DOMAIN_X / 2.0])
+    y0 = np.array([_DOMAIN_Y / 2.0])
+    # 起點已貼近海床（在 deposition_tolerance_m=0.5 內），確保粒子從第一小時
+    # 起就連續停留在海床附近，3 小時後即達 deposition_consecutive_hours 門檻。
+    z0 = np.array([bed_z_m + 0.1])
+    soa = _SyntheticSoa(x=x0, y=y0, z=z0, row_particle_index=np.arange(n, dtype=np.int64))
+    seed_hex_values = ["7" * 32]
+
+    common_kwargs: dict[str, object] = dict(
+        arrival_time_utc_ns=arrival_utc,
+        # 刻意用很小的沉降速度量值：逆向時 ibf=-1 會把沉降方向反轉（回溯重建的
+        # 是「沉底前」的位置，理當離海床而去），量值太大會讓粒子一小時內就
+        # 遠遠超出 deposition_tolerance_m，永遠無法累積連續 3 小時；這裡選
+        # 0.036 m/hour 的等效垂向速度，3 小時內都還在 0.5 m 容許帶內。
+        settling_velocity_mps=-0.00001,
+        max_backtrack_seconds=5.0 * 3600.0,
+        dt_max_seconds=30.0,
+        enable_diffusion=False,
+        output_interval_seconds=3600.0,
+        deposition_consecutive_hours=3,
+        deposition_tolerance_m=0.5,
+        master_seed=11,
+    )
+
+    # ── 1. 省略 bed_reflect：必須是既有基線行為（第 3 小時沉底）───────────
+    default_config = bd.BackwardDriverConfig(**common_kwargs)
+    assert default_config.bed_reflect is False
+    default_result = bd.run_backward_batch(
+        driver_grid, handles, soa,
+        seed_hex_values=seed_hex_values,
+        config=default_config,
+        forcing_resolver=resolver,
+        interest_region_polygon=interest_polygon,
+    )
+    assert default_result.final_status[0] == bd.NATIVE_STATUS_DEPOSITED
+    assert default_result.hours_run == 3
+    assert len(default_result.departures) == 1
+    assert default_result.departures[0].status == bd.NATIVE_STATUS_DEPOSITED
+    assert default_result.departures[0].utc_ns == arrival_utc - 3 * _HOUR_NS
+    assert default_result.bed_reflect_events == ()
+
+    # ── 2. 明示 bed_reflect=False：必須與省略時逐位元相同（硬要求本身）───
+    explicit_false_result = bd.run_backward_batch(
+        driver_grid, handles, soa,
+        seed_hex_values=seed_hex_values,
+        config=bd.BackwardDriverConfig(**common_kwargs, bed_reflect=False),
+        forcing_resolver=resolver,
+        interest_region_polygon=interest_polygon,
+    )
+    assert np.array_equal(explicit_false_result.final_status, default_result.final_status)
+    assert np.array_equal(explicit_false_result.final_x_m, default_result.final_x_m)
+    assert np.array_equal(explicit_false_result.final_y_m, default_result.final_y_m)
+    assert np.array_equal(explicit_false_result.final_z_m, default_result.final_z_m)
+    assert np.array_equal(explicit_false_result.final_utc_ns, default_result.final_utc_ns)
+    assert np.array_equal(explicit_false_result.trajectory_x_m, default_result.trajectory_x_m)
+    assert np.array_equal(explicit_false_result.trajectory_y_m, default_result.trajectory_y_m)
+    assert np.array_equal(explicit_false_result.trajectory_z_m, default_result.trajectory_z_m)
+    assert np.array_equal(explicit_false_result.trajectory_status, default_result.trajectory_status)
+    assert explicit_false_result.departures == default_result.departures
+    assert explicit_false_result.hours_run == default_result.hours_run
+    assert explicit_false_result.bed_reflect_events == default_result.bed_reflect_events
+
+    # ── 3. bed_reflect=True：不沉底，反射事件被記錄，直到回溯上限才停止 ──
+    reflect_result = bd.run_backward_batch(
+        driver_grid, handles, soa,
+        seed_hex_values=seed_hex_values,
+        config=bd.BackwardDriverConfig(**common_kwargs, bed_reflect=True),
+        forcing_resolver=resolver,
+        interest_region_polygon=interest_polygon,
+    )
+    assert reflect_result.final_status[0] == bd.NATIVE_STATUS_MAX_BACKTRACK
+    assert reflect_result.hours_run == 5
+    assert len(reflect_result.departures) == 1
+    assert reflect_result.departures[0].status == bd.NATIVE_STATUS_MAX_BACKTRACK
+    # 這一批 departures 完全沒有 DEPOSITED：兩種案例的結果不會混在同一份
+    # departures 統計裡（見任務書「寫進...結果目錄命名，兩種案例的結果絕不可
+    # 混在同一份統計」——這裡先在資料結構層級證明互不污染）。
+    assert all(d.status != bd.NATIVE_STATUS_DEPOSITED for d in reflect_result.departures)
+    assert len(reflect_result.bed_reflect_events) == 1
+    reflect_event = reflect_result.bed_reflect_events[0]
+    assert isinstance(reflect_event, bd.BedReflectEventRecord)
+    assert reflect_event.row_particle_index == 0
+    assert reflect_event.utc_ns == arrival_utc - 3 * _HOUR_NS
+    # 兩個案例在第 3 小時之前的物理完全相同（差異只在事後如何處置這個
+    # 「本應沉底」的判定），所以反射事件的位置理當與基線案例的沉底位置
+    # 逐位元相同——這也再次證明兩種案例共用同一段軌跡計算，不會憑空分岔。
+    assert reflect_event.x_m == default_result.departures[0].x_m
+    assert reflect_event.y_m == default_result.departures[0].y_m
+    assert reflect_event.z_m == default_result.departures[0].z_m
+
+
 def test_all_status_codes_are_unique_and_documented() -> None:
     """七種狀態碼彼此數值不同，且每一種都有獨立描述文字。"""
 

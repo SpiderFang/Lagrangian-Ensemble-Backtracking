@@ -2634,7 +2634,9 @@ class RuntimeRequestFactory:
                 backtrack_mode=residence.backtrack_mode,
                 requested_horizon_days=self._max_backtrack_days,
                 maximum_age_days=residence.maximum_age_days,
-                sampling_seed=residence.sampling_seed,
+                # WP-26：改讀 effective_sampling_seed，讓 age_sampling_seed 覆寫（若有
+                # 明示）在這裡也生效；未明示時原樣等於 sampling_seed，逐位元相同。
+                sampling_seed=residence.effective_sampling_seed,
             )
         settings = self._build_settings(
             scenario.arrival_time_utc_ns,

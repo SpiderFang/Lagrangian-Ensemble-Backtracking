@@ -611,10 +611,12 @@ class StudySiteConfig(StrictModel):
 class BedResidenceTimeConfig(StrictModel):
     """五站共用沉底年齡抽樣與回溯模式切換的嚴格契約。
 
-    此區塊只有在 YAML 明示時才啟用；啟用後所有欄位都必須明確提供，且固定為本期已定
-    案的 90 日、每站 50 個整點小時年齡及既有抽樣 policy。支援的兩種 backtrack mode
-    必須同時登錄，實際執行只由 backtrack_mode 選擇一種。runtime_horizon_support_days
-    可在尚未建立 horizon suite 的 template 設為 null；suite 產生的正式設定須填正整數。
+    此區塊只有在 YAML 明示時才啟用；啟用後所有欄位都必須明確提供，每站 50 個整點
+    小時年齡及既有抽樣 policy 固定不變，沉底年齡上限（``maximum_age_days``）則見該
+    欄位 docstring（WP-26 起由固定 90 天放寬為 30／60／90 三選一，預設仍是 90）。
+    支援的兩種 backtrack mode 必須同時登錄，實際執行只由 backtrack_mode 選擇一種。
+    runtime_horizon_support_days 可在尚未建立 horizon suite 的 template 設為 null；
+    suite 產生的正式設定須填正整數。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -626,6 +628,13 @@ class BedResidenceTimeConfig(StrictModel):
     supported_backtrack_modes: tuple[
         Literal["fixed_calendar_window", "full_horizon_from_deposition"], ...
     ]
+    # WP-26 前固定鎖死為 90；WP-26 起放寬為「沉底年齡上限敏感度」的三個已核准格點
+    # 30／60／90（天），供量測「年齡上限選擇本身」對來源足跡的影響。90 仍是唯一
+    # 的正式基線值，30／60 只在明示選用時才會生效，且會產生與 90 不同的
+    # config hash、不同的抽樣範圍（見 ``bed_residence.py`` 的
+    # ``sample_bed_residence_age_hours`` 等函式——這些函式本來就把
+    # ``maximum_age_days`` 當一般參數讀取，不曾寫死 90，因此這裡放寬只是移除
+    # schema 層的人工上限，不改變任何既有下游計算路徑）。
     maximum_age_days: StrictInt
     sample_count_per_site: StrictInt
     sampling_policy: Literal["discrete_hourly_stratified_uniform_v1"]
@@ -636,6 +645,20 @@ class BedResidenceTimeConfig(StrictModel):
         "reject_unavailable_deposition_hour_within_stratum_v1"
     ] | None = None
     sampling_seed: StrictInt
+    # WP-26 新增：獨立於 ``sampling_seed``（正式核准、進入 run identity 的既有欄位）
+    # 的沉底年齡抽樣種子覆寫。``sampling_seed`` 是正式流程的核准值，一旦變更就代表
+    # 換了一個新的正式設計；``age_sampling_seed`` 則是給敏感度分析用的「快速覆寫」
+    # ——設定後只有「抽出哪 50 個年齡」這件事改用這組種子，其餘設定（含
+    # ``sampling_seed`` 本身的欄位值）不動，讓主代理可以在同一份設定基礎上另外
+    # 產生一組完全獨立的 50 個年齡樣本，跑一次子集比較，藉此回答「這 50 個年齡是
+    # 任選的，換一組會不會變」。省略（``None``，預設）時 ``effective_sampling_seed``
+    # 屬性回傳與省略此欄位前完全相同的 ``sampling_seed`` 整數，因此所有實際讀取
+    # 「有效抽樣種子」的呼叫端（``input_derivation``／``manifests``／``cli``／
+    # ``runtime``，見各自模組的 WP-26 章節）在省略此欄位時取得逐位元相同的參數，
+    # 保證預設抽樣結果不變；``normalized_payload`` 也會在未明示時把 Pydantic 補上
+    # 的 ``None`` 從 canonical payload 移除，不改變既有 config hash（做法與
+    # ``age_sampling_scope``／``formal_release_backtrack_modes`` 相同）。
+    age_sampling_seed: StrictInt | None = None
     shared_age_offsets_across_sites: StrictBool
     pre_window_policy: Literal[
         "record_pre_window_deposition_without_transport"
@@ -686,9 +709,10 @@ class BedResidenceTimeConfig(StrictModel):
             raise ValueError(
                 "scenarios.bed_residence_time.backtrack_mode 必須列於 supported_backtrack_modes"
             )
-        if self.maximum_age_days != 90:
+        if self.maximum_age_days not in (30, 60, 90):
             raise ValueError(
-                "scenarios.bed_residence_time.maximum_age_days 必須固定為 90"
+                "scenarios.bed_residence_time.maximum_age_days 必須是 30、60 或 90"
+                "（WP-26：90 為正式基線，30／60 為年齡上限敏感度格點）"
             )
         if self.sample_count_per_site != 50:
             raise ValueError(
@@ -708,6 +732,10 @@ class BedResidenceTimeConfig(StrictModel):
         if self.sampling_seed < 0:
             raise ValueError(
                 "scenarios.bed_residence_time.sampling_seed 必須是非負嚴格整數"
+            )
+        if self.age_sampling_seed is not None and self.age_sampling_seed < 0:
+            raise ValueError(
+                "scenarios.bed_residence_time.age_sampling_seed 必須是非負嚴格整數或省略"
             )
         if self.shared_age_offsets_across_sites is not True:
             raise ValueError(
@@ -745,6 +773,27 @@ class BedResidenceTimeConfig(StrictModel):
                     "都必須列於 supported_backtrack_modes"
                 )
         return self
+
+    @property
+    def effective_sampling_seed(self) -> int:
+        """回傳這次執行「實際用來抽 50 個沉底年齡」的種子（WP-26 新增）。
+
+        省略 ``age_sampling_seed``（預設 ``None``）時原樣回傳 ``sampling_seed``——
+        與新增這個屬性前，所有呼叫端直接讀取 ``sampling_seed`` 的行為逐位元相同。
+        只有明示 ``age_sampling_seed`` 時才回傳覆寫值；所有「實際抽樣或驗證抽樣
+        結果」的呼叫端（``input_derivation.py``、``manifests.py``、``cli.py``、
+        ``runtime.py``）都必須改讀這個屬性而不是直接讀 ``sampling_seed`` 欄位，
+        否則覆寫只會影響一部分呼叫端，造成 arrival metadata 與重算結果不一致而
+        fail-closed。這個屬性本身不寫入任何 manifest 或 provenance 欄位——寫入的
+        永遠是「實際傳入抽樣函式的那個整數」，讓稽核者不需要知道這個屬性存在，
+        也能單純比對數字。
+        """
+
+        return (
+            self.sampling_seed
+            if self.age_sampling_seed is None
+            else self.age_sampling_seed
+        )
 
 
 class ArrivalTimeSelectionConfig(StrictModel):
@@ -1682,6 +1731,16 @@ class ProjectConfig(StrictModel):
                 and "formal_release_backtrack_modes" not in bed_model.model_fields_set
             ):
                 del bed_payload["formal_release_backtrack_modes"]
+            # WP-26：age_sampling_seed 是新增的 optional 覆寫欄位（預設 None，
+            # effective_sampling_seed 退回既有 sampling_seed）。舊 YAML 沒有它時，
+            # Pydantic 的 None default 不可改變既有 config hash；只有來源 YAML
+            # 明示此欄位（包括明示 null）才進 canonical payload。
+            if (
+                bed_model is not None
+                and "age_sampling_seed" in bed_payload
+                and "age_sampling_seed" not in bed_model.model_fields_set
+            ):
+                del bed_payload["age_sampling_seed"]
         if isinstance(scenarios_payload, dict) and self.design_version != CURRENT_DESIGN_VERSION:
             # random receptor policy 是本期 current formal 的新契約；舊 v2／v3 設定即使
             # 由新版範例複製後殘留這些 extra key，也不能讓歷史 config hash 改變，或讓

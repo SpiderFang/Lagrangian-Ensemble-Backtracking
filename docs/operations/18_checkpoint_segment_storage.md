@@ -58,9 +58,9 @@ compact、RNG、identity、binding、history payload checksum 與遷移來源都
 
 `compact_state.json.gz` 每代只保存目前的粒子狀態與恢復控制資料。每個 particle record
 包含 RunUnit identity、`ParticleState`、步數、最小步長夾制次數、下一個輸出 age cursor、
-observation／event cursor、PCG64DXSM RNG state、triangle hint 與最後一筆尚可能被 engine
-更新 context 的 pending observation。最後一筆觀測暫放 compact，是因為同一時間／位置的
-engine context 可能在下一次取樣前被替換；跨代判定沿用 engine 的同點契約：particle 與
+observation／event cursor、PCG64DXSM RNG state、triangle hint 與最後一筆 engine context
+尚未終局的 pending observation。最後一筆觀測暫放 compact，是因為同一時間／位置的
+engine context 在下一次取樣前不保證維持不變；跨代判定沿用 engine 的同點契約：particle 與
 UTC time 必須相同，age 允許 `np.isclose(rtol=0, atol=1e-12)` 的浮點容差；它不代表目前
 state 必定與觀測落在同一時間。
 若某粒子的 `ParticleState.status` 已不是 `ACTIVE`，後續 generation 必須逐欄保留該粒子的
@@ -97,10 +97,10 @@ controller 的 generation scan 仍會讀取並 JSON parse 每代 compact／histo
 驗證 gzip 壓縮檔 `st_size`／SHA-256，再解壓核對 raw 大小與 JSON 欄位拓撲、cursor、row count，
 但只在最高代完整 restore 時建立全部
 `Observation`／`BoundaryEvent` 物件。若保留很多代，冷快取或 NFS 連線下的 scan／resume
-可能多次線性讀取整條 chain；這部分必須以 SERVER fault／resume 實測評估，不能用本機 page
+會多次線性讀取整條 chain；這部分必須以 SERVER fault／resume 實測評估，不能用本機 page
 cache 命中推論 NFS 實際讀取量或完成時間。現行 loader 會先保留完整 chain 的 JSON dict，
-再建立還原物件，因此 resume 的記憶體峰值約為 `Θ(GP + H)` 的 JSON／history 內容，可能
-是檔案長度的數倍；本輪不以 streaming loader 取代既有契約，需先以 SERVER fault／resume
+再建立還原物件，因此 resume 的記憶體峰值約為 `Θ(GP + H)` 的 JSON／history 內容，通常
+明顯大於壓縮後的檔案長度；本輪不以 streaming loader 取代既有契約，需先以 SERVER fault／resume
 benchmark 量測 RSS 與時間後，才能評估正式部署。
 
 ## 寫入與容量語意
@@ -110,7 +110,7 @@ writer 的發布順序是：在同一父目錄建立 `.partial-*` → 以 gzip l
 manifest → `os.replace` 發布 generation。controller 隨後原子更新
 `latest.json`，最後更新 progress。partial 目錄沒有完整 manifest 時不具備可恢復資格；若
 Python 例外或 `KeyboardInterrupt` 發生在 writer 的清理範圍內，`BaseException` cleanup
-會嘗試移除該 partial；NFS 權限／I/O 錯誤仍可能讓暫存目錄殘留。這不涵蓋 `SIGKILL`、主機掉電或
+會嘗試移除該 partial；NFS 權限／I/O 錯誤發生時，暫存目錄不保證被清除。這不涵蓋 `SIGKILL`、主機掉電或
 NFS client crash，因為這些情況沒有機會執行清理。scanner 對殘留 partial／未知項目會 fail-closed；遇到這類現場應先停止 worker、
 保存程序與檔案系統證據，再依 SERVER runbook 由人工處理，不能把 partial 改名或當成成功
 generation。若 generation 已發布而 latest／progress 更新失敗，controller 會以完整 loader
@@ -151,7 +151,7 @@ worker 在 NFS 上因鎖等待成為瓶頸，必須另行調整 checkpoint inter
 progress 發布策略，不能把 schema 3 的線性 history 寫入誤稱為鎖競爭已解決。
 
 `ProductionBatch.advance` 必須先正常回傳完整 sweep 的結果，controller 才會發布下一代
-checkpoint。若 Ctrl-C／例外發生在 advance 內，當前 execution 可能只完成部分粒子，
+checkpoint。若 Ctrl-C／例外發生在 advance 內，當前 execution 只會完成部分粒子，
 controller 會保留上一個已發布 generation 與原有 `RUNNING` progress；下一次 `--resume`
 會由該代重新執行整個 interval。這個安全邊界避免使用舊 sweep counter 為半個 sweep 建立
 看似可恢復的檔案，也避免在沒有 phase cursor 時重複或遺失粒子步進。

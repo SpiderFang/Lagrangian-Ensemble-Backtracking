@@ -118,7 +118,7 @@ boundaries:
 
 母體驗證後，`release-config-create --max-backtrack-days` 可分別產生 7 日、30 日設定，直接綁定同一批不可覆寫的輸入。兩者保留相同 `design_version`、到達／受體／初始條件／情境 ID 及輸入雜湊；回溯長度不同則執行設定雜湊不同，各自使用 run、checkpoint、輸出目錄與 runtime preflight inventory。原始建置設定雜湊仍作為來源證據，不改寫成後製執行設定的雜湊。
 
-若日後要跑 60 日，原 30 日母體不足，需以參數另建 60 日輸入版本；程式不需改碼。新母體可能因缺時排除更多日期。若要嚴格比較 7／30／60 日，應重新從共同通過 60 日檢查的母體建立三份執行設定，不能把兩批不同日期當成只有回溯長度不同的比較。
+若日後要跑 60 日，原 30 日母體不足，需以參數另建 60 日輸入版本；程式不需改碼。新母體是否排除更多日期，視實際缺時分布而定。若要嚴格比較 7／30／60 日，應重新從共同通過 60 日檢查的母體建立三份執行設定，不能把兩批不同日期當成只有回溯長度不同的比較。
 
 #### 3.1.1 隨機沉底的 selection/runtime 支援與 `horizon-suite`
 
@@ -167,7 +167,7 @@ build／validator 仍必須拒絕；新版 gap-censored suite 會保留相同缺
 `supported_backtrack_modes` 登錄兩個 `backtrack_mode`，release 時只切換該欄位：
 
 - `fixed_calendar_window`：固定日曆終點往前回溯 H 日，實際漂流期間為 `H - age`；若沉底早於該研究窗，保留 `pre_window_deposition` outcome，不建立 forcing 運算。
-- `full_horizon_from_deposition`：從隨機 deposition UTC 再向前完整回溯 H 日；實際 H 仍可能因物理邊界、資料或數值失敗提前終止。
+- `full_horizon_from_deposition`：從隨機 deposition UTC 再向前完整回溯 H 日；遇到物理邊界、資料或數值失敗時，實際 H 會提前終止。
 
 **WP-18（依 PI 原話變更）**：正式（formal）release 的預設模式改為
 `full_horizon_from_deposition`——即「從沉底當下回溯到完整地平線」，而不是固定日曆窗。

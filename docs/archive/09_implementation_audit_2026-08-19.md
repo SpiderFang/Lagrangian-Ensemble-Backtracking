@@ -68,7 +68,7 @@ multiprocessing，也未放寬 backward round-trip 成功判定。`ptrack4a` 僅
 | CLI／runtime | `config-check`、`preflight`、`behavior-manifest`、`synthetic-smoke`、`validate-shard`、`run-create`、`run-shard`、`run-reconcile` | pilot／formal workspace 建立、shard、checkpoint／resume 與 reconcile 已由本機測試驗證；正式 release artifacts 與 SERVER 科學批次尚未完成 |
 
 實作過程另修正四個若只做理想常流測試容易遺漏的問題：polygon exit 原先未區分海岸與
-開放水域；RK stage 可能先落到無效 native mesh 而漏記已發生的 coast/outer crossing；
+開放水域；RK stage 會先落到無效 native mesh 而漏記已發生的 coast/outer crossing；
 fraction=0 終止會產生同時刻重複 observation；foreign-local 的步末／下一步步首同一交點
 會產生假 exit。四者均已有針對性回歸測試。
 

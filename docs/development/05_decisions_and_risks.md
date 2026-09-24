@@ -24,7 +24,7 @@
 | D003 | decided | G1 | 採 `nww3_dp_wnd_two_typhoon_adopted_v1`：由山陀兒與康芮兩個獨立事件判定 `DP` 為自正北順時針 wave-from、`+180°` 轉 propagation-to，`.wnd` planes 1/2 為東／北向風分量；後續產品做 cardinal/vector QC | 只有新實證直接反駁時才建立新版契約並重跑；供應者不可考不是未決項 | 研究團隊／海洋數值審查 |
 | D004 | decided | 情境基線 | `10×20×50=10,000` 套用於貢寮、龜山島、新竹、南灣、連江每一獨立站點；A 區 20,000、全案 50,000，1,000 為誤植。`M` 由 member convergence 衍生 | 不得把任一站 baseline 縮為 1,000、把 A 區兩站合併或把全案縮為 10,000 | 研究團隊／數值／系統 |
 | D005 | decided | G0/G3 | 每站 5 個 seeded random persistent-wet 水平 face × 每面 4 個 seeded random `(0,1)` normalized vertical draws，共 20；全案 100。實際座標與每個 arrival 的 z 由 accepted OCM mesh／zcor 生成，random rank 不代表物理層位 | manifest 未通過前可用合成 receptor 測試；current formal 必須保存 seed、draw order、fraction 與 bracket evidence | geometry／受體 selector／數值審查 |
-| D006 | decided | G0/G3 | 依研究主持人 2026-08-27 指示（經使用者轉述：不含上升、須對應不同材質與形狀之海廢），取消中性與所有上浮情境；計畫書未提供速度數值、現地團隊亦無實測資料，故由分析端依文獻量級與材質排序暫定十個速度為 `-0.0001,-0.0002,-0.0005,-0.001,-0.002,-0.005,-0.010,-0.020,-0.050,-0.100 m/s`，一對一連結 iOcean 十類及代表材質／形狀條件 | 所有速度必須嚴格小於 0；iOcean 只供分類名稱，數值仍是 `provisional_proxy`，不得宣稱為官方量測或類別平均 | 研究主持人（方向）／分析端（數值）／研究方法基線 |
+| D006 | decided（2026-09-23 由 D021 補充措辭與呈現規則，數值與配對不變） | G0/G3 | 依研究主持人 2026-08-27 指示（經使用者轉述：不含上升、須對應不同材質與形狀之海廢），取消中性與所有上浮情境；計畫書未提供速度數值、現地團隊亦無實測資料，十個速度由分析端依文獻量級與材質排序設定為 `-0.0001,-0.0002,-0.0005,-0.001,-0.002,-0.005,-0.010,-0.020,-0.050,-0.100 m/s`，一對一連結 iOcean 十類及代表材質／形狀條件 | 所有速度必須嚴格小於 0；iOcean 只供分類名稱，數值為未校準的敏感度格點，不得宣稱為官方量測或類別平均；材質名稱不得作為成果主詞，正確主詞是速度數值或 D021 分群，見文件 03 第 11.1 節 | 研究主持人（方向）／分析端（數值）／研究方法基線 |
 | D007 | derived_pending | G0/G3 | 每站 50 個 arrival times 採 48 個年份×季節×大／小潮×三潮位相位 proxy，加局地高波與強流各 1；確切 UTC 由 observed/reconstructed forcing selector 產生，重建未過門檻時限於 gap-safe windows | 不得刪除 strata；若較長 horizon 無法支撐全部 strata，採最短已收斂且可完整覆蓋者並揭露限制 | deterministic selector／統計審查 |
 | D008 | derived_pending | G2/G4 | local first exit 記錄後續跑、flow-domain exit/coast/deposition 停止；sinking 代理因擴散越過海面時反射並記錄；`max_backtrack_days` 比較 7/14/30/60 日取最小穩定值 | horizon 未收斂前只可跑 pilot；正式設定若含零速或正值須在情境建表前拒絕 | 數值 pilot／方法審查 |
 | D009 | derived_pending | G2 | 常數 Kh/Kz 作 reference，實際值由 Brownian/well-mixed 與 pilot 決定；Smagorinsky + gradient drift 通過 PDE/well-mixed 測試後才可升為基準 | 未通過時不得把空變 K 當正式基準 | 數值驗證／統計 |
@@ -39,6 +39,7 @@
 | D018 | decided（定性優先項） | G5 | 依合作團隊一頁簡報與主管口頭意見，將 `oca_fishinggear_open_mesh_bundle` 列為正文主要分析材質；current formal 垂向結果依 `random_vertical_draw_0..3` identity 分層，不把 random rank 命名為 `near_bed` | 不得由「最大宗」或「特別關注」推導件數／重量先驗、沉降速度或因果來源；十類、速度、情境 ID 與 10×20×50 不變 | 研究團隊／報告統計 |
 | D019 | decided（2026-09-09；空間支援條款由 D020 更新） | G0/G1/G4 | 本期 A 區不南擴，沿用 `northeast_taiwan_common_cache_v3` bbox `[121.306315,122.793685,24.600844,25.499156]`；以 `formal_domain_policy=v3_local20km_20260909_v1` 建立貢寮／龜山島各自 12.5 km receptor core 與 20 km local domain，共用原 A 區 outer boundary。`design_baseline_v3_non_rising_a_v3_local20_20260909` 形成新的 geometry／design identity；原 35 km sensitivity 移出本期，不自行加入 15 km 或 23 km。舊 `formal_domain_policy=expanded_domain_v1` 只保留 legacy configuration 相容身分；B-D 原有 `expanded_domain` 敏感度不因本決定刪除 | A 區範圍、半徑、outer stop 與不擴張決策維持不變；原列的共同兩格 margin 前置條件由 D020 的逐 RK4 階段封閉失敗契約取代 | 研究團隊／geometry／forcing preflight |
 | D020 | decided（2026-09-15） | G0/G1/G4 | A 區正式空間支援沿用 24 小時工程 DEMO 的核心機制，但不沿用 DEMO 母體或成果：`runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`、`formal_release_domain_status=no_expansion_runtime_stage_fail_closed`。OCM surface 在 input build 支援完整 arrival 母體；OCM native／NWW analysis 於每個實際 RK4 階段依位置、深度、UTC、有限值與 mask 嚴格取樣，任一必要 forcing 無支援立即停止並保存 `data_gap`／對應品質狀態 | 不建立 A v4、不南擴、不新增半徑；禁止零值、最近值、未登錄跨月／域外外插及 current-only 降級。站點欄位 `minimum_flow_domain_margin_local_grid_scales=2` 只作受體候選的局部幾何安全篩選，不得再稱為三產品共同 margin。既有 1 天、20 情境只是 `engineering_only` DEMO；30 天 formal 必須重建並驗證四區五站、100 receptors、250 arrivals、5,000 pairs 與 50,000 基礎 scenarios | 使用者／研究團隊／runtime／forcing preflight |
+| D021 | decided（2026-09-23，WP-24） | G5 | 依 run01（H30、M=1、五站 50,000 顆）真實成果診斷（`claude/diagnosis-20260923-十檔沉降速度可區辨性與M的下限.md`），十個 `settling_velocity_mps` 一律改稱「未校準的沉降速度敏感度格點」，iOcean 材質對應降級為附註標籤；正式報告與圖表禁止以材質名稱為主詞直接連結單一來源方向（例如「寶特瓶來自 SSE」），改以「沉降速度 `-0.005 m/s` 這一檔的條件式來源足跡」表述。主要圖表以極慢／慢／中／快約 3–4 群呈現，不逐檔並列十組數字。完整依據見科學方法與驗證文件第 11.1 節與設計基線文件第 6 節 | 未來若以 `M≈7–10`（見同一診斷的雜訊估計）重跑並證實快群內部可分辨，才能改回逐檔呈現；在此之前任何逐檔材質敏感度結論均不成立 | 研究團隊／開發（WP-24） |
 
 ## 3. 決策紀錄模板
 
@@ -60,7 +61,7 @@ Supersedes:
 
 ## 4. 風險矩陣
 
-評分使用可能性 L/M/H 與影響 L/M/H。H/H 與 H/M 每週審查。
+評分使用發生機率 L/M/H 與影響 L/M/H。H/H 與 H/M 每週審查。
 
 | ID | 風險 | L/I | 預防與緩解 | 觸發與應變 |
 |---|---|---|---|---|
@@ -73,21 +74,23 @@ Supersedes:
 | R007 | backward diffusion 被誤當真實歷史或機率 | H/H | conditional-footprint 命名、正向-逆向 synthetic、分母與 prior 欄位、措辭審查 | 未通過合成驗證禁止 probability／source attribution 字樣 |
 | R008 | 空變 K 缺 gradient drift，造成人工聚集或穿障壁 | H/H | 常數 K reference、PDE/well-mixed/障壁測試、Milstein sensitivity | 測試失敗：Smagorinsky 不進 baseline，只保留工程診斷 |
 | R009 | bulk Stokes 在近岸、淺水或混合風浪下偏差大 | H/H | finite/deep/no-Stokes、kh/steepness QC、方向與 mean wavelength 對照 | ranking 對 formulation 高敏感：列主要不確定性，不給單一結論 |
-| R010 | OCM 已含波流耦合效應，額外 Stokes 可能重複 | M/H | 查 OCM 產品說明與模式設定；將 no-Stokes 設為核心對照 | 無法確認：報告明載可能 double counting，不作精確量值歸因 |
+| R010 | OCM 若已含波流耦合效應，額外 Stokes 項即為重複計算 | M/H | 查 OCM 產品說明與模式設定；將 no-Stokes 設為核心對照 | 尚未查證 OCM 是否已含波流耦合效應前，報告明載存在 double counting 風險，不作精確量值歸因 |
 | R011 | local/flow domain 太小，人工邊界主導 entry/exit KDE | M/H | 本期 A 採 v3 原 bbox、12.5 km receptor core 與 20 km local domain；兩站共用 outer stop，local domains 可重疊。逐 RK4 階段嚴格驗證 OCM native／NWW analysis 空間支援，並把合法 outer exit、`data_gap` 與 numerical failure 分開統計；舊 v4 南擴與 35 km sensitivity 僅作歷史背景 | 若短時同邊退出或空間無支援高度集中、主要指標不穩定，正式結果降級或阻擋科學發布；不得用補值、current-only 或擴域偷偷改變已核定範圍 |
 | R012 | domain 擴大或 `50,000×M×experiment cases` 導致計算／儲存爆量 | H/H | particle-step benchmark、最小收斂 M、向量化/Numba、shard/checkpoint、流式聚合與容量緩衝 | 超出資源時先增加合理並行、降低已驗證的儲存頻率並延後非核心案例；不得把任一站 baseline 靜默縮為 1,000 |
 | R013 | 每站 20／全案 100 receptors 或每站 50 times 的衍生 manifest 尚未產出，trial 資料被誤當正式成果 | H/H | schema 與 synthetic test 可先行；正式 config 驗證 derived gate 與 `status=approved` | 未通過不得啟動 G4，輸出必須標 TRIAL |
 | R014 | 粒子停留不出界，模擬無限延長 | M/H | forcing start、max age、step limit與 manifest 外 data gap 停止；各原因分開統計 | max-age 比例過高：調整研究問題/domain/horizon，不把它當 exit；不得依賴已知缺口代替科學停止條件 |
 | R015 | dt 過大漏掉窄通道、海岸或 crossing | M/H | advective/vertical/diffusive CFL、step-interpolated crossing、dt halving | ranking/HDR 未收斂：縮 dt 並重跑受影響 cases |
-| R016 | checkpoint、worker 或 shard 改變 seed | M/H | hash-derived seed、seed table、restart/merge 等價測試 | checksum/ID 不一致為 G3 blocker，禁止只重跑「看起來失敗」的 member |
+| R016 | checkpoint、worker 或 shard 改變 seed | M/H | hash-derived seed、seed table、restart/merge 等價測試 | checksum/ID 不一致為 G3 blocker，禁止只重跑「表面上失敗」的 member |
 | R017 | KDE bandwidth 與分母選擇主導結論 | H/M | raw exits、1D boundary + 2D map、三 bandwidth、HDR、bootstrap、分母 sidecar | ranking 翻轉：不得給單一來源排序，改報範圍與不穩定性 |
 | R018 | observed/reconstructed/unsupported 區被混合，低 coverage 誤讀為低來源或低路徑密度 | M/H | origin mask、每軌跡 reconstructed exposure、failure density、有效分母、forcing coverage 與成功率地圖；並列 observed-only/gap-safe、reconstructed 與 forcing-member sensitivity | reconstruction exposure 主導或空間失敗集中時降級結論、改採 gap-safe baseline 或改善模型；不發布未校正密度 |
 | R019 | 大型資料或私密 SERVER path 誤提交 Git | L/H | `.gitignore`、root token、secret/path scan、只提交 schema 與小 fixture | 發現即停止發布，移除敏感歷史並重建乾淨 release |
 | R020 | 中文註解、README、schema 與程式行為不同步 | M/M | PR checklist、docstring/README/tests 同任務更新、每週文件檢查 | 行為已變但文件未更新：不得合併或通過 gate |
 | R021 | local domains 重疊造成 site 歸屬、事件或分母混用 | M/H | own-local first-exit 與 foreign-local diagnostic 使用不同 event types；`study_site_id` immutable；跨站比例按原站有效 members 正規化 | foreign crossing 改變 scenario/site/seed/停止狀態或進入主要入口分母時，視為 G2/G5 blocker |
 | R022 | 含 Stokes 軌跡超出 NWW analysis 或 OCM native 的實際支撐 | M/H | A 本期由 OCM surface 驗證完整 arrival 母體；runtime 再於每個 RK4 階段分別驗證 OCM native、NWW analysis、UTC、有限值與逐時 mask，並保存失敗位置及狀態。B-D 保留原 `expanded_domain` 敏感度，仍依各自支援契約驗證 | 任一必要 forcing 在實際 stage 無效即停止該粒子並列入 `data_gap`／對應品質分母；不以 current-only、最近值或零值結果冒充 baseline |
-| R023 | iOcean 清除分類或文獻量級被誤讀為單體沉降校準 | H/H | manifest 分開保存 `classification_source`、`velocity_source`、代表形狀、適用條件、`calibration_status` 與證據等級；YAML 與程式測試拒絕零速、正值及缺欄位 | 未取得樣本密度、尺寸、含氣／附著狀態與終端速度前，只能報告代理敏感度；不得以清除重量作來源先驗或把暫定值稱為實測 |
+| R023 | iOcean 清除分類或文獻量級被誤讀為單體沉降校準 | H/H | manifest 分開保存 `classification_source`、`velocity_source`、代表形狀、適用條件、`calibration_status` 與證據等級；YAML 與程式測試拒絕零速、正值及缺欄位 | 未取得樣本密度、尺寸、含氣／附著狀態與終端速度前，只能報告代理敏感度；不得以清除重量作來源先驗或把未校準值稱為實測。2026-09-23 診斷進一步證實 M=1 下最快四檔材質在統計上不可分辨（見 D021），report 撰寫者不得逐檔宣稱材質差異 |
 | R024 | 主管關注沉底漁具被誤讀成統計權重，或 repeated contact 被當成基線必要資料 | M/H | 報告層固定以 `study_site_id × material_id` member 分母計算；首次接觸／沉積各自保存 raw count 與比例，`BED_CONTACT` member-level 去重 | 只有正式樣本或再懸浮敏感度才能加入覆網掛附、拖曳、再移動與 repeated-contact 動力；目前不調整基線速度與情境矩陣 |
+| R025 | `deposit_on_first_contact_and_stop` 沒有再懸浮／底流搬運參數，被誤讀為完整沉積歷史 | H/M | 報告固定揭露此假設；措辭限定「首次接觸海床即視為沉積」，不得稱為「實際沉積廢棄物的完整歷史來源」；完整說明見科學方法與驗證文件第 11.2 節 | 假設使逆向足跡系統性偏向較近來源，方向性偏誤目前未量化；只有另行登錄 `bed_reflect`／再懸浮敏感度才能量化此偏誤，目前不列入核心結果 |
+| R026 | 沉底年齡 `per_observation`（全案僅 50 種年齡、年齡與到達時刻一對一綁定）被誤讀為逐成員獨立隨機變數 | M/M | 報告固定揭露「年齡與到達時刻綁定，分不開『躺多久』與『何時被發現』」；`per_member` 已登錄契約與抽樣原語但下游未接線，見 `reports/WP-27.md` | 完整說明見科學方法與驗證文件第 11.3 節與輸入衍生契約第 3.1.1 節；`per_member` 接線前不得宣稱年齡已是逐成員隨機變數 |
 
 ## 5. 資源不足時的裁決順序
 

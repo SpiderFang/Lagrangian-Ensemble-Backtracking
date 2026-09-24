@@ -208,7 +208,7 @@ uv run lbt horizon-suite-validate \
 `.partial-*` 現場供人工稽核，不自動遞迴刪除。共享同帳號 SERVER 上，操作員清理前必須先
 確認 process、partial 的目錄擁有者、inode 與 final 狀態，不可採用先 `stat` 再 `unlink` 的
 競態方式；`.partial-*` 不能當作成功。即使六份 config 與 manifest 均有效，也只保證共同設計
-母體與執行設定可比較，不保證每粒子走滿指定 H；粒子仍可能因海岸、域外、資料缺口或數值
+母體與執行設定可比較，不保證每粒子走滿指定 H；粒子仍會因海岸、域外、資料缺口或數值
 狀態停止。正式輸入限 OCM schema 3 `ocm_native`、OCM schema 3 `ocm_surface` 與 NWW3 schema
 1 `nww3_analysis`，禁止 raw NetCDF、transfer archive、零值與最近值補齊。
 
@@ -302,7 +302,7 @@ uv run lbt release-config-create \
 `--max-backtrack-days` 只改新輸出 YAML 的 `boundaries.max_backtrack_days`，
 `--maximum-step-count` 只改新輸出的步數預算；省略時沿用模板。指定較長回溯時不會
 自動放大步長、降低成員數或改動母體檔案。已指定的步數至少須達
-`ceil(回溯日數 × 86400 / dt_max_seconds)`；自適應縮短步長可能需要更多步，
+`ceil(回溯日數 × 86400 / dt_max_seconds)`；自適應縮短步長時需要更多步，
 此式只是必要下限，不能當成足夠的執行預算。缺少正式數值設定仍會留下發布阻擋。
 
 日數不是固定選單，新的正整日支援上限可任意設定，但執行長度不得超出母體。
@@ -509,7 +509,7 @@ worker 的總計時包含本次 handler 的前置驗證與連續分片執行，�
 `run-formal-parallel` 僅接受 `run_kind=formal`，預設依 run plan 的全部 shard ID 建立一次
 dynamic parent queue 與 assignment。scenario index 範圍維持連續，並以 plan 已有的分析區域／UTC
 月份和 scenario table 已存在的站點／flow-domain 欄位產生 locality 摘要；缺少表格欄位時會在
-assignment JSON 明示 `plan_order_only`，不從 config、路徑或名稱推測 flow domain。每個 persistent
+assignment JSON 明示 `plan_order_only`，不從 config、路徑或名稱臆測 flow domain。每個 persistent
 worker child 只啟動一次 Python，內部以同一個既有 `run-worker` controller 從中央 queue 連續處理
 多個 shard，因而重用 forcing manager 與 JIT import；worker 完成一片後不退出。assignment 綁定
 run ID 和 run-plan SHA-256，不寫回 run plan，也不因 worker 完成順序改變 run identity。

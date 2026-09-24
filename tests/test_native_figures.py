@@ -774,3 +774,173 @@ def test_all_eight_figures_still_produced_with_mixed_local_equals_flow_sites(
             png_path = output_dir / site_id / f"{stem}.png"
             assert png_path.is_file()
             assert png_path.stat().st_size > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WP-24b：圖面不畫警語、圖說另存為 captions.md、--figure-text {full,none} 開關
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_module_no_longer_defines_any_disclaimer_helper() -> None:
+    """WP-24b：底部紅字警語整段移除，不是縮短或改寫——這裡直接鎖定舊版繪製警語
+    用的兩個私有函式已經從模組消失，防止之後又悄悄加回某種形式的警語文字。"""
+
+    assert not hasattr(native_figures, "_disclaimer_text")
+    assert not hasattr(native_figures, "_add_disclaimer")
+
+    # 模組 docstring 仍可能提到「警語」二字來說明這項裁決本身（見 WP-24b 一節），
+    # 但舊版真正畫在圖上的那句固定警語全文不應該再出現在任何地方。
+    source_text = Path(native_figures.__file__).read_text(encoding="utf-8")
+    assert "不得解讀為絕對來源機率或因果歸因" not in source_text
+    assert "尚未提升為核准發布幾何" not in source_text
+
+
+def test_full_mode_figures_carry_no_disclaimer_text_object(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """即使在 ``figure_text="full"``（畫標題／副標）模式下，也不應該有任何一個
+    ``fig.text`` 物件是舊版警語（紅字、``color="#b3261e"``）。攔截
+    ``_save_exclusive`` 在關閉圖面前檢查每個 ``Figure`` 物件的全部文字元素。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-full-no-disclaimer"
+
+    checked_figures = 0
+
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        nonlocal checked_figures
+        checked_figures += 1
+        for text_obj in fig.texts:
+            assert text_obj.get_color() != "#b3261e", f"{path.name} 仍有紅字警語顏色的文字物件"
+            assert "警語" not in text_obj.get_text()
+            assert "不得解讀為" not in text_obj.get_text()
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    assert checked_figures == 2 * len(native_figures.FIGURE_STEMS)
+
+
+def test_captions_markdown_has_one_section_per_figure_and_matches_manifest(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """``captions.md`` 必須每張圖都有對應段落，且與 manifest 記錄的 ``caption``
+    欄位逐字相同（同一份文字，不是兩處各自維護）。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-captions"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    captions_path = output_dir / "captions.md"
+    assert captions_path.is_file()
+    captions_text = captions_path.read_text(encoding="utf-8")
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    png_records = manifest["output_png_sha256"]
+
+    for site_id in ("site_a", "site_b"):
+        for stem in native_figures.FIGURE_STEMS:
+            key = f"{site_id}/{stem}.png"
+            assert key in png_records
+            caption = png_records[key]["caption"]
+            assert isinstance(caption, str) and caption.strip()
+            # captions.md 用 `### `stem.png`` 小節標題，內文緊接著同一段 manifest 文字。
+            assert f"`{stem}.png`" in captions_text
+            assert caption in captions_text
+            # 圖說內容須交代關鍵設定：站點、粒子數、M、終止邊界定義。
+            assert "M=1" in caption
+            assert "flow domain 開放邊界" in caption
+            assert "顆粒子" in caption
+
+    # sha256 與圖說綁在同一筆 record，供事後核對「這段文字對應的就是這個版本的圖」。
+    for record in png_records.values():
+        assert set(record) == {"sha256", "size_bytes", "caption"}
+
+
+def test_figure_text_none_mode_omits_titles_and_subtitles(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--figure-text none`` 只留座標軸與圖例：攔截 ``_save_exclusive``，在每張
+    圖存檔前確認沒有 ``suptitle``、也沒有任何 ``fig.text`` 加上去的副標／說明文字
+    （圖例用 ``fig.legend``，不算在 ``fig.texts`` 內，因此圖例存在不受影響）。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-none"
+
+    checked_figures = 0
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        nonlocal checked_figures
+        checked_figures += 1
+        assert fig._suptitle is None, f"{path.name} 在 figure_text=none 模式下不應有標題"
+        assert fig.texts == [], f"{path.name} 在 figure_text=none 模式下不應有額外文字物件"
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+        figure_text="none",
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test --figure-text none")
+
+    assert checked_figures == 2 * len(native_figures.FIGURE_STEMS)
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["config"]["figure_text"] == "none"
+    assert (output_dir / "captions.md").is_file()
+
+    for site_id in ("site_a", "site_b"):
+        for stem in native_figures.FIGURE_STEMS:
+            png_path = output_dir / site_id / f"{stem}.png"
+            assert png_path.is_file()
+            assert png_path.stat().st_size > 0
+
+
+def test_figure_text_full_mode_draws_a_title_for_at_least_one_figure(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """反向對照 :func:`test_figure_text_none_mode_omits_titles_and_subtitles`：
+    確認預設 ``full`` 模式底下標題機制本身仍然有畫，不是兩種模式都畫不出來而讓
+    上一個測試變得沒有意義。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-full-title"
+
+    saw_suptitle = False
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        nonlocal saw_suptitle
+        if fig._suptitle is not None:
+            saw_suptitle = True
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    assert saw_suptitle, "full 模式下應該至少有一張圖畫出標題"
+
+
+def test_figure_text_rejects_unknown_value(tmp_path: Path, synthetic_inputs: tuple[Path, Path]) -> None:
+    postprocess_dir, coastline_path = synthetic_inputs
+    with pytest.raises(native_figures.FiguresError, match="figure_text"):
+        native_figures.NativeFiguresConfig(
+            postprocess_dir=postprocess_dir, coastline_path=coastline_path,
+            output_dir=tmp_path / "figures-out-bad-mode", figure_text="partial",
+        )

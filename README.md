@@ -186,7 +186,7 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 1. 本專案沿用 BayTrace 可對應的工程思路：CPU SoA／batch／chunk、每粒子可重現亂數、triangle hint、可暫停 engine 與可驗證 I/O；不承諾整包 tracker output 的格式或物理範圍，也不把 BayTrace 的工程參照當成本案科學驗證。
 2. 在沒有先驗、似然、調查努力量與獨立觀測前，任何逆向結果都不可稱為絕對來源機率、法律責任或因果歸因；報告必須保留原始分子／分母、有效分母、低樣本、零分母、`DATA_GAP` 與 `NUMERICAL_FAILURE`，不得將不可用狀態改成 0。
-3. 確定性海流、Stokes 與沉降沿正向物理速度積分，時間方向由 signed-time step 表示；隨機擴散獨立於 RK4，不能插入 RK4 階段。材質名稱與沉降格點是條件式敏感度代理，不是來源先驗；缺少密度、阻力與再懸浮參數時，不宣稱完整沉積—再懸浮動力。方法理由與待驗證項目見[科學方法與驗證](docs/foundation/03_scientific_method_and_validation.md)。
+3. 確定性海流、Stokes 與沉降沿正向物理速度積分，時間方向由 signed-time step 表示；隨機擴散獨立於 RK4，不能插入 RK4 階段。十個沉降速度是「未校準的沉降速度敏感度格點」，iOcean 材質名稱只是附註，不是來源先驗；正式成果須以速度數值或極慢／慢／中／快分群為主詞，不得以材質名稱直接對應單一來源方向（例如不得寫「寶特瓶來自 SSE」）；`deposit_on_first_contact_and_stop` 沒有再懸浮或底流搬運參數，會使足跡系統性偏向較近來源。完整限制、依據數據與 `M` 下限估計見[科學方法與驗證第 11 節](docs/foundation/03_scientific_method_and_validation.md)。
 
 ## 9. B 區海岸預覽（既有示範）
 

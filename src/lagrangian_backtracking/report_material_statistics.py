@@ -13,11 +13,17 @@ iOcean 清除統計或主管的定性關注轉成速度、數量權重或來源�
 有多個接觸事件仍只計一次；基線 ``deposit_on_first_contact_and_stop`` 不需要提供
 repeated-contact 欄位，也不把 repeated contact 當成核心分母或分子。沉積統計以
 ``ParticleStatus.DEPOSITED`` 或 ``DEPOSITED`` event 證明，並同樣按 member 去重。
+**已知限制（見** ``docs/foundation/03_scientific_method_and_validation.md`` **第 11.2
+節）**：``deposit_on_first_contact_and_stop`` 沒有再懸浮或底流搬運參數，本統計的
+沉積結果會使逆向足跡系統性偏向較近的來源，不代表完整的沉積—再懸浮歷史。
 
 輸出是 frozen dataclass 加上唯讀 mapping；比例在有效分母為零時使用 ``None``，而非
 零值。這些數值只能解讀為指定情境下的條件式來源足跡／相對來源權重，不能解讀為絕對
 來源機率或因果歸因。所有位置單位、公尺垂向方向與 Observation 環境脈絡沿用既有
-``engine.py`` 資料契約；本最小產品目前不另行重算 depth-age histogram。
+``engine.py`` 資料契約；本最小產品目前不另行重算 depth-age histogram。呼叫端依
+``material_id`` 呈現統計時，須以 ``settling_velocity_mps`` 或極慢／慢／中／快分群
+（見文件 03 第 11.1 節）為主詞，``material_id``／``oca_category_zh`` 只能作附註，
+理由是 M=1 下最快四檔材質在統計上不可分辨。
 """
 
 from __future__ import annotations

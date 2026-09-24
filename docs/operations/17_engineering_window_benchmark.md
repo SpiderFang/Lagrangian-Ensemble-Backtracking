@@ -16,7 +16,7 @@ I/O 與可恢復性的證據，供五站正式工期估算使用。這個樣本�
 |---|---|---|
 | 站點 | `guishan`（A 區） | 保留 A 區 v3、局部 20 km、受體核心 12.5 km；不包含 35 km 或南擴 |
 | 到達時刻 | `2024-08-02T00:00:00Z` | 往前至 `2024-07-03T00:00:00Z`，inclusive 721 個逐時節點；仍須由 adapter 重驗實際產品 |
-| 材質代理 | `oca_fishinggear_open_mesh_bundle` | `settling_velocity_mps=-0.002` 的既有暫定代理，不是漁具類別校準值 |
+| 材質代理 | `oca_fishinggear_open_mesh_bundle` | `settling_velocity_mps=-0.002` 的既有未校準代理，不是漁具類別校準值 |
 | 速度案例 | `finite_depth_stokes` | 沿用既有 pilot 的有限水深 Stokes 工程設定，不新增物理候選 |
 | 基礎情境 | 5 個既有 near-bed receptors × 1 arrival × 1 material | 從既有 5 水平位置 × 4 垂向層位清單取 near-bed，合計 5 個；不是新正式 20 XY 受體設計 |
 | 成員 | `M=1` | 只供工程耗時，不能解讀為 member convergence |
@@ -208,7 +208,7 @@ phase 產生一份不可部分更新的 timings JSON。它在自己的 process g
 
 - `elapsed_seconds_monotonic`、PID／PGID、exit code、budget reached 與 phase status。
 - process tree 的目前／峰值 RSS。RSS 是每次取樣時程序樹的總和再取最大值，收尾不重複
-  累加；程序在兩次取樣間退出時，峰值可能低估。
+  累加；程序在兩次取樣間退出時，峰值會低估。
 - CPU ticks／秒與 proc I/O 差值：`rchar`、`wchar`、`read_bytes`、`write_bytes` 分開
   保存。前三者不可混稱 NFS 實際 bytes；`read_bytes`／`write_bytes` 也不是 NFS
   server-side 網路 accounting。
@@ -217,7 +217,7 @@ phase 產生一份不可部分更新的 timings JSON。它在自己的 process g
 - phase 開始／結束時的其他程序數、CPU／RSS 總量與前十名摘要，作為共享 SERVER 資源
   干擾紀錄；它不提供精確的 CPU 歸因。
 
-由於 `/proc` 是定期取樣，monitor 的 CPU／I/O 累積可能漏掉尚未被觀察到就退出的子程序；
+由於 `/proc` 是定期取樣，monitor 的 CPU／I/O 累積會漏掉尚未被觀察到就退出的子程序；
 不能把它當成完整 CPU 精確總量。SERVER 同時用 `/usr/bin/time -v` 保存外部命令的
 elapsed、user／system CPU 與最大 RSS 作為核對；兩份資料的量測語意必須分開記錄，不能
 把 RSS 或平行 shard elapsed 再次相加。

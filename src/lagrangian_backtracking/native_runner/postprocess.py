@@ -38,9 +38,12 @@
   計數，但不貢獻任何來源足跡分子，語意上與「資料缺口」「數值失敗」平行、但
   成因不同（不是運算失敗，是這顆粒子的沉底時刻本身就在本次固定日曆窗之外）。
 - 本模組產出的所有空間密度、機率與高密度區（HDR）一律稱為「條件式來源足跡」
-  或「相對來源權重」，不得解讀為絕對來源機率或因果歸因（AGENTS.md、
+  或「相對來源權重」：本量的定義是「給定站點、受體、沉降速度與到達時刻等情境
+  設定後，穿越各方位扇區／各邊界弧段的相對頻率」，是描述這批 ``M=1`` 系集在
+  既定設定下分布的統計量。來源機率與因果歸因是另一層科學推論，需要另外建立
+  先驗、概似與觀測驗證，本模組不提供、也不輸出這一層推論（AGENTS.md、
   ``aggregation.binned_gaussian_kde_2d``／``conditional_kde_2d`` docstring 已有
-  相同宣告，這裡沿用同一用語，不另創新詞）。
+  相同定義，這裡沿用同一用語，不另創新詞）。
 - 所有物理量（離開位置、頻寬、格網）都以公尺制運算座標為準；經緯度欄位只在
   提供 ``lonlat_projector`` 時才會被填入，且只作為資料交換／圖面顯示用途，不
   參與任何統計或核密度計算。
@@ -85,7 +88,7 @@
 ``scipy`` 內建的資料驅動頻寬公式，優點是完全由樣本點的離散程度與樣本數自動
 決定、不需要人工試誤；代價是假設離開點分布近似橢圓對稱的單峰或平緩多峰分布，
 若真實分布是尖銳的多群聚（multi-modal、群間距遠大於群內離散度），Scott 頻寬
-可能過度平滑，掩蓋群聚間的細節。工作書要求的固定敏感度分析（多個頻寬對照）
+會過度平滑，掩蓋群聚間的細節。工作書要求的固定敏感度分析（多個頻寬對照）
 屬於報告層 ``report_kde_statistics`` 的既有契約，本模組的postprocess輸出的
 ``bandwidth_factor`` 已足以讓下游報告層另外做頻寬敏感度比較，不在 WP-6 這一層
 重複建立。
@@ -220,10 +223,10 @@ flow domain 是同一條邊界，「離開 local domain」與「離開 flow doma
 2. 邊界穿越通量統計只提供「各站」「各沉降速度」「各受體深度（以 z0_m 站內
    四分位數為代理）」「各季節」四個**各自獨立**的邊際分組，不提供四維聯合
    交叉分表；理由是 ``M=1`` 正式設計下（50,000 顆粒子）若做四維聯合交叉，
-   每格分母可能只有數十顆粒子，比例估計噪聲很大且容易誤導，一維邊際分組的
-   分母遠大於聯合分表，統計上更穩健。若下游報告確實需要聯合交叉，應該在
-   report 層另外從本模組輸出的離開紀錄表（``departures.parquet``，含全部原始
-   欄位）重新聚合，而不是由 WP-6 預先算好一份可能誤導的聯合表。
+   每格分母僅有數十顆粒子的量級，比例估計噪聲很大且容易誤導，一維邊際分組的
+   分母遠大於聯合分表，統計上更穩健。下游報告若需要聯合交叉，應在 report 層
+   另外從本模組輸出的離開紀錄表（``departures.parquet``，含全部原始欄位）重新
+   聚合，而不是由 WP-6 預先算好一份分母過小、容易誤導的聯合表。
 3. 「各受體深度」沒有獨立的垂向 receptor 分類欄位可用——``ParticleIdentityTable``
    只保留連續的初始深度 ``z0_m``（公尺，海面為零、向上為正），沒有保留
    ``receptors.RandomVerticalDraw`` 的 ``vertical_id``。本模組以「站內
@@ -423,7 +426,7 @@ DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
 ``null``。``also_local_domain_first_exit``（WP-23 新增，恆有值、不是可選欄位）
 原樣複製 ``DepartureRecord.also_local_domain_first_exit``：只有這一列同時滿足
 ``crossed_interest_region_boundary=True`` 且該站 ``local_equals_flow=True``
-（目前是新竹／南灣／連江）時才可能是 ``True``，代表這一列同時是「離開 flow
+（目前是新竹／南灣／連江）時才會是 ``True``，代表這一列同時是「離開 flow
 domain 終止」與「首次離開 local domain」兩件事，因此**不會**、也不應該在
 ``local_domain_departures.parquet`` 另外出現一列，見該表 docstring 與模組
 docstring「WP-23」一節。"""
@@ -727,7 +730,7 @@ def compute_batch_result_fingerprint(result: BackwardDriverResult) -> str:
     ——這個指紋的用途是 manifest 記錄「這次後處理實際讀到了哪些批次結果」的
     provenance（同一個 run 若重新產生批次結果，指紋應該一致），不是要取代
     ``run_backward_batch`` 自己對軌跡數值正確性的驗收（那是 WP-5 的責任，見
-    ``tests/test_native_backward_driver.py``）；把完整軌跡（可能每批次上萬個
+    ``tests/test_native_backward_driver.py``）；把完整軌跡（每批次動輒上萬個
     浮點數）也納入雜湊，只會讓每個批次的指紋計算成本大幅增加，卻不會讓
     「這批是不是同一批」這個判斷更準確（``final_*``＋``row_particle_index``
     已經足以識別批次身分與其最終結果）。

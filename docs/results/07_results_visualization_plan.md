@@ -9,7 +9,7 @@
 
 計畫書只要求辨識主要潛在來源路徑與 KDE，未完整規定圖表。本文依海洋 Lagrangian、逆向溯源、海洋廢棄物及 ensemble drift 的同儕審查研究，制定本專案的正式成果呈現方式。下列圖組是從文獻常見做法推導出的本專案規格，並非把文獻個案的物理假設直接移植至本研究。
 
-主要讀者為教授與博士級計畫主持人，因此圖表必須同時回答：模型輸入與假設為何、粒子可能從何處而來、需時多久、季節／潮況／物性如何改變結論、結果是否收斂，以及資料或數值失敗是否造成偏誤。
+主要讀者為教授與博士級計畫主持人，因此圖表必須同時回答：模型輸入與假設為何、粒子的潛在來源為何、需時多久、季節／潮況／物性如何改變結論、結果是否收斂，以及資料或數值失敗是否造成偏誤。
 
 ## 2. 文獻中的成果呈現方式
 
@@ -17,8 +17,8 @@
 |---|---|---|
 | [van Sebille et al. (2018), *Lagrangian ocean analysis: Fundamentals and practices*](https://doi.org/10.1016/j.ocemod.2017.11.008) | 以粒子位置或「每粒子每格只計一次」建立網格密度／機率圖，並以 transit-time distribution 呈現傳輸時間；文中亦特別區分停留造成的高計數與實際訪格粒子比例 | `pathway_unique_particle_fraction` 與 `residence_time` 必須分圖；旅行時間以分布而非單一平均值呈現 |
 | [Carlson et al. (2017), *Combining Litter Observations with a Regional Ocean Model...*](https://doi.org/10.3389/fmars.2017.00078) | 少量代表逆向／正向軌跡依漂移時間著色；以「觀測 transect × 海岸段」矩陣顯示到達比例；另有網格粒子數圖，以及擱淺／漂浮／開放邊界比例與 bootstrap 信賴區間表 | 代表軌跡只用於說明機制；主結論改用來源—受體矩陣、空間密度、停止結果比例與 CI |
-| [Ko et al. (2018), *Monitoring multi-year macro ocean litter dynamics and backward-tracking simulation...*](https://doi.org/10.1088/1748-9326/aaaf21) | 以南海區域路徑圖搭配月份、可能來源區與 windage／深度案例的色帶或比例，並列表比較各來源區漂移日數；同時以觀測的月／年統計驗證季節性敘事 | 台灣周邊成果應用共同底圖做季節小多圖，並同步呈現來源區比例與 travel-time 統計，不只展示單一路徑 |
-| [Rypina et al. (2014), *Drifter-based estimate of the 5 year dispersal of Fukushima-derived radionuclides*](https://doi.org/10.1002/2014JC010306) | 將「到達／訪格機率圖」與「平均首次抵達時間圖」配對，使高可能路徑與傳輸速度可同時解讀 | 每張主要 pathway footprint 應配一張 first-passage-time 圖，避免把高密度誤讀為快速到達 |
+| [Ko et al. (2018), *Monitoring multi-year macro ocean litter dynamics and backward-tracking simulation...*](https://doi.org/10.1088/1748-9326/aaaf21) | 以南海區域路徑圖搭配月份、潛在來源區與 windage／深度案例的色帶或比例，並列表比較各來源區漂移日數；同時以觀測的月／年統計驗證季節性敘事 | 台灣周邊成果應用共同底圖做季節小多圖，並同步呈現來源區比例與 travel-time 統計，不只展示單一路徑 |
+| [Rypina et al. (2014), *Drifter-based estimate of the 5 year dispersal of Fukushima-derived radionuclides*](https://doi.org/10.1002/2014JC010306) | 將「到達／訪格機率圖」與「平均首次抵達時間圖」配對，使高機率路徑與傳輸速度可同時解讀 | 每張主要 pathway footprint 應配一張 first-passage-time 圖，避免把高密度誤讀為快速到達 |
 | [Cedarholm et al. (2019), *Investigating Subsurface Pathways of Fukushima Cesium in the Northwest Pacific*](https://doi.org/10.1029/2019GL082500) | 對 subsurface backward/forward trajectories 並列每格平均到達日期與軌跡通過百分比，直接比較逆向與正向結果 | 三維成果除平面密度外，需加入深度—時間剖面；合成驗證應並列 forward/backward footprint 與時間差異 |
 | [Pierard et al. (2022), *Attribution of Plastic Sources Using Bayesian Inference...*](https://doi.org/10.3389/fmars.2022.925437) | 以多來源 likelihood／posterior 地圖、指定採樣點的來源權重—粒子年齡曲線與標準差陰影，以及沿岸來源比例堆疊圖呈現 | 若未加入來源先驗，只沿用版式而稱為「條件式足跡／相對權重」；受體可用來源權重—回溯時間曲線與不確定性帶 |
 | [Hammoud et al. (2021), *Moving source identification in an uncertain marine flow...*](https://doi.org/10.1016/j.oceaneng.2020.108435) | ensemble 流場產生 forward probability map，再由 backward inverse maps 與目標函數辨識來源位置／時間，並檢查觀測面積、觀測時間與流場變異等敏感度 | 逆向 footprint 必須伴隨來源時間與物理參數敏感度；若日後有已知候選來源，可另建 objective/ranking，而非只靠目視熱區 |
@@ -113,13 +113,29 @@
 - 每 panel 顯示來源足跡或來源段相對權重，並標示實際 arrival-time 數、members 與 forcing coverage。
 - 每站 50 個到達時間的個別結果保留在 supplement／scenario browser；正文以站點分層摘要與代表個案呈現。
 
-### F09 材質／形狀代理、沉降、停留與底部接觸
+### F09 沉降速度敏感度格點、停留與底部接觸
 
-- 10 種非上浮材質／形狀代理按沉降速度排序，以 small multiples 或「速度 × 指標」曲線呈現；圖例同時保留 iOcean 類別與代理形狀，不能只顯示匿名速度。
-- 正文主要 panel 可固定先呈現 `material_id=oca_fishinggear_open_mesh_bundle`；current formal 的垂向 panel 必須依 `random_vertical_draw_0..3` identity 與 normalized fraction 分層，不得把 random draw rank 命名為 `near_bed` 或其他物理層。其餘九類與所有 random vertical draws 仍以相同尺度完整保留於比較／補充產品。這是研究注意力排序，不是將漁具數量或任一 draw 設定為先驗權重；`near_bed` 僅可出現在歷史／legacy pilot 報告。
+> **2026-09-23 更正（WP-24）**：本節原文字要求圖例「同時保留 iOcean 類別與代理形狀，不能
+> 只顯示匿名速度」；依 run01（H30、M=1）真實成果的可區辨性診斷
+> （`claude/diagnosis-20260923-十檔沉降速度可區辨性與M的下限.md`，完整數據見
+> [科學方法與驗證文件第 11.1 節](../foundation/03_scientific_method_and_validation.md#111-十檔沉降速度的可區辨性與-m-的下限)），
+> 這個要求與實際可區辨性矛盾：最快四檔材質在 M=1 下彼此的水平來源足跡差異低於抽樣雜訊，
+> 統計上不可分辨，若圖例仍以材質名稱為主要標示，會讓讀者誤以為十者皆可分辨。下列規則已
+> 改為以速度／分群為主、材質名稱為附註，WP-25 據此實作。
+
+- 十個未校準沉降速度敏感度格點按 `settling_velocity_mps` 排序，以 small multiples 或
+  「速度 × 指標」曲線呈現；**圖例與軸標籤以速度數值或極慢／慢／中／快分群為主要文字**，
+  iOcean 類別與代理形狀只能以括號附註或次要文字呈現，不得作為圖例主要標示。
+- 主要成果圖建議以極慢／慢／中／快四群呈現（分群定義見設計基線文件第 6 節），逐檔十組數字
+  的版本只放入 supplement／scenario browser，並附註「M=1 下最快四檔統計不可分辨」。
+- 正文主要 panel 可固定先呈現 `material_id=oca_fishinggear_open_mesh_bundle`（沉降速度
+  `-0.002 m/s`，屬「中」群）；current formal 的垂向 panel 必須依 `random_vertical_draw_0..3`
+  identity 與 normalized fraction 分層，不得把 random draw rank 命名為 `near_bed` 或其他物理層。
+  其餘九類與所有 random vertical draws 仍以相同尺度完整保留於比較／補充產品。這是研究注意力
+  排序，不是將漁具數量或任一 draw 設定為先驗權重；`near_bed` 僅可出現在歷史／legacy pilot 報告。
 - 各類至少並列首次海床接觸 member count/fraction 與 deposited member count/fraction；`BED_CONTACT` 的多次事件以 member 去重，基線不要求 repeated-contact 欄位。海面接觸只表示亂流擴散造成的反射事件，不得解讀為材料具有上浮速度。
 - 深度分布使用 depth–time heatmap 或 quantile ribbon，明示 z positive-up、深度／HAB 基準及水深變化。
-- 不具再懸浮參數時，圖名只能使用 contact/deposition-under-assumed-policy，不能宣稱完整底床沉積動力。
+- 不具再懸浮參數時，圖名只能使用 contact/deposition-under-assumed-policy，不能宣稱完整底床沉積動力；`deposit_on_first_contact_and_stop` 會使足跡系統性偏向較近來源，caption 須揭露此假設。
 
 材質計數由 `report_material_statistics.py` 的一次串流 reducer 產生。每一列以
 `study_site_id × material_id` 為 join key，保存有效 member 分母、首次接觸與沉積 raw count

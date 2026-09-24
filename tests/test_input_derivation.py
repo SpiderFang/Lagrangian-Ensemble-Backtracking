@@ -3179,12 +3179,14 @@ def test_v3_policy_binds_exact_source_and_preserves_runtime_stage_status() -> No
     )
 
 
-def test_bed_residence_input_transformation_replaces_each_site_mapping_before_pair_build() -> None:
-    """input-build 共用轉換 helper 逐站套同一 age vector，並把 mapping 全部換成 deposition UTC。"""
+def _synthetic_bed_residence_observation_by_site(config) -> dict[str, list[ArrivalTime]]:
+    """建立五站各 50 筆 observation-anchor ``ArrivalTime`` 合成 fixture。
 
-    config = input_derivation_module.load_config(EXAMPLE_CONFIG, formal_release=False)
-    bed = config.scenarios.bed_residence_time
-    assert bed is not None
+    供沉底年齡抽樣相關測試共用：每站用同一種規則（每 14 天一筆、固定潮況／
+    事件標籤）建立互不相關的合成觀測時刻，只用來驗證 ``_apply_bed_residence_
+    sampling_by_site`` 的轉換與抽樣種子行為，不代表任何真實觀測資料。
+    """
+
     season_by_month = {
         12: "DJF",
         1: "DJF",
@@ -3227,6 +3229,16 @@ def test_bed_residence_input_transformation_replaces_each_site_mapping_before_pa
                 )
             )
         observation_by_site[site.study_site_id] = site_rows
+    return observation_by_site
+
+
+def test_bed_residence_input_transformation_replaces_each_site_mapping_before_pair_build() -> None:
+    """input-build 共用轉換 helper 逐站套同一 age vector，並把 mapping 全部換成 deposition UTC。"""
+
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG, formal_release=False)
+    bed = config.scenarios.bed_residence_time
+    assert bed is not None
+    observation_by_site = _synthetic_bed_residence_observation_by_site(config)
 
     transformed_by_site = input_derivation_module._apply_bed_residence_sampling_by_site(
         observation_by_site,
@@ -3256,6 +3268,65 @@ def test_bed_residence_input_transformation_replaces_each_site_mapping_before_pa
             == row.metadata["bed_residence_age_hours"] * 3_600_000_000_000
             for row in deposition_rows
         )
+
+
+def test_bed_residence_age_sampling_seed_override_resamples_and_default_stays_bit_identical() -> None:
+    """WP-26：``age_sampling_seed`` 覆寫必須真的改變抽出的 50 個年齡、且完整
+    寫入 metadata 供子集比較；省略時對同一批 observation 必須逐位元相同於
+    覆寫欄位新增前的行為（硬要求本身）。"""
+
+    config = input_derivation_module.load_config(EXAMPLE_CONFIG, formal_release=False)
+    bed = config.scenarios.bed_residence_time
+    assert bed is not None
+    observation_by_site = _synthetic_bed_residence_observation_by_site(config)
+
+    # ── 1. 省略 age_sampling_seed：effective_sampling_seed 等於 sampling_seed，
+    #       轉換結果必須與直接用 sampling_seed 呼叫既有抽樣函式完全一致。
+    assert bed.age_sampling_seed is None
+    baseline_by_site = input_derivation_module._apply_bed_residence_sampling_by_site(
+        observation_by_site,
+        bed_residence=bed,
+        design_version=config.design_version,
+    )
+    baseline_ages_by_site = {
+        site_id: tuple(row.metadata["bed_residence_age_hours"] for row in rows)
+        for site_id, rows in baseline_by_site.items()
+    }
+    for rows in baseline_by_site.values():
+        assert all(row.metadata["bed_residence_sampling_seed"] == bed.sampling_seed for row in rows)
+
+    # ── 2. 覆寫 age_sampling_seed：抽出不同的 50 個年齡，metadata 記錄的是
+    #       實際使用的覆寫種子（不是原本的 sampling_seed），且與 config 的
+    #       normalized sampling_seed 欄位不同，兩組結果可以清楚分開稽核。
+    override_seed = bed.sampling_seed + 424242
+    overridden_bed = bed.model_copy(update={"age_sampling_seed": override_seed})
+    assert overridden_bed.sampling_seed == bed.sampling_seed
+    assert overridden_bed.effective_sampling_seed == override_seed
+    overridden_by_site = input_derivation_module._apply_bed_residence_sampling_by_site(
+        observation_by_site,
+        bed_residence=overridden_bed,
+        design_version=config.design_version,
+    )
+    overridden_ages_by_site = {
+        site_id: tuple(row.metadata["bed_residence_age_hours"] for row in rows)
+        for site_id, rows in overridden_by_site.items()
+    }
+    assert set(baseline_ages_by_site) == set(overridden_ages_by_site)
+    for site_id in baseline_ages_by_site:
+        # 換一組種子，至少要抽出不同的年齡組合（兩組各 50 個唯一值，若剛好
+        # 完全相同代表覆寫根本沒有生效，必須讓測試失敗而不是誤判通過）。
+        assert set(baseline_ages_by_site[site_id]) != set(overridden_ages_by_site[site_id])
+    for rows in overridden_by_site.values():
+        assert all(row.metadata["bed_residence_sampling_seed"] == override_seed for row in rows)
+        assert all(row.metadata["bed_residence_sampling_seed"] != bed.sampling_seed for row in rows)
+
+    # ── 3. arrival_time_id 也必須因為覆寫種子而改變（identity 公式把
+    #       sampling_seed 納入雜湊輸入，見 bed_residence.apply_bed_residence_
+    #       sampling），確保兩組年齡的結果不會被誤判成同一批 arrival。
+    for site_id in baseline_ages_by_site:
+        baseline_ids = {row.arrival_time_id for row in baseline_by_site[site_id]}
+        overridden_ids = {row.arrival_time_id for row in overridden_by_site[site_id]}
+        assert baseline_ids.isdisjoint(overridden_ids)
 
 
 def test_v3_runtime_support_inventory_and_binding_reject_tamper(

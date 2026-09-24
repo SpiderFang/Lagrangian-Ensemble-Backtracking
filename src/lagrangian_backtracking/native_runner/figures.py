@@ -14,8 +14,21 @@ manifest。舊版管線的任何行為都不因本模組存在而改變。
 
 視覺風格沿用 ``build_pilot_coastline_preview.py --style baytrace`` 已核准的版面
 語彙（標題兩行、副標列出情境身分與設定、灰色陸地、虛線 domain／開放邊界外框、
-綠點＝回溯起點、紅叉／狀態標記＝停止位置、圖例在下方、底部紅字警語），但資料
-來源完全不同，兩份程式碼刻意不共用任何私有函式，避免舊版契約被新用途悄悄改動。
+綠點＝回溯起點、紅叉／狀態標記＝停止位置、圖例在下方），但資料來源完全不同，
+兩份程式碼刻意不共用任何私有函式，避免舊版契約被新用途悄悄改動。
+
+WP-24b：圖面不畫警語、圖說另存、文字層級開關
+--------------------------------------------
+研究團隊裁決：正式成果圖面不畫任何警語文字（含舊版底部紅字警語），圖面本身只
+承載資料（座標軸、圖例、可選標題／副標）；每張圖對應的文字說明（圖是什麼、
+資料來源欄位、關鍵設定）改由本模組另外輸出的 ``captions.md`` 承載，並把同一段
+文字與該圖的 SHA-256 一起寫進 ``manifest.json`` 的 ``captions`` 欄位，供報告
+排版時原文引用、也供事後稽核「這張圖當初配的文字是不是這段」。``--figure-text``
+命令列選項另外控制標題／副標是否畫在圖面上：``full``（預設）維持標題、副標、
+圖例、座標軸標籤全部都畫，供內部檢視；``none`` 只畫座標軸與圖例，不畫標題與
+副標，供正式報告排版——報告本身用 ``captions.md`` 的文字做圖說，不需要圖面上
+再重複一次標題。兩種模式都會輸出 ``captions.md``，且 ``none`` 模式會把
+``figure_text: "none"`` 記進 manifest，供人工確認這批圖是哪種文字層級。
 
 真實輸入的已知落差（誠實揭露，見 ``reports/WP-21.md``）
 --------------------------------------------------------
@@ -27,7 +40,7 @@ manifest。舊版管線的任何行為都不因本模組存在而改變。
 ``settling_velocity_mps`` 等全部原始欄位，因此本模組對「方位扇區」「弧段」
 「沉降速度細分」三張圖一律**直接從離開紀錄表重新聚合**（聚合公式與
 ``postprocess._sector_entry_table``／``_arc_segment_entry_table`` 完全相同：
-分母是同一分組內成功穿越邊界的粒子數），不依賴那些可能缺席的聚合表。唯一
+分母是同一分組內成功穿越邊界的粒子數），不依賴那些屬於可選、允許缺席的聚合表。唯一
 無法從離開紀錄表重建、且本模組必須讀取的**幾何**，是開放邊界折線本身的實際
 座標，來自 ``boundary_arc_segments_geometry_by_site``。
 
@@ -50,7 +63,7 @@ D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local 
 五站可以直接互相比較；本模組另外從 ``local_domain_departures.parquet``（僅
 ``local_equals_flow=False`` 的測站——目前是貢寮、龜山島——才有列）與
 ``departures.parquet`` 的 ``also_local_domain_first_exit``（僅
-``local_equals_flow=True`` 的測站——新竹、南灣、連江——才可能為
+``local_equals_flow=True`` 的測站——新竹、南灣、連江——才會為
 ``True``，代表這一列同時是 local 首次離開與 flow 終止）取得 local 首次離開的
 位置，在水平總覽／局部兩張圖上用**另一種標記**畫出，並在圖例與副標明確區分
 「local domain 邊界（記錄用，非終止）」與「flow domain 邊界（終止邊界）」。
@@ -61,8 +74,8 @@ D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local 
 經緯度還原（無 domain manifest 輸入下的投影復原）
 --------------------------------------------------
 本模組命令列只有 ``--postprocess-dir`` 與 ``--coastline``，不讀 domain／open
-manifest（避免疊床架屋，也避免正式圖表管線多一份可能與 postprocess 輸出的站點
-不同步的幾何來源）。但代表軌跡樣本表只保存公尺制 ``x_m``／``y_m``／``z_m``，
+manifest（避免疊床架屋，也避免正式圖表管線另外維護一份與 postprocess 輸出站點
+不保證同步的幾何來源）。但代表軌跡樣本表只保存公尺制 ``x_m``／``y_m``／``z_m``，
 沒有經緯度欄位；要疊圖到海岸底圖就必須知道各站「等距方位投影」（AEQD）的中心
 經緯度。``departures.parquet`` 剛好同時保存同一列粒子的
 ``departure_x_m``／``departure_y_m``（公尺）與
@@ -77,9 +90,13 @@ manifest（避免疊床架屋，也避免正式圖表管線多一份可能與 po
 科學語意與用語（依 AGENTS.md）
 --------------------------------
 本模組產出的方位扇區／弧段統計一律稱為「相對來源權重」，條件式核密度足跡一律
-稱為「條件式來源足跡」；不得使用「機率」「probability of origin」等字樣。
-每張圖與 README 都固定附上 M=1（每情境僅一個系集成員）、幾何為工程生成、停止
-位置不等於污染來源等警語。
+稱為「條件式來源足跡」；不使用「機率」「probability of origin」等字樣。這兩個
+量的定義是：給定站點、受體、沉降速度與到達時刻等情境設定後，穿越各方位扇區／
+各邊界弧段的相對頻率——是描述這一批 ``M=1`` 系集在既定設定下的分布，需要先驗、
+概似與觀測驗證後才能延伸為來源機率或因果歸因，本模組不提供、也不宣稱提供這一
+層推論。每張圖的副標與 ``captions.md`` 固定寫出站點、粒子數、``M=1``、終止邊界
+定義（flow domain 開放邊界）等已知設定，供讀者自行核對適用範圍，不使用警語式
+的「不得」句型。
 
 字型與雙語退場
 ----------------
@@ -241,22 +258,12 @@ class _Labeler:
         return zh if self.cjk_available else en
 
 
-def _disclaimer_text(t: _Labeler) -> str:
-    """回傳每張圖與 README 共用的固定警語（中英文擇一）。"""
-
-    return t.t(
-        "警語：M=1（每情境僅一個系集成員，含隨機擴散）；邊界與足跡統計是「條件式來源足跡」"
-        "與「相對來源權重」，不得解讀為絕對來源機率或因果歸因；停止位置是追蹤停止處，不是已知"
-        "污染來源；海岸與開放邊界幾何為工程生成，尚未提升為核准發布幾何。",
-        "Caution: M=1 (one ensemble member per scenario, includes random diffusion). Boundary "
-        "and footprint statistics are a conditional source footprint / relative source weight "
-        "only, not an absolute probability of origin or causal attribution. Endpoints mark where "
-        "tracking stopped, not a known pollution source. Coastline and boundary geometry are "
-        "engineering-generated, not approved for formal release.",
-    )
-
-
 # ── 設定 ─────────────────────────────────────────────────────────────────
+
+FIGURE_TEXT_MODES: tuple[str, ...] = ("full", "none")
+"""``--figure-text`` 合法值：``full``＝標題／副標／圖例／座標軸標籤全部畫出
+（預設，供內部檢視）；``none``＝只畫座標軸與圖例，不畫標題與副標（供正式報告
+排版，文字改由 ``captions.md`` 承載）。見模組 docstring「WP-24b」一節。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +279,10 @@ class NativeFiguresConfig:
     省略時走 ``resolve_cjk_font()``，找不到合格字型時整批圖面改用英文標籤（見模組
     docstring）。``max_trajectories_per_site`` 上限代表軌跡樣本數（水平總覽／局部
     ／深度年齡三張圖共用同一批已排序抽樣，避免同一顆粒子在不同圖之間對不上）；
-    ``dpi`` 是輸出 PNG 的解析度。
+    ``dpi`` 是輸出 PNG 的解析度。``figure_text`` 是 WP-24b 新增的文字層級開關，
+    合法值見 :data:`FIGURE_TEXT_MODES`；``"full"``（預設）維持標題／副標／圖例／
+    座標軸標籤全部畫出，``"none"`` 只畫座標軸與圖例，不畫標題與副標。兩種模式都
+    會輸出 ``captions.md``（見模組 docstring）。
     """
 
     postprocess_dir: Path
@@ -282,6 +292,7 @@ class NativeFiguresConfig:
     font_path: Path | None = None
     max_trajectories_per_site: int = 24
     dpi: int = 150
+    figure_text: str = "full"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "postprocess_dir", Path(self.postprocess_dir))
@@ -298,6 +309,10 @@ class NativeFiguresConfig:
             raise FiguresError("max_trajectories_per_site 必須是正整數")
         if self.dpi < 1:
             raise FiguresError("dpi 必須是正整數")
+        if self.figure_text not in FIGURE_TEXT_MODES:
+            raise FiguresError(
+                f"figure_text 必須是 {FIGURE_TEXT_MODES} 之一，收到：{self.figure_text!r}"
+            )
 
 
 # ── 表格讀取：優先 Parquet，缺 Parquet 才退回同名 CSV ───────────────────────
@@ -343,7 +358,7 @@ def _load_coastline(path: Path) -> list[Polygon | MultiPolygon]:
 
     只驗證結構（CRS84、FeatureCollection、每個 feature 是有效非空 Polygon／
     MultiPolygon），不像舊版 preview 管線那樣鎖定特定 SHA-256 或固定 1905 筆
-    ——本模組是通用 native 管線，呼叫端可能提供不同版本或測試用的縮小海岸檔。
+    ——本模組是通用 native 管線，呼叫端提供的可以是不同版本或測試用的縮小海岸檔。
     海岸只作底圖地理參照，不參與任何粒子有效性判定。
     """
 
@@ -478,7 +493,7 @@ def _recover_site_projection_center(
         raise FiguresError(
             "無法由離開紀錄反解出一致的 AEQD 投影中心（殘差 "
             f"{max_residual:.6g} 公尺，超過門檻 {_PROJECTION_FIT_MAX_RESIDUAL_M} 公尺）；"
-            "經緯度與公尺欄位可能不是同一個投影的樣本對"
+            "經緯度與公尺欄位不是同一個投影的一致樣本對"
         )
     return DomainProjection(float(result.x[0]), float(result.x[1]))
 
@@ -526,7 +541,7 @@ class SiteData:
 
     ``departures`` 是這一站全部離開紀錄，攤平成欄名到 NumPy 陣列的 dict（保留
     ``departures.parquet`` 原始列順序），供各圖表獨立重新聚合方位扇區、弧段、
-    沉降速度等統計，不依賴可能缺席的聚合表（見模組 docstring）。``kde`` 為
+    沉降速度等統計，不依賴那些屬於可選、允許缺席的聚合表（見模組 docstring）。``kde`` 為
     ``None`` 表示 ``kde_by_site`` 沒有這一站的列（理論上不應發生，
     ``PostprocessAccumulator`` 對每個處理過的站一定會有一列，但仍保守處理避免
     對不存在的鍵盲目索引）。
@@ -679,7 +694,7 @@ _LOCAL_SUMMARY_REQUIRED_COLUMNS: tuple[str, ...] = (
 
 
 def _column_to_numpy(table: pa.Table, name: str) -> np.ndarray:
-    """把一欄轉成 NumPy 陣列；字串／可能含 null 的欄位改用逐元素 Python list 轉換，
+    """把一欄轉成 NumPy 陣列；字串或允許含 null 的欄位改用逐元素 Python list 轉換，
     避免 ``to_numpy(zero_copy_only=True)`` 對非固定寬度型別拋例外。"""
 
     column = table.column(name)
@@ -785,7 +800,7 @@ def _build_trajectory_samples(
             raise FiguresError(
                 f"{site_id} 站代表軌跡樣本（row_particle_index={row_particle_index}）"
                 "在離開紀錄表中找不到對應列；trajectory_samples_by_site 與 departures"
-                "可能不是同一次後處理輸出"
+                "不是同一次後處理輸出"
             )
         receptor_id, final_status_code, final_status_description_zh = looked_up
         utc_ns = np.asarray(utc_ns_lists[i], dtype=np.int64)
@@ -1310,23 +1325,27 @@ def _resolve_open_boundary_lines_xy(site: SiteData) -> dict[str, tuple[np.ndarra
     return lines
 
 
-def _add_two_line_title(fig, t: _Labeler, font: Any, title: str, subtitle: str) -> None:
+def _add_two_line_title(
+    fig, t: _Labeler, font: Any, title: str, subtitle: str, *, figure_text: str
+) -> None:
+    """畫兩行標題（主標＋副標）；``figure_text=="none"`` 時什麼都不畫（見
+    :data:`FIGURE_TEXT_MODES`），供 WP-24b 正式報告排版模式使用——文字改由
+    ``captions.md`` 承載，圖面本身只留座標軸與圖例。"""
+
+    if figure_text == "none":
+        return
     fig.suptitle(title, fontproperties=font, fontsize=17, y=0.985)
     fig.text(0.5, 0.945, subtitle, ha="center", va="top", fontproperties=font, fontsize=10)
 
 
-def _add_disclaimer(fig, t: _Labeler, font: Any) -> None:
-    fig.text(
-        0.5,
-        0.012,
-        _disclaimer_text(t),
-        ha="center",
-        va="bottom",
-        fontproperties=font,
-        fontsize=7.6,
-        color="#b3261e",
-        wrap=True,
-    )
+def _title_top_margin(figure_text: str, *, full: float, none: float = 0.97) -> float:
+    """依文字層級回傳 ``fig.subplots_adjust(top=...)`` 用的頂部邊界。
+
+    ``full`` 模式沿用各圖原本的邊界（留給標題／副標的畫面空間）；``none`` 模式
+    不畫標題，因此把繪圖區延伸到更接近畫面頂端，避免留下沒有文字的大片空白。
+    """
+
+    return full if figure_text == "full" else none
 
 
 def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
@@ -1371,6 +1390,7 @@ def _plot_horizontal_overview(
     font: Any,
     path: Path,
     dpi: int,
+    figure_text: str,
 ) -> None:
     """代表粒子水平軌跡總覽（整個 flow domain 範圍，經緯度顯示）。"""
 
@@ -1488,23 +1508,24 @@ def _plot_horizontal_overview(
         fig, t, font,
         t.t(f"水平軌跡總覽｜{site.site_label_zh}", f"Horizontal overview | {site.site_id}"),
         _site_subtitle(site, t, extra=t.t("｜線色：代表粒子起始深度序位（淺→深）", "")),
+        figure_text=figure_text,
     )
-    fig.text(
-        0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
-        fontproperties=font, fontsize=8, wrap=True,
-    )
-    _add_disclaimer(fig, t, font)
+    if figure_text == "full":
+        fig.text(
+            0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
+            fontproperties=font, fontsize=8, wrap=True,
+        )
     # 改用 subplots_adjust 明確指定邊界，不用 tight_layout：tight_layout 與
     # ax.set_aspect(..., adjustable="box") 併用時，在某些「經緯度範圍很扁」的
     # 站點（例如本圖含寬闊 flow_open_boundary 外框）會於內部多重繪製階段留下
     # 殘影（已實測，圖例列會疊到一個淡灰色殘影字元），改用固定邊界可穩定避免。
-    fig.subplots_adjust(left=0.08, bottom=0.30, right=0.97, top=0.84)
+    fig.subplots_adjust(left=0.08, bottom=0.30, right=0.97, top=_title_top_margin(figure_text, full=0.84))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
 
 def _plot_horizontal_local(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
 ) -> None:
     """受體附近局部放大（公尺制平移座標，原點取代表粒子回溯起點的平均位置）。"""
 
@@ -1617,18 +1638,21 @@ def _plot_horizontal_local(
         fig, t, font,
         t.t(f"水平局部放大｜{site.site_label_zh}", f"Horizontal local view | {site.site_id}"),
         _site_subtitle(site, t),
+        figure_text=figure_text,
     )
-    fig.text(
-        0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
-        fontproperties=font, fontsize=8, wrap=True,
-    )
-    _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.05, bottom=0.24, right=0.98, top=0.84)
+    if figure_text == "full":
+        fig.text(
+            0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
+            fontproperties=font, fontsize=8, wrap=True,
+        )
+    fig.subplots_adjust(left=0.05, bottom=0.24, right=0.98, top=_title_top_margin(figure_text, full=0.84))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
 
-def _plot_depth_age(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int) -> None:
+def _plot_depth_age(
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+) -> None:
     """深度對回溯時齡曲線；線色依垂向抽樣序位（不代表固定物理水層）。"""
 
     import matplotlib
@@ -1664,14 +1688,16 @@ def _plot_depth_age(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int
         fig, t, font,
         t.t(f"深度—時齡曲線｜{site.site_label_zh}", f"Depth vs. age | {site.site_id}"),
         _site_subtitle(site, t),
+        figure_text=figure_text,
     )
-    _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.02, bottom=0.12, right=0.98, top=0.90)
+    fig.subplots_adjust(left=0.02, bottom=0.12, right=0.98, top=_title_top_margin(figure_text, full=0.90))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
 
-def _plot_terminal_counts(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int) -> None:
+def _plot_terminal_counts(
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+) -> None:
     """停止類別計數／比例長條圖；分母與 ``boundary_summary_by_site`` 一致。"""
 
     import matplotlib
@@ -1702,14 +1728,16 @@ def _plot_terminal_counts(site: SiteData, t: _Labeler, font: Any, path: Path, dp
         fig, t, font,
         t.t(f"停止類別統計｜{site.site_label_zh}", f"Terminal status counts | {site.site_id}"),
         _site_subtitle(site, t),
+        figure_text=figure_text,
     )
-    _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.08, bottom=0.34, right=0.98, top=0.90)
+    fig.subplots_adjust(left=0.08, bottom=0.34, right=0.98, top=_title_top_margin(figure_text, full=0.90))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
 
-def _plot_boundary_azimuth_rose(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int) -> None:
+def _plot_boundary_azimuth_rose(
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+) -> None:
     """16 方位扇區相對來源權重極座標玫瑰圖（正北向上、順時針）。"""
 
     import matplotlib
@@ -1749,20 +1777,21 @@ def _plot_boundary_azimuth_rose(site: SiteData, t: _Labeler, font: Any, path: Pa
         if top3
         else t.t("無穿越邊界粒子", "No particles crossed the boundary")
     )
-    fig.suptitle(
-        t.t(
-            f"方位扇區相對來源權重（玫瑰圖）｜{site.site_label_zh}",
-            f"Azimuth-sector relative source weight | {site.site_id}",
-        ),
-        fontproperties=font, fontsize=16, y=0.985,
-    )
-    fig.text(
-        0.5, 0.945, t.t(f"前三大方位：{top_text}", f"Top-3 sectors: {top_text}"), ha="center", va="top",
-        fontproperties=font, fontsize=10,
-    )
-    fig.text(0.5, 0.915, _site_subtitle(site, t), ha="center", va="top", fontproperties=font, fontsize=9)
-    _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.03, bottom=0.14, right=0.97, top=0.82)
+    if figure_text == "full":
+        fig.suptitle(
+            t.t(
+                f"方位扇區相對來源權重（玫瑰圖）｜{site.site_label_zh}",
+                f"Azimuth-sector relative source weight | {site.site_id}",
+            ),
+            fontproperties=font, fontsize=16, y=0.985,
+        )
+        fig.text(
+            0.5, 0.945, t.t(f"前三大方位：{top_text}", f"Top-3 sectors: {top_text}"), ha="center", va="top",
+            fontproperties=font, fontsize=10,
+        )
+        fig.text(0.5, 0.915, _site_subtitle(site, t), ha="center", va="top", fontproperties=font, fontsize=9)
+    top_margin = _title_top_margin(figure_text, full=0.82, none=0.92)
+    fig.subplots_adjust(left=0.03, bottom=0.14, right=0.97, top=top_margin)
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
@@ -1781,7 +1810,9 @@ def _short_boundary_label(base_boundary_segment_id: str) -> str:
     return kind if kind in ("local", "flow") else base_boundary_segment_id
 
 
-def _plot_boundary_arc_segments(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int) -> None:
+def _plot_boundary_arc_segments(
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+) -> None:
     """開放邊界折線依弧段著色（權重色階）＋弧段權重長條圖。"""
 
     import matplotlib
@@ -1863,9 +1894,9 @@ def _plot_boundary_arc_segments(site: SiteData, t: _Labeler, font: Any, path: Pa
             f"Boundary-arc relative source weight | {site.site_id}",
         ),
         _site_subtitle(site, t),
+        figure_text=figure_text,
     )
-    _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.06, bottom=0.2, right=0.98, top=0.88)
+    fig.subplots_adjust(left=0.06, bottom=0.2, right=0.98, top=_title_top_margin(figure_text, full=0.88))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
@@ -1877,6 +1908,7 @@ def _plot_source_footprint_kde(
     font: Any,
     path: Path,
     dpi: int,
+    figure_text: str,
 ) -> None:
     """由 ``kde_by_site`` 畫條件式來源足跡：密度色階＋HDR 等值線，疊海岸線與開放邊界。"""
 
@@ -1967,14 +1999,16 @@ def _plot_source_footprint_kde(
             f"Conditional source footprint (KDE) | {site.site_id}",
         ),
         _site_subtitle(site, t),
+        figure_text=figure_text,
     )
-    _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.02, bottom=0.14, right=0.98, top=0.88)
+    fig.subplots_adjust(left=0.02, bottom=0.14, right=0.98, top=_title_top_margin(figure_text, full=0.88))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
 
-def _plot_settling_velocity_breakdown(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int) -> None:
+def _plot_settling_velocity_breakdown(
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+) -> None:
     """十種沉降速度的穿越比例（長條圖）與主要方位扇區權重比較（熱圖）。"""
 
     import matplotlib
@@ -2038,9 +2072,9 @@ def _plot_settling_velocity_breakdown(site: SiteData, t: _Labeler, font: Any, pa
         fig, t, font,
         t.t(f"沉降速度細分｜{site.site_label_zh}", f"Settling-velocity breakdown | {site.site_id}"),
         _site_subtitle(site, t),
+        figure_text=figure_text,
     )
-    _add_disclaimer(fig, t, font)
-    fig.subplots_adjust(left=0.02, bottom=0.14, right=0.98, top=0.88)
+    fig.subplots_adjust(left=0.02, bottom=0.14, right=0.98, top=_title_top_margin(figure_text, full=0.88))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
 
@@ -2053,25 +2087,166 @@ def _dispatch_plot(
     font: Any,
     path: Path,
     dpi: int,
+    figure_text: str,
 ) -> None:
     if stem == "horizontal_overview":
-        _plot_horizontal_overview(site, land_geometries, t, font, path, dpi)
+        _plot_horizontal_overview(site, land_geometries, t, font, path, dpi, figure_text)
     elif stem == "horizontal_local":
-        _plot_horizontal_local(site, t, font, path, dpi)
+        _plot_horizontal_local(site, t, font, path, dpi, figure_text)
     elif stem == "depth_age":
-        _plot_depth_age(site, t, font, path, dpi)
+        _plot_depth_age(site, t, font, path, dpi, figure_text)
     elif stem == "terminal_counts":
-        _plot_terminal_counts(site, t, font, path, dpi)
+        _plot_terminal_counts(site, t, font, path, dpi, figure_text)
     elif stem == "boundary_azimuth_rose":
-        _plot_boundary_azimuth_rose(site, t, font, path, dpi)
+        _plot_boundary_azimuth_rose(site, t, font, path, dpi, figure_text)
     elif stem == "boundary_arc_segments":
-        _plot_boundary_arc_segments(site, t, font, path, dpi)
+        _plot_boundary_arc_segments(site, t, font, path, dpi, figure_text)
     elif stem == "source_footprint_kde":
-        _plot_source_footprint_kde(site, land_geometries, t, font, path, dpi)
+        _plot_source_footprint_kde(site, land_geometries, t, font, path, dpi, figure_text)
     elif stem == "settling_velocity_breakdown":
-        _plot_settling_velocity_breakdown(site, t, font, path, dpi)
+        _plot_settling_velocity_breakdown(site, t, font, path, dpi, figure_text)
     else:  # pragma: no cover - FIGURE_STEMS 是唯一呼叫來源，這裡只是防禦
         raise FiguresError(f"未知圖表代號：{stem}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 圖說（captions.md）：WP-24b 新增，圖面不畫警語後，文字改由這裡承載
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _experiment_case_label(postprocess_manifest: Mapping[str, Any]) -> str:
+    """回傳這批圖對應的物理案例識別碼（供圖說列出「關鍵設定」的物理案例）。
+
+    直接讀 ``postprocess.py`` 自己輸出的 ``manifest.json`` 的
+    ``experiment_case_id``；沒有這個欄位時如實寫「未於後處理 manifest 記錄」，
+    不臆測案例名稱。
+    """
+
+    case_id = postprocess_manifest.get("experiment_case_id")
+    return str(case_id) if case_id else "未於後處理 manifest 記錄"
+
+
+def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case_label: str) -> str:
+    """回傳單張圖（某站 × 某圖種）的繁體中文圖說，全部用直述句。
+
+    每段固定交代三件事（見 WP-24b 任務要求）：這張圖是什麼、資料來源欄位、
+    關鍵設定（站點、粒子數、``M``、終止邊界定義、物理案例）。全部用直述句陳述
+    已量測的事實與方法定義——量得到的數字直接寫數字，量不到的（例如個別離開
+    點分類的實際誤差率）不在此揣測，只寫清楚的方法定義。
+    """
+
+    total = int(site.summary["total_particle_count"])
+    site_desc = f"{site.site_label_zh}（{site.site_id}）"
+    settings_tail = (
+        f"{site_desc}，{total:,} 顆粒子，M=1（每情境一個系集成員，含隨機擴散），"
+        f"終止邊界為 flow domain 開放邊界，物理案例：{experiment_case_label}。"
+    )
+    if stem == "horizontal_overview":
+        body = (
+            "代表粒子水平軌跡總覽，涵蓋整個 flow domain 範圍，同時標示 local domain 與 "
+            "flow domain 兩條開放邊界、依 final_status_code 著色的終止標記，以及 local "
+            "domain 首次離開（非終止）標記。資料來源：trajectory_samples_by_site.parquet "
+            "的軌跡座標與時間、departures.parquet 的 final_status_code 與 "
+            "also_local_domain_first_exit、local_domain_departures.parquet 的 local 首次 "
+            "離開位置、boundary_arc_segments_geometry_by_site 的開放邊界折線幾何。"
+        )
+    elif stem == "horizontal_local":
+        body = (
+            "受體附近局部放大圖，座標為經緯度相對代表粒子回溯起點平均位置的偏移量，同樣 "
+            "標示 local／flow 兩條開放邊界與 local domain 首次離開標記。資料來源與水平軌跡 "
+            "總覽圖相同：trajectory_samples_by_site.parquet、departures.parquet、"
+            "local_domain_departures.parquet、boundary_arc_segments_geometry_by_site。"
+        )
+    elif stem == "depth_age":
+        body = (
+            "代表粒子深度對回溯時齡曲線，深度為海面以下之公尺數（海面為零、向上為正），"
+            "顏色依代表粒子起始深度在同批抽樣中的排序序位分色，序位只用來分色，不對應固定 "
+            "物理水層。資料來源：trajectory_samples_by_site.parquet 的 trajectory_z_m 與 "
+            "trajectory_utc_ns。"
+        )
+    elif stem == "terminal_counts":
+        body = (
+            "七種未穿越邊界的停止類別與一種成功穿越開放邊界的粒子計數與比例長條圖，分母為 "
+            "boundary_summary_by_site.total_particle_count。資料來源：departures.parquet 的 "
+            "final_status_code 逐列統計，並與 boundary_summary_by_site 的 fraction_* 欄位 "
+            "互相核對。"
+        )
+    elif stem == "boundary_azimuth_rose":
+        body = (
+            f"{site.azimuth_sector_count} 方位扇區的相對來源權重極座標玫瑰圖（正北向上、"
+            "順時針），標出前三大方位扇區名稱與百分比。相對來源權重＝該扇區成功穿越次數除以 "
+            "全站成功穿越開放邊界的總次數。資料來源：departures.parquet 的 "
+            "departure_azimuth_sector_index 與 departure_azimuth_sector_name。"
+        )
+    elif stem == "boundary_arc_segments":
+        arc_count = sum(len(rows) for rows in site.arc_segments_by_boundary.values())
+        body = (
+            f"開放邊界弧段相對來源權重，本站共 {arc_count} 段弧段，依權重色階著色並以長條圖 "
+            "並列比較。相對來源權重＝該弧段成功穿越次數除以全站成功穿越開放邊界的總次數。"
+            "資料來源：boundary_arc_segments_geometry_by_site 的弧段幾何與 "
+            "departures.parquet 的 boundary_segment_id、boundary_arc_segment_index。"
+        )
+    elif stem == "source_footprint_kde":
+        body = (
+            "條件式來源足跡核密度圖，背景為每平方公尺密度，疊加 50%／75%／90% 高密度區間"
+            "（HDR，Highest Density Region）等值線，並疊海岸線與開放邊界作地理參照。資料來源："
+            "kde_by_site.parquet。"
+        )
+    elif stem == "settling_velocity_breakdown":
+        body = (
+            "十個未校準沉降速度敏感度格點各自的穿越開放邊界比例長條圖，與各沉降速度分組內 "
+            "方位扇區相對來源權重熱圖並列比較。資料來源：departures.parquet 的 "
+            "settling_velocity_mps 與 departure_azimuth_sector_index，逐沉降速度重新分組 "
+            "聚合。"
+        )
+    else:  # pragma: no cover - FIGURE_STEMS 是唯一呼叫來源，這裡只是防禦
+        raise FiguresError(f"未知圖表代號：{stem}")
+    return f"{body} {settings_tail}"
+
+
+def _build_captions(inputs: NativeFiguresInputs) -> dict[str, str]:
+    """建立「``<site_id>/<stem>.png`` → 圖說」對照，供 ``captions.md`` 與
+    manifest 的 ``output_png_sha256.<key>.caption`` 共用同一份文字（見模組
+    docstring「WP-24b」一節：文字只寫一次，圖說與 manifest 互相核對用同一個
+    來源，不會出現兩處文字不一致的情況）。"""
+
+    experiment_case_label = _experiment_case_label(inputs.postprocess_manifest)
+    captions: dict[str, str] = {}
+    for site in inputs.sites:
+        for stem in FIGURE_STEMS:
+            captions[f"{site.site_id}/{stem}.png"] = _figure_caption_zh(
+                stem, site, experiment_case_label=experiment_case_label
+            )
+    return captions
+
+
+def _render_captions_markdown(
+    inputs: NativeFiguresInputs, captions: Mapping[str, str], *, generated_at_utc: str, figure_text: str
+) -> str:
+    """把 :func:`_build_captions` 的對照表排版成人類可讀的 Markdown。
+
+    每站一個章節、每張圖一個小節，順序固定依 ``FIGURE_STEMS``，方便報告排版時
+    逐段複製圖說。
+    """
+
+    lines = [
+        f"# WP-21 native 正式成果圖表：圖說（{generated_at_utc}）",
+        "",
+        f"文字層級：`--figure-text {figure_text}`。本檔案逐圖列出圖說——這張圖是什麼、"
+        "資料來源欄位、關鍵設定（站點、粒子數、M、終止邊界定義、物理案例）；文字與 "
+        "`manifest.json` 對應圖檔的 `caption` 欄位完全相同，可用 SHA-256 核對圖檔與圖說"
+        "是否對得上同一個版本。",
+        "",
+    ]
+    for site in inputs.sites:
+        lines.append(f"## {site.site_label_zh}（{site.site_id}）")
+        lines.append("")
+        for stem in FIGURE_STEMS:
+            lines.append(f"### `{stem}.png`")
+            lines.append("")
+            lines.append(captions[f"{site.site_id}/{stem}.png"])
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2083,11 +2258,23 @@ _README_TEMPLATE = """\
 
 本目錄由 `native-figures` 命令列由既有 native 後處理輸出（`departures.parquet`
 等，見下方「輸入來源」）獨立繪製，**不重跑任何積分、不讀取 forcing、不改寫任何
-輸入檔**；輸入檔前後 SHA-256 已核對一致（見 `manifest.json`）。
+輸入檔**；輸入檔前後 SHA-256 已核對一致（見 `manifest.json`）。文字層級為
+`--figure-text {figure_text}`（見下方「每站八張圖」一節）。
 
-## 重要警語（請先讀）
+## 科學定義與範圍
 
-{disclaimer}
+- **M=1**：每個情境（站點 × 受體 × 沉降速度 × 到達時刻等）只有一個系集成員，
+  含隨機擴散。
+- 「條件式來源足跡」與「相對來源權重」的定義：給定站點、受體、沉降速度與到達
+  時刻等情境設定後，代表粒子穿越各方位扇區／各邊界弧段的相對頻率，是描述這批
+  `M=1` 系集在既定設定下分布的統計量。來源機率與因果歸因是另一層科學推論，需要
+  另外建立先驗、概似與觀測驗證，本批圖表不提供這一層推論。
+- 圖上的終止標記位置是回溯積分停止處的座標，對應 `final_status_code` 七種
+  互斥狀態之一（成功穿越 flow domain 開放邊界、達回溯上限、擱淺、沉底、流場
+  缺值、數值失敗、`pre_window_deposition`）；停止處是積分終止的座標，不是另外
+  查證過的實際污染來源。
+- 海岸與開放邊界幾何目前的版本狀態是工程生成版：由既有海岸資料與弧段幾何直接
+  取得，尚未經研究團隊另立正式核准發布流程。
 
 ## 站點
 
@@ -2097,8 +2284,8 @@ _README_TEMPLATE = """\
 
 研究團隊裁決（`AGENTS.md`、`docs/development/05_decisions_and_risks.md`
 D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local domain 是非終止
-事件，只記錄、粒子繼續回溯**。因此每站可能有兩條開放邊界線，圖上用不同線型
-區分：
+事件，只記錄、粒子繼續回溯**。因此各站依 `local_equals_flow` 而定，會有一條或
+兩條開放邊界線，圖上用不同線型區分：
 
 - **flow domain 開放邊界**（藍色虛線）：真正的終止邊界，粒子離開這條線才停止
   回溯，`terminal_counts.png` 等圖的「穿越開放邊界（正常結束）」指的就是這裡。
@@ -2117,8 +2304,11 @@ domain 邊界上；若這顆代表粒子還有一筆「首次離開 local domain
 
 ## 每站八張圖
 
-各站資料夾（`<site_id>/`）內固定輸出以下八張 PNG，圖面標題、副標與底部紅字警語
-與本 README 一致：
+各站資料夾（`<site_id>/`）內固定輸出以下八張 PNG。`--figure-text full`（預設）
+在圖面上同時畫出標題、副標、圖例與座標軸標籤；`--figure-text none` 只畫座標軸
+與圖例，不畫標題與副標，供正式報告排版——每張圖對應的文字改由 `captions.md`
+承載（逐圖一段，內容與下列條列一致，並與 `manifest.json` 的
+`output_png_sha256.<site_id>/<stem>.png.caption` 完全相同）：
 
 1. `horizontal_overview.png`：代表粒子水平軌跡總覽（經緯度顯示，涵蓋整個 flow
    domain 範圍），**同時畫出 local domain 與 flow domain 兩條開放邊界**（見上
@@ -2166,8 +2356,8 @@ domain 邊界上；若這顆代表粒子還有一筆「首次離開 local domain
   `terminal_counts.png` 與 `boundary_summary_by_site` 的整體分母。
 - `boundary_segment_id`（離開點最終判定所屬的開放邊界）採用「離開點到候選開放
   邊界線最短距離」的啟發式（見 `postprocess.classify_boundary_segment`
-  docstring），不是精確幾何交點，個別離開點的分類可能有誤差。
-- 海岸與開放邊界幾何為工程生成，尚未提升為核准發布幾何；`horizontal_overview`
+  docstring），是近似判定，不是精確幾何交點。
+- 海岸與開放邊界幾何目前的版本狀態見上方「科學定義與範圍」；`horizontal_overview`
   等圖以「開放邊界折線（由弧段起訖點重建）」近似完整 domain 外框，本管線不讀
   domain／open manifest，因此不畫閉合陸域邊界，只畫開放水域邊界。
 - 深度—時齡曲線的「序位」只是同一批代表粒子按起始深度排序後的名次，同一序位
@@ -2196,13 +2386,11 @@ domain 邊界上；若這顆代表粒子還有一筆「首次離開 local domain
 """
 
 
-def _build_readme(
-    inputs: NativeFiguresInputs, config: NativeFiguresConfig, command: str, disclaimer_zh: str
-) -> str:
+def _build_readme(inputs: NativeFiguresInputs, config: NativeFiguresConfig, command: str) -> str:
     site_list = "\n".join(f"- `{s.site_id}`（{s.site_label_zh}）" for s in inputs.sites)
     return _README_TEMPLATE.format(
         generated_at_utc=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
-        disclaimer=disclaimer_zh,
+        figure_text=config.figure_text,
         site_list=site_list,
         command=command,
     )
@@ -2228,6 +2416,7 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
     labeler = _Labeler(font_resolution.cjk_available)
 
     output_dir.mkdir(parents=True)
+    captions = _build_captions(inputs)
     png_records: dict[str, dict[str, Any]] = {}
     for site in inputs.sites:
         site_dir = output_dir / site.site_id
@@ -2235,20 +2424,23 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
         for stem in FIGURE_STEMS:
             png_path = site_dir / f"{stem}.png"
             _dispatch_plot(
-                stem, site, land_geometries, labeler, font_resolution.font_properties, png_path, config.dpi
+                stem, site, land_geometries, labeler, font_resolution.font_properties, png_path, config.dpi,
+                config.figure_text,
             )
-            png_records[f"{site.site_id}/{stem}.png"] = {
+            key = f"{site.site_id}/{stem}.png"
+            png_records[key] = {
                 "sha256": sha256_file(png_path),
                 "size_bytes": png_path.stat().st_size,
+                "caption": captions[key],
             }
 
     sources_after = _snapshot_sources(inputs.source_paths)
     if sources_after != dict(inputs.sources_before):
         raise FiguresError("輸入檔在繪圖過程中被改動，前後 SHA-256 不一致，fail-closed")
 
-    disclaimer_zh = _disclaimer_text(_Labeler(True))
+    generated_at_utc = datetime.now(UTC)
     manifest = {
-        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "generated_at_utc": generated_at_utc.isoformat(),
         "command": command,
         "sites": [s.site_id for s in inputs.sites],
         "site_labels_zh": {s.site_id: s.site_label_zh for s in inputs.sites},
@@ -2266,6 +2458,7 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
             "max_trajectories_per_site": config.max_trajectories_per_site,
             "dpi": config.dpi,
             "sites_filter": list(config.sites) if config.sites is not None else None,
+            "figure_text": config.figure_text,
         },
     }
     manifest_path = output_dir / "manifest.json"
@@ -2273,8 +2466,17 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
         json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
         stream.write("\n")
 
+    captions_path = output_dir / "captions.md"
+    captions_text = _render_captions_markdown(
+        inputs, captions,
+        generated_at_utc=generated_at_utc.strftime("%Y-%m-%d %H:%M UTC"),
+        figure_text=config.figure_text,
+    )
+    with captions_path.open("x", encoding="utf-8") as stream:
+        stream.write(captions_text)
+
     readme_path = output_dir / "README.md"
-    readme_text = _build_readme(inputs, config, command, disclaimer_zh)
+    readme_text = _build_readme(inputs, config, command)
     with readme_path.open("x", encoding="utf-8") as stream:
         stream.write(readme_text)
 

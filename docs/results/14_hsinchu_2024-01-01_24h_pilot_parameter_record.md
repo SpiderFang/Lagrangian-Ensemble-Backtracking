@@ -117,7 +117,7 @@ manifest 及 pair parquet 共同追溯，不能只引用本文件的手抄值。
 | calibration manifest SHA-256 | `a2d9b45fa576428372d8267af461164569c8ba99b7b55b9cc5100a46c5b39df7` | 核對校準輸入來源、版本與 pair 清單；此項不是 pilot 輸出 checksum。 |
 | calibration pair parquet SHA-256 | `5250a9cb0e9d126d038d44060a250edd63034671af8a4f36412157845299479f` | 核對逐 pair 的校準樣本；不可用來宣稱軌跡結果已完成。 |
 | config semantic hash | `dfc8c5a1fcdbf07c293d93bc2204fd17d11749b66a0d6579c07088cf618d6909` | 核對設定語意；需與 generated config／`pilot_execution_binding` 一起使用。 |
-| config raw SHA-256 | `8b8882df0d2e7ffb014dcdcdc7df3e033dbc6fdd9715d1ee04127c160666924c` | 核對設定檔原始位元組；格式或序列化變更也可能造成差異。 |
+| config raw SHA-256 | `8b8882df0d2e7ffb014dcdcdc7df3e033dbc6fdd9715d1ee04127c160666924c` | 核對設定檔原始位元組；格式或序列化變更也會造成差異。 |
 | preflight raw SHA-256 | `a921ef1bf850f8db66eda6c283eeba8eb793204817bf389f7d0409bccafb9c08` | 核對 preflight 原始證據；不代替本次 run 的結果驗證。 |
 | Git commit | `4fa055d0b3fd27edd749856a2075e14f4f9103c2` | 固定程式版本邊界。 |
 | deployment tree | `fd98f746b150db886a8bfc295d6eb2e51a31a811a4c2a2310a24b8401a75b322` | 固定部署樹內容指紋；不可解讀為輸出資料 checksum。 |

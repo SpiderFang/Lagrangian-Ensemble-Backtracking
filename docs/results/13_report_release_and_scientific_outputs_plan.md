@@ -308,7 +308,7 @@ source shard 的 `trajectory_schema_version` 精確等於目前 v2 常數；lega
 至少包含解析解誤差、時間步收斂、member 收斂、known-source synthetic coverage、restart 差異、
 NumPy/Numba 差異與 forward/backward 指標；只記錄「pytest 通過」不合格。所有門檻必須在看到
 正式比較結果前由版本化設定核定，未核定時只能維持 formal baseline，不能由 renderer 臨時選擇
-看起來會通過的 threshold。
+表面上會通過的 threshold。
 
 只有 comparison、validation、正式 run、所有 F/T 產品與 provenance 同時通過，且兩個 allow
 flags 都關閉，才可產生 `server_scientific_evidence`。因此「可在 SERVER 完整執行」的工程驗收

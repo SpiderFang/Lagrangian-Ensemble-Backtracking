@@ -582,6 +582,106 @@ def test_bed_residence_age_sampling_scope_rejects_unregistered_value() -> None:
         ProjectConfig.model_validate(payload)
 
 
+@pytest.mark.parametrize("value", [30, 60, 90])
+def test_bed_residence_maximum_age_days_accepts_sensitivity_grid(value: int) -> None:
+    """WP-26：沉底年齡上限敏感度格點 30／60／90 都必須被接受，且各自進入
+    canonical payload（不像 age_sampling_scope 那樣省略時才回填預設值——
+    ``maximum_age_days`` 一直是必填欄位，明示哪一個數值本來就會進 hash）。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["maximum_age_days"] = value
+    payload["scenarios"]["bed_residence_time"] = block
+    config = ProjectConfig.model_validate(payload)
+    assert config.scenarios.bed_residence_time.maximum_age_days == value
+    assert config.normalized_payload()["scenarios"]["bed_residence_time"]["maximum_age_days"] == value
+
+
+@pytest.mark.parametrize("value", [0, 1, 29, 31, 45, 59, 61, 89, 91, 120, 180, -90])
+def test_bed_residence_maximum_age_days_rejects_values_outside_sensitivity_grid(value: int) -> None:
+    """90 以外只放行 30／60 兩個已核准的敏感度格點，其餘數值一律 fail closed，
+    避免有人隨手填一個未經討論的年齡上限就悄悄改變科學結論。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["maximum_age_days"] = value
+    payload["scenarios"]["bed_residence_time"] = block
+    with pytest.raises(ValueError, match="maximum_age_days"):
+        ProjectConfig.model_validate(payload)
+
+
+def test_bed_residence_maximum_age_days_sensitivity_grid_changes_config_hash() -> None:
+    """30／60／90 三個格點必須各自產生不同的 config hash，讓三次敏感度跑的
+    結果天然被儲存在互不覆蓋的目錄／manifest 下，不會被誤判成同一次設定。"""
+
+    hashes = {}
+    for value in (30, 60, 90):
+        payload = _payload()
+        block = _bed_residence_block()
+        block["maximum_age_days"] = value
+        payload["scenarios"]["bed_residence_time"] = block
+        hashes[value] = ProjectConfig.model_validate(payload).config_hash()
+    assert len(set(hashes.values())) == 3
+
+
+def test_bed_residence_age_sampling_seed_omission_keeps_hash_and_effective_seed_unchanged() -> None:
+    """WP-26：省略 ``age_sampling_seed``（硬要求的『預設行為位元相同』本身）時：
+
+    1. ``effective_sampling_seed`` 必須原樣等於 ``sampling_seed``（沒有任何
+       呼叫端會看到不同的抽樣種子）。
+    2. 不得因為新增這個 optional 欄位改變既有（未明示此欄位）設定的
+       canonical config hash——與 ``age_sampling_scope``／
+       ``formal_release_backtrack_modes`` 採用完全相同的省略即刪除做法。
+    """
+
+    payload = _payload()
+    payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    with_field = ProjectConfig.model_validate(payload)
+    bed = with_field.scenarios.bed_residence_time
+    assert bed.age_sampling_seed is None
+    assert bed.effective_sampling_seed == bed.sampling_seed == 20260916
+    assert "age_sampling_seed" not in with_field.normalized_payload()["scenarios"]["bed_residence_time"]
+
+    without_field = ProjectConfig.model_validate(deepcopy(payload))
+    assert with_field.config_hash() == without_field.config_hash()
+
+
+def test_bed_residence_age_sampling_seed_explicit_overrides_effective_seed_and_enters_hash() -> None:
+    """明示 ``age_sampling_seed`` 時必須真的覆寫 ``effective_sampling_seed``
+    （``sampling_seed`` 欄位本身維持不動，供稽核比對兩者差異），並寫入
+    canonical payload、產生與未覆寫時不同的 config hash——這樣主代理才能用
+    另一組種子重抽 50 個年齡、與正式核准的 ``sampling_seed`` 結果分開存放。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["age_sampling_seed"] = 99887766
+    payload["scenarios"]["bed_residence_time"] = block
+    config = ProjectConfig.model_validate(payload)
+    bed = config.scenarios.bed_residence_time
+    assert bed.sampling_seed == 20260916
+    assert bed.age_sampling_seed == 99887766
+    assert bed.effective_sampling_seed == 99887766
+    assert config.normalized_payload()["scenarios"]["bed_residence_time"]["age_sampling_seed"] == 99887766
+
+    default_payload = _payload()
+    default_payload["scenarios"]["bed_residence_time"] = _bed_residence_block()
+    default_config = ProjectConfig.model_validate(default_payload)
+    assert config.config_hash() != default_config.config_hash()
+
+
+@pytest.mark.parametrize("value", [-1, -20260916, True, False, 1.5, "20260916"])
+def test_bed_residence_age_sampling_seed_rejects_invalid_values(value: object) -> None:
+    """``age_sampling_seed`` 與 ``sampling_seed`` 採同一套嚴格規則：非負原生
+    整數或省略，拒絕負值、bool、浮點與字串，避免靜默轉型。"""
+
+    payload = _payload()
+    block = _bed_residence_block()
+    block["age_sampling_seed"] = value
+    payload["scenarios"]["bed_residence_time"] = block
+    with pytest.raises(ValueError):
+        ProjectConfig.model_validate(payload)
+
+
 def test_formal_release_backtrack_modes_defaults_and_omission_keeps_hash() -> None:
     """WP-18：省略 ``formal_release_backtrack_modes`` 時為 ``None``（沿用
     horizon-suite 既有「兩種模式都發布」的舊行為），且不得因為這個新增欄位改變

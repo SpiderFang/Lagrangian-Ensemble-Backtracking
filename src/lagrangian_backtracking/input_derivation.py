@@ -5730,7 +5730,10 @@ def _arrival_payload(
             offsets = sample_bed_residence_age_hours(
                 maximum_age_days=bed_config.maximum_age_days,
                 sample_count=bed_config.sample_count_per_site,
-                seed=bed_config.sampling_seed,
+                # WP-26：改讀 effective_sampling_seed，讓 age_sampling_seed 覆寫（若有
+                # 明示）真正改變抽出的 50 個年齡；未明示時等於 sampling_seed，逐位元
+                # 相同於此欄位新增前的行為。
+                seed=bed_config.effective_sampling_seed,
             )
             age_offsets_hash = sha256(
                 json.dumps(
@@ -5751,7 +5754,10 @@ def _arrival_payload(
             ),
             "maximum_age_days": bed_config.maximum_age_days,
             "sample_count_per_site": bed_config.sample_count_per_site,
-            "sampling_seed": bed_config.sampling_seed,
+            # WP-26：provenance 保存的是實際用來抽樣的種子（effective_sampling_seed），
+            # 讓 manifests.py 之後可以只用同一個欄位重算與驗證，不需要另外知道
+            # age_sampling_seed 這個覆寫欄位存在。
+            "sampling_seed": bed_config.effective_sampling_seed,
             "shared_age_offsets_across_sites": bed_config.shared_age_offsets_across_sites,
             "age_offsets_hours_sha256": age_offsets_hash,
             "selection_support_days": horizon_settings.selection_support_days,
@@ -6884,7 +6890,9 @@ def _apply_bed_residence_sampling_by_site(
             )
         apply_kwargs: dict[str, Any] = {
             "age_hours": age_offsets,
-            "sampling_seed": bed_residence.sampling_seed,
+            # WP-26：改讀 effective_sampling_seed，讓每一站沉底 arrival 的
+            # metadata 記錄的是實際用來抽樣的種子。
+            "sampling_seed": bed_residence.effective_sampling_seed,
             "maximum_age_days": bed_residence.maximum_age_days,
             "design_version": design_version,
         }
@@ -6941,7 +6949,8 @@ def _sample_bed_residence_age_offsets(
             sample_bed_residence_age_hours(
                 maximum_age_days=bed_residence.maximum_age_days,
                 sample_count=bed_residence.sample_count_per_site,
-                seed=bed_residence.sampling_seed,
+                # WP-26：同上，改讀 effective_sampling_seed。
+                seed=bed_residence.effective_sampling_seed,
             ),
             {"policy": BED_RESIDENCE_SAMPLING_POLICY_ID, "rejected_candidates": 0},
             None,
@@ -6986,8 +6995,10 @@ def _sample_bed_residence_age_offsets(
         "maximum_age_days": bed_residence.maximum_age_days,
         "sample_count": bed_residence.sample_count_per_site,
         "sample_count_per_site": bed_residence.sample_count_per_site,
-        "seed": bed_residence.sampling_seed,
-        "sampling_seed": bed_residence.sampling_seed,
+        # WP-26：條件式（gap-conditioned）抽樣器也必須用同一個 effective_sampling_seed，
+        # 否則覆寫只對 legacy sampler 生效，條件式路徑仍會抽出未覆寫的 50 個年齡。
+        "seed": bed_residence.effective_sampling_seed,
+        "sampling_seed": bed_residence.effective_sampling_seed,
         "observation_times_by_site": observation_times,
         "observation_time_utc_ns_by_site": observation_times,
         "available_time_ns_by_site": available,

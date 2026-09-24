@@ -195,7 +195,7 @@ uv run lbt native-status --output /data/LBT/native-run
 - **生產環境的 `build_worker_resources`／`run_unit` 接線刻意不內建**：實際網格建構、
   每站 `interest_region_polygon`、forcing 月份目錄解析與波浪橋接依賴
   `config.py`／`mesh.py`／`geometry.py`，以及 `wave_bridge.py`／`postprocess.py`；後兩者
-  在 WP-7 交付時可能尚未完成。與其提供一個可能不正確或不完整的預設接線，`lbt native-run`
+  在 WP-7 交付時的完成進度不由本模組保證。與其提供一份未必正確或未必完整的預設接線，`lbt native-run`
   透過 `--resource-provider` 讓呼叫端自行提供、自行對其正確性負責。
 - **尚未整合波浪與後處理**：目前的 orchestrator 只負責 `run_backward_batch` 這一層的
   排程與執行；`wave_bridge`／`postprocess` 完成後，需要由另一個資源 provider 或後續工作
@@ -252,7 +252,7 @@ uv run lbt native-status --output /data/LBT/native-run
 4. `ParticleTracker.find_initial_elements`（`locate_initial_elements` 的底層實作）
    **不是**依 `status` 篩選的——它對傳入陣列裡的每一列都做 KD-tree 搜尋並無條件覆寫
    `element`／`status`／`z`／`u/v/w`／`x_prev`／`y_prev` 等欄位。因此**絕不能**對整個
-   合併陣列直接呼叫這個函式；`_release_new_arrivals` 改用一個只裝新到達列的獨立暫時
+   合併陣列直接呼叫這個函式；`_release_new_arrivals` 改用一個只裝新到達列的獨立臨時
    `ParticleArrays`，定位完成後才把結果的特定欄位散寫回合併陣列對應的列。
 
 ### 9.3 Smagorinsky 擴散場的小時鏈結（跨到達時刻合併時的正確性陷阱）
@@ -260,15 +260,15 @@ uv run lbt native-status --output /data/LBT/native-run
 `run_backward_batch` 的算子分裂擴散用 `hf1_field`（這一小時開始時的場）／`hf2_field`
 （這一小時結束時的場）夾出一個小時內的線性內插；`hf1_now` 的定義是「上一次迴圈迭代的
 `hf2`（如果有）否則等於這次的 `hf2`」——這個鏈結是**依批次的迭代次序**定義的，不是
-依絕對 UTC 小時定義的。合併多個到達時刻到同一個沉降速度分組後，同一個絕對小時可能同時
+依絕對 UTC 小時定義的。合併多個到達時刻到同一個沉降速度分組後，同一個絕對小時有時會同時
 出現「剛到達、需要 `hf1=hf2=這小時的值`」與「延續中、需要 `hf1=上一小時的值`」兩種
 粒子，兩者要的 `hf1_field` 不同，不能用同一次 kernel 呼叫服務。
 
 解法：只有在（啟用擴散 **且** 同一小時同時有新到達與延續中作用中粒子）時，才把這個
-分組這一小時拆成兩次 `mirror_rk4_substep_loop` 呼叫（分別暫時把另一批粒子的 `status`
+分組這一小時拆成兩次 `mirror_rk4_substep_loop` 呼叫（分別臨時把另一批粒子的 `status`
 設成 0），其餘情況維持一次呼叫。拆成兩次呼叫時，兩次呼叫都會各自觸發支撐事實 2 描述的
-「`batch_interpolate_velocity`／`batch_interpolate_diffusivity` 對暫時停用的列寫入預設值」
-副作用，因此每次暫時停用前後都必須額外保存／還原被停用列的 `u/v/w`（與啟用擴散時的
+「`batch_interpolate_velocity`／`batch_interpolate_diffusivity` 對臨時停用的列寫入預設值」
+副作用，因此每次臨時停用前後都必須額外保存／還原被停用列的 `u/v/w`（與啟用擴散時的
 `dhfx/dhfy/dhfz/grdx/grdy/grdz`），見 `hour_major._snapshot_fields`／`_restore_fields`。
 
 另外，`prev_hf2` 本身在「分組曾經整個小時完全沒有作用中粒子」（例如兩個到達時刻之間
@@ -281,13 +281,13 @@ uv run lbt native-status --output /data/LBT/native-run
 以下四個問題全部是在**跑通測試的過程中**發現的，不是設計階段就想到的，記錄下來是為了
 提醒之後修改本模組的人這些地方特別容易出錯：
 
-1. **`batch_interpolate_velocity` 對暫時停用列的歸零副作用**（見支撐事實 2、9.3）：
+1. **`batch_interpolate_velocity` 對臨時停用列的歸零副作用**（見支撐事實 2、9.3）：
    `_prime_new_arrivals`（對剛到達列重新內插起點速度）與 `_run_group_hour` 的擴散拆分
-   路徑，都用「暫時把其他列的 `status` 設成 0」的方式限制某次 kernel 呼叫的作用範圍；
+   路徑，都用「臨時把其他列的 `status` 設成 0」的方式限制某次 kernel 呼叫的作用範圍；
    一開始沒注意到這兩個 kernel 會把 `status != 1` 的列寫成預設值（而非略過），導致
    跟其他到達時刻共用同一個沉降速度分組的延續中粒子，其速度／擴散狀態在下一次合併呼叫
    前被錯誤歸零，造成移動量少了一個 RK4 子步的量——用單一單元跑 vs. 併入多到達時刻的
-   分組跑，結果會出現看似隨機大小的位置偏差。修正是在每次這種暫時停用前後，額外保存／
+   分組跑，結果會出現看似隨機大小的位置偏差。修正是在每次這種臨時停用前後，額外保存／
    還原被停用列的 `u/v/w`（與擴散狀態）。
 2. **軌跡取樣少一筆、且其餘各筆整體錯位一小時**：`run_backward_batch` 在
    `locate_initial_elements` 之後、任何本小時移動之前，就把「到達當下」的原始位置存成
@@ -320,7 +320,7 @@ uv run lbt native-status --output /data/LBT/native-run
 第 1、3、4 點若沒有 `tests/test_native_hour_major.py` 的位元等價驗收（尤其是「擴散啟用
 且跨到達時刻合併」與「回溯上限精確觸發」兩個測試）幾乎不可能靠人工審查發現——差異都在
 公尺等級以下、或是只在特定的批次組成下才出現，這也是為什麼驗收測試要求「同一顆粒子
-單獨跑 vs. 併入更大批次跑必須位元相同」而不是「大致相符」。
+單獨跑 vs. 併入更大批次跑必須位元相同」而不是「近似相符」。
 
 ### 9.5 分批粒度與 `NativeWorkUnit` 的關係、checkpoint
 
@@ -384,8 +384,8 @@ prefetch worker」。本次交付**做了前者、刻意沒有實作後者**，�
 越高，固定開銷攤提的相對收益越小）。
 
 **這不是正式規模（30,000 節點、20 層、2 個流場區域、每區域 5 個到達時刻 × 10 個沉降
-速度 × 20/200 顆粒子、30 天回溯窗）的逐字重跑**，原因是正式規模單次量測本身可能需要
-數分鐘到數十分鐘（`test_realistic_grid_scale_hourly_overhead_benchmark` 在 60,000 節點、
+速度 × 20/200 顆粒子、30 天回溯窗）的逐字重跑**，原因是正式規模單次量測本身需要
+數分鐘到數十分鐘量級（`test_realistic_grid_scale_hourly_overhead_benchmark` 在 60,000 節點、
 單一小時下就要約 110 秒），在測試套件的時間預算內重複兩條路徑、多個 M 值不可行。外插到
 正式規模時的推論鏈與明確假設：
 
@@ -629,7 +629,7 @@ total_wall_clock_seconds(K) ≈ max(total_cost_seconds(K) / min(K, target_worker
 該區域的工作單元先保留在「尚未就緒」清單裡、**不**提交進 `ProcessPoolExecutor`
 的佇列；已就緒區域的單元立刻正常提交。主迴圈在「還有進行中的 future、或還有保留住的
 單元、或還有尚未就緒的區域」任一條件成立時都不會結束，因此空閒 worker 在資料還沒到齊
-時只是繼續等待，不會誤判「佇列暫時空了」就提前結束或跑出不完整的結果；標記檔出現後，
+時只是繼續等待，不會誤判「佇列臨時空了」就提前結束或跑出不完整的結果；標記檔出現後，
 下一輪輪詢立刻把該區域的單元補進佇列。全部區域都就緒、且佇列清空後才正常結束、寫出
 最終的 `NativeRunSummary`。省略這個參數時（預設）行為與 WP-13 之前完全相同（視為全部
 區域已就緒）。
@@ -690,11 +690,11 @@ run --resource-provider` 的正式接線）依環境變數在每個 worker 子�
 下佔比可忽略而刻意保留但不重要）兩項。WP-16 的量測（見 `reports/WP-16.md` 第 4 節）顯示：
 
 1. `seconds_per_node_layer_hour`（底場合成，含乾濕＋Stokes＋Smagorinsky）的**校準值本身
-   大致不受 WP-16 影響**——`compose_current_and_stokes_fields`／`compute_smagorinsky_kh_field`
+   不受 WP-16 影響**——`compose_current_and_stokes_fields`／`compute_smagorinsky_kh_field`
    沒有被本次工作包修改運算內容，只是 Smagorinsky 的記憶體存取順序與快取被優化（見 9.11.3），
    在正式 56 核心伺服器上會比沙箱量到的略快，但量級不變。
 2. **`seconds_per_particle_substep` 這一項不能再視為可忽略**：在有真實近岸極細網格的區域
-   （近岸元素邊長可能只有 0.1-1 公尺量級），舊版 `global_cfl` 政策會把子步數逼到每小時數千
+   （近岸元素邊長落在 0.1-1 公尺量級），舊版 `global_cfl` 政策會把子步數逼到每小時數千
    （沙箱重現到 4,250 子步/小時量級），子步迴圈成本因而主導整個小時成本（NE 67,600 節點
    M=1 情境下，`global_cfl`＋Python 逐步路徑的子步迴圈本身佔了實測 80,816.90 ms/小時裡
    絕大部分）。改成 `local_cfl`＋Numba 融合迴圈後，子步數大幅下降、迴圈本身也更快，底場合成
@@ -769,7 +769,8 @@ WP-17 之前，`native_runner`（第 1-11 節描述的全部路徑）對每個�
 `hour_major.HourMajorSettlingGroupInput` 新增 `max_backtrack_ns` 逐列陣列（`-1` sentinel
 表示「這個粒子沒有明示值，退回 `config.max_backtrack_seconds`」）；`run_flow_domain_
 hour_major` 的回溯上限判定從「整個分組共用一個純量」改成逐列 `np.where(...)` 比較，讓
-同一分組（可能合併多個到達時刻）裡不同沉底年齡的粒子各自在自己的有效回溯時間停止。
+同一分組（依批次組成，可含合併後的多個到達時刻）裡不同沉底年齡的粒子各自在自己的有效
+回溯時間停止。
 `pre_window_deposition=True` 的單元完全不會被送進 `build_hour_major_domain_batch`（送入
 會 fail-closed 拒絕）；這批粒子由 `hour_major_provider._run_unit_entrypoint` 直接呼叫
 `backward_driver.build_pre_window_deposition_result` 組出「零運算」結果（不定位初始元素、

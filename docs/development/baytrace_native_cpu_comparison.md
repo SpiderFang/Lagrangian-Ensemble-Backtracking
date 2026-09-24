@@ -145,7 +145,7 @@ CPU累積秒、RSS、步數、checkpoint序列及逐站原版完成證據；工�
 其餘4,990片必須維持 `PLANNED`／零步數。原run計畫、seed與檢查點繫結不改寫，新程式commit、
 實際來源、初始十片進度與revision另存新log session。既有CLI `--resume` 負責片鎖下的檢查點
 還原與完成輸出驗證，不重算已驗證完成片、不先執行全run reconcile。此選項**不略過**既有
-CLI／runtime的全run歷史驗證，因此啟動仍可能耗時；不能將setup當成粒子推進。切換前必須確認
+CLI／runtime的全run歷史驗證，因此啟動仍需要時間；不能將setup當成粒子推進。切換前必須確認
 舊operator與workers均已退出，不能同片雙寫；本腳本不代替操作者停止其他invocation。
 
 純流逐站出圖：`build_completed_subset_preview.py --current100-site SITE` 配合該站兩個
@@ -221,4 +221,4 @@ full啟動時只標記已要求完整驗證，是否完成必須以`setup_comple
 `profile.raw`、`result.json` 是診斷證據；採樣失敗不得冒稱已定位卡點。
 每10次掃描的摘要另保存cache hits/misses、frame builds/evictions、cached bytes及
 native completed/fallback/group-size程序累計統計；快取容量不因向量化而調整。
-原進度可能由既有worker正常更新，不能把它當成診斷寫入。
+原進度會由既有worker正常更新，不能把它當成診斷寫入。

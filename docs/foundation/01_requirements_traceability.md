@@ -91,9 +91,9 @@
 
 負擴散係數會造成病態問題，不納入基線。backward ensemble 以逆時間 advection 加正變異擴散建立 conditional source footprint。嚴格 time-reversed stochastic process 的轉移機率需要額外的密度或平穩性假設，只能作獨立研究敏感度，不能與基線混稱。
 
-### 3.4 只用離域條件可能永不停止
+### 3.4 只用離域條件不保證停止
 
-封閉或回流軌跡可能長期留在 domain，且 forcing 只涵蓋 2024-2025。因此基線另設：
+封閉或回流軌跡會長期留在 domain，且 forcing 只涵蓋 2024-2025。因此基線另設：
 
 - 抵達 forcing 起始時間；
 - 達到核定 `max_backtrack_days`；

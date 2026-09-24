@@ -328,8 +328,9 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
         ],
         "read_first": (
             "先分清 observation UTC 與 deposition UTC；五站共用同一組 50 個年齡偏移，"
-            "fixed_calendar_window 可能產生不讀 forcing 的 pre_window_deposition，"
-            "full_horizon_from_deposition 則從沉底日向前走滿指定 horizon。"
+            "沉底時刻落在固定日曆窗之外時，fixed_calendar_window 會產生不讀 forcing 的 "
+            "pre_window_deposition，full_horizon_from_deposition 則從沉底日向前走滿指定 "
+            "horizon。"
         ),
     },
     "models": {
@@ -2074,7 +2075,7 @@ HTML_TEMPLATE = r'''<!doctype html>
         <section class="detail-section"><h3>主要閱讀入口</h3>${listHtml(module.entrypoints, "此模組沒有列出的公開入口。")}</section>
         <section class="detail-section"><h3>輸入</h3><p>${module.inputs}</p></section>
         <section class="detail-section"><h3>輸出／責任</h3><p>${module.outputs}</p></section>
-        <section class="detail-section"><h3>它實際引用的模組</h3>${listHtml(imports, "沒有相對匯入；可能是資料型別、數值核心或入口模組。")}</section>
+        <section class="detail-section"><h3>它實際引用的模組</h3>${listHtml(imports, "沒有相對匯入；屬於資料型別、數值核心或入口模組之一。")}</section>
         <section class="detail-section"><h3>引用它的模組</h3>${listHtml(importedBy, "目前沒有其他 src 模組直接相對匯入它。")}</section>
         <section class="detail-section"><h3>文件化流程：輸入 → 它</h3>${listHtml(flowIn, "沒有登錄的上游流程連線。")}</section>
         <section class="detail-section"><h3>文件化流程：它 → 輸出</h3>${listHtml(flowOut, "沒有登錄的下游流程連線。")}</section>

@@ -92,7 +92,7 @@ PREPARE 完成：未建立、啟動或恢復任何 run workspace。
 
 寫入能力以每個執行資料根上的實際探針為準：建立唯一暫存檔、寫入並同步檔案、在同一目錄
 原子改名、重新開啟／同步後清理。NFS 的存取控制清單（ACL）或伺服器匯出設定（export）
-可能使系統呼叫 `access(2)` 對寫入權限旗標 `W_OK` 的預先查詢，與實際檔案開啟 `open`／
+會使系統呼叫 `access(2)` 對寫入權限旗標 `W_OK` 的預先查詢，與實際檔案開啟 `open`／
 寫入結果不同，因此不單獨依賴該查詢判定可寫性；目錄仍須通過搜尋權限檢查，而實際探針
 任一步失敗會回報 `write_probe_failed` 並停止執行。
 
@@ -116,7 +116,7 @@ bash scripts/run_b_hsinchu_expanded_matrix.sh RUN
 
 `RUN` 會再次執行全部前置檢查，因此不會只依賴稍早的 `PREPARE` 結果。每組試跑含 4 個平行分片；
 任一分片失敗時，腳本會保留日誌、失敗紀錄及先前已成功發布的續跑檔（checkpoint），並停止
-啟動後續組別。若錯誤發生在第一份續跑檔建立前，該分片可能沒有可恢復的續跑檔。
+啟動後續組別。若錯誤發生在第一份續跑檔建立前，該分片就沒有可恢復的續跑檔。
 
 離開 tmux 但保持運算：按 `Ctrl-b`，放開後按 `d`。重新查看：
 
@@ -216,7 +216,7 @@ uv run lbt run-worker "$WORKSPACE" \
 ```
 
 若既有分片是 `RUNNING`、`PAUSED` 或 `FAILED`，同一命令才加 `--resume`；初次 `PLANNED` 不加。
-`run-worker` 遇到安全暫停也可能退出 0，因此最後仍須執行完整驗證：
+`run-worker` 遇到安全暫停時也會退出 0，因此最後仍須執行完整驗證：
 
 ```bash
 uv run lbt run-reconcile "$WORKSPACE" \

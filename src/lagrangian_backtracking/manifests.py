@@ -1668,7 +1668,9 @@ def _validate_bed_residence_arrival_records(
         offsets = sample_bed_residence_age_hours(
             maximum_age_days=bed.maximum_age_days,
             sample_count=bed.sample_count_per_site,
-            seed=bed.sampling_seed,
+            # WP-26：改讀 effective_sampling_seed，與 input_derivation 寫入
+            # provenance 時實際使用的種子一致，才能重算出相同的 50 個年齡。
+            seed=bed.effective_sampling_seed,
         )
     if len(offsets) != bed.sample_count_per_site:
         raise ValueError("重算的 bed residence age vector 長度與設定不一致")
@@ -1680,7 +1682,9 @@ def _validate_bed_residence_arrival_records(
         "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
         "maximum_age_days": bed.maximum_age_days,
         "sample_count_per_site": bed.sample_count_per_site,
-        "sampling_seed": bed.sampling_seed,
+        # WP-26：與 input_derivation 寫入 provenance 的欄位一致，改比對 effective
+        # seed；未明示 age_sampling_seed 時等於 sampling_seed，逐位元相同。
+        "sampling_seed": bed.effective_sampling_seed,
         "shared_age_offsets_across_sites": True,
         "age_offsets_hours_sha256": age_vector_hash,
     }
@@ -1816,7 +1820,9 @@ def _validate_bed_residence_arrival_records(
                 f"arrival[{arrival.arrival_time_id}] legacy metadata 不得帶 "
                 "availability provenance"
             )
-        if sampling_seed != bed.sampling_seed:
+        # WP-26：metadata 保存的是實際用來抽樣的種子，因此這裡要跟
+        # effective_sampling_seed 比對；未明示 age_sampling_seed 時兩者相同。
+        if sampling_seed != bed.effective_sampling_seed:
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence seed 與 config 不一致")
         if metadata.get("bed_residence_maximum_age_days") != bed.maximum_age_days:
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence 最大年齡與 config 不一致")
@@ -1953,7 +1959,10 @@ def _validate_bed_residence_arrival_records(
                     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
                 ]
             )
-        identity_fields.extend([str(bed.sampling_seed), design_hash])
+        # WP-26：identity 公式必須與 bed_residence.apply_bed_residence_sampling 建立
+        # arrival_time_id 時實際傳入的 sampling_seed（即 effective_sampling_seed）
+        # 完全一致，否則覆寫種子時這裡會重算出不同的 arrival_time_id 而誤判偽造。
+        identity_fields.extend([str(bed.effective_sampling_seed), design_hash])
         expected_arrival_id = stable_identifier("arrival_bed", identity_fields)
         if arrival.arrival_time_id != expected_arrival_id:
             raise ValueError(f"arrival[{arrival.arrival_time_id}] bed residence identity 不可重算")

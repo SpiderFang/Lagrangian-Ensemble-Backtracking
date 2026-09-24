@@ -109,8 +109,13 @@ def _config(tmp_path: Path, *, with_paths: bool = False) -> ProjectConfig:
     return ProjectConfig.model_validate(payload)
 
 
-def _bed_config() -> ProjectConfig:
-    """建立五站正式沉底 loader 測試設定，分離 180 日選時與 90 日運算支援。"""
+def _bed_config(*, age_sampling_seed: int | None = None) -> ProjectConfig:
+    """建立五站正式沉底 loader 測試設定，分離 180 日選時與 90 日運算支援。
+
+    ``age_sampling_seed``（WP-26 新增，預設 ``None``）：省略時與新增此參數前
+    逐位元相同；提供時會寫入 ``scenarios.bed_residence_time.age_sampling_seed``，
+    供年齡重抽種子覆寫的 loader 往返測試使用。
+    """
 
     payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
@@ -127,6 +132,8 @@ def _bed_config() -> ProjectConfig:
             "runtime_horizon_support_days": 90,
         }
     )
+    if age_sampling_seed is not None:
+        payload["scenarios"]["bed_residence_time"]["age_sampling_seed"] = age_sampling_seed
     return ProjectConfig.model_validate(payload)
 
 
@@ -419,7 +426,10 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
         available_time_ns_by_site=available_by_site,
         maximum_age_days=bed.maximum_age_days,
         sample_count=bed.sample_count_per_site,
-        seed=bed.sampling_seed,
+        # WP-26：改用 effective_sampling_seed，讓這個 fixture 產生的 payload
+        # 與真正的 input_derivation._apply_bed_residence_sampling_by_site 在
+        # age_sampling_seed 覆寫時的行為一致。
+        seed=bed.effective_sampling_seed,
     )
     offsets = conditioned.age_hours
     deposition_records = [
@@ -428,7 +438,7 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
         for arrival in apply_bed_residence_sampling(
             observations_by_site[site_id],
             age_hours=offsets,
-            sampling_seed=bed.sampling_seed,
+            sampling_seed=bed.effective_sampling_seed,
             maximum_age_days=bed.maximum_age_days,
             design_version=design_version,
             sampling_method_id=conditioned.sampling_method_id,
@@ -487,7 +497,7 @@ def _bed_arrival_payload(config: ProjectConfig) -> dict[str, object]:
                 "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
                 "maximum_age_days": bed.maximum_age_days,
                 "sample_count_per_site": bed.sample_count_per_site,
-                "sampling_seed": bed.sampling_seed,
+                "sampling_seed": bed.effective_sampling_seed,
                 "shared_age_offsets_across_sites": True,
                 "age_offsets_hours_sha256": age_vector_hash,
                 "sampling_method_id": BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
@@ -894,6 +904,42 @@ def test_bed_residence_formal_loader_recomputes_shared_age_vector_and_paired_a_i
         arrival.metadata["shared_A_forcing_policy"] == "gongliao_paired_utc_reference_v1"
         for arrival in guishan_events
     )
+
+
+def test_bed_residence_formal_loader_age_sampling_seed_override_round_trips_and_seed_mismatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """WP-26：``age_sampling_seed`` 覆寫必須端到端可用——依覆寫種子建立的
+    manifest 只能用同一個覆寫設定驗證通過；換回原本未覆寫的設定驗證會因為
+    ``effective_sampling_seed`` 不同而 fail closed，兩組結果不會被誤判成
+    同一組（任務書「兩種案例的結果絕不可混在同一份統計」在年齡重抽情境的
+    對應保證）。"""
+
+    override_seed = 20260916 + 13579
+    overridden_config = _bed_config(age_sampling_seed=override_seed)
+    payload = _bed_arrival_payload(overridden_config)
+    path = tmp_path / "bed-arrival-age-seed-override.json"
+    _write_json(path, payload)
+
+    # 用同一個覆寫設定驗證：必須通過，且 provenance／metadata 記錄的是
+    # 覆寫種子而不是原本的 sampling_seed。
+    loaded = load_arrival_time_manifest(path, overridden_config, formal=True)
+    assert len(loaded) == 250
+    assert payload["provenance"]["bed_residence_sampling"]["sampling_seed"] == override_seed
+    assert all(
+        arrival.metadata["bed_residence_sampling_seed"] == override_seed for arrival in loaded
+    )
+    original_sampling_seed = overridden_config.scenarios.bed_residence_time.sampling_seed
+    assert all(
+        arrival.metadata["bed_residence_sampling_seed"] != original_sampling_seed for arrival in loaded
+    )
+
+    # 换回未覆寫（沿用正式核准 sampling_seed）的設定驗證同一份 manifest：
+    # effective_sampling_seed 不同，loader 必須 fail closed，不能誤判成有效。
+    baseline_config = _bed_config()
+    assert baseline_config.scenarios.bed_residence_time.effective_sampling_seed != override_seed
+    with pytest.raises(ValueError):
+        load_arrival_time_manifest(path, baseline_config, formal=True)
 
 
 @pytest.mark.parametrize("mutation", ["core_radius", "legacy_policy"])

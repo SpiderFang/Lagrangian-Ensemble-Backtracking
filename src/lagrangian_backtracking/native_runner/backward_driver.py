@@ -159,6 +159,28 @@ SHA-256、以 ``importlib.util.spec_from_file_location`` 手動依拓樸序
    但這不是 ``boundaries.first_polygon_crossing`` 那種精確線段—多邊形
    交點；如需精確交點，需在偵測到離開後另外用該函式對該粒子的最後一段
    軌跡做一次性後處理（不在本模組範圍內）。
+
+WP-26：``bed_reflect`` 再懸浮敏感度案例（誠實範圍揭露）
+----------------------------------------------------------
+``BackwardDriverConfig.bed_reflect``（預設 ``False``，見該欄位 docstring）只
+關閉「連續停留海床即終止」這一個判定，讓粒子留在 ``NATIVE_STATUS_ACTIVE``
+繼續交給**完全未修改**的 ``mirror_rk4_substep_loop``／``batch_clamp_z`` 驅動
+——不是在海床做一次真正的鏡射速度／位置反射（那需要改寫原版
+``batch_clamp_z``／子步 kernel 本身，本模組刻意不修改原版物理核心，見本檔
+模組說明最上方「模組結構」原則）。native 路徑每個子步本來就會把 z 夾限在
+``[bed_z, eta]`` 之間（``batch_clamp_z``），粒子在數值上本來就無法穿透海床，
+因此對「已經被夾限在海床」的粒子而言，「不終止、任由既有平流＋擴散把它帶離
+海床」與「鏡射」兩者的物理效果一致；差異只在於本模組刻意選擇實作前者，因為
+後者需要動到不該修改的原版子步 kernel。**已知未完成的整合工作**（風險與
+``postprocess.py`` 之類的範圍限制，詳見 ``reports/WP-26.md``）：
+``bed_reflect`` 目前只在 ``BackwardDriverConfig``／``run_backward_batch`` 這一層
+生效，尚未接上 ``native_physics_case.py`` 式的 CLI／環境變數解析、
+``orchestrator.py``／``hour_major.py``／``hour_major_provider.py`` 的參數傳遞、
+``particle_input.py`` 的批次身分雜湊，也**沒有**寫入 ``postprocess.py`` 產生的
+結果 manifest 或結果目錄命名（``postprocess.py`` 不在本工作包可修改清單內）。
+呼叫端目前只能用 Python 直接建構 ``BackwardDriverConfig(bed_reflect=True, ...)``
+呼叫 ``run_backward_batch``，尚不能透過既有 ``native-plan``／``native-run`` CLI
+指定這個敏感度案例。
 """
 
 from __future__ import annotations
@@ -506,6 +528,7 @@ __all__ = [
     "HourlyOverheadDiagnostics",
     "DepartureRecord",
     "LocalDomainFirstExitRecord",
+    "BedReflectEventRecord",
     "mirror_rk4_substep_loop",
     "BackwardDriverConfig",
     "BackwardDriverResult",
@@ -2663,6 +2686,29 @@ class LocalDomainFirstExitRecord:
     utc_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class BedReflectEventRecord:
+    """``BackwardDriverConfig.bed_reflect=True`` 時，一次「本應沉底、改為反射」的非終止事件。
+
+    WP-26 新增。語意對應 ``LocalDomainFirstExitRecord``：只在明示啟用
+    ``bed_reflect`` 敏感度案例時才會產生，``bed_reflect=False``（預設基線）時
+    ``BackwardDriverResult.bed_reflect_events`` 恆為空 tuple。記錄的時刻是這顆
+    粒子連續 ``deposition_consecutive_hours`` 小時停留在海床附近、依基線政策
+    「應該」被標記 ``NATIVE_STATUS_DEPOSITED`` 的那個小時終點；粒子本身**不**
+    終止，反射後的連續小時計數會重設為 0（見 ``run_backward_batch``），因此
+    同一顆粒子若之後又再次連續停留滿足門檻，會再產生一筆新記錄——一顆粒子
+    在同一次回溯中可能出現多筆，不像 ``DepartureRecord``／
+    ``LocalDomainFirstExitRecord`` 那樣至多一筆。欄位語意與
+    ``LocalDomainFirstExitRecord`` 相同（公尺制運算座標、UTC 奈秒）。
+    """
+
+    row_particle_index: int
+    x_m: float
+    y_m: float
+    z_m: float
+    utc_ns: int
+
+
 def mirror_rk4_substep_loop(
     driver_grid: NativeBackwardDriverGrid,
     handles: BayTraceModuleHandles,
@@ -3159,6 +3205,19 @@ class BackwardDriverConfig:
     小時主軸路徑（``hour_major.py``）預設啟用（見該模組文件），若要跟
     ``run_backward_batch`` 做位元相同的等價驗收，兩邊必須明確傳入同一個
     數值。
+
+    ``bed_reflect``（WP-26 新增，見模組文件「WP-26」一節）：預設 ``False``，
+    行為與新增此欄位前逐位元相同——粒子連續 ``deposition_consecutive_hours``
+    小時停留在海床附近（見 ``particle_bed_z_levels``／``deposition_tolerance_m``）
+    即終止並標記 ``NATIVE_STATUS_DEPOSITED``（現行基線
+    ``deposit_on_first_contact_and_stop`` 的 native 對應實作）。設為 ``True``
+    時關閉這個終止判定：符合條件的粒子改為重設連續小時計數、**不**終止、
+    繼續留在 ``NATIVE_STATUS_ACTIVE`` 接受後續正常物理（平流＋Smagorinsky
+    擴散＋既有 ``batch_clamp_z`` 垂向夾限）驅動，等同假設海床沉積物可被
+    再懸浮，量測「不再懸浮」這個基線假設讓來源足跡偏近多少。每次符合條件
+    都會在回傳值的 ``BackwardDriverResult.bed_reflect_events`` 多寫一筆
+    ``BedReflectEventRecord`` 稽核（不是終止事件，不進入 ``departures``），
+    供下游統計或人工核對「反射」確實發生過、發生在哪些粒子與小時。
     """
 
     arrival_time_utc_ns: int
@@ -3174,6 +3233,7 @@ class BackwardDriverConfig:
     deposition_tolerance_m: float = 0.5
     master_seed: int = 0
     stokes_depth_threshold_ratio: float | None = None
+    bed_reflect: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -3194,6 +3254,12 @@ class BackwardDriverResult:
     ``local_equals_flow=True`` 的測站（新竹／南灣／連江）不會在這裡出現，
     改由 ``departures`` 對應那筆 ``DepartureRecord`` 的
     ``also_local_domain_first_exit=True`` 表達，見該欄位 docstring。
+
+    ``bed_reflect_events``（WP-26 新增）同樣是**非終止**事件：只在
+    ``BackwardDriverConfig.bed_reflect=True`` 時才可能非空，見
+    ``BedReflectEventRecord`` docstring；``bed_reflect=False``（省略此欄位的
+    既有呼叫端）時恆為空 tuple，不影響 ``departures``／``final_status`` 等其餘
+    欄位的既有內容或型別。
     """
 
     row_particle_index: np.ndarray
@@ -3212,6 +3278,7 @@ class BackwardDriverResult:
     overhead_diagnostics: HourlyOverheadDiagnostics
     hours_run: int
     local_domain_departures: tuple[LocalDomainFirstExitRecord, ...] = ()
+    bed_reflect_events: tuple[BedReflectEventRecord, ...] = ()
 
 
 _HOUR_NS = 3_600_000_000_000
@@ -3388,6 +3455,7 @@ def run_backward_batch(
     native_status = np.full(n, NATIVE_STATUS_ACTIVE, dtype=np.int32)
     departures: list[DepartureRecord] = []
     local_departures: list[LocalDomainFirstExitRecord] = []
+    bed_reflect_events: list[BedReflectEventRecord] = []
     local_first_exit_pending = (
         np.ones(n, dtype=bool) if local_domain_polygon is not None else None
     )
@@ -3673,15 +3741,32 @@ def run_backward_batch(
                 deposit_streak[active & ~at_bed] = 0
                 newly_deposited = active & (deposit_streak >= config.deposition_consecutive_hours)
                 if np.any(newly_deposited):
-                    native_status[newly_deposited] = NATIVE_STATUS_DEPOSITED
-                    pa.status[newly_deposited] = 0
-                    for row in np.flatnonzero(newly_deposited):
-                        departures.append(
-                            DepartureRecord(
-                                int(row), NATIVE_STATUS_DEPOSITED,
-                                float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc),
+                    if config.bed_reflect:
+                        # WP-26 敏感度案例：不終止、不寫 DepartureRecord，只重設連續
+                        # 小時計數（讓粒子需要再連續停留滿門檻才會被記下一次反射
+                        # 事件）並記一筆非終止的 BedReflectEventRecord。native_status／
+                        # pa.status 完全不變，粒子維持 ACTIVE，之後這個小時循環照常
+                        # 用未修改的 mirror_rk4_substep_loop／batch_clamp_z 繼續驅動
+                        # ——見模組文件「WP-26」一節與 BackwardDriverConfig.bed_reflect
+                        # docstring 對「反射」在本模組語意的誠實界定。
+                        deposit_streak[newly_deposited] = 0
+                        for row in np.flatnonzero(newly_deposited):
+                            bed_reflect_events.append(
+                                BedReflectEventRecord(
+                                    int(row),
+                                    float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc),
+                                )
                             )
-                        )
+                    else:
+                        native_status[newly_deposited] = NATIVE_STATUS_DEPOSITED
+                        pa.status[newly_deposited] = 0
+                        for row in np.flatnonzero(newly_deposited):
+                            departures.append(
+                                DepartureRecord(
+                                    int(row), NATIVE_STATUS_DEPOSITED,
+                                    float(pa.x[row]), float(pa.y[row]), float(pa.z[row]), int(hour_end_utc),
+                                )
+                            )
 
         current_utc = hour_end_utc
         hours_run += 1
@@ -3731,4 +3816,5 @@ def run_backward_batch(
         overhead_diagnostics=total_overhead,
         hours_run=hours_run,
         local_domain_departures=tuple(local_departures),
+        bed_reflect_events=tuple(bed_reflect_events),
     )

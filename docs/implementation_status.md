@@ -89,7 +89,7 @@ B／C／D 圖面可讀不會改變其 pilot-only 性質。
 沉降水平不是本模型分項，缺少波浪資料時必須保留缺值／非零 QC，不得當作 0。
 
 `CombinedMonthForcing` 的正式有效樣本提供完整分項；明確關閉 Stokes 可記有效的 0，自然
-海況計算結果也可能是有效的 0，但沒有 NWW3 波浪資料則是缺值並帶非零 QC，不能記成 0。
+海況計算結果本身也可以是有效的 0，但沒有 NWW3 波浪資料則是缺值並帶非零 QC，不能記成 0。
 只有總速度的 synthetic callback 標為 `total_only`，不能當作 OCM／NWW3 來源證據。`not_sampled`、`missing`、`invalid`、
 `nonfinite` 與 `sum_mismatch` 各自保留狀態；缺資料在資料契約中是 `None`／NaN sentinel，
 不可與 0 混淆。

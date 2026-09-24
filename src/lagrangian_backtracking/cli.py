@@ -1147,7 +1147,9 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         )
         arrivals_by_time_utc_ns = {int(record.time_utc_ns): record for record in arrival_records}
         maximum_age_days = bed_residence_time.maximum_age_days
-        sampling_seed = bed_residence_time.sampling_seed
+        # WP-26：改讀 effective_sampling_seed，讓 age_sampling_seed 覆寫（若有明示）
+        # 也套用到 fixed_calendar_window 的年齡解析；未明示時逐位元相同。
+        sampling_seed = bed_residence_time.effective_sampling_seed
 
     units = native_orchestrator.resolve_native_work_unit_backtrack_horizons(
         units,
@@ -1936,7 +1938,8 @@ def run_native_derive_horizon_command(argv: Sequence[str] | None = None) -> int:
         )
         arrivals_by_time_utc_ns = {int(record.time_utc_ns): record for record in arrival_records}
         maximum_age_days = bed_residence_time.maximum_age_days
-        sampling_seed = bed_residence_time.sampling_seed
+        # WP-26：同上，改讀 effective_sampling_seed。
+        sampling_seed = bed_residence_time.effective_sampling_seed
 
     manifest = native_horizon_derivation.derive_result_directory(
         source_results_dir=args.source_results_dir,
@@ -1990,6 +1993,14 @@ def _native_figures_parser() -> argparse.ArgumentParser:
         help="水平總覽／局部／深度年齡三張圖共用的代表軌跡樣本上限",
     )
     parser.add_argument("--dpi", type=int, default=150, help="輸出 PNG 解析度")
+    parser.add_argument(
+        "--figure-text", choices=list(native_figures.FIGURE_TEXT_MODES), default="full",
+        help=(
+            "圖面文字層級（WP-24b）：full（預設）畫出標題／副標／圖例／座標軸標籤，供內部"
+            "檢視；none 只畫座標軸與圖例，不畫標題與副標，供正式報告排版——文字改由輸出目錄"
+            "的 captions.md 承載。兩種模式都會輸出 captions.md。"
+        ),
+    )
     return parser
 
 
@@ -2008,6 +2019,7 @@ def run_native_figures_command(argv: Sequence[str] | None = None) -> int:
         font_path=args.font_path,
         max_trajectories_per_site=args.max_trajectories_per_site,
         dpi=args.dpi,
+        figure_text=args.figure_text,
     )
     output_dir = native_figures.build_native_figures(config, command=command)
     report = {

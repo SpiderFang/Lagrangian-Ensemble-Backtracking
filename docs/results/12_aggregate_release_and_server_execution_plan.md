@@ -417,7 +417,7 @@ lbt report-validate <report-release>
 `aggregate-spec-create` 不得從範例設定猜測 grid、bandwidth、age bins 或 bootstrap 次數；
 未經 PI／研究團隊核定的數值必須由命令列或核准 spec 明示。`aggregate-build` 重新載入
 原 config 與 component／geometry manifests，核對 normalized config、canonical hashes、
-scenario table 與 run plan；不能只依 trajectory 表中缺少 season/tide 的欄位推測分層。
+scenario table 與 run plan；不能只依 trajectory 表中缺少 season/tide 的欄位臆測分層。
 
 CLI 成功輸出 JSON 只包含可攜識別、計數、hash 與相對產品名稱；SERVER forcing root、
 checkpoint root、帳密及其他絕對部署路徑不得寫入 release manifest 或錯誤訊息。
