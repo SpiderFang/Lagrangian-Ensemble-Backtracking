@@ -310,6 +310,20 @@ def _assert_results_bit_identical(
         assert la.row_particle_index == lb.row_particle_index
         assert la.x_m == lb.x_m and la.y_m == lb.y_m and la.z_m == lb.z_m
         assert la.utc_ns == lb.utc_ns
+    # WP-28：bed_no_deposition 的非終止事件（一顆粒子可能出現多次，見
+    # BedNoDepositionEventRecord docstring）也要逐筆位元比對，不能只比對
+    # departures／local_domain_departures 就宣稱合併路徑與獨立路徑相同。
+    assert len(a.bed_no_deposition_events) == len(b.bed_no_deposition_events), (
+        f"{label}: bed_no_deposition_events 數量不同"
+    )
+    for ba, bb in zip(
+        sorted(a.bed_no_deposition_events, key=lambda d: (d.row_particle_index, d.utc_ns)),
+        sorted(b.bed_no_deposition_events, key=lambda d: (d.row_particle_index, d.utc_ns)),
+        strict=True,
+    ):
+        assert ba.row_particle_index == bb.row_particle_index
+        assert ba.x_m == bb.x_m and ba.y_m == bb.y_m and ba.z_m == bb.z_m
+        assert ba.utc_ns == bb.utc_ns
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1511,6 +1525,84 @@ def test_hour_major_substep_loop_impl_numba_statistically_equivalent_to_python(d
         assert status_mismatch <= max(1, int(0.05 * py_result.final_status.shape[0])), (
             unit.unit_id, status_mismatch,
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-28：HourMajorConfig.bed_no_deposition——把 WP-26 的敏感度案例接上小時
+# 主軸合併執行路徑（正式 native-plan／native-run 實際使用的路徑）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_hour_major_bed_no_deposition_matches_standalone_and_records_events(
+    driver_grid, handles
+) -> None:
+    """``HourMajorConfig.bed_no_deposition=True`` 在合併執行路徑必須與獨立呼叫
+    ``run_backward_batch`` 位元相同，且真的關閉沉積終止判定（不是宣稱接了線、
+    實際上合併路徑仍然照樣沉底）。
+
+    情境與 ``tests/test_native_backward_driver.py::
+    test_bed_no_deposition_default_bit_identical_and_sensitivity_case_never_deposits``
+    相同（單一粒子、零水平流速、起點已貼近海床），但這裡刻意走
+    ``run_flow_domain_hour_major`` 這條正式生產路徑會用到的合併執行路徑，
+    而不是直接呼叫 ``run_backward_batch``——見 ``hour_major.py``
+    ``_post_hour_checks`` 的 ``bed_no_deposition`` 分支（WP-28 新增，之前
+    這個分支在合併路徑完全不存在，設定這個旗標不會有任何效果）。
+    """
+
+    arrival_utc = 6_000 * _HOUR_NS
+    bed_z_m = -_DP_M
+
+    resolver = _make_resolver(driver_grid, u=0.0, v=0.0)
+    interest_regions = {"S": _BIG_POLYGON}
+
+    x0 = np.array([_DOMAIN_X / 2.0])
+    y0 = np.array([_DOMAIN_Y / 2.0])
+    z0 = np.array([bed_z_m + 0.1])
+    row_ids = np.arange(1, dtype=np.int64)
+    table = _FakeIdentityTable(x0_m=x0, y0_m=y0, z0_m=z0, seed_hex=_seed_hex_for(row_ids))
+
+    unit = _make_unit(
+        unit_id="U", region="R", domain="D", site="S", arrival_utc=arrival_utc,
+        settling=-0.00001, rows=row_ids,
+    )
+
+    hm_config = hm.HourMajorConfig(
+        max_backtrack_seconds=5.0 * 3600.0, dt_max_seconds=30.0, enable_diffusion=False,
+        deposition_consecutive_hours=3, deposition_tolerance_m=0.5, master_seed=11,
+        bed_no_deposition=True,
+    )
+    batch = hm.build_hour_major_domain_batch(
+        table, [unit], interest_regions=interest_regions, **_flow_only_kwargs(interest_regions),
+    )
+    merged_result_holder = hm.run_flow_domain_hour_major(
+        driver_grid, handles, batch, config=hm_config, forcing_resolver=resolver,
+    )
+    merged_result = merged_result_holder.unit_results["U"]
+
+    standalone_result = _run_unit_standalone(
+        driver_grid, handles, table=table, unit=unit, hm_config=hm_config, resolver=resolver,
+    )
+    _assert_results_bit_identical(merged_result, standalone_result, label="bed_no_deposition")
+
+    # 真的關閉了沉積終止判定：最終狀態是回溯達上限，不是 DEPOSITED；
+    # departures 完全沒有 DEPOSITED；有記到一筆不沉積事件。
+    assert merged_result.final_status[0] == bd.NATIVE_STATUS_MAX_BACKTRACK
+    assert all(d.status != bd.NATIVE_STATUS_DEPOSITED for d in merged_result.departures)
+    assert len(merged_result.bed_no_deposition_events) == 1
+    assert merged_result.bed_no_deposition_events[0].utc_ns == arrival_utc - 3 * _HOUR_NS
+
+    # 對照組：省略 bed_no_deposition（預設 False）時，同一個合併路徑必須是
+    # 既有基線行為（第 3 小時沉底），證明這個旗標真的是「開關」而不是恆定
+    # 生效或恆定失效。
+    baseline_config = dataclasses.replace(hm_config, bed_no_deposition=False)
+    baseline_batch = hm.build_hour_major_domain_batch(
+        table, [unit], interest_regions=interest_regions, **_flow_only_kwargs(interest_regions),
+    )
+    baseline_result = hm.run_flow_domain_hour_major(
+        driver_grid, handles, baseline_batch, config=baseline_config, forcing_resolver=resolver,
+    ).unit_results["U"]
+    assert baseline_result.final_status[0] == bd.NATIVE_STATUS_DEPOSITED
+    assert baseline_result.bed_no_deposition_events == ()
 
 
 # ══════════════════════════════════════════════════════════════════════════

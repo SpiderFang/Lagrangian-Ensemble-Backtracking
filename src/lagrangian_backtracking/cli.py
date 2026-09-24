@@ -1992,7 +1992,13 @@ def _native_figures_parser() -> argparse.ArgumentParser:
         "--max-trajectories-per-site", type=int, default=24,
         help="水平總覽／局部／深度年齡三張圖共用的代表軌跡樣本上限",
     )
-    parser.add_argument("--dpi", type=int, default=150, help="輸出 PNG 解析度")
+    parser.add_argument(
+        "--dpi", type=int, default=600,
+        help=(
+            "輸出 PNG 解析度（WP-25：正式交付預設 600 dpi，對齊 OCM-SVD-Analysis 成圖"
+            "規範；每張圖同時固定輸出同名 SVG，不受此參數影響）"
+        ),
+    )
     parser.add_argument(
         "--figure-text", choices=list(native_figures.FIGURE_TEXT_MODES), default="full",
         help=(

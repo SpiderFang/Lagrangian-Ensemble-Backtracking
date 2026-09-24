@@ -1107,19 +1107,26 @@ def test_stopping_conditions_and_status_codes_are_distinct(driver_grid, handles)
     assert len(set(descriptions.values())) == len(descriptions)
 
 
-def test_bed_reflect_default_bit_identical_and_sensitivity_case_never_deposits(
+def test_bed_no_deposition_default_bit_identical_and_sensitivity_case_never_deposits(
     driver_grid, handles
 ) -> None:
-    """WP-26：``bed_reflect`` 敏感度案例的兩個硬要求都要證明，不能只宣稱。
+    """WP-26／WP-28：``bed_no_deposition`` 敏感度案例的兩個硬要求都要證明，不能只宣稱。
 
-    1. 省略／明示 ``bed_reflect=False`` 必須對同一批輸入產生逐位元相同的
-       ``BackwardDriverResult``（含 ``departures``／``bed_reflect_events``），
+    （WP-28 正名：本函式與其中的欄位名原為 ``bed_reflect``／
+    ``BedReflectEventRecord``，見 ``backward_driver.py`` 模組文件「WP-26／
+    WP-28」一節的正名說明——實作行為從來就是「不沉積、不終止」，不是鏡射
+    反射，這裡把測試名稱與斷言一併正名，避免測試本身繼續延續誤導性的
+    舊名字。）
+
+    1. 省略／明示 ``bed_no_deposition=False`` 必須對同一批輸入產生逐位元相同的
+       ``BackwardDriverResult``（含 ``departures``／``bed_no_deposition_events``），
        這是現行 ``deposit_on_first_contact_and_stop`` 基線的位元相同回歸測試。
-    2. ``bed_reflect=True`` 時，本應在第 3 小時沉底的粒子改為不終止、留在
-       ``NATIVE_STATUS_ACTIVE``，並在原本會沉底的那個小時記一筆非終止的
-       ``BedReflectEventRecord``（不進入 ``departures``），直到觸及回溯上限
-       才停止——語意上與海面反射相同（不終止、事件被記錄），差異只在於本
-       模組刻意不改寫原版 ``batch_clamp_z``，見模組文件「WP-26」一節。
+    2. ``bed_no_deposition=True`` 時，本應在第 3 小時沉底的粒子改為不終止、
+       留在 ``NATIVE_STATUS_ACTIVE``，並在原本會沉底的那個小時記一筆非終止
+       的 ``BedNoDepositionEventRecord``（不進入 ``departures``），直到觸及
+       回溯上限才停止——這裡驗證的是「不沉積、不終止，交給既有物理繼續
+       驅動」，**不是**鏡射反射、也不是再懸浮動力學，見模組文件「WP-26／
+       WP-28」一節對這個敏感度案例的誠實界定。
     """
 
     arrival_utc = 6_000 * _HOUR_NS
@@ -1163,9 +1170,9 @@ def test_bed_reflect_default_bit_identical_and_sensitivity_case_never_deposits(
         master_seed=11,
     )
 
-    # ── 1. 省略 bed_reflect：必須是既有基線行為（第 3 小時沉底）───────────
+    # ── 1. 省略 bed_no_deposition：必須是既有基線行為（第 3 小時沉底）─────
     default_config = bd.BackwardDriverConfig(**common_kwargs)
-    assert default_config.bed_reflect is False
+    assert default_config.bed_no_deposition is False
     default_result = bd.run_backward_batch(
         driver_grid, handles, soa,
         seed_hex_values=seed_hex_values,
@@ -1178,13 +1185,13 @@ def test_bed_reflect_default_bit_identical_and_sensitivity_case_never_deposits(
     assert len(default_result.departures) == 1
     assert default_result.departures[0].status == bd.NATIVE_STATUS_DEPOSITED
     assert default_result.departures[0].utc_ns == arrival_utc - 3 * _HOUR_NS
-    assert default_result.bed_reflect_events == ()
+    assert default_result.bed_no_deposition_events == ()
 
-    # ── 2. 明示 bed_reflect=False：必須與省略時逐位元相同（硬要求本身）───
+    # ── 2. 明示 bed_no_deposition=False：必須與省略時逐位元相同（硬要求本身）
     explicit_false_result = bd.run_backward_batch(
         driver_grid, handles, soa,
         seed_hex_values=seed_hex_values,
-        config=bd.BackwardDriverConfig(**common_kwargs, bed_reflect=False),
+        config=bd.BackwardDriverConfig(**common_kwargs, bed_no_deposition=False),
         forcing_resolver=resolver,
         interest_region_polygon=interest_polygon,
     )
@@ -1199,35 +1206,35 @@ def test_bed_reflect_default_bit_identical_and_sensitivity_case_never_deposits(
     assert np.array_equal(explicit_false_result.trajectory_status, default_result.trajectory_status)
     assert explicit_false_result.departures == default_result.departures
     assert explicit_false_result.hours_run == default_result.hours_run
-    assert explicit_false_result.bed_reflect_events == default_result.bed_reflect_events
+    assert explicit_false_result.bed_no_deposition_events == default_result.bed_no_deposition_events
 
-    # ── 3. bed_reflect=True：不沉底，反射事件被記錄，直到回溯上限才停止 ──
-    reflect_result = bd.run_backward_batch(
+    # ── 3. bed_no_deposition=True：不沉底，不沉積事件被記錄，直到回溯上限才停止
+    no_deposition_result = bd.run_backward_batch(
         driver_grid, handles, soa,
         seed_hex_values=seed_hex_values,
-        config=bd.BackwardDriverConfig(**common_kwargs, bed_reflect=True),
+        config=bd.BackwardDriverConfig(**common_kwargs, bed_no_deposition=True),
         forcing_resolver=resolver,
         interest_region_polygon=interest_polygon,
     )
-    assert reflect_result.final_status[0] == bd.NATIVE_STATUS_MAX_BACKTRACK
-    assert reflect_result.hours_run == 5
-    assert len(reflect_result.departures) == 1
-    assert reflect_result.departures[0].status == bd.NATIVE_STATUS_MAX_BACKTRACK
+    assert no_deposition_result.final_status[0] == bd.NATIVE_STATUS_MAX_BACKTRACK
+    assert no_deposition_result.hours_run == 5
+    assert len(no_deposition_result.departures) == 1
+    assert no_deposition_result.departures[0].status == bd.NATIVE_STATUS_MAX_BACKTRACK
     # 這一批 departures 完全沒有 DEPOSITED：兩種案例的結果不會混在同一份
     # departures 統計裡（見任務書「寫進...結果目錄命名，兩種案例的結果絕不可
     # 混在同一份統計」——這裡先在資料結構層級證明互不污染）。
-    assert all(d.status != bd.NATIVE_STATUS_DEPOSITED for d in reflect_result.departures)
-    assert len(reflect_result.bed_reflect_events) == 1
-    reflect_event = reflect_result.bed_reflect_events[0]
-    assert isinstance(reflect_event, bd.BedReflectEventRecord)
-    assert reflect_event.row_particle_index == 0
-    assert reflect_event.utc_ns == arrival_utc - 3 * _HOUR_NS
+    assert all(d.status != bd.NATIVE_STATUS_DEPOSITED for d in no_deposition_result.departures)
+    assert len(no_deposition_result.bed_no_deposition_events) == 1
+    no_deposition_event = no_deposition_result.bed_no_deposition_events[0]
+    assert isinstance(no_deposition_event, bd.BedNoDepositionEventRecord)
+    assert no_deposition_event.row_particle_index == 0
+    assert no_deposition_event.utc_ns == arrival_utc - 3 * _HOUR_NS
     # 兩個案例在第 3 小時之前的物理完全相同（差異只在事後如何處置這個
-    # 「本應沉底」的判定），所以反射事件的位置理當與基線案例的沉底位置
+    # 「本應沉底」的判定），所以不沉積事件的位置理當與基線案例的沉底位置
     # 逐位元相同——這也再次證明兩種案例共用同一段軌跡計算，不會憑空分岔。
-    assert reflect_event.x_m == default_result.departures[0].x_m
-    assert reflect_event.y_m == default_result.departures[0].y_m
-    assert reflect_event.z_m == default_result.departures[0].z_m
+    assert no_deposition_event.x_m == default_result.departures[0].x_m
+    assert no_deposition_event.y_m == default_result.departures[0].y_m
+    assert no_deposition_event.z_m == default_result.departures[0].z_m
 
 
 def test_all_status_codes_are_unique_and_documented() -> None:

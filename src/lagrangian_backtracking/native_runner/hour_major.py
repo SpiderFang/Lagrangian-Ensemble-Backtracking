@@ -209,6 +209,7 @@ from .backward_driver import (
     BayTraceModuleHandles,
     ComposedCurrentAndStokesFields,
     ComposedFieldEndpoint,
+    BedNoDepositionEventRecord,
     DepartureRecord,
     HourlyOverheadDiagnostics,
     LocalCflSpatialIndex,
@@ -283,6 +284,14 @@ class HourMajorConfig:
     deposition_tolerance_m: float = 0.5
     master_seed: int = 0
     stokes_depth_threshold_ratio: float | None = None
+    bed_no_deposition: bool = False
+    """WP-26／WP-28 敏感度案例（見 ``backward_driver.BackwardDriverConfig.
+    bed_no_deposition`` docstring 與該模組文件「WP-26／WP-28」一節的完整科學
+    語意與正名說明）：預設 ``False``，行為與新增此欄位前逐位元相同。設為
+    ``True`` 時，粒子接觸海床達 ``deposition_consecutive_hours`` 門檻不視為
+    沉積、不終止，由既有物理繼續驅動——**不是**鏡射反射，也不是再懸浮動力
+    學。本欄位只是把 ``BackwardDriverConfig`` 同名欄位透傳到小時主軸合併
+    執行路徑（``_post_hour_checks``），語意完全相同，不重新定義。"""
     # 水平擴散係數（Smagorinsky，工作書式(10)）的計算實作：
     # ``"numba"``（預設）＝``smagorinsky_batch`` 的 Numba 移植，同一演算法、同一運算式，但浮點
     # 加總順序不同，與原版差 1–2 個最後有效位元（真實東北網格實測最大相對差 7e-16），屬統計
@@ -334,6 +343,7 @@ def hour_major_config_to_backward_driver_config(
         deposition_tolerance_m=config.deposition_tolerance_m,
         master_seed=config.master_seed,
         stokes_depth_threshold_ratio=config.stokes_depth_threshold_ratio,
+        bed_no_deposition=config.bed_no_deposition,
     )
 
 
@@ -605,6 +615,10 @@ class _UnitProgress:
     永遠是空 list——那些單元的 local 首次離開改由 ``departures`` 對應那筆
     ``DepartureRecord.also_local_domain_first_exit=True`` 表達，見
     ``_finalize_unit_result``。"""
+    bed_no_deposition_events: list[BedNoDepositionEventRecord] = field(default_factory=list)
+    """WP-26／WP-28 新增：只在 ``HourMajorConfig.bed_no_deposition=True`` 時
+    才可能非空，見 ``backward_driver.BedNoDepositionEventRecord`` docstring。
+    ``bed_no_deposition=False``（省略此欄位的既有呼叫端）時永遠是空 list。"""
 
 
 @dataclass
@@ -769,6 +783,7 @@ def _finalize_unit_result(group: _GroupState, progress: _UnitProgress) -> Backwa
         overhead_diagnostics=HourlyOverheadDiagnostics(),
         hours_run=progress.hours_run,
         local_domain_departures=tuple(progress.local_departures),
+        bed_no_deposition_events=tuple(progress.bed_no_deposition_events),
     )
 
 
@@ -796,6 +811,40 @@ def _record_departures(
                     DepartureRecord(
                         row_particle_index=row - progress.info.start,
                         status=status,
+                        x_m=float(group.pa.x[row]),
+                        y_m=float(group.pa.y[row]),
+                        z_m=float(group.pa.z[row]),
+                        utc_ns=int(utc_ns),
+                    )
+                )
+                break
+
+
+def _record_bed_no_deposition_events(
+    group: _GroupState, rows: np.ndarray, *, utc_ns: int
+) -> None:
+    """WP-26／WP-28：``_record_departures`` 的「不沉積」版本，非終止事件。
+
+    與 ``_record_departures`` 的關鍵差異：**不**改寫 ``group.native_status``
+    或 ``group.pa.status``——粒子維持 ``NATIVE_STATUS_ACTIVE``，只是把「本應
+    沉底」這件事記成一筆 ``BedNoDepositionEventRecord`` 分派到所屬單元（依
+    ``rows`` 找出擁有它的 ``_UnitProgress``，語意與 ``_record_departures``
+    完全對應，只是寫入 ``progress.bed_no_deposition_events`` 而不是
+    ``progress.departures``）。呼叫端必須自行負責重設 ``group.
+    deposit_streak[rows] = 0``（見 ``_post_hour_checks``），本函式只負責
+    記錄事件，不改動任何陣列狀態，這樣職責劃分與 ``backward_driver.
+    run_backward_batch`` 對應分支完全一致。
+    """
+
+    if rows.size == 0:
+        return
+    for row in rows:
+        row = int(row)
+        for progress in group.units.values():
+            if progress.info.start <= row < progress.info.stop:
+                progress.bed_no_deposition_events.append(
+                    BedNoDepositionEventRecord(
+                        row_particle_index=row - progress.info.start,
                         x_m=float(group.pa.x[row]),
                         y_m=float(group.pa.y[row]),
                         z_m=float(group.pa.z[row]),
@@ -1766,10 +1815,22 @@ def _post_hour_checks(
             group.deposit_streak[active & ~at_bed] = 0
             newly_deposited = active & (group.deposit_streak >= config.deposition_consecutive_hours)
             if np.any(newly_deposited):
-                _record_departures(
-                    group, np.flatnonzero(newly_deposited),
-                    status=NATIVE_STATUS_DEPOSITED, utc_ns=hour_end_utc,
-                )
+                if config.bed_no_deposition:
+                    # WP-26／WP-28 敏感度案例（見 HourMajorConfig.bed_no_deposition
+                    # docstring 與 backward_driver.py 模組文件「WP-26／WP-28」一節）：
+                    # 不終止、不寫 DepartureRecord，只重設連續小時計數並記一筆非
+                    # 終止的 BedNoDepositionEventRecord，逐行對應
+                    # run_backward_batch 同一分支——只是不沉積，不是反射、也不是
+                    # 再懸浮動力學。
+                    group.deposit_streak[newly_deposited] = 0
+                    _record_bed_no_deposition_events(
+                        group, np.flatnonzero(newly_deposited), utc_ns=hour_end_utc,
+                    )
+                else:
+                    _record_departures(
+                        group, np.flatnonzero(newly_deposited),
+                        status=NATIVE_STATUS_DEPOSITED, utc_ns=hour_end_utc,
+                    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1866,6 +1927,19 @@ def save_hour_major_checkpoint(
                             "utc_ns": d.utc_ns,
                         }
                         for d in progress.local_departures
+                    ],
+                    # WP-28 新增（見 _UnitProgress.bed_no_deposition_events
+                    # docstring）：格式與 local_departures 相同（非終止事件，
+                    # 沒有 status 欄位）。
+                    "bed_no_deposition_events": [
+                        {
+                            "row_particle_index": d.row_particle_index,
+                            "x_m": d.x_m,
+                            "y_m": d.y_m,
+                            "z_m": d.z_m,
+                            "utc_ns": d.utc_ns,
+                        }
+                        for d in progress.bed_no_deposition_events
                     ],
                     "has_trajectory": bool(progress.trajectory_x),
                 }
@@ -1991,6 +2065,21 @@ def load_hour_major_checkpoint(
                     )
                     for d in unit_meta["local_departures"]
                 ]
+                # WP-28 新增：舊 checkpoint（本欄位新增前寫出）沒有這個 key，
+                # 用 .get(..., []) 退回空 list——語意是「寫出當下這個敏感度
+                # 案例的支援根本還不存在」，恆為 False／恆為空，不是資料遺失
+                # （見 hour_major_provider.py 的 npz 往返採用相同的相容性策略
+                # 與 reports/WP-23-fix.md 對這個模式的完整論證）。
+                bed_no_deposition_events = [
+                    BedNoDepositionEventRecord(
+                        row_particle_index=int(d["row_particle_index"]),
+                        x_m=float(d["x_m"]),
+                        y_m=float(d["y_m"]),
+                        z_m=float(d["z_m"]),
+                        utc_ns=int(d["utc_ns"]),
+                    )
+                    for d in unit_meta.get("bed_no_deposition_events", [])
+                ]
                 units[unit_info.unit_id] = _UnitProgress(
                     info=unit_info,
                     finished=bool(unit_meta["finished"]),
@@ -2003,6 +2092,7 @@ def load_hour_major_checkpoint(
                     trajectory_status=trajectory_status,
                     departures=departures,
                     local_departures=local_departures,
+                    bed_no_deposition_events=bed_no_deposition_events,
                 )
 
         groups.append(

@@ -944,3 +944,385 @@ def test_figure_text_rejects_unknown_value(tmp_path: Path, synthetic_inputs: tup
             postprocess_dir=postprocess_dir, coastline_path=coastline_path,
             output_dir=tmp_path / "figures-out-bad-mode", figure_text="partial",
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WP-25：對齊 OCM-SVD-Analysis 正式成圖規範——輸出格式（PNG+SVG）、固定色階、
+# 跨站色條刻度一致化，以及水平軌跡圖移除 local domain 圖層
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_svg_and_png_both_produced_with_matching_dpi(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """每張圖必須同時輸出 ``.png``（指定 dpi）與同名 ``.svg``（向量），且兩者的
+    SHA-256 都記進 manifest 的 `output_png_sha256`／`output_svg_sha256`。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-formats"
+    requested_dpi = 220
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+        dpi=requested_dpi,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["output_formats"] == ["png", "svg"]
+
+    from PIL import Image
+
+    for site_id in ("site_a", "site_b"):
+        for stem in native_figures.FIGURE_STEMS:
+            png_path = output_dir / site_id / f"{stem}.png"
+            svg_path = output_dir / site_id / f"{stem}.svg"
+            assert png_path.is_file() and png_path.stat().st_size > 0
+            assert svg_path.is_file() and svg_path.stat().st_size > 0
+            # SVG 是 XML 文字，內容應該可解析且含向量標記（不是整張點陣圖包裝）。
+            svg_text = svg_path.read_text(encoding="utf-8")
+            assert svg_text.lstrip().startswith("<?xml")
+            assert "<svg" in svg_text
+
+            with Image.open(png_path) as img:
+                dpi_x, dpi_y = img.info["dpi"]
+            assert abs(dpi_x - requested_dpi) < 1.0
+            assert abs(dpi_y - requested_dpi) < 1.0
+
+            svg_key = f"{site_id}/{stem}.svg"
+            assert svg_key in manifest["output_svg_sha256"]
+            assert manifest["output_svg_sha256"][svg_key]["sha256"] == _sha256_file(svg_path)
+            assert manifest["output_svg_sha256"][svg_key]["size_bytes"] == svg_path.stat().st_size
+
+
+def test_color_scales_manifest_has_fixed_vmin_and_seven_ticks_for_four_stems(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """跨站共用色階只涵蓋四種圖（見 ``_SHARED_COLOR_SCALE_STEMS``），每種都要有
+    ``vmin=0.0``、七個等距刻度、``colorbar_extend="neither"``，且兩站都有
+    per-site 的 over-limit 紀錄。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-scales"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    color_scales = manifest["color_scales"]
+    assert set(color_scales) == {
+        "source_footprint_kde", "boundary_arc_segments", "boundary_azimuth_rose",
+        "settling_velocity_breakdown",
+    }
+    for record in color_scales.values():
+        assert record["vmin"] == 0.0
+        assert record["vmax"] > 0.0
+        assert len(record["ticks"]) == 7
+        assert record["ticks"][0] == pytest.approx(0.0)
+        assert record["ticks"][-1] == pytest.approx(record["vmax"])
+        assert record["colorbar_extend"] == "neither"
+        assert set(record["per_site"]) == {"site_a", "site_b"}
+        for site_record in record["per_site"].values():
+            assert site_record["status"] == "available"
+            # vmax 定義為這批站點的跨站最大值，因此本次執行下 over-limit 必為 0
+            # （見 _compute_shared_color_scales docstring 對「與 OCM-SVD-Analysis
+            # 差異」的誠實揭露）；仍要求欄位存在，供未來改用外部固定常數時沿用
+            # 同一套統計與紀錄邏輯。
+            assert site_record["over_limit_count"] == 0
+            assert site_record["over_limit_fraction"] == 0.0
+            assert site_record["display_saturation"] is False
+
+
+def test_compute_shared_color_scales_pools_across_sites_not_just_one_site() -> None:
+    """直接單元測試 ``_compute_shared_color_scales``：兩個手造站點的弧段權重
+    分布明顯不同，跨站色階的 ``vmax`` 必須等於兩站當中真正的最大值，不是只看
+    其中一站或取平均——這是「色條刻度一致化」規則的核心行為。"""
+
+    projection = DomainProjection(121.0, 24.0)
+
+    def _make_site(site_id: str, *, crossed_count: int, sector_index: int) -> native_figures.SiteData:
+        # 所有粒子都穿越、且全部落在同一個方位扇區，讓 relative_source_weight
+        # 集中變成 1.0（該站唯一有資料的扇區權重 = 1.0），藉此製造兩站之間
+        # 明顯不同的「有效」最大值：下面兩個站改用不同的粒子數與扇區數量分散
+        # 情況，讓其中一站的最大權重明顯高於另一站。
+        n = crossed_count
+        departures = {
+            "crossed_interest_region_boundary": np.ones(n, dtype=bool),
+            "departure_azimuth_sector_index": np.array(
+                [sector_index] * (n - 1) + [(sector_index + 1) % 16], dtype=object
+            ),
+            "boundary_segment_id": np.array([f"{site_id}_flow_open_boundary"] * n, dtype=object),
+            "boundary_arc_segment_index": np.array([0] * n, dtype=object),
+            "settling_velocity_mps": np.array([-0.01] * n, dtype=np.float64),
+        }
+        return native_figures.SiteData(
+            site_id=site_id,
+            site_label_zh=site_id,
+            projection=projection,
+            departures=departures,
+            trajectories=(),
+            kde=None,
+            summary={},
+            arc_segments_by_boundary={},
+            azimuth_sector_count=16,
+            boundary_arc_segment_count=1,
+            local_equals_flow=True,
+            local_first_exit_particle_count=0,
+            local_first_exit_fraction=0.0,
+            local_departures_by_row={},
+        )
+
+    # site_low：10 顆粒子，1 顆落在另一扇區 → 主要扇區權重 0.9。
+    # site_high：100 顆粒子，只有 1 顆落在另一扇區 → 主要扇區權重 0.99。
+    site_low = _make_site("site_low", crossed_count=10, sector_index=0)
+    site_high = _make_site("site_high", crossed_count=100, sector_index=0)
+
+    scales = native_figures._compute_shared_color_scales((site_low, site_high))
+    rose_scale = scales["boundary_azimuth_rose"]
+    assert rose_scale.vmax == pytest.approx(0.99)
+    assert rose_scale.vmin == 0.0
+
+    # 兩站共用同一個 ColorScale 物件的 vmax，不是各自獨立算出 0.9／0.99。
+    manifest_block = native_figures._build_color_scale_manifest((site_low, site_high), scales)
+    assert manifest_block["boundary_azimuth_rose"]["vmax"] == pytest.approx(0.99)
+    low_over_limit = manifest_block["boundary_azimuth_rose"]["per_site"]["site_low"]
+    high_over_limit = manifest_block["boundary_azimuth_rose"]["per_site"]["site_high"]
+    assert low_over_limit["over_limit_count"] == 0  # 0.9 < 0.99，不超限
+    assert high_over_limit["over_limit_count"] == 0  # 0.99 就是上限本身，不超限
+
+
+def test_color_scale_over_limit_reports_saturation_without_clipping_data() -> None:
+    """直接單元測試 :meth:`ColorScale.over_limit`：提供一個刻意小於實際資料
+    最大值的 ``vmax``（模擬未來若採用外部核定的固定常數，新資料可能超過它），
+    確認超限筆數、比例與 ``display_saturation`` 正確，且來源陣列本身不被改寫
+    （呼叫端只用來標示狀態，不做任何資料裁切）。"""
+
+    scale = native_figures.ColorScale(vmin=0.0, vmax=0.5, tick_count=6)
+    values = np.array([0.1, 0.2, 0.6, 0.6, 0.9, np.nan])
+
+    count, fraction, saturated = scale.over_limit(values)
+
+    assert count == 3  # 0.6, 0.6, 0.9 三筆超過 0.5
+    assert fraction == pytest.approx(3 / 5)  # 分母只計入 5 個有限值，NaN 不計
+    assert saturated is True
+    # 原始陣列不應被就地修改（呼叫端只讀，不裁切）。
+    assert values[2] == 0.6
+    assert values[4] == 0.9
+
+    ticks = scale.ticks()
+    assert len(ticks) == 6
+    assert ticks[0] == pytest.approx(0.0)
+    assert ticks[-1] == pytest.approx(0.5)
+
+
+def test_color_scale_rejects_non_positive_range() -> None:
+    with pytest.raises(native_figures.FiguresError, match="vmax"):
+        native_figures.ColorScale(vmin=0.0, vmax=0.0)
+    with pytest.raises(native_figures.FiguresError, match="vmax"):
+        native_figures.ColorScale(vmin=1.0, vmax=0.5)
+
+
+def test_kde_plot_uses_identical_color_limits_across_sites(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """端到端驗證：``source_footprint_kde.png`` 實際繪圖時，兩站的 ``pcolormesh``
+    ``get_clim()`` 必須完全相同（同一組 ``vmin``／``vmax``），不是各自依自己的
+    資料範圍正規化。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-kde-clim"
+
+    clims: dict[str, tuple[float, float]] = {}
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        if path.name == "source_footprint_kde.png":
+            mesh = fig.axes[0].collections[0]
+            clims[path.parent.name] = mesh.get_clim()
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    assert set(clims) == {"site_a", "site_b"}
+    assert clims["site_a"] == clims["site_b"]
+
+
+# ── WP-25 任務 0：水平軌跡圖移除 local domain 圖層（僅圖面，資料層不變）────
+
+
+def test_horizontal_plots_no_longer_draw_local_domain_boundary_or_marker(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """``horizontal_overview``／``horizontal_local`` 不應再畫出 local domain
+    邊界線（橘色點線）或 local 首次離開標記（空心橘色菱形），即使
+    ``site_a``（``local_equals_flow=False``）確實有 local 首次離開資料可畫。
+    只檢查圖例文字與線條顏色，不逐像素比對。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-no-local-layer"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    for stem in ("horizontal_overview", "horizontal_local"):
+        for site_id in ("site_a", "site_b"):
+            svg_path = output_dir / site_id / f"{stem}.svg"
+            svg_text = svg_path.read_text(encoding="utf-8")
+            # local domain 邊界線／標記的邊框色是 #b35806（見已移除的
+            # _BOUNDARY_LINE_STYLE_BY_KIND["local"]／_LOCAL_FIRST_EXIT_MARKER_
+            # STYLE），SVG 向量檔會把顏色寫成十六進位色碼字串，可直接文字比對。
+            assert "b35806" not in svg_text.lower(), f"{stem}（{site_id}）仍畫出 local domain 橘色圖層"
+
+
+def test_local_first_exit_marker_style_and_caption_helper_removed() -> None:
+    """WP-25：舊版的 local 首次離開標記樣式常數與副標說明函式應該已經整個移除
+    （不是留著但沒被呼叫），避免之後又悄悄加回某種形式的 local domain 圖層。"""
+
+    assert not hasattr(native_figures, "_LOCAL_FIRST_EXIT_MARKER_STYLE")
+    assert not hasattr(native_figures, "_local_flow_semantics_caption")
+
+
+def test_horizontal_overview_caption_no_longer_mentions_local_domain_layer(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """``captions.md`` 的圖說同步更新：``horizontal_overview``／
+    ``horizontal_local`` 的圖說不再提到圖面上的 local domain 邊界或首次離開
+    標記（資料層 local_domain_departures.parquet 仍照常存在，只是不在圖說裡
+    描述成「這張圖畫了什麼」）。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-caption-no-local"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    for site_id in ("site_a", "site_b"):
+        for stem in ("horizontal_overview", "horizontal_local"):
+            caption = manifest["output_png_sha256"][f"{site_id}/{stem}.png"]["caption"]
+            # 圖說仍可能「提到」local domain（例如解釋為什麼這次不畫、資料去哪
+            # 查），但不得再宣稱圖面上真的畫了這些圖層——舊版這幾句正面宣稱的
+            # 文字必須整段消失，不是只改個說法。
+            assert "空心橘色菱形" not in caption
+            assert "同時標示 local domain 與 flow domain 兩條開放邊界" not in caption
+            assert "疊 local／flow 兩條開放邊界" not in caption
+            assert "local_domain_departures.parquet 的 local 首次" not in caption
+            assert "不畫 local domain" in caption
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WP-25：JSON 契約與 figures.py 執行期常數一致性檢查
+#
+# figures.py 並未在執行期讀取 docs/data/native_figures_formal_output_policy_v1.json
+# （見該檔 changelog 說明），因此兩邊資料「不得各寫一套而對不起來」這件事改由
+# 本測試逐項自動比對常數值來保證：任一邊修改而未同步更新另一邊時，本測試會
+# 失敗，而不是等到人工比對才發現。
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _load_policy_json() -> dict:
+    policy_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "data"
+        / "native_figures_formal_output_policy_v1.json"
+    )
+    return json.loads(policy_path.read_text(encoding="utf-8"))
+
+
+def test_json_policy_document_exists_and_is_valid_json() -> None:
+    policy = _load_policy_json()
+    assert policy["schema_name"] == "lbt_native_figures_formal_output_policy"
+    assert policy["status"] == "current"
+
+
+def test_json_policy_rules_document_path_exists() -> None:
+    policy = _load_policy_json()
+    rules_path = Path(__file__).resolve().parents[1] / policy["rules_document_path"]
+    assert rules_path.is_file(), f"JSON 契約指向的規則文件不存在：{rules_path}"
+
+
+def test_json_policy_matches_figures_py_runtime_constants() -> None:
+    """逐項比對 JSON 契約宣告的常數與 ``figures.py`` 實際的執行期常數。"""
+
+    policy = _load_policy_json()
+
+    assert tuple(policy["figure_stems"]["value"]) == native_figures.FIGURE_STEMS
+
+    assert dict(policy["site_labels_zh"]["value"]) == dict(native_figures.SITE_LABELS_ZH)
+
+    assert tuple(policy["figure_text_modes"]["value"]) == native_figures.FIGURE_TEXT_MODES
+
+    assert (
+        tuple(policy["shared_color_scale_stems"]["value"])
+        == native_figures._SHARED_COLOR_SCALE_STEMS
+    )
+
+    excluded_declared = set(policy["shared_color_scale_stems"]["excluded_stems_and_reason"])
+    excluded_actual = set(native_figures.FIGURE_STEMS) - set(
+        native_figures._SHARED_COLOR_SCALE_STEMS
+    )
+    assert excluded_declared == excluded_actual
+
+    default_scale = native_figures.ColorScale(vmin=0.0, vmax=1.0)
+    assert policy["color_scale_policy"]["tick_count_default"] == default_scale.tick_count
+    assert policy["color_scale_policy"]["vmin_fixed"] == default_scale.vmin
+    assert policy["color_scale_policy"]["colorbar_extend"] == "neither"
+    assert policy["color_scale_policy"]["data_clipping"] is False
+
+    assert policy["output_format"]["formats"] == ["png", "svg"]
+    assert policy["output_format"]["save_function"] == "figures._save_exclusive"
+
+    assert (
+        policy["task0_local_domain_layer_removal"]["affected_figure_stems"]
+        == ["horizontal_overview", "horizontal_local"]
+    )
+    for stem in policy["task0_local_domain_layer_removal"]["affected_figure_stems"]:
+        assert stem in native_figures.FIGURE_STEMS
+    for stem in policy["task0_local_domain_layer_removal"]["unaffected_figure_stems"]:
+        assert stem in native_figures.FIGURE_STEMS
+    assert set(policy["task0_local_domain_layer_removal"]["affected_figure_stems"]) | set(
+        policy["task0_local_domain_layer_removal"]["unaffected_figure_stems"]
+    ) == set(native_figures.FIGURE_STEMS)
+
+
+def test_json_policy_dpi_default_matches_cli() -> None:
+    """JSON 契約宣告的 600 dpi 預設值須與 ``cli.py`` 的 ``--dpi`` 旗標預設值一致。"""
+
+    policy = _load_policy_json()
+    cli_path = Path(__file__).resolve().parents[1] / "src" / "lagrangian_backtracking" / "cli.py"
+    cli_text = cli_path.read_text(encoding="utf-8")
+    assert '"--dpi", type=int, default=600' in cli_text
+    assert policy["output_format"]["png_dpi"] == 600
+
+
+def test_json_policy_over_limit_metadata_fields_match_manifest_keys(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """JSON 契約宣告的 over-limit metadata 欄位名稱須真的出現在 manifest 裡。"""
+
+    policy = _load_policy_json()
+    declared_fields = policy["color_scale_policy"]["over_limit_metadata_fields"]
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out-policy-manifest-check"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    for stem in native_figures._SHARED_COLOR_SCALE_STEMS:
+        per_site = manifest["color_scales"][stem]["per_site"]
+        for site_record in per_site.values():
+            if site_record.get("status") != "available":
+                continue
+            for field in declared_fields:
+                assert field in site_record

@@ -1,0 +1,132 @@
+{
+  "schema_name": "lbt_native_figures_formal_output_policy",
+  "schema_version": "1.0.0",
+  "approved_date": "2026-09-24",
+  "status": "current",
+  "rules_document_path": "docs/results/17_native_figures_formal_output_rules.md",
+  "consistency_check": "tests/test_native_figures.py::test_json_policy_matches_figures_py_runtime_constants",
+  "note_zh": "本檔為機器可讀契約，人類可讀規則與理由見 rules_document_path。figures.py 未在執行期讀取本檔（見 changelog v1.0.0 說明）；兩者的一致性改由 consistency_check 所指的自動化測試逐項比對常數，任一方修改而未同步更新另一方時測試會失敗。",
+  "changelog": [
+    {
+      "version": "1.0.0",
+      "date": "2026-09-24",
+      "change": "首次建立。對齊 OCM-SVD-Analysis water_column_svd_formal_spatial_figure_policy_v1.json（schema_version 1.8.5）之雙格式輸出、固定色階與超限記錄、跨站色階一致化三項規則；記錄任務 0（水平軌跡圖移除 local domain 圖層）之範圍與資料層不變承諾。figures.py 未在執行期讀取本檔——LBT 現有實作已在 WP-25 之前完成並通過完整測試，改用本檔逐項對照的自動化測試機制以避免對已驗證程式碼做非必要的重構風險；本檔的每一個數值欄位對應 figures.py 的一個具名常數或函式行為，欄位旁以 source 標明出處。"
+    }
+  ],
+  "scope": {
+    "module_path": "src/lagrangian_backtracking/native_runner/figures.py",
+    "entry_point": "build_native_figures",
+    "figure_kind": "lagrangian_trajectory_and_source_footprint_figures",
+    "not_applicable_to": "water_column_svd_spatial_mode_figures（見 rules_document 第 4 節逐條理由）"
+  },
+  "figure_stems": {
+    "source": "figures.FIGURE_STEMS",
+    "value": [
+      "horizontal_overview",
+      "horizontal_local",
+      "depth_age",
+      "terminal_counts",
+      "boundary_azimuth_rose",
+      "boundary_arc_segments",
+      "source_footprint_kde",
+      "settling_velocity_breakdown"
+    ]
+  },
+  "site_labels_zh": {
+    "source": "figures.SITE_LABELS_ZH",
+    "value": {
+      "gongliao": "貢寮",
+      "guishan": "龜山島西側",
+      "hsinchu": "新竹外海",
+      "nanwan": "南灣",
+      "lienchiang": "連江"
+    }
+  },
+  "figure_text_modes": {
+    "source": "figures.FIGURE_TEXT_MODES",
+    "value": ["full", "none"],
+    "note_zh": "WP-24b 建立，本次 WP-25 未變更此行為；full＝標題／副標／圖例／座標軸標籤全部畫出，none＝只畫座標軸與圖例，文字改由 captions.md 承載。"
+  },
+  "task0_local_domain_layer_removal": {
+    "status": "completed",
+    "affected_figure_stems": ["horizontal_overview", "horizontal_local"],
+    "removed_from_figure": [
+      "local domain 橘色點線邊界",
+      "local 首次離開橘色空心菱形標記",
+      "圖例中對應的兩個項目",
+      "副標中解釋 local／flow 差異的說明行"
+    ],
+    "data_layer_unchanged": [
+      "local_domain_departures.parquet",
+      "local_domain_first_exit_summary_by_site.parquet",
+      "departures.parquet.also_local_domain_first_exit"
+    ],
+    "unaffected_figure_stems": [
+      "depth_age",
+      "terminal_counts",
+      "boundary_azimuth_rose",
+      "boundary_arc_segments",
+      "source_footprint_kde",
+      "settling_velocity_breakdown"
+    ],
+    "note_zh": "boundary_arc_segments 與 source_footprint_kde 兩張圖仍依需要畫出 local domain 邊界，因為呈現 local／flow 邊界幾何關係正是這兩張圖的設計目的；移除範圍僅限研究團隊明確指出的 horizontal_overview／horizontal_local 兩張圖。"
+  },
+  "output_format": {
+    "adopted_from": "OCM-SVD-Analysis water_column_svd_formal_spatial_figure_policy_v1.json formal_delivery",
+    "formats": ["png", "svg"],
+    "png_dpi": 600,
+    "png_dpi_source": "cli.py --dpi flag default (line ~1996)",
+    "save_function": "figures._save_exclusive",
+    "save_mode": "exclusive_write_no_overwrite",
+    "manifest_fields": ["output_formats", "output_png_sha256", "output_svg_sha256"]
+  },
+  "color_scale_policy": {
+    "adopted_from": "OCM-SVD-Analysis fixed vmin/vmax + over-limit saturation (no data clipping)",
+    "color_scale_dataclass": "figures.ColorScale",
+    "vmin_fixed": 0.0,
+    "vmin_rationale_zh": "KDE 密度與相對來源權重皆為非負量",
+    "tick_count_default": 7,
+    "vmax_basis": "max_of_finite_values_across_selected_sites_this_run",
+    "vmax_basis_diverges_from_ocm_zh": "OCM-SVD-Analysis 之 vmax=0.024 為經審查之歷史常數；LBT 尚未建立此類跨 run 常數，見 rules_document 第 5 節誠實揭露。",
+    "colorbar_extend": "neither",
+    "data_clipping": false,
+    "display_saturation_mechanism": "matplotlib Normalize(vmin, vmax) 內建飽和語意，不額外裁切資料",
+    "over_limit_metadata_fields": ["over_limit_count", "over_limit_fraction", "display_saturation"],
+    "over_limit_denominator": "finite_value_count_only",
+    "hard_limit_stop_and_resubmit": null,
+    "hard_limit_rationale_zh": "OCM-SVD-Analysis 之 1% 硬性上限機制以審查過的固定 vmax 為前提；LBT 目前 vmax 取自本次執行實際最大值，數學上不會產生超限，套用相同硬性門檻無實質意義，見 rules_document 第 4 節。"
+  },
+  "shared_color_scale_stems": {
+    "source": "figures._SHARED_COLOR_SCALE_STEMS",
+    "value": [
+      "source_footprint_kde",
+      "boundary_arc_segments",
+      "boundary_azimuth_rose",
+      "settling_velocity_breakdown"
+    ],
+    "excluded_stems_and_reason": {
+      "horizontal_overview": "顏色代表代表粒子起始深度序位（rank_index/rank_total），不同站抽樣數不同，序位非跨站可比物理量",
+      "horizontal_local": "同上",
+      "depth_age": "同上",
+      "terminal_counts": "使用固定狀態別類別色（_STATUS_COLORS），與資料範圍無關，天生跨站一致"
+    }
+  },
+  "excluded_ocm_rules": {
+    "note_zh": "以下規則經檢視後判定不適用於 LBT，理由詳見 rules_document 第 4 節，此處僅列條目避免遺漏、不重複展開理由。",
+    "items": [
+      "fixed_vmax_0.024_svd_velocity_specific_constant",
+      "eta_mode_symmetric_diverging_color_scale",
+      "common_quiver_scale_and_arrow_geometry",
+      "pc_time_coefficient_display_rules_sigma_vt",
+      "mode_orthonormality_gram_matrix_qa",
+      "mode_comparison_2x2_layout_asset",
+      "propack_svd_solver_numerical_rules",
+      "scientific_notation_x10-2_colorbar_tick_label_format",
+      "1_percent_hard_limit_stop_and_resubmit"
+    ]
+  },
+  "unchanged_existing_behavior": {
+    "figure_text_flag": "--figure-text {full,none} 行為不變",
+    "captions_md": "captions.md 機制不變，僅同步更新 horizontal_overview/horizontal_local 圖說文字以反映任務 0"
+  }
+}

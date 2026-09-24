@@ -9,8 +9,10 @@
 ``summary.json``），沒有 native 後處理輸出可讀的欄位，也不認得方位扇區、弧段等
 WP-20 新增產品。本模組是**獨立的 native 專用繪圖管線**：只讀
 ``postprocess.py`` 已經寫出的檔案與呼叫端明示的海岸 GeoJSON，**不讀
-forcing、不重新積分、不改寫任何輸入**，輸出五站各八張 PNG、一份 README 與一份
-manifest。舊版管線的任何行為都不因本模組存在而改變。
+forcing、不重新積分、不改寫任何輸入**，輸出五站各八張圖（WP-25 起每張圖同時
+輸出 PNG 與 SVG 兩種格式，見「WP-25：對齊 OCM-SVD-Analysis 正式成圖規範」
+一節）、一份 README 與一份 manifest。舊版管線的任何行為都不因本模組存在而
+改變。
 
 視覺風格沿用 ``build_pilot_coastline_preview.py --style baytrace`` 已核准的版面
 語彙（標題兩行、副標列出情境身分與設定、灰色陸地、虛線 domain／開放邊界外框、
@@ -70,6 +72,46 @@ D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local 
 ``local_equals_flow=True`` 的站點兩者是同一次穿越，圖上只畫一個標記（沿用
 終止標記本身），不另外疊加 local 標記，避免造成「同一顆粒子被畫了兩次」的
 錯覺。
+
+WP-25：水平軌跡圖移除 local domain 圖層（僅圖面，資料層不變）
+--------------------------------------------------------------
+研究團隊裁決：``horizontal_overview.png``／``horizontal_local.png`` 不再畫出
+local domain 的橘色點線邊界與 local 首次離開的橘色空心菱形標記，讓貢寮／
+龜山島（A 區，``local_equals_flow=False``）與新竹／南灣／連江
+（``local_equals_flow=True``）五站的圖面版式完全一致——圖上一律只保留 flow
+domain 開放邊界（終止邊界）與依 ``final_status_code`` 著色的終止標記。這是
+**純圖面裁決**：``local_domain_departures.parquet``、
+``local_domain_first_exit_summary_by_site``、``departures.parquet`` 的
+``also_local_domain_first_exit`` 欄位一律照常產出（見上一節「WP-23」），
+:class:`SiteData` 與 :class:`TrajectorySample` 的 ``local_first_exit_*`` 欄位
+也維持照常填值；只是本模組不再把這兩個欄位畫成任何圖層。若需要 local domain
+首次離開的空間分布，仍可直接查詢上述三個資料產品，不受本次圖面裁決影響。
+其餘六種圖（`source_footprint_kde` 等）本來就不受這項裁決規範，維持原樣，
+`source_footprint_kde` 仍會畫出 local domain 開放邊界線（見該函式）。
+
+WP-25：對齊 OCM-SVD-Analysis 正式成圖規範（輸出格式與色階）
+--------------------------------------------------------------
+本模組另依 ``docs/results/17_native_figures_formal_output_rules.md``（機器可讀
+契約：``docs/data/native_figures_formal_output_policy_v1.json``）新增兩類規則，
+細節見該文件，這裡只列摘要：
+
+1. **輸出格式**：每張圖同時輸出 ``.png``（``dpi`` 由 ``NativeFiguresConfig.dpi``
+   指定，正式交付預設 600）與同名 ``.svg``（向量、不受 ``dpi`` 影響解析度）；
+   兩者的 SHA-256 都寫入 ``manifest.json``。``--figure-text`` 與
+   ``captions.md`` 的既有行為完全不變，兩種格式共用同一份標題／副標／圖例
+   邏輯，不是分別繪製兩次。
+2. **固定色階與跨站色條刻度一致化**：``source_footprint_kde``（密度）、
+   ``boundary_arc_segments``（弧段相對來源權重）、``boundary_azimuth_rose``
+   （方位扇區相對來源權重）、``settling_velocity_breakdown``（熱圖相對來源
+   權重）四張圖，改用同一批被選取站點共同的色階上下限與刻度（見
+   :func:`_compute_shared_color_scales`），不再各站各自依自己的資料最大值
+   正規化色階。超過上限的值仍以最高色顯示，不做視覺裁切；每個「站×圖」組合
+   的 ``over_limit_count``／``over_limit_fraction``／``display_saturation``
+   寫入 ``manifest.json`` 的 ``color_scales`` 區塊。``horizontal_overview``／
+   ``horizontal_local``／``depth_age`` 的色階是「代表粒子起始深度序位」
+   （``rank_index``），不是可跨站比較的物理量或比例——不同站的代表粒子抽樣
+   數（``rank_total``）本來就可能不同，因此不適用跨站固定色階，這三張圖的
+   色階規則維持原樣（見規則文件「不適用條目」一節的說明）。
 
 經緯度還原（無 domain manifest 輸入下的投影復原）
 --------------------------------------------------
@@ -1220,6 +1262,190 @@ def _status_counts(departures: Mapping[str, np.ndarray]) -> dict[int, int]:
     return counts
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# WP-25：跨站共用色階（對齊 OCM-SVD-Analysis 的「四海域共同尺度」規則，見
+# docs/results/17_native_figures_formal_output_rules.md 與模組 docstring）
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SHARED_COLOR_SCALE_STEMS: tuple[str, ...] = (
+    "source_footprint_kde",
+    "boundary_arc_segments",
+    "boundary_azimuth_rose",
+    "settling_velocity_breakdown",
+)
+"""這四張圖的色階／色條在同一批被選取站點之間共用同一組上下限與刻度，讓讀者
+可以直接比較不同站點的顏色深淺（見 :func:`_compute_shared_color_scales`）。
+
+其餘四張圖（``horizontal_overview``／``horizontal_local``／``depth_age``／
+``terminal_counts``）刻意不在這裡：前三張的顏色是「代表粒子起始深度序位」
+（``rank_index``／``rank_total``），不同站的代表粒子抽樣數本來就可能不同，
+序位不是可跨站比較的物理量或比例；``terminal_counts`` 用的是固定的狀態別
+類別色（``_STATUS_COLORS``），本來就與資料範圍無關、天生就跨站一致，不需要
+額外的「共用色階」機制。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ColorScale:
+    """一張圖在跨站比較情境下共用的色階上下限與刻度。
+
+    ``vmin``／``vmax`` 是這批被選取站點共同套用的色階範圍；``tick_count``
+    個刻度在 ``[vmin, vmax]`` 之間等距分布（含頭尾兩端），供色條標示。超過
+    ``vmax`` 的值不會被裁掉或改寫，只是顯示時飽和成色階最頂端的顏色（呼叫端
+    對 ``matplotlib`` 的 ``Normalize``／``imshow``／``pcolormesh`` 傳入同一組
+    ``vmin``／``vmax`` 即可得到這個行為，這是 ``matplotlib`` 內建語意，本類別
+    不需要自己做視覺裁切）；實際超限狀況另由 :meth:`over_limit` 算出並寫進
+    manifest，供人工稽核「這批資料有沒有真的超過目前的色階上限」。
+    """
+
+    vmin: float
+    vmax: float
+    tick_count: int = 7
+
+    def __post_init__(self) -> None:
+        if self.tick_count < 2:
+            raise FiguresError("ColorScale.tick_count 必須至少為 2")
+        if not (math.isfinite(self.vmin) and math.isfinite(self.vmax)) or self.vmax <= self.vmin:
+            raise FiguresError(
+                f"ColorScale 上下限必須是有限數值且 vmax > vmin，收到 vmin={self.vmin}, vmax={self.vmax}"
+            )
+
+    def ticks(self) -> tuple[float, ...]:
+        step = (self.vmax - self.vmin) / (self.tick_count - 1)
+        return tuple(self.vmin + step * i for i in range(self.tick_count))
+
+    def over_limit(self, values: np.ndarray) -> tuple[int, float, bool]:
+        """回傳 ``(over_limit_count, over_limit_fraction, display_saturation)``。
+
+        分母是 ``values`` 中的有限值筆數（``NaN``／``inf`` 不計入，也不算超限，
+        因為那些本來就不是可比較的數值）；``values`` 全空或全非有限值時回傳
+        ``(0, 0.0, False)``，代表這一站這張圖沒有可統計的資料，不是「沒有超限」
+        的積極宣稱。
+        """
+
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return 0, 0.0, False
+        count = int(np.sum(finite > self.vmax))
+        fraction = count / finite.size
+        return count, fraction, count > 0
+
+
+def _color_scale_source_values(stem: str, site: SiteData) -> np.ndarray | None:
+    """回傳某張圖在某一站實際餵進共用色階的原始數值陣列。
+
+    :func:`_compute_shared_color_scales`（跨站 preflight，決定共同 vmax）與
+    manifest 的 over-limit 統計（單站紀錄）都呼叫這個函式，確保兩處用的是
+    同一份「這張圖的色階量到底是什麼」定義，不會算出兩種不同答案。回傳
+    ``None`` 表示這一站這張圖沒有色階資料可比（目前只有 KDE 狀態不是
+    ``"available"`` 時會發生），呼叫端不應把這解讀成「有資料但剛好是 0 筆」。
+    """
+
+    if stem == "source_footprint_kde":
+        if site.kde is None or site.kde.get("status") != "available":
+            return None
+        return np.asarray(site.kde["density_per_m2_flat"], dtype=np.float64)
+    if stem == "boundary_arc_segments":
+        weights = _compute_arc_segment_weights(site.departures, site_id=site.site_id)
+        return np.asarray([w.relative_source_weight for w in weights], dtype=np.float64)
+    if stem == "boundary_azimuth_rose":
+        weights = _compute_sector_weights(
+            site.departures, sector_count=site.azimuth_sector_count, site_id=site.site_id
+        )
+        return np.asarray([w.relative_source_weight for w in weights], dtype=np.float64)
+    if stem == "settling_velocity_breakdown":
+        sv_array = np.asarray(site.departures["settling_velocity_mps"], dtype=np.float64)
+        collected: list[float] = []
+        for sv in sorted(set(sv_array.tolist())):
+            sv_mask = np.isclose(sv_array, sv)
+            weights = _compute_sector_weights(
+                site.departures, sector_count=site.azimuth_sector_count, site_id=site.site_id,
+                extra_mask=sv_mask,
+            )
+            collected.extend(w.relative_source_weight for w in weights)
+        return np.asarray(collected, dtype=np.float64)
+    raise FiguresError(f"{stem} 不是支援共用色階的圖種")  # pragma: no cover - 呼叫端已限制範圍
+
+
+_COLOR_SCALE_DEFAULT_VMAX = 1.0
+"""某張圖在這批站點完全沒有任何可用數值時（例如全部站點都沒有粒子成功穿越
+邊界）的保底 ``vmax``。``relative_source_weight`` 與 KDE 密度都是非負量，用
+``1.0`` 只是避免 ``ColorScale`` 因 ``vmax<=vmin`` 而拒絕建構，不代表任何量測
+到的數值；這種退化情況下色條會整片顯示同一色階最低色，如實反映「這批圖沒有
+任何非零訊號」，不是刻意誤導。"""
+
+
+def _compute_shared_color_scales(sites: tuple[SiteData, ...]) -> dict[str, ColorScale]:
+    """對這批被選取的站點做一次跨站 preflight，決定
+    :data:`_SHARED_COLOR_SCALE_STEMS` 四張圖各自的共同色階。
+
+    ``vmin`` 固定為 ``0.0``（KDE 密度與相對來源權重都是非負量，見
+    ``postprocess`` 與模組 docstring 的定義）；``vmax`` 取這批站點『這次執行』
+    實際觀測到的跨站最大值。
+
+    **與 OCM-SVD-Analysis 的差異，誠實揭露**：那邊的 ``vmax=0.024`` 是先用
+    真實四海域 science run 資料做過一次 preflight、經過審查後寫死在規則文件
+    裡的常數，之後每次重繪都固定使用同一個數字，因此新資料若超過它才會真的
+    出現非零的 over-limit 紀錄。LBT 目前是第一次建立這套機制，沒有這樣一個
+    經過審查、可以直接套用到未來所有 run 的歷史常數；本函式因此把 vmax 定義
+    為「這次執行、這批站點的實際最大值」，這樣做在本次執行內一定不會有
+    over-limit（因為上限本來就取自這批資料本身），但已經達成規則要求的
+    「同一批圖之間色階刻度一致化、超限只記在 metadata、不做視覺裁切」的
+    核心行為；``over_limit_count`` 等欄位在架構上完整保留，未來若研究團隊
+    審閱後要另外核定一個跨 run 永遠固定的常數，只需要在呼叫端改用那個常數
+    建構 :class:`ColorScale` 即可，不必更動這裡的統計或繪圖邏輯。
+    """
+
+    scales: dict[str, ColorScale] = {}
+    for stem in _SHARED_COLOR_SCALE_STEMS:
+        collected: list[np.ndarray] = []
+        for site in sites:
+            values = _color_scale_source_values(stem, site)
+            if values is not None and values.size:
+                finite = values[np.isfinite(values)]
+                if finite.size:
+                    collected.append(finite)
+        pooled = np.concatenate(collected) if collected else np.array([], dtype=np.float64)
+        vmax = float(pooled.max()) if pooled.size else _COLOR_SCALE_DEFAULT_VMAX
+        if not math.isfinite(vmax) or vmax <= 0.0:
+            vmax = _COLOR_SCALE_DEFAULT_VMAX
+        scales[stem] = ColorScale(vmin=0.0, vmax=vmax)
+    return scales
+
+
+def _build_color_scale_manifest(
+    sites: tuple[SiteData, ...], color_scales: Mapping[str, ColorScale]
+) -> dict[str, Any]:
+    """把 :func:`_compute_shared_color_scales` 的結果與每站實際超限狀況整理成
+    manifest 的 ``color_scales`` 區塊（見規則文件「固定色階與超限處理」一節）。"""
+
+    result: dict[str, Any] = {}
+    for stem in _SHARED_COLOR_SCALE_STEMS:
+        scale = color_scales[stem]
+        per_site: dict[str, Any] = {}
+        for site in sites:
+            values = _color_scale_source_values(stem, site)
+            if values is None:
+                per_site[site.site_id] = {"status": "not_applicable"}
+                continue
+            count, fraction, saturated = scale.over_limit(values)
+            per_site[site.site_id] = {
+                "status": "available",
+                "sample_count": int(values.size),
+                "over_limit_count": count,
+                "over_limit_fraction": fraction,
+                "display_saturation": saturated,
+            }
+        result[stem] = {
+            "vmin": scale.vmin,
+            "vmax": scale.vmax,
+            "vmax_basis": "max_of_finite_values_across_selected_sites_this_run",
+            "ticks": list(scale.ticks()),
+            "colorbar_extend": "neither",
+            "per_site": per_site,
+        }
+    return result
+
+
 # ── 共用版面元件（標題兩行、副標、底部紅字警語、排他落檔）───────────────────
 
 
@@ -1254,48 +1480,11 @@ _BOUNDARY_LINE_STYLE_BY_KIND: Mapping[str, Mapping[str, Any]] = {
     "other": {"color": "#666666", "linewidth": 1.0, "linestyle": "-."},
 }
 
-# local domain 首次離開（非終止事件）的標記樣式：空心菱形，邊框色與 local 邊界線
-# 同色，讓「這個標記」與「哪條邊界」在視覺上互相對應；刻意用空心（不像終止標記
-# 那樣實心）強調「粒子在這裡沒有停止，仍繼續回溯」。
-_LOCAL_FIRST_EXIT_MARKER_STYLE: Mapping[str, Any] = {
-    "marker": "D",
-    "markersize": 6.5,
-    "markerfacecolor": "none",
-    "markeredgecolor": "#b35806",
-    "markeredgewidth": 1.4,
-}
-
-
-def _local_flow_semantics_caption(site: SiteData, t: _Labeler) -> str:
-    """回傳水平總覽／局部兩張圖共用的副標第三行：說明 local／flow 兩種邊界與
-    標記的差異（WP-23 要求「副標或圖說註明兩者的差別」，見模組 docstring）。
-
-    依 ``site.local_equals_flow`` 給三種文字之一：``True``（同一次穿越，圖上
-    只有一個標記）、``False``（兩個事件、兩個標記）、``None``（未知，僅提示
-    「本次 postprocess 未提供 boundary_geometries，無法判定」，不臆測）。
-    """
-
-    if site.local_equals_flow is True:
-        return t.t(
-            "local domain 與 flow domain 邊界相同：離開 local domain＝離開 flow domain，"
-            "圖上只有一個終止標記，不另畫 local 首次離開標記。",
-            "local domain equals flow domain here: leaving local = leaving flow. "
-            "Only one termination marker is drawn (no separate local-exit marker).",
-        )
-    if site.local_equals_flow is False:
-        return t.t(
-            "空心菱形＝首次離開 local domain（僅記錄，粒子當時仍繼續回溯）；"
-            "實心終止標記＝離開 flow domain 開放邊界（真正停止處）。兩者是不同時刻、不同位置的事件。",
-            "Open diamond = first exit from local domain (recorded only, tracking continued). "
-            "Filled terminal marker = exit from the flow-domain open boundary (actual stop). "
-            "These are two distinct events at different times and locations.",
-        )
-    return t.t(
-        "本次後處理未提供 boundary_geometries，無法判定 local domain 與 flow domain 是否相同"
-        "（local_equals_flow 未知），圖上不畫 local 首次離開標記。",
-        "This postprocess run did not provide boundary_geometries, so local_equals_flow is "
-        "unknown; no local-exit marker is drawn.",
-    )
+# WP-25：local domain 首次離開標記樣式（``_LOCAL_FIRST_EXIT_MARKER_STYLE``）與
+# 對應的副標說明函式（``_local_flow_semantics_caption``）已隨「水平軌跡圖移除
+# local domain 圖層」裁決一併移除（見模組 docstring「WP-25：水平軌跡圖移除
+# local domain 圖層」一節）；資料層（``local_first_exit_lon_deg`` 等欄位）仍在
+# :class:`TrajectorySample`／:class:`SiteData` 保留，只是不再有圖面樣式常數。
 
 
 def _resolve_dashed_open_boundary_lines(site: SiteData) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -1361,10 +1550,21 @@ def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
 
 
 def _save_exclusive(fig, path: Path, *, dpi: int) -> None:
-    """以排他建立方式落檔（``xb``），輸出目錄若已存在同名檔一律 fail-closed。"""
+    """以排他建立方式落檔（``xb``），輸出目錄若已存在同名檔一律 fail-closed。
+
+    WP-25：對齊 OCM-SVD-Analysis 正式成圖規範「PNG 600 dpi ＋ SVG 都出」的
+    輸出格式決定，``path``（``.png``）與其同名 ``.svg``（向量，不受 ``dpi``
+    影響解析度）在這裡一次寫出，共用同一個已經畫好的 ``Figure`` 物件，不是
+    分別呼叫繪圖函式兩次；呼叫端（:func:`build_native_figures`）另外把兩者的
+    SHA-256 都記進 manifest。任何一步失敗都不會留下另一個格式的半完成檔——
+    PNG 排他建立失敗時整個函式直接拋例外，不會嘗試寫 SVG。
+    """
 
     with path.open("xb") as stream:
         fig.savefig(stream, format="png", dpi=dpi, bbox_inches="tight")
+    svg_path = path.with_suffix(".svg")
+    with svg_path.open("xb") as stream:
+        fig.savefig(stream, format="svg", dpi=dpi, bbox_inches="tight")
 
 
 def _land_lonlat_patches(land_geometries: Sequence[Polygon | MultiPolygon]):
@@ -1406,12 +1606,16 @@ def _plot_horizontal_overview(
     boundary_kinds_present: set[str] = set()
     for base_id, (lon, lat) in boundary_lines.items():
         kind = _boundary_kind(base_id)
+        if kind == "local":
+            # WP-25：水平總覽圖不再畫 local domain 邊界（見模組 docstring
+            # 「WP-25：水平軌跡圖移除 local domain 圖層」一節）；資料仍完整保存
+            # 在 local_domain_departures.parquet 等表，只是不進這張圖。
+            continue
         boundary_kinds_present.add(kind)
         style = _BOUNDARY_LINE_STYLE_BY_KIND[kind]
         ax.plot(lon, lat, zorder=2, **style)
 
     cmap = plt.get_cmap("viridis")
-    any_local_marker = False
     for sample in site.trajectories:
         color = cmap(0.0 if sample.rank_total <= 1 else (sample.rank_index - 1) / (sample.rank_total - 1))
         ax.plot(sample.lon_deg, sample.lat_deg, color=color, linewidth=1.0, alpha=0.85, zorder=4)
@@ -1419,16 +1623,8 @@ def _plot_horizontal_overview(
             sample.lon_deg[0], sample.lat_deg[0], marker="o", markersize=5.2, markerfacecolor="#1a9850",
             markeredgecolor="white", markeredgewidth=0.6, linestyle="None", zorder=6,
         )
-        # local domain 首次離開（非終止）：只有 local_equals_flow=False 的測站、
-        # 且這顆代表粒子確實有對應紀錄時才畫；與下面的終止標記是兩個不同事件
-        # （見 _local_flow_semantics_caption），local_equals_flow=True 的測站
-        # 這兩個欄位恆為 None，不會多畫一個重疊標記。
-        if sample.local_first_exit_lon_deg is not None and sample.local_first_exit_lat_deg is not None:
-            any_local_marker = True
-            ax.plot(
-                sample.local_first_exit_lon_deg, sample.local_first_exit_lat_deg,
-                linestyle="None", zorder=6.5, **_LOCAL_FIRST_EXIT_MARKER_STYLE,
-            )
+        # WP-25：不再畫 local domain 首次離開標記（資料仍在 sample.local_first_
+        # exit_lon_deg／lat_deg，只是這張圖不使用），圖上只保留下面的終止標記。
         marker = _STATUS_MARKERS.get(sample.final_status_code, "X")
         color_end = _STATUS_COLORS.get(sample.final_status_code, "#d62728")
         ax.plot(
@@ -1464,31 +1660,11 @@ def _plot_horizontal_overview(
                 label=t.t("flow domain 開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
             )
         )
-    if "local" in boundary_kinds_present:
-        handles.append(
-            Line2D(
-                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["local"],
-                label=t.t(
-                    "local domain 開放邊界（記錄用，非終止）",
-                    "Local-domain open boundary (record only, non-terminal)",
-                ),
-            )
-        )
     if "other" in boundary_kinds_present:
         handles.append(
             Line2D(
                 [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["other"],
                 label=t.t("未分類開放邊界", "Unclassified open boundary"),
-            )
-        )
-    if any_local_marker:
-        handles.append(
-            Line2D(
-                [], [], linestyle="None", **_LOCAL_FIRST_EXIT_MARKER_STYLE,
-                label=t.t(
-                    "local domain 首次離開（非終止，繼續回溯）",
-                    "First exit from local domain (non-terminal, tracking continued)",
-                ),
             )
         )
     for code in _STATUS_ORDER:
@@ -1510,11 +1686,8 @@ def _plot_horizontal_overview(
         _site_subtitle(site, t, extra=t.t("｜線色：代表粒子起始深度序位（淺→深）", "")),
         figure_text=figure_text,
     )
-    if figure_text == "full":
-        fig.text(
-            0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
-            fontproperties=font, fontsize=8, wrap=True,
-        )
+    # WP-25：不再畫 local／flow 差異說明副標（圖上已經只剩 flow domain 邊界，
+    # 不需要再解釋兩者差異）。
     # 改用 subplots_adjust 明確指定邊界，不用 tight_layout：tight_layout 與
     # ax.set_aspect(..., adjustable="box") 併用時，在某些「經緯度範圍很扁」的
     # 站點（例如本圖含寬闊 flow_open_boundary 外框）會於內部多重繪製階段留下
@@ -1550,6 +1723,10 @@ def _plot_horizontal_local(
     boundary_kinds_present: set[str] = set()
     for base_id, (lon, lat) in boundary_lines.items():
         kind = _boundary_kind(base_id)
+        if kind == "local":
+            # WP-25：局部放大圖同樣不再畫 local domain 邊界（見水平總覽圖同一
+            # 段說明）；資料仍完整保存，只是不進這張圖。
+            continue
         boundary_kinds_present.add(kind)
         style = _BOUNDARY_LINE_STYLE_BY_KIND[kind]
         # flow domain 邊界通常遠在局部圖視窗之外（局部圖只依代表粒子範圍縮放，
@@ -1557,7 +1734,6 @@ def _plot_horizontal_local(
         # 涵蓋到時能看見；不在範圍內時 matplotlib 自動裁掉，不影響軸範圍。
         ax.plot(lon - x0, lat - y0, zorder=2, **style)
     cmap = plt.get_cmap("viridis")
-    any_local_marker = False
     all_lon: list[float] = []
     all_lat: list[float] = []
     for sample in site.trajectories:
@@ -1568,12 +1744,7 @@ def _plot_horizontal_local(
             markerfacecolor="#1a9850", markeredgecolor="white", markeredgewidth=0.7,
             linestyle="None", zorder=6,
         )
-        if sample.local_first_exit_lon_deg is not None and sample.local_first_exit_lat_deg is not None:
-            any_local_marker = True
-            ax.plot(
-                sample.local_first_exit_lon_deg - x0, sample.local_first_exit_lat_deg - y0,
-                linestyle="None", zorder=6.5, **_LOCAL_FIRST_EXIT_MARKER_STYLE,
-            )
+        # WP-25：不再畫 local domain 首次離開標記（理由同水平總覽圖）。
         marker = _STATUS_MARKERS.get(sample.final_status_code, "X")
         color_end = _STATUS_COLORS.get(sample.final_status_code, "#d62728")
         ax.plot(
@@ -1609,26 +1780,6 @@ def _plot_horizontal_local(
                 label=t.t("flow domain 開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
             )
         )
-    if "local" in boundary_kinds_present:
-        handles.append(
-            Line2D(
-                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["local"],
-                label=t.t(
-                    "local domain 開放邊界（記錄用，非終止）",
-                    "Local-domain open boundary (record only, non-terminal)",
-                ),
-            )
-        )
-    if any_local_marker:
-        handles.append(
-            Line2D(
-                [], [], linestyle="None", **_LOCAL_FIRST_EXIT_MARKER_STYLE,
-                label=t.t(
-                    "local domain 首次離開（非終止，繼續回溯）",
-                    "First exit from local domain (non-terminal, tracking continued)",
-                ),
-            )
-        )
     fig.legend(
         handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.045), ncol=2, prop=font, frameon=True,
         fontsize=8,
@@ -1640,11 +1791,7 @@ def _plot_horizontal_local(
         _site_subtitle(site, t),
         figure_text=figure_text,
     )
-    if figure_text == "full":
-        fig.text(
-            0.5, 0.905, _local_flow_semantics_caption(site, t), ha="center", va="top",
-            fontproperties=font, fontsize=8, wrap=True,
-        )
+    # WP-25：不再畫 local／flow 差異說明副標（理由同水平總覽圖）。
     fig.subplots_adjust(left=0.05, bottom=0.24, right=0.98, top=_title_top_margin(figure_text, full=0.84))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
@@ -1736,9 +1883,15 @@ def _plot_terminal_counts(
 
 
 def _plot_boundary_azimuth_rose(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str,
+    color_scale: ColorScale,
 ) -> None:
-    """16 方位扇區相對來源權重極座標玫瑰圖（正北向上、順時針）。"""
+    """16 方位扇區相對來源權重極座標玫瑰圖（正北向上、順時針）。
+
+    ``color_scale``（WP-25）同時固定極座標半徑軸上限與長條顏色映射的
+    ``vmin``／``vmax``，讓五站的玫瑰圖用同一把尺——半徑本身已經是可直接比較
+    的相對來源權重，顏色只是輔助辨識，見 :data:`_SHARED_COLOR_SCALE_STEMS`。
+    """
 
     import matplotlib
 
@@ -1759,16 +1912,25 @@ def _plot_boundary_azimuth_rose(
     ax.set_theta_zero_location("N")
     ax.set_theta_direction(-1)
     cmap = plt.get_cmap("viridis")
-    max_radius = float(radii.max()) if radii.size and radii.max() > 0 else 1.0
+    norm = plt.Normalize(color_scale.vmin, color_scale.vmax)
     ax.bar(
-        theta, radii, width=width, color=[cmap(r / max_radius) for r in radii],
+        theta, radii, width=width, color=[cmap(norm(r)) for r in radii],
         edgecolor="white", linewidth=0.6,
     )
+    ax.set_ylim(color_scale.vmin, color_scale.vmax)
     ax.set_xticks(np.radians([i * 360.0 / 16 for i in range(16)]))
     ax.set_xticklabels(
         _COMPASS_16_ORDER if n == 16 else [f"{i}" for i in range(n)], fontproperties=font, fontsize=8
     )
     ax.set_ylabel("")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.045, pad=0.09, shrink=0.75)
+    cbar.set_ticks(color_scale.ticks())
+    cbar.set_label(
+        t.t("相對來源權重（跨站共用色階）", "Relative source weight (shared cross-site scale)"),
+        fontproperties=font,
+    )
 
     top3 = sorted(weights, key=lambda w: w.relative_source_weight, reverse=True)[:3]
     separator = t.t("；", "; ")
@@ -1811,9 +1973,14 @@ def _short_boundary_label(base_boundary_segment_id: str) -> str:
 
 
 def _plot_boundary_arc_segments(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str,
+    color_scale: ColorScale,
 ) -> None:
-    """開放邊界折線依弧段著色（權重色階）＋弧段權重長條圖。"""
+    """開放邊界折線依弧段著色（權重色階）＋弧段權重長條圖。
+
+    ``color_scale``（WP-25）固定色階上下限與刻度，讓五站可直接比較顏色深淺；
+    見 :data:`_SHARED_COLOR_SCALE_STEMS`。
+    """
 
     import matplotlib
 
@@ -1822,8 +1989,8 @@ def _plot_boundary_arc_segments(
 
     weights = _compute_arc_segment_weights(site.departures, site_id=site.site_id)
     by_key = {(w.base_boundary_segment_id, w.arc_segment_index): w for w in weights}
-    max_weight = max((w.relative_source_weight for w in weights), default=0.0) or 1.0
     cmap = plt.get_cmap("viridis")
+    norm = plt.Normalize(color_scale.vmin, color_scale.vmax)
 
     fig, (ax_map, ax_bar) = plt.subplots(
         1, 2, figsize=(15, 7), dpi=150, gridspec_kw={"width_ratios": [1.1, 1.0]}
@@ -1836,7 +2003,7 @@ def _plot_boundary_arc_segments(
             index = int(row["arc_segment_index"])
             weight = by_key.get((base_id, index))
             value = weight.relative_source_weight if weight is not None else 0.0
-            color = cmap(value / max_weight)
+            color = cmap(norm(value))
             ax_map.plot(
                 [row["start_lon_deg"], row["end_lon_deg"]], [row["start_lat_deg"], row["end_lat_deg"]],
                 color=color, linewidth=3.5, solid_capstyle="butt", zorder=3,
@@ -1873,18 +2040,26 @@ def _plot_boundary_arc_segments(
     else:
         center_lat = 25.0
     ax_map.set_aspect(1.0 / math.cos(math.radians(center_lat)), adjustable="box")
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, max_weight))
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     cbar = fig.colorbar(sm, ax=ax_map, fraction=0.05, pad=0.02)
-    cbar.set_label(t.t("相對來源權重", "Relative source weight"), fontproperties=font)
+    cbar.set_ticks(color_scale.ticks())
+    cbar.set_label(
+        t.t("相對來源權重（跨站共用色階）", "Relative source weight (shared cross-site scale)"),
+        fontproperties=font,
+    )
 
     order = sorted(range(len(all_labels)), key=lambda i: -all_values[i])
     ax_bar.bar(
         range(len(order)), [all_values[i] for i in order],
-        color=[cmap(all_values[i] / max_weight) for i in order],
+        color=[cmap(norm(all_values[i])) for i in order],
     )
     ax_bar.set_xticks(range(len(order)))
     ax_bar.set_xticklabels([all_labels[i] for i in order], rotation=90, fontsize=6)
-    ax_bar.set_ylabel(t.t("相對來源權重", "Relative source weight"), fontproperties=font)
+    ax_bar.set_ylim(color_scale.vmin, color_scale.vmax)
+    ax_bar.set_ylabel(
+        t.t("相對來源權重（跨站共用色階）", "Relative source weight (shared cross-site scale)"),
+        fontproperties=font,
+    )
     ax_bar.grid(axis="y", color="#dddddd", linewidth=0.6)
 
     _add_two_line_title(
@@ -1909,8 +2084,14 @@ def _plot_source_footprint_kde(
     path: Path,
     dpi: int,
     figure_text: str,
+    color_scale: ColorScale,
 ) -> None:
-    """由 ``kde_by_site`` 畫條件式來源足跡：密度色階＋HDR 等值線，疊海岸線與開放邊界。"""
+    """由 ``kde_by_site`` 畫條件式來源足跡：密度色階＋HDR 等值線，疊海岸線與開放邊界。
+
+    ``color_scale``（WP-25）固定密度色階的 ``vmin``／``vmax``，讓五站可直接
+    比較密度深淺；超過 ``vmax`` 的格點仍以最高色顯示，不裁切資料（見
+    :data:`_SHARED_COLOR_SCALE_STEMS`）。
+    """
 
     import matplotlib
 
@@ -1938,10 +2119,17 @@ def _plot_source_footprint_kde(
         lon_grid = lon_grid.reshape(rows, cols)
         lat_grid = lat_grid.reshape(rows, cols)
 
-        mesh = ax.pcolormesh(lon_grid, lat_grid, density, cmap="viridis", shading="auto", zorder=2, alpha=0.9)
+        mesh = ax.pcolormesh(
+            lon_grid, lat_grid, density, cmap="viridis", shading="auto", zorder=2, alpha=0.9,
+            vmin=color_scale.vmin, vmax=color_scale.vmax,
+        )
         cbar = fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.02)
+        cbar.set_ticks(color_scale.ticks())
         cbar.set_label(
-            t.t("條件式來源足跡密度（每平方公尺）", "Conditional source footprint density (per m^2)"),
+            t.t(
+                "條件式來源足跡密度（每平方公尺，跨站共用色階）",
+                "Conditional source footprint density (per m^2, shared cross-site scale)",
+            ),
             fontproperties=font,
         )
 
@@ -2007,9 +2195,14 @@ def _plot_source_footprint_kde(
 
 
 def _plot_settling_velocity_breakdown(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
+    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str,
+    color_scale: ColorScale,
 ) -> None:
-    """十種沉降速度的穿越比例（長條圖）與主要方位扇區權重比較（熱圖）。"""
+    """十種沉降速度的穿越比例（長條圖）與主要方位扇區權重比較（熱圖）。
+
+    ``color_scale``（WP-25）固定熱圖色階上下限與刻度，讓五站可直接比較顏色
+    深淺（見 :data:`_SHARED_COLOR_SCALE_STEMS`）。
+    """
 
     import matplotlib
 
@@ -2053,17 +2246,21 @@ def _plot_settling_velocity_breakdown(
     ]
     # origin="lower"讓熱圖第 0 列（sv_values 最小、下沉最快）畫在圖底部，
     # 與左側 barh 預設「索引 0 在最下面」的列順序一致，兩張子圖才能逐列對照。
-    im = ax_heat.imshow(heatmap, aspect="auto", cmap="viridis", origin="lower")
+    im = ax_heat.imshow(
+        heatmap, aspect="auto", cmap="viridis", origin="lower",
+        vmin=color_scale.vmin, vmax=color_scale.vmax,
+    )
     ax_heat.set_xticks(range(len(sector_labels)))
     ax_heat.set_xticklabels(sector_labels, fontsize=7, rotation=90)
     ax_heat.set_yticks(range(len(sv_values)))
     ax_heat.set_yticklabels(sv_labels, fontsize=8)
     ax_heat.set_xlabel(t.t("方位扇區", "Azimuth sector"), fontproperties=font)
     cbar = fig.colorbar(im, ax=ax_heat, fraction=0.045, pad=0.02)
+    cbar.set_ticks(color_scale.ticks())
     cbar.set_label(
         t.t(
-            "相對來源權重（同沉降速度分組內）",
-            "Relative source weight (within same settling velocity)",
+            "相對來源權重（同沉降速度分組內，跨站共用色階）",
+            "Relative source weight (within same settling velocity, shared cross-site scale)",
         ),
         fontproperties=font,
     )
@@ -2088,7 +2285,14 @@ def _dispatch_plot(
     path: Path,
     dpi: int,
     figure_text: str,
+    color_scales: Mapping[str, ColorScale],
 ) -> None:
+    """依 ``stem`` 呼叫對應的繪圖函式；``color_scales`` 是
+    :func:`_compute_shared_color_scales` 算好的跨站共用色階，只有
+    :data:`_SHARED_COLOR_SCALE_STEMS` 內的四種圖會用到，其餘圖種忽略此參數
+    （見各圖種色階規則的說明）。
+    """
+
     if stem == "horizontal_overview":
         _plot_horizontal_overview(site, land_geometries, t, font, path, dpi, figure_text)
     elif stem == "horizontal_local":
@@ -2098,13 +2302,15 @@ def _dispatch_plot(
     elif stem == "terminal_counts":
         _plot_terminal_counts(site, t, font, path, dpi, figure_text)
     elif stem == "boundary_azimuth_rose":
-        _plot_boundary_azimuth_rose(site, t, font, path, dpi, figure_text)
+        _plot_boundary_azimuth_rose(site, t, font, path, dpi, figure_text, color_scales[stem])
     elif stem == "boundary_arc_segments":
-        _plot_boundary_arc_segments(site, t, font, path, dpi, figure_text)
+        _plot_boundary_arc_segments(site, t, font, path, dpi, figure_text, color_scales[stem])
     elif stem == "source_footprint_kde":
-        _plot_source_footprint_kde(site, land_geometries, t, font, path, dpi, figure_text)
+        _plot_source_footprint_kde(
+            site, land_geometries, t, font, path, dpi, figure_text, color_scales[stem]
+        )
     elif stem == "settling_velocity_breakdown":
-        _plot_settling_velocity_breakdown(site, t, font, path, dpi, figure_text)
+        _plot_settling_velocity_breakdown(site, t, font, path, dpi, figure_text, color_scales[stem])
     else:  # pragma: no cover - FIGURE_STEMS 是唯一呼叫來源，這裡只是防禦
         raise FiguresError(f"未知圖表代號：{stem}")
 
@@ -2143,19 +2349,21 @@ def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case_label: str)
     )
     if stem == "horizontal_overview":
         body = (
-            "代表粒子水平軌跡總覽，涵蓋整個 flow domain 範圍，同時標示 local domain 與 "
-            "flow domain 兩條開放邊界、依 final_status_code 著色的終止標記，以及 local "
-            "domain 首次離開（非終止）標記。資料來源：trajectory_samples_by_site.parquet "
-            "的軌跡座標與時間、departures.parquet 的 final_status_code 與 "
-            "also_local_domain_first_exit、local_domain_departures.parquet 的 local 首次 "
-            "離開位置、boundary_arc_segments_geometry_by_site 的開放邊界折線幾何。"
+            "代表粒子水平軌跡總覽，涵蓋整個 flow domain 範圍，標示 flow domain 開放邊界"
+            "（終止邊界）與依 final_status_code 著色的終止標記；五站圖面版式一致，不畫 "
+            "local domain 邊界或 local domain 首次離開標記（WP-25 裁決，該事件仍完整"
+            "保存於 local_domain_departures.parquet 等資料表，只是不在這張圖呈現）。"
+            "資料來源：trajectory_samples_by_site.parquet 的軌跡座標與時間、"
+            "departures.parquet 的 final_status_code、"
+            "boundary_arc_segments_geometry_by_site 的開放邊界折線幾何。"
         )
     elif stem == "horizontal_local":
         body = (
-            "受體附近局部放大圖，座標為經緯度相對代表粒子回溯起點平均位置的偏移量，同樣 "
-            "標示 local／flow 兩條開放邊界與 local domain 首次離開標記。資料來源與水平軌跡 "
-            "總覽圖相同：trajectory_samples_by_site.parquet、departures.parquet、"
-            "local_domain_departures.parquet、boundary_arc_segments_geometry_by_site。"
+            "受體附近局部放大圖，座標為經緯度相對代表粒子回溯起點平均位置的偏移量，同樣"
+            "只畫 flow domain 開放邊界與終止標記，不畫 local domain 邊界或首次離開標記"
+            "（WP-25 裁決，理由同水平軌跡總覽圖）。資料來源與水平軌跡總覽圖相同："
+            "trajectory_samples_by_site.parquet、departures.parquet、"
+            "boundary_arc_segments_geometry_by_site。"
         )
     elif stem == "depth_age":
         body = (
@@ -2261,6 +2469,15 @@ _README_TEMPLATE = """\
 輸入檔**；輸入檔前後 SHA-256 已核對一致（見 `manifest.json`）。文字層級為
 `--figure-text {figure_text}`（見下方「每站八張圖」一節）。
 
+**WP-25：輸出格式與跨站色階**——每張圖同時輸出 `.png`（{dpi} dpi）與同名
+`.svg`（向量），對齊相鄰專案 `OCM-SVD-Analysis` 的正式成圖規範（見
+`docs/results/17_native_figures_formal_output_rules.md`）；`source_footprint_
+kde`、`boundary_arc_segments`、`boundary_azimuth_rose`、`settling_velocity_
+breakdown` 四張圖改用同一批被選取站點共同的色階上下限與刻度，讓站間可直接
+比較，超過上限的值以最高色顯示、不裁切資料，實際狀態記錄於 `manifest.json`
+的 `color_scales` 區塊（`over_limit_count`／`over_limit_fraction`／
+`display_saturation`）。
+
 ## 科學定義與範圍
 
 - **M=1**：每個情境（站點 × 受體 × 沉降速度 × 到達時刻等）只有一個系集成員，
@@ -2280,27 +2497,26 @@ _README_TEMPLATE = """\
 
 {site_list}
 
-## WP-23：兩種開放邊界與兩種「離開」事件（請先讀，影響前兩張圖）
+## WP-23／WP-25：flow domain 終止邊界與 local domain 首次離開（資料仍在，圖上已不畫）
 
 研究團隊裁決（`AGENTS.md`、`docs/development/05_decisions_and_risks.md`
 D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local domain 是非終止
-事件，只記錄、粒子繼續回溯**。因此各站依 `local_equals_flow` 而定，會有一條或
-兩條開放邊界線，圖上用不同線型區分：
+事件，只記錄、粒子繼續回溯**。`departures.parquet` 的 `crossed_interest_region_
+boundary`／`final_status_code` 因此一律是 flow domain 語意，五站可直接互相
+比較；`local_domain_departures.parquet`、`local_domain_first_exit_summary_by_
+site` 與 `departures.parquet` 的 `also_local_domain_first_exit` 欄位完整保存
+每顆粒子「首次離開自己站點 local domain」的位置與統計，不受下一段圖面裁決
+影響。
 
-- **flow domain 開放邊界**（藍色虛線）：真正的終止邊界，粒子離開這條線才停止
-  回溯，`terminal_counts.png` 等圖的「穿越開放邊界（正常結束）」指的就是這裡。
-- **local domain 開放邊界**（橘色點線）：只是記錄用，粒子離開這條線後仍繼續
-  回溯，不影響 `final_status_code`。
-
-對應地，粒子的終點標記（依 `final_status_code` 著色的實心標記）永遠畫在 flow
-domain 邊界上；若這顆代表粒子還有一筆「首次離開 local domain」的紀錄
-（`local_domain_departures.parquet` 或 `departures.parquet` 的
-`also_local_domain_first_exit=True`），會另外疊一個**空心橘色菱形**標記非終止
-事件。若某站 `local_equals_flow=True`（目前是新竹、南灣、連江——local domain
-與 flow domain 是同一個多邊形），兩個事件是同一次穿越，圖上只會看到一個標記
-（終止標記本身），不會另外畫空心菱形；若 `local_equals_flow=False`（目前是
-貢寮、龜山島），兩個標記通常出現在軌跡上不同位置。詳細語意見每張圖下方的
-「local domain 與 flow domain 的差別」副標文字。
+**WP-25 裁決**：`horizontal_overview.png`／`horizontal_local.png` 不再畫 local
+domain 邊界或 local domain 首次離開標記，讓貢寮／龜山島（`local_equals_
+flow=False`）與新竹／南灣／連江（`local_equals_flow=True`）五站的圖面版式
+完全一致——圖上只保留 **flow domain 開放邊界**（藍色虛線，真正的終止邊界，
+`terminal_counts.png` 等圖的「穿越開放邊界（正常結束）」指的就是這裡）與依
+`final_status_code` 著色的終止標記。若需要 local domain 首次離開的空間分布，
+請直接查詢 `local_domain_departures.parquet`（僅 `local_equals_flow=False`
+的站有列）或 `local_domain_first_exit_summary_by_site` 的
+`fraction_local_first_exit`（各站皆有一列彙總統計）。
 
 ## 每站八張圖
 
@@ -2311,17 +2527,16 @@ domain 邊界上；若這顆代表粒子還有一筆「首次離開 local domain
 `output_png_sha256.<site_id>/<stem>.png.caption` 完全相同）：
 
 1. `horizontal_overview.png`：代表粒子水平軌跡總覽（經緯度顯示，涵蓋整個 flow
-   domain 範圍），**同時畫出 local domain 與 flow domain 兩條開放邊界**（見上
-   一節）。資料來源：`trajectory_samples_by_site`（軌跡座標、狀態）、
-   `departures.parquet`（起訖狀態對照，含 `also_local_domain_first_exit`）、
-   `local_domain_departures.parquet`（local 首次離開位置）、
-   `boundary_arc_segments_geometry_by_site`（開放邊界折線）。綠點＝回溯起點
-   （受體到達位置）；flow domain 終點依 `final_status_code` 用不同顏色與標記
-   形狀表示；空心橘色菱形＝local domain 首次離開（非終止）；線色依代表粒子
-   起始深度序位（淺→深）。
+   domain 範圍），**只畫 flow domain 開放邊界**（見上一節；WP-25 起不再畫
+   local domain 邊界或首次離開標記，五站版式一致）。資料來源：
+   `trajectory_samples_by_site`（軌跡座標、狀態）、`departures.parquet`
+   （`final_status_code`）、`boundary_arc_segments_geometry_by_site`
+   （開放邊界折線）。綠點＝回溯起點（受體到達位置）；終點依
+   `final_status_code` 用不同顏色與標記形狀表示；線色依代表粒子起始深度序位
+   （淺→深）。
 2. `horizontal_local.png`：受體附近局部放大，座標為經緯度相對代表粒子回溯起點
-   平均位置的偏移量，**同樣疊 local／flow 兩條開放邊界與 local 首次離開標記**
-   （舊版本圖完全不畫邊界，WP-23 起新增）。資料來源同上。
+   平均位置的偏移量，**同樣只畫 flow domain 開放邊界與終止標記**（WP-25 起不
+   再疊 local domain 邊界或首次離開標記）。資料來源同上。
 3. `depth_age.png`：深度（`z_m`，海面為 0、向上為正）對回溯時齡（小時）曲線，
    顏色依代表粒子的垂向抽樣序位分色——**序位不代表固定物理水層**，native 後
    處理沒有保留原始的 `vertical_id`。資料來源：`trajectory_samples_by_site`。
@@ -2393,6 +2608,7 @@ def _build_readme(inputs: NativeFiguresInputs, config: NativeFiguresConfig, comm
         figure_text=config.figure_text,
         site_list=site_list,
         command=command,
+        dpi=config.dpi,
     )
 
 
@@ -2414,24 +2630,32 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
     land_geometries = _load_coastline(config.coastline_path)
     font_resolution = _resolve_font(config.font_path)
     labeler = _Labeler(font_resolution.cjk_available)
+    color_scales = _compute_shared_color_scales(inputs.sites)
 
     output_dir.mkdir(parents=True)
     captions = _build_captions(inputs)
     png_records: dict[str, dict[str, Any]] = {}
+    svg_records: dict[str, dict[str, Any]] = {}
     for site in inputs.sites:
         site_dir = output_dir / site.site_id
         site_dir.mkdir()
         for stem in FIGURE_STEMS:
             png_path = site_dir / f"{stem}.png"
+            svg_path = png_path.with_suffix(".svg")
             _dispatch_plot(
                 stem, site, land_geometries, labeler, font_resolution.font_properties, png_path, config.dpi,
-                config.figure_text,
+                config.figure_text, color_scales,
             )
             key = f"{site.site_id}/{stem}.png"
             png_records[key] = {
                 "sha256": sha256_file(png_path),
                 "size_bytes": png_path.stat().st_size,
                 "caption": captions[key],
+            }
+            svg_key = f"{site.site_id}/{stem}.svg"
+            svg_records[svg_key] = {
+                "sha256": sha256_file(svg_path),
+                "size_bytes": svg_path.stat().st_size,
             }
 
     sources_after = _snapshot_sources(inputs.source_paths)
@@ -2445,11 +2669,14 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
         "sites": [s.site_id for s in inputs.sites],
         "site_labels_zh": {s.site_id: s.site_label_zh for s in inputs.sites},
         "figure_stems": list(FIGURE_STEMS),
+        "output_formats": ["png", "svg"],
         "font": dict(font_resolution.manifest_record),
         "cjk_labels_used": font_resolution.cjk_available,
         "inputs_sha256_before": dict(inputs.sources_before),
         "inputs_sha256_after": sources_after,
         "output_png_sha256": png_records,
+        "output_svg_sha256": svg_records,
+        "color_scales": _build_color_scale_manifest(inputs.sites, color_scales),
         "postprocess_manifest_experiment_case_id": inputs.postprocess_manifest.get("experiment_case_id"),
         "postprocess_manifest_master_seed": inputs.postprocess_manifest.get("master_seed"),
         "config": {

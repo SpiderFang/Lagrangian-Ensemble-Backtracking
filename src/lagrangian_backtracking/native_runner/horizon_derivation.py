@@ -32,6 +32,39 @@
 
 本模組**不重新執行任何流場運算**，只讀取既有 ``.npz`` 結果、切片既有陣列；因此
 即使來源目錄有數萬顆粒子，推導也是純陣列操作，秒級完成。
+
+## local domain 相關欄位的截斷語意（WP-28 補完）
+
+``BackwardDriverResult`` 除了 ``departures``（終止事件）之外，還有兩個 WP-23／
+WP-26 新增、與「截斷之後這一小時是否真的發生過」有關的欄位，截斷推導時不能
+直接原樣複製或直接丟棄，必須依「這個事件發生的時刻相對於截止時刻的先後」逐一
+重新判定：
+
+1. ``local_domain_departures``（``local_equals_flow=False`` 測站——目前是貢寮、
+   龜山島——首次離開自己 local domain 的**非終止**事件）：只保留
+   ``utc_ns >= cutoff_utc_ns`` 的記錄（發生在截止時刻或更早、即在短 H 的回溯
+   範圍內就已經發生），捨棄 ``utc_ns < cutoff_utc_ns`` 的記錄（發生在截止時刻
+   之後、也就是短 H 走到截止時刻為止都還沒發生這件事，不能出現在短 H 結果
+   裡）。這與「較長回溯結果截斷之後、事件時間點落在被丟棄的那一段」是同一件
+   事：截斷推導本來就是在丟棄截止時刻之後（更深、更早）的那段軌跡與其上發生的
+   一切事件，local domain 首次離開事件沒有理由是例外。
+2. ``DepartureRecord.also_local_domain_first_exit``（只對 ``local_equals_flow=
+   True`` 測站——目前是新竹、南灣、連江——有意義，且依欄位自身定義只有在
+   ``status == NATIVE_STATUS_LEFT_FLOW_DOMAIN`` 時才可能是 ``True``）：
+   - 該粒子的終止事件發生在截止時刻之前或恰好在截止時刻（``final_utc_ns >=
+     cutoff_utc_ns``，即本函式判定的「不需要重新截斷」）：終止原因與時刻完全
+     不受截斷影響，``also_local_domain_first_exit`` 原樣保留（因為描述的仍然是
+     同一次真實發生過的「離開 flow domain」事件）。
+   - 該粒子在短 H 的截止時刻仍在追蹤中、來源結果要到更深的時刻才終止
+     （``final_utc_ns < cutoff_utc_ns``，本函式判定的「需要重新截斷」）：不論
+     來源的終止原因是什麼（``NATIVE_STATUS_LEFT_FLOW_DOMAIN`` 或其他），在短 H
+     的時間範圍內這件事根本沒有發生過，正確的終止原因永遠是「回溯達上限」
+     （``NATIVE_STATUS_MAX_BACKTRACK``）——依 ``also_local_domain_first_exit``
+     欄位本身的定義（只在 ``status == NATIVE_STATUS_LEFT_FLOW_DOMAIN`` 時才可能
+     為真），這種情況下必須明確重新判定為 ``False``，**不能原樣複製來源記錄的
+     值**（來源記錄描述的是「後來（更深的時刻）才發生的離開事件」，把它的旗標
+     套在一個「其實還在 flow domain 內、只是回溯上限到了」的粒子身上，會誤導
+     下游把「回溯上限」誤記成「離開 local domain」，兩者是完全不同的終止原因）。
 """
 
 from __future__ import annotations
@@ -92,6 +125,11 @@ class HorizonDerivationInfo:
     """來源結果本身（全部粒子）在到達這個目標 horizon 之前就已經整批終止；此時
     ``cutoff_utc_ns`` 實際上等於來源最深取樣時刻，沒有任何粒子被改標成新的
     回溯上限，推導結果與來源在（可能較短的）目標長度內完全一致。"""
+    local_domain_departure_count: int
+    """推導後 ``BackwardDriverResult.local_domain_departures`` 保留的筆數（見模組
+    文件「local domain 相關欄位的截斷語意」）：只計入發生在截止時刻或更早
+    （``utc_ns >= cutoff_utc_ns``）的首次離開 local domain 事件；發生在截止時刻
+    之後（短 H 範圍內尚未發生）的來源記錄已被捨棄，不計入這裡。"""
 
 
 def derive_backward_driver_result(
@@ -149,6 +187,7 @@ def derive_backward_driver_result(
             newly_capped_particle_count=0,
             unchanged_particle_count=0,
             source_exhausted_before_cutoff=False,
+            local_domain_departure_count=0,
         )
         return derived, info
 
@@ -236,6 +275,14 @@ def derive_backward_driver_result(
     new_departures: list[DepartureRecord] = []
     for row in range(n):
         if row in needs_recap_rows:
+            # 這顆粒子在短 H 的截止時刻仍在追蹤中，來源結果要到更深的時刻才
+            # 終止；短 H 範圍內「離開 flow domain」這件事根本沒有發生過，正確
+            # 的終止原因永遠是回溯達上限。也因此 also_local_domain_first_exit
+            # 明確重新判定為 False（該欄位只在 status ==
+            # NATIVE_STATUS_LEFT_FLOW_DOMAIN 時才可能為真，見欄位 docstring），
+            # 不得原樣沿用來源記錄的值——即使來源記錄剛好是
+            # also_local_domain_first_exit=True，也必須捨棄，這裡刻意用建構子
+            # 預設值表達「重新判定為 False」而不是從來源記錄複製任何欄位。
             new_departures.append(
                 DepartureRecord(
                     row_particle_index=row,
@@ -247,9 +294,19 @@ def derive_backward_driver_result(
                 )
             )
         else:
+            # 終止事件發生在截止時刻之前或恰好在截止時刻，完全不受截斷影響，
+            # 包含 also_local_domain_first_exit 在內的全部欄位原樣保留。
             record = original_departures_by_row.get(row)
             if record is not None:
                 new_departures.append(record)
+
+    # local_domain_departures（local_equals_flow=False 測站首次離開 local
+    # domain 的非終止事件）：只保留發生在截止時刻或更早（即短 H 範圍內確實
+    # 已經發生）的記錄，捨棄發生在截止時刻之後（短 H 尚未走到）的記錄——見模組
+    # 文件「local domain 相關欄位的截斷語意」。
+    retained_local_domain_departures = tuple(
+        record for record in result.local_domain_departures if record.utc_ns >= cutoff_utc_ns
+    )
 
     derived = BackwardDriverResult(
         row_particle_index=result.row_particle_index.copy(),
@@ -267,6 +324,7 @@ def derive_backward_driver_result(
         diagnostics=SubstepDiagnostics(),
         overhead_diagnostics=HourlyOverheadDiagnostics(),
         hours_run=k,
+        local_domain_departures=retained_local_domain_departures,
     )
     info = HorizonDerivationInfo(
         source_arrival_time_utc_ns=arrival_utc_ns,
@@ -281,6 +339,7 @@ def derive_backward_driver_result(
         newly_capped_particle_count=newly_capped,
         unchanged_particle_count=n - newly_capped,
         source_exhausted_before_cutoff=source_exhausted_before_cutoff,
+        local_domain_departure_count=len(retained_local_domain_departures),
     )
     return derived, info
 
@@ -376,6 +435,7 @@ def derive_result_directory(
             "newly_capped_particle_count": info.newly_capped_particle_count,
             "unchanged_particle_count": info.unchanged_particle_count,
             "source_exhausted_before_cutoff": info.source_exhausted_before_cutoff,
+            "local_domain_departure_count": info.local_domain_departure_count,
         }
 
     manifest = {
