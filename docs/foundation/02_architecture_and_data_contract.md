@@ -382,7 +382,11 @@ loader 會逐欄核對 receptor／arrival 的站點、region、UTC ns、`vertica
 並以 `DomainConfig.resolved_flow_domain_id` 統一解析 flow domain：pilot 使用 base ID；formal
 若設定 `formal_release_flow_domain_id` 則使用該正式 ID，否則使用 base ID。formal／可執行
 pilot 只接受 `wetdry_elem_value=0`、固定語意
-`schism_wetdry_elem_0_wet_1_dry` 與 `ocm_time_origin=observed`。所有 z 與高度以公尺、z
+`schism_wetdry_elem_0_wet_1_dry` 與 `ocm_time_origin=observed`。`ocm_month_yyyymm` 須為
+`YYYYMM` 格式，且接受 arrival UTC 月份或其前一個月／後一個月（含跨年），更遠的月份一律
+fail-closed 拒絕（見決策 D022）：OCM native 月目錄在邊界重疊，canonical 時間軸的
+`sort_and_deduplicate_prefer_last` 政策使重複 UTC 一律取最後一個 chunk，因此誠實記錄的
+來源月份可能落在 arrival UTC 月份的相鄰月，而非嚴格相等。所有 z 與高度以公尺、z
 向上為正；必須滿足 `eta>bed`、`water=eta-bed`、`bed≤z≤eta`、
 `height=z-bed`、`bed≤zcor_lower<zcor_upper≤eta`、`lower≤z≤upper` 及
 `alpha=(z-lower)/(upper-lower)∈[0,1]`。固定 `1e-8` 公差只吸收 JSON 浮點序列化尾差，

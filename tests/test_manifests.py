@@ -1421,6 +1421,74 @@ def test_dynamic_initial_condition_rejects_source_and_wetdry_contract(
         load_receptor_arrival_initial_condition_manifest(path, config, receptors, arrivals)
 
 
+def test_dynamic_initial_condition_accepts_arrival_utc_month(tmp_path: Path) -> None:
+    """回歸：``ocm_month_yyyymm`` 等於 arrival UTC 月份時必須通過（WP-33）。"""
+
+    config, receptors, arrivals, path, payload = _pilot_dynamic_fixture(tmp_path)
+    # gongliao 站唯一 receptor×arrival pair 的 arrival UTC 為 2024-01-01T00:00Z。
+    changed = deepcopy(payload)
+    changed["records"][0]["ocm_month_yyyymm"] = "202401"
+    _write_json(path, changed)
+    loaded = load_receptor_arrival_initial_condition_manifest(path, config, receptors, arrivals)
+    assert loaded[0].ocm_month_yyyymm == "202401"
+
+
+def test_dynamic_initial_condition_accepts_next_month_from_overlap_chunk(tmp_path: Path) -> None:
+    """OCM 月目錄邊界重疊、canonical 軸 prefer-last 使來源落在下一個月時仍應通過（WP-33）。
+
+    重現正式建置實際發生的情境：arrival UTC 為 2025-06-30T01:00Z（月份 202506），
+    但 canonical 軸的 ``sort_and_deduplicate_prefer_last`` 政策讓重複 UTC 取最後一個
+    chunk，來源月目錄其實是 202507。此測試以本檔 fixture 的 2024-01 arrival 複現同一種
+    「來源月份是下一個月」的邊界情境。
+    """
+
+    config, receptors, arrivals, path, payload = _pilot_dynamic_fixture(tmp_path)
+    changed = deepcopy(payload)
+    changed["records"][0]["ocm_month_yyyymm"] = "202402"
+    _write_json(path, changed)
+    loaded = load_receptor_arrival_initial_condition_manifest(path, config, receptors, arrivals)
+    assert loaded[0].ocm_month_yyyymm == "202402"
+
+
+def test_dynamic_initial_condition_accepts_previous_month_from_overlap_chunk(tmp_path: Path) -> None:
+    """若 arrival UTC 那一小時只存在於前一個月目錄，誠實記錄的來源月份也應通過（WP-33）。"""
+
+    config, receptors, arrivals, path, payload = _pilot_dynamic_fixture(tmp_path)
+    changed = deepcopy(payload)
+    changed["records"][0]["ocm_month_yyyymm"] = "202312"
+    _write_json(path, changed)
+    loaded = load_receptor_arrival_initial_condition_manifest(path, config, receptors, arrivals)
+    assert loaded[0].ocm_month_yyyymm == "202312"
+
+
+def test_dynamic_initial_condition_rejects_two_months_away(tmp_path: Path) -> None:
+    """相差兩個月的來源月份仍須 fail-closed 拒絕，且錯誤訊息列出接受的月份（WP-33）。"""
+
+    config, receptors, arrivals, path, payload = _pilot_dynamic_fixture(tmp_path)
+    changed = deepcopy(payload)
+    changed["records"][0]["ocm_month_yyyymm"] = "202403"
+    _write_json(path, changed)
+    with pytest.raises(ValueError, match=r"接受 \('202312', '202401', '202402'\)"):
+        load_receptor_arrival_initial_condition_manifest(path, config, receptors, arrivals)
+
+
+def test_dynamic_initial_condition_month_gate_handles_year_boundary(tmp_path: Path) -> None:
+    """跨年邊界：arrival UTC 月份 202401 時接受 202312，拒絕更早一個月的 202311（WP-33）。"""
+
+    config, receptors, arrivals, path, payload = _pilot_dynamic_fixture(tmp_path)
+    accepted = deepcopy(payload)
+    accepted["records"][0]["ocm_month_yyyymm"] = "202312"
+    _write_json(path, accepted)
+    loaded = load_receptor_arrival_initial_condition_manifest(path, config, receptors, arrivals)
+    assert loaded[0].ocm_month_yyyymm == "202312"
+
+    rejected = deepcopy(payload)
+    rejected["records"][0]["ocm_month_yyyymm"] = "202311"
+    _write_json(path, rejected)
+    with pytest.raises(ValueError, match=r"接受 \('202312', '202401', '202402'\)"):
+        load_receptor_arrival_initial_condition_manifest(path, config, receptors, arrivals)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -1130,6 +1130,19 @@ def _utc_datetime(time_utc_ns: int, label: str) -> datetime:
         raise ValueError(f"{label} 無法轉成 UTC datetime") from exc
 
 
+def _shifted_yyyymm(year: int, month: int, offset: int) -> str:
+    """把 (year, month) 依 offset 個曆月位移，回傳六位數 ``YYYYMM``。
+
+    只用整數的月序號（``year*12+month-1``）做加減再還原，避免用
+    ``month + offset`` 直接相加時跨年產生非法的第 0 月或第 13 月；``offset``
+    可正可負，供計算 arrival UTC 月份的前一個月／後一個月使用。
+    """
+
+    serial = year * 12 + (month - 1) + offset
+    shifted_year, shifted_month_zero_based = divmod(serial, 12)
+    return f"{shifted_year:04d}{shifted_month_zero_based + 1:02d}"
+
+
 @dataclass(frozen=True, slots=True)
 class _ArrivalSelectionContract:
     """保存 arrival observation 母體的有效欄位，避免 loader 各處自行解讀設定。
@@ -2376,8 +2389,25 @@ def _load_receptor_arrival_initial_condition_document(
         if re.fullmatch(r"[0-9]{6}", month) is None:
             raise ValueError(f"{label}.ocm_month_yyyymm 必須是 YYYYMM")
         utc = _utc_datetime(time_ns, f"{label}.time_utc_ns")
-        if month != f"{utc.year:04d}{utc.month:02d}":
-            raise ValueError(f"{label}.ocm_month_yyyymm 與 arrival UTC 月份不一致")
+        # OCM native 的月目錄在邊界重疊（例如 202507 目錄從 2025-06-30T01:00Z 就開始），
+        # 而 canonical 時間軸登錄的政策是 sort_and_deduplicate_prefer_last
+        # （見 time_axis.py 的 CanonicalTimeAxis）：重複 UTC 一律取最後一個 chunk，也就是
+        # 較晚的月份。因此 input_derivation.py 誠實記錄下來的 ocm_month_yyyymm，在月初
+        # 重疊窗附近可能是 arrival UTC 月份的下一個月，而不是同一個月；反過來，若某月
+        # 目錄不含當月 1 日 00:00（該小時只存在於前一個月目錄），誠實記錄的月份也可能是
+        # 上一個月。這兩種情況都不是資料錯誤，若仍要求月份「必須相等」，這個 gate 在月初
+        # 邊界會恆常無法通過。因此把 gate 放寬為「必須是 arrival UTC 月份，或其前一個月／
+        # 後一個月（含跨年）」；更遠的月份仍視為錯誤，fail-closed 拒絕，不放寬其他任何檢查。
+        accepted_months = (
+            _shifted_yyyymm(utc.year, utc.month, -1),
+            f"{utc.year:04d}{utc.month:02d}",
+            _shifted_yyyymm(utc.year, utc.month, 1),
+        )
+        if month not in accepted_months:
+            raise ValueError(
+                f"{label}.ocm_month_yyyymm 必須是 arrival UTC 月份或其相鄰月份（"
+                f"接受 {accepted_months}），實際收到 {month!r}"
+            )
         origin = _nonempty_string(row["ocm_time_origin"], f"{label}.ocm_time_origin")
         if origin != "observed":
             raise ValueError(
