@@ -1703,6 +1703,13 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
     ``<unit_id>.driver_result.npz`` 檔案格式（見該模組文件「重量級輸出的存放
     格式」一節）；``--results-dir`` 應該是 ``LBT_NATIVE_RESULTS_DIR`` 指向的
     同一個目錄。
+
+    WP-30：``--project-root``／``--declared-git-commit``／``--formal`` 三者比照
+    ``native-plan``／``native-run`` 既有同名參數的語意，收集程式部署指紋寫進
+    manifest 的 ``code_provenance``（見 ``provenance.collect_code_provenance``）；
+    這三個參數在此之前完全沒有開放，導致 native-postprocess 的 manifest 一律拿
+    不到 git commit hash，是正式成果報告可追溯性附錄的缺口。``--project-root``
+    省略時維持修正前的既有行為（``code_provenance`` 只留一句略過說明）。
     """
 
     parser = argparse.ArgumentParser(description="合併 native-run 全部工作單元成果，輸出後處理正式產品")
@@ -1729,7 +1736,38 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
             "邊界幾何 manifest 必須可載入，否則 fail closed（不靜默略過這個統計）"
         ),
     )
-    parser.add_argument("--formal", action="store_true", help="載入邊界幾何 manifest 時是否要求正式門檻")
+    parser.add_argument(
+        "--formal",
+        action="store_true",
+        help=(
+            "載入邊界幾何 manifest 時是否要求正式門檻；同時也是 --project-root 收集"
+            "程式部署指紋時的正式門檻（與 native-plan／native-run 的 --formal 相同"
+            "語意——啟用時沒有 .git 部署必須另外提供 --declared-git-commit，且拒絕"
+            "dirty working tree，見 provenance.collect_code_provenance）"
+        ),
+    )
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help=(
+            "WP-30：可選，正式部署所在的程式根目錄；提供時比照 native-plan／"
+            "native-run 既有的同名參數，呼叫 provenance.collect_code_provenance "
+            "收集程式部署指紋（Git commit、dirty 狀態、部署樹雜湊與依賴版本），"
+            "寫入本次後處理 manifest 的 code_provenance，讓正式成果報告的可追溯性"
+            "附錄拿得到 git commit hash。省略時 code_provenance 只留一句略過"
+            "說明（僅限測試或探索用途），與加入本參數之前的既有行為完全相同"
+        ),
+    )
+    parser.add_argument(
+        "--declared-git-commit",
+        default=None,
+        help=(
+            "只在提供 --project-root 且該目錄沒有 .git（例如 SERVER 發布部署）時"
+            "才會被使用：由呼叫端宣告的 40 位小寫 Git commit；--formal 且無 .git "
+            "時必須提供，否則 collect_code_provenance 會 fail-fast 拒絕產生指紋"
+        ),
+    )
     parser.add_argument(
         "--plan",
         type=Path,
@@ -1837,6 +1875,11 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         kde_minimum_point_count=args.kde_minimum_point_count,
         azimuth_sector_count=args.azimuth_sector_count,
         boundary_arc_segment_count=args.boundary_arc_segment_count,
+        # WP-30：只有明確提供 --project-root 才收集程式部署指紋，省略時保留 None，
+        # 讓 PostprocessAccumulator.finalize 走既有的「略過收集」分支（見 postprocess.py）。
+        project_root=str(args.project_root) if args.project_root is not None else None,
+        declared_git_commit=args.declared_git_commit,
+        formal_provenance=args.formal,
     )
     accumulator = native_postprocess.PostprocessAccumulator(
         identity_table,

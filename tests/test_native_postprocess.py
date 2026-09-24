@@ -12,13 +12,16 @@
 
 from __future__ import annotations
 
+import json
 import resource
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from lagrangian_backtracking import cli
 from lagrangian_backtracking.native_runner.backward_driver import (
     NATIVE_STATUS_ACTIVE,
     NATIVE_STATUS_DEPOSITED,
@@ -34,7 +37,13 @@ from lagrangian_backtracking.native_runner.backward_driver import (
     LocalDomainFirstExitRecord,
     SubstepDiagnostics,
 )
-from lagrangian_backtracking.native_runner.particle_input import ParticleIdentityTable
+from lagrangian_backtracking.native_runner.hour_major_provider import (
+    save_backward_driver_result_npz,
+)
+from lagrangian_backtracking.native_runner.particle_input import (
+    ParticleIdentityTable,
+    save_particle_identity_table_npz,
+)
 from lagrangian_backtracking.native_runner.postprocess import (
     COMPASS_16_SECTOR_NAMES,
     KDE_STATUS_AVAILABLE,
@@ -1931,3 +1940,91 @@ def test_npz_roundtrip_backward_compatible_with_pre_wp23_result_file(tmp_path) -
     }
     assert summary_rows["siteA"]["local_first_exit_particle_count"] == 0
     assert summary_rows["siteA"]["local_first_exit_source"] == "local_domain_departures"
+
+
+# ── WP-30：CLI ``native-postprocess`` 的 --project-root 端對端佈線 ──────────
+
+
+def _write_native_postprocess_fixture(tmp_path):
+    """寫出一份最小可用的 identity table npz 與單一批次 driver_result.npz。
+
+    刻意不經過任何 BayTrace 或 native-run 流程，直接用 ``save_*_npz`` 序列化
+    合成資料，只為了驗證 ``lbt native-postprocess`` CLI 這一層有沒有把
+    ``--project-root``／``--declared-git-commit``／``--formal`` 正確接到
+    ``PostprocessConfig``，不重覆驗證後處理數值邏輯本身（那是本檔其餘測試
+    與 ``test_native_hour_major_provider.py`` 的範圍）。
+    """
+
+    identity = _make_identity_table(
+        particle_ids=["p0", "p1"],
+        study_site_id=["A", "A"],
+        settling_velocity_mps=[-0.001, -0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS, _JAN_2024_UTC_NS],
+    )
+    identity_path = tmp_path / "identity.npz"
+    save_particle_identity_table_npz(identity, identity_path)
+
+    result = _make_result(rows=[0, 1], final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION] * 2)
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    save_backward_driver_result_npz(results_dir / "unit-0.driver_result.npz", result)
+
+    return identity_path, results_dir
+
+
+def test_cli_native_postprocess_without_project_root_keeps_legacy_skip_note(tmp_path):
+    """不給 ``--project-root`` 時，``code_provenance`` 必須與加入本參數前完全相同。
+
+    也就是仍然只有那一句「未提供 project_root，略過程式部署指紋收集」說明，
+    不能因為新增了這個選項就意外改變既有輸出（WP-30 任務要求的回溯相容性）。
+    """
+
+    identity_path, results_dir = _write_native_postprocess_fixture(tmp_path)
+    output_dir = tmp_path / "out_no_root"
+
+    code = cli.run_native_postprocess_command(
+        [
+            "--identity-table", str(identity_path),
+            "--results-dir", str(results_dir),
+            "--output", str(output_dir),
+        ]
+    )
+    assert code in (0, None)
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["code_provenance"] == {
+        "note": "未提供 project_root，略過程式部署指紋收集（僅限測試或探索用途）"
+    }
+
+
+def test_cli_native_postprocess_with_project_root_collects_code_provenance(tmp_path):
+    """給了 ``--project-root`` 時，manifest 的 ``code_provenance`` 必須有實質內容。
+
+    「實質內容」指真正呼叫了 ``provenance.collect_code_provenance``：能看到
+    ``git_available``、部署樹雜湊、套件與依賴版本等欄位，而不是那句略過說明。
+    本機工作目錄未必是 Git repo（例如 SERVER 發布只有原始碼、沒有 ``.git``），
+    所以本測試不斷言 ``git_commit`` 一定非 null，只斷言確實收集到了指紋本體。
+    """
+
+    identity_path, results_dir = _write_native_postprocess_fixture(tmp_path)
+    output_dir = tmp_path / "out_with_root"
+    project_root = Path(__file__).resolve().parents[1]
+
+    code = cli.run_native_postprocess_command(
+        [
+            "--identity-table", str(identity_path),
+            "--results-dir", str(results_dir),
+            "--output", str(output_dir),
+            "--project-root", str(project_root),
+        ]
+    )
+    assert code in (0, None)
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    code_provenance = manifest["code_provenance"]
+    assert "note" not in code_provenance
+    assert "git_available" in code_provenance
+    assert code_provenance["deployment_tree_sha256"]
+    assert code_provenance["uv_lock_sha256"]
+    assert code_provenance["package_version"]
+    assert code_provenance["python_version"]
