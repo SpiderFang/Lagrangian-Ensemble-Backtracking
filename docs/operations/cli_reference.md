@@ -108,6 +108,20 @@ uv run lbt release-config-validate "$LBT_SCRATCH_ROOT/release-2024-2025.yaml" \
 constant-field fallback。`release-config-create`、`release-config-validate` 只處理
 immutable input binding；它們不啟動粒子運算。
 
+`inputs-build`（及間接呼叫它的 `horizon-suite-create`）在正式發布前，會先於隱藏的
+`.partial-<token>` 目錄寫入所有 component，再跑一次唯讀的 cross-reference validator
+重新載入 material、receptor、arrival、initial_condition、boundary_geometries 五個
+component；validator 若判定 `valid: False`（例如 component 之間互相矛盾、schema
+或 formal gate 未通過），該隱藏 partial 不會被刪除，而是原地改名成同層、非隱藏的
+`<destination 名稱>.invalid-<token>`（沿用原本 partial 目錄名稱裡的隨機 token），
+異常訊息會附上這個保留目錄的絕對路徑，並逐一列出是哪個 component、哪種例外型別、
+完整例外訊息（或 `component_cross_reference_skipped:<name>:<依賴的 component>`，
+代表它依賴的 component 已先失敗而略過重跑）。這個 `*.invalid-*` 目錄**只供人工
+事後診斷**（直接用既有 loader 重新讀取裡面已寫出的 component，不必重跑一次動輒
+數十分鐘甚至超過一小時的正式母體建置），**絕不是可發布的母體**，也不會被任何
+CLI 自動當成 `--destination` 或 `--partial` 讀入；確認診斷完成後應手動清除。
+其餘（非 validator 判定失敗的）例外仍維持原行為，直接清除 partial。
+
 ### horizon suite：一次建立共同母體與六份 mode release
 
 正式範例啟用每站 50 個隨機沉底年齡，最大 90 日，以 `20260916` seed 在 50 個離散小時 strata

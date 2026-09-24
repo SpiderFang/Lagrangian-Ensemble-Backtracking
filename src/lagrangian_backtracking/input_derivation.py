@@ -6786,8 +6786,27 @@ def _write_artifact_directory(
             detail = ";".join(str(item) for item in errors[:8])
             if len(errors) > 8:
                 detail += f";...共{len(errors)}項"
+            # validator 判定失敗時不能直接讓下面 except 區塊的 shutil.rmtree 把 partial
+            # 整個刪掉：這是唯一能事後重現「哪個 component 失敗」的資料，刪掉後只能重跑
+            # 一次動輒數十分鐘甚至超過一小時的正式母體建置才能重新診斷。改成把它改名成
+            # 同層、非隱藏的 `<destination 名稱>.invalid-<token>`，沿用既有 partial 目錄
+            # 名稱裡的隨機 token，讓目錄名本身就能看出「不可發布、只供診斷」。保留目錄
+            # 仍是未通過 cross-reference 驗證的內容，不得當成可發布母體使用。
+            partial_prefix = f".{destination.name}.partial-"
+            token = (
+                partial.name[len(partial_prefix) :]
+                if partial.name.startswith(partial_prefix)
+                else partial.name
+            )
+            invalid_dir = destination.parent / f"{destination.name}.invalid-{token}"
+            os.replace(partial, invalid_dir)
+            # 已經改名到 invalid_dir，把 partial 重新指派成空 Path()，避免下面
+            # `except Exception:` 區塊誤以為它還在原地而對它做 shutil.rmtree。
+            partial = Path()
             raise InputDerivationError(
-                "input artifact partial publish 前 cross-reference validator 失敗：" + detail
+                "input artifact partial publish 前 cross-reference validator 失敗："
+                + detail
+                + f"；保留供診斷的目錄：{invalid_dir}"
             )
         os.replace(partial, destination)
         partial = Path()
@@ -8161,17 +8180,61 @@ def validate_input_derivatives(
             }
         )
     if config is not None:
+        # 逐一載入五個 component，各自獨立 try/except：先前把五個 loader 包在同一個
+        # try 裡，失敗時只記例外型別名稱（例如單獨一個 "ValueError"），完全看不出是
+        # 哪一個 component、什麼訊息，事後必須重跑一次一小時的正式母體建置才能重現。
+        # 這裡改成逐一記錄「component 名稱：例外型別：完整例外訊息」，讓錯誤本身就能
+        # 診斷；同時 receptor／arrival 只各載入一次並重用結果，取代舊版重複呼叫兩次
+        # 的寫法（`load_receptor_arrival_initial_condition_manifest` 之前吃到的是
+        # 另一次重新呼叫的結果，而非上面獨立檢查那次）。
+        component_cross_reference_ok: dict[str, bool] = {}
+        receptor_records: tuple[Receptor, ...] | None = None
+        arrival_records: tuple[ArrivalTime, ...] | None = None
+
         try:
             load_material_manifest(paths["material"], config, formal=formal)
-            load_receptor_manifest(paths["receptor"], config, formal=formal)
-            load_arrival_time_manifest(paths["arrival"], config, formal=formal)
-            load_receptor_arrival_initial_condition_manifest(
-                paths["initial_condition"],
-                config,
-                load_receptor_manifest(paths["receptor"], config, formal=formal),
-                load_arrival_time_manifest(paths["arrival"], config, formal=formal),
-                formal=formal,
+            component_cross_reference_ok["material"] = True
+        except Exception as exc:
+            component_cross_reference_ok["material"] = False
+            errors.append(f"component_cross_reference_invalid:material:{type(exc).__name__}:{exc}")
+
+        try:
+            receptor_records = load_receptor_manifest(paths["receptor"], config, formal=formal)
+            component_cross_reference_ok["receptor"] = True
+        except Exception as exc:
+            component_cross_reference_ok["receptor"] = False
+            errors.append(f"component_cross_reference_invalid:receptor:{type(exc).__name__}:{exc}")
+
+        try:
+            arrival_records = load_arrival_time_manifest(paths["arrival"], config, formal=formal)
+            component_cross_reference_ok["arrival"] = True
+        except Exception as exc:
+            component_cross_reference_ok["arrival"] = False
+            errors.append(f"component_cross_reference_invalid:arrival:{type(exc).__name__}:{exc}")
+
+        if component_cross_reference_ok["receptor"] and component_cross_reference_ok["arrival"]:
+            try:
+                load_receptor_arrival_initial_condition_manifest(
+                    paths["initial_condition"],
+                    config,
+                    receptor_records,
+                    arrival_records,
+                    formal=formal,
+                )
+            except Exception as exc:
+                errors.append(
+                    "component_cross_reference_invalid:"
+                    f"initial_condition:{type(exc).__name__}:{exc}"
+                )
+        else:
+            # 依賴的 component（receptor／arrival）已經失敗，initial_condition 無法
+            # 有意義地重跑，直接記成「已略過」而不是再拋一次容易誤導的例外。
+            failed_dependencies = ",".join(
+                name for name in ("receptor", "arrival") if not component_cross_reference_ok[name]
             )
+            errors.append(f"component_cross_reference_skipped:initial_condition:{failed_dependencies}")
+
+        try:
             load_boundary_geometries(
                 config,
                 domain_manifest_path=paths["domain_geometry"],
@@ -8180,7 +8243,10 @@ def validate_input_derivatives(
                 formal=formal,
             )
         except Exception as exc:
-            errors.append(f"component_cross_reference_invalid:{type(exc).__name__}")
+            errors.append(
+                "component_cross_reference_invalid:"
+                f"boundary_geometries:{type(exc).__name__}:{exc}"
+            )
     if formal:
         # strict loader 已檢查 receptor/arrival/dynamic/geometry 的 status；這裡補上
         # 沒有既有 loader 的 forcing、NWW 與 gap-safe 根節點，避免有人只把 records

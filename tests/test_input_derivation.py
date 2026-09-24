@@ -3530,6 +3530,71 @@ def test_v3_geometry_identity_and_preclip_fail_closed(tmp_path: Path) -> None:
         )
 
 
+def test_validate_input_derivatives_reports_component_name_and_original_message(
+    synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cross-reference loader 失敗時，errors 必須含 component 名稱與**原始例外訊息文字**。
+
+    WP-32 修正前，``validate_input_derivatives`` 把五個 component loader 包在同一個
+    try，失敗時只記 ``component_cross_reference_invalid:{例外型別名稱}``——例如單獨一個
+    ``ValueError``，完全看不出是哪個 loader、什麼訊息。這裡用 monkeypatch 讓
+    ``load_arrival_time_manifest`` 拋出已知訊息的 ``ValueError``（不需要真實 forcing
+    資料），驗證新版錯誤字串同時含 component 名稱（``arrival``）、例外型別
+    （``ValueError``）與完整原始訊息；同時驗證依賴 arrival 的 initial_condition
+    component 改記成 skipped，而不是再拋一次容易誤導的例外。
+    """
+
+    config_path, ocm_root, surface_root, nww_root, root = synthetic_input_fixture
+    artifact_directory = root / "derived-inputs"
+    build_input_derivatives(
+        config_path=config_path,
+        destination=artifact_directory,
+        ocm_native_root=ocm_root,
+        ocm_surface_root=surface_root,
+        nww_analysis_root=nww_root,
+        formal=False,
+    )
+
+    known_message = "synthetic arrival loader 已知失敗訊息：時次 42 號缺少對應 receptor"
+
+    def failing_arrival_loader(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError(known_message)
+
+    monkeypatch.setattr(input_derivation_module, "load_arrival_time_manifest", failing_arrival_loader)
+
+    validation = validate_input_derivatives(
+        artifact_directory,
+        config_path=config_path,
+        ocm_native_root=ocm_root,
+        ocm_surface_root=surface_root,
+        nww_analysis_root=nww_root,
+        formal=False,
+    )
+    assert validation["valid"] is False
+    arrival_errors = [
+        error
+        for error in validation["errors"]
+        if error.startswith("component_cross_reference_invalid:arrival:")
+    ]
+    assert arrival_errors, validation["errors"]
+    assert any("ValueError" in error and known_message in error for error in arrival_errors)
+    # initial_condition 依賴 arrival 的載入結果；arrival 已失敗時應記成 skipped，而不是
+    # 再重新呼叫一次 loader、拋出第二個容易誤導人的例外。
+    assert any(
+        error.startswith("component_cross_reference_skipped:initial_condition:") and "arrival" in error
+        for error in validation["errors"]
+    )
+    # material 與 boundary_geometries 屬於彼此獨立的 component，不應受 arrival 失敗牽連。
+    assert not any(
+        error.startswith("component_cross_reference_invalid:material:") for error in validation["errors"]
+    )
+    assert not any(
+        error.startswith("component_cross_reference_invalid:boundary_geometries:")
+        for error in validation["errors"]
+    )
+
+
 def test_input_validator_rejects_artifact_closure_tamper(
     synthetic_input_fixture: tuple[Path, Path, Path, Path, Path],
 ) -> None:
@@ -3553,11 +3618,18 @@ def test_input_validator_rejects_artifact_closure_tamper(
     assert any("artifact_index" in error or "closure" in error for error in result["errors"])
 
 
-def test_artifact_prepublish_cross_reference_failure_removes_partial(
+def test_artifact_prepublish_cross_reference_failure_keeps_invalid_directory_for_diagnosis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """partial cross-reference validator 失敗時不得留下 final 或 hidden partial。"""
+    """validator 判定 valid:False 時，保留改名後的 ``*.invalid-*`` 目錄供事後診斷。
+
+    WP-32 修正前，``_write_artifact_directory`` 的 ``except Exception:`` 區塊會對
+    partial 整個 ``shutil.rmtree``，即使失敗原因是 validator 明確判定
+    ``valid: False``。正式母體建置一旦在這裡失敗（曾實際發生，重跑一次耗時超過一小時），
+    就完全無法用既有 loader 直接重現失敗的 component。這裡驗證新行為：partial 改名保留
+    （不再被清除）、例外訊息含保留目錄的絕對路徑，且正式 destination 確實沒有被建立。
+    """
 
     config_path = tmp_path / "config.yaml"
     config_path.write_text("config_status: generated\n", encoding="utf-8")
@@ -3575,14 +3647,75 @@ def test_artifact_prepublish_cross_reference_failure_removes_partial(
         calls.update(kwargs)
         return {
             "valid": False,
-            "errors": ["component_cross_reference_invalid:fixture"],
+            "errors": ["component_cross_reference_invalid:fixture:ValueError:模擬失敗訊息"],
             "warnings": [],
             "summary": {},
         }
 
     monkeypatch.setattr(input_derivation_module, "validate_input_derivatives", reject_partial)
     destination = tmp_path / "derived-inputs"
-    with pytest.raises(InputDerivationError, match="partial publish"):
+    with pytest.raises(InputDerivationError, match="保留供診斷的目錄") as excinfo:
+        input_derivation_module._write_artifact_directory(
+            destination,
+            {"material": {"fixture": True}},
+            config_path=config_path,
+            formal=False,
+            ocm_native_root=native_root,
+            ocm_surface_root=surface_root,
+            nww_analysis_root=nww_root,
+        )
+
+    # 正式 destination 完全沒有被建立。
+    assert not destination.exists()
+    # hidden partial 已經改名走了，不會再以 ``.partial-`` 命名殘留。
+    assert not list(tmp_path.glob(f".{destination.name}.partial-*"))
+    # 但改名後、非隱藏的 ``<name>.invalid-<token>`` 目錄確實被保留，且內容仍是
+    # 失敗當下寫到一半的 component（只供診斷，不可當成可發布母體）。
+    invalid_dirs = list(tmp_path.glob(f"{destination.name}.invalid-*"))
+    assert len(invalid_dirs) == 1, invalid_dirs
+    invalid_dir = invalid_dirs[0]
+    assert invalid_dir.is_dir()
+    assert (invalid_dir / "material.json").exists()
+    # 例外訊息含保留目錄的絕對路徑，才能直接拿去診斷而不必再重建一次。
+    assert str(invalid_dir) in str(excinfo.value)
+    assert calls["directory"].name.startswith(f".{destination.name}.partial-")
+    assert calls["formal"] is False
+    assert calls["config_path"] == config_path
+    assert calls["ocm_native_root"] == native_root
+    assert calls["ocm_surface_root"] == surface_root
+
+
+def test_artifact_prepublish_generic_exception_still_removes_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 validator 判定失敗的例外（例如 validator 本身崩潰）時，partial 仍照舊被清除。
+
+    這是 2.2 節改動的回歸測試：只有 validator 明確回傳 ``valid: False`` 的那條分支
+    才會保留改名後的目錄；其他例外（例如這裡模擬 validator 自己丟出未預期例外）必須
+    維持原本 ``except Exception:`` 區塊整個清除 partial 的行為，不得被 2.2 的改動誤傷。
+    """
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("config_status: generated\n", encoding="utf-8")
+    native_root = tmp_path / "ocm_native"
+    surface_root = tmp_path / "ocm_surface"
+    nww_root = tmp_path / "nww_analysis"
+    for root in (native_root, surface_root, nww_root):
+        root.mkdir()
+
+    calls: dict[str, Any] = {}
+
+    def raise_unexpected(directory: Path, **kwargs: Any) -> dict[str, Any]:
+        """模擬 validator 自身崩潰（不是 valid:False 判定），例如程式錯誤或 IO 例外。"""
+
+        calls["directory"] = directory
+        calls.update(kwargs)
+        raise RuntimeError("simulated validator crash，不是 valid:False 判定")
+
+    monkeypatch.setattr(input_derivation_module, "validate_input_derivatives", raise_unexpected)
+    destination = tmp_path / "derived-inputs"
+    with pytest.raises(RuntimeError, match="simulated validator crash"):
         input_derivation_module._write_artifact_directory(
             destination,
             {"material": {"fixture": True}},
@@ -3595,9 +3728,5 @@ def test_artifact_prepublish_cross_reference_failure_removes_partial(
 
     assert not destination.exists()
     assert not list(tmp_path.glob(f".{destination.name}.partial-*"))
-    assert calls["directory"].name.startswith(f".{destination.name}.partial-")
-    assert calls["formal"] is False
-    assert calls["config_path"] == config_path
-    assert calls["ocm_native_root"] == native_root
-    assert calls["ocm_surface_root"] == surface_root
+    assert not list(tmp_path.glob(f"{destination.name}.invalid-*"))
     assert calls["nww_analysis_root"] == nww_root
