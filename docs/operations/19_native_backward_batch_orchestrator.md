@@ -936,3 +936,74 @@ manifest，且與設定檔宣告不一致時同樣須 `--acknowledge-config-mode
 `EXPERIMENT_CASE_SPECS` 中的常數擴散（`constant_kh_m2ps`）選項；此固定選擇會以
 `diffusion_method=smagorinsky_workbook_eq10` 寫入 provenance，避免與 legacy 常數擴散結果
 混淆比較。
+
+## 9.15 WP-26／WP-28：`bed_no_deposition`（海床不沉積）敏感度案例
+
+### 9.15.1 語意（正名後）
+
+`native-plan`／`native-run` 新增 `--bed-no-deposition`／`LBT_NATIVE_BED_NO_DEPOSITION`
+（介面與 9.14 節的 `--experiment-case` 同款：CLI 旗標優先於環境變數，兩者都提供且不一致
+時 fail closed，都省略時預設關閉），明確宣告本次是否啟用這個研究用敏感度案例。**這個
+案例的定義是**：粒子回溯軌跡接觸海床、連續停留達到既有沉積門檻（`deposition_consecutive_
+hours`／`deposition_tolerance_m`）時，**不視為沉積、不終止**，由既有物理（平流＋
+Smagorinsky 擴散＋既有垂向夾擠 `batch_clamp_z`）繼續驅動，量測「若不假設沉積物永久停留
+海床」這個基線假設讓來源足跡偏近多少。
+
+這個名字（`bed_no_deposition`）在 WP-28 之前暫名 `bed_reflect`（見 `reports/WP-26.md`／
+`reports/WP-28.md` 的完整正名記錄）；舊名字暗示「鏡射反射」，但實作行為從來就只是「關掉
+沉積終止判定」，**不得宣稱為鏡射反射，也不得宣稱為再懸浮動力學**（沉積物被水流或紊流
+重新捲起的物理過程）——本案例完全沒有實作、也沒有嘗試近似後者的任何運動學或動力學公式，
+只是關閉一個終止判定，讓既有的、完全未修改的子步物理核心繼續驅動這顆粒子。
+
+### 9.15.2 接線與 provenance
+
+- 啟用與否會寫進 `native-plan` 產生的計畫檔（`bed_no_deposition` 區塊）、`native-run`
+  每份結果摘要（`member_summaries[unit_id].bed_no_deposition`）與 `native-postprocess`
+  的 `--plan` 選項讀回後寫入的 `PostprocessManifest.config.runtime_bed_no_deposition`。
+- `native-run` 啟動任何工作單元之前會核對計畫檔宣稱值與本次執行環境變數是否一致，
+  不一致且未設 `LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1` 時 fail closed（語意同
+  9.14 節的實驗案例不一致檢查）。
+- 粒子身分表（`particle_input.ParticleIdentityTable`）**刻意不**把這個開關納入
+  `content_sha256`：兩個案例本來就應該共用同一份粒子部署（相同起點、相同種子）才能做
+  公平比較，見該模組 docstring 的完整說明。
+- `postprocess.py` 只新增 manifest 欄位（`runtime_bed_no_deposition`），**不改動**任何
+  統計邏輯或既有欄位定義——兩種案例各自的離開紀錄、通量表與條件式來源足跡計算方式完全
+  相同，差異只在輸入結果檔本身（是否含 `NATIVE_STATUS_DEPOSITED` 事件）。
+
+### 9.15.3 輸出目錄命名（兩案例的結果絕不可混在同一份統計）
+
+**兩種案例的結果必須放在不同的 `--output` 目錄**，例如
+`results-deposit-stop`／`results-bed-no-deposition`，或加上明確後綴
+`results_bed_no_deposition_<region>`；`native-postprocess` 的 `--output` 也必須各自
+分開，不得把兩種案例的 `.driver_result.npz` 混在同一個 `--results-dir` 底下呼叫一次
+`native-postprocess`（`PostprocessAccumulator` 本身不會、也不應該嘗試偵測混批，這是操作
+紀律，由 manifest 裡的 `runtime_bed_no_deposition` 供人工事後稽核，而不是程式強制擋下）。
+
+### 9.15.4 範例
+
+```bash
+uv run lbt native-plan --config <正式設定 YAML> \
+  --identity-table <identity_table.npz> \
+  --ocm-native-root <OCM_NATIVE_ROOT> \
+  --bed-no-deposition \
+  --output work/sensitivity-bed-no-deposition/plan.json
+
+LBT_NATIVE_BED_NO_DEPOSITION=1 \
+uv run lbt native-run work/sensitivity-bed-no-deposition/plan.json \
+  --resource-provider lagrangian_backtracking.native_runner.hour_major_provider:make_hour_major_resource_provider \
+  --output work/sensitivity-bed-no-deposition/results \
+  --auto-worker-count --per-worker-memory-bytes <每個 worker 的記憶體上限> \
+  --baytrace-root "$LBT_BAYTRACE_ROOT" --formal
+
+uv run lbt native-postprocess \
+  --results-dir work/sensitivity-bed-no-deposition/results \
+  --identity-table <identity_table.npz> \
+  --output work/sensitivity-bed-no-deposition/postprocess \
+  --config <正式設定 YAML> \
+  --plan work/sensitivity-bed-no-deposition/plan.json \
+  --with-boundary-segments --formal
+```
+
+（`native-run` 的 worker 子程序透過 `LBT_NATIVE_BED_NO_DEPOSITION` 環境變數讀到這個設定，
+`--bed-no-deposition` 只是 `native-plan` 的 CLI 旗標，本身不會傳遞到 `native-run` 的子
+程序，兩者必須各自設定，見 9.15.2 節的一致性檢查。）

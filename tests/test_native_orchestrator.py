@@ -1573,3 +1573,150 @@ def test_native_run_without_physics_case_field_is_unaffected(tmp_path, monkeypat
         pytest.fail("舊計畫檔（沒有 physics_case 欄位）不應該觸發 WP-18 的實驗案例比對")
     except Exception:
         pass  # 其餘失敗（例如 provider 不合法）不是本測試要驗證的範圍。
+
+
+def test_write_native_plan_file_round_trips_bed_no_deposition_declaration(tmp_path) -> None:
+    """WP-26／WP-28：計畫檔的 ``bed_no_deposition`` 區塊必須原樣寫入並可讀回，
+    供 native-run／native-postprocess 與人工稽核核對本次規劃是否啟用這個
+    「海床不沉積」敏感度案例（見 bed_no_deposition_case.py 模組文件）。"""
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    declaration = {"bed_no_deposition": True}
+    orch.write_native_plan_file(
+        plan_path,
+        units=[unit],
+        gap_checks=[],
+        summary=summary,
+        bed_no_deposition_declaration=declaration,
+    )
+    _units, payload = orch.read_native_plan_file(plan_path)
+    assert payload["bed_no_deposition"] == declaration
+
+
+def test_native_run_fails_closed_on_plan_bed_no_deposition_mismatch(tmp_path, monkeypatch) -> None:
+    """計畫檔以 ``bed_no_deposition=True`` 規劃，但執行環境沒有設定
+    ``LBT_NATIVE_BED_NO_DEPOSITION``（因此退回預設 ``False``）時，``native-run``
+    必須在動用任何 ``--resource-provider`` 或執行任何工作單元之前就 fail closed，
+    理由與 backtrack_mode／physics_case 的既有比對測試相同，只是換成 WP-28
+    新增的 bed_no_deposition 比對（見 ``cli.run_native_run`` 讀回計畫檔後的
+    ``bed_no_deposition`` 比對邏輯）。"""
+
+    from lagrangian_backtracking import cli
+    from lagrangian_backtracking.native_runner.bed_no_deposition_case import (
+        BedNoDepositionCaseError,
+    )
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(
+        plan_path,
+        units=[unit],
+        gap_checks=[],
+        summary=summary,
+        bed_no_deposition_declaration={"bed_no_deposition": True},
+    )
+
+    monkeypatch.delenv("LBT_NATIVE_BED_NO_DEPOSITION", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_EXPERIMENT_CASE", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_BACKTRACK_MODE", raising=False)
+
+    with pytest.raises(BedNoDepositionCaseError):
+        cli.run_native_run(
+            [
+                str(plan_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--resource-provider",
+                "os.path:join",
+                "--worker-count",
+                "1",
+            ]
+        )
+
+
+def test_native_run_bed_no_deposition_mismatch_acknowledged_proceeds_past_check(
+    tmp_path, monkeypatch
+) -> None:
+    """明確設定 ``LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1`` 承認差異時，
+    ``bed_no_deposition`` 比對不再 fail closed，執行會繼續往下（在後續其他步驟
+    因為 ``--resource-provider`` 不是真正的 provider 而失敗，但那不是本測試要
+    驗證的範圍——本測試只確認「承認旗標能讓這一個特定檢查放行」）。"""
+
+    from lagrangian_backtracking import cli
+    from lagrangian_backtracking.native_runner.bed_no_deposition_case import (
+        BedNoDepositionCaseError,
+    )
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(
+        plan_path,
+        units=[unit],
+        gap_checks=[],
+        summary=summary,
+        bed_no_deposition_declaration={"bed_no_deposition": True},
+    )
+
+    monkeypatch.delenv("LBT_NATIVE_BED_NO_DEPOSITION", raising=False)
+    monkeypatch.setenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", "1")
+    monkeypatch.delenv("LBT_NATIVE_EXPERIMENT_CASE", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_BACKTRACK_MODE", raising=False)
+
+    try:
+        cli.run_native_run(
+            [
+                str(plan_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--resource-provider",
+                "os.path:join",
+                "--worker-count",
+                "1",
+            ]
+        )
+    except BedNoDepositionCaseError:
+        pytest.fail("已明確承認不一致，bed_no_deposition 比對不應該再 fail closed")
+    except Exception:
+        pass  # 其餘失敗（例如 provider 不合法）不是本測試要驗證的範圍。
+
+
+def test_native_run_without_bed_no_deposition_field_is_unaffected(tmp_path, monkeypatch) -> None:
+    """WP-28 之前產生的舊計畫檔沒有 ``bed_no_deposition`` 欄位；新增的比對必須
+    完全跳過（不能對舊計畫檔 fail closed），行為與新增此檢查之前相同。"""
+
+    from lagrangian_backtracking import cli
+    from lagrangian_backtracking.native_runner.bed_no_deposition_case import (
+        BedNoDepositionCaseError,
+    )
+
+    unit = _make_synthetic_unit(unit_id="u0", flow_domain_id="flowA", sleep_seconds=0.0)
+    summary = orch.summarize_native_work_plan([unit])
+    plan_path = tmp_path / "plan.json"
+    orch.write_native_plan_file(plan_path, units=[unit], gap_checks=[], summary=summary)
+
+    monkeypatch.delenv("LBT_NATIVE_BED_NO_DEPOSITION", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_EXPERIMENT_CASE", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", raising=False)
+    monkeypatch.delenv("LBT_NATIVE_BACKTRACK_MODE", raising=False)
+
+    try:
+        cli.run_native_run(
+            [
+                str(plan_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--resource-provider",
+                "os.path:join",
+                "--worker-count",
+                "1",
+            ]
+        )
+    except BedNoDepositionCaseError:
+        pytest.fail("舊計畫檔（沒有 bed_no_deposition 欄位）不應該觸發 WP-28 的比對")
+    except Exception:
+        pass  # 其餘失敗（例如 provider 不合法）不是本測試要驗證的範圍。

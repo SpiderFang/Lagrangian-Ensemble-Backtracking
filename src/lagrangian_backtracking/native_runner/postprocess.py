@@ -1677,6 +1677,7 @@ class PostprocessAccumulator:
         lonlat_projector: LonLatProjector | None = None,
         boundary_geometries: Mapping[str, BoundaryGeometry] | None = None,
         runtime_physics_case: Mapping[str, Any] | None = None,
+        runtime_bed_no_deposition: Mapping[str, Any] | None = None,
     ) -> None:
         self._identity_table = identity_table
         self._config = config if config is not None else PostprocessConfig()
@@ -1689,6 +1690,17 @@ class PostprocessAccumulator:
         # 兩者刻意分開命名，避免呼叫端把身分表標籤誤當成物理案例的證據。省略時
         # （``None``）輸出 manifest 明確保存 ``None``，不臆測。
         self._runtime_physics_case = dict(runtime_physics_case) if runtime_physics_case is not None else None
+        # WP-26／WP-28：native-plan 計畫檔 ``bed_no_deposition`` 區塊的原樣副本
+        # （若呼叫端提供 ``--plan``），記錄本次結果是否啟用「海床不沉積」敏感度
+        # 案例（見 native_runner.bed_no_deposition_case 模組文件與
+        # backward_driver.BackwardDriverConfig.bed_no_deposition docstring 的
+        # 完整正名與科學語意說明）。省略時（``None``）輸出 manifest 明確保存
+        # ``None``，不代表這批結果沒有啟用這個案例，只代表呼叫端沒有提供計畫檔
+        # 可供核對——與 ``runtime_physics_case`` 的「省略不代表無 Stokes」是同一種
+        # 誠實揭露政策。
+        self._runtime_bed_no_deposition = (
+            dict(runtime_bed_no_deposition) if runtime_bed_no_deposition is not None else None
+        )
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2348,6 +2360,10 @@ class PostprocessAccumulator:
                 # PostprocessAccumulator.__init__ 對兩種 experiment_case_id 語意
                 # 差異的說明。
                 "runtime_physics_case": self._runtime_physics_case,
+                # WP-26／WP-28：native-plan 計畫檔的 bed_no_deposition（海床不沉積）
+                # 敏感度案例聲明（若呼叫端提供 --plan）。None 表示呼叫端未提供計畫
+                # 檔，不代表「未啟用」，見 PostprocessAccumulator.__init__ 的說明。
+                "runtime_bed_no_deposition": self._runtime_bed_no_deposition,
                 # WP-23：終止邊界改為 flow domain 之後，兩種「離開」定義不再相同，
                 # 在 manifest 明確記錄差異與哪些站是 local_equals_flow，不能只靠
                 # 表格欄名讓使用者自己猜（見模組 docstring「WP-23」一節）。

@@ -1035,6 +1035,109 @@ def test_no_stokes_experiment_case_end_to_end_skips_wave_data(
     assert default_summary["experiment_case_id"] == "finite_depth_stokes"
 
 
+def test_bed_no_deposition_end_to_end_default_bit_identical_and_flag_propagates(
+    two_domain_env, baytrace_root, clean_k1_run, numba_cache_dir, tmp_path_factory
+) -> None:
+    """WP-26／WP-28：``--bed-no-deposition`` 從 ``native-plan`` 到 ``native-run``
+    全程串起來後：
+
+    1. 省略這個旗標（``clean_k1_run`` 既有基線）時，每個結果摘要都必須標示
+       ``bed_no_deposition=False``，且產出的 ``.driver_result.npz`` 與本測試
+       另外重跑一次「明確設定為 False」的結果逐位元相同——這是「省略新旗標
+       與明示 False 必須位元相同」這個硬要求在完整 CLI／worker 接線層級的
+       證明（驅動層本身的位元相同證明見
+       ``tests/test_native_backward_driver.py::
+       test_bed_no_deposition_default_bit_identical_and_sensitivity_case_never_deposits``，
+       本測試證明的是「CLI 旗標與環境變數接線沒有在半路把這個設定弄丟或
+       弄錯」，兩者互補、缺一不可）。
+    2. 啟用這個旗標時，計畫檔與每個結果摘要（含摺疊排程單元底下的
+       ``member_summaries``）都必須標示 ``bed_no_deposition=True``，證明
+       ``--bed-no-deposition``／``LBT_NATIVE_BED_NO_DEPOSITION`` 確實一路
+       傳到 ``hour_major.HourMajorConfig``，不是只停在 CLI 層。
+    """
+
+    region_to_flow_domain_path = two_domain_env["identity_path"].parent / "region_to_flow_domain.json"
+    assert region_to_flow_domain_path.exists()
+
+    # ── 明確設定為 False：與省略（clean_k1_run）比對位元相同 ──────────────
+    explicit_false_plan_path = tmp_path_factory.mktemp("bed_no_deposition_plan") / "plan_explicit_false.json"
+    rc = cli.run_native_plan_command(
+        [
+            "--identity-table",
+            str(two_domain_env["identity_path"]),
+            "--region-to-flow-domain",
+            str(region_to_flow_domain_path),
+            "--output",
+            str(explicit_false_plan_path),
+            "--schedule",
+            "hour-major-segmented",
+            "--segments",
+            "1",
+            "--skip-gap-check",
+        ]
+    )
+    assert rc == 0
+    _units, explicit_false_plan_payload = orch.read_native_plan_file(explicit_false_plan_path)
+    assert explicit_false_plan_payload["bed_no_deposition"]["bed_no_deposition"] is False
+
+    env_base = _base_env(two_domain_env, baytrace_root)
+    env_base["LBT_NATIVE_BED_NO_DEPOSITION"] = "0"
+    explicit_false_run = _run_clean_native_run(
+        env_base, explicit_false_plan_path, numba_cache_dir, tmp_path_factory, "bed_no_deposition_false"
+    )
+
+    baseline_results = sorted(clean_k1_run["results_dir"].glob("*.driver_result.npz"))
+    explicit_false_results = sorted(explicit_false_run["results_dir"].glob("*.driver_result.npz"))
+    assert baseline_results and len(baseline_results) == len(explicit_false_results)
+    for baseline_path, explicit_false_path in zip(baseline_results, explicit_false_results, strict=True):
+        assert baseline_path.name == explicit_false_path.name
+        _assert_driver_results_bit_identical(
+            baseline_path, explicit_false_path, label="bed_no_deposition省略 vs 明示False"
+        )
+
+    for result_path in sorted(clean_k1_run["output_dir"].glob("*.result.json")):
+        summary = json.loads(result_path.read_text(encoding="utf-8"))
+        assert summary["bed_no_deposition"] is False
+        for member_summary in summary.get("member_summaries", {}).values():
+            assert member_summary["bed_no_deposition"] is False
+
+    # ── 啟用時：計畫檔與每份結果摘要都必須標示 True ─────────────────────
+    enabled_plan_path = tmp_path_factory.mktemp("bed_no_deposition_plan") / "plan_enabled.json"
+    rc = cli.run_native_plan_command(
+        [
+            "--identity-table",
+            str(two_domain_env["identity_path"]),
+            "--region-to-flow-domain",
+            str(region_to_flow_domain_path),
+            "--output",
+            str(enabled_plan_path),
+            "--schedule",
+            "hour-major-segmented",
+            "--segments",
+            "1",
+            "--skip-gap-check",
+            "--bed-no-deposition",
+        ]
+    )
+    assert rc == 0
+    _units, enabled_plan_payload = orch.read_native_plan_file(enabled_plan_path)
+    assert enabled_plan_payload["bed_no_deposition"]["bed_no_deposition"] is True
+
+    env_enabled = _base_env(two_domain_env, baytrace_root)
+    env_enabled["LBT_NATIVE_BED_NO_DEPOSITION"] = "1"
+    enabled_run = _run_clean_native_run(
+        env_enabled, enabled_plan_path, numba_cache_dir, tmp_path_factory, "bed_no_deposition_true"
+    )
+
+    result_paths = sorted(enabled_run["output_dir"].glob("*.result.json"))
+    assert result_paths, "啟用 bed_no_deposition 的 native-run 沒有寫出任何 *.result.json 結果摘要"
+    for result_path in result_paths:
+        summary = json.loads(result_path.read_text(encoding="utf-8"))
+        assert summary["bed_no_deposition"] is True
+        for member_summary in summary.get("member_summaries", {}).values():
+            assert member_summary["bed_no_deposition"] is True
+
+
 def clean_k1_run_output_result_paths(two_domain_env, baytrace_root, numba_cache_dir, tmp_path_factory):
     """獨立跑一次預設案例的 K=1 native-run，回傳其 ``*.result.json`` 路徑清單。
 

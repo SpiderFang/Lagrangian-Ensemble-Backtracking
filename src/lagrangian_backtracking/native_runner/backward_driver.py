@@ -196,7 +196,9 @@ bed_reflect`` 改名為 ``bed_no_deposition``、``BedReflectEventRecord`` 改名
 ``physics_case.py`` 同款「CLI 優先於環境變數、不一致 fail closed」介面）、
 ``hour_major.HourMajorConfig``／``hour_major_provider.py`` 的參數傳遞、
 ``postprocess.py`` 結果 manifest（見該模組 ``PostprocessManifest.config`` 的
-``bed_no_deposition`` 欄位），以及輸出目錄命名慣例（見 ``docs/operations``
+``runtime_bed_no_deposition`` 欄位，由 ``native-postprocess --plan`` 讀回
+``native-plan`` 計畫檔的 ``bed_no_deposition`` 區塊寫入），以及輸出目錄命名
+慣例（見 ``docs/operations/19_native_backward_batch_orchestrator.md`` 9.15 節
 與 CLI 說明：兩種案例的結果必須放在不同的 ``--output`` 目錄，manifest 記錄
 本次是否啟用這個案例，供人工核對兩批結果沒有被混在同一份統計）。
 ``particle_input.py`` 的批次身分雜湊**刻意沒有**把 ``bed_no_deposition`` 納入

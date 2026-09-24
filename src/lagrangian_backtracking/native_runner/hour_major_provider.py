@@ -108,6 +108,17 @@ WP-11 可修改檔案清單內，因此本模組退回 ``hour_major.HourMajorCon
 - ``LBT_NATIVE_DEPOSITION_TOLERANCE_M``：浮點，預設 ``0.5``。
 - ``LBT_NATIVE_STOKES_DEPTH_THRESHOLD_RATIO``：浮點或空字串（``None``），
   預設 ``None``（沿用 ``run_backward_batch`` 自身預設）。
+- ``LBT_NATIVE_BED_NO_DEPOSITION``（WP-26 新增、WP-28 正名接線）：``"1"``／
+  ``"0"``（預設）。啟用時關閉「連續停留海床即視為沉積並終止」這個判定，
+  粒子留在 ``NATIVE_STATUS_ACTIVE`` 繼續交給既有物理驅動——**不是**鏡射
+  反射，也不是再懸浮動力學，見 ``backward_driver.BackwardDriverConfig.
+  bed_no_deposition`` docstring 與該模組文件「WP-26／WP-28」一節的完整
+  正名與科學語意說明。與上面的回溯模式／實驗案例核對同一個理由：
+  ``cli.run_native_run`` 會在啟動任何工作單元之前，核對這個環境變數與
+  計畫檔 ``bed_no_deposition`` 區塊（``native-plan --bed-no-deposition``
+  的解析結果）是否一致，不一致且未設
+  ``LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1`` 時 fail-closed，見
+  ``bed_no_deposition_case.py`` 模組文件。
 
   **WP-13 誠實記載的已知限制（史托克斯子行程池未接線到正式路徑）**：
   ``backward_driver.compose_current_and_stokes_fields``／
@@ -264,6 +275,7 @@ from .backward_driver import (
     build_pre_window_deposition_result,
     load_baytrace_modules,
 )
+from .bed_no_deposition_case import resolve_bed_no_deposition
 from .hour_major import (
     HourMajorConfig,
     build_hour_major_domain_batch,
@@ -464,6 +476,11 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         master_seed=int(master_seed),
         stokes_depth_threshold_ratio=_env_optional_float(env, "LBT_NATIVE_STOKES_DEPTH_THRESHOLD_RATIO"),
         smagorinsky_impl=_env_smagorinsky_impl(env),
+        # WP-26／WP-28：只從環境變數解析實際採用值（不帶 cli_bed_no_deposition，
+        # 與上面 resolve_physics_case(cli_experiment_case_id=None, ...) 同一個
+        # 理由——「計畫檔宣稱值 vs. 本次執行環境變數」的一致性檢查在 cli.py 的
+        # run_native_run 裡進行，這裡只需要單純解析出本次要用的值）。
+        bed_no_deposition=resolve_bed_no_deposition(cli_bed_no_deposition=None, env=dict(env)),
     )
     return HourMajorProviderParams(
         config_path=config_path,
@@ -834,6 +851,14 @@ def _run_unit_entrypoint(
             "diffusion_method": params.diffusion_method,
         }
 
+    def _bed_no_deposition_provenance() -> dict[str, Any]:
+        # WP-26／WP-28：每個結果摘要都記錄本次是否啟用 bed_no_deposition（海床
+        # 不沉積）敏感度案例，避免事後只看 .driver_result.npz 本身（其中沒有
+        # 這個標記）猜不出這批結果是不是關掉了沉積終止判定，見
+        # bed_no_deposition_case.py 模組文件。直接讀 hour_major_config 本身
+        # 已經解析好的值，不重複解析環境變數。
+        return {"bed_no_deposition": params.hour_major_config.bed_no_deposition}
+
     for unit in pre_window_units:
         table = resources.identity_table
         driver_result = build_pre_window_deposition_result(
@@ -851,6 +876,7 @@ def _run_unit_entrypoint(
             "result_npz": str(result_npz_path(results_dir, unit.unit_id)),
             **_unit_horizon_provenance(unit),
             **_physics_case_provenance(),
+            **_bed_no_deposition_provenance(),
         }
 
     if not runnable_units:
@@ -871,6 +897,7 @@ def _run_unit_entrypoint(
             "effective_backtrack_mode": params.effective_backtrack_mode,
             "requested_horizon_days": params.requested_horizon_days,
             **_physics_case_provenance(),
+            **_bed_no_deposition_provenance(),
         }
 
     batch = build_hour_major_domain_batch(
@@ -953,6 +980,7 @@ def _run_unit_entrypoint(
             "result_npz": str(result_npz_path(results_dir, unit.unit_id)),
             **_unit_horizon_provenance(unit),
             **_physics_case_provenance(),
+            **_bed_no_deposition_provenance(),
         }
 
     return {
@@ -970,6 +998,7 @@ def _run_unit_entrypoint(
         "effective_backtrack_mode": params.effective_backtrack_mode,
         "requested_horizon_days": params.requested_horizon_days,
         **_physics_case_provenance(),
+        **_bed_no_deposition_provenance(),
     }
 
 

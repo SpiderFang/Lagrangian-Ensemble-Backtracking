@@ -256,6 +256,36 @@ def test_merge_departure_table_and_flux_denominators(tmp_path):
         assert row["fraction_crossed"] == pytest.approx(row["count_crossed"] / total)
 
 
+def test_runtime_bed_no_deposition_manifest_field_round_trips_and_defaults_to_none(tmp_path):
+    """WP-26／WP-28：``PostprocessAccumulator`` 收到 ``runtime_bed_no_deposition``
+    時要原樣寫進 ``manifest.config.runtime_bed_no_deposition``；沒有提供（呼叫端
+    沒有給 ``--plan``）時必須明確是 ``None``，不能臆測成 ``False``（省略計畫檔
+    不代表「未啟用」，只代表無法核對，見 ``PostprocessAccumulator.__init__``
+    docstring）。統計邏輯本身（``status_counts`` 等）不受這個欄位影響。"""
+
+    identity = _make_identity_table(
+        particle_ids=["p0"],
+        study_site_id=["A"],
+        settling_velocity_mps=[-0.001],
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS],
+    )
+    result = _make_result(rows=[0], final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION])
+
+    declaration = {"bed_no_deposition": True}
+    accumulator = PostprocessAccumulator(
+        identity, output_dir=tmp_path / "with_plan", runtime_bed_no_deposition=declaration
+    )
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+    assert manifest.config["runtime_bed_no_deposition"] == declaration
+    assert manifest.particle_count_total == 1
+
+    accumulator_no_plan = PostprocessAccumulator(identity, output_dir=tmp_path / "without_plan")
+    accumulator_no_plan.add_batch("batch-0", result)
+    manifest_no_plan = accumulator_no_plan.finalize()
+    assert manifest_no_plan.config["runtime_bed_no_deposition"] is None
+
+
 def test_season_grouping_uses_shared_season_by_month(tmp_path):
     """四顆粒子分別在四個不同季節到達，驗證季節分組表確實區分四季。"""
 

@@ -179,7 +179,9 @@ def test_cli_native_derive_horizon_requires_arrival_manifest_for_fixed_calendar_
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def _resolved_full_horizon(*, requested_horizon_days: float, effective_horizon_seconds: float) -> ResolvedUnitHorizon:
+def _resolved_full_horizon(
+    *, requested_horizon_days: float, effective_horizon_seconds: float
+) -> ResolvedUnitHorizon:
     return ResolvedUnitHorizon(
         backtrack_mode="full_horizon_from_deposition",
         requested_horizon_days=requested_horizon_days,
@@ -290,8 +292,12 @@ def test_local_domain_departures_all_dropped_when_all_after_cutoff() -> None:
     result = _synthetic_result_with_local_domain_fields(
         arrival_utc_ns=t0, n_hours=6, n_particles=2,
         local_domain_departures=(
-            bd.LocalDomainFirstExitRecord(row_particle_index=0, x_m=1.0, y_m=-1.0, z_m=-5.0, utc_ns=t0 - 5 * _HOUR_NS),
-            bd.LocalDomainFirstExitRecord(row_particle_index=1, x_m=2.0, y_m=-2.0, z_m=-5.0, utc_ns=t0 - 6 * _HOUR_NS),
+            bd.LocalDomainFirstExitRecord(
+                row_particle_index=0, x_m=1.0, y_m=-1.0, z_m=-5.0, utc_ns=t0 - 5 * _HOUR_NS
+            ),
+            bd.LocalDomainFirstExitRecord(
+                row_particle_index=1, x_m=2.0, y_m=-2.0, z_m=-5.0, utc_ns=t0 - 6 * _HOUR_NS
+            ),
         ),
     )
     resolved = _resolved_full_horizon(requested_horizon_days=3 / 24, effective_horizon_seconds=3 * 3600.0)
@@ -374,8 +380,12 @@ def test_derive_result_directory_preserves_local_domain_departures_end_to_end(tm
     source_dir = tmp_path / "source"
     source_dir.mkdir()
     t0 = 100_000 * _HOUR_NS
-    kept = bd.LocalDomainFirstExitRecord(row_particle_index=0, x_m=1.0, y_m=-1.0, z_m=-5.0, utc_ns=t0 - 2 * _HOUR_NS)
-    dropped = bd.LocalDomainFirstExitRecord(row_particle_index=1, x_m=2.0, y_m=-2.0, z_m=-5.0, utc_ns=t0 - 5 * _HOUR_NS)
+    kept = bd.LocalDomainFirstExitRecord(
+        row_particle_index=0, x_m=1.0, y_m=-1.0, z_m=-5.0, utc_ns=t0 - 2 * _HOUR_NS
+    )
+    dropped = bd.LocalDomainFirstExitRecord(
+        row_particle_index=1, x_m=2.0, y_m=-2.0, z_m=-5.0, utc_ns=t0 - 5 * _HOUR_NS
+    )
     result = _synthetic_result_with_local_domain_fields(
         arrival_utc_ns=t0, n_hours=6, n_particles=2, local_domain_departures=(kept, dropped),
     )

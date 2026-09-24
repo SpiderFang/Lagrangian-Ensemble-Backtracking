@@ -2401,6 +2401,7 @@ def write_native_plan_file(
     hour_major_members: Mapping[str, Sequence[NativeWorkUnit]] | None = None,
     backtrack_mode_declaration: Mapping[str, Any] | None = None,
     physics_case_declaration: Mapping[str, Any] | None = None,
+    bed_no_deposition_declaration: Mapping[str, Any] | None = None,
 ) -> None:
     """把規劃結果（工作單元、缺口檢查、規模摘要、manifest）寫成單一 JSON 計畫檔。
 
@@ -2445,6 +2446,12 @@ def write_native_plan_file(
         # 與 backtrack_horizon 同一層級；native-run／native-postprocess 與人工稽核
         # 都應該從這裡讀，不必回頭猜測本次規劃有沒有讀波浪資料。
         payload["physics_case"] = dict(physics_case_declaration)
+    if bed_no_deposition_declaration is not None:
+        # WP-26／WP-28：把「本次規劃是否啟用 bed_no_deposition（海床不沉積）敏感度
+        # 案例」寫進計畫檔，與 backtrack_horizon／physics_case 同一層級；
+        # native-run／native-postprocess 與人工稽核都應該從這裡讀，避免事後只看
+        # 摺疊後的排程單元猜不出這批結果有沒有關掉沉積終止判定。
+        payload["bed_no_deposition"] = dict(bed_no_deposition_declaration)
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(output_path, payload)

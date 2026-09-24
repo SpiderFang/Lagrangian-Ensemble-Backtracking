@@ -65,6 +65,7 @@ from .input_derivation import (
 )
 from .models import ParticleState, VelocitySample
 from .native_runner import backtrack_horizon as native_backtrack_horizon
+from .native_runner import bed_no_deposition_case as native_bed_no_deposition_case
 from .native_runner import figures as native_figures
 from .native_runner import horizon_derivation as native_horizon_derivation
 from .native_runner import hour_major_provider as native_hour_major_provider
@@ -902,6 +903,21 @@ def _native_plan_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--bed-no-deposition",
+        dest="bed_no_deposition",
+        action="store_true",
+        default=None,
+        help=(
+            "WP-26／WP-28：研究用敏感度案例；省略時讀取 LBT_NATIVE_BED_NO_DEPOSITION 環境"
+            "變數，兩者都省略時預設 False（既有行為：粒子連續停留海床即視為沉積並終止，"
+            "見 native_runner.backward_driver.BackwardDriverConfig.bed_no_deposition 與"
+            " reports/WP-28.md 的完整正名說明）。設為啟用時，粒子接觸海床達沉積門檻"
+            "不視為沉積、不終止，由既有平流＋擴散＋既有垂向夾擠繼續驅動——不是鏡射反射，"
+            "也不是再懸浮動力學。啟用與否會寫進計畫檔／每份結果摘要／後處理 manifest，"
+            "兩種案例的結果必須各自使用不同的 --output 目錄，絕不可混在同一份統計"
+        ),
+    )
+    parser.add_argument(
         "--skip-gap-check",
         action="store_true",
         help="明確略過缺口安全檢查（例如合成資料試跑）；一律在輸出中標記，不靜默略過",
@@ -1126,6 +1142,13 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         "require_wave_data": bool(args.require_wave_data),
     }
 
+    # WP-26／WP-28：bed_no_deposition（海床不沉積）敏感度案例明確化，介面與上面
+    # 的實驗案例同款（見 bed_no_deposition_case.py 模組文件）。
+    resolved_bed_no_deposition = native_bed_no_deposition_case.resolve_bed_no_deposition(
+        cli_bed_no_deposition=args.bed_no_deposition
+    )
+    bed_no_deposition_declaration = {"bed_no_deposition": resolved_bed_no_deposition}
+
     arrivals_by_time_utc_ns: dict[int, Any] | None = None
     maximum_age_days: int | None = None
     sampling_seed: int | None = None
@@ -1327,6 +1350,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         hour_major_members=hour_major_members,
         backtrack_mode_declaration=backtrack_mode_declaration,
         physics_case_declaration=physics_case_declaration,
+        bed_no_deposition_declaration=bed_no_deposition_declaration,
     )
 
     unsafe = [check for check in gap_checks if not check.is_gap_safe]
@@ -1346,6 +1370,7 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         "cost_model": cost_model_report,
         "backtrack_horizon": backtrack_mode_declaration,
         "physics_case": physics_case_declaration,
+        "bed_no_deposition": bed_no_deposition_declaration,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if report["is_gap_safe_ready"] else 2
@@ -1400,6 +1425,26 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
                 f"native-run 實際採用的 LBT_NATIVE_EXPERIMENT_CASE={run_experiment_case_id!r} "
                 "不一致，拒絕默默執行。請明確設定 LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1 "
                 "承認此差異，或改用與計畫檔一致的實驗案例"
+            )
+
+    # WP-26／WP-28：計畫檔記錄了 native-plan 當初是否啟用 bed_no_deposition（海床
+    # 不沉積）敏感度案例；同樣在執行任何工作單元之前核對本次 native-run 進程實際
+    # 會採用的值（LBT_NATIVE_BED_NO_DEPOSITION，與每個 worker 行程
+    # hour_major_provider._resolve_params 讀到的值同一套解析邏輯）是否與計畫檔一致，
+    # 理由與上面 backtrack_horizon／physics_case 的核對相同：避免結果摘要與輸出
+    # 目錄貼上與計畫檔不符的標籤，讓兩種案例的結果被誤判成同一批可直接合併統計。
+    plan_bed_no_deposition = payload.get("bed_no_deposition")
+    if plan_bed_no_deposition is not None:
+        plan_bed_no_deposition_value = bool(plan_bed_no_deposition.get("bed_no_deposition", False))
+        run_bed_no_deposition_value = native_bed_no_deposition_case.resolve_bed_no_deposition(
+            cli_bed_no_deposition=None
+        )
+        if run_bed_no_deposition_value != plan_bed_no_deposition_value and not acknowledge_mismatch:
+            raise native_bed_no_deposition_case.BedNoDepositionCaseError(
+                f"計畫檔 bed_no_deposition={plan_bed_no_deposition_value!r} 與本次 native-run 實際"
+                f" 採用的 LBT_NATIVE_BED_NO_DEPOSITION={run_bed_no_deposition_value!r} 不一致，拒絕"
+                "默默執行。請明確設定 LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1 承認此差異，"
+                "或改用與計畫檔一致的設定"
             )
 
     if not payload.get("is_gap_safe_ready", False) and not args.allow_unsafe_arrivals:
@@ -1773,10 +1818,13 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "WP-18：可選，native-plan 產生的計畫檔路徑；提供時把其中 physics_case "
-            "區塊（實際採用的實驗案例、是否含 Stokes、擴散方法聲明）原樣寫進本次"
-            "後處理 manifest 的 config.runtime_physics_case，供人工稽核與避免與"
-            "另一種實驗案例的結果混用。省略時該欄位為 null，不代表結果沒有 Stokes"
+            "WP-18／WP-26／WP-28：可選，native-plan 產生的計畫檔路徑；提供時把其中"
+            " physics_case 區塊（實際採用的實驗案例、是否含 Stokes、擴散方法聲明）"
+            "原樣寫進本次後處理 manifest 的 config.runtime_physics_case，並把"
+            " bed_no_deposition 區塊（本次是否啟用海床不沉積敏感度案例）寫進"
+            " config.runtime_bed_no_deposition，供人工稽核與避免不同案例的結果"
+            "被混用或合併統計。省略時兩個欄位皆為 null，不代表結果沒有 Stokes，"
+            "也不代表沒有啟用 bed_no_deposition"
         ),
     )
     parser.add_argument("--trajectory-sample-size-per-group", type=int, default=24)
@@ -1864,9 +1912,11 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         )
 
     runtime_physics_case: Mapping[str, Any] | None = None
+    runtime_bed_no_deposition: Mapping[str, Any] | None = None
     if args.plan is not None:
         _plan_units, plan_payload = native_orchestrator.read_native_plan_file(args.plan)
         runtime_physics_case = plan_payload.get("physics_case")
+        runtime_bed_no_deposition = plan_payload.get("bed_no_deposition")
 
     postprocess_config = native_postprocess.PostprocessConfig(
         trajectory_sample_size_per_group=args.trajectory_sample_size_per_group,
@@ -1888,6 +1938,7 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         lonlat_projector=lonlat_projector,
         boundary_geometries=boundary_geometries,
         runtime_physics_case=runtime_physics_case,
+        runtime_bed_no_deposition=runtime_bed_no_deposition,
     )
 
     result_paths = sorted(Path(args.results_dir).glob("*.driver_result.npz"))

@@ -190,6 +190,21 @@ class ParticleIdentityTable:
     「建構時一次驗證＋內容雜湊取代每步驗證」政策的核心：下游只需比對這個
     雜湊，不必像 ``production.py`` 的 ``_validate_alignment`` 那樣每個 sweep
     都逐列核對。
+
+    ``bed_no_deposition``（WP-26 新增、WP-28 正名接線，見
+    ``native_runner.backward_driver.BackwardDriverConfig.bed_no_deposition``
+    docstring）**刻意不**是本表的欄位、也不參與 ``content_sha256`` 的計算：
+    這個開關決定的是「粒子軌跡回溯到接觸海床時要不要終止」，屬於回溯動力學
+    層級的執行時設定，與本表描述的「粒子從哪裡出發、屬於哪個實驗案例（是否
+    含 Stokes，即 ``experiment_case_id``）」完全無關——同一批粒子起點與種子
+    本來就應該同時餵給 ``bed_no_deposition=False``（基線）與 ``True``（敏感
+    度案例）兩次執行，才能在完全相同的粒子部署下比較「是否關掉沉積終止判定」
+    這一個變因；若把它納入內容雜湊，會強迫兩種案例各自重建一份內容相同、只
+    是雜湊不同的粒子身分表，徒增管理負擔且沒有任何科學上的必要性。兩種案例
+    的結果差異改由 ``native_runner.postprocess.PostprocessManifest.config``
+    的 ``runtime_bed_no_deposition`` 欄位（來自 ``native-plan`` 計畫檔的
+    ``bed_no_deposition`` 區塊）與各自獨立的 ``--output`` 目錄辨識，不依賴
+    粒子身分表本身的雜湊差異。
     """
 
     particle_id: np.ndarray

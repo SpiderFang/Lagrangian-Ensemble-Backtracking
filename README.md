@@ -152,7 +152,7 @@ OCM 重建建置器只讀上游 schema 3 cache，在另一個 NFS 目錄發布�
 
 ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/results/15_four_region_first_pilot_audit.md)；A 區使用 `no_stokes`，B／C／D 使用 `finite_depth_stokes`，不能宣稱同設定比較。在 NFS 上，preview／figure 的 `.complete` 只表示成果目錄已通過驗證可供 reader 讀取，不表示粒子 run 完成；run 生命週期仍以 `run_progress.json`、`run-reconcile` 與 `validate-run --require-complete` 判定。
 
-`native_runner` 子套件另外提供 `lbt native-plan`／`lbt native-run`／`lbt native-status`／`lbt native-postprocess`／`lbt native-derive-horizon` 五個子命令，以工作單元（區域、到達時刻、沉降速度、`study_site_id`）為顆粒度做規劃、持續 worker 排程、續跑與失敗隔離；`--backtrack-mode`、`--experiment-case`（`no_stokes`／`finite_depth_stokes`，固定使用工作手冊 eq.(10) Smagorinsky 擴散）與設定檔不一致時 fail closed，須明示 `--acknowledge-config-mode-mismatch` 才放行。`native-postprocess --with-boundary-segments` 可依方位扇區／沿邊界弧長位置細分邊界進入統計。伺服器背景啟動入口見 `scripts/run_native_backtrack_server.sh`；完整工作單元模型、排程策略、實驗案例契約與已知限制見[native 逆向批次 orchestrator 操作契約](docs/operations/19_native_backward_batch_orchestrator.md)。此路徑是獨立於既有 `run-formal-parallel` 的排程／執行實作，不能取代既有正式母體流程。
+`native_runner` 子套件另外提供 `lbt native-plan`／`lbt native-run`／`lbt native-status`／`lbt native-postprocess`／`lbt native-derive-horizon` 五個子命令，以工作單元（區域、到達時刻、沉降速度、`study_site_id`）為顆粒度做規劃、持續 worker 排程、續跑與失敗隔離；`--backtrack-mode`、`--experiment-case`（`no_stokes`／`finite_depth_stokes`，固定使用工作手冊 eq.(10) Smagorinsky 擴散）、`--bed-no-deposition`（研究用敏感度案例：關閉「連續停留海床即沉積並終止」判定，不是鏡射反射也不是再懸浮動力學，見該文件 9.15 節）與設定檔不一致時 fail closed，須明示 `--acknowledge-config-mode-mismatch` 才放行。`native-postprocess --with-boundary-segments` 可依方位扇區／沿邊界弧長位置細分邊界進入統計。伺服器背景啟動入口見 `scripts/run_native_backtrack_server.sh`；完整工作單元模型、排程策略、實驗案例契約與已知限制見[native 逆向批次 orchestrator 操作契約](docs/operations/19_native_backward_batch_orchestrator.md)。此路徑是獨立於既有 `run-formal-parallel` 的排程／執行實作，不能取代既有正式母體流程。
 
 ## 6. 文件導覽
 
