@@ -76,6 +76,8 @@ def _make_identity_table(
     x0_m: list[float] | None = None,
     y0_m: list[float] | None = None,
     receptor_id: list[str] | None = None,
+    scenario_id: list[str] | None = None,
+    member_id: list[int] | None = None,
     experiment_case_id: str = "case-001",
     master_seed: int = 42,
 ) -> ParticleIdentityTable:
@@ -84,6 +86,11 @@ def _make_identity_table(
     ``x0_m``／``y0_m``（逆向追蹤起點，即受體位置的公尺座標）預設全零，與 WP-17
     之前既有測試的行為完全相同；WP-20 的方位扇區測試需要指定非零受體位置作為
     「站受體位置中心」，因此新增這兩個可選覆寫參數，不影響既有呼叫端。
+
+    ``scenario_id``／``member_id``（WP-37 新增可選覆寫）預設分別是「每顆粒子各
+    自一個情境」「member_id 全部是 0」，與既有測試 100% 相同的行為（即 M=1）；
+    只有驗證系集成員數（M）計算與一致性檢核的測試才會明確覆寫成「多顆粒子共用
+    同一個 scenario_id、member_id 各不相同」的組合。
     """
 
     n = len(particle_ids)
@@ -95,10 +102,14 @@ def _make_identity_table(
         y0_m = [0.0] * n
     if receptor_id is None:
         receptor_id = [f"recv-{i % 5}" for i in range(n)]
+    if scenario_id is None:
+        scenario_id = [f"scn-{i}" for i in range(n)]
+    if member_id is None:
+        member_id = [0] * n
     return ParticleIdentityTable(
         particle_id=np.asarray(particle_ids, dtype="<U64"),
-        scenario_id=np.asarray([f"scn-{i}" for i in range(n)], dtype="<U64"),
-        member_id=np.zeros(n, dtype=np.int32),
+        scenario_id=np.asarray(scenario_id, dtype="<U64"),
+        member_id=np.asarray(member_id, dtype=np.int32),
         study_site_id=np.asarray(study_site_id, dtype="<U64"),
         analysis_region_id=np.asarray(["region-a"] * n, dtype="<U64"),
         receptor_id=np.asarray(receptor_id, dtype="<U64"),
@@ -1444,6 +1455,91 @@ def test_boundary_summary_by_site_matches_flux_definition(tmp_path) -> None:
     assert summary_row["fraction_deposited"] == pytest.approx(
         flux_row[f"fraction_status_{NATIVE_STATUS_DEPOSITED}"]
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-37：系集成員數（M）直接由 member_id 相異值算出，並 fail-closed 檢核一致性
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_ensemble_member_count_computed_from_member_id_and_written_to_summary_and_manifest(
+    tmp_path,
+) -> None:
+    """單站、2 個情境、各自 3 個系集成員（``member_id`` 0/1/2）：
+    ``boundary_summary_by_site.ensemble_member_count`` 與 manifest 的
+    ``ensemble_member_count_by_site`` 都必須回報 3，且直接由資料算出（本測試
+    完全沒有提供任何「M=3」設定值，只提供 member_id 本身）。"""
+
+    particle_ids = [f"p{i}" for i in range(6)]
+    scenario_ids = ["scnA", "scnA", "scnA", "scnB", "scnB", "scnB"]
+    member_ids = [0, 1, 2, 0, 1, 2]
+    identity = _make_identity_table(
+        particle_ids=particle_ids,
+        study_site_id=["A"] * 6,
+        settling_velocity_mps=[-0.001] * 6,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 6,
+        scenario_id=scenario_ids,
+        member_id=member_ids,
+    )
+    result = _make_result(rows=list(range(6)), final_status=[NATIVE_STATUS_LEFT_INTEREST_REGION] * 6)
+
+    accumulator = PostprocessAccumulator(identity, output_dir=tmp_path, config=PostprocessConfig())
+    accumulator.add_batch("batch-0", result)
+    manifest = accumulator.finalize()
+
+    summary_row = pq.read_table(tmp_path / "boundary_summary_by_site.parquet").to_pylist()[0]
+    assert summary_row["ensemble_member_count"] == 3
+    assert manifest.ensemble_member_count_by_site == {"A": 3}
+
+    manifest_json = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest_json["ensemble_member_count_by_site"] == {"A": 3}
+
+
+def test_ensemble_member_count_fails_closed_when_a_scenario_has_fewer_members(tmp_path) -> None:
+    """同一站內某個情境的相異 ``member_id`` 數量與其他情境不同（此處 ``scnA``
+    有 3 個成員、``scnB`` 只有 2 個），必須在建構 ``PostprocessAccumulator`` 時
+    就 fail-closed（不用等到 ``finalize``），錯誤訊息附上實際數字與情境／站點
+    名稱，不嘗試補齊或忽略。"""
+
+    particle_ids = [f"p{i}" for i in range(5)]
+    scenario_ids = ["scnA", "scnA", "scnA", "scnB", "scnB"]
+    member_ids = [0, 1, 2, 0, 1]
+    identity = _make_identity_table(
+        particle_ids=particle_ids,
+        study_site_id=["A"] * 5,
+        settling_velocity_mps=[-0.001] * 5,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 5,
+        scenario_id=scenario_ids,
+        member_id=member_ids,
+    )
+    with pytest.raises(PostprocessError) as exc_info:
+        PostprocessAccumulator(identity, output_dir=tmp_path, config=PostprocessConfig())
+    message = str(exc_info.value)
+    assert "A" in message
+    assert "scnB" in message
+    assert "2" in message
+    assert "3" in message
+
+
+def test_ensemble_member_count_fails_closed_when_sites_disagree(tmp_path) -> None:
+    """站與站之間系集成員數不同（此處站 A 的情境有 3 個成員、站 B 的情境只有
+    2 個），即使每一站「站內各情境互相一致」，仍必須 fail-closed——圖說與副標
+    只能寫一個 M，不能對應到不同站不同的實際系集大小。"""
+
+    particle_ids = [f"p{i}" for i in range(5)]
+    study_site_id = ["A", "A", "A", "B", "B"]
+    scenario_ids = ["scnA", "scnA", "scnA", "scnB", "scnB"]
+    member_ids = [0, 1, 2, 0, 1]
+    identity = _make_identity_table(
+        particle_ids=particle_ids,
+        study_site_id=study_site_id,
+        settling_velocity_mps=[-0.001] * 5,
+        arrival_time_utc_ns=[_JAN_2024_UTC_NS] * 5,
+        scenario_id=scenario_ids,
+        member_id=member_ids,
+    )
+    with pytest.raises(PostprocessError, match="各站系集成員數不一致"):
+        PostprocessAccumulator(identity, output_dir=tmp_path, config=PostprocessConfig())
 
 
 # ══════════════════════════════════════════════════════════════════════════

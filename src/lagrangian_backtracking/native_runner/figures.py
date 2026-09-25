@@ -134,11 +134,14 @@ manifest（避免疊床架屋，也避免正式圖表管線另外維護一份與
 本模組產出的方位扇區／弧段統計一律稱為「相對來源權重」，條件式核密度足跡一律
 稱為「條件式來源足跡」；不使用「機率」「probability of origin」等字樣。這兩個
 量的定義是：給定站點、受體、沉降速度與到達時刻等情境設定後，穿越各方位扇區／
-各邊界弧段的相對頻率——是描述這一批 ``M=1`` 系集在既定設定下的分布，需要先驗、
-概似與觀測驗證後才能延伸為來源機率或因果歸因，本模組不提供、也不宣稱提供這一
-層推論。每張圖的副標與 ``captions.md`` 固定寫出站點、粒子數、``M=1``、終止邊界
-定義（flow domain 開放邊界）等已知設定，供讀者自行核對適用範圍，不使用警語式
-的「不得」句型。
+各邊界弧段的相對頻率——是描述這一批 ``M`` 個系集成員在既定設定下的分布，需要
+先驗、概似與觀測驗證後才能延伸為來源機率或因果歸因，本模組不提供、也不宣稱
+提供這一層推論。每張圖的副標與 ``captions.md`` 固定寫出站點、粒子數、``M``、
+終止邊界定義（flow domain 開放邊界）等已知設定，供讀者自行核對適用範圍，不使用
+警語式的「不得」句型。``M``（WP-37 起）一律讀 ``boundary_summary_by_site.
+ensemble_member_count``（後處理實測的相異 ``member_id`` 數量），不是任何寫死的
+常數——同一批圖表可能來自 ``M=1`` 的確定性試驗，也可能來自 ``M>1`` 的隨機系集，
+由後處理實際資料決定，本模組不假設固定為 1。
 
 字型與雙語退場
 ----------------
@@ -688,6 +691,14 @@ _SUMMARY_REQUIRED_COLUMNS: tuple[str, ...] = (
     "fraction_pre_window_deposition",
 )
 
+# WP-37：這一站實測的系集成員數（M，相異 member_id 數量），由
+# ``postprocess._write_site_summary_table`` 寫入。刻意**不**放進上面的
+# ``_SUMMARY_REQUIRED_COLUMNS``（那個 tuple 缺欄位時只會得到 _require_columns
+# 的通用訊息「缺少必要欄位」），而是在 load_native_figures_inputs 另外用專屬
+# 訊息檢查，明確指出這是舊版後處理輸出、需要重跑 native-postprocess，避免使用
+# 預設值 1 靜默帶過（那正是 WP-37 修的缺陷成因，見模組 docstring）。
+_SUMMARY_ENSEMBLE_MEMBER_COUNT_COLUMN = "ensemble_member_count"
+
 _ARC_GEOMETRY_REQUIRED_COLUMNS: tuple[str, ...] = (
     "study_site_id",
     "base_boundary_segment_id",
@@ -899,13 +910,18 @@ def _build_kde_row(kde_table: pa.Table, site_id: str) -> dict[str, Any] | None:
 
 
 def _build_summary_row(summary_table: pa.Table, site_id: str) -> dict[str, Any]:
+    """讀 ``boundary_summary_by_site`` 這一站的一列，並附上 WP-37 的
+    ``ensemble_member_count``（呼叫端 :func:`load_native_figures_inputs` 已經
+    確認這欄存在才會呼叫本函式，這裡不重複檢查）。"""
+
     mask = pc.equal(summary_table.column("study_site_id"), site_id)
     matched = summary_table.filter(mask)
     if matched.num_rows == 0:
         raise FiguresError(f"boundary_summary_by_site 沒有 {site_id} 站的列")
     if matched.num_rows > 1:
         raise FiguresError(f"boundary_summary_by_site 對 {site_id} 有超過一列，資料不一致")
-    return {name: matched.column(name)[0].as_py() for name in _SUMMARY_REQUIRED_COLUMNS}
+    columns = (*_SUMMARY_REQUIRED_COLUMNS, _SUMMARY_ENSEMBLE_MEMBER_COUNT_COLUMN)
+    return {name: matched.column(name)[0].as_py() for name in columns}
 
 
 def _build_local_departures_by_row(
@@ -987,6 +1003,16 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
     _require_columns(kde_table, _KDE_REQUIRED_COLUMNS, "kde_by_site.parquet")
     summary_table, summary_path = _read_table_any(postprocess_dir, "boundary_summary_by_site")
     _require_columns(summary_table, _SUMMARY_REQUIRED_COLUMNS, "boundary_summary_by_site")
+    if _SUMMARY_ENSEMBLE_MEMBER_COUNT_COLUMN not in summary_table.column_names:
+        # WP-37：這是舊版 native-postprocess 輸出（尚未把系集成員數寫進
+        # boundary_summary_by_site），不是普通的缺欄位——fail-closed 拒絕出圖，
+        # 不用預設值 1 靜默帶過，否則正是這次正式成果把 M 印錯的成因重演。
+        raise FiguresError(
+            f"boundary_summary_by_site 缺少 {_SUMMARY_ENSEMBLE_MEMBER_COUNT_COLUMN} 欄位——"
+            "這是舊版 native-postprocess 輸出，尚未記錄系集成員數（M），請重新執行 "
+            "native-postprocess 重新產生 boundary_summary_by_site 後再出圖，不可用預設值 1 "
+            "靜默帶過"
+        )
     arc_table, arc_path = _read_table_any(postprocess_dir, "boundary_arc_segments_geometry_by_site")
     _require_columns(arc_table, _ARC_GEOMETRY_REQUIRED_COLUMNS, "boundary_arc_segments_geometry_by_site")
     local_departures_table, local_departures_path = _require_strict_parquet(
@@ -1537,14 +1563,37 @@ def _title_top_margin(figure_text: str, *, full: float, none: float = 0.97) -> f
     return full if figure_text == "full" else none
 
 
+def _ensemble_member_count_text(n: int) -> tuple[str, str]:
+    """回傳系集成員數（``M``）的中／英文描述短句，供圖面副標與 ``captions.md``
+    共用同一份措辭（WP-37：兩處過去各自寫死 ``M=1``，這裡改成唯一來源）。
+
+    ``n`` 是後處理實測的相異 ``member_id`` 數量（見
+    ``postprocess._ensemble_member_count_by_site``），不是任何寫死的常數；
+    ``n == 1`` 時維持既有語句（正式成果曾經真的是確定性單一系集試驗時用這句），
+    其餘一律寫「每情境 n 個獨立隨機系集成員」。
+    """
+
+    if n == 1:
+        return (
+            "M=1（每情境一個系集成員，含隨機擴散）",
+            "M=1 (single ensemble member)",
+        )
+    return (
+        f"M={n}（每情境 {n} 個獨立隨機系集成員，含隨機擴散）",
+        f"M={n} ({n} ensemble members per scenario)",
+    )
+
+
 def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
     total = int(site.summary["total_particle_count"])
     crossed_fraction = float(site.summary["fraction_crossed_interest_region_boundary"])
+    member_count = int(site.summary["ensemble_member_count"])
+    member_text_zh, member_text_en = _ensemble_member_count_text(member_count)
     base = t.t(
         f"站點：{site.site_label_zh}（{site.site_id}）｜粒子數：{total}｜穿越開放邊界比例："
-        f"{crossed_fraction * 100:.1f}%｜M=1（含隨機擴散，單一系集成員）",
+        f"{crossed_fraction * 100:.1f}%｜{member_text_zh}",
         f"Site: {site.site_id} | N={total} | crossed fraction: "
-        f"{crossed_fraction * 100:.1f}% | M=1 (single ensemble member)",
+        f"{crossed_fraction * 100:.1f}% | {member_text_en}",
     )
     return f"{base}{extra}"
 
@@ -2320,33 +2369,113 @@ def _dispatch_plot(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _experiment_case_label(postprocess_manifest: Mapping[str, Any]) -> str:
-    """回傳這批圖對應的物理案例識別碼（供圖說列出「關鍵設定」的物理案例）。
+@dataclass(frozen=True, slots=True)
+class _ExperimentCaseDisclosure:
+    """WP-37：把「物理案例」與「粒子身分表標籤」分開陳述的兩段中文文字。
 
-    直接讀 ``postprocess.py`` 自己輸出的 ``manifest.json`` 的
-    ``experiment_case_id``；沒有這個欄位時如實寫「未於後處理 manifest 記錄」，
-    不臆測案例名稱。
+    這兩個量語意不同、且刻意分開命名，理由見 ``postprocess.py`` 模組 docstring
+    「WP-18」一節與 ``PostprocessAccumulator.__init__`` 對
+    ``runtime_physics_case`` 的說明：
+
+    - ``physics_case_zh``：**物理案例**（是否含 Stokes 漂移、擴散方法），取自
+      ``manifest.json`` 的 ``config.runtime_physics_case``——這是
+      ``native-postprocess`` 呼叫端提供 ``--plan`` 時，原樣複製自計畫檔
+      ``physics_case`` 區塊的內容，只有這個欄位才是「這次執行實際採用的物理
+      設定」的證據。呼叫端沒有提供 ``--plan`` 時這個欄位是 ``None``，**不代表
+      沒有 Stokes**，只代表無法從 manifest 核對，如實寫「未於後處理 manifest
+      記錄」，不退回去用粒子身分表標籤假冒。
+    - ``identity_table_label_zh``：**粒子身分表標籤**，取自 manifest 頂層的
+      ``experiment_case_id``——這是建立粒子身分表時的字串標籤（seed 命名空間
+      用），只保證同一批粒子部署使用同一個標籤，**不保證**等於實際執行時的
+      物理設定，因此文字明確標示「這是身分表標籤、不是物理設定的證據」。
+    - ``bed_no_deposition_zh``：``config.runtime_bed_no_deposition`` 非
+      ``None`` 時，這批結果是否啟用「海床不沉積」敏感度案例；``None``（呼叫端
+      未提供 ``--plan``）時本欄位也是 ``None``（圖說不列出這一項，而不是猜測
+      未啟用）。
     """
 
-    case_id = postprocess_manifest.get("experiment_case_id")
-    return str(case_id) if case_id else "未於後處理 manifest 記錄"
+    physics_case_zh: str
+    identity_table_label_zh: str
+    bed_no_deposition_zh: str | None
 
 
-def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case_label: str) -> str:
+def _describe_experiment_case(postprocess_manifest: Mapping[str, Any]) -> _ExperimentCaseDisclosure:
+    """由 ``postprocess.py`` 輸出的 ``manifest.json`` 建立 :class:`_ExperimentCaseDisclosure`。
+
+    WP-37 修正：舊版 ``_experiment_case_label`` 的 docstring 宣稱回傳「物理案例
+    識別碼」，實際讀的卻是 ``experiment_case_id``（粒子身分表標籤），把兩個語意
+    不同的量混成一個字串、還掛錯名字——這裡改成分開回傳，呼叫端各自標明用途，
+    不再有任何一個字串同時被兩種語意共用。
+    """
+
+    config = postprocess_manifest.get("config")
+    config = config if isinstance(config, Mapping) else {}
+
+    runtime_physics_case = config.get("runtime_physics_case")
+    if isinstance(runtime_physics_case, Mapping):
+        case_id = runtime_physics_case.get("experiment_case_id")
+        include_stokes = runtime_physics_case.get("include_stokes")
+        diffusion_method = runtime_physics_case.get("diffusion_method")
+        if include_stokes is True:
+            stokes_zh = "含 Stokes 漂移"
+        elif include_stokes is False:
+            stokes_zh = "不含 Stokes 漂移"
+        else:
+            stokes_zh = "是否含 Stokes 漂移未記錄"
+        physics_case_zh = f"{case_id}（{stokes_zh}"
+        if diffusion_method:
+            physics_case_zh += f"，擴散方法：{diffusion_method}"
+        physics_case_zh += "）"
+    else:
+        physics_case_zh = "未於後處理 manifest 記錄（`native-postprocess` 未提供 `--plan`）"
+
+    identity_case_id = postprocess_manifest.get("experiment_case_id")
+    identity_table_label_zh = (
+        f"{identity_case_id}（粒子身分表標籤，僅供 seed 命名空間辨識，不是物理設定的證據）"
+        if identity_case_id
+        else "未於後處理 manifest 記錄"
+    )
+
+    runtime_bed_no_deposition = config.get("runtime_bed_no_deposition")
+    bed_no_deposition_zh: str | None = None
+    if isinstance(runtime_bed_no_deposition, Mapping):
+        enabled = bool(runtime_bed_no_deposition.get("bed_no_deposition", False))
+        bed_no_deposition_zh = (
+            "已啟用「海床不沉積」敏感度案例" if enabled else "未啟用「海床不沉積」敏感度案例"
+        )
+
+    return _ExperimentCaseDisclosure(
+        physics_case_zh=physics_case_zh,
+        identity_table_label_zh=identity_table_label_zh,
+        bed_no_deposition_zh=bed_no_deposition_zh,
+    )
+
+
+def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case: _ExperimentCaseDisclosure) -> str:
     """回傳單張圖（某站 × 某圖種）的繁體中文圖說，全部用直述句。
 
     每段固定交代三件事（見 WP-24b 任務要求）：這張圖是什麼、資料來源欄位、
     關鍵設定（站點、粒子數、``M``、終止邊界定義、物理案例）。全部用直述句陳述
     已量測的事實與方法定義——量得到的數字直接寫數字，量不到的（例如個別離開
     點分類的實際誤差率）不在此揣測，只寫清楚的方法定義。
+
+    WP-37：``M`` 改讀該站實測的 ``ensemble_member_count``（不再寫死 1），且
+    「物理案例」與「粒子身分表標籤」分開陳述（見 :class:`_ExperimentCaseDisclosure`
+    docstring），避免讀者把身分表標籤誤當成物理設定的證據。
     """
 
     total = int(site.summary["total_particle_count"])
+    member_count = int(site.summary["ensemble_member_count"])
+    member_text_zh, _member_text_en = _ensemble_member_count_text(member_count)
     site_desc = f"{site.site_label_zh}（{site.site_id}）"
     settings_tail = (
-        f"{site_desc}，{total:,} 顆粒子，M=1（每情境一個系集成員，含隨機擴散），"
-        f"終止邊界為 flow domain 開放邊界，物理案例：{experiment_case_label}。"
+        f"{site_desc}，{total:,} 顆粒子，{member_text_zh}，"
+        f"終止邊界為 flow domain 開放邊界，物理案例：{experiment_case.physics_case_zh}，"
+        f"粒子身分表標籤：{experiment_case.identity_table_label_zh}"
     )
+    if experiment_case.bed_no_deposition_zh is not None:
+        settings_tail += f"，{experiment_case.bed_no_deposition_zh}"
+    settings_tail += "。"
     if stem == "horizontal_overview":
         body = (
             "代表粒子水平軌跡總覽，涵蓋整個 flow domain 範圍，標示 flow domain 開放邊界"
@@ -2440,12 +2569,12 @@ def _build_captions(inputs: NativeFiguresInputs) -> dict[str, str]:
     docstring「WP-24b」一節：文字只寫一次，圖說與 manifest 互相核對用同一個
     來源，不會出現兩處文字不一致的情況）。"""
 
-    experiment_case_label = _experiment_case_label(inputs.postprocess_manifest)
+    experiment_case = _describe_experiment_case(inputs.postprocess_manifest)
     captions: dict[str, str] = {}
     for site in inputs.sites:
         for stem in FIGURE_STEMS:
             captions[f"{site.site_id}/{stem}.png"] = _figure_caption_zh(
-                stem, site, experiment_case_label=experiment_case_label
+                stem, site, experiment_case=experiment_case
             )
     return captions
 
@@ -2502,12 +2631,15 @@ breakdown` 四張圖改用同一批被選取站點共同的色階上下限與刻
 
 ## 科學定義與範圍
 
-- **M=1**：每個情境（站點 × 受體 × 沉降速度 × 到達時刻等）只有一個系集成員，
-  含隨機擴散。
+- **系集成員數（M）**：{ensemble_member_summary}；每個系集成員皆含隨機擴散，
+  差異只來自隨機數種子。M 是後處理實測值（`boundary_summary_by_site.
+  ensemble_member_count`，相異 `member_id` 數量），不是本模組寫死的常數
+  （WP-37）——同一套管線可能產出 `M=1` 的確定性試驗，也可能產出 `M>1` 的
+  隨機系集。
 - 「條件式來源足跡」與「相對來源權重」的定義：給定站點、受體、沉降速度與到達
   時刻等情境設定後，代表粒子穿越各方位扇區／各邊界弧段的相對頻率，是描述這批
-  `M=1` 系集在既定設定下分布的統計量。來源機率與因果歸因是另一層科學推論，需要
-  另外建立先驗、概似與觀測驗證，本批圖表不提供這一層推論。
+  M 個系集成員在既定設定下分布的統計量。來源機率與因果歸因是另一層科學推論，
+  需要另外建立先驗、概似與觀測驗證，本批圖表不提供這一層推論。
 - 圖上的終止標記位置是回溯積分停止處的座標，對應 `final_status_code` 七種
   互斥狀態之一（成功穿越 flow domain 開放邊界、達回溯上限、擱淺、沉底、流場
   缺值、數值失敗、`pre_window_deposition`）；停止處是積分終止的座標，不是另外
@@ -2586,8 +2718,9 @@ flow=False`）與新竹／南灣／連江（`local_equals_flow=True`）五站的
 
 ## 已知限制與方法揭露
 
-- **M=1**：每個情境（站點 × 受體 × 沉降速度 × 到達時刻等）只有一個系集成員
-  （含隨機擴散），本批圖表不呈現、也不能呈現系集離散度或不確定性區間。
+- **系集成員數（M）**：{ensemble_member_summary}（見上方「科學定義與範圍」）；
+  本批圖表不論 M 為何，一律把同一情境下的全部系集成員直接併入同一批統計，
+  不呈現、也不能呈現系集內部的離散度或不確定性區間。
 - 方位扇區與弧段的「相對來源權重」分母是**同一分組內成功穿越開放邊界的粒子
   數**，不是該分組全部粒子數；未穿越邊界的粒子不參與方位／弧段統計，但仍計入
   `terminal_counts.png` 與 `boundary_summary_by_site` 的整體分母。
@@ -2623,12 +2756,30 @@ flow=False`）與新竹／南灣／連江（`local_equals_flow=True`）五站的
 """
 
 
+def _ensemble_member_summary_zh(inputs: NativeFiguresInputs) -> str:
+    """回傳 README 用的系集成員數摘要文字（WP-37）。
+
+    正常情況下全部被選取站點的 ``ensemble_member_count`` 應該相同（後處理
+    ``_ensemble_member_count_by_site`` 已經 fail-closed 檢核過一致性），這裡
+    直接寫成單一 ``M=n``；萬一讀到不一致的舊資料（例如手動拼接的後處理輸出），
+    仍誠實逐站列出，不假裝一致或悄悄取其中一個值。
+    """
+
+    member_counts = {s.site_id: int(s.summary["ensemble_member_count"]) for s in inputs.sites}
+    distinct_counts = sorted(set(member_counts.values()))
+    if len(distinct_counts) == 1:
+        return f"M={distinct_counts[0]}"
+    detail = "、".join(f"{site_id}: M={count}" for site_id, count in sorted(member_counts.items()))
+    return f"各站不一致（{detail}）"
+
+
 def _build_readme(inputs: NativeFiguresInputs, config: NativeFiguresConfig, command: str) -> str:
     site_list = "\n".join(f"- `{s.site_id}`（{s.site_label_zh}）" for s in inputs.sites)
     return _README_TEMPLATE.format(
         generated_at_utc=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         figure_text=config.figure_text,
         site_list=site_list,
+        ensemble_member_summary=_ensemble_member_summary_zh(inputs),
         command=command,
         dpi=config.dpi,
     )

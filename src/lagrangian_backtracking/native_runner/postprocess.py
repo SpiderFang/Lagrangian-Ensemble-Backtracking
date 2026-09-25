@@ -151,7 +151,9 @@ WP-17 的分段表對每站只會有一列、相對來源權重恆為 1，答不
   ``boundary_flux_by_site`` 的計數換算成人類可讀的比例欄位（穿越比例、回溯達
   上限比例、擱淺、沉底、流場缺值、數值失敗、pre-window 各自比例），分母沿用
   ``boundary_flux_by_site`` 的 ``total_particle_count`` 定義，不另立新分母。這張
-  表**不需要** ``boundary_geometries``，永遠輸出。
+  表**不需要** ``boundary_geometries``，永遠輸出。``ensemble_member_count``
+  （WP-37 新增）是這一站相異 ``member_id`` 的數量，即這次執行實際覆蓋的系集
+  成員數（``M``），見下方「WP-37」一節。
 
 WP-23：終止邊界改為 flow domain、新增 local domain 首次離開統計
 ------------------------------------------------------------------
@@ -251,6 +253,29 @@ exit_summary_by_site``／``boundary_summary_by_site`` 也都保留
 不是被這個修法悄悄丟棄的資訊；``native_runner.figures`` 的弧段圖圖說也已同步
 改寫，明確區分「終止邊界（20 段，有權重）」與「幾何表另含的 local 邊界
 （20 段，供地理參照、恆為零權重）」，不再籠統寫「本站共 40 段弧段」。
+
+WP-37：系集成員數（``M``）改為由後處理實測，不再由出圖端寫死
+------------------------------------------------------------------
+正式成果（run04）審查發現：``native_runner.figures`` 的圖面副標與
+``captions.md`` 把系集成員數寫死成常數 ``M=1``，即使 release config 的
+``members_per_scenario`` 是 10、``departures.parquet`` 的 ``member_id`` 也確實
+有 10 個相異值，圖說仍固定印 ``M=1``——系集大小正是收斂性主張與沉降速度可
+區辨性下限（見 ``docs/development/05_decisions_and_risks.md`` D021）的核心
+依據，圖面上印錯等於自己送上把柄。
+
+修法：``M`` 不再是任何模組寫死的常數，而是 :class:`PostprocessAccumulator`
+建構時直接由 :class:`particle_input.ParticleIdentityTable` 的 ``member_id``
+欄位算出（見 :func:`_ensemble_member_count_by_site`）——逐站數相異
+``member_id`` 的數量，寫入 ``boundary_summary_by_site.ensemble_member_count``
+與 ``manifest.json`` 頂層欄位 ``ensemble_member_count_by_site``
+（``{study_site_id: M}``）；``native_runner.figures`` 改讀這個實測欄位，缺欄位
+時 fail-closed 拒絕出圖（見該模組 docstring），不再用預設值 1 靜默帶過。
+
+一致性 fail-closed 檢核（建構 :class:`PostprocessAccumulator` 時就做，不等到
+``finalize``，讓設定錯誤盡早浮現）：任一 ``scenario_id`` 底下相異
+``member_id`` 數量與該站其他情境不同（系集成員缺漏或重複），或各站的系集
+成員數彼此不一致（無法用單一 ``M`` 描述本次執行），都直接丟出
+:class:`PostprocessError`，訊息附上實際數字與站點名稱。
 
 不做的事（誠實揭露）
 ----------------------
@@ -854,7 +879,14 @@ class PostprocessConfig:
 
 @dataclass(frozen=True, slots=True)
 class PostprocessManifest:
-    """一次 WP-6 後處理執行的完整 provenance 與成果摘要。"""
+    """一次 WP-6 後處理執行的完整 provenance 與成果摘要。
+
+    ``ensemble_member_count_by_site``（WP-37 新增）是 :func:`_ensemble_member_
+    count_by_site` 逐站算出的系集成員數（``M``，相異 ``member_id`` 數量），與
+    ``boundary_summary_by_site.ensemble_member_count`` 同一份資料，這裡多存一份
+    頂層欄位是為了讓 ``native_runner.figures`` 與人工稽核不必為了讀一個整數就
+    另外解析 Parquet／CSV。
+    """
 
     experiment_case_id: str
     master_seed: int
@@ -870,6 +902,7 @@ class PostprocessManifest:
     trajectory_sample_seed_policy: str
     resource_usage: Mapping[str, float]
     generated_at_utc_ns: int
+    ensemble_member_count_by_site: Mapping[str, int]
 
     def to_json_dict(self) -> dict[str, Any]:
         """轉成可直接 ``json.dumps`` 的 dict（所有 key 轉成字串、值只用原生型別）。"""
@@ -896,6 +929,7 @@ class PostprocessManifest:
             "trajectory_sample_seed_policy": self.trajectory_sample_seed_policy,
             "resource_usage": dict(self.resource_usage),
             "generated_at_utc_ns": self.generated_at_utc_ns,
+            "ensemble_member_count_by_site": dict(self.ensemble_member_count_by_site),
         }
 
 
@@ -1649,6 +1683,73 @@ def _flux_table_for_grouping(
     return pa.table(columns)
 
 
+def _ensemble_member_count_by_site(identity: ParticleIdentityTable) -> dict[str, int]:
+    """依粒子身分表（:class:`ParticleIdentityTable`）的 ``member_id`` 相異值
+    數量，逐站算出這次執行實際覆蓋的系集成員數（``M``）。
+
+    直接由資料（``member_id`` 欄）算，不讀 release config 的
+    ``members_per_scenario``——這樣才能反映「這次執行實際覆蓋了幾個系集成員」，
+    不會因為某個成員的粒子在批次處理中缺漏，卻被 config 上的名義值悄悄蓋過去
+    （WP-37：正式成果曾經把圖說的 ``M`` 寫死成常數 1，即使 release config 與
+    實際資料都是 10，就是同一種「不讀資料、自己編數字」的錯誤，見模組
+    docstring「WP-37」一節）。
+
+    Fail-closed 一致性檢核（違反任一項都拒絕產出成果，不嘗試修補或取平均）：
+
+    1. 每個 ``study_site_id`` 底下、每個 ``scenario_id`` 的相異 ``member_id``
+       數量都必須等於該站的系集成員數——不等代表某個情境的系集成員缺漏或
+       重複，會讓「每個情境都有同樣多個獨立隨機系集成員」這個收斂性主張的
+       前提失效。
+    2. 全案所有站點的系集成員數必須彼此一致——否則圖說與副標只能寫一個
+       數字，卻對應到不同站不同的實際系集大小。
+
+    Returns:
+        ``{study_site_id: 該站相異 member_id 數量}``。
+
+    Raises:
+        PostprocessError: 任一情境的系集成員數與該站不一致，或各站系集成員數
+            互不相同時，訊息附上實際數字與站點名稱。
+    """
+
+    sites = identity.study_site_id
+    scenario_ids = identity.scenario_id
+    member_ids = identity.member_id
+
+    counts_by_site: dict[str, int] = {}
+    for site in np.unique(sites):
+        site_id = str(site)
+        site_mask = sites == site
+        site_scenarios = scenario_ids[site_mask]
+        site_members = member_ids[site_mask]
+        site_member_count = int(np.unique(site_members).shape[0])
+
+        # 依情境分組（np.unique(..., return_inverse=True) 轉連續整數編碼後排序、
+        # 用 searchsorted 找每組區間，避免對每個情境各自掃描一次陣列），逐情境
+        # 核對相異 member_id 數量是否都等於該站的系集成員數。
+        unique_scenarios, scenario_codes = np.unique(site_scenarios, return_inverse=True)
+        order = np.argsort(scenario_codes, kind="stable")
+        sorted_codes = scenario_codes[order]
+        sorted_members = site_members[order]
+        boundaries = np.searchsorted(sorted_codes, np.arange(unique_scenarios.shape[0] + 1))
+        for scenario_index in range(unique_scenarios.shape[0]):
+            start, end = int(boundaries[scenario_index]), int(boundaries[scenario_index + 1])
+            this_scenario_member_count = int(np.unique(sorted_members[start:end]).shape[0])
+            if this_scenario_member_count != site_member_count:
+                raise PostprocessError(
+                    f"{site_id} 站情境 {unique_scenarios[scenario_index]!r} 的相異 "
+                    f"member_id 數量為 {this_scenario_member_count}，與該站其他情境的"
+                    f"系集成員數 {site_member_count} 不一致——系集成員缺漏或重複會讓"
+                    "收斂性主張建立在不完整的系集上，拒絕產出成果"
+                )
+        counts_by_site[site_id] = site_member_count
+
+    distinct_counts = set(counts_by_site.values())
+    if len(distinct_counts) > 1:
+        detail = "、".join(f"{site_id}={count}" for site_id, count in sorted(counts_by_site.items()))
+        raise PostprocessError(f"各站系集成員數不一致，無法用單一 M 描述本次執行：{detail}")
+    return counts_by_site
+
+
 # ── 主要串流累加器 ───────────────────────────────────────────────────────
 
 
@@ -1728,6 +1829,14 @@ class PostprocessAccumulator:
         self._final_y_m = np.full(n, np.nan, dtype=np.float64)
         self._final_z_m = np.full(n, np.nan, dtype=np.float64)
         self._final_utc_ns = np.zeros(n, dtype=np.int64)
+
+        # WP-37：系集成員數（M）與其一致性檢核只依賴粒子身分表本身、不依賴任何
+        # 批次結果，因此在建構時就算好、就檢核（見 _ensemble_member_count_by_site
+        # docstring 與模組 docstring「WP-37」一節），設定錯誤（系集成員缺漏、
+        # 各站 M 不一致）才能盡早浮現，不用等到全部批次跑完才在 finalize 發現。
+        self._ensemble_member_count_by_site: dict[str, int] = _ensemble_member_count_by_site(
+            identity_table
+        )
 
         # WP-23：local domain 首次離開（非終止事件）。``self._local_first_exit_seen``
         # 是「這顆粒子曾經離開過自己站點 local domain」的旗標，不分事件實際記錄在
@@ -2395,6 +2504,7 @@ class PostprocessAccumulator:
             ),
             resource_usage=resource_usage,
             generated_at_utc_ns=time.time_ns(),
+            ensemble_member_count_by_site=dict(self._ensemble_member_count_by_site),
         )
 
         manifest_path = self._output_dir / "manifest.json"
@@ -2512,7 +2622,9 @@ class PostprocessAccumulator:
         grouping`` 的 ``total_particle_count``／``fraction_*`` 欄），本函式只是把
         同一份計數換算成人類容易一眼讀懂的中文欄名摘要表，不重新定義任何分母或
         分類。不需要 ``boundary_geometries`` 就能輸出（只依賴 ``final_status``），
-        因此在 ``finalize`` 中無條件呼叫。
+        因此在 ``finalize`` 中無條件呼叫。``ensemble_member_count``（WP-37 新增）
+        取自 ``__init__`` 已經算好並 fail-closed 檢核過的
+        ``self._ensemble_member_count_by_site``，不在這裡重新計算。
         """
 
         table = _flux_table_for_grouping(
@@ -2521,9 +2633,10 @@ class PostprocessAccumulator:
         rows = table.to_pylist()
         summary_rows: list[dict[str, Any]] = []
         for row in rows:
+            site_id = row["study_site_id"]
             summary_rows.append(
                 {
-                    "study_site_id": row["study_site_id"],
+                    "study_site_id": site_id,
                     "total_particle_count": row["total_particle_count"],
                     "fraction_crossed_interest_region_boundary": row["fraction_crossed"],
                     "fraction_max_backtrack": row[f"fraction_status_{NATIVE_STATUS_MAX_BACKTRACK}"],
@@ -2534,6 +2647,7 @@ class PostprocessAccumulator:
                     "fraction_pre_window_deposition": (
                         row[f"fraction_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"]
                     ),
+                    "ensemble_member_count": self._ensemble_member_count_by_site[site_id],
                 }
             )
         if summary_rows:
@@ -2549,6 +2663,7 @@ class PostprocessAccumulator:
                 pa.field("fraction_forcing_missing", pa.float64()),
                 pa.field("fraction_numerical_failure", pa.float64()),
                 pa.field("fraction_pre_window_deposition", pa.float64()),
+                pa.field("ensemble_member_count", pa.int64()),
             ]
             summary_table = pa.table(
                 {f.name: pa.array([], type=f.type) for f in fields}, schema=pa.schema(fields)

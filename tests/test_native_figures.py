@@ -324,7 +324,16 @@ def _build_kde_row(site_id: str) -> dict[str, object]:
     }
 
 
-def _build_summary_row(site_id: str, departures: dict[str, list]) -> dict[str, object]:
+def _build_summary_row(
+    site_id: str, departures: dict[str, list], *, ensemble_member_count: int = 1
+) -> dict[str, object]:
+    """建立合成 ``boundary_summary_by_site`` 的一列。
+
+    ``ensemble_member_count``（WP-37 新增欄位）預設 ``1``，維持既有測試 100%
+    不變的行為；驗證「M 由後處理實測值驅動、不是寫死的常數」的測試才會明確
+    覆寫成別的值（見 ``test_ensemble_member_count_*`` 系列測試）。
+    """
+
     total = len(departures["particle_id"])
     codes = departures["final_status_code"]
 
@@ -341,6 +350,7 @@ def _build_summary_row(site_id: str, departures: dict[str, list]) -> dict[str, o
         "fraction_forcing_missing": _fraction(NATIVE_STATUS_FORCING_MISSING),
         "fraction_numerical_failure": _fraction(NATIVE_STATUS_NUMERICAL_FAILURE),
         "fraction_pre_window_deposition": _fraction(NATIVE_STATUS_PRE_WINDOW_DEPOSITION),
+        "ensemble_member_count": ensemble_member_count,
     }
 
 
@@ -397,9 +407,20 @@ def _build_arc_geometry_rows(site_id: str, projection: DomainProjection) -> list
 
 
 def _write_synthetic_postprocess_dir(
-    base_dir: Path, *, sites: tuple[str, ...] = ("site_a", "site_b")
+    base_dir: Path,
+    *,
+    sites: tuple[str, ...] = ("site_a", "site_b"),
+    ensemble_member_count: int = 1,
+    manifest_config_extra: dict[str, object] | None = None,
 ) -> Path:
-    """在 ``base_dir`` 下寫出一份最小但欄位齊全的合成 native 後處理目錄。"""
+    """在 ``base_dir`` 下寫出一份最小但欄位齊全的合成 native 後處理目錄。
+
+    ``ensemble_member_count``（WP-37）：寫進每一站 ``boundary_summary_by_site``
+    的系集成員數，預設 ``1`` 維持既有測試行為；``manifest_config_extra``
+    （WP-37）：合併進 ``manifest.json`` 的 ``config`` 區塊，供測試注入
+    ``runtime_physics_case``／``runtime_bed_no_deposition`` 而不需要重寫整個
+    manifest 字典。
+    """
 
     postprocess_dir = base_dir / "postprocess"
     postprocess_dir.mkdir()
@@ -424,7 +445,9 @@ def _write_synthetic_postprocess_dir(
             all_trajectories.setdefault(key, []).extend(values)
 
         kde_rows.append(_build_kde_row(site_id))
-        summary_rows.append(_build_summary_row(site_id, departures))
+        summary_rows.append(
+            _build_summary_row(site_id, departures, ensemble_member_count=ensemble_member_count)
+        )
         arc_rows.extend(_build_arc_geometry_rows(site_id, projection))
         local_departure_rows.extend(
             _fill_local_first_exit_lonlat(_build_local_departure_rows(site_id, departures), projection)
@@ -462,10 +485,13 @@ def _write_synthetic_postprocess_dir(
         postprocess_dir / "local_domain_first_exit_summary_by_site.parquet",
     )
 
+    manifest_config = {"azimuth_sector_count": 16, "boundary_arc_segment_count": 4}
+    if manifest_config_extra:
+        manifest_config.update(manifest_config_extra)
     manifest = {
         "experiment_case_id": "synthetic_test_case",
         "master_seed": 12345,
-        "config": {"azimuth_sector_count": 16, "boundary_arc_segment_count": 4},
+        "config": manifest_config,
     }
     (postprocess_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
 
@@ -567,6 +593,154 @@ def test_missing_required_column_raises_clear_error(tmp_path: Path) -> None:
     )
     with pytest.raises(native_figures.FiguresError, match="departure_azimuth_sector_index"):
         native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-37：系集成員數（M）改讀後處理實測值；物理案例與粒子身分表標籤分開陳述
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_ensemble_member_count_m3_appears_in_subtitle_and_caption_not_m1(tmp_path: Path) -> None:
+    """M=3 的合成後處理輸入：圖面副標與 ``captions.md`` 都要出現 ``M=3``，不能
+    出現 ``M=1``（WP-37 缺陷 A：出圖端曾經把 M 寫死成 1，即使實測值是別的數字）。
+    """
+
+    postprocess_dir = _write_synthetic_postprocess_dir(tmp_path, ensemble_member_count=3)
+    coastline_path = _write_synthetic_coastline(tmp_path)
+    output_dir = tmp_path / "figures-out"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    captions_text = (output_dir / "captions.md").read_text(encoding="utf-8")
+    assert "M=3（每情境 3 個獨立隨機系集成員，含隨機擴散）" in captions_text
+    assert "M=1" not in captions_text
+
+    inputs = native_figures.load_native_figures_inputs(config)
+    assert inputs.sites
+    for site in inputs.sites:
+        assert site.summary["ensemble_member_count"] == 3
+        subtitle_zh = native_figures._site_subtitle(site, native_figures._Labeler(True))
+        subtitle_en = native_figures._site_subtitle(site, native_figures._Labeler(False))
+        assert "M=3（每情境 3 個獨立隨機系集成員，含隨機擴散）" in subtitle_zh
+        assert "M=3 (3 ensemble members per scenario)" in subtitle_en
+        assert "M=1" not in subtitle_zh
+        assert "M=1" not in subtitle_en
+
+
+def test_ensemble_member_count_one_keeps_existing_wording(tmp_path: Path) -> None:
+    """``M=1``（確定性試驗）仍維持既有語句，不因為改讀實測值就變成
+    「M=1（1 個獨立隨機系集成員...）」這種數字硬套公式硬湊出來的怪句子。"""
+
+    postprocess_dir = _write_synthetic_postprocess_dir(tmp_path, ensemble_member_count=1)
+    coastline_path = _write_synthetic_coastline(tmp_path)
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path,
+        output_dir=tmp_path / "figures-out",
+    )
+    inputs = native_figures.load_native_figures_inputs(config)
+    site = inputs.sites[0]
+    subtitle_zh = native_figures._site_subtitle(site, native_figures._Labeler(True))
+    subtitle_en = native_figures._site_subtitle(site, native_figures._Labeler(False))
+    assert "M=1（每情境一個系集成員，含隨機擴散）" in subtitle_zh
+    assert "M=1 (single ensemble member)" in subtitle_en
+
+
+def test_missing_ensemble_member_count_column_fails_closed_with_rerun_hint(tmp_path: Path) -> None:
+    """``boundary_summary_by_site`` 缺 ``ensemble_member_count``（舊版
+    ``native-postprocess`` 輸出）時必須 fail-closed，且錯誤訊息指出要重跑
+    ``native-postprocess``——不能用預設值 1 靜默帶過（那正是 WP-37 缺陷 A 的
+    成因）。"""
+
+    postprocess_dir = _write_synthetic_postprocess_dir(tmp_path)
+    coastline_path = _write_synthetic_coastline(tmp_path)
+
+    # 讀回 boundary_summary_by_site.parquet，刪掉新欄位後覆寫，模擬舊版
+    # native-postprocess（尚未有 WP-37 修法）的輸出目錄；.parquet 優先於 .csv
+    # 被讀取（見 _read_table_any docstring），因此不需要同步修改 .csv。
+    summary_path = postprocess_dir / "boundary_summary_by_site.parquet"
+    table = pq.read_table(summary_path)
+    table = table.drop(["ensemble_member_count"])
+    pq.write_table(table, summary_path)
+
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path,
+        output_dir=tmp_path / "figures-out",
+    )
+    with pytest.raises(native_figures.FiguresError, match="native-postprocess"):
+        native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+
+def test_physics_case_reported_separately_from_identity_table_label(tmp_path: Path) -> None:
+    """``config.runtime_physics_case`` 有值時，圖說要把「物理案例」與「粒子身分表
+    標籤」分開列出，且物理案例文字要能區分 ``no_stokes``／``finite_depth_stokes``、
+    是否含 Stokes（WP-37 缺陷 B）。"""
+
+    postprocess_dir = _write_synthetic_postprocess_dir(
+        tmp_path,
+        manifest_config_extra={
+            "runtime_physics_case": {
+                "experiment_case_id": "no_stokes",
+                "include_stokes": False,
+                "diffusion_method": "smagorinsky_workbook_eq10",
+            },
+        },
+    )
+    coastline_path = _write_synthetic_coastline(tmp_path)
+    output_dir = tmp_path / "figures-out"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+    captions_text = (output_dir / "captions.md").read_text(encoding="utf-8")
+
+    assert "物理案例：no_stokes（不含 Stokes 漂移，擴散方法：smagorinsky_workbook_eq10）" in captions_text
+    assert (
+        "粒子身分表標籤：synthetic_test_case（粒子身分表標籤，僅供 seed 命名空間辨識，"
+        "不是物理設定的證據）"
+    ) in captions_text
+    # 身分表標籤的字串值不得單獨出現在「物理案例」欄位裡——不得被誤當成物理案例的證據。
+    assert "物理案例：synthetic_test_case" not in captions_text
+
+
+def test_physics_case_none_when_plan_not_provided_and_not_faked_from_identity_label(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path]
+) -> None:
+    """呼叫端沒有提供 ``--plan``（``config.runtime_physics_case`` 缺席）時，圖說
+    要如實寫「未於後處理 manifest 記錄」，不得退回去用 ``experiment_case_id``
+    （粒子身分表標籤）假冒物理案例。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    output_dir = tmp_path / "figures-out"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+    captions_text = (output_dir / "captions.md").read_text(encoding="utf-8")
+
+    assert "物理案例：未於後處理 manifest 記錄（`native-postprocess` 未提供 `--plan`）" in captions_text
+    assert "物理案例：synthetic_test_case" not in captions_text
+    assert "粒子身分表標籤：synthetic_test_case" in captions_text
+
+
+def test_bed_no_deposition_listed_only_when_present_in_manifest(tmp_path: Path) -> None:
+    """``config.runtime_bed_no_deposition`` 非 ``None`` 時列出是否啟用「海床不
+    沉積」敏感度案例；``None``（未提供 ``--plan``）時圖說不列出這一項，不猜測
+    未啟用。"""
+
+    postprocess_dir = _write_synthetic_postprocess_dir(
+        tmp_path,
+        manifest_config_extra={"runtime_bed_no_deposition": {"bed_no_deposition": True}},
+    )
+    coastline_path = _write_synthetic_coastline(tmp_path)
+    output_dir = tmp_path / "figures-out"
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=output_dir,
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+    captions_text = (output_dir / "captions.md").read_text(encoding="utf-8")
+    assert "已啟用「海床不沉積」敏感度案例" in captions_text
 
 
 def test_sites_filter_selects_only_requested_site(
