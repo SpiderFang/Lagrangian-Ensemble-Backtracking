@@ -188,6 +188,7 @@ __all__ = [
     "FiguresError",
     "NativeFiguresConfig",
     "FIGURE_STEMS",
+    "FOOTPRINT_FIGURE_STEMS",
     "SITE_LABELS_ZH",
     "build_native_figures",
 ]
@@ -328,6 +329,10 @@ class NativeFiguresConfig:
     合法值見 :data:`FIGURE_TEXT_MODES`；``"full"``（預設）維持標題／副標／圖例／
     座標軸標籤全部畫出，``"none"`` 只畫座標軸與圖例，不畫標題與副標。兩種模式都
     會輸出 ``captions.md``（見模組 docstring）。
+
+    ``bathymetry_path``（WP-38）是 ``scripts/export_isobaths.py`` 匯出的等深線 GeoJSON
+    （CRS84）；省略或檔案不存在時，停留時數密度等新圖仍照常繪製，只是不畫等深線，
+    並在 ``manifest.json`` 的 ``footprint_figures`` 區塊記錄原因。
     """
 
     postprocess_dir: Path
@@ -338,6 +343,7 @@ class NativeFiguresConfig:
     max_trajectories_per_site: int = 24
     dpi: int = 150
     figure_text: str = "full"
+    bathymetry_path: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "postprocess_dir", Path(self.postprocess_dir))
@@ -345,6 +351,8 @@ class NativeFiguresConfig:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         if self.font_path is not None:
             object.__setattr__(self, "font_path", Path(self.font_path))
+        if self.bathymetry_path is not None:
+            object.__setattr__(self, "bathymetry_path", Path(self.bathymetry_path))
         if self.sites is not None:
             sites = tuple(self.sites)
             if not sites or any(not isinstance(s, str) or not s for s in sites):
@@ -630,6 +638,8 @@ class NativeFiguresInputs:
     postprocess_manifest: Mapping[str, Any]
     sources_before: Mapping[str, Mapping[str, Any]]
     source_paths: Mapping[str, Path]
+    footprint: Mapping[str, FootprintSiteFigureData] | None = None
+    footprint_manifest: Mapping[str, Any] | None = None
 
 
 _DEPARTURE_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -1127,7 +1137,15 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
             )
         )
 
+    footprint_data: dict[str, FootprintSiteFigureData] | None = None
+    footprint_paths: dict[str, Path] = {}
+    if _footprint_tables_present(postprocess_dir):
+        footprint_data, footprint_paths = _load_footprint_figure_inputs(
+            postprocess_dir, [site.site_id for site in sites]
+        )
+
     source_paths: dict[str, Path] = {
+        **footprint_paths,
         "manifest.json": manifest_path,
         departures_path.name: departures_path,
         trajectory_path.name: trajectory_path,
@@ -1138,6 +1156,8 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
         local_summary_path.name: local_summary_path,
         "coastline": config.coastline_path,
     }
+    if config.bathymetry_path is not None and config.bathymetry_path.is_file():
+        source_paths["bathymetry"] = config.bathymetry_path
     sources_before = _snapshot_sources(source_paths)
 
     return NativeFiguresInputs(
@@ -1145,6 +1165,10 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
         postprocess_manifest=manifest_payload,
         sources_before=sources_before,
         source_paths=source_paths,
+        footprint=footprint_data,
+        footprint_manifest=(
+            manifest_payload.get("footprint") if isinstance(manifest_payload.get("footprint"), dict) else None
+        ),
     )
 
 
@@ -2365,6 +2389,983 @@ def _dispatch_plot(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# WP-38：停留時數密度、回溯快照與邊界弧長分布三種新圖
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 這一節的圖只讀 ``postprocess`` 在 ``--with-footprint`` 下多輸出的表（見
+# ``native_runner.footprint``），後處理目錄沒有這些表時完全不出這三種圖，八張既有圖
+# 的行為不變。舊的 ``source_footprint_kde`` 仍照常輸出，但不再是報告主圖：它的輸入
+# 是粒子穿越開放邊界的那一點，這些點全部落在一維的邊界線上，二維核密度不適用。
+
+FOOTPRINT_FIGURE_STEMS: tuple[str, ...] = (
+    "source_footprint_residence",
+    "source_footprint_residence_site_scale",
+    "lookback_snapshot",
+    "boundary_departure_along_arc",
+)
+"""WP-38 新增的圖種檔名（不含副檔名）。``source_footprint_residence`` 使用跨站共用色階，
+``source_footprint_residence_site_scale`` 使用各站自己的色階，兩者資料相同。"""
+
+_FOOTPRINT_TABLE_STEMS: tuple[str, ...] = (
+    "residence_density_by_site",
+    "residence_hdr_by_site",
+    "footprint_grid_by_site",
+    "lookback_snapshot_kde_by_site",
+    "boundary_departure_along_arc_by_site",
+    "boundary_edge_intervals_by_site",
+    "footprint_geometry_by_site",
+    "footprint_summary_by_site",
+)
+
+RESIDENCE_COLOR_FLOOR_FRACTION = 1.0e-4
+"""對數色階的下限占上限的比例；低於下限的網格不著色（透明）。"""
+
+_RESIDENCE_CMAP = "YlGnBu"
+
+# 高密度區間（HDR）50%／75%／90%：同一色系（棕色）由深到淺，線型為實線／虛線／點線。
+_HDR_LINE_STYLES: tuple[Mapping[str, Any], ...] = (
+    {"color": "#3b2314", "linestyle": "-", "linewidth": 1.5},
+    {"color": "#7a5230", "linestyle": "--", "linewidth": 1.3},
+    {"color": "#a77c4e", "linestyle": ":", "linewidth": 1.5},
+)
+
+_OPEN_BOUNDARY_STYLE: Mapping[str, Any] = {"color": "#d0009f", "linewidth": 1.2, "linestyle": "--"}
+_OPEN_BOUNDARY_LABEL_ZH = "流場範圍開放邊界（終止邊界）"
+_OPEN_BOUNDARY_LABEL_EN = "Flow-domain open boundary (terminating boundary)"
+_LAND_COLOR = "#d9d9d9"
+_ISOBATH_COLOR = "#7a7a7a"
+
+_EDGE_NAME_ZH: Mapping[str, str] = {"west": "西", "east": "東", "south": "南", "north": "北"}
+
+
+def _corner_name_zh(name: str) -> str:
+    """``"south-east"`` -> ``"東南角"``（中文慣例東西在前、南北在後）。"""
+
+    parts = name.split("-")
+    ordered = sorted(parts, key=lambda p: 0 if p in ("east", "west") else 1)
+    return "".join(_EDGE_NAME_ZH.get(p, p) for p in ordered) + "角"
+
+
+@dataclass(frozen=True, slots=True)
+class FootprintSiteFigureData:
+    """單站 WP-38 繪圖輸入：停留時數密度場、HDR、回溯快照、弧長分布與幾何。"""
+
+    site_id: str
+    grid: Mapping[str, Any]
+    density_pct_per_km2: np.ndarray
+    hdr_threshold_pct_per_km2: Mapping[float, float]
+    hdr_area_km2: Mapping[float, float]
+    snapshots: tuple[Mapping[str, Any], ...]
+    arc_bins: tuple[Mapping[str, Any], ...]
+    edge_intervals: tuple[Mapping[str, Any], ...]
+    domain_lonlat: np.ndarray
+    open_boundary_parts: tuple[np.ndarray, ...]
+    receptor_center: tuple[float, float] | None
+    summary: Mapping[str, Any]
+
+    @property
+    def lon_edges(self) -> np.ndarray:
+        g = self.grid
+        return float(g["lon0_deg"]) + np.arange(int(g["nx"]) + 1) * float(g["resolution_deg"])
+
+    @property
+    def lat_edges(self) -> np.ndarray:
+        g = self.grid
+        return float(g["lat0_deg"]) + np.arange(int(g["ny"]) + 1) * float(g["resolution_deg"])
+
+    def density_max(self) -> float:
+        return float(np.max(self.density_pct_per_km2)) if self.density_pct_per_km2.size else 0.0
+
+
+def _footprint_tables_present(postprocess_dir: Path) -> bool:
+    return (postprocess_dir / "residence_density_by_site.parquet").is_file()
+
+
+def _rows_for_site(table: pa.Table, site_id: str) -> list[dict[str, Any]]:
+    return _filter_site(table, site_id).to_pylist()
+
+
+def _load_footprint_figure_inputs(
+    postprocess_dir: Path, site_ids: Sequence[str]
+) -> tuple[dict[str, FootprintSiteFigureData], dict[str, Path]]:
+    """讀取 WP-38 的表；已有停留時數密度表卻缺其他表時 fail-closed。"""
+
+    tables: dict[str, pa.Table] = {}
+    paths: dict[str, Path] = {}
+    for stem in _FOOTPRINT_TABLE_STEMS:
+        path = postprocess_dir / f"{stem}.parquet"
+        if not path.is_file():
+            raise FiguresError(f"後處理目錄有停留時數密度表，但缺少配套輸入表：{stem}.parquet")
+        tables[stem] = pq.read_table(path)
+        paths[path.name] = path
+
+    result: dict[str, FootprintSiteFigureData] = {}
+    for site_id in site_ids:
+        grid_rows = _rows_for_site(tables["footprint_grid_by_site"], site_id)
+        if len(grid_rows) != 1:
+            raise FiguresError(f"footprint_grid_by_site 對站 {site_id} 應恰有一列，實際 {len(grid_rows)} 列")
+        grid = grid_rows[0]
+        nx, ny = int(grid["nx"]), int(grid["ny"])
+
+        residence = [
+            r
+            for r in _rows_for_site(tables["residence_density_by_site"], site_id)
+            if r["group_kind"] == "all"
+        ]
+        density = np.zeros((ny, nx), dtype=np.float64)
+        for row in residence:
+            density[int(row["cell_iy"]), int(row["cell_ix"])] = float(row["density_fraction_per_km2"]) * 100.0
+        if not residence:
+            raise FiguresError(f"residence_density_by_site 沒有站 {site_id} 的全體停留時數列")
+
+        hdr_rows = [
+            r for r in _rows_for_site(tables["residence_hdr_by_site"], site_id) if r["group_kind"] == "all"
+        ]
+        thresholds = {
+            round(float(r["level"]), 6): float(r["density_threshold_fraction_per_km2"]) * 100.0
+            for r in hdr_rows
+        }
+        areas = {round(float(r["level"]), 6): float(r["area_km2"]) for r in hdr_rows}
+
+        snapshots = tuple(
+            sorted(
+                _rows_for_site(tables["lookback_snapshot_kde_by_site"], site_id),
+                key=lambda r: r["snapshot_hours"],
+            )
+        )
+        arc_bins = tuple(
+            sorted(
+                _rows_for_site(tables["boundary_departure_along_arc_by_site"], site_id),
+                key=lambda r: r["bin_index"],
+            )
+        )
+        edges = tuple(
+            sorted(
+                _rows_for_site(tables["boundary_edge_intervals_by_site"], site_id),
+                key=lambda r: (r["s_start_km"], r["kind"] != "edge"),
+            )
+        )
+
+        geometry = _rows_for_site(tables["footprint_geometry_by_site"], site_id)
+        domain = sorted(
+            (r for r in geometry if r["element"] == "flow_domain"), key=lambda r: r["vertex_index"]
+        )
+        domain_lonlat = np.asarray([[r["lon_deg"], r["lat_deg"]] for r in domain], dtype=np.float64)
+        if domain_lonlat.shape[0] < 3:
+            raise FiguresError(f"footprint_geometry_by_site 對站 {site_id} 缺少 flow domain 外框")
+        parts: dict[int, list[dict[str, Any]]] = {}
+        for r in geometry:
+            if r["element"] == "open_boundary":
+                parts.setdefault(int(r["part_index"]), []).append(r)
+        boundary_parts = tuple(
+            np.asarray(
+                [
+                    [r["lon_deg"], r["lat_deg"], r["s_km"]]
+                    for r in sorted(parts[p], key=lambda r: r["vertex_index"])
+                ],
+                dtype=np.float64,
+            )
+            for p in sorted(parts)
+        )
+        centers = [r for r in geometry if r["element"] == "receptor_center"]
+        receptor_center = (float(centers[0]["lon_deg"]), float(centers[0]["lat_deg"])) if centers else None
+
+        summary_rows = _rows_for_site(tables["footprint_summary_by_site"], site_id)
+        if len(summary_rows) != 1:
+            raise FiguresError(f"footprint_summary_by_site 對站 {site_id} 應恰有一列")
+
+        result[site_id] = FootprintSiteFigureData(
+            site_id=site_id,
+            grid=grid,
+            density_pct_per_km2=density,
+            hdr_threshold_pct_per_km2=thresholds,
+            hdr_area_km2=areas,
+            snapshots=snapshots,
+            arc_bins=arc_bins,
+            edge_intervals=edges,
+            domain_lonlat=domain_lonlat,
+            open_boundary_parts=boundary_parts,
+            receptor_center=receptor_center,
+            summary=summary_rows[0],
+        )
+    return result, paths
+
+
+# ── 等深線 ───────────────────────────────────────────────────────────────
+
+
+def _load_isobaths(path: Path | None) -> tuple[dict[str, dict[float, list[np.ndarray]]], dict[str, Any]]:
+    """讀取等深線 GeoJSON（``scripts/export_isobaths.py`` 的輸出）。
+
+    回傳 ``({站: {水深: [線段陣列 (n, 2)]}}, 紀錄)``。沒有提供路徑或檔案不存在時
+    回傳空對照並在紀錄註明原因（圖仍照常繪製，只是沒有等深線）；檔案存在但格式
+    不符則 fail-closed。
+    """
+
+    if path is None:
+        return {}, {"status": "not_provided", "reason": "未提供 --bathymetry"}
+    if not path.is_file():
+        return {}, {"status": "file_not_found", "reason": f"等深線檔案不存在：{path.name}"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FiguresError(f"無法讀取等深線 GeoJSON：{exc}") from exc
+    crs_block = payload.get("crs") if isinstance(payload, dict) else None
+    crs_name = crs_block.get("properties", {}).get("name") if isinstance(crs_block, dict) else None
+    if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
+        raise FiguresError("等深線 GeoJSON 必須是 FeatureCollection")
+    if crs_name != "urn:ogc:def:crs:OGC:1.3:CRS84":
+        raise FiguresError("等深線 GeoJSON 必須明示 CRS84（經度、緯度）座標順序")
+    result: dict[str, dict[float, list[np.ndarray]]] = {}
+    for index, feature in enumerate(payload.get("features", [])):
+        try:
+            props = feature["properties"]
+            site_id, depth = str(props["site_id"]), float(props["depth_m"])
+            geometry = feature["geometry"]
+            coords = geometry["coordinates"]
+            gtype = geometry["type"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FiguresError(f"等深線 GeoJSON feature[{index}] 缺少 site_id／depth_m／geometry") from exc
+        if gtype == "LineString":
+            coords = [coords]
+        elif gtype != "MultiLineString":
+            raise FiguresError(f"等深線 GeoJSON feature[{index}] 必須是 LineString／MultiLineString")
+        segments = [np.asarray(seg, dtype=np.float64) for seg in coords if len(seg) >= 2]
+        if any(seg.ndim != 2 or seg.shape[1] != 2 or not np.all(np.isfinite(seg)) for seg in segments):
+            raise FiguresError(f"等深線 GeoJSON feature[{index}] 座標必須是有限的 (經度, 緯度)")
+        result.setdefault(site_id, {}).setdefault(depth, []).extend(segments)
+    return result, {"status": "loaded", "features": len(payload.get("features", []))}
+
+
+def _site_extent(
+    fp: FootprintSiteFigureData, margin_fraction: float = 0.04
+) -> tuple[float, float, float, float]:
+    lon = fp.domain_lonlat[:, 0]
+    lat = fp.domain_lonlat[:, 1]
+    lon_min, lon_max, lat_min, lat_max = (
+        float(lon.min()),
+        float(lon.max()),
+        float(lat.min()),
+        float(lat.max()),
+    )
+    dx = (lon_max - lon_min) * margin_fraction
+    dy = (lat_max - lat_min) * margin_fraction
+    return lon_min - dx, lon_max + dx, lat_min - dy, lat_max + dy
+
+
+def _inside_runs(seg: np.ndarray, extent: tuple[float, float, float, float]) -> list[np.ndarray]:
+    """把折線裁成落在範圍內的連續段（含只有兩個頂點但穿過範圍的長線段）。"""
+
+    import shapely
+
+    x0, x1, y0, y1 = extent
+    clipped = shapely.clip_by_rect(shapely.linestrings(seg), x0, y0, x1, y1)
+    if clipped.is_empty:
+        return []
+    parts = list(clipped.geoms) if hasattr(clipped, "geoms") else [clipped]
+    runs: list[np.ndarray] = []
+    for part in parts:
+        if part.geom_type != "LineString":
+            continue
+        coords = np.asarray(part.coords, dtype=np.float64)
+        if coords.shape[0] >= 2:
+            runs.append(coords)
+    return runs
+
+
+def _draw_isobaths(
+    ax,
+    site_isobaths: Mapping[float, list[np.ndarray]],
+    extent: tuple[float, float, float, float],
+    font: Any,
+    *,
+    label_fontsize: float = 6.5,
+) -> list[float]:
+    """畫等深線（細灰線，200 公尺稍粗）並標注水深；回傳實際畫出的水深清單。"""
+
+    drawn: list[float] = []
+    diag = math.hypot(extent[1] - extent[0], extent[3] - extent[2])
+    for depth in sorted(site_isobaths):
+        runs: list[np.ndarray] = []
+        for seg in site_isobaths[depth]:
+            runs.extend(_inside_runs(seg, extent))
+        if not runs:
+            continue
+        width = 0.9 if abs(depth - 200.0) < 1e-9 else 0.45
+        for run in runs:
+            ax.plot(
+                run[:, 0], run[:, 1], color=_ISOBATH_COLOR, linewidth=width, zorder=4, solid_capstyle="round"
+            )
+        drawn.append(depth)
+        # 標注：取最長的兩段，兩個標注點要相隔夠遠。
+        lengths = [float(np.sum(np.hypot(np.diff(r[:, 0]), np.diff(r[:, 1])))) for r in runs]
+        placed: list[tuple[float, float]] = []
+        for idx in np.argsort(lengths)[::-1][:2]:
+            if lengths[int(idx)] < 0.12 * diag:
+                continue
+            run = runs[int(idx)]
+            mid = run[run.shape[0] // 2]
+            if any(math.hypot(mid[0] - p[0], mid[1] - p[1]) < 0.3 * diag for p in placed):
+                continue
+            placed.append((float(mid[0]), float(mid[1])))
+            ax.text(
+                float(mid[0]),
+                float(mid[1]),
+                f"{depth:g} m",
+                fontsize=label_fontsize,
+                color="#3c3c3c",
+                ha="center",
+                va="center",
+                zorder=4.5,
+                fontproperties=font,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.4},
+                clip_on=True,
+            )
+    return drawn
+
+
+def _lon_formatter(value: float, _pos: int | None = None) -> str:
+    return f"{value:.2f}°E"
+
+
+def _lat_formatter(value: float, _pos: int | None = None) -> str:
+    return f"{value:.2f}°N"
+
+
+def _draw_footprint_base_map(
+    ax,
+    fp: FootprintSiteFigureData,
+    land_geometries: Sequence[Polygon | MultiPolygon],
+    site_isobaths: Mapping[float, list[np.ndarray]],
+    t: _Labeler,
+    font: Any,
+    *,
+    site_label: str,
+    label_fontsize: float = 6.5,
+    tick_fontsize: float = 8.0,
+) -> tuple[tuple[float, float, float, float], list[float]]:
+    """陸地（灰）、海岸線（黑 0.5 pt）、等深線、開放邊界（洋紅虛線）與受體星號。"""
+
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+    from shapely.plotting import plot_polygon
+
+    extent = _site_extent(fp)
+    for land in land_geometries:
+        plot_polygon(
+            land,
+            ax=ax,
+            add_points=False,
+            facecolor=_LAND_COLOR,
+            edgecolor="black",
+            linewidth=0.5,
+            zorder=3,
+        )
+    drawn = _draw_isobaths(ax, site_isobaths, extent, font, label_fontsize=label_fontsize)
+    for part in fp.open_boundary_parts:
+        ax.plot(part[:, 0], part[:, 1], zorder=6, **_OPEN_BOUNDARY_STYLE)
+    if fp.receptor_center is not None:
+        lon, lat = fp.receptor_center
+        ax.plot(
+            lon,
+            lat,
+            marker="*",
+            markersize=13,
+            markerfacecolor="#ffd92f",
+            markeredgecolor="black",
+            markeredgewidth=0.7,
+            linestyle="none",
+            zorder=8,
+        )
+        ax.annotate(
+            site_label,
+            xy=(lon, lat),
+            xytext=(7, 7),
+            textcoords="offset points",
+            fontproperties=font,
+            fontsize=9,
+            zorder=9,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8, "pad": 1.0},
+        )
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_aspect(1.0 / math.cos(math.radians((extent[2] + extent[3]) / 2.0)), adjustable="box")
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.xaxis.set_major_formatter(FuncFormatter(_lon_formatter))
+    ax.yaxis.set_major_formatter(FuncFormatter(_lat_formatter))
+    ax.tick_params(labelsize=tick_fontsize)
+    ax.set_facecolor("white")
+    return extent, drawn
+
+
+def _footprint_legend_handles(
+    t: _Labeler, hdr_levels: Sequence[float], *, isobaths_drawn: bool, site_label: str
+) -> list[Any]:
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D(
+            [],
+            [],
+            label=t.t(f"高密度區間 {level * 100:.0f}%", f"HDR {level * 100:.0f}%"),
+            **_HDR_LINE_STYLES[i % len(_HDR_LINE_STYLES)],
+        )
+        for i, level in enumerate(hdr_levels)
+    ]
+    handles.append(
+        Line2D([], [], label=t.t(_OPEN_BOUNDARY_LABEL_ZH, _OPEN_BOUNDARY_LABEL_EN), **_OPEN_BOUNDARY_STYLE)
+    )
+    handles.append(
+        Line2D(
+            [],
+            [],
+            marker="*",
+            markersize=12,
+            markerfacecolor="#ffd92f",
+            markeredgecolor="black",
+            linestyle="none",
+            label=t.t(f"受體（{site_label}）", f"Receptor ({site_label})"),
+        )
+    )
+    if isobaths_drawn:
+        handles.append(
+            Line2D([], [], color=_ISOBATH_COLOR, linewidth=0.7, label=t.t("等深線（公尺）", "Isobath (m)"))
+        )
+    return handles
+
+
+def _log_colorbar_ticks(vmin: float, vmax: float) -> list[float]:
+    lo, hi = math.ceil(math.log10(vmin) - 1e-9), math.floor(math.log10(vmax) + 1e-9)
+    ticks = [10.0**e for e in range(lo, hi + 1)]
+    return ticks if len(ticks) >= 2 else [vmin, vmax]
+
+
+def _decade_formatter(value: float, _pos: int | None = None) -> str:
+    return f"{value:g}"
+
+
+def _residence_color_limits(vmax: float) -> tuple[float, float]:
+    return vmax * RESIDENCE_COLOR_FLOOR_FRACTION, vmax
+
+
+def _draw_hdr_contours(ax, lon: np.ndarray, lat: np.ndarray, masks: Sequence[np.ndarray]) -> None:
+    for i, mask in enumerate(masks):
+        if not mask.any():
+            continue
+        style = _HDR_LINE_STYLES[i % len(_HDR_LINE_STYLES)]
+        ax.contour(
+            lon,
+            lat,
+            mask.astype(np.float64),
+            levels=[0.5],
+            colors=[style["color"]],
+            linestyles=[style["linestyle"]],
+            linewidths=[style["linewidth"]],
+            zorder=5,
+        )
+
+
+def _plot_source_footprint_residence(
+    site: SiteData,
+    fp: FootprintSiteFigureData,
+    land_geometries: Sequence[Polygon | MultiPolygon],
+    site_isobaths: Mapping[float, list[np.ndarray]],
+    t: _Labeler,
+    font: Any,
+    path: Path,
+    dpi: int,
+    figure_text: str,
+    vmax: float,
+    *,
+    scale_kind: str,
+) -> dict[str, Any]:
+    """停留時數密度圖：對數色階、HDR 50／75／90%、底圖與受體。回傳繪圖紀錄。"""
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+    from matplotlib.ticker import FuncFormatter
+
+    fig, ax = plt.subplots(figsize=(9.6, 8.6), dpi=150)
+    extent, drawn = _draw_footprint_base_map(
+        ax, fp, land_geometries, site_isobaths, t, font, site_label=site.site_label_zh
+    )
+    vmin, vmax_used = _residence_color_limits(vmax)
+    density = fp.density_pct_per_km2
+    masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
+    cmap = plt.get_cmap(_RESIDENCE_CMAP).with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
+    mesh = ax.pcolormesh(
+        fp.lon_edges,
+        fp.lat_edges,
+        masked,
+        cmap=cmap,
+        norm=LogNorm(vmin=vmin, vmax=vmax_used),
+        shading="flat",
+        zorder=2,
+    )
+    cbar = fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.02)
+    cbar.set_ticks(_log_colorbar_ticks(vmin, vmax_used))
+    cbar.ax.yaxis.set_major_formatter(FuncFormatter(_decade_formatter))
+    cbar.ax.minorticks_off()
+    cbar.set_label(
+        t.t("停留時數密度（% 停留時數／km²）", "Residence density (% of particle-hours / km^2)"),
+        fontproperties=font,
+    )
+
+    lon_c = 0.5 * (fp.lon_edges[:-1] + fp.lon_edges[1:])
+    lat_c = 0.5 * (fp.lat_edges[:-1] + fp.lat_edges[1:])
+    levels = sorted(fp.hdr_threshold_pct_per_km2)
+    masks = [density >= fp.hdr_threshold_pct_per_km2[level] * (1.0 - 1e-9) for level in levels]
+    _draw_hdr_contours(ax, lon_c, lat_c, masks)
+
+    ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
+    ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
+    ax.legend(
+        handles=_footprint_legend_handles(
+            t, levels, isobaths_drawn=bool(drawn), site_label=site.site_label_zh
+        ),
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.09),
+        ncol=3,
+        prop=font,
+        frameon=True,
+    )
+    total_hours = int(fp.grid["total_particle_hours"])
+    resolution = float(fp.grid["resolution_deg"])
+    scale_text = (
+        t.t("跨站共用色階", "shared cross-site scale")
+        if scale_kind == "shared"
+        else t.t("本站自訂色階", "per-site scale")
+    )
+    _add_two_line_title(
+        fig,
+        t,
+        font,
+        t.t(f"停留時數密度｜{site.site_label_zh}", f"Residence density | {site.site_id}"),
+        _site_subtitle(
+            site,
+            t,
+            extra=t.t(
+                f"｜總停留時數：{total_hours:,} 粒子小時｜網格 {resolution:.2f}°｜{scale_text}",
+                f" | {total_hours:,} particle-hours | grid {resolution:.2f} deg | {scale_text}",
+            ),
+        ),
+        figure_text=figure_text,
+    )
+    fig.subplots_adjust(left=0.1, bottom=0.14, right=0.95, top=_title_top_margin(figure_text, full=0.9))
+    _save_exclusive(fig, path, dpi=dpi)
+    plt.close(fig)
+    return {"isobath_levels_m": drawn, "vmin": vmin, "vmax": vmax_used, "scale": scale_kind}
+
+
+def _plot_lookback_snapshot(
+    site: SiteData,
+    fp: FootprintSiteFigureData,
+    land_geometries: Sequence[Polygon | MultiPolygon],
+    site_isobaths: Mapping[float, list[np.ndarray]],
+    t: _Labeler,
+    font: Any,
+    path: Path,
+    dpi: int,
+    figure_text: str,
+) -> dict[str, Any]:
+    """2×2 回溯快照圖：各面板是該回溯時刻仍在漂流的粒子的條件式來源足跡（二維 KDE）。"""
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+    from matplotlib.ticker import FuncFormatter
+
+    snapshots = list(fp.snapshots)[:4]
+    fig, axes = plt.subplots(2, 2, figsize=(13.0, 11.6), dpi=150, sharex=True, sharey=True)
+    flat_axes = list(axes.ravel())
+
+    unit_scale = 1.0e8  # 每平方公尺機率密度 -> % 快照粒子／km²
+    densities: list[np.ndarray | None] = []
+    for snap in snapshots:
+        if snap["status"] == "available" and snap["density_per_m2_flat"]:
+            rows_, cols_ = int(snap["grid_rows"]), int(snap["grid_cols"])
+            densities.append(
+                np.asarray(snap["density_per_m2_flat"], dtype=np.float64).reshape(rows_, cols_) * unit_scale
+            )
+        else:
+            densities.append(None)
+    available = [d for d in densities if d is not None]
+    vmax = max((float(d.max()) for d in available), default=0.0)
+    vmin = vmax * RESIDENCE_COLOR_FLOOR_FRACTION
+    cmap = plt.get_cmap(_RESIDENCE_CMAP).with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
+    mesh = None
+    drawn_levels: list[float] = []
+    levels = sorted(fp.hdr_threshold_pct_per_km2) or [0.5, 0.75, 0.9]
+
+    for ax, snap, density in zip(flat_axes, snapshots, densities, strict=False):
+        _extent, drawn = _draw_footprint_base_map(
+            ax,
+            fp,
+            land_geometries,
+            site_isobaths,
+            t,
+            font,
+            site_label=site.site_label_zh,
+            label_fontsize=5.5,
+            tick_fontsize=7.5,
+        )
+        drawn_levels = drawn or drawn_levels
+        hours = int(snap["snapshot_hours"])
+        active_pct = float(snap["active_fraction"]) * 100.0
+        title = t.t(
+            f"回溯 {hours} 小時（{hours / 24:g} 天）｜仍在漂流 {active_pct:.1f}%",
+            f"{hours} h back ({hours / 24:g} d) | still drifting {active_pct:.1f}%",
+        )
+        if density is not None:
+            rows_, cols_ = int(snap["grid_rows"]), int(snap["grid_cols"])
+            lon = np.asarray(snap["lon_flat_deg"], dtype=np.float64).reshape(rows_, cols_)
+            lat = np.asarray(snap["lat_flat_deg"], dtype=np.float64).reshape(rows_, cols_)
+            masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
+            mesh = ax.pcolormesh(
+                lon, lat, masked, cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax), shading="auto", zorder=2
+            )
+            hdr_flat = np.asarray(snap["hdr_masks_flat"], dtype=bool)
+            n_cells = rows_ * cols_
+            n_levels = len(snap["hdr_levels"])
+            masks = [hdr_flat[i * n_cells : (i + 1) * n_cells].reshape(rows_, cols_) for i in range(n_levels)]
+            _draw_hdr_contours(ax, lon, lat, masks)
+            outside = snap["outside_domain_mass_fraction"]
+            if snap["outside_mass_warning"] and outside is not None:
+                title += t.t(
+                    f"｜範圍外 {float(outside) * 100:.0f}%", f" | outside {float(outside) * 100:.0f}%"
+                )
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                t.t(
+                    f"仍在漂流的粒子只有 {int(snap['active_particle_count'])} 顆，數量不足，未估計",
+                    f"Only {int(snap['active_particle_count'])} particles still drifting; not estimated",
+                ),
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontproperties=font,
+                fontsize=10,
+                zorder=7,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85, "pad": 3.0},
+            )
+        ax.set_title(title, fontproperties=font, fontsize=10.5)
+
+    for ax in flat_axes[len(snapshots) :]:
+        ax.set_visible(False)
+    for ax in axes[1, :]:
+        ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
+    for ax in axes[:, 0]:
+        ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
+    if mesh is not None:
+        cbar = fig.colorbar(mesh, ax=flat_axes, fraction=0.03, pad=0.02, shrink=0.8)
+        cbar.set_ticks(_log_colorbar_ticks(vmin, vmax))
+        cbar.ax.yaxis.set_major_formatter(FuncFormatter(_decade_formatter))
+        cbar.ax.minorticks_off()
+        cbar.set_label(
+            t.t(
+                "條件式來源足跡密度（% 仍在漂流粒子／km²）",
+                "Conditional footprint density (% of drifting particles / km^2)",
+            ),
+            fontproperties=font,
+        )
+    fig.legend(
+        handles=_footprint_legend_handles(
+            t, levels, isobaths_drawn=bool(drawn_levels), site_label=site.site_label_zh
+        ),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.005),
+        ncol=3,
+        prop=font,
+        frameon=True,
+    )
+    _add_two_line_title(
+        fig,
+        t,
+        font,
+        t.t(
+            f"回溯快照的條件式來源足跡｜{site.site_label_zh}",
+            f"Look-back snapshot footprints | {site.site_id}",
+        ),
+        _site_subtitle(site, t),
+        figure_text=figure_text,
+    )
+    fig.subplots_adjust(
+        left=0.07,
+        bottom=0.09,
+        right=0.88,
+        top=_title_top_margin(figure_text, full=0.91, none=0.96),
+        hspace=0.16,
+        wspace=0.08,
+    )
+    _save_exclusive(fig, path, dpi=dpi)
+    plt.close(fig)
+    return {
+        "isobath_levels_m": drawn_levels,
+        "snapshot_hours": [int(s["snapshot_hours"]) for s in snapshots],
+        "vmin": vmin if mesh is not None else None,
+        "vmax": vmax if mesh is not None else None,
+        "panels_estimated": [
+            int(s["snapshot_hours"]) for s, d in zip(snapshots, densities, strict=False) if d is not None
+        ],
+    }
+
+
+def _plot_boundary_departure_along_arc(
+    site: SiteData,
+    fp: FootprintSiteFigureData,
+    t: _Labeler,
+    font: Any,
+    path: Path,
+    dpi: int,
+    figure_text: str,
+) -> dict[str, Any]:
+    """沿開放邊界弧長的一維穿越分布：直條圖（每 bin 占比）＋累積曲線，標出各邊與轉角。"""
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(12.0, 5.6), dpi=150)
+    bins = list(fp.arc_bins)
+    total = sum(int(b["crossed_particle_count"]) for b in bins)
+    length_km = float(bins[0]["boundary_length_km"]) if bins else 0.0
+    bin_km = float(bins[0]["bin_km"]) if bins else 0.0
+    if not bins or total == 0:
+        ax.text(
+            0.5,
+            0.5,
+            t.t("本站沒有粒子穿越流場範圍開放邊界", "No particle crossed the open boundary"),
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontproperties=font,
+        )
+        ax.set_xlim(0.0, max(length_km, 1.0))
+    else:
+        starts = np.asarray([float(b["s_start_km"]) for b in bins])
+        ends = np.asarray([float(b["s_end_km"]) for b in bins])
+        share = np.asarray([float(b["fraction"]) for b in bins]) * 100.0
+        cum = np.asarray([float(b["cumulative_fraction"]) for b in bins]) * 100.0
+
+        edge_colors = ("#eef3f7", "#ffffff")
+        edges = [e for e in fp.edge_intervals if e["kind"] == "edge"]
+        for k, e in enumerate(edges):
+            ax.axvspan(float(e["s_start_km"]), float(e["s_end_km"]), facecolor=edge_colors[k % 2], zorder=0)
+        ax.bar(
+            starts,
+            share,
+            width=ends - starts,
+            align="edge",
+            color="#3a7ca5",
+            edgecolor="white",
+            linewidth=0.4,
+            zorder=2,
+        )
+        ax2 = ax.twinx()
+        ax2.plot(ends, cum, color="#3b2314", linewidth=1.6, zorder=3)
+        ax2.plot([0.0, float(ends[0])], [0.0, float(cum[0])], color="#3b2314", linewidth=1.6, zorder=3)
+        ax2.set_ylim(0.0, 100.0)
+        ax2.set_ylabel(t.t("累積比例（%）", "Cumulative share (%)"), fontproperties=font)
+        ymax = float(share.max()) * 1.25
+        ax.set_ylim(0.0, ymax)
+        ax.set_xlim(0.0, length_km)
+        for e in edges:
+            centre = 0.5 * (float(e["s_start_km"]) + float(e["s_end_km"]))
+            ax.text(
+                centre,
+                ymax * 0.965,
+                t.t(f"{_EDGE_NAME_ZH.get(e['name'], e['name'])}邊界", f"{e['name']} edge"),
+                ha="center",
+                va="top",
+                fontproperties=font,
+                fontsize=10,
+                color="#333333",
+                zorder=4,
+            )
+        for c in (e for e in fp.edge_intervals if e["kind"] == "corner"):
+            s = float(c["s_start_km"])
+            ax.axvline(s, color="#555555", linewidth=0.8, linestyle="--", zorder=1)
+            ax.text(
+                s,
+                ymax * 0.02,
+                t.t(_corner_name_zh(str(c["name"])), str(c["name"])),
+                rotation=90,
+                ha="right",
+                va="bottom",
+                fontproperties=font,
+                fontsize=8,
+                color="#444444",
+                zorder=4,
+            )
+    ax.set_xlabel(
+        t.t(
+            "沿流場範圍開放邊界的弧長（km，自邊界折線起點量起）",
+            "Arc length along open boundary (km from start)",
+        ),
+        fontproperties=font,
+    )
+    ax.set_ylabel(
+        t.t(f"穿越粒子占比（%，每 {bin_km:g} km）", f"Share of crossings (%, per {bin_km:g} km)"),
+        fontproperties=font,
+    )
+    ax.grid(axis="y", color="#dddddd", linewidth=0.5, zorder=0)
+    origin = fp.open_boundary_parts[0][0] if fp.open_boundary_parts else None
+    origin_zh = (
+        f"｜弧長起點：{origin[0]:.3f}°E, {origin[1]:.3f}°N（依邊界折線頂點順序前進）"
+        if origin is not None
+        else ""
+    )
+    origin_en = f" | start: {origin[0]:.3f}E, {origin[1]:.3f}N" if origin is not None else ""
+    _add_two_line_title(
+        fig,
+        t,
+        font,
+        t.t(
+            f"穿越位置沿開放邊界的分布｜{site.site_label_zh}",
+            f"Crossing position along open boundary | {site.site_id}",
+        ),
+        _site_subtitle(
+            site,
+            t,
+            extra=t.t(
+                f"｜穿越粒子 {total:,} 顆｜邊界長 {length_km:.0f} km{origin_zh}",
+                f" | {total:,} crossed | length {length_km:.0f} km{origin_en}",
+            ),
+        ),
+        figure_text=figure_text,
+    )
+    fig.subplots_adjust(
+        left=0.07, bottom=0.14, right=0.93, top=_title_top_margin(figure_text, full=0.86, none=0.96)
+    )
+    _save_exclusive(fig, path, dpi=dpi)
+    plt.close(fig)
+    return {"crossed_particle_count": total, "boundary_length_km": length_km, "bin_km": bin_km}
+
+
+def _footprint_residence_color_scales(
+    footprint: Mapping[str, FootprintSiteFigureData],
+) -> tuple[float, dict[str, float]]:
+    """回傳 ``(跨站共用上限, {站: 各站上限})``，單位 % 停留時數／km²。"""
+
+    per_site = {site_id: fp.density_max() for site_id, fp in footprint.items()}
+    shared = max(per_site.values(), default=0.0)
+    return shared, per_site
+
+
+def _hdr_area_text(fp: FootprintSiteFigureData) -> str:
+    parts = []
+    for level in sorted(fp.hdr_area_km2):
+        parts.append(f"{level * 100:.0f}% 為 {fp.hdr_area_km2[level]:,.0f} km²")
+    return "、".join(parts)
+
+
+def _footprint_caption_zh(
+    stem: str,
+    site: SiteData,
+    fp: FootprintSiteFigureData,
+    *,
+    experiment_case: _ExperimentCaseDisclosure,
+    footprint_manifest: Mapping[str, Any] | None,
+    isobath_levels: Sequence[float],
+    isobath_reason: str | None,
+    shared_vmax: float,
+    site_vmax: float,
+) -> str:
+    """WP-38 三種新圖的圖說。全部用直述句，不出現程式識別字與檔名。"""
+
+    total = int(site.summary["total_particle_count"])
+    member_count = int(site.summary["ensemble_member_count"])
+    member_text_zh, _ = _ensemble_member_count_text(member_count)
+    settings_tail = (
+        f"{site.site_label_zh}，{total:,} 顆粒子，{member_text_zh}，終止邊界為流場範圍開放邊界，"
+        f"物理案例：{experiment_case.physics_case_zh}"
+    )
+    if experiment_case.bed_no_deposition_zh is not None:
+        settings_tail += f"，{experiment_case.bed_no_deposition_zh}"
+    settings_tail += "。"
+
+    arrival_included = True
+    if footprint_manifest is not None:
+        arrival_included = bool(footprint_manifest.get("arrival_sample_included", True))
+    arrival_zh = "回溯起點（到達時刻）的位置計入" if arrival_included else "回溯起點（到達時刻）的位置不計入"
+    res = float(fp.grid["resolution_deg"])
+    km = res * 111.19
+    if isobath_levels:
+        levels_txt = "、".join(f"{v:g}" for v in isobath_levels)
+        base_zh = (
+            f"底圖為陸地（灰）與海岸線（黑），細灰線為 {levels_txt} 公尺等深線"
+            "（200 公尺線稍粗；水深取自計算網格的"
+            "節點水深），星號為受體位置，洋紅色虛線為流場範圍開放邊界（終止邊界）。"
+        )
+    else:
+        base_zh = (
+            "底圖為陸地（灰）與海岸線（黑），"
+            f"本圖未繪等深線（{isobath_reason or '本站沒有可用的水深資料'}），"
+            "星號為受體位置，洋紅色虛線為流場範圍開放邊界（終止邊界）。"
+        )
+
+    if stem in ("source_footprint_residence", "source_footprint_residence_site_scale"):
+        if stem == "source_footprint_residence":
+            scale_zh = (
+                f"本圖採用跨站共用色階（色階上限為各站最大值 {shared_vmax:.3g} % 停留時數／km²），"
+                "各站顏色深淺可直接比較"
+            )
+        else:
+            scale_zh = (
+                f"本圖採用本站自訂色階（色階上限為本站最大值 {site_vmax:.3g} % 停留時數／km²），"
+                "只適合看本站內部的分布形狀；跨站比較請看共用色階版本"
+            )
+        body = (
+            "停留時數密度圖，呈現回溯過程中這一站全部粒子逐小時所在位置的累計分布。"
+            "停留時數的定義：每顆粒子在回溯的每個整點時刻，只要仍在漂流（尚未穿越開放邊界、擱淺、沉底或因其他原因"
+            f"終止），就在它所在的網格記 1 個粒子小時；{arrival_zh}；粒子終止之後凍結的位置不再計入。"
+            "各網格的粒子小時數除以本站粒子小時總數，再除以網格面積（km²），單位為「% 停留時數／km²」，"
+            "全部網格對面積積分為 100%。"
+            f"網格為經緯度規則網格，解析度 {res:.2f}°（約 {km:.1f} km），面積依緯度以 cos φ 計算。"
+            f"色階為對數色階，下限為色階上限的 1/10000，低於下限的網格不著色；{scale_zh}。"
+            "圖上的線為高密度區間（Highest Density Region, HDR）50%、75%、90%：依密度由高到低累加網格，"
+            f"累計到該比例的停留時數所需的最小面積範圍；本站三個區間的面積依序為 {_hdr_area_text(fp)}。"
+            "與舊版邊界核密度圖的差別：舊圖的輸入只有粒子穿越開放邊界的那一個點，這些點全部落在一維的邊界線上，"
+            "二維核密度不適用；本圖改用回溯全程逐小時的位置，反映粒子在流場範圍內實際停留的地方。"
+            f"{base_zh}"
+        )
+    elif stem == "lookback_snapshot":
+        hours = "、".join(str(int(s["snapshot_hours"])) for s in fp.snapshots)
+        body = (
+            f"回溯快照圖，2×2 四個面板依序為回溯第 {hours} 小時仍在漂流的粒子所在位置的條件式來源足跡"
+            "（二維核密度估計，Kernel Density Estimation, KDE）。每個面板只計入該時刻仍在漂流的粒子，"
+            "分母是本站全部粒子；已經終止的粒子（含回溯總時間不足該時刻者）不在面板內，各面板標題列出仍在漂流的比例。"
+            "仍在漂流的粒子太少時該面板不估計密度，並在面板中註明粒子數。"
+            "色階為對數色階，四個面板共用同一組上下限，單位為「% 仍在漂流粒子／km²」，下限為上限的 1/10000，"
+            "低於下限的位置不著色；線為該面板的高密度區間（HDR）50%、75%、90%。"
+            "核密度估計不受流場範圍限制，落在流場範圍外的密度質量超過 10% 時，面板標題會標註範圍外的比例。"
+            f"{base_zh}"
+        )
+    elif stem == "boundary_departure_along_arc":
+        length_km = float(fp.arc_bins[0]["boundary_length_km"]) if fp.arc_bins else 0.0
+        bin_km = float(fp.arc_bins[0]["bin_km"]) if fp.arc_bins else 0.0
+        crossed = sum(int(b["crossed_particle_count"]) for b in fp.arc_bins)
+        body = (
+            "穿越位置沿開放邊界的一維分布圖。橫軸是沿流場範圍開放邊界折線自起點量起的弧長（km），"
+            f"起點與前進方向取自邊界折線的頂點順序，邊界全長 {length_km:.0f} km；"
+            f"直條為每 {bin_km:g} km 弧長內穿越的粒子占全部穿越粒子的百分比，棕色曲線與右軸為累積百分比；"
+            f"淡色底色區分西、南、東、北各邊，虛線標出各邊之間的轉角。本站共 {crossed:,} 顆粒子穿越開放邊界。"
+            "穿越點全部落在一維的邊界線上，因此以一維分布呈現，取代舊版把這些點做二維核密度的圖。"
+        )
+    else:  # pragma: no cover - FOOTPRINT_FIGURE_STEMS 是唯一呼叫來源
+        raise FiguresError(f"未知圖表代號：{stem}")
+    return f"{body} {settings_tail}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 圖說（captions.md）：WP-24b 新增，圖面不畫警語後，文字改由這裡承載
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2563,11 +3564,70 @@ def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case: _Experimen
     return f"{body} {settings_tail}"
 
 
-def _build_captions(inputs: NativeFiguresInputs) -> dict[str, str]:
+@dataclass(frozen=True, slots=True)
+class _FootprintFigurePlan:
+    """WP-38 新圖的繪製計畫：等深線、色階上限與每站實際會畫出的等深線水深。
+
+    圖說在繪圖前建立，因此「會畫哪些等深線」要在繪圖前就用與繪圖相同的判準算好
+    （:func:`_isobath_levels_in_extent`），圖說與圖面才會一致。
+    """
+
+    isobaths: Mapping[str, Mapping[float, list[np.ndarray]]]
+    bathymetry_record: Mapping[str, Any]
+    site_isobath_levels: Mapping[str, tuple[float, ...]]
+    site_isobath_reason: Mapping[str, str | None]
+    shared_vmax: float
+    site_vmax: Mapping[str, float]
+
+
+def _isobath_levels_in_extent(
+    site_isobaths: Mapping[float, list[np.ndarray]], extent: tuple[float, float, float, float]
+) -> tuple[float, ...]:
+    return tuple(
+        depth
+        for depth in sorted(site_isobaths)
+        if any(_inside_runs(seg, extent) for seg in site_isobaths[depth])
+    )
+
+
+def _plan_footprint_figures(
+    inputs: NativeFiguresInputs, config: NativeFiguresConfig
+) -> _FootprintFigurePlan | None:
+    if inputs.footprint is None:
+        return None
+    isobaths, record = _load_isobaths(config.bathymetry_path)
+    levels: dict[str, tuple[float, ...]] = {}
+    reasons: dict[str, str | None] = {}
+    for site in inputs.sites:
+        fp = inputs.footprint[site.site_id]
+        site_isobaths = isobaths.get(site.site_id, {})
+        found = _isobath_levels_in_extent(site_isobaths, _site_extent(fp))
+        levels[site.site_id] = found
+        if found:
+            reasons[site.site_id] = None
+        elif record["status"] != "loaded":
+            reasons[site.site_id] = str(record["reason"])
+        elif not site_isobaths:
+            reasons[site.site_id] = "水深檔沒有本站的等深線"
+        else:
+            reasons[site.site_id] = "本站繪圖範圍內沒有所要求水深的等深線"
+    shared_vmax, site_vmax = _footprint_residence_color_scales(inputs.footprint)
+    return _FootprintFigurePlan(
+        isobaths=isobaths,
+        bathymetry_record=record,
+        site_isobath_levels=levels,
+        site_isobath_reason=reasons,
+        shared_vmax=shared_vmax,
+        site_vmax=site_vmax,
+    )
+
+
+def _build_captions(inputs: NativeFiguresInputs, plan: _FootprintFigurePlan | None = None) -> dict[str, str]:
     """建立「``<site_id>/<stem>.png`` → 圖說」對照，供 ``captions.md`` 與
     manifest 的 ``output_png_sha256.<key>.caption`` 共用同一份文字（見模組
     docstring「WP-24b」一節：文字只寫一次，圖說與 manifest 互相核對用同一個
-    來源，不會出現兩處文字不一致的情況）。"""
+    來源，不會出現兩處文字不一致的情況）。``plan`` 不為 ``None`` 時另外建立
+    WP-38 三種新圖的圖說。"""
 
     experiment_case = _describe_experiment_case(inputs.postprocess_manifest)
     captions: dict[str, str] = {}
@@ -2576,6 +3636,19 @@ def _build_captions(inputs: NativeFiguresInputs) -> dict[str, str]:
             captions[f"{site.site_id}/{stem}.png"] = _figure_caption_zh(
                 stem, site, experiment_case=experiment_case
             )
+        if plan is not None and inputs.footprint is not None:
+            for stem in FOOTPRINT_FIGURE_STEMS:
+                captions[f"{site.site_id}/{stem}.png"] = _footprint_caption_zh(
+                    stem,
+                    site,
+                    inputs.footprint[site.site_id],
+                    experiment_case=experiment_case,
+                    footprint_manifest=inputs.footprint_manifest,
+                    isobath_levels=plan.site_isobath_levels[site.site_id],
+                    isobath_reason=plan.site_isobath_reason[site.site_id],
+                    shared_vmax=plan.shared_vmax,
+                    site_vmax=plan.site_vmax[site.site_id],
+                )
     return captions
 
 
@@ -2600,7 +3673,10 @@ def _render_captions_markdown(
     for site in inputs.sites:
         lines.append(f"## {site.site_label_zh}（{site.site_id}）")
         lines.append("")
-        for stem in FIGURE_STEMS:
+        stems = FIGURE_STEMS
+        if inputs.footprint is not None:
+            stems = (*FIGURE_STEMS, *FOOTPRINT_FIGURE_STEMS)
+        for stem in stems:
             lines.append(f"### `{stem}.png`")
             lines.append("")
             lines.append(captions[f"{site.site_id}/{stem}.png"])
@@ -2716,7 +3792,7 @@ flow=False`）與新竹／南灣／連江（`local_equals_flow=True`）五站的
    自的穿越開放邊界比例（長條圖）與各沉降速度分組內的方位扇區相對來源權重
    （熱圖）。資料來源：`departures.parquet`（逐沉降速度重新分組聚合）。
 
-## 已知限制與方法揭露
+{footprint_readme}## 已知限制與方法揭露
 
 - **系集成員數（M）**：{ensemble_member_summary}（見上方「科學定義與範圍」）；
   本批圖表不論 M 為何，一律把同一情境下的全部系集成員直接併入同一批統計，
@@ -2773,9 +3849,48 @@ def _ensemble_member_summary_zh(inputs: NativeFiguresInputs) -> str:
     return f"各站不一致（{detail}）"
 
 
-def _build_readme(inputs: NativeFiguresInputs, config: NativeFiguresConfig, command: str) -> str:
+def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigurePlan | None) -> str:
+    """WP-38 新圖的 README 段落；後處理目錄沒有足跡產品時回傳空字串。"""
+
+    if plan is None or inputs.footprint is None:
+        return ""
+    bathy = plan.bathymetry_record
+    bathy_line = (
+        "等深線取自 `--bathymetry` 指定的 GeoJSON（由 `scripts/export_isobaths.py` 依 SCHISM 計算網格的節點"
+        "水深匯出）。"
+        if bathy.get("status") == "loaded"
+        else f"本批圖未繪等深線：{bathy.get('reason')}。"
+    )
+    return (
+        "## WP-38：停留時數密度、回溯快照與邊界弧長分布\n\n"
+        "後處理目錄含足跡產品（`native-postprocess --with-footprint`）時，每站另外輸出四張圖：\n\n"
+        "1. `source_footprint_residence.png`：停留時數密度（跨站共用對數色階）。停留時數＝回溯過程中逐小時、"
+        "仍在漂流（尚未終止）的粒子所在網格的粒子小時數，終止後凍結的位置不計入；色階單位 % 停留時數／km²，"
+        "下限為上限的 1/10000，低於下限不著色；疊高密度區間（HDR）50%／75%／90%。\n"
+        "2. `source_footprint_residence_site_scale.png`：同一份資料，色階上限改用各站自己的最大值，"
+        "只適合看單站"
+        "內部形狀；跨站比較請看上一張。\n"
+        "3. `lookback_snapshot.png`：回溯 72／168／336／720 小時仍在漂流的粒子的條件式來源足跡（2×2 面板，"
+        "二維核密度估計），標題列出仍在漂流的比例。\n"
+        "4. `boundary_departure_along_arc.png`：穿越位置沿開放邊界弧長的一維分布"
+        "（直條＋累積曲線），標出各邊與"
+        "轉角。\n\n"
+        "舊的 `source_footprint_kde.png` 照常輸出，但不再是報告主圖：它的輸入只有粒子穿越開放邊界的那一點，"
+        "這些點全部落在一維的邊界線上，二維核密度不適用。\n\n"
+        f"{bathy_line}底圖為陸地（灰）、海岸線（黑 0.5 pt）、星號（受體）與洋紅色虛線（流場範圍開放邊界）。"
+        "`manifest.json` 的 `footprint_figures` 區塊記錄各圖的色階類型與上下限、等深線狀態。\n\n"
+    )
+
+
+def _build_readme(
+    inputs: NativeFiguresInputs,
+    config: NativeFiguresConfig,
+    command: str,
+    plan: _FootprintFigurePlan | None = None,
+) -> str:
     site_list = "\n".join(f"- `{s.site_id}`（{s.site_label_zh}）" for s in inputs.sites)
     return _README_TEMPLATE.format(
+        footprint_readme=_footprint_readme_section(inputs, plan),
         generated_at_utc=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         figure_text=config.figure_text,
         site_list=site_list,
@@ -2783,6 +3898,58 @@ def _build_readme(inputs: NativeFiguresInputs, config: NativeFiguresConfig, comm
         command=command,
         dpi=config.dpi,
     )
+
+
+def _build_footprint_figures_manifest(
+    inputs: NativeFiguresInputs, plan: _FootprintFigurePlan, records: Mapping[str, Any]
+) -> dict[str, Any]:
+    """``manifest.json`` 的 ``footprint_figures`` 區塊：色階類型與上下限、等深線狀態。"""
+
+    lower = RESIDENCE_COLOR_FLOOR_FRACTION
+    return {
+        "residence_color_scale": {
+            "unit": "% 停留時數／km²",
+            "norm": "log",
+            "lower_limit_fraction_of_upper_limit": lower,
+            "cells_below_lower_limit": "transparent",
+            "colormap": _RESIDENCE_CMAP,
+            "variants": {
+                "source_footprint_residence": {
+                    "scale": "shared_across_sites",
+                    "upper_limit": plan.shared_vmax,
+                    "lower_limit": plan.shared_vmax * lower,
+                },
+                "source_footprint_residence_site_scale": {
+                    "scale": "per_site",
+                    "upper_limit_by_site": dict(plan.site_vmax),
+                    "lower_limit_by_site": {k: v * lower for k, v in plan.site_vmax.items()},
+                },
+            },
+        },
+        "snapshot_color_scale": {
+            "unit": "% 仍在漂流粒子／km²",
+            "norm": "log",
+            "lower_limit_fraction_of_upper_limit": lower,
+            "scale": "shared_across_the_four_panels_of_each_site",
+        },
+        "bathymetry": {
+            **dict(plan.bathymetry_record),
+            "by_site": {
+                site.site_id: {
+                    "status": "drawn" if plan.site_isobath_levels[site.site_id] else "not_drawn",
+                    "levels_m": list(plan.site_isobath_levels[site.site_id]),
+                    "reason": plan.site_isobath_reason[site.site_id],
+                }
+                for site in inputs.sites
+            },
+        },
+        "hdr_levels": [0.5, 0.75, 0.9],
+        "text_modes": {
+            "full": "標題、副標、面板標題、圖例、座標軸標籤全部畫出",
+            "none": "不畫標題與副標；面板標題（快照時刻）、圖例與座標軸標籤保留",
+        },
+        "figures": dict(records),
+    }
 
 
 def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
@@ -2805,10 +3972,13 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
     labeler = _Labeler(font_resolution.cjk_available)
     color_scales = _compute_shared_color_scales(inputs.sites)
 
+    footprint_plan = _plan_footprint_figures(inputs, config)
+
     output_dir.mkdir(parents=True)
-    captions = _build_captions(inputs)
+    captions = _build_captions(inputs, footprint_plan)
     png_records: dict[str, dict[str, Any]] = {}
     svg_records: dict[str, dict[str, Any]] = {}
+    footprint_figure_records: dict[str, Any] = {}
     for site in inputs.sites:
         site_dir = output_dir / site.site_id
         site_dir.mkdir()
@@ -2816,8 +3986,15 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
             png_path = site_dir / f"{stem}.png"
             svg_path = png_path.with_suffix(".svg")
             _dispatch_plot(
-                stem, site, land_geometries, labeler, font_resolution.font_properties, png_path, config.dpi,
-                config.figure_text, color_scales,
+                stem,
+                site,
+                land_geometries,
+                labeler,
+                font_resolution.font_properties,
+                png_path,
+                config.dpi,
+                config.figure_text,
+                color_scales,
             )
             key = f"{site.site_id}/{stem}.png"
             png_records[key] = {
@@ -2830,6 +4007,73 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
                 "sha256": sha256_file(svg_path),
                 "size_bytes": svg_path.stat().st_size,
             }
+        if footprint_plan is not None and inputs.footprint is not None:
+            fp = inputs.footprint[site.site_id]
+            site_isobaths = footprint_plan.isobaths.get(site.site_id, {})
+            for stem in FOOTPRINT_FIGURE_STEMS:
+                png_path = site_dir / f"{stem}.png"
+                svg_path = png_path.with_suffix(".svg")
+                if stem == "source_footprint_residence":
+                    record = _plot_source_footprint_residence(
+                        site,
+                        fp,
+                        land_geometries,
+                        site_isobaths,
+                        labeler,
+                        font_resolution.font_properties,
+                        png_path,
+                        config.dpi,
+                        config.figure_text,
+                        footprint_plan.shared_vmax,
+                        scale_kind="shared",
+                    )
+                elif stem == "source_footprint_residence_site_scale":
+                    record = _plot_source_footprint_residence(
+                        site,
+                        fp,
+                        land_geometries,
+                        site_isobaths,
+                        labeler,
+                        font_resolution.font_properties,
+                        png_path,
+                        config.dpi,
+                        config.figure_text,
+                        footprint_plan.site_vmax[site.site_id],
+                        scale_kind="per_site",
+                    )
+                elif stem == "lookback_snapshot":
+                    record = _plot_lookback_snapshot(
+                        site,
+                        fp,
+                        land_geometries,
+                        site_isobaths,
+                        labeler,
+                        font_resolution.font_properties,
+                        png_path,
+                        config.dpi,
+                        config.figure_text,
+                    )
+                else:
+                    record = _plot_boundary_departure_along_arc(
+                        site,
+                        fp,
+                        labeler,
+                        font_resolution.font_properties,
+                        png_path,
+                        config.dpi,
+                        config.figure_text,
+                    )
+                key = f"{site.site_id}/{stem}.png"
+                png_records[key] = {
+                    "sha256": sha256_file(png_path),
+                    "size_bytes": png_path.stat().st_size,
+                    "caption": captions[key],
+                }
+                svg_records[f"{site.site_id}/{stem}.svg"] = {
+                    "sha256": sha256_file(svg_path),
+                    "size_bytes": svg_path.stat().st_size,
+                }
+                footprint_figure_records[key] = record
 
     sources_after = _snapshot_sources(inputs.source_paths)
     if sources_after != dict(inputs.sources_before):
@@ -2853,6 +4097,9 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
         "postprocess_manifest_experiment_case_id": inputs.postprocess_manifest.get("experiment_case_id"),
         "postprocess_manifest_master_seed": inputs.postprocess_manifest.get("master_seed"),
         "config": {
+            "bathymetry_basename": config.bathymetry_path.name
+            if config.bathymetry_path is not None
+            else None,
             "postprocess_dir_basename": config.postprocess_dir.name,
             "coastline_basename": config.coastline_path.name,
             "max_trajectories_per_site": config.max_trajectories_per_site,
@@ -2861,6 +4108,11 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
             "figure_text": config.figure_text,
         },
     }
+    if footprint_plan is not None:
+        manifest["footprint_figure_stems"] = list(FOOTPRINT_FIGURE_STEMS)
+        manifest["footprint_figures"] = _build_footprint_figures_manifest(
+            inputs, footprint_plan, footprint_figure_records
+        )
     manifest_path = output_dir / "manifest.json"
     with manifest_path.open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -2868,7 +4120,8 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
 
     captions_path = output_dir / "captions.md"
     captions_text = _render_captions_markdown(
-        inputs, captions,
+        inputs,
+        captions,
         generated_at_utc=generated_at_utc.strftime("%Y-%m-%d %H:%M UTC"),
         figure_text=config.figure_text,
     )
@@ -2876,7 +4129,7 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
         stream.write(captions_text)
 
     readme_path = output_dir / "README.md"
-    readme_text = _build_readme(inputs, config, command)
+    readme_text = _build_readme(inputs, config, command, footprint_plan)
     with readme_path.open("x", encoding="utf-8") as stream:
         stream.write(readme_text)
 

@@ -2236,6 +2236,13 @@ def _native_figures_parser() -> argparse.ArgumentParser:
             "的 captions.md 承載。兩種模式都會輸出 captions.md。"
         ),
     )
+    parser.add_argument(
+        "--bathymetry", type=Path, default=None,
+        help=(
+            "WP-38：等深線 GeoJSON（CRS84，由 scripts/export_isobaths.py 匯出，只讀）；"
+            "省略或檔案不存在時停留時數密度等新圖仍照常繪製，只是不畫等深線並在 manifest 記錄"
+        ),
+    )
     return parser
 
 
@@ -2255,6 +2262,7 @@ def run_native_figures_command(argv: Sequence[str] | None = None) -> int:
         max_trajectories_per_site=args.max_trajectories_per_site,
         dpi=args.dpi,
         figure_text=args.figure_text,
+        bathymetry_path=args.bathymetry,
     )
     output_dir = native_figures.build_native_figures(config, command=command)
     report = {
