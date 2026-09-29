@@ -363,9 +363,7 @@ class NativeFiguresConfig:
         if self.dpi < 1:
             raise FiguresError("dpi 必須是正整數")
         if self.figure_text not in FIGURE_TEXT_MODES:
-            raise FiguresError(
-                f"figure_text 必須是 {FIGURE_TEXT_MODES} 之一，收到：{self.figure_text!r}"
-            )
+            raise FiguresError(f"figure_text 必須是 {FIGURE_TEXT_MODES} 之一，收到：{self.figure_text!r}")
 
 
 # ── 表格讀取：優先 Parquet，缺 Parquet 才退回同名 CSV ───────────────────────
@@ -934,9 +932,7 @@ def _build_summary_row(summary_table: pa.Table, site_id: str) -> dict[str, Any]:
     return {name: matched.column(name)[0].as_py() for name in columns}
 
 
-def _build_local_departures_by_row(
-    local_table: pa.Table, site_id: str
-) -> dict[int, dict[str, Any]]:
+def _build_local_departures_by_row(local_table: pa.Table, site_id: str) -> dict[int, dict[str, Any]]:
     """把一站的 ``local_domain_departures.parquet`` 列攤平成
     ``row_particle_index -> 欄位 dict`` 對照（見 :class:`SiteData` docstring）。
 
@@ -972,9 +968,7 @@ def _build_local_summary_row(summary_table: pa.Table, site_id: str) -> dict[str,
     return {name: matched.column(name)[0].as_py() for name in _LOCAL_SUMMARY_REQUIRED_COLUMNS}
 
 
-def _build_arc_segments(
-    arc_table: pa.Table, site_id: str
-) -> dict[str, tuple[dict[str, Any], ...]]:
+def _build_arc_segments(arc_table: pa.Table, site_id: str) -> dict[str, tuple[dict[str, Any], ...]]:
     """依 ``base_boundary_segment_id`` 分組、依 ``arc_segment_index`` 排序的弧段幾何。"""
 
     mask = pc.equal(arc_table.column("study_site_id"), site_id)
@@ -1005,9 +999,7 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
     manifest_payload, manifest_path = _load_manifest_json(postprocess_dir)
     departures_table, departures_path = _require_strict_parquet(postprocess_dir, "departures")
     _require_columns(departures_table, _DEPARTURE_REQUIRED_COLUMNS, "departures.parquet")
-    trajectory_table, trajectory_path = _require_strict_parquet(
-        postprocess_dir, "trajectory_samples_by_site"
-    )
+    trajectory_table, trajectory_path = _require_strict_parquet(postprocess_dir, "trajectory_samples_by_site")
     _require_columns(trajectory_table, _TRAJECTORY_REQUIRED_COLUMNS, "trajectory_samples_by_site.parquet")
     kde_table, kde_path = _require_strict_parquet(postprocess_dir, "kde_by_site")
     _require_columns(kde_table, _KDE_REQUIRED_COLUMNS, "kde_by_site.parquet")
@@ -1178,8 +1170,22 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
 # ═══════════════════════════════════════════════════════════════════════════
 
 _COMPASS_16_ORDER: tuple[str, ...] = (
-    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-    "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+    "N",
+    "NNE",
+    "NE",
+    "ENE",
+    "E",
+    "ESE",
+    "SE",
+    "SSE",
+    "S",
+    "SSW",
+    "SW",
+    "WSW",
+    "W",
+    "WNW",
+    "NW",
+    "NNW",
 )
 """與 ``postprocess.COMPASS_16_SECTOR_NAMES`` 完全相同的 16 方位順序，這裡獨立
 覆寫一份常數只是避免繪圖層與後處理層產生模組間的隱性耦合；數值上必須永遠一致，
@@ -1210,9 +1216,7 @@ def _masked_int_array(values: np.ndarray, mask: np.ndarray, *, field_name: str, 
 
     selected = np.asarray(values, dtype=object)[mask]
     if selected.size and any(v is None for v in selected):
-        raise FiguresError(
-            f"{site_id} 站 {field_name} 在已穿越邊界的列中出現缺值，資料契約不一致"
-        )
+        raise FiguresError(f"{site_id} 站 {field_name} 在已穿越邊界的列中出現缺值，資料契約不一致")
     return selected.astype(np.int64) if selected.size else np.array([], dtype=np.int64)
 
 
@@ -1247,7 +1251,9 @@ def _compute_sector_weights(
     if total == 0:
         return ()
     sector_index = _masked_int_array(
-        departures["departure_azimuth_sector_index"], mask, field_name="departure_azimuth_sector_index",
+        departures["departure_azimuth_sector_index"],
+        mask,
+        field_name="departure_azimuth_sector_index",
         site_id=site_id,
     )
     counts: dict[int, int] = {}
@@ -1257,11 +1263,7 @@ def _compute_sector_weights(
     for index in sorted(counts):
         if not (0 <= index < sector_count):
             raise FiguresError(f"{site_id} 站方位扇區索引 {index} 超出 sector_count={sector_count} 範圍")
-        name = (
-            _COMPASS_16_ORDER[index]
-            if sector_count == len(_COMPASS_16_ORDER)
-            else f"sector_{index:03d}"
-        )
+        name = _COMPASS_16_ORDER[index] if sector_count == len(_COMPASS_16_ORDER) else f"sector_{index:03d}"
         count = counts[index]
         results.append(SectorWeight(index, name, count, float(count) / float(total)))
     return tuple(results)
@@ -1288,8 +1290,10 @@ def _compute_arc_segment_weights(
         return ()
     base_ids = np.asarray(departures["boundary_segment_id"], dtype=object)[mask]
     arc_index = _masked_int_array(
-        departures["boundary_arc_segment_index"], mask,
-        field_name="boundary_arc_segment_index", site_id=site_id,
+        departures["boundary_arc_segment_index"],
+        mask,
+        field_name="boundary_arc_segment_index",
+        site_id=site_id,
     )
     counts: dict[tuple[str, int], int] = {}
     for base_id, index in zip(base_ids, arc_index, strict=True):
@@ -1298,7 +1302,7 @@ def _compute_arc_segment_weights(
         key = (str(base_id), int(index))
         counts[key] = counts.get(key, 0) + 1
     results = []
-    for (base_id, index) in sorted(counts):
+    for base_id, index in sorted(counts):
         count = counts[(base_id, index)]
         results.append(ArcSegmentWeight(base_id, index, count, float(count) / float(total)))
     return tuple(results)
@@ -1408,7 +1412,9 @@ def _color_scale_source_values(stem: str, site: SiteData) -> np.ndarray | None:
         for sv in sorted(set(sv_array.tolist())):
             sv_mask = np.isclose(sv_array, sv)
             weights = _compute_sector_weights(
-                site.departures, sector_count=site.azimuth_sector_count, site_id=site.site_id,
+                site.departures,
+                sector_count=site.azimuth_sector_count,
+                site_id=site.site_id,
                 extra_mask=sv_mask,
             )
             collected.extend(w.relative_source_weight for w in weights)
@@ -1564,9 +1570,7 @@ def _resolve_open_boundary_lines_xy(site: SiteData) -> dict[str, tuple[np.ndarra
     return lines
 
 
-def _add_two_line_title(
-    fig, t: _Labeler, font: Any, title: str, subtitle: str, *, figure_text: str
-) -> None:
+def _add_two_line_title(fig, t: _Labeler, font: Any, title: str, subtitle: str, *, figure_text: str) -> None:
     """畫兩行標題（主標＋副標）；``figure_text=="none"`` 時什麼都不畫（見
     :data:`FIGURE_TEXT_MODES`），供 WP-24b 正式報告排版模式使用——文字改由
     ``captions.md`` 承載，圖面本身只留座標軸與圖例。"""
@@ -1647,8 +1651,14 @@ def _land_lonlat_patches(land_geometries: Sequence[Polygon | MultiPolygon]):
     def _draw(ax) -> None:
         for land in land_geometries:
             plot_polygon(
-                land, ax=ax, add_points=False, facecolor="#c9c9c9", edgecolor="#858585",
-                linewidth=0.25, alpha=0.85, zorder=1,
+                land,
+                ax=ax,
+                add_points=False,
+                facecolor="#c9c9c9",
+                edgecolor="#858585",
+                linewidth=0.25,
+                alpha=0.85,
+                zorder=1,
             )
 
     return _draw
@@ -1694,16 +1704,29 @@ def _plot_horizontal_overview(
         color = cmap(0.0 if sample.rank_total <= 1 else (sample.rank_index - 1) / (sample.rank_total - 1))
         ax.plot(sample.lon_deg, sample.lat_deg, color=color, linewidth=1.0, alpha=0.85, zorder=4)
         ax.plot(
-            sample.lon_deg[0], sample.lat_deg[0], marker="o", markersize=5.2, markerfacecolor="#1a9850",
-            markeredgecolor="white", markeredgewidth=0.6, linestyle="None", zorder=6,
+            sample.lon_deg[0],
+            sample.lat_deg[0],
+            marker="o",
+            markersize=5.2,
+            markerfacecolor="#1a9850",
+            markeredgecolor="white",
+            markeredgewidth=0.6,
+            linestyle="None",
+            zorder=6,
         )
         # WP-25：不再畫 local domain 首次離開標記（資料仍在 sample.local_first_
         # exit_lon_deg／lat_deg，只是這張圖不使用），圖上只保留下面的終止標記。
         marker = _STATUS_MARKERS.get(sample.final_status_code, "X")
         color_end = _STATUS_COLORS.get(sample.final_status_code, "#d62728")
         ax.plot(
-            sample.lon_deg[-1], sample.lat_deg[-1], marker=marker, markersize=7.0, markerfacecolor=color_end,
-            markeredgecolor=color_end, linestyle="None", zorder=7,
+            sample.lon_deg[-1],
+            sample.lat_deg[-1],
+            marker=marker,
+            markersize=7.0,
+            markerfacecolor=color_end,
+            markeredgecolor=color_end,
+            linestyle="None",
+            zorder=7,
         )
 
     all_lon = np.concatenate([s.lon_deg for s in site.trajectories]) if site.trajectories else np.array([0.0])
@@ -1724,38 +1747,60 @@ def _plot_horizontal_overview(
     from matplotlib.lines import Line2D
 
     handles = [
-        Line2D([], [], marker="o", color="#1a9850", markerfacecolor="#1a9850", linestyle="None",
-               label=t.t("回溯起點（受體到達位置）", "Backtrack start (receptor arrival)")),
+        Line2D(
+            [],
+            [],
+            marker="o",
+            color="#1a9850",
+            markerfacecolor="#1a9850",
+            linestyle="None",
+            label=t.t("回溯起點（受體到達位置）", "Backtrack start (receptor arrival)"),
+        ),
     ]
     if "flow" in boundary_kinds_present:
         handles.append(
             Line2D(
-                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
+                [],
+                [],
+                **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
                 label=t.t("流場範圍開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
             )
         )
     if "other" in boundary_kinds_present:
         handles.append(
             Line2D(
-                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["other"],
+                [],
+                [],
+                **_BOUNDARY_LINE_STYLE_BY_KIND["other"],
                 label=t.t("未分類開放邊界", "Unclassified open boundary"),
             )
         )
     for code in _STATUS_ORDER:
         handles.append(
             Line2D(
-                [], [], marker=_STATUS_MARKERS.get(code, "X"), color=_STATUS_COLORS.get(code, "#d62728"),
-                linestyle="None", markersize=7,
+                [],
+                [],
+                marker=_STATUS_MARKERS.get(code, "X"),
+                color=_STATUS_COLORS.get(code, "#d62728"),
+                linestyle="None",
+                markersize=7,
                 label=t.t(_STATUS_LABELS_ZH.get(code, str(code)), _STATUS_LABELS_EN.get(code, str(code))),
             )
         )
     fig.legend(
-        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.05), ncol=4, prop=font, frameon=True,
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.05),
+        ncol=4,
+        prop=font,
+        frameon=True,
         fontsize=8,
     )
 
     _add_two_line_title(
-        fig, t, font,
+        fig,
+        t,
+        font,
         t.t(f"水平軌跡總覽｜{site.site_label_zh}", f"Horizontal overview | {site.site_id}"),
         _site_subtitle(site, t, extra=t.t("｜線色：代表粒子起始深度序位（淺→深）", "")),
         figure_text=figure_text,
@@ -1814,16 +1859,28 @@ def _plot_horizontal_local(
         color = cmap(0.0 if sample.rank_total <= 1 else (sample.rank_index - 1) / (sample.rank_total - 1))
         ax.plot(sample.lon_deg - x0, sample.lat_deg - y0, color=color, linewidth=1.3, alpha=0.85, zorder=4)
         ax.plot(
-            sample.lon_deg[0] - x0, sample.lat_deg[0] - y0, marker="o", markersize=6.2,
-            markerfacecolor="#1a9850", markeredgecolor="white", markeredgewidth=0.7,
-            linestyle="None", zorder=6,
+            sample.lon_deg[0] - x0,
+            sample.lat_deg[0] - y0,
+            marker="o",
+            markersize=6.2,
+            markerfacecolor="#1a9850",
+            markeredgecolor="white",
+            markeredgewidth=0.7,
+            linestyle="None",
+            zorder=6,
         )
         # WP-25：不再畫 local domain 首次離開標記（理由同水平總覽圖）。
         marker = _STATUS_MARKERS.get(sample.final_status_code, "X")
         color_end = _STATUS_COLORS.get(sample.final_status_code, "#d62728")
         ax.plot(
-            sample.lon_deg[-1] - x0, sample.lat_deg[-1] - y0, marker=marker, markersize=8.2,
-            markerfacecolor=color_end, markeredgecolor=color_end, linestyle="None", zorder=7,
+            sample.lon_deg[-1] - x0,
+            sample.lat_deg[-1] - y0,
+            marker=marker,
+            markersize=8.2,
+            markerfacecolor=color_end,
+            markeredgecolor=color_end,
+            linestyle="None",
+            zorder=7,
         )
         all_lon.extend((sample.lon_deg - x0).tolist())
         all_lat.extend((sample.lat_deg - y0).tolist())
@@ -1835,32 +1892,52 @@ def _plot_horizontal_local(
     ax.set_ylim(cy - span / 2, cy + span / 2)
     center_lat = y0
     ax.set_aspect(1.0 / math.cos(math.radians(center_lat)), adjustable="box")
-    ax.set_xlabel(t.t("經度偏移（度，相對代表粒子起點平均）", "Longitude offset (deg, rel. mean start)"),
-                  fontproperties=font)
-    ax.set_ylabel(t.t("緯度偏移（度，相對代表粒子起點平均）", "Latitude offset (deg, rel. mean start)"),
-                  fontproperties=font)
+    ax.set_xlabel(
+        t.t("經度偏移（度，相對代表粒子起點平均）", "Longitude offset (deg, rel. mean start)"),
+        fontproperties=font,
+    )
+    ax.set_ylabel(
+        t.t("緯度偏移（度，相對代表粒子起點平均）", "Latitude offset (deg, rel. mean start)"),
+        fontproperties=font,
+    )
     ax.grid(color="white", linewidth=0.8)
 
     from matplotlib.lines import Line2D
 
     handles = [
-        Line2D([], [], marker="o", color="#1a9850", markerfacecolor="#1a9850", linestyle="None",
-               label=t.t("回溯起點（受體到達位置）", "Backtrack start (receptor arrival)")),
+        Line2D(
+            [],
+            [],
+            marker="o",
+            color="#1a9850",
+            markerfacecolor="#1a9850",
+            linestyle="None",
+            label=t.t("回溯起點（受體到達位置）", "Backtrack start (receptor arrival)"),
+        ),
     ]
     if "flow" in boundary_kinds_present:
         handles.append(
             Line2D(
-                [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
+                [],
+                [],
+                **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
                 label=t.t("流場範圍開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
             )
         )
     fig.legend(
-        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.045), ncol=2, prop=font, frameon=True,
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.045),
+        ncol=2,
+        prop=font,
+        frameon=True,
         fontsize=8,
     )
 
     _add_two_line_title(
-        fig, t, font,
+        fig,
+        t,
+        font,
         t.t(f"水平局部放大｜{site.site_label_zh}", f"Horizontal local view | {site.site_id}"),
         _site_subtitle(site, t),
         figure_text=figure_text,
@@ -1871,9 +1948,7 @@ def _plot_horizontal_local(
     plt.close(fig)
 
 
-def _plot_depth_age(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str
-) -> None:
+def _plot_depth_age(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str) -> None:
     """深度對回溯時齡曲線；線色依垂向抽樣序位（不代表固定物理水層）。"""
 
     import matplotlib
@@ -1906,7 +1981,9 @@ def _plot_depth_age(
         )
 
     _add_two_line_title(
-        fig, t, font,
+        fig,
+        t,
+        font,
         t.t(f"深度—時齡曲線｜{site.site_label_zh}", f"Depth vs. age | {site.site_id}"),
         _site_subtitle(site, t),
         figure_text=figure_text,
@@ -1936,8 +2013,13 @@ def _plot_terminal_counts(
     bars = ax.bar(range(len(_STATUS_ORDER)), fractions, color=colors, edgecolor="white")
     for bar, value, fraction in zip(bars, values, fractions, strict=True):
         ax.text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005, f"{value}\n({fraction * 100:.1f}%)",
-            ha="center", va="bottom", fontsize=8, fontproperties=font,
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.005,
+            f"{value}\n({fraction * 100:.1f}%)",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            fontproperties=font,
         )
     ax.set_xticks(range(len(_STATUS_ORDER)))
     ax.set_xticklabels(labels, rotation=25, ha="right", fontproperties=font, fontsize=8)
@@ -1946,7 +2028,9 @@ def _plot_terminal_counts(
     ax.grid(axis="y", color="#dddddd", linewidth=0.6)
 
     _add_two_line_title(
-        fig, t, font,
+        fig,
+        t,
+        font,
         t.t(f"停止類別統計｜{site.site_label_zh}", f"Terminal status counts | {site.site_id}"),
         _site_subtitle(site, t),
         figure_text=figure_text,
@@ -1957,7 +2041,12 @@ def _plot_terminal_counts(
 
 
 def _plot_boundary_azimuth_rose(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str,
+    site: SiteData,
+    t: _Labeler,
+    font: Any,
+    path: Path,
+    dpi: int,
+    figure_text: str,
     color_scale: ColorScale,
 ) -> None:
     """16 方位扇區相對來源權重極座標玫瑰圖（正北向上、順時針）。
@@ -1988,8 +2077,12 @@ def _plot_boundary_azimuth_rose(
     cmap = plt.get_cmap("viridis")
     norm = plt.Normalize(color_scale.vmin, color_scale.vmax)
     ax.bar(
-        theta, radii, width=width, color=[cmap(norm(r)) for r in radii],
-        edgecolor="white", linewidth=0.6,
+        theta,
+        radii,
+        width=width,
+        color=[cmap(norm(r)) for r in radii],
+        edgecolor="white",
+        linewidth=0.6,
     )
     ax.set_ylim(color_scale.vmin, color_scale.vmax)
     ax.set_xticks(np.radians([i * 360.0 / 16 for i in range(16)]))
@@ -2019,11 +2112,18 @@ def _plot_boundary_azimuth_rose(
                 f"方位扇區相對來源權重（玫瑰圖）｜{site.site_label_zh}",
                 f"Azimuth-sector relative source weight | {site.site_id}",
             ),
-            fontproperties=font, fontsize=16, y=0.985,
+            fontproperties=font,
+            fontsize=16,
+            y=0.985,
         )
         fig.text(
-            0.5, 0.945, t.t(f"前三大方位：{top_text}", f"Top-3 sectors: {top_text}"), ha="center", va="top",
-            fontproperties=font, fontsize=10,
+            0.5,
+            0.945,
+            t.t(f"前三大方位：{top_text}", f"Top-3 sectors: {top_text}"),
+            ha="center",
+            va="top",
+            fontproperties=font,
+            fontsize=10,
         )
         fig.text(0.5, 0.915, _site_subtitle(site, t), ha="center", va="top", fontproperties=font, fontsize=9)
     top_margin = _title_top_margin(figure_text, full=0.82, none=0.92)
@@ -2047,7 +2147,12 @@ def _short_boundary_label(base_boundary_segment_id: str) -> str:
 
 
 def _plot_boundary_arc_segments(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str,
+    site: SiteData,
+    t: _Labeler,
+    font: Any,
+    path: Path,
+    dpi: int,
+    figure_text: str,
     color_scale: ColorScale,
 ) -> None:
     """開放邊界折線依弧段著色（權重色階）＋弧段權重長條圖。
@@ -2079,8 +2184,12 @@ def _plot_boundary_arc_segments(
             value = weight.relative_source_weight if weight is not None else 0.0
             color = cmap(norm(value))
             ax_map.plot(
-                [row["start_lon_deg"], row["end_lon_deg"]], [row["start_lat_deg"], row["end_lat_deg"]],
-                color=color, linewidth=3.5, solid_capstyle="butt", zorder=3,
+                [row["start_lon_deg"], row["end_lon_deg"]],
+                [row["start_lat_deg"], row["end_lat_deg"]],
+                color=color,
+                linewidth=3.5,
+                solid_capstyle="butt",
+                zorder=3,
             )
             all_labels.append(f"{_short_boundary_label(base_id)}#{index}")
             all_values.append(value)
@@ -2124,7 +2233,8 @@ def _plot_boundary_arc_segments(
 
     order = sorted(range(len(all_labels)), key=lambda i: -all_values[i])
     ax_bar.bar(
-        range(len(order)), [all_values[i] for i in order],
+        range(len(order)),
+        [all_values[i] for i in order],
         color=[cmap(norm(all_values[i])) for i in order],
     )
     ax_bar.set_xticks(range(len(order)))
@@ -2137,7 +2247,9 @@ def _plot_boundary_arc_segments(
     ax_bar.grid(axis="y", color="#dddddd", linewidth=0.6)
 
     _add_two_line_title(
-        fig, t, font,
+        fig,
+        t,
+        font,
         t.t(
             f"弧段相對來源權重｜{site.site_label_zh}",
             f"Boundary-arc relative source weight | {site.site_id}",
@@ -2178,9 +2290,16 @@ def _plot_source_footprint_kde(
     if site.kde is None or site.kde["status"] != "available":
         status_text = "" if site.kde is None else str(site.kde["status"])
         ax.text(
-            0.5, 0.5, t.t(f"此站無可用條件式來源足跡（狀態：{status_text or '缺席'}）",
-                          f"No source footprint available (status: {status_text or 'missing'})"),
-            ha="center", va="center", transform=ax.transAxes, fontproperties=font,
+            0.5,
+            0.5,
+            t.t(
+                f"此站無可用條件式來源足跡（狀態：{status_text or '缺席'}）",
+                f"No source footprint available (status: {status_text or 'missing'})",
+            ),
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontproperties=font,
         )
     else:
         kde = site.kde
@@ -2194,8 +2313,15 @@ def _plot_source_footprint_kde(
         lat_grid = lat_grid.reshape(rows, cols)
 
         mesh = ax.pcolormesh(
-            lon_grid, lat_grid, density, cmap="viridis", shading="auto", zorder=2, alpha=0.9,
-            vmin=color_scale.vmin, vmax=color_scale.vmax,
+            lon_grid,
+            lat_grid,
+            density,
+            cmap="viridis",
+            shading="auto",
+            zorder=2,
+            alpha=0.9,
+            vmin=color_scale.vmin,
+            vmax=color_scale.vmax,
         )
         cbar = fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.02)
         cbar.set_ticks(color_scale.ticks())
@@ -2217,22 +2343,34 @@ def _plot_source_footprint_kde(
             if not mask.any():
                 continue
             ax.contour(
-                lon_grid, lat_grid, mask.astype(np.float64), levels=[0.5],
-                colors=[hdr_colors[level_index % len(hdr_colors)]], linewidths=1.6, zorder=5,
+                lon_grid,
+                lat_grid,
+                mask.astype(np.float64),
+                levels=[0.5],
+                colors=[hdr_colors[level_index % len(hdr_colors)]],
+                linewidths=1.6,
+                zorder=5,
             )
 
         from matplotlib.lines import Line2D
 
         hdr_handles = [
             Line2D(
-                [], [], color=hdr_colors[i % len(hdr_colors)], linewidth=1.6,
+                [],
+                [],
+                color=hdr_colors[i % len(hdr_colors)],
+                linewidth=1.6,
                 label=t.t(f"高密度區間 {level * 100:.0f}%", f"HDR {level * 100:.0f}%"),
             )
             for i, level in enumerate(hdr_levels)
         ]
         fig.legend(
-            handles=hdr_handles, loc="lower center", bbox_to_anchor=(0.5, 0.05),
-            ncol=len(hdr_handles), prop=font, frameon=True,
+            handles=hdr_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.05),
+            ncol=len(hdr_handles),
+            prop=font,
+            frameon=True,
         )
 
     _land_lonlat_patches(land_geometries)(ax)
@@ -2255,7 +2393,9 @@ def _plot_source_footprint_kde(
     ax.grid(color="white", linewidth=0.6, alpha=0.6)
 
     _add_two_line_title(
-        fig, t, font,
+        fig,
+        t,
+        font,
         t.t(
             f"條件式來源足跡（核密度）｜{site.site_label_zh}",
             f"Conditional source footprint (KDE) | {site.site_id}",
@@ -2269,7 +2409,12 @@ def _plot_source_footprint_kde(
 
 
 def _plot_settling_velocity_breakdown(
-    site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int, figure_text: str,
+    site: SiteData,
+    t: _Labeler,
+    font: Any,
+    path: Path,
+    dpi: int,
+    figure_text: str,
     color_scale: ColorScale,
 ) -> None:
     """十種沉降速度的穿越比例（長條圖）與主要方位扇區權重比較（熱圖）。
@@ -2295,7 +2440,9 @@ def _plot_settling_velocity_breakdown(
         crossed_sv = int(np.sum(sv_mask & crossed))
         crossing_fractions.append(crossed_sv / total_sv if total_sv else 0.0)
         weights = _compute_sector_weights(
-            site.departures, sector_count=site.azimuth_sector_count, site_id=site.site_id,
+            site.departures,
+            sector_count=site.azimuth_sector_count,
+            site_id=site.site_id,
             extra_mask=sv_mask,
         )
         for w in weights:
@@ -2315,14 +2462,20 @@ def _plot_settling_velocity_breakdown(
     )
     ax_bar.grid(axis="x", color="#dddddd", linewidth=0.6)
 
-    sector_labels = _COMPASS_16_ORDER if site.azimuth_sector_count == 16 else [
-        f"{i}" for i in range(site.azimuth_sector_count)
-    ]
+    sector_labels = (
+        _COMPASS_16_ORDER
+        if site.azimuth_sector_count == 16
+        else [f"{i}" for i in range(site.azimuth_sector_count)]
+    )
     # origin="lower"讓熱圖第 0 列（sv_values 最小、下沉最快）畫在圖底部，
     # 與左側 barh 預設「索引 0 在最下面」的列順序一致，兩張子圖才能逐列對照。
     im = ax_heat.imshow(
-        heatmap, aspect="auto", cmap="viridis", origin="lower",
-        vmin=color_scale.vmin, vmax=color_scale.vmax,
+        heatmap,
+        aspect="auto",
+        cmap="viridis",
+        origin="lower",
+        vmin=color_scale.vmin,
+        vmax=color_scale.vmax,
     )
     ax_heat.set_xticks(range(len(sector_labels)))
     ax_heat.set_xticklabels(sector_labels, fontsize=7, rotation=90)
@@ -2340,7 +2493,9 @@ def _plot_settling_velocity_breakdown(
     )
 
     _add_two_line_title(
-        fig, t, font,
+        fig,
+        t,
+        font,
         t.t(f"沉降速度細分｜{site.site_label_zh}", f"Settling-velocity breakdown | {site.site_id}"),
         _site_subtitle(site, t),
         figure_text=figure_text,
@@ -2380,9 +2535,7 @@ def _dispatch_plot(
     elif stem == "boundary_arc_segments":
         _plot_boundary_arc_segments(site, t, font, path, dpi, figure_text, color_scales[stem])
     elif stem == "source_footprint_kde":
-        _plot_source_footprint_kde(
-            site, land_geometries, t, font, path, dpi, figure_text, color_scales[stem]
-        )
+        _plot_source_footprint_kde(site, land_geometries, t, font, path, dpi, figure_text, color_scales[stem])
     elif stem == "settling_velocity_breakdown":
         _plot_settling_velocity_breakdown(site, t, font, path, dpi, figure_text, color_scales[stem])
     else:  # pragma: no cover - FIGURE_STEMS 是唯一呼叫來源，這裡只是防禦
@@ -2411,7 +2564,8 @@ _FOOTPRINT_TABLE_STEMS: tuple[str, ...] = (
     "residence_density_by_site",
     "residence_hdr_by_site",
     "footprint_grid_by_site",
-    "lookback_snapshot_kde_by_site",
+    "lookback_snapshot_by_site",
+    "lookback_snapshot_density_by_site",
     "boundary_departure_along_arc_by_site",
     "boundary_edge_intervals_by_site",
     "footprint_geometry_by_site",
@@ -2528,12 +2682,37 @@ def _load_footprint_figure_inputs(
         }
         areas = {round(float(r["level"]), 6): float(r["area_km2"]) for r in hdr_rows}
 
-        snapshots = tuple(
-            sorted(
-                _rows_for_site(tables["lookback_snapshot_kde_by_site"], site_id),
-                key=lambda r: r["snapshot_hours"],
+        snap_density_rows = _rows_for_site(tables["lookback_snapshot_density_by_site"], site_id)
+        snap_hdr_rows = [
+            r
+            for r in _rows_for_site(tables["residence_hdr_by_site"], site_id)
+            if r["group_kind"] == "snapshot"
+        ]
+        snapshot_list = []
+        for status_row in sorted(
+            _rows_for_site(tables["lookback_snapshot_by_site"], site_id), key=lambda r: r["snapshot_hours"]
+        ):
+            hours_ = int(status_row["snapshot_hours"])
+            snap_density: np.ndarray | None = None
+            if status_row["status"] == "available":
+                snap_density = np.zeros((ny, nx), dtype=np.float64)
+                for r in snap_density_rows:
+                    if int(r["snapshot_hours"]) == hours_:
+                        snap_density[int(r["cell_iy"]), int(r["cell_ix"])] = (
+                            float(r["density_fraction_per_km2"]) * 100.0
+                        )
+            snapshot_list.append(
+                {
+                    **status_row,
+                    "density_pct_per_km2": snap_density,
+                    "hdr_threshold_pct_per_km2": {
+                        round(float(r["level"]), 6): float(r["density_threshold_fraction_per_km2"]) * 100.0
+                        for r in snap_hdr_rows
+                        if r["group_value"] == str(hours_)
+                    },
+                }
             )
-        )
+        snapshots = tuple(snapshot_list)
         arc_bins = tuple(
             sorted(
                 _rows_for_site(tables["boundary_departure_along_arc_by_site"], site_id),
@@ -2759,7 +2938,7 @@ def _draw_footprint_base_map(
             facecolor=_LAND_COLOR,
             edgecolor="black",
             linewidth=0.5,
-            zorder=3,
+            zorder=5.5,  # 陸地蓋在密度與 HDR 線之上，密度不會畫到陸地上
         )
     drawn = _draw_isobaths(ax, site_isobaths, extent, font, label_fontsize=label_fontsize)
     for part in fp.open_boundary_parts:
@@ -2990,7 +3169,7 @@ def _plot_lookback_snapshot(
     dpi: int,
     figure_text: str,
 ) -> dict[str, Any]:
-    """2×2 回溯快照圖：各面板是該回溯時刻仍在漂流的粒子的條件式來源足跡（二維 KDE）。"""
+    """2×2 回溯快照圖：各面板是該回溯時刻仍在漂流的粒子的條件式來源足跡（與停留時數密度同網格）。"""
 
     import matplotlib
 
@@ -3003,16 +3182,7 @@ def _plot_lookback_snapshot(
     fig, axes = plt.subplots(2, 2, figsize=(13.0, 9.6), dpi=150, sharex=True, sharey=True)
     flat_axes = list(axes.ravel())
 
-    unit_scale = 1.0e8  # 每平方公尺機率密度 -> % 快照粒子／km²
-    densities: list[np.ndarray | None] = []
-    for snap in snapshots:
-        if snap["status"] == "available" and snap["density_per_m2_flat"]:
-            rows_, cols_ = int(snap["grid_rows"]), int(snap["grid_cols"])
-            densities.append(
-                np.asarray(snap["density_per_m2_flat"], dtype=np.float64).reshape(rows_, cols_) * unit_scale
-            )
-        else:
-            densities.append(None)
+    densities: list[np.ndarray | None] = [snap["density_pct_per_km2"] for snap in snapshots]
     available = [d for d in densities if d is not None]
     vmax = max((float(d.max()) for d in available), default=0.0)
     vmin = vmax * RESIDENCE_COLOR_FLOOR_FRACTION
@@ -3020,6 +3190,8 @@ def _plot_lookback_snapshot(
     mesh = None
     drawn_levels: list[float] = []
     levels = sorted(fp.hdr_threshold_pct_per_km2) or [0.5, 0.75, 0.9]
+    lon_c = 0.5 * (fp.lon_edges[:-1] + fp.lon_edges[1:])
+    lat_c = 0.5 * (fp.lat_edges[:-1] + fp.lat_edges[1:])
 
     for ax, snap, density in zip(flat_axes, snapshots, densities, strict=False):
         _extent, drawn = _draw_footprint_base_map(
@@ -3041,33 +3213,28 @@ def _plot_lookback_snapshot(
             f"{hours} h back ({hours / 24:g} d) | still drifting {active_pct:.1f}%",
         )
         if density is not None:
-            rows_, cols_ = int(snap["grid_rows"]), int(snap["grid_cols"])
-            lon = np.asarray(snap["lon_flat_deg"], dtype=np.float64).reshape(rows_, cols_)
-            lat = np.asarray(snap["lat_flat_deg"], dtype=np.float64).reshape(rows_, cols_)
             masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
             mesh = ax.pcolormesh(
-                lon, lat, masked, cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax), shading="auto", zorder=2
+                fp.lon_edges,
+                fp.lat_edges,
+                masked,
+                cmap=cmap,
+                norm=LogNorm(vmin=vmin, vmax=vmax),
+                shading="flat",
+                zorder=2,
             )
             clip_patch = _domain_clip_patch(ax, fp)
             mesh.set_clip_path(clip_patch)
-            hdr_flat = np.asarray(snap["hdr_masks_flat"], dtype=bool)
-            n_cells = rows_ * cols_
-            n_levels = len(snap["hdr_levels"])
-            masks = [hdr_flat[i * n_cells : (i + 1) * n_cells].reshape(rows_, cols_) for i in range(n_levels)]
-            _draw_hdr_contours(ax, lon, lat, masks, clip_patch)
-            outside = snap["outside_domain_mass_fraction"]
-            if snap["outside_mass_warning"] and outside is not None:
-                title += t.t(
-                    f"｜範圍外 {float(outside) * 100:.0f}% 未繪",
-                    f" | {float(outside) * 100:.0f}% outside domain (not drawn)",
-                )
+            thresholds = snap["hdr_threshold_pct_per_km2"]
+            masks = [density >= thresholds[level] * (1.0 - 1e-9) for level in sorted(thresholds)]
+            _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
         else:
             ax.text(
                 0.5,
                 0.9,
                 t.t(
-                    f"仍在漂流的粒子只有 {int(snap['active_particle_count'])} 顆，數量不足，未估計",
-                    f"Only {int(snap['active_particle_count'])} particles still drifting; not estimated",
+                    f"仍在漂流粒子數不足（n={int(snap['active_particle_count'])}）",
+                    f"Too few particles still drifting (n={int(snap['active_particle_count'])})",
                 ),
                 ha="center",
                 va="center",
@@ -3137,6 +3304,10 @@ def _plot_lookback_snapshot(
         "panels_estimated": [
             int(s["snapshot_hours"]) for s, d in zip(snapshots, densities, strict=False) if d is not None
         ],
+        "smoothing_sigma_km": float(snapshots[0]["smoothing_sigma_km"]) if snapshots else None,
+        "minimum_active_particle_count": (
+            int(snapshots[0]["minimum_active_particle_count"]) if snapshots else None
+        ),
     }
 
 
@@ -3362,15 +3533,25 @@ def _footprint_caption_zh(
         )
     elif stem == "lookback_snapshot":
         hours = "、".join(str(int(s["snapshot_hours"])) for s in fp.snapshots)
+        sigma = float(fp.snapshots[0]["smoothing_sigma_km"]) if fp.snapshots else 0.0
+        min_n = int(fp.snapshots[0]["minimum_active_particle_count"]) if fp.snapshots else 0
+        smooth_zh = (
+            f"密度先累加到與停留時數密度相同的 {res:.2f}° 網格，再以寬度 {sigma:g} km 的高斯核做輕度平滑；"
+            "平滑只在海域內進行（分子分母都乘上海域遮罩，陸地與流場範圍外的格不參與也不會得到密度），"
+            "平滑後總質量重新正規化為 1。"
+            if sigma > 0
+            else f"密度直接累加到與停留時數密度相同的 {res:.2f}° 網格，不做平滑。"
+        )
         body = (
-            f"回溯快照圖，2×2 四個面板依序為回溯第 {hours} 小時仍在漂流的粒子所在位置的條件式來源足跡"
-            "（二維核密度估計，Kernel Density Estimation, KDE）。每個面板只計入該時刻仍在漂流的粒子，"
-            "分母是本站全部粒子；已經終止的粒子（含回溯總時間不足該時刻者）不在面板內，各面板標題列出仍在漂流的比例。"
-            "仍在漂流的粒子太少時該面板不估計密度，並在面板中註明粒子數。"
+            f"回溯快照圖，2×2 四個面板依序為回溯第 {hours} 小時仍在漂流的粒子所在位置的條件式來源足跡。"
+            f"{smooth_zh}"
+            "每個面板只計入該時刻仍在漂流的粒子，密度的分母是該時刻仍在漂流的粒子數，"
+            "因此各面板的總和都是 1；已經終止的粒子（含回溯總時間不足該時刻者）不在面板內，"
+            "各面板標題列出仍在漂流的比例（分母是本站全部粒子）。"
+            f"仍在漂流的粒子少於 {min_n} 顆時該面板不畫密度，並在面板中註明粒子數。"
             "色階為對數色階，四個面板共用同一組上下限，單位為「% 仍在漂流粒子／km²」，下限為上限的 1/10000，"
-            "低於下限的位置不著色；線為該面板的高密度區間（HDR）50%、75%、90%。"
-            "核密度估計不受流場範圍限制，但流場範圍外的部分不繪出；"
-            "該部分的密度質量超過 10% 時，面板標題會標註範圍外的比例。"
+            "低於下限的位置不著色；線為該面板的高密度區間（HDR）50%、75%、90%，算法與停留時數密度相同。"
+            "陸地畫在密度之上，密度不會出現在陸地上。"
             f"{base_zh}"
         )
     elif stem == "boundary_departure_along_arc":
@@ -3895,7 +4076,8 @@ def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigur
         "只適合看單站"
         "內部形狀；跨站比較請看上一張。\n"
         "3. `lookback_snapshot.png`：回溯 72／168／336／720 小時仍在漂流的粒子的條件式來源足跡（2×2 面板，"
-        "二維核密度估計），標題列出仍在漂流的比例。\n"
+        "與停留時數密度同網格的直方圖，可選海域遮罩下的輕度平滑），標題列出仍在漂流的比例；"
+        "仍在漂流粒子數低於門檻的面板不畫密度。\n"
         "4. `boundary_departure_along_arc.png`：穿越位置沿開放邊界弧長的一維分布"
         "（直條＋累積曲線），標出各邊與"
         "轉角。\n\n"

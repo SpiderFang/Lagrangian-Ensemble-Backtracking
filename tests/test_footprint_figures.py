@@ -55,7 +55,7 @@ def _two_site_world():
 
 def _write_footprint_tables(postprocess_dir: Path, *, snapshot_hours=(24, 72, 168, 336)) -> dict:
     identity, units = _two_site_world()
-    cfg = FootprintConfig(lookback_snapshot_hours=snapshot_hours, snapshot_minimum_point_count=20)
+    cfg = FootprintConfig(lookback_snapshot_hours=snapshot_hours, snapshot_minimum_particle_count=20)
     specs = {s: FootprintSiteSpec(flow_domain=DOMAIN, flow_open_boundary=OPEN_BOUNDARY) for s in SITES}
     acc = FootprintAccumulator(identity, config=cfg, specs=specs, lonlat_projector=fx.linear_projector)
     rng = np.random.default_rng(4)
@@ -278,4 +278,6 @@ def test_snapshot_panel_with_too_few_particles_is_annotated_not_estimated(
     _build(tmp_path, postprocess_dir, coastline, isobaths)
     # 合成資料的隨機終止使 336 小時面板只剩少數粒子或沒有粒子。
     manifest_text = "\n".join(seen)
-    assert "數量不足，未估計" in manifest_text or "回溯 336 小時" in manifest_text
+    assert "仍在漂流粒子數不足（n=" in manifest_text or "回溯 336 小時" in manifest_text
+    # 快照不再有 KDE 的「範圍外未繪」註記。
+    assert "範圍外" not in manifest_text and "未繪" not in manifest_text

@@ -26,11 +26,15 @@
 - **HDR**：依 ``density_fraction_per_km2`` 由高到低累加網格，累積停留時數比例首次
   達到 50／75／90% 時停止；被累加的網格集合就是「包含該比例停留時數的最小面積
   網格集合」，密度門檻是最後加入網格的密度，面積是該集合的網格面積和。
-- **回溯快照**：回溯 ``h`` 小時時 ``status == 0`` 的粒子位置，以既有
-  ``aggregation.conditional_kde_2d`` 估計；分母是該站全部粒子，另記錄該時刻仍在
-  漂流的粒子比例（軌跡長度不足 ``h + 1`` 筆的單元視為已全部終止）。KDE 網格涵蓋
-  flow domain 外框並外擴，落在 flow domain 外的 KDE 質量比例超過 10% 時在
-  manifest 標註警告。
+- **回溯快照**：回溯 ``h`` 小時時 ``status == 0`` 的粒子位置，直接累加到與停留時數密度
+  **同一個**經緯度網格（整數計數、同樣的面積權重），不做核密度估計。分母是該時刻仍在漂流
+  的粒子數（另記錄仍在漂流比例＝仍在漂流粒子數 ÷ 全站粒子數；軌跡長度不足 ``h + 1`` 筆
+  的單元視為已全部終止）。可選的輕度平滑是「海域遮罩下的正規化卷積」：
+  ``G*(d·m) / G*m``，``d`` 是密度、``m`` 是海域遮罩（陸地與 flow domain 外一律為 0）、
+  ``G`` 是以公里指定寬度的高斯核（預設 2 km，約一個網格）；平滑後再依總質量重新正規化為 1，
+  陸地格的密度恆為 0。仍在漂流粒子數低於門檻（預設 200）時不出密度。
+  海域遮罩＝flow domain 內、且海域面積占格面積不小於 0.5 的格（另加：曾有粒子出現的格
+  必為海域），陸地來源是海岸線 GeoJSON（與出圖所用同一檔）。
 - **沿開放邊界弧長的離開分布**：終止於 flow domain 開放邊界的粒子，其離開座標投影
   到開放邊界折線上的弧長（km），以 10 km 為預設組距做直方圖，附累積分布；並依
   flow domain 外框標出北、東、南、西各邊與角落的弧長區間。
@@ -41,8 +45,8 @@
 狀態大小為「網格格數 × (沉降速度數 × 系集成員數 + 到達單元數)」的整數陣列，與粒子
 總數與軌跡長度無關。投影座標（公尺）到經緯度網格的對照，用每站一張預先計算的查表
 （``lut_cell_m``，預設 200 m，只在建構時呼叫一次投影反轉換），逐點只做整數索引。
-計數為整數，因此分塊累加與一次累加的結果位元相同；需要浮點運算的快照 KDE 與弧長
-直方圖在 finalize 時先把點依座標排序，輸出同樣與批次切分無關。
+計數為整數（快照也是整數直方圖），因此分塊累加與一次累加的結果位元相同；弧長直方圖
+在 finalize 時先把點依座標排序，輸出同樣與批次切分無關。
 
 收斂與敏感度
 ------------
@@ -64,6 +68,7 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 import shapely
+from scipy import ndimage
 from shapely.geometry.base import BaseGeometry
 
 from .backward_driver import NATIVE_STATUS_LEFT_FLOW_DOMAIN
@@ -79,6 +84,8 @@ __all__ = [
     "EARTH_RADIUS_KM",
     "cell_area_km2_by_row",
     "compute_hdr",
+    "smooth_masked_density",
+    "load_land_lonlat",
     "total_variation_distance",
     "haversine_km_and_bearing_deg",
 ]
@@ -92,6 +99,7 @@ NORMALIZED_SUM_TOLERANCE = 1.0e-9
 GROUP_ALL = "all"
 GROUP_SETTLING_VELOCITY = "settling_velocity"
 GROUP_MEMBER_HALF = "member_half"
+GROUP_SNAPSHOT = "snapshot"
 
 KDE_NOTE_ZH = (
     "kde_by_site 的輸入點位於一維開放邊界，二維 KDE 不適用，不再作報告主圖；"
@@ -118,10 +126,9 @@ class FootprintConfig:
     lut_cell_m: float = 200.0
     hdr_levels: tuple[float, ...] = (0.50, 0.75, 0.90)
     lookback_snapshot_hours: tuple[int, ...] = (72, 168, 336, 720)
-    snapshot_kde_grid_cell_count: int = 96
-    snapshot_kde_padding_fraction: float = 0.25
-    snapshot_minimum_point_count: int = 30
-    outside_mass_warning_fraction: float = 0.10
+    snapshot_smoothing_km: float = 2.0
+    snapshot_minimum_particle_count: int = 200
+    land_mask_min_sea_fraction: float = 0.5
     arc_bin_km: float = 10.0
     noise_floor_repeats: int = 64
     noise_floor_seed: int = 20260929
@@ -146,10 +153,12 @@ class FootprintConfig:
         if any(h < 0 for h in hours):
             raise FootprintError("lookback_snapshot_hours 不可為負")
         object.__setattr__(self, "lookback_snapshot_hours", hours)
-        if self.snapshot_kde_grid_cell_count < 8:
-            raise FootprintError("snapshot_kde_grid_cell_count 太小")
-        if self.snapshot_minimum_point_count < 3:
-            raise FootprintError("snapshot_minimum_point_count 必須至少為 3")
+        if self.snapshot_smoothing_km < 0.0:
+            raise FootprintError("snapshot_smoothing_km 不可為負（0 表示不平滑）")
+        if self.snapshot_minimum_particle_count < 1:
+            raise FootprintError("snapshot_minimum_particle_count 必須為正整數")
+        if not (0.0 < self.land_mask_min_sea_fraction <= 1.0):
+            raise FootprintError("land_mask_min_sea_fraction 必須介於 0（不含）與 1 之間")
         if self.arc_bin_km <= 0.0:
             raise FootprintError("arc_bin_km 必須為正")
         if self.noise_floor_repeats < 1:
@@ -163,10 +172,9 @@ class FootprintConfig:
             "lut_cell_m": self.lut_cell_m,
             "hdr_levels": list(self.hdr_levels),
             "lookback_snapshot_hours": list(self.lookback_snapshot_hours),
-            "snapshot_kde_grid_cell_count": self.snapshot_kde_grid_cell_count,
-            "snapshot_kde_padding_fraction": self.snapshot_kde_padding_fraction,
-            "snapshot_minimum_point_count": self.snapshot_minimum_point_count,
-            "outside_mass_warning_fraction": self.outside_mass_warning_fraction,
+            "snapshot_smoothing_km": self.snapshot_smoothing_km,
+            "snapshot_minimum_particle_count": self.snapshot_minimum_particle_count,
+            "land_mask_min_sea_fraction": self.land_mask_min_sea_fraction,
             "arc_bin_km": self.arc_bin_km,
             "noise_floor_repeats": self.noise_floor_repeats,
             "noise_floor_seed": self.noise_floor_seed,
@@ -260,33 +268,37 @@ def make_grid(
 
 
 def compute_hdr(hours: np.ndarray, area_km2: np.ndarray, levels: Sequence[float]) -> list[dict[str, Any]]:
-    """由停留時數與網格面積求 HDR。
+    """由停留時數（或其他非負權重）與網格面積求 HDR。
 
-    依密度（停留時數 ÷ 面積）由高到低累加網格，累積停留時數首次不小於
-    ``level × 總時數`` 時停止（以整數時數比較，避免浮點誤差）。回傳每個等級一筆
+    依密度（權重 ÷ 面積）由高到低累加網格，累積權重首次不小於 ``level × 總權重`` 時停止。
+    權重為整數時以整數比較（避免浮點誤差）；為浮點數（例如平滑後的快照）時目標值乘上
+    ``1 - 1e-12`` 容差。回傳每個等級一筆
     ``{"level", "density_threshold_fraction_per_km2", "area_km2", "cell_count",
-    "achieved_fraction", "cell_indices"}``。總時數為 0 時回傳空清單。
+    "achieved_fraction", "cell_indices"}``。總權重為 0 時回傳空清單。
     """
 
-    hours = np.asarray(hours, dtype=np.int64)
+    weights = np.asarray(hours)
+    is_int = weights.dtype.kind in "iu"
+    weights = weights.astype(np.int64 if is_int else np.float64)
     area = np.asarray(area_km2, dtype=np.float64)
-    total = int(hours.sum())
+    total = weights.sum()
     if total <= 0:
         return []
-    positive = np.flatnonzero(hours > 0)
-    density = hours[positive] / area[positive]
+    positive = np.flatnonzero(weights > 0)
+    density = weights[positive] / area[positive]
     order = positive[np.argsort(-density, kind="stable")]
-    cumulative = np.cumsum(hours[order])
+    cumulative = np.cumsum(weights[order])
     result: list[dict[str, Any]] = []
     for level in levels:
-        k = int(np.searchsorted(cumulative, float(level) * total, side="left")) + 1
+        target = float(level) * total if is_int else float(level) * float(total) * (1.0 - 1e-12)
+        k = int(np.searchsorted(cumulative, target, side="left")) + 1
         k = min(k, order.size)
         chosen = order[:k]
         last = chosen[-1]
         result.append(
             {
                 "level": float(level),
-                "density_threshold_fraction_per_km2": float(hours[last] / total / area[last]),
+                "density_threshold_fraction_per_km2": float(weights[last] / total / area[last]),
                 "area_km2": float(area[chosen].sum()),
                 "cell_count": int(k),
                 "achieved_fraction": float(cumulative[k - 1] / total),
@@ -294,6 +306,66 @@ def compute_hdr(hours: np.ndarray, area_km2: np.ndarray, levels: Sequence[float]
             }
         )
     return result
+
+
+def smooth_masked_density(
+    density: np.ndarray, mask: np.ndarray, sigma_cells: tuple[float, float]
+) -> np.ndarray:
+    """海域遮罩下的正規化卷積 ``G*(d·m) / G*m``；遮罩為 0 的格輸出恆為 0。
+
+    ``density`` 與 ``mask`` 形狀為 ``(ny, nx)``；``sigma_cells`` 是 ``(沿緯度方向, 沿經度方向)``
+    的高斯核標準差（單位：格）。兩者皆 0 時不平滑，直接回傳 ``d·m``。遮罩外的密度不會被抹進海域，
+    也不會有質量流失到陸地：``G*m`` 只在海域格上作分母。
+    """
+
+    d = np.asarray(density, dtype=np.float64)
+    m = np.asarray(mask, dtype=bool)
+    if d.shape != m.shape:
+        raise FootprintError("density 與 mask 形狀不一致")
+    dm = np.where(m, d, 0.0)
+    if sigma_cells[0] <= 0.0 and sigma_cells[1] <= 0.0:
+        return dm
+    num = ndimage.gaussian_filter(dm, sigma=sigma_cells, mode="constant", cval=0.0, truncate=3.0)
+    den = ndimage.gaussian_filter(
+        m.astype(np.float64), sigma=sigma_cells, mode="constant", cval=0.0, truncate=3.0
+    )
+    out = np.zeros_like(dm)
+    ok = m & (den > 0.0)
+    out[ok] = num[ok] / den[ok]
+    return out
+
+
+def load_land_lonlat(path: Any) -> tuple[BaseGeometry, dict[str, Any]]:
+    """讀取海岸線 GeoJSON（CRS84 的 Polygon／MultiPolygon），回傳合併後的陸地幾何與來源紀錄。"""
+
+    import hashlib
+    import json
+    from pathlib import Path
+
+    from shapely.geometry import shape
+
+    file = Path(path)
+    raw = file.read_bytes()
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
+        raise FootprintError("海岸線 GeoJSON 必須是 FeatureCollection")
+    geoms = []
+    for index, feature in enumerate(payload.get("features") or []):
+        try:
+            geom = shape(feature["geometry"])
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise FootprintError(f"海岸線 GeoJSON feature[{index}] geometry 無法解析") from exc
+        if geom.geom_type not in ("Polygon", "MultiPolygon") or geom.is_empty:
+            raise FootprintError(f"海岸線 GeoJSON feature[{index}] 必須是非空 Polygon／MultiPolygon")
+        geoms.append(shapely.make_valid(geom) if not geom.is_valid else geom)
+    if not geoms:
+        raise FootprintError("海岸線 GeoJSON features 不得為空")
+    land = shapely.union_all(geoms)
+    return land, {
+        "file_name": file.name,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "feature_count": len(geoms),
+    }
 
 
 def total_variation_distance(hours_a: np.ndarray, hours_b: np.ndarray) -> float | None:
@@ -364,8 +436,9 @@ class _SiteState:
     hours_vm: np.ndarray
     hours_unit: np.ndarray
     sens_hours: dict[float, np.ndarray]
-    snapshot_points: dict[int, list[np.ndarray]] = field(default_factory=dict)
+    snapshot_hist: dict[int, np.ndarray] = field(default_factory=dict)
     snapshot_active: dict[int, int] = field(default_factory=dict)
+    snapshot_outside: dict[int, int] = field(default_factory=dict)
     arc_s_m: list[np.ndarray] = field(default_factory=list)
     hours_outside_lut: int = 0
     hours_outside_grid: int = 0
@@ -390,6 +463,8 @@ class FootprintAccumulator:
         specs: 每站的公尺制幾何。
         lonlat_projector: ``(站 id 陣列, x, y) -> (lon, lat)``。
         bathymetry_by_site: 可選，每站水深場（``bathymetry.BathymetryField``）。
+        land_lonlat: 可選，CRS84 的陸地幾何（海岸線）；提供時用於回溯快照的海域遮罩。
+        land_source: 陸地幾何的來源紀錄（檔名、SHA-256），寫進 manifest。
     """
 
     def __init__(
@@ -400,7 +475,11 @@ class FootprintAccumulator:
         specs: Mapping[str, FootprintSiteSpec],
         lonlat_projector: LonLatProjector,
         bathymetry_by_site: Mapping[str, Any] | None = None,
+        land_lonlat: BaseGeometry | None = None,
+        land_source: Mapping[str, Any] | None = None,
     ) -> None:
+        self._land = land_lonlat
+        self._land_source = dict(land_source) if land_source else None
         self._identity = identity
         self._config = config
         self._projector = lonlat_projector
@@ -468,8 +547,11 @@ class FootprintAccumulator:
                 hours_vm=np.zeros(velocities.size * members.size * grid.cell_count, dtype=np.int64),
                 hours_unit=np.zeros(unit_count * grid.cell_count, dtype=np.int64),
                 sens_hours={res: np.zeros(g.cell_count, dtype=np.int64) for res, g in sens.items()},
-                snapshot_points={h: [] for h in config.lookback_snapshot_hours},
+                snapshot_hist={
+                    h: np.zeros(grid.cell_count, dtype=np.int64) for h in config.lookback_snapshot_hours
+                },
                 snapshot_active={h: 0 for h in config.lookback_snapshot_hours},
+                snapshot_outside={h: 0 for h in config.lookback_snapshot_hours},
             )
 
     # -- 建構輔助 ---------------------------------------------------------
@@ -573,7 +655,13 @@ class FootprintAccumulator:
             sel = status[h] == 0
             count = int(np.count_nonzero(sel))
             if count:
-                state.snapshot_points[h].append(np.column_stack((tx[h][sel], ty[h][sel])))
+                xs, ys = tx[h][sel], ty[h][sel]
+                if not (np.all(np.isfinite(xs)) and np.all(np.isfinite(ys))):
+                    raise FootprintError(f"{state.site_id}：快照 {h} 小時 status==0 的樣本含非有限座標")
+                snap_cell, _ = state.lut.lookup(xs, ys, state.grid.resolution_deg)
+                inside = snap_cell >= 0
+                state.snapshot_hist[h] += np.bincount(snap_cell[inside], minlength=state.grid.cell_count)
+                state.snapshot_outside[h] += int(np.count_nonzero(~inside))
                 state.snapshot_active[h] += count
 
         crossed = final_status == NATIVE_STATUS_LEFT_FLOW_DOMAIN
@@ -606,6 +694,8 @@ class FootprintAccumulator:
             "edge": [],
             "geometry": [],
             "snapshot": [],
+            "snapshot_density": [],
+            "sea_mask": [],
         }
         summary_rows: list[dict[str, Any]] = []
         manifest_sites: dict[str, Any] = {}
@@ -633,7 +723,9 @@ class FootprintAccumulator:
             "residence_density_by_site_member_half": _residence_half_table(tables_rows["residence_half"]),
             "residence_hdr_by_site": _hdr_table(tables_rows["hdr"]),
             "footprint_grid_by_site": pa.Table.from_pylist(tables_rows["grid"]),
-            "lookback_snapshot_kde_by_site": _snapshot_table(tables_rows["snapshot"]),
+            "lookback_snapshot_by_site": _snapshot_table(tables_rows["snapshot"]),
+            "lookback_snapshot_density_by_site": _snapshot_density_table(tables_rows["snapshot_density"]),
+            "footprint_sea_mask_by_site": _sea_mask_table(tables_rows["sea_mask"]),
             "boundary_departure_along_arc_by_site": _arc_table(tables_rows["arc"]),
             "boundary_edge_intervals_by_site": _edge_table(tables_rows["edge"]),
             "footprint_geometry_by_site": _geometry_table(tables_rows["geometry"]),
@@ -644,6 +736,14 @@ class FootprintAccumulator:
                 "正規化＝網格停留時數÷該站總停留時數，密度＝正規化值÷網格面積（km²）；"
                 "HDR＝依密度由高到低累加至 50／75／90% 停留時數的最小面積網格集合。"
             ),
+            "snapshot_definition_zh": (
+                "回溯快照＝該回溯時刻仍在漂流（status==0）的粒子位置，累加到與停留時數密度相同的網格"
+                "（整數計數、面積加權），分母是該時刻仍在漂流的粒子數；可選的平滑為海域遮罩下的正規化卷積"
+                "G*(d·m)/G*m（高斯核，寬度以公里指定），平滑後依總質量重新正規化；"
+                "陸地與 flow domain 外的格密度恆為 0；HDR 算法與停留時數密度相同；"
+                "仍在漂流粒子數低於門檻時不出密度。"
+            ),
+            "sea_mask_source": self._land_source,
             "arrival_sample_included": bool(cfg.count_arrival_sample),
             "kde_by_site_note_zh": KDE_NOTE_ZH,
             "config": cfg.to_manifest_dict(),
@@ -826,7 +926,7 @@ class FootprintAccumulator:
                 )
 
         # 回溯快照。
-        snapshot_info = self._finalize_snapshots(state, pp, rows_out["snapshot"], lon_c, warnings)
+        snapshot_info, sea_info = self._finalize_snapshots(state, rows_out, hours_all, area, warnings)
 
         # 邊界弧長分布。
         arc_info = self._finalize_arc(state, rows_out["arc"], rows_out["edge"], rows_out["geometry"])
@@ -881,7 +981,8 @@ class FootprintAccumulator:
         for h in cfg.lookback_snapshot_hours:
             info = snapshot_info[h]
             summary[f"active_fraction_{h}h"] = info["active_fraction"]
-            summary[f"kde_outside_domain_mass_fraction_{h}h"] = info["outside_mass_fraction"]
+            summary[f"active_particle_count_{h}h"] = info["active_particle_count"]
+            summary[f"snapshot_hdr50_area_km2_{h}h"] = info["hdr_area_km2"].get("0.5")
         summary.update(
             {
                 "member_half_tvd": half_tvd,
@@ -917,44 +1018,141 @@ class FootprintAccumulator:
             },
             "arrival_unit_count": state.unit_count,
             "snapshots": {str(h): snapshot_info[h] for h in cfg.lookback_snapshot_hours},
+            "sea_mask": sea_info,
             "boundary_departure": arc_info,
             "bathymetry_available": bathy is not None,
         }
         return {"summary": summary, "manifest": manifest}
 
+    def _domain_lonlat_polygon(self, state: _SiteState) -> BaseGeometry:
+        """flow domain（公尺制）投影到經緯度後的多邊形（含內環）。"""
+
+        site = state.site_id
+
+        def project(coords: np.ndarray) -> np.ndarray:
+            lon, lat = self._projector(np.full(coords.shape[0], site), coords[:, 0], coords[:, 1])
+            return np.column_stack((lon, lat))
+
+        domain = state.spec.flow_domain
+        polys = list(domain.geoms) if hasattr(domain, "geoms") else [domain]
+        out = []
+        for poly in polys:
+            shell = project(np.asarray(poly.exterior.coords, dtype=np.float64))
+            holes = [project(np.asarray(r.coords, dtype=np.float64)) for r in poly.interiors]
+            out.append(shapely.Polygon(shell, holes))
+        geom = shapely.union_all(out)
+        return shapely.make_valid(geom) if not geom.is_valid else geom
+
+    def _sea_mask(
+        self, state: _SiteState, observed: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        """回傳 ``(海域遮罩, 海域面積占比, 統計)``，陣列長度為網格格數。
+
+        海域＝flow domain 內、且扣掉陸地（海岸線）之後；海域面積占比不小於
+        ``land_mask_min_sea_fraction`` 的格為海域格。曾有粒子出現的格（``observed``）必為海域，
+        避免海岸邊被 200 m 查表量化到相鄰陸地格的粒子質量被遮罩吃掉。
+        """
+
+        cfg = self._config
+        grid = state.grid
+        n = grid.cell_count
+        idx = np.arange(n)
+        ix, iy = idx % grid.nx, idx // grid.nx
+        res = grid.resolution_deg
+        boxes = shapely.box(
+            grid.lon0 + ix * res, grid.lat0 + iy * res, grid.lon0 + (ix + 1) * res, grid.lat0 + (iy + 1) * res
+        )
+        sea = self._domain_lonlat_polygon(state)
+        if self._land is not None:
+            lon_min, lat_min = grid.lon0, grid.lat0
+            clip = shapely.clip_by_rect(
+                self._land,
+                lon_min - res,
+                lat_min - res,
+                lon_min + (grid.nx + 1) * res,
+                lat_min + (grid.ny + 1) * res,
+            )
+            if not clip.is_empty:
+                sea = shapely.difference(sea, clip)
+        fraction = np.zeros(n, dtype=np.float64)
+        if not sea.is_empty:
+            shapely.prepare(sea)
+            full = shapely.contains(sea, boxes)
+            partial = shapely.intersects(sea, boxes) & ~full
+            fraction[full] = 1.0
+            if partial.any():
+                inter = shapely.intersection(boxes[partial], sea)
+                fraction[partial] = shapely.area(inter) / shapely.area(boxes[partial])
+        geometric = fraction >= cfg.land_mask_min_sea_fraction
+        mask = geometric | observed
+        stats = {
+            "min_sea_fraction": cfg.land_mask_min_sea_fraction,
+            "land_source": self._land_source,
+            "cell_count": int(n),
+            "sea_cell_count": int(mask.sum()),
+            "land_or_outside_domain_cell_count": int(n - mask.sum()),
+            "cells_sea_by_observation_only": int((mask & ~geometric).sum()),
+            "cells_partly_land_but_sea": int((mask & (fraction < 1.0)).sum()),
+        }
+        return mask, fraction, stats
+
     def _finalize_snapshots(
         self,
         state: _SiteState,
-        pp: Any,
-        out_rows: list[dict[str, Any]],
-        lon_c: np.ndarray,
+        rows_out: dict[str, list[dict[str, Any]]],
+        hours_all: np.ndarray,
+        area: np.ndarray,
         warnings: list[str],
-    ) -> dict[int, dict[str, Any]]:
-        from .. import aggregation as aggregation_module
-
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
         cfg = self._config
         site = state.site_id
-        x_min, y_min, x_max, y_max = state.spec.flow_domain.bounds
-        pad_x = (x_max - x_min) * cfg.snapshot_kde_padding_fraction
-        pad_y = (y_max - y_min) * cfg.snapshot_kde_padding_fraction
-        n_cells = cfg.snapshot_kde_grid_cell_count
-        x_edges = np.linspace(x_min - pad_x, x_max + pad_x, n_cells + 1)
-        y_edges = np.linspace(y_min - pad_y, y_max + pad_y, n_cells + 1)
-        xc = (x_edges[:-1] + x_edges[1:]) / 2
-        yc = (y_edges[:-1] + y_edges[1:]) / 2
-        xx, yy = np.meshgrid(xc, yc)
-        inside = shapely.contains_xy(state.spec.flow_domain, xx.ravel(), yy.ravel())
-        lon_g, lat_g = self._projector(np.full(xx.size, site), xx.ravel(), yy.ravel())
+        grid = state.grid
+        ncell = grid.cell_count
+        lon_c, lat_c = grid.cell_centers_lonlat()
+
+        observed = hours_all > 0
+        for h in cfg.lookback_snapshot_hours:
+            observed = observed | (state.snapshot_hist[h] > 0)
+        mask, sea_fraction, sea_info = self._sea_mask(state, observed)
+        for cell in range(ncell):
+            rows_out["sea_mask"].append(
+                {
+                    "study_site_id": site,
+                    "cell_ix": int(cell % grid.nx),
+                    "cell_iy": int(cell // grid.nx),
+                    "lon_center_deg": float(lon_c[cell]),
+                    "lat_center_deg": float(lat_c[cell]),
+                    "sea_area_fraction": float(sea_fraction[cell]),
+                    "is_sea_cell": bool(mask[cell]),
+                    "observed_particle": bool(observed[cell]),
+                }
+            )
+
+        # 平滑核：公里 -> 格。緯度方向每格 res°×111.195 km，經度方向再乘 cos(平均緯度)。
+        dy_km = grid.resolution_deg * math.radians(1.0) * EARTH_RADIUS_KM
+        mean_lat = float(lat_c.mean())
+        dx_km = dy_km * math.cos(math.radians(mean_lat))
+        sigma_cells = (cfg.snapshot_smoothing_km / dy_km, cfg.snapshot_smoothing_km / dx_km)
+        sea_info = {
+            **sea_info,
+            "smoothing_sigma_km": cfg.snapshot_smoothing_km,
+            "smoothing_sigma_cells_lat_lon": [sigma_cells[0], sigma_cells[1]],
+        }
 
         info_by_hour: dict[int, dict[str, Any]] = {}
         for h in cfg.lookback_snapshot_hours:
-            chunks = state.snapshot_points[h]
-            points = np.concatenate(chunks, axis=0) if chunks else np.empty((0, 2))
-            if points.shape[0]:
-                order = np.lexsort((points[:, 1], points[:, 0]))
-                points = points[order]
+            counts = state.snapshot_hist[h]
             n_active = int(state.snapshot_active[h])
+            n_outside = int(state.snapshot_outside[h])
+            n_in = int(counts.sum())
+            if n_in + n_outside != n_active:
+                raise FootprintError(
+                    f"{site}：回溯 {h} 小時快照的網格計數 {n_in}＋網格外 {n_outside} 不等於 {n_active}"
+                )
+            if n_outside:
+                warnings.append(f"{site}：回溯 {h} 小時快照有 {n_outside} 顆粒子落在網格範圍外")
             active_fraction = n_active / state.total_particles
+            available = n_active >= cfg.snapshot_minimum_particle_count and n_in > 0
             row: dict[str, Any] = {
                 "study_site_id": site,
                 "snapshot_hours": int(h),
@@ -962,74 +1160,74 @@ class FootprintAccumulator:
                 "site_particle_count": state.total_particles,
                 "active_particle_count": n_active,
                 "active_fraction": active_fraction,
-                "status": pp.KDE_STATUS_INSUFFICIENT_POINTS,
-                "raw_point_count": n_active,
-                "bandwidth_factor": None,
-                "grid_rows": 0,
-                "grid_cols": 0,
-                "x_centers_m": [],
-                "y_centers_m": [],
-                "lon_flat_deg": [],
-                "lat_flat_deg": [],
-                "density_per_m2_flat": [],
-                "cell_probability_flat": [],
-                "hdr_levels": list(cfg.hdr_levels),
-                "hdr_masks_flat": [],
-                "outside_domain_mass_fraction": None,
-                "outside_mass_warning": False,
+                "status": "available" if available else "insufficient_active_particles",
+                "minimum_active_particle_count": cfg.snapshot_minimum_particle_count,
+                "smoothing_sigma_km": cfg.snapshot_smoothing_km,
+                "mass_rescale_factor": None,
+                "hdr50_area_km2": None,
+                "hdr75_area_km2": None,
+                "hdr90_area_km2": None,
+                "particles_outside_grid": n_outside,
             }
             info = {
                 "active_fraction": active_fraction,
                 "active_particle_count": n_active,
                 "status": row["status"],
-                "outside_mass_fraction": None,
-                "outside_mass_warning": False,
+                "minimum_active_particle_count": cfg.snapshot_minimum_particle_count,
+                "mass_rescale_factor": None,
+                "hdr_area_km2": {},
             }
-            if n_active >= cfg.snapshot_minimum_point_count:
-                try:
-                    grid = aggregation_module.conditional_kde_2d(
-                        points,
-                        x_edges_m=x_edges,
-                        y_edges_m=y_edges,
-                        hdr_levels=cfg.hdr_levels,
-                        bandwidth="scott",
+            if available:
+                raw_density = (counts / n_in / area).reshape(grid.ny, grid.nx)
+                smooth = smooth_masked_density(
+                    raw_density, mask.reshape(grid.ny, grid.nx), sigma_cells
+                ).ravel()
+                mass = float((smooth * area).sum())
+                if not mass > 0.0:
+                    raise FootprintError(f"{site}：回溯 {h} 小時快照平滑後總質量為 0")
+                factor = 1.0 / mass
+                fraction = smooth * area * factor
+                density = fraction / area
+                if abs(float(fraction.sum()) - 1.0) > NORMALIZED_SUM_TOLERANCE:
+                    raise FootprintError(
+                        f"{site}：回溯 {h} 小時快照正規化總和 {fraction.sum()!r} 與 1 相差超過容差"
                     )
-                except ValueError:
-                    row["status"] = info["status"] = pp.KDE_STATUS_COLLINEAR_POINTS
-                else:
-                    prob = grid.cell_probability
-                    outside = float(prob.ravel()[~inside].sum())
-                    warn = outside > cfg.outside_mass_warning_fraction
-                    row.update(
-                        status=pp.KDE_STATUS_AVAILABLE,
-                        bandwidth_factor=float(grid.bandwidth_factor),
-                        grid_rows=int(n_cells),
-                        grid_cols=int(n_cells),
-                        x_centers_m=xc.tolist(),
-                        y_centers_m=yc.tolist(),
-                        lon_flat_deg=lon_g.tolist(),
-                        lat_flat_deg=lat_g.tolist(),
-                        density_per_m2_flat=grid.density_per_m2.ravel().tolist(),
-                        cell_probability_flat=prob.ravel().tolist(),
-                        hdr_masks_flat=[
-                            bool(v) for lv in cfg.hdr_levels for v in grid.hdr_masks[lv].ravel().tolist()
-                        ],
-                        outside_domain_mass_fraction=outside,
-                        outside_mass_warning=warn,
+                if np.any(fraction[~mask] != 0.0):
+                    raise FootprintError(f"{site}：回溯 {h} 小時快照在陸地格出現非零密度")
+                row["mass_rescale_factor"] = info["mass_rescale_factor"] = factor
+                for cell in np.flatnonzero(fraction > 0):
+                    rows_out["snapshot_density"].append(
+                        {
+                            "study_site_id": site,
+                            "snapshot_hours": int(h),
+                            "cell_ix": int(cell % grid.nx),
+                            "cell_iy": int(cell // grid.nx),
+                            "lon_center_deg": float(lon_c[cell]),
+                            "lat_center_deg": float(lat_c[cell]),
+                            "cell_area_km2": float(area[cell]),
+                            "particle_count": int(counts[cell]),
+                            "fraction_of_active": float(fraction[cell]),
+                            "density_fraction_per_km2": float(density[cell]),
+                        }
                     )
-                    info.update(
-                        status=pp.KDE_STATUS_AVAILABLE,
-                        outside_mass_fraction=outside,
-                        outside_mass_warning=warn,
+                for hdr in compute_hdr(fraction, area, cfg.hdr_levels):
+                    rows_out["hdr"].append(
+                        {
+                            "study_site_id": site,
+                            "group_kind": GROUP_SNAPSHOT,
+                            "group_value": str(h),
+                            "level": hdr["level"],
+                            "density_threshold_fraction_per_km2": hdr["density_threshold_fraction_per_km2"],
+                            "area_km2": hdr["area_km2"],
+                            "cell_count": hdr["cell_count"],
+                            "achieved_fraction": hdr["achieved_fraction"],
+                        }
                     )
-                    if warn:
-                        warnings.append(
-                            f"{site}：回溯 {h} 小時快照的 KDE 質量有 {outside * 100:.1f}% 落在 flow domain 外"
-                            f"（超過 {cfg.outside_mass_warning_fraction * 100:.0f}%）"
-                        )
-            out_rows.append(row)
+                    row[f"hdr{int(round(hdr['level'] * 100))}_area_km2"] = hdr["area_km2"]
+                    info["hdr_area_km2"][str(hdr["level"])] = hdr["area_km2"]
+            rows_out["snapshot"].append(row)
             info_by_hour[h] = info
-        return info_by_hour
+        return info_by_hour, sea_info
 
     def _finalize_arc(
         self,
@@ -1266,7 +1464,6 @@ def _hdr_table(rows: list[dict[str, Any]]) -> pa.Table:
 
 
 def _snapshot_table(rows: list[dict[str, Any]]) -> pa.Table:
-    lst = pa.list_(pa.float64())
     return _table_from_rows(
         rows,
         [
@@ -1277,20 +1474,47 @@ def _snapshot_table(rows: list[dict[str, Any]]) -> pa.Table:
             ("active_particle_count", pa.int64()),
             ("active_fraction", pa.float64()),
             ("status", pa.string()),
-            ("raw_point_count", pa.int64()),
-            ("bandwidth_factor", pa.float64()),
-            ("grid_rows", pa.int32()),
-            ("grid_cols", pa.int32()),
-            ("x_centers_m", lst),
-            ("y_centers_m", lst),
-            ("lon_flat_deg", lst),
-            ("lat_flat_deg", lst),
-            ("density_per_m2_flat", lst),
-            ("cell_probability_flat", lst),
-            ("hdr_levels", lst),
-            ("hdr_masks_flat", pa.list_(pa.bool_())),
-            ("outside_domain_mass_fraction", pa.float64()),
-            ("outside_mass_warning", pa.bool_()),
+            ("minimum_active_particle_count", pa.int64()),
+            ("smoothing_sigma_km", pa.float64()),
+            ("mass_rescale_factor", pa.float64()),
+            ("hdr50_area_km2", pa.float64()),
+            ("hdr75_area_km2", pa.float64()),
+            ("hdr90_area_km2", pa.float64()),
+            ("particles_outside_grid", pa.int64()),
+        ],
+    )
+
+
+def _snapshot_density_table(rows: list[dict[str, Any]]) -> pa.Table:
+    return _table_from_rows(
+        rows,
+        [
+            ("study_site_id", pa.string()),
+            ("snapshot_hours", pa.int64()),
+            ("cell_ix", pa.int32()),
+            ("cell_iy", pa.int32()),
+            ("lon_center_deg", pa.float64()),
+            ("lat_center_deg", pa.float64()),
+            ("cell_area_km2", pa.float64()),
+            ("particle_count", pa.int64()),
+            ("fraction_of_active", pa.float64()),
+            ("density_fraction_per_km2", pa.float64()),
+        ],
+    )
+
+
+def _sea_mask_table(rows: list[dict[str, Any]]) -> pa.Table:
+    return _table_from_rows(
+        rows,
+        [
+            ("study_site_id", pa.string()),
+            ("cell_ix", pa.int32()),
+            ("cell_iy", pa.int32()),
+            ("lon_center_deg", pa.float64()),
+            ("lat_center_deg", pa.float64()),
+            ("sea_area_fraction", pa.float64()),
+            ("is_sea_cell", pa.bool_()),
+            ("observed_particle", pa.bool_()),
         ],
     )
 

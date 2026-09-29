@@ -297,9 +297,10 @@ WP-38 在 :meth:`PostprocessAccumulator.add_batch` 內另外以串流方式累�
   值（每 km² 佔該站總停留時數的比例）。終止後凍結的位置不計入；到達時刻樣本
   （軌跡第 0 筆）計入。
 - ``residence_hdr_by_site.parquet``：50／75／90% 停留時數 HDR 的密度門檻與面積。
-- ``lookback_snapshot_kde_by_site.parquet``：回溯 72／168／336／720 小時時仍在漂流
-  的粒子位置，以既有 ``conditional_kde_2d`` 估計，附仍在漂流的比例與 KDE 質量落在
-  flow domain 外的比例。
+- ``lookback_snapshot_by_site.parquet``、``lookback_snapshot_density_by_site.parquet``：
+  回溯 72／168／336／720 小時時仍在漂流的粒子位置，累加到與停留時數密度相同的網格
+  （整數計數、面積加權；可選的海域遮罩正規化卷積平滑），附仍在漂流的比例、HDR 面積與
+  粒子數門檻判定；``footprint_sea_mask_by_site.parquet`` 是所用的海域遮罩。
 - ``boundary_departure_along_arc_by_site.parquet``：終止於開放邊界的粒子沿邊界弧長
   （km，一維）的直方圖與累積分布，另附 ``boundary_edge_intervals_by_site.parquet``
   標出北東南西各邊的弧長區間。
@@ -387,6 +388,7 @@ from .footprint import (
     FootprintAccumulator,
     FootprintConfig,
     FootprintSiteSpec,
+    load_land_lonlat,
     summary_table,
 )
 from .particle_input import ParticleIdentityTable
@@ -394,6 +396,7 @@ from .particle_input import ParticleIdentityTable
 __all__ = [
     "FootprintConfig",
     "FootprintSiteSpec",
+    "load_land_lonlat",
     "PostprocessError",
     "NON_CROSSING_STATUS_CATEGORY_ZH",
     "DEPARTURE_TABLE_SCHEMA",
@@ -1839,6 +1842,8 @@ class PostprocessAccumulator:
         runtime_bed_no_deposition: Mapping[str, Any] | None = None,
         footprint_specs: Mapping[str, FootprintSiteSpec] | None = None,
         bathymetry_by_site: Mapping[str, Any] | None = None,
+        footprint_land_lonlat: Any = None,
+        footprint_land_source: Mapping[str, Any] | None = None,
     ) -> None:
         self._identity_table = identity_table
         self._config = config if config is not None else PostprocessConfig()
@@ -1962,6 +1967,8 @@ class PostprocessAccumulator:
                 specs=specs,
                 lonlat_projector=self._lonlat_projector,
                 bathymetry_by_site=bathymetry_by_site,
+                land_lonlat=footprint_land_lonlat,
+                land_source=footprint_land_source,
             )
 
         departure_path = self._output_dir / "departures.parquet"

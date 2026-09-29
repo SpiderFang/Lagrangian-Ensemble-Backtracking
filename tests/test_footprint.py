@@ -102,13 +102,17 @@ SPEC = FootprintSiteSpec(flow_domain=DOMAIN, flow_open_boundary=OPEN_BOUNDARY)
 RECEPTORS = ((500.0, 500.0), (1000.0, 700.0))  # 同一個 0.02 度網格內（離格線超過查表格距）
 
 
-def make_accumulator(identity, *, config: FootprintConfig | None = None, bathymetry_by_site=None):
+def make_accumulator(
+    identity, *, config: FootprintConfig | None = None, bathymetry_by_site=None, land_lonlat=None
+):
     return FootprintAccumulator(
         identity,
         config=config or FootprintConfig(),
         specs={SITE: SPEC},
         lonlat_projector=fx.linear_projector,
         bathymetry_by_site=bathymetry_by_site,
+        land_lonlat=land_lonlat,
+        land_source={"file_name": "synthetic"} if land_lonlat is not None else None,
     )
 
 
@@ -158,8 +162,12 @@ def walk_results(
     return identity, results
 
 
-def run_accumulator(identity, batches, *, config: FootprintConfig | None = None, bathymetry_by_site=None):
-    acc = make_accumulator(identity, config=config, bathymetry_by_site=bathymetry_by_site)
+def run_accumulator(
+    identity, batches, *, config: FootprintConfig | None = None, bathymetry_by_site=None, land_lonlat=None
+):
+    acc = make_accumulator(
+        identity, config=config, bathymetry_by_site=bathymetry_by_site, land_lonlat=land_lonlat
+    )
     for key, rows, result in batches:
         acc.add_batch(key, rows, result)
     return finalize(acc)
@@ -457,7 +465,7 @@ def _assert_products_identical(a, b):
 
 def test_chunked_accumulation_is_bit_identical_to_one_shot():
     identity, results = walk_results(n_time=90)
-    cfg = FootprintConfig(lookback_snapshot_hours=(24, 72), snapshot_minimum_point_count=10)
+    cfg = FootprintConfig(lookback_snapshot_hours=(24, 72), snapshot_minimum_particle_count=10)
     per_unit = run_accumulator(identity, results, config=cfg)
 
     rows_all, big = concat_results(identity, results)
@@ -570,10 +578,18 @@ def test_arc_without_open_boundary_is_marked_unavailable():
 # ── 回溯快照 ─────────────────────────────────────────────────────────────────
 
 
+def _snap_status(products) -> dict[int, dict[str, Any]]:
+    return {r["snapshot_hours"]: r for r in products.tables["lookback_snapshot_by_site"].to_pylist()}
+
+
+def _snap_cells(products, hours: int) -> list[dict[str, Any]]:
+    return table_rows(products, "lookback_snapshot_density_by_site", snapshot_hours=hours)
+
+
 def test_snapshot_active_fraction_including_short_units():
     identity, units = walk_world(members=4, arrivals=2)
     assert len(units) == 4  # 2 到達 × 2 沉降速度
-    cfg = FootprintConfig(lookback_snapshot_hours=(24, 72), snapshot_minimum_point_count=3)
+    cfg = FootprintConfig(lookback_snapshot_hours=(24, 72), snapshot_minimum_particle_count=3)
     rng = np.random.default_rng(3)
     batches = []
     for i, (key, rows) in enumerate(units):
@@ -587,7 +603,7 @@ def test_snapshot_active_fraction_including_short_units():
         )
     products = run_accumulator(identity, batches, config=cfg)
     total = len(identity)
-    snaps = {r["snapshot_hours"]: r for r in products.tables["lookback_snapshot_kde_by_site"].to_pylist()}
+    snaps = _snap_status(products)
     # 24 小時：單元 0 剩一半（4）、其餘三個單元各 8 顆全在漂流。
     assert total == 32
     assert snaps[24]["active_particle_count"] == 4 + 8 * 3
@@ -598,53 +614,225 @@ def test_snapshot_active_fraction_including_short_units():
     assert snaps[72]["active_fraction"] == pytest.approx(12 / total)
     s = products.summary_rows[0]
     assert s["active_fraction_72h"] == pytest.approx(12 / total)
-    assert snaps[24]["status"] == pp.KDE_STATUS_AVAILABLE
-    assert sum(snaps[24]["cell_probability_flat"]) == pytest.approx(1.0, abs=1e-6)
+    assert snaps[24]["status"] == "available"
+    # 分母是該時刻仍在漂流的粒子數：質量守恆，總和為 1；原始計數總和等於仍在漂流粒子數。
+    cells = _snap_cells(products, 24)
+    assert sum(r["fraction_of_active"] for r in cells) == pytest.approx(1.0, abs=1e-9)
+    assert sum(r["particle_count"] for r in cells) <= 28  # 平滑後才有計數為 0 的格
+    assert sum(r["particle_count"] for r in cells) == 28
 
 
-def test_snapshot_insufficient_points_uses_existing_status_code():
+def test_snapshot_below_particle_threshold_draws_no_density():
     identity, results = walk_results(n_time=90)
-    cfg = FootprintConfig(lookback_snapshot_hours=(24, 720), snapshot_minimum_point_count=30)
+    cfg = FootprintConfig(lookback_snapshot_hours=(24, 720), snapshot_minimum_particle_count=30)
     products = run_accumulator(identity, results, config=cfg)
-    snaps = {r["snapshot_hours"]: r for r in products.tables["lookback_snapshot_kde_by_site"].to_pylist()}
+    snaps = _snap_status(products)
     assert snaps[720]["active_particle_count"] == 0
-    assert snaps[720]["status"] == pp.KDE_STATUS_INSUFFICIENT_POINTS
+    assert snaps[720]["status"] == "insufficient_active_particles"
     assert snaps[720]["active_fraction"] == 0.0
-    assert snaps[720]["cell_probability_flat"] == []
+    assert _snap_cells(products, 720) == []
+    assert snaps[720]["hdr50_area_km2"] is None
+    assert products.summary_rows[0]["snapshot_hdr50_area_km2_720h"] is None
+    # 門檻本身寫進表與 manifest。
+    assert snaps[24]["minimum_active_particle_count"] == 30
+    assert products.manifest["config"]["snapshot_minimum_particle_count"] == 30
 
 
-def test_snapshot_outside_domain_mass_warning():
-    identity, units = walk_world(members=8, arrivals=1)
-    cfg = FootprintConfig(lookback_snapshot_hours=(1,), snapshot_minimum_point_count=10)
-    rng = np.random.default_rng(5)
-    batches = []
-    for key, rows in units:
-        n = rows.size
-        x = np.repeat(identity.x0_m[rows][None, :], 3, axis=0)
-        y = np.repeat(identity.y0_m[rows][None, :], 3, axis=0)
-        # 第 1 小時起位置在 flow domain 東側外、但仍在快照 KDE 網格的填充範圍內。
-        x[1:] = 60e3 + rng.uniform(0, 8e3, size=(2, n))
-        y[1:] = rng.uniform(-8e3, 8e3, size=(2, n))
-        batches.append((key, rows, fx.make_result(identity, rows, x, y, np.zeros((3, n), dtype=np.int32))))
-    products = run_accumulator(identity, batches, config=cfg)
-    snap = products.tables["lookback_snapshot_kde_by_site"].to_pylist()[0]
-    assert snap["status"] == pp.KDE_STATUS_AVAILABLE
-    assert snap["outside_domain_mass_fraction"] > 0.10
-    assert snap["outside_mass_warning"] is True
-    assert any("flow domain 外" in w for w in products.manifest["warnings"])
-    assert (
-        products.summary_rows[0]["kde_outside_domain_mass_fraction_1h"]
-        == snap["outside_domain_mass_fraction"]
-    )
+def test_snapshot_threshold_is_inclusive_and_configurable():
+    identity, results = walk_results(n_time=90)
+    base = FootprintConfig(lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=1)
+    n_active = _snap_status(run_accumulator(identity, results, config=base))[24]["active_particle_count"]
+    assert n_active > 10
+    at = FootprintConfig(lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=n_active)
+    above = FootprintConfig(lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=n_active + 1)
+    p_at = run_accumulator(identity, results, config=at)
+    p_above = run_accumulator(identity, results, config=above)
+    assert _snap_status(p_at)[24]["status"] == "available" and _snap_cells(p_at, 24)
+    assert _snap_status(p_above)[24]["status"] == "insufficient_active_particles"
+    assert _snap_cells(p_above, 24) == []
+    # 預設門檻是 200。
+    assert FootprintConfig().snapshot_minimum_particle_count == 200
 
 
-def test_snapshot_inside_domain_has_no_warning():
+def test_snapshot_shares_grid_and_area_weights_with_residence():
     identity, results = walk_results(n_time=90, step_m=800.0)
-    cfg = FootprintConfig(lookback_snapshot_hours=(24,), snapshot_minimum_point_count=10)
+    cfg = FootprintConfig(
+        lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=10, snapshot_smoothing_km=0.0
+    )
     products = run_accumulator(identity, results, config=cfg)
-    snap = products.tables["lookback_snapshot_kde_by_site"].to_pylist()[0]
-    assert snap["outside_mass_warning"] is False
-    assert snap["outside_domain_mass_fraction"] < 0.10
+    grid = products.manifest["sites"][SITE]["grid"]
+    residence = {
+        (r["cell_ix"], r["cell_iy"]): r
+        for r in table_rows(products, "residence_density_by_site", group_kind="all")
+    }
+    cells = _snap_cells(products, 24)
+    assert cells
+    for r in cells:
+        assert 0 <= r["cell_ix"] < grid["nx"] and 0 <= r["cell_iy"] < grid["ny"]
+        # 快照的粒子位置也是停留時數的一部分，因此每個快照格都在停留時數表裡，面積與座標相同。
+        ref = residence[(r["cell_ix"], r["cell_iy"])]
+        assert r["cell_area_km2"] == ref["cell_area_km2"]
+        assert r["lon_center_deg"] == ref["lon_center_deg"] and r["lat_center_deg"] == ref["lat_center_deg"]
+        # 密度＝比例 ÷ 面積（面積加權）。
+        assert r["density_fraction_per_km2"] == pytest.approx(r["fraction_of_active"] / r["cell_area_km2"])
+
+
+def _land_box(lon_min, lat_min, lon_max, lat_max):
+    return box(lon_min, lat_min, lon_max, lat_max)
+
+
+def test_snapshot_density_is_zero_on_land_and_outside_domain_even_when_smoothed():
+    identity, results = walk_results(n_time=90, step_m=500.0)
+    east_x = 25e3  # 陸地位於受體東側 25 km 以外，粒子走不到
+    lon_w, lat_s = fx.linear_projector(np.array(["x"]), np.array([east_x]), np.array([-40e3]))
+    lon_e, lat_n = fx.linear_projector(np.array(["x"]), np.array([60e3]), np.array([40e3]))
+    land = _land_box(float(lon_w[0]), float(lat_s[0]), float(lon_e[0]), float(lat_n[0]))
+    for smoothing in (0.0, 3.0, 8.0):
+        cfg = FootprintConfig(
+            lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=10, snapshot_smoothing_km=smoothing
+        )
+        products = run_accumulator(identity, results, config=cfg, land_lonlat=land)
+        mask = {
+            (r["cell_ix"], r["cell_iy"]): r for r in products.tables["footprint_sea_mask_by_site"].to_pylist()
+        }
+        cells = _snap_cells(products, 24)
+        assert cells
+        assert sum(r["fraction_of_active"] for r in cells) == pytest.approx(1.0, abs=1e-9)
+        for r in cells:
+            m = mask[(r["cell_ix"], r["cell_iy"])]
+            assert m["is_sea_cell"], (smoothing, r)
+            assert r["lon_center_deg"] < float(lon_w[0]) + 0.02
+        # 陸地與 flow domain 外的格全部標成非海域，且沒有任何密度列。
+        land_cells = [k for k, m in mask.items() if not m["is_sea_cell"]]
+        assert land_cells
+        with_density = {(r["cell_ix"], r["cell_iy"]) for r in cells}
+        assert not (set(land_cells) & with_density)
+        assert products.manifest["sites"][SITE]["sea_mask"]["land_or_outside_domain_cell_count"] == len(
+            land_cells
+        )
+
+
+def test_snapshot_smoothing_conserves_total_mass_and_spreads_only_over_sea():
+    identity, results = walk_results(n_time=90, step_m=500.0)
+    raw = FootprintConfig(
+        lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=10, snapshot_smoothing_km=0.0
+    )
+    smooth = FootprintConfig(
+        lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=10, snapshot_smoothing_km=6.0
+    )
+    p_raw = run_accumulator(identity, results, config=raw)
+    p_smooth = run_accumulator(identity, results, config=smooth)
+    c_raw, c_smooth = _snap_cells(p_raw, 24), _snap_cells(p_smooth, 24)
+    assert sum(r["fraction_of_active"] for r in c_raw) == pytest.approx(1.0, abs=1e-9)
+    assert sum(r["fraction_of_active"] for r in c_smooth) == pytest.approx(1.0, abs=1e-9)
+    assert len(c_smooth) > len(c_raw)  # 平滑把質量攤到相鄰格
+    # 不平滑時，比例就是原始計數 ÷ 仍在漂流粒子數。
+    n_active = _snap_status(p_raw)[24]["active_particle_count"]
+    for r in c_raw:
+        assert r["fraction_of_active"] == pytest.approx(r["particle_count"] / n_active, abs=1e-12)
+    assert _snap_status(p_raw)[24]["mass_rescale_factor"] == pytest.approx(1.0, abs=1e-9)
+    assert p_smooth.manifest["sites"][SITE]["sea_mask"]["smoothing_sigma_km"] == 6.0
+
+
+def test_smooth_masked_density_is_normalized_convolution():
+    ny, nx = 12, 15
+    mask = np.ones((ny, nx), dtype=bool)
+    mask[:, 9:] = False  # 東側是陸地
+    mask[3:6, 2:4] = False  # 一座小島
+    # 常數場經過正規化卷積仍是常數（陸地不會把海域的值拉低）。
+    const = np.full((ny, nx), 2.0)
+    out = footprint.smooth_masked_density(const, mask, (1.0, 1.0))
+    assert np.allclose(out[mask], 2.0)
+    assert np.all(out[~mask] == 0.0)
+    # 質量只來自海域，陸地格恆為 0；集中在海岸邊的密度不會外洩到陸地。
+    spike = np.zeros((ny, nx))
+    spike[6, 8] = 5.0
+    out2 = footprint.smooth_masked_density(spike, mask, (1.5, 1.5))
+    assert np.all(out2[~mask] == 0.0)
+    assert out2[mask].sum() > 0
+    assert out2[6, 7] > 0 and out2[6, 8] > 0
+    # 遮罩外的輸入值被忽略。
+    dirty = spike.copy()
+    dirty[:, 12] = 100.0
+    assert np.array_equal(footprint.smooth_masked_density(dirty, mask, (1.5, 1.5)), out2)
+    # sigma 為 0 時不平滑。
+    assert np.array_equal(footprint.smooth_masked_density(spike, mask, (0.0, 0.0)), spike * mask)
+    with pytest.raises(FootprintError):
+        footprint.smooth_masked_density(spike, mask[:-1], (1.0, 1.0))
+
+
+def test_sea_mask_marks_full_land_cells_and_keeps_partly_land_small_islands():
+    identity, results = walk_results(n_time=90, step_m=500.0)
+    res = 0.02
+    # 大島：對齊 0.04 度網格、覆蓋整整兩個格（西側 20 km 外，粒子走不到）。
+    lon_a = math.floor((fx.LON0 - 0.25) / 0.04) * 0.04
+    lat_a = math.floor((fx.LAT0 + 0.10) / 0.04) * 0.04
+    big = _land_box(lon_a, lat_a, lon_a + 2 * res, lat_a + res)
+    # 小島：面積遠小於半個格，位在另一個沒有粒子的格內。
+    lon_b = math.floor((fx.LON0 - 0.25) / 0.04) * 0.04 + 0.08
+    small = _land_box(lon_b + 0.006, lat_a + 0.006, lon_b + 0.010, lat_a + 0.010)
+    cfg = FootprintConfig(lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=10)
+    products = run_accumulator(identity, results, config=cfg, land_lonlat=big.union(small))
+    mask = {
+        (r["lon_center_deg"], r["lat_center_deg"]): r
+        for r in products.tables["footprint_sea_mask_by_site"].to_pylist()
+    }
+
+    def cell_at(lon, lat):
+        return min(
+            mask.values(), key=lambda r: abs(r["lon_center_deg"] - lon) + abs(r["lat_center_deg"] - lat)
+        )
+
+    for dlon in (0.5 * res, 1.5 * res):
+        c = cell_at(lon_a + dlon, lat_a + 0.5 * res)
+        assert c["sea_area_fraction"] == pytest.approx(0.0, abs=1e-9)
+        assert c["is_sea_cell"] is False
+    c_small = cell_at(lon_b + 0.5 * res, lat_a + 0.5 * res)
+    assert 0.9 < c_small["sea_area_fraction"] < 1.0  # 有陸地，但不到半個格
+    assert c_small["is_sea_cell"] is True
+    stats = products.manifest["sites"][SITE]["sea_mask"]
+    assert stats["cells_partly_land_but_sea"] >= 1
+
+
+def test_sea_cells_with_observed_particles_are_never_masked():
+    # 陸地多邊形蓋住整個粒子活動範圍：有粒子出現的格仍必須是海域，質量不得被遮罩吃掉。
+    identity, results = walk_results(n_time=90, step_m=500.0)
+    land = _land_box(fx.LON0 - 0.3, fx.LAT0 - 0.3, fx.LON0 + 0.3, fx.LAT0 + 0.3)
+    cfg = FootprintConfig(lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=10)
+    products = run_accumulator(identity, results, config=cfg, land_lonlat=land)
+    stats = products.manifest["sites"][SITE]["sea_mask"]
+    assert stats["cells_sea_by_observation_only"] > 0
+    cells = _snap_cells(products, 24)
+    assert sum(r["fraction_of_active"] for r in cells) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_snapshot_hdr_uses_area_weighted_density_like_residence():
+    identity, results = walk_results(n_time=90, step_m=800.0)
+    cfg = FootprintConfig(
+        lookback_snapshot_hours=(24,), snapshot_minimum_particle_count=10, snapshot_smoothing_km=0.0
+    )
+    products = run_accumulator(identity, results, config=cfg)
+    cells = _snap_cells(products, 24)
+    weights = np.asarray([r["fraction_of_active"] for r in cells])
+    area = np.asarray([r["cell_area_km2"] for r in cells])
+    expected = footprint.compute_hdr(weights, area, cfg.hdr_levels)
+    rows = table_rows(products, "residence_hdr_by_site", group_kind="snapshot", group_value="24")
+    assert [r["level"] for r in rows] == [0.5, 0.75, 0.9]
+    for row, hdr in zip(rows, expected, strict=True):
+        assert row["area_km2"] == pytest.approx(hdr["area_km2"])
+        assert row["achieved_fraction"] >= row["level"] - 1e-9
+    status = _snap_status(products)[24]
+    assert status["hdr50_area_km2"] < status["hdr75_area_km2"] <= status["hdr90_area_km2"]
+
+
+def test_snapshot_config_validation():
+    with pytest.raises(FootprintError):
+        FootprintConfig(snapshot_smoothing_km=-1.0)
+    with pytest.raises(FootprintError):
+        FootprintConfig(snapshot_minimum_particle_count=0)
+    with pytest.raises(FootprintError):
+        FootprintConfig(land_mask_min_sea_fraction=0.0)
+    assert FootprintConfig().snapshot_smoothing_km == 2.0
 
 
 # ── 水深 ─────────────────────────────────────────────────────────────────────

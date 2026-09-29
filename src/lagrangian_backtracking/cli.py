@@ -1881,6 +1881,27 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
         "--footprint-arc-bin-km", type=float, default=10.0, help="WP-38：沿開放邊界弧長直方圖的組距（km）"
     )
     parser.add_argument(
+        "--footprint-land-geojson",
+        type=Path,
+        default=None,
+        help=(
+            "WP-38：陸地來源（CRS84 的海岸線 GeoJSON，與 native-figures --coastline 同一檔）；"
+            "用於回溯快照的海域遮罩，--with-footprint 時必須提供"
+        ),
+    )
+    parser.add_argument(
+        "--footprint-snapshot-smoothing-km",
+        type=float,
+        default=2.0,
+        help="WP-38：回溯快照的海域遮罩正規化卷積高斯核寬度（km，約一個網格；0＝不平滑），預設 2.0",
+    )
+    parser.add_argument(
+        "--footprint-snapshot-min-particles",
+        type=int,
+        default=200,
+        help="WP-38：回溯快照每一時刻仍在漂流的粒子數低於此值時不出密度，預設 200",
+    )
+    parser.add_argument(
         "--bathymetry-grid-root",
         type=Path,
         default=None,
@@ -2016,6 +2037,8 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
 
     footprint_config = None
     bathymetry_by_site = None
+    land_lonlat = None
+    land_source = None
     if args.with_footprint:
         if config is None or boundary_geometries is None:
             raise ValueError("--with-footprint 必須同時提供 --config 與 --with-boundary-segments")
@@ -2024,7 +2047,12 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
             padding_deg=args.footprint_padding_deg,
             lookback_snapshot_hours=tuple(args.footprint_lookback_hours),
             arc_bin_km=args.footprint_arc_bin_km,
+            snapshot_smoothing_km=args.footprint_snapshot_smoothing_km,
+            snapshot_minimum_particle_count=args.footprint_snapshot_min_particles,
         )
+        if args.footprint_land_geojson is None:
+            raise ValueError("--with-footprint 必須提供 --footprint-land-geojson（回溯快照的海域遮罩）")
+        land_lonlat, land_source = native_postprocess.load_land_lonlat(args.footprint_land_geojson)
         if (args.bathymetry_grid_root is None) != (args.region_flow_domain_map is None):
             raise ValueError("--bathymetry-grid-root 與 --region-flow-domain-map 必須同時提供")
         if args.bathymetry_grid_root is not None:
@@ -2073,6 +2101,8 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         runtime_physics_case=runtime_physics_case,
         runtime_bed_no_deposition=runtime_bed_no_deposition,
         bathymetry_by_site=bathymetry_by_site,
+        footprint_land_lonlat=land_lonlat,
+        footprint_land_source=land_source,
     )
 
     for result_path in result_paths:
