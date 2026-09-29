@@ -443,6 +443,8 @@ def _describe_figure(fig) -> dict:
         right = maps[1]
         info.update(
             twin=True,
+            arc_label_boxes=[t.get_window_extent() for t in maps[0].texts],
+            arc_axes_top_px=float(maps[0].get_window_extent().y1),
             right_ylim=tuple(right.get_ylim()),
             right_yticks=[float(v) for v in right.get_yticks()],
             right_ylabels=[t.get_text() for t in right.get_yticklabels()],
@@ -1013,3 +1015,20 @@ def test_tick_labels_do_not_overlap_including_neighbouring_snapshot_panels(
     figs = _wp38_colorbar_figs(described)
     assert len(figs) == 3 * len(SITES) and any(d["n_maps"] == 4 for d in figs)
     assert all(d["tick_label_overlaps"] == 0 for d in figs)
+
+
+def test_arc_edge_and_corner_names_sit_above_the_frame_without_overlap(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    described = _capture_figures(monkeypatch)
+    _build(tmp_path, postprocess_dir, coastline, isobaths)
+    arcs = [d for d in described if d["twin"]]
+    assert len(arcs) == len(SITES)
+    for d in arcs:
+        boxes = d["arc_label_boxes"]
+        assert len(boxes) >= 4  # 至少有各邊名稱
+        assert all(box.y0 >= d["arc_axes_top_px"] - 0.5 for box in boxes)  # 不壓在直條與曲線上
+        assert not any(
+            boxes[i].overlaps(boxes[j]) for i in range(len(boxes)) for j in range(i + 1, len(boxes))
+        )

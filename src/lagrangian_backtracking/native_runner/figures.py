@@ -3773,7 +3773,8 @@ def _plot_boundary_departure_along_arc(
     """沿開放邊界弧長的一維穿越分布：直條圖（每 bin 占比）＋累積曲線，標出各邊與轉角。
 
     三條軸都從 0 起算並向上取整到刻度倍數：橫軸 0 到邊界全長向上取整；左縱軸 0 到最大占比
-    向上取整；右縱軸 0–100%；首末刻度就是軸的兩端，兩端都標值。
+    向上取整；右縱軸 0–100%；首末刻度就是軸的兩端，兩端都標值。各邊名稱與轉角名稱寫在上框外側，
+    不壓在直條與累積曲線上。
     """
 
     import matplotlib
@@ -3831,29 +3832,30 @@ def _plot_boundary_departure_along_arc(
             centre = 0.5 * (float(e["s_start_km"]) + float(e["s_end_km"]))
             ax.text(
                 centre,
-                ymax * 0.965,
+                1.012,
                 t.t(f"{_EDGE_NAME_ZH.get(e['name'], e['name'])}邊界", f"{e['name']} edge"),
+                transform=ax.get_xaxis_transform(),
                 ha="center",
-                va="top",
+                va="bottom",
                 fontproperties=font,
                 fontsize=10,
                 color="#333333",
-                zorder=4,
+                clip_on=False,
             )
         for c in (e for e in fp.edge_intervals if e["kind"] == "corner"):
             sk = float(c["s_start_km"])
             ax.axvline(sk, color="#555555", linewidth=0.8, linestyle="--", zorder=1)
             ax.text(
                 sk,
-                ymax * 0.02,
+                1.012,
                 t.t(_corner_name_zh(str(c["name"])), str(c["name"])),
-                rotation=90,
-                ha="right",
+                transform=ax.get_xaxis_transform(),
+                ha="center",
                 va="bottom",
                 fontproperties=font,
                 fontsize=9,
                 color="#444444",
-                zorder=4,
+                clip_on=False,
             )
     number = FuncFormatter(lambda v, _p=None: f"{v:g}")
     ax.set_xlim(0.0, float(xticks[-1]))
