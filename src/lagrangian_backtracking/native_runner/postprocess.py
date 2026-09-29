@@ -277,6 +277,38 @@ WP-37：系集成員數（``M``）改為由後處理實測，不再由出圖端�
 成員數彼此不一致（無法用單一 ``M`` 描述本次執行），都直接丟出
 :class:`PostprocessError`，訊息附上實際數字與站點名稱。
 
+WP-38：停留時數密度取代邊界點核密度，作為條件式來源足跡的主產品
+------------------------------------------------------------------
+``kde_by_site``（式 (11) 的二維核密度）的輸入是粒子「穿越開放邊界時的離開座標」。
+這些點全部落在一維邊界上，二維核密度（Scott 頻寬）把它們抹成跨出計算域的圓團，
+高密度區間（HDR）大片落在域外，物理上站不住。**輸入點位於一維邊界，二維 KDE
+不適用，不再作報告主圖**；``kde_by_site*.parquet`` 的內容與數值不變、照常輸出
+（既有下游與稽核不受影響），manifest 的 ``config.kde_by_site_note_zh`` 明確標註
+這一點。
+
+WP-38 在 :meth:`PostprocessAccumulator.add_batch` 內另外以串流方式累加下列新產品
+（實作見 ``native_runner.footprint``，只在 ``PostprocessConfig.footprint`` 不為
+``None`` 時啟用，關閉時既有輸出與過去逐位元相同）：
+
+- ``residence_density_by_site.parquet``（主產品；另有依沉降速度分群的
+  ``residence_density_by_site_settling_velocity.parquet`` 與依系集成員分半的
+  ``residence_density_by_site_member_half.parquet``）：固定經緯度規則網格
+  （預設 0.02°）上，逐小時、``status == 0``（仍在漂流）的粒子樣本數，及其正規化
+  值（每 km² 佔該站總停留時數的比例）。終止後凍結的位置不計入；到達時刻樣本
+  （軌跡第 0 筆）計入。
+- ``residence_hdr_by_site.parquet``：50／75／90% 停留時數 HDR 的密度門檻與面積。
+- ``lookback_snapshot_kde_by_site.parquet``：回溯 72／168／336／720 小時時仍在漂流
+  的粒子位置，以既有 ``conditional_kde_2d`` 估計，附仍在漂流的比例與 KDE 質量落在
+  flow domain 外的比例。
+- ``boundary_departure_along_arc_by_site.parquet``：終止於開放邊界的粒子沿邊界弧長
+  （km，一維）的直方圖與累積分布，另附 ``boundary_edge_intervals_by_site.parquet``
+  標出北東南西各邊的弧長區間。
+- ``footprint_summary_by_site.{parquet,csv}``：每站一列的定量摘要（HDR 面積、質心、
+  與受體的距離與方位、水深小於門檻的停留時數比例、成員分半收斂指標與雜訊底、
+  網格敏感度）。
+- ``footprint_grid_by_site.parquet``、``footprint_geometry_by_site.parquet``：網格
+  定義與圖面用幾何（flow domain 外框、開放邊界、受體站）。
+
 不做的事（誠實揭露）
 ----------------------
 1. 本模組不知道也不假設任何 ``(lon, lat) ↔ (x, y)`` 的投影方式；``lonlat_projector``
@@ -350,9 +382,18 @@ from .backward_driver import (
     NATIVE_STATUS_STRANDED,
     BackwardDriverResult,
 )
+from .footprint import (
+    KDE_NOTE_ZH,
+    FootprintAccumulator,
+    FootprintConfig,
+    FootprintSiteSpec,
+    summary_table,
+)
 from .particle_input import ParticleIdentityTable
 
 __all__ = [
+    "FootprintConfig",
+    "FootprintSiteSpec",
     "PostprocessError",
     "NON_CROSSING_STATUS_CATEGORY_ZH",
     "DEPARTURE_TABLE_SCHEMA",
@@ -601,6 +642,10 @@ def build_source_footprint_kde(
     hdr_levels: Sequence[float] = (0.50, 0.75, 0.90),
 ) -> SourceFootprintKDEProduct:
     """對一組成功穿越關注區域邊界的離開點，建立式 (11) 條件式來源足跡。
+
+    WP-38 註記：離開點位於一維開放邊界上，二維 KDE 不適用，本函式的產物
+    （``kde_by_site``）不再作報告主圖；報告主圖改用停留時數密度
+    （``native_runner.footprint``）。本函式的行為與輸出維持不變。
 
     這是本模組唯一的 KDE 入口，直接呼叫既有 ``aggregation.conditional_kde_2d``
     做真正的核密度數學（見模組 docstring「既有模組重用」一節），本函式只負責
@@ -855,6 +900,12 @@ class PostprocessConfig:
     project_root: str | None = None
     declared_git_commit: str | None = None
     formal_provenance: bool = False
+    footprint: FootprintConfig | None = None
+    """WP-38：不為 ``None`` 時啟用停留時數密度等足跡新產品（見模組 docstring
+    「WP-38」一節）；``None``（預設）時既有輸出與過去逐位元相同。"""
+    trial_subset_note: str | None = None
+    """試產專用：非 ``None`` 表示身分表已縮成部分工作單元的子集，說明文字原樣寫入
+    manifest；正式成果不得使用。"""
 
     def __post_init__(self) -> None:
         if self.trajectory_sample_size_per_group < 1:
@@ -903,10 +954,17 @@ class PostprocessManifest:
     resource_usage: Mapping[str, float]
     generated_at_utc_ns: int
     ensemble_member_count_by_site: Mapping[str, int]
+    footprint: Mapping[str, Any] | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         """轉成可直接 ``json.dumps`` 的 dict（所有 key 轉成字串、值只用原生型別）。"""
 
+        payload = self._base_json_dict()
+        if self.footprint is not None:
+            payload["footprint"] = dict(self.footprint)
+        return payload
+
+    def _base_json_dict(self) -> dict[str, Any]:
         return {
             "experiment_case_id": self.experiment_case_id,
             "master_seed": self.master_seed,
@@ -1779,6 +1837,8 @@ class PostprocessAccumulator:
         boundary_geometries: Mapping[str, BoundaryGeometry] | None = None,
         runtime_physics_case: Mapping[str, Any] | None = None,
         runtime_bed_no_deposition: Mapping[str, Any] | None = None,
+        footprint_specs: Mapping[str, FootprintSiteSpec] | None = None,
+        bathymetry_by_site: Mapping[str, Any] | None = None,
     ) -> None:
         self._identity_table = identity_table
         self._config = config if config is not None else PostprocessConfig()
@@ -1876,6 +1936,33 @@ class PostprocessAccumulator:
         # KDE 離開點暫存：只保留成功穿越邊界的粒子座標，依站與站×沉降速度分組。
         self._kde_points_by_site: dict[str, list[np.ndarray]] = {}
         self._kde_points_by_site_velocity: dict[tuple[str, float], list[np.ndarray]] = {}
+
+        # WP-38：停留時數密度等足跡新產品（只在 config.footprint 不為 None 時啟用）。
+        # 幾何來源優先用呼叫端明示的 ``footprint_specs``，否則由 ``boundary_geometries``
+        # 的 flow domain 與 flow 開放邊界建立；兩者都沒有、或沒有投影器時 fail-closed，
+        # 不靜默略過（否則使用者以為有產出、實際上缺產品）。
+        self._footprint: FootprintAccumulator | None = None
+        if self._config.footprint is not None:
+            if self._lonlat_projector is None:
+                raise PostprocessError("啟用足跡產品需要 lonlat_projector（沿用 --config 建立的投影器）")
+            specs = dict(footprint_specs) if footprint_specs is not None else None
+            if specs is None:
+                if self._boundary_geometries is None:
+                    raise PostprocessError("啟用足跡產品需要 boundary_geometries 或明示的 footprint_specs")
+                specs = {
+                    site_id: FootprintSiteSpec(
+                        flow_domain=geometry.flow_domain,
+                        flow_open_boundary=geometry.flow_open_boundary,
+                    )
+                    for site_id, geometry in self._boundary_geometries.items()
+                }
+            self._footprint = FootprintAccumulator(
+                identity_table,
+                config=self._config.footprint,
+                specs=specs,
+                lonlat_projector=self._lonlat_projector,
+                bathymetry_by_site=bathymetry_by_site,
+            )
 
         departure_path = self._output_dir / "departures.parquet"
         self._departure_path = departure_path
@@ -2004,6 +2091,8 @@ class PostprocessAccumulator:
         self._write_local_domain_departure_batch(rows, result)
         self._update_trajectory_samples(rows, result)
         self._update_kde_points(rows, final_status)
+        if self._footprint is not None:
+            self._footprint.add_batch(batch_id, rows, result)
 
         self._batches.append(
             BatchRecord(
@@ -2405,6 +2494,7 @@ class PostprocessAccumulator:
         self._write_local_domain_first_exit_summary_table()
         kde_summary = self._write_kde_products()
         self._write_trajectory_samples()
+        footprint_manifest = self._write_footprint_products()
 
         output_files_sha256 = {
             path.name: sha256_file(path) for path in sorted(self._output_dir.glob("*.parquet"))
@@ -2446,6 +2536,10 @@ class PostprocessAccumulator:
                 "kde_hdr_levels": list(self._config.kde_hdr_levels),
                 "depth_quartile_count": self._config.depth_quartile_count,
                 "kde_group_summary": kde_summary,
+                # WP-38：kde_by_site 的輸入點位於一維邊界，二維 KDE 不適用。
+                "kde_by_site_note_zh": KDE_NOTE_ZH,
+                "footprint_enabled": self._footprint is not None,
+                "trial_subset_note": self._config.trial_subset_note,
                 "boundary_segment_classification_available": self._boundary_geometries is not None,
                 "boundary_segment_classification_method": (
                     "nearest_open_boundary_line_by_euclidean_distance_v1（見"
@@ -2505,6 +2599,7 @@ class PostprocessAccumulator:
             resource_usage=resource_usage,
             generated_at_utc_ns=time.time_ns(),
             ensemble_member_count_by_site=dict(self._ensemble_member_count_by_site),
+            footprint=footprint_manifest,
         )
 
         manifest_path = self._output_dir / "manifest.json"
@@ -2733,6 +2828,10 @@ class PostprocessAccumulator:
     def _write_kde_products(self) -> dict[str, dict[str, Any]]:
         """對兩種分組（各站；各站×沉降速度）建立條件式來源足跡並寫成 Parquet。
 
+        WP-38 註記：輸入點是穿越開放邊界的離開座標，位於一維邊界上，二維 KDE
+        不適用，本產品不再作報告主圖（主圖改用停留時數密度，見模組 docstring
+        「WP-38」一節）；內容與數值維持不變，供既有下游與稽核使用。
+
         Returns:
             分組鍵值到 ``{"status": ..., "raw_point_count": ...}`` 的摘要 dict，
             供 manifest 快速呈現各分組的可估計性，不需要重新讀取 Parquet 檔案。
@@ -2779,6 +2878,34 @@ class PostprocessAccumulator:
             str(self._output_dir / "kde_by_site_settling_velocity.parquet"),
         )
         return summary
+
+    def _write_footprint_products(self) -> dict[str, Any] | None:
+        """WP-38：輸出停留時數密度、HDR、回溯快照、邊界弧長分布與逐站摘要。
+
+        未啟用足跡產品時回傳 ``None``，不寫任何檔案。所有表另以 Parquet 保存；
+        逐站摘要 ``footprint_summary_by_site`` 同時寫 CSV（人可讀）。
+        """
+
+        if self._footprint is None:
+            return None
+        runtime_case = self._runtime_physics_case
+        case_id = runtime_case.get("experiment_case_id") if isinstance(runtime_case, Mapping) else None
+        receptor_xy = {
+            site: (float(center[0]), float(center[1])) for site, center in self._site_receptor_centers.items()
+        }
+        products = self._footprint.finalize(
+            receptor_centers_xy=receptor_xy,
+            physical_case_id=str(case_id) if case_id is not None else None,
+            ensemble_member_count_by_site=self._ensemble_member_count_by_site,
+        )
+        for stem, table in products.tables.items():
+            pq.write_table(table, str(self._output_dir / f"{stem}.parquet"))
+        summary = summary_table(products.summary_rows)
+        _write_table_with_csv(summary, self._output_dir, "footprint_summary_by_site")
+        manifest = dict(products.manifest)
+        manifest["output_tables"] = sorted(products.tables) + ["footprint_summary_by_site"]
+        manifest["trial_subset_note"] = self._config.trial_subset_note
+        return manifest
 
     def _write_trajectory_samples(self) -> None:
         """輸出兩種分組方案（各站；各站×沉降速度）的軌跡抽樣 Parquet 表。"""

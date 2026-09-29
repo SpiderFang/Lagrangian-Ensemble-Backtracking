@@ -1852,7 +1852,81 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
             "boundary_entry_by_site_arc_segment.*"
         ),
     )
+    parser.add_argument(
+        "--with-footprint",
+        action="store_true",
+        help=(
+            "WP-38：另外輸出停留時數密度（主產品）、HDR、回溯快照 KDE、沿開放邊界弧長"
+            "的離開分布與逐站摘要；需要同時提供 --config 與 --with-boundary-segments。"
+            "未指定時既有輸出與過去逐位元相同"
+        ),
+    )
+    parser.add_argument(
+        "--footprint-grid-deg", type=float, default=0.02, help="WP-38：停留時數網格解析度（度），預設 0.02"
+    )
+    parser.add_argument(
+        "--footprint-padding-deg",
+        type=float,
+        default=0.05,
+        help="WP-38：網格範圍在 flow domain 外框之外的外擴量（度），預設 0.05",
+    )
+    parser.add_argument(
+        "--footprint-lookback-hours",
+        type=int,
+        nargs="+",
+        default=[72, 168, 336, 720],
+        help="WP-38：回溯快照的時刻索引（小時，1 小時一筆），預設 72 168 336 720（3、7、14、30 天）",
+    )
+    parser.add_argument(
+        "--footprint-arc-bin-km", type=float, default=10.0, help="WP-38：沿開放邊界弧長直方圖的組距（km）"
+    )
+    parser.add_argument(
+        "--bathymetry-grid-root",
+        type=Path,
+        default=None,
+        help=(
+            "WP-38：可選，各 flow domain 快取目錄（內含 grid/）所在的上層目錄；與"
+            " --region-flow-domain-map 併用，提供每站水深以計算「水深小於 200 m 的停留"
+            "時數比例」。省略時該欄位為空並在 manifest 記錄"
+        ),
+    )
+    parser.add_argument(
+        "--region-flow-domain-map",
+        type=Path,
+        default=None,
+        help=(
+            "WP-38：分析區 -> flow domain 快取目錄名稱的 JSON"
+            "（例如 run 的 inputs/region_to_flow_domain.json）"
+        ),
+    )
+    parser.add_argument(
+        "--trial-subset-from-results",
+        action="store_true",
+        help=(
+            "WP-38 試產專用：把身分表縮成 --results-dir 內實際存在的工作單元所含粒子（不複製、"
+            "不改動結果檔），供以少量單元的符號連結目錄試跑；manifest 的 config.trial_subset_note "
+            "會標註。正式成果不得使用"
+        ),
+    )
     return parser
+
+
+def _subset_identity_table(identity_table: Any, keep_rows: np.ndarray) -> Any:
+    """依全域列位置取出身分表的子集（重算內容雜湊），供 WP-38 試產使用。"""
+
+    from .native_runner.particle_input import ParticleIdentityTable
+
+    arrays = {
+        field.name: getattr(identity_table, field.name)[keep_rows]
+        for field in dataclasses.fields(identity_table)
+        if isinstance(getattr(identity_table, field.name), np.ndarray)
+    }
+    return ParticleIdentityTable(
+        **arrays,
+        experiment_case_id=identity_table.experiment_case_id,
+        master_seed=identity_table.master_seed,
+        random_stream_id=identity_table.random_stream_id,
+    )
 
 
 def _build_native_lonlat_projector(
@@ -1918,6 +1992,63 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         runtime_physics_case = plan_payload.get("physics_case")
         runtime_bed_no_deposition = plan_payload.get("bed_no_deposition")
 
+    result_paths = sorted(Path(args.results_dir).glob("*.driver_result.npz"))
+    if not result_paths:
+        raise ValueError(f"{args.results_dir} 底下找不到任何 *.driver_result.npz 成果檔")
+
+    # WP-38 試產：把身分表縮成結果目錄內實際存在的單元所含粒子，並在讀入時重映射列位置。
+    row_remap: np.ndarray | None = None
+    trial_subset_note: str | None = None
+    if args.trial_subset_from_results:
+        kept: list[np.ndarray] = []
+        for result_path in result_paths:
+            with np.load(str(result_path), allow_pickle=False) as npz:
+                kept.append(np.asarray(npz["row_particle_index"], dtype=np.int64))
+        keep_rows = np.unique(np.concatenate(kept))
+        full_count = len(identity_table)
+        row_remap = np.full(full_count, -1, dtype=np.int64)
+        row_remap[keep_rows] = np.arange(keep_rows.size, dtype=np.int64)
+        identity_table = _subset_identity_table(identity_table, keep_rows)
+        trial_subset_note = (
+            f"試產子集：{len(result_paths)} 個工作單元、{keep_rows.size} 顆粒子"
+            f"（全量身分表 {full_count} 顆）；僅供試產與耗時量測，不是正式成果"
+        )
+
+    footprint_config = None
+    bathymetry_by_site = None
+    if args.with_footprint:
+        if config is None or boundary_geometries is None:
+            raise ValueError("--with-footprint 必須同時提供 --config 與 --with-boundary-segments")
+        footprint_config = native_postprocess.FootprintConfig(
+            grid_resolution_deg=args.footprint_grid_deg,
+            padding_deg=args.footprint_padding_deg,
+            lookback_snapshot_hours=tuple(args.footprint_lookback_hours),
+            arc_bin_km=args.footprint_arc_bin_km,
+        )
+        if (args.bathymetry_grid_root is None) != (args.region_flow_domain_map is None):
+            raise ValueError("--bathymetry-grid-root 與 --region-flow-domain-map 必須同時提供")
+        if args.bathymetry_grid_root is not None:
+            from .native_runner import bathymetry as native_bathymetry
+
+            region_map = json.loads(Path(args.region_flow_domain_map).read_text(encoding="utf-8"))
+            site_to_region = {
+                str(site): str(region)
+                for site, region in zip(
+                    identity_table.study_site_id.tolist(),
+                    identity_table.analysis_region_id.tolist(),
+                    strict=True,
+                )
+            }
+            grid_dirs = native_bathymetry.resolve_site_grid_dirs(
+                site_to_region, region_map, args.bathymetry_grid_root
+            )
+            loaded: dict[Path, Any] = {}
+            bathymetry_by_site = {}
+            for site_id, grid_dir in grid_dirs.items():
+                if grid_dir not in loaded:
+                    loaded[grid_dir] = native_bathymetry.load_ocm_grid_bathymetry(grid_dir)
+                bathymetry_by_site[site_id] = loaded[grid_dir]
+
     postprocess_config = native_postprocess.PostprocessConfig(
         trajectory_sample_size_per_group=args.trajectory_sample_size_per_group,
         trajectory_sample_seed=args.trajectory_sample_seed,
@@ -1930,6 +2061,8 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         project_root=str(args.project_root) if args.project_root is not None else None,
         declared_git_commit=args.declared_git_commit,
         formal_provenance=args.formal,
+        footprint=footprint_config,
+        trial_subset_note=trial_subset_note,
     )
     accumulator = native_postprocess.PostprocessAccumulator(
         identity_table,
@@ -1939,14 +2072,16 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         boundary_geometries=boundary_geometries,
         runtime_physics_case=runtime_physics_case,
         runtime_bed_no_deposition=runtime_bed_no_deposition,
+        bathymetry_by_site=bathymetry_by_site,
     )
 
-    result_paths = sorted(Path(args.results_dir).glob("*.driver_result.npz"))
-    if not result_paths:
-        raise ValueError(f"{args.results_dir} 底下找不到任何 *.driver_result.npz 成果檔")
     for result_path in result_paths:
         unit_id = result_path.name[: -len(".driver_result.npz")]
         driver_result = native_hour_major_provider.load_backward_driver_result_npz(result_path)
+        if row_remap is not None:
+            driver_result = dataclasses.replace(
+                driver_result, row_particle_index=row_remap[driver_result.row_particle_index]
+            )
         accumulator.add_batch(unit_id, driver_result)
 
     manifest = accumulator.finalize()
