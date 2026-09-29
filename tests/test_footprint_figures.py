@@ -281,3 +281,77 @@ def test_snapshot_panel_with_too_few_particles_is_annotated_not_estimated(
     assert "仍在漂流粒子數不足（n=" in manifest_text or "回溯 336 小時" in manifest_text
     # 快照不再有 KDE 的「範圍外未繪」註記。
     assert "範圍外" not in manifest_text and "未繪" not in manifest_text
+
+
+def _base_map_pixels(land_geometries, *, domain):
+    """只畫底圖（陸地、邊界），回傳渲染後的 RGBA 陣列與 (x0, x1, y0, y1) 範圍。"""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fp = native_figures.FootprintSiteFigureData(
+        site_id="t",
+        grid={"lon0_deg": 0.0, "lat0_deg": 0.0, "nx": 1, "ny": 1, "resolution_deg": 1.0},
+        density_pct_per_km2=np.zeros((1, 1)),
+        hdr_threshold_pct_per_km2={},
+        hdr_area_km2={},
+        snapshots=(),
+        arc_bins=(),
+        edge_intervals=(),
+        domain_lonlat=np.asarray(domain, dtype=float),
+        open_boundary_parts=(),
+        receptor_center=None,
+        summary={},
+    )
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=100)
+    try:
+        extent, _ = native_figures._draw_footprint_base_map(
+            ax,
+            fp,
+            land_geometries,
+            {},
+            native_figures._Labeler(False),
+            None,
+            site_label="t",
+        )
+        fig.canvas.draw()
+        pixels = np.asarray(fig.canvas.buffer_rgba()).copy()
+        bbox = ax.get_window_extent()
+    finally:
+        plt.close(fig)
+    return pixels, extent, bbox
+
+
+def _pixel_at(pixels, extent, bbox, lon, lat):
+    h = pixels.shape[0]
+    fx = (lon - extent[0]) / (extent[1] - extent[0])
+    fy = (lat - extent[2]) / (extent[3] - extent[2])
+    col = int(bbox.x0 + fx * bbox.width)
+    row = int(h - (bbox.y0 + fy * bbox.height))
+    return tuple(int(v) for v in pixels[row, col, :3])
+
+
+def test_land_crossing_the_frame_is_still_filled_inside_the_frame():
+    """陸地多邊形跨出圖框時，框內部分仍須填色；內環（湖泊）與獨立小島也要正確。"""
+
+    from shapely.geometry import MultiPolygon, Polygon
+
+    land_rgb = tuple(int(native_figures._LAND_COLOR[i : i + 2], 16) for i in (1, 3, 5))
+    domain = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    # 大陸塊：從框外（x<0、y>10）延伸進框內；內環是框內的湖，另有框內小島與整個在框外的島
+    mainland = Polygon(
+        [(-20.0, -20.0), (4.0, -20.0), (4.0, 30.0), (-20.0, 30.0)],
+        holes=[[(1.0, 4.0), (3.0, 4.0), (3.0, 6.0), (1.0, 6.0)]],
+    )
+    islet = Polygon([(7.0, 7.0), (8.0, 7.0), (8.0, 8.0), (7.0, 8.0)])
+    far_away = Polygon([(100.0, 100.0), (101.0, 100.0), (101.0, 101.0), (100.0, 101.0)])
+    pixels, extent, bbox = _base_map_pixels(
+        [MultiPolygon([mainland, islet]), far_away], domain=domain
+    )
+    assert _pixel_at(pixels, extent, bbox, 2.0, 8.0) == land_rgb  # 框內、跨界大陸塊
+    assert _pixel_at(pixels, extent, bbox, 0.5, 9.5) == land_rgb  # 靠近跨出圖框的角落
+    assert _pixel_at(pixels, extent, bbox, 7.5, 7.5) == land_rgb  # 框內小島
+    assert _pixel_at(pixels, extent, bbox, 2.0, 5.0) != land_rgb  # 湖（內環）不填
+    assert _pixel_at(pixels, extent, bbox, 6.0, 3.0) != land_rgb  # 海
