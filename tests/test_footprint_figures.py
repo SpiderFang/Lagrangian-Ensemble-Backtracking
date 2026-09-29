@@ -105,7 +105,16 @@ def footprint_inputs(tmp_path: Path):
 
 
 def _build(
-    tmp_path: Path, postprocess_dir: Path, coastline: Path, isobaths: Path | None, *, text="full", name="out"
+    tmp_path: Path,
+    postprocess_dir: Path,
+    coastline: Path,
+    isobaths: Path | None,
+    *,
+    text="full",
+    name="out",
+    isobath_levels=native_figures.ISOBATH_LEVELS_DEFAULT,
+    receptor_config: Path | None = None,
+    allow_unanchored: bool = True,
 ):
     config = native_figures.NativeFiguresConfig(
         postprocess_dir=postprocess_dir,
@@ -114,6 +123,9 @@ def _build(
         dpi=60,
         figure_text=text,
         bathymetry_path=isobaths,
+        isobath_levels_m=tuple(isobath_levels),
+        receptor_config_path=receptor_config,
+        allow_unanchored_receptor=receptor_config is None and allow_unanchored,
     )
     native_figures.build_native_figures(config, command="lbt native-figures --test")
     return tmp_path / name
@@ -137,15 +149,25 @@ def test_footprint_figures_are_produced_for_each_site(tmp_path, footprint_inputs
     shared = scales["variants"]["source_footprint_residence"]
     per_site = scales["variants"]["source_footprint_residence_site_scale"]
     assert shared["scale"] == "shared_across_sites" and per_site["scale"] == "per_site"
-    assert shared["upper_limit"] == pytest.approx(max(per_site["upper_limit_by_site"].values()))
-    assert per_site["upper_limit_by_site"]["site_a"] != per_site["upper_limit_by_site"]["site_b"]
+    assert shared["raw_max"] == pytest.approx(max(per_site["raw_max_by_site"].values()))
+    assert per_site["raw_max_by_site"]["site_a"] != per_site["raw_max_by_site"]["site_b"]
+    # 上限是最大值向上取整到 10 的整數次方，下限是上限的 1/10000
+    for upper, lower in (
+        (shared["upper_limit"], shared["lower_limit"]),
+        *((per_site["upper_limit_by_site"][s], per_site["lower_limit_by_site"][s]) for s in SITES),
+    ):
+        assert np.log10(upper) == pytest.approx(round(np.log10(upper)))
+        assert lower == pytest.approx(upper * 1e-4)
+    assert shared["upper_limit"] >= shared["raw_max"] > shared["upper_limit"] / 10.0
     for key in ("site_a/source_footprint_residence.png", "site_b/lookback_snapshot.png"):
         assert key in manifest["output_png_sha256"]
         assert key in block["figures"]
     assert manifest["footprint_figures"]["bathymetry"]["status"] == "loaded"
     for site in SITES:
         rec = block["bathymetry"]["by_site"][site]
-        assert rec["status"] == "drawn" and rec["levels_m"] == [50.0, 100.0, 200.0, 1000.0]
+        # 預設只畫 200 m（陸棚邊緣）與 1000 m；其他水深不畫，免得干擾高密度區間
+        assert rec["status"] == "drawn" and rec["levels_m"] == [200.0, 1000.0]
+    assert block["bathymetry"]["requested_levels_m"] == [200.0, 1000.0]
 
 
 def test_missing_bathymetry_still_draws_and_records_reason(tmp_path, footprint_inputs):
@@ -307,15 +329,7 @@ def _base_map_pixels(land_geometries, *, domain):
     )
     fig, ax = plt.subplots(figsize=(4, 4), dpi=100)
     try:
-        extent, _ = native_figures._draw_footprint_base_map(
-            ax,
-            fp,
-            land_geometries,
-            {},
-            native_figures._Labeler(False),
-            None,
-            site_label="t",
-        )
+        extent, _ = native_figures._draw_footprint_base_map(ax, fp, land_geometries, {})
         fig.canvas.draw()
         pixels = np.asarray(fig.canvas.buffer_rgba()).copy()
         bbox = ax.get_window_extent()
@@ -347,11 +361,631 @@ def test_land_crossing_the_frame_is_still_filled_inside_the_frame():
     )
     islet = Polygon([(7.0, 7.0), (8.0, 7.0), (8.0, 8.0), (7.0, 8.0)])
     far_away = Polygon([(100.0, 100.0), (101.0, 100.0), (101.0, 101.0), (100.0, 101.0)])
-    pixels, extent, bbox = _base_map_pixels(
-        [MultiPolygon([mainland, islet]), far_away], domain=domain
-    )
+    pixels, extent, bbox = _base_map_pixels([MultiPolygon([mainland, islet]), far_away], domain=domain)
     assert _pixel_at(pixels, extent, bbox, 2.0, 8.0) == land_rgb  # 框內、跨界大陸塊
     assert _pixel_at(pixels, extent, bbox, 0.5, 9.5) == land_rgb  # 靠近跨出圖框的角落
     assert _pixel_at(pixels, extent, bbox, 7.5, 7.5) == land_rgb  # 框內小島
     assert _pixel_at(pixels, extent, bbox, 2.0, 5.0) != land_rgb  # 湖（內環）不填
     assert _pixel_at(pixels, extent, bbox, 6.0, 3.0) != land_rgb  # 海
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 改版（c）：色條與地圖同高、座標軸對齊刻度、等深線、受體權威來源、不寫站名
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _describe_figure(fig) -> dict:
+    """在存檔前量測實際版面：地圖軸、色條軸的顯示座標、座標軸範圍與刻度、星號與等深線。"""
+
+    import matplotlib.colors
+    import matplotlib.text
+
+    fig.canvas.draw()
+    visible = [a for a in fig.axes if a.get_visible()]
+    cbar_axes = [a for a in visible if a.get_position().width < 0.05 and a.get_position().height > 0.2]
+    maps = [a for a in visible if a not in cbar_axes]
+    info: dict = {
+        "n_maps": len(maps),
+        "cbar": None,
+        "twin": False,
+        "stars": [
+            tuple(float(v) for v in ln.get_xydata()[0])
+            for a in maps
+            for ln in a.lines
+            if ln.get_marker() == "*"
+        ],
+        "texts": [t.get_text() for t in fig.findobj(matplotlib.text.Text)],
+        "isobaths": [
+            (ln.get_linewidth(), ln.get_linestyle(), ln.get_zorder())
+            for a in maps
+            for ln in a.lines
+            if ln.get_color() == native_figures._ISOBATH_COLOR
+        ],
+        "collections": [(type(c).__name__, c.get_zorder()) for a in maps for c in a.collections],
+        "axes_texts": [t.get_text() for a in maps for t in a.texts],
+        "legend_texts": [
+            t.get_text()
+            for legend in [*fig.legends, *(a.get_legend() for a in maps)]
+            if legend is not None
+            for t in legend.get_texts()
+        ],
+        "release_polygons": [
+            np.asarray(p.get_xy())
+            for a in maps
+            for p in a.patches
+            if type(p).__name__ == "Polygon"
+            and np.allclose(p.get_edgecolor(), matplotlib.colors.to_rgba(native_figures._RELEASE_EDGE))
+        ],
+    }
+    ref = min(maps, key=lambda a: (round(a.get_window_extent().y0), round(a.get_window_extent().x0)))
+    info.update(
+        xlim=tuple(ref.get_xlim()),
+        ylim=tuple(ref.get_ylim()),
+        xticks=[float(v) for v in ref.get_xticks()],
+        yticks=[float(v) for v in ref.get_yticks()],
+        xlabels=[t.get_text() for t in ref.get_xticklabels()],
+        ylabels=[t.get_text() for t in ref.get_yticklabels()],
+    )
+    if len(maps) == 2 and maps[0].get_position().bounds == maps[1].get_position().bounds:
+        right = maps[1]
+        info.update(
+            twin=True,
+            right_ylim=tuple(right.get_ylim()),
+            right_yticks=[float(v) for v in right.get_yticks()],
+            right_ylabels=[t.get_text() for t in right.get_yticklabels()],
+            xlim=tuple(maps[0].get_xlim()),
+            ylim=tuple(maps[0].get_ylim()),
+            xticks=[float(v) for v in maps[0].get_xticks()],
+            yticks=[float(v) for v in maps[0].get_yticks()],
+            xlabels=[t.get_text() for t in maps[0].get_xticklabels()],
+            ylabels=[t.get_text() for t in maps[0].get_yticklabels()],
+        )
+    if cbar_axes:
+        cax = cbar_axes[0]
+        top = max(a.get_window_extent().y1 for a in maps)
+        bottom = min(a.get_window_extent().y0 for a in maps)
+        box = cax.get_window_extent()
+        info["cbar"] = {
+            "top_diff": float(box.y1 - top),
+            "bottom_diff": float(box.y0 - bottom),
+            "ylim": tuple(cax.get_ylim()),
+            "ticks": [float(v) for v in cax.get_yticks()],
+            "labels": [t.get_text() for t in cax.get_yticklabels()],
+        }
+    return info
+
+
+def _capture_figures(monkeypatch) -> list[dict]:
+    import matplotlib.figure
+
+    described: list[dict] = []
+    original = matplotlib.figure.Figure.savefig
+
+    def spy(self, *args, **kwargs):
+        if not getattr(self, "_wp38_described", False):
+            self._wp38_described = True
+            described.append(_describe_figure(self))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", spy)
+    return described
+
+
+def _wp38_colorbar_figs(described: list[dict]) -> list[dict]:
+    """WP-38 的有色條圖（停留時數密度、快照）：色條刻度是 10 的次方；舊圖的色條不是。"""
+
+    return [
+        d
+        for d in described
+        if d["cbar"] is not None and d["cbar"]["labels"] and d["cbar"]["labels"][0].startswith("$10^{")
+    ]
+
+
+def _footprint_figs(described: list[dict]) -> list[dict]:
+    """只留 WP-38 的圖（有色條的停留時數／快照圖，以及雙縱軸的弧長分布圖）。"""
+
+    return [*_wp38_colorbar_figs(described), *(d for d in described if d["twin"])]
+
+
+def test_colorbar_height_equals_map_axes_height_including_shared_snapshot_bar(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    described = _capture_figures(monkeypatch)
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths)
+    with_cbar = _wp38_colorbar_figs(described)
+    assert len(with_cbar) == 3 * len(SITES)  # 每站：兩張停留時數密度＋一張快照
+    assert sorted(d["n_maps"] for d in with_cbar) == [1] * (2 * len(SITES)) + [4] * len(SITES)
+    tol = native_figures.COLORBAR_ALIGNMENT_TOLERANCE_PX
+    for d in with_cbar:
+        assert abs(d["cbar"]["top_diff"]) <= tol
+        assert abs(d["cbar"]["bottom_diff"]) <= tol
+    # manifest 記錄的量測值與獨立量到的一致，且同樣在容差內
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    records = manifest["footprint_figures"]["figures"]
+    measured = [r["layout"] for k, r in records.items() if "boundary_departure" not in k]
+    assert len(measured) == 3 * len(SITES)
+    for layout in measured:
+        assert abs(layout["top_diff_px"]) <= tol and abs(layout["bottom_diff_px"]) <= tol
+        assert layout["colorbar_top_px"] > layout["colorbar_bottom_px"]
+    assert manifest["footprint_figures"]["colorbar_alignment_tolerance_px"] == tol
+
+
+def test_axes_limits_equal_first_and_last_ticks_with_all_ends_labelled(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    described = _capture_figures(monkeypatch)
+    _build(tmp_path, postprocess_dir, coastline, isobaths)
+    figs = _footprint_figs(described)
+    assert len(figs) == 4 * len(SITES)
+    for d in figs:
+        assert d["xlim"] == (d["xticks"][0], d["xticks"][-1])
+        assert d["ylim"] == (d["yticks"][0], d["yticks"][-1])
+        assert len(d["xticks"]) >= 2 and len(d["yticks"]) >= 2
+        assert d["xlabels"][0] and d["xlabels"][-1] and d["ylabels"][0] and d["ylabels"][-1]
+        if d["twin"]:  # 弧長分布圖：三條軸都從 0 起算，右軸 0–100%
+            assert d["xticks"][0] == 0.0 and d["yticks"][0] == 0.0
+            assert d["right_ylim"] == (0.0, 100.0)
+            assert d["right_yticks"][0] == 0.0 and d["right_yticks"][-1] == 100.0
+            assert d["right_ylabels"][0] and d["right_ylabels"][-1]
+        else:  # 地圖：等間距、間距是 0.1／0.2／0.5／1 度，刻度格式如 121.60°E
+            for ticks in (d["xticks"], d["yticks"]):
+                step = np.diff(ticks)
+                assert np.allclose(step, step[0])
+                assert any(np.isclose(step[0], c) for c in native_figures._TICK_STEP_CHOICES_DEG)
+            assert d["xlabels"][0].endswith("°E") and d["ylabels"][0].endswith("°N")
+
+
+def test_map_extent_is_rounded_outward_and_contains_flow_domain(tmp_path, footprint_inputs):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir,
+        coastline_path=coastline,
+        output_dir=tmp_path / "unused",
+        allow_unanchored_receptor=True,
+    )
+    fp = native_figures.load_native_figures_inputs(config).footprint["site_a"]
+    for max_intervals in (native_figures._RESIDENCE_MAX_INTERVALS, native_figures._SNAPSHOT_MAX_INTERVALS):
+        xt, yt = native_figures._site_axis_ticks(fp, max_intervals=max_intervals)
+        lon, lat = fp.domain_lonlat[:, 0], fp.domain_lonlat[:, 1]
+        assert xt[0] <= lon.min() and xt[-1] >= lon.max() and yt[0] <= lat.min() and yt[-1] >= lat.max()
+        assert 4 <= len(xt) <= 7 and 4 <= len(yt) <= 7  # 每軸 4～7 個刻度
+        assert len(xt) - 1 <= max_intervals or native_figures._TICK_STEP_CHOICES_DEG[-1] == round(
+            xt[1] - xt[0], 10
+        )
+        assert native_figures._site_extent(fp, max_intervals=max_intervals) == (xt[0], xt[-1], yt[0], yt[-1])
+
+
+def test_axis_ticks_helper_rounds_outward_to_step_multiples():
+    ticks = native_figures._axis_ticks(121.63, 122.18, max_intervals=7)
+    assert ticks[0] == pytest.approx(121.6) and ticks[-1] == pytest.approx(122.2)
+    assert np.allclose(np.diff(ticks), 0.1)
+    wide = native_figures._axis_ticks(119.4, 122.3, max_intervals=7)
+    assert np.allclose(np.diff(wide), 0.5) and wide[0] == 119.0 and wide[-1] == 122.5
+    quarter = native_figures._axis_ticks(120.0, 121.4, max_intervals=6)
+    assert np.allclose(np.diff(quarter), 0.25) and quarter[0] == 120.0 and quarter[-1] == 121.5  # 0.25 度間距
+    tiny = native_figures._axis_ticks(120.51, 120.58, max_intervals=6)  # 範圍太小：至少 4 個刻度
+    assert len(tiny) == 4 and tiny[0] <= 120.51 and tiny[-1] >= 120.58
+    exact = native_figures._axis_ticks(120.0, 121.0, max_intervals=10)
+    assert exact[0] == 120.0 and exact[-1] == 121.0  # 剛好在刻度上就不多擴一格
+    top, ticks_arc = native_figures._nice_ceiling_axis(412.0, max_intervals=10)
+    assert top >= 412.0 and ticks_arc[0] == 0.0 and ticks_arc[-1] == top
+    assert native_figures._nice_ceiling_axis(0.0, max_intervals=5)[0] == 1.0
+
+
+def test_colorbar_end_ticks_equal_limits_are_decades_and_labelled(tmp_path, footprint_inputs, monkeypatch):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    described = _capture_figures(monkeypatch)
+    _build(tmp_path, postprocess_dir, coastline, isobaths)
+    bars = [d["cbar"] for d in _wp38_colorbar_figs(described)]
+    assert len(bars) == 3 * len(SITES)
+    for bar in bars:
+        vmin, vmax = bar["ylim"]
+        assert bar["ticks"][0] == pytest.approx(vmin) and bar["ticks"][-1] == pytest.approx(vmax)
+        assert vmax / vmin == pytest.approx(1e4)
+        exps = np.log10(bar["ticks"])
+        assert np.allclose(exps, np.round(exps)) and np.allclose(np.diff(exps), 1.0)  # 每個 10 的次方一個刻度
+        assert len(bar["ticks"]) == 5
+        assert all(label.startswith("$10^{") for label in bar["labels"])  # 兩端與中間都有顯示文字
+        assert bar["labels"][0] and bar["labels"][-1]
+
+
+def test_decade_limits_and_tick_text():
+    assert native_figures._decade_limits(0.37) == (1e-4, 1.0)
+    assert native_figures._decade_limits(1.0) == (1e-4, 1.0)  # 剛好是 10 的次方不再多進一位
+    assert native_figures._decade_limits(1.0001) == (1e-3, 10.0)
+    for raw in (1e-7, 3.3e-5, 0.999999999, 1.0 + 1e-12, 7.7, 1234.5):
+        lo, hi = native_figures._decade_limits(raw)
+        assert hi >= raw and lo == pytest.approx(hi * 1e-4)  # 上限一定 >= 資料最大值
+    assert native_figures._decade_limits(0.0) == (1e-4, 1.0)
+    assert native_figures._decade_formatter(1e-4) == "$10^{-4}$"
+    assert native_figures._decade_formatter(100.0) == "$10^{2}$"
+
+
+def test_limit_stats_count_cells_outside_the_limits_without_clipping():
+    fp = native_figures.FootprintSiteFigureData(
+        site_id="t",
+        grid={
+            "lon0_deg": 120.0,
+            "lat0_deg": 24.0,
+            "nx": 4,
+            "ny": 1,
+            "resolution_deg": 0.1,
+            "total_particle_hours": 10,
+        },
+        density_pct_per_km2=np.zeros((1, 4)),
+        hdr_threshold_pct_per_km2={},
+        hdr_area_km2={},
+        snapshots=(),
+        arc_bins=(),
+        edge_intervals=(),
+        domain_lonlat=np.asarray([[120, 24], [121, 24], [121, 25]], dtype=float),
+        open_boundary_parts=(),
+        receptor_center=None,
+        summary={},
+    )
+    density = np.array([[0.0, 1e-6, 1e-3, 1.0]])
+    stats = native_figures._limit_stats(fp, density, 1e-4, 1.0)
+    assert stats["cells_with_density"] == 3
+    assert stats["cells_below_lower_limit"] == 1 and stats["cells_above_upper_limit"] == 0
+    assert 0.0 < stats["mass_fraction_below_lower_limit"] < 1e-5
+    over = native_figures._limit_stats(fp, np.array([[0.0, 0.0, 0.0, 5.0]]), 1e-4, 1.0)
+    assert over["cells_above_upper_limit"] == 1 and over["mass_fraction_above_upper_limit"] == pytest.approx(
+        1.0
+    )
+
+
+def test_manifest_records_cells_below_lower_limit_per_figure(tmp_path, footprint_inputs):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths)
+    records = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["footprint_figures"]["figures"]
+    for site in SITES:
+        stats = records[f"{site}/source_footprint_residence.png"]["limit_stats"]
+        assert {
+            "cells_below_lower_limit",
+            "mass_fraction_below_lower_limit",
+            "cells_above_upper_limit",
+        } <= set(stats)
+        assert stats["cells_above_upper_limit"] == 0  # 上限取的是最大值向上取整
+        for panel in records[f"{site}/lookback_snapshot.png"]["limit_stats_by_panel"]:
+            assert panel["cells_above_upper_limit"] == 0
+
+
+def test_isobaths_are_thin_gray_between_density_and_hdr_and_default_to_200_and_1000(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    described = _capture_figures(monkeypatch)
+    _build(tmp_path, postprocess_dir, coastline, isobaths)
+    residence = [d for d in _wp38_colorbar_figs(described) if d["n_maps"] == 1]
+    assert residence
+    hdr_widths = [s["linewidth"] for s in native_figures._HDR_LINE_STYLES]
+    assert min(hdr_widths) > native_figures._ISOBATH_LINEWIDTH * 2
+    for d in residence:
+        assert d["isobaths"], "合成水深應在範圍內畫出等深線"
+        widths = {w for w, _style, _z in d["isobaths"]}
+        assert widths == {native_figures._ISOBATH_LINEWIDTH}
+        assert {style for _w, style, _z in d["isobaths"]} == {"-", "--"}  # 200 m 實線、1000 m 虛線
+        iso_z = {z for _w, _s, z in d["isobaths"]}
+        mesh_z = {z for name, z in d["collections"] if name == "QuadMesh"}
+        contour_z = {z for name, z in d["collections"] if "Contour" in name or name == "LineCollection"}
+        assert mesh_z and max(mesh_z) < min(iso_z)
+        assert contour_z and max(iso_z) < min(contour_z)
+    # 圖例交代水深與線型
+    legend_texts = "\n".join("\n".join(d["texts"]) for d in residence)
+    assert "等深線 200 m（實線）" in legend_texts and "等深線 1000 m（虛線）" in legend_texts
+
+
+def test_isobath_levels_are_a_parameter(tmp_path, footprint_inputs, monkeypatch):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths, isobath_levels=(100.0,))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    for site in SITES:
+        assert manifest["footprint_figures"]["bathymetry"]["by_site"][site]["levels_m"] == [100.0]
+    assert manifest["config"]["isobath_levels_m"] == [100.0]
+    with pytest.raises(native_figures.FiguresError, match="isobath_levels_m"):
+        native_figures.NativeFiguresConfig(
+            postprocess_dir=postprocess_dir,
+            coastline_path=coastline,
+            output_dir=tmp_path / "x",
+            isobath_levels_m=(-5.0,),
+        )
+
+
+def _write_release_config(path: Path, anchors: dict[str, tuple[float, float]]) -> Path:
+    lines = ["study_sites:"]
+    for site, (lon, lat) in anchors.items():
+        lines += [
+            f"- study_site_id: {site}",
+            "  anchor_lonlat:",
+            f"  - {lon}",
+            f"  - {lat}",
+            "  receptor_core_radius_m: 12500.0",
+        ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_receptor_star_comes_from_release_config_anchor_not_release_point_mean(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    anchors = {"site_a": (120.9, 25.1), "site_b": (121.2, 24.9)}
+    config_path = _write_release_config(tmp_path / "release.yaml", anchors)
+    described = _capture_figures(monkeypatch)
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths, receptor_config=config_path)
+    stars = [d["stars"] for d in _wp38_colorbar_figs(described)]
+    assert stars and all(len(s) >= 1 for s in stars)
+    drawn_positions = {pos for s in stars for pos in s}
+    assert drawn_positions == set(anchors.values())
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    by_site = manifest["footprint_figures"]["receptors"]["by_site"]
+    for site, lonlat in anchors.items():
+        rec = by_site[site]
+        assert rec["source"] == "release_config_anchor_lonlat"
+        assert rec["anchor_lonlat"] == list(lonlat) and rec["star_lonlat"] == list(lonlat)
+        assert rec["receptor_core_radius_m"] == 12500.0
+        # 後處理由釋放點反推的平均位置仍記錄著，但不是畫出來的位置
+        assert rec["postprocess_release_point_mean_lonlat"] != list(lonlat)
+        caption = manifest["output_png_sha256"][f"{site}/lookback_snapshot.png"]["caption"]
+        assert f"{lonlat[0]:.4f}°E, {lonlat[1]:.4f}°N" in caption and "12.5 km" in caption
+    assert "receptor_config" in manifest["inputs_sha256_before"]
+    assert manifest["config"]["receptor_config_basename"] == "release.yaml"
+
+
+def test_receptor_falls_back_to_release_point_mean_and_says_so(tmp_path, footprint_inputs):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    rec = manifest["footprint_figures"]["receptors"]["by_site"]["site_a"]
+    assert rec["source"] == "postprocess_release_point_mean" and rec["anchor_lonlat"] is None
+    assert rec["star_lonlat"] == rec["postprocess_release_point_mean_lonlat"]
+    caption = manifest["output_png_sha256"]["site_a/source_footprint_residence.png"]["caption"]
+    assert "平均位置" in caption and "不是研究點錨點" in caption
+
+
+def test_release_config_missing_a_site_fails_closed(tmp_path, footprint_inputs):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    config_path = _write_release_config(tmp_path / "release.yaml", {"site_a": (120.9, 25.1)})
+    with pytest.raises(native_figures.FiguresError, match="anchor_lonlat"):
+        _build(tmp_path, postprocess_dir, coastline, isobaths, receptor_config=config_path)
+    (tmp_path / "bad.yaml").write_text("study_sites: []\n", encoding="utf-8")
+    with pytest.raises(native_figures.FiguresError, match="study_sites"):
+        _build(
+            tmp_path, postprocess_dir, coastline, isobaths, receptor_config=tmp_path / "bad.yaml", name="o2"
+        )
+
+
+def test_site_name_is_absent_from_none_mode_figures_but_kept_in_captions(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    names = {"site_a": "甲灣", "site_b": "乙岸"}
+    monkeypatch.setitem(native_figures.SITE_LABELS_ZH, "site_a", names["site_a"])
+    monkeypatch.setitem(native_figures.SITE_LABELS_ZH, "site_b", names["site_b"])
+    config_path = _write_release_config(
+        tmp_path / "release.yaml", {"site_a": (120.9, 25.1), "site_b": (121.2, 24.9)}
+    )
+    full = _build(tmp_path, postprocess_dir, coastline, isobaths, name="full", receptor_config=config_path)
+    none = _build(
+        tmp_path, postprocess_dir, coastline, isobaths, name="none", text="none", receptor_config=config_path
+    )
+    forbidden = [*names.values(), "site_a", "site_b"]
+    for site in SITES:
+        for stem in native_figures.FOOTPRINT_FIGURE_STEMS:
+            svg_none = (none / site / f"{stem}.svg").read_text(encoding="utf-8")
+            svg_full = (full / site / f"{stem}.svg").read_text(encoding="utf-8")
+            for word in forbidden:
+                assert word not in svg_none, (site, stem, word)
+            # 對照：full 模式的標題確實有站名，所以上面的檢查不是空轉
+            assert names[site] in svg_full, (site, stem)
+        caps = (none / "captions.md").read_text(encoding="utf-8")
+        assert names[site] in caps
+    # 星號旁沒有站名標籤，圖例只寫「受體」
+    for stem in ("source_footprint_residence", "lookback_snapshot"):
+        svg_full = (full / "site_a" / f"{stem}.svg").read_text(encoding="utf-8")
+        assert "受體（研究點錨點）" in svg_full and "粒子釋放範圍" in svg_full
+    # 每張新圖的圖說都有站名與受體經緯度
+    manifest = json.loads((none / "manifest.json").read_text(encoding="utf-8"))
+    for site, (lon, lat) in {"site_a": (120.9, 25.1), "site_b": (121.2, 24.9)}.items():
+        for stem in native_figures.FOOTPRINT_FIGURE_STEMS:
+            caption = manifest["output_png_sha256"][f"{site}/{stem}.png"]["caption"]
+            assert names[site] in caption and f"{lon:.4f}°E, {lat:.4f}°N" in caption, (site, stem)
+
+
+def test_map_has_no_isobath_number_labels_and_no_site_names(tmp_path, footprint_inputs, monkeypatch):
+    """地圖 axes 內沒有等深線數字標籤，地圖與圖例都沒有站名（只有 full 模式的圖標題可以有）。"""
+
+    import re
+
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    names = {"site_a": "甲灣", "site_b": "乙岸"}
+    for site, name in names.items():
+        monkeypatch.setitem(native_figures.SITE_LABELS_ZH, site, name)
+    config_path = _write_release_config(
+        tmp_path / "release.yaml", {"site_a": (120.9, 25.1), "site_b": (121.2, 24.9)}
+    )
+    described = _capture_figures(monkeypatch)
+    _build(tmp_path, postprocess_dir, coastline, isobaths, receptor_config=config_path)
+    figs = _wp38_colorbar_figs(described)
+    assert len(figs) == 3 * len(SITES)
+    depth_label = re.compile(r"^\s*\d+(\.\d+)?\s*(m|公尺)\s*$")
+    for d in figs:
+        assert d["isobaths"], "等深線有畫，只是沒有數字標籤"
+        for text in d["axes_texts"]:
+            assert not depth_label.match(text), text
+            assert not any(word in text for word in (*names.values(), *SITES)), text
+        for text in d["legend_texts"]:
+            assert not any(word in text for word in (*names.values(), *SITES)), text
+        assert "受體（研究點錨點）" in d["legend_texts"] and "粒子釋放範圍" in d["legend_texts"]
+        assert "等深線 200 m（實線）" in d["legend_texts"] and "等深線 1000 m（虛線）" in d["legend_texts"]
+
+
+def test_legend_omits_isobath_levels_that_are_absent_from_the_site(tmp_path, footprint_inputs, monkeypatch):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    described = _capture_figures(monkeypatch)
+    _build(tmp_path, postprocess_dir, coastline, isobaths, isobath_levels=(200.0,))
+    for d in _wp38_colorbar_figs(described):
+        assert "等深線 200 m（實線）" in d["legend_texts"]
+        assert not any("1000" in text for text in d["legend_texts"])
+
+
+def test_release_hull_contains_every_release_point_and_is_drawn():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from shapely.geometry import Point
+
+    points = np.array([[120.80, 21.90], [120.85, 21.95], [120.78, 22.00], [120.83, 21.98], [120.81, 21.93]])
+    hull = native_figures._release_hull(points)
+    assert hull is not None and hull.geom_type == "Polygon"
+    assert all(hull.buffer(1e-9).contains(Point(x, y)) for x, y in points)
+    assert native_figures._release_hull(None) is None
+    assert native_figures._release_hull(points[:2]).geom_type == "LineString"  # 兩點：線段
+    domain = np.array([[120.5, 21.6], [121.1, 21.6], [121.1, 22.3], [120.5, 22.3]])
+    fp = native_figures.FootprintSiteFigureData(
+        site_id="t",
+        grid={
+            "lon0_deg": 120.5,
+            "lat0_deg": 21.6,
+            "nx": 6,
+            "ny": 7,
+            "resolution_deg": 0.1,
+            "total_particle_hours": 1,
+        },
+        density_pct_per_km2=np.zeros((7, 6)),
+        hdr_threshold_pct_per_km2={},
+        hdr_area_km2={},
+        snapshots=(),
+        arc_bins=(),
+        edge_intervals=(),
+        domain_lonlat=domain,
+        open_boundary_parts=(),
+        receptor_center=(120.83, 21.89),
+        summary={},
+        receptor_anchor=(120.763161, 21.946577),
+        release_points=points,
+    )
+    fig, ax = plt.subplots()
+    try:
+        native_figures._draw_footprint_base_map(ax, fp, [], {})
+        polygons = [p for p in ax.patches if type(p).__name__ == "Polygon"]
+        assert len(polygons) == 1
+        drawn = polygons[0].get_xy()
+        from shapely.geometry import Polygon as ShapelyPolygon
+
+        drawn_hull = ShapelyPolygon(drawn)
+        assert all(drawn_hull.buffer(1e-9).contains(Point(x, y)) for x, y in points)
+        star = [ln for ln in ax.lines if ln.get_marker() == "*"]
+        assert len(star) == 1 and tuple(star[0].get_xydata()[0]) == (120.763161, 21.946577)
+    finally:
+        plt.close(fig)
+
+
+def test_manifest_records_release_geometry_and_anchor_checks(tmp_path, footprint_inputs, monkeypatch):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    anchors = {"site_a": (120.9, 25.1), "site_b": (121.1, 24.6)}  # site_b 的錨點落在合成陸地方塊內
+    config_path = _write_release_config(tmp_path / "release.yaml", anchors)
+    described = _capture_figures(monkeypatch)
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths, receptor_config=config_path)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    block = manifest["footprint_figures"]["receptors"]
+    import hashlib
+
+    assert block["config_sha256"] == hashlib.sha256(config_path.read_bytes()).hexdigest()
+    assert block["config_path"] == str(config_path)
+    for site, (lon, lat) in anchors.items():
+        geo = block["by_site"][site]["release_geometry"]
+        assert geo["release_point_count"] == len(RECEPTORS)
+        pts = np.asarray(geo["release_points_lonlat"])
+        centroid = pts.mean(axis=0)
+        assert geo["release_centroid_lonlat"] == pytest.approx(list(centroid))
+        # 獨立估算：小範圍內用等距圓柱近似（1 度緯度約 111.195 km）
+        dx = (centroid[0] - lon) * np.cos(np.radians(lat)) * 111.195
+        dy = (centroid[1] - lat) * 111.195
+        assert geo["anchor_to_release_centroid_km"] == pytest.approx(float(np.hypot(dx, dy)), rel=0.02)
+        assert geo["release_max_radius_km"] >= 0.0
+        assert geo["release_max_distance_from_anchor_km"] >= geo["anchor_to_release_centroid_km"] - 1e-9
+    assert block["by_site"]["site_a"]["release_geometry"]["anchor_on_sea"] is True
+    assert block["by_site"]["site_b"]["release_geometry"]["anchor_on_sea"] is False
+    # 兩個釋放點：凸包退化成線段，圖上不畫多邊形，但釋放點仍在 manifest
+    assert all(not d["release_polygons"] for d in _wp38_colorbar_figs(described))
+
+
+def test_missing_config_is_rejected_unless_explicitly_allowed(tmp_path, footprint_inputs):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    with pytest.raises(native_figures.FiguresError, match="--config"):
+        _build(tmp_path, postprocess_dir, coastline, isobaths, allow_unanchored=False)
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths, name="diag")  # 診斷模式：明示允許
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["config"]["allow_unanchored_receptor"] is True
+    rec = manifest["footprint_figures"]["receptors"]
+    assert rec["config_sha256"] is None and rec["by_site"]["site_a"]["formal_anchor_used"] is False
+
+
+def test_cli_requires_config_flag_for_formal_figures(tmp_path, footprint_inputs, monkeypatch):
+    from lagrangian_backtracking import cli
+
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    parser = cli._native_figures_parser()
+    args = parser.parse_args(
+        [
+            "--postprocess-dir",
+            str(postprocess_dir),
+            "--coastline",
+            str(coastline),
+            "--output-dir",
+            str(tmp_path / "o"),
+        ]
+    )
+    assert args.config is None and args.allow_unanchored_receptor is False
+    assert args.isobath_levels == [200.0, 1000.0]
+    with pytest.raises(native_figures.FiguresError, match="--config"):
+        cli.run_native_figures_command(
+            [
+                "--postprocess-dir",
+                str(postprocess_dir),
+                "--coastline",
+                str(coastline),
+                "--output-dir",
+                str(tmp_path / "o"),
+            ]
+        )
+
+
+def test_json_policy_wp38_constants_match_figures_py():
+    """JSON 契約 wp38_footprint_figures 區塊的常數與 figures.py 執行期常數逐項一致。"""
+
+    policy_path = (
+        Path(__file__).resolve().parents[1] / "docs" / "data" / "native_figures_formal_output_policy_v1.json"
+    )
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert policy["schema_version"] == "1.1.0" and policy["rules_document_version"] == "1.1.0"
+    block = policy["wp38_footprint_figures"]
+    assert tuple(block["figure_stems"]["value"]) == native_figures.FOOTPRINT_FIGURE_STEMS
+    iso = block["isobath"]
+    assert tuple(iso["levels_m_default"]["value"]) == native_figures.ISOBATH_LEVELS_DEFAULT
+    assert tuple(iso["linestyles_by_level_order"]["value"]) == native_figures._ISOBATH_LINESTYLES
+    assert iso["color"]["value"] == native_figures._ISOBATH_COLOR
+    assert iso["linewidth_pt"]["value"] == native_figures._ISOBATH_LINEWIDTH
+    assert iso["number_labels_on_map"] is False
+    release = block["release_range"]
+    assert tuple(release["face_rgba"]["value"]) == native_figures._RELEASE_FACE
+    assert release["edge_color"]["value"] == native_figures._RELEASE_EDGE
+    assert release["linewidth_pt"]["value"] == native_figures._RELEASE_LINEWIDTH
+    axes = block["map_axes"]
+    assert tuple(axes["tick_step_choices_deg"]["value"]) == native_figures._TICK_STEP_CHOICES_DEG
+    assert axes["min_intervals"]["value"] == native_figures._MIN_INTERVALS
+    assert axes["residence_max_intervals"]["value"] == native_figures._RESIDENCE_MAX_INTERVALS
+    assert axes["snapshot_max_intervals"]["value"] == native_figures._SNAPSHOT_MAX_INTERVALS
+    bar = block["colorbar"]
+    assert bar["extend"] == "neither"
+    assert (
+        bar["lower_limit_fraction_of_upper_limit"]["value"] == native_figures.RESIDENCE_COLOR_FLOOR_FRACTION
+    )
+    assert bar["alignment_tolerance_px"]["value"] == native_figures.COLORBAR_ALIGNMENT_TOLERANCE_PX
+    lo, hi = native_figures._decade_limits(0.37)
+    assert lo / hi == pytest.approx(bar["lower_limit_fraction_of_upper_limit"]["value"])
+    assert block["receptor"]["config_required"] is True

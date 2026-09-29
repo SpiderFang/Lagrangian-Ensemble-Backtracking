@@ -2273,6 +2273,24 @@ def _native_figures_parser() -> argparse.ArgumentParser:
             "省略或檔案不存在時停留時數密度等新圖仍照常繪製，只是不畫等深線並在 manifest 記錄"
         ),
     )
+    parser.add_argument(
+        "--isobath-levels", type=float, nargs="+", default=list(native_figures.ISOBATH_LEVELS_DEFAULT),
+        help="WP-38：要畫的等深線水深（公尺，預設 200 1000；200 為陸棚邊緣）。畫多了會干擾高密度區間",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=None,
+        help=(
+            "WP-38：正式釋放設定 YAML（只讀）；星號受體位置取其 study_sites[].anchor_lonlat，"
+            "manifest 記錄檔案 SHA-256。後處理目錄含足跡產品時必須提供（fail-closed）"
+        ),
+    )
+    parser.add_argument(
+        "--allow-unanchored-receptor", action="store_true",
+        help=(
+            "WP-38 診斷用：允許省略 --config，星號退回後處理由釋放點反推的平均位置；"
+            "圖例、圖說與 manifest 會標明這不是站點錨點，正式出圖不得使用"
+        ),
+    )
     return parser
 
 
@@ -2293,6 +2311,9 @@ def run_native_figures_command(argv: Sequence[str] | None = None) -> int:
         dpi=args.dpi,
         figure_text=args.figure_text,
         bathymetry_path=args.bathymetry,
+        isobath_levels_m=tuple(args.isobath_levels),
+        receptor_config_path=args.config,
+        allow_unanchored_receptor=args.allow_unanchored_receptor,
     )
     output_dir = native_figures.build_native_figures(config, command=command)
     report = {

@@ -157,7 +157,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -182,6 +182,7 @@ from .backward_driver import (
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
     NATIVE_STATUS_STRANDED,
 )
+from .footprint import cell_area_km2_by_row
 from .postprocess import DEFAULT_AZIMUTH_SECTOR_COUNT, NON_CROSSING_STATUS_CATEGORY_ZH
 
 __all__ = [
@@ -306,6 +307,10 @@ class _Labeler:
 
 # ── 設定 ─────────────────────────────────────────────────────────────────
 
+ISOBATH_LEVELS_DEFAULT: tuple[float, ...] = (200.0, 1000.0)
+"""WP-38 預設只畫兩條等深線：200 m（陸棚邊緣，摘要表的陸棚占比即以此為界）與 1000 m；
+等深線密了會和高密度區間（HDR）互相干擾，所以其他水深預設不畫，需要時由參數指定。"""
+
 FIGURE_TEXT_MODES: tuple[str, ...] = ("full", "none")
 """``--figure-text`` 合法值：``full``＝標題／副標／圖例／座標軸標籤全部畫出
 （預設，供內部檢視）；``none``＝只畫座標軸與圖例，不畫標題與副標（供正式報告
@@ -332,7 +337,12 @@ class NativeFiguresConfig:
 
     ``bathymetry_path``（WP-38）是 ``scripts/export_isobaths.py`` 匯出的等深線 GeoJSON
     （CRS84）；省略或檔案不存在時，停留時數密度等新圖仍照常繪製，只是不畫等深線，
-    並在 ``manifest.json`` 的 ``footprint_figures`` 區塊記錄原因。
+    並在 ``manifest.json`` 的 ``footprint_figures`` 區塊記錄原因。``isobath_levels_m`` 是要畫的
+    等深線水深（預設 200、1000 公尺，見 :data:`ISOBATH_LEVELS_DEFAULT`）。
+    ``receptor_config_path`` 是正式釋放設定 YAML（讀 ``study_sites[].anchor_lonlat``）：星號受體
+    位置以此為準。後處理目錄含足跡產品而沒有提供 ``receptor_config_path`` 時 fail-closed（正式出圖必須帶
+    釋放設定）；只有明示 ``allow_unanchored_receptor=True``（診斷用）才退回後處理由釋放點反推的
+    平均位置，並在圖例、圖說與 manifest 標明這不是站點錨點。
     """
 
     postprocess_dir: Path
@@ -344,6 +354,9 @@ class NativeFiguresConfig:
     dpi: int = 150
     figure_text: str = "full"
     bathymetry_path: Path | None = None
+    isobath_levels_m: tuple[float, ...] = ISOBATH_LEVELS_DEFAULT
+    receptor_config_path: Path | None = None
+    allow_unanchored_receptor: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "postprocess_dir", Path(self.postprocess_dir))
@@ -353,6 +366,12 @@ class NativeFiguresConfig:
             object.__setattr__(self, "font_path", Path(self.font_path))
         if self.bathymetry_path is not None:
             object.__setattr__(self, "bathymetry_path", Path(self.bathymetry_path))
+        if self.receptor_config_path is not None:
+            object.__setattr__(self, "receptor_config_path", Path(self.receptor_config_path))
+        levels = tuple(sorted({float(v) for v in self.isobath_levels_m}))
+        if any(not math.isfinite(v) or v <= 0 for v in levels):
+            raise FiguresError("isobath_levels_m 必須是有限正數（水深，公尺）")
+        object.__setattr__(self, "isobath_levels_m", levels)
         if self.sites is not None:
             sites = tuple(self.sites)
             if not sites or any(not isinstance(s, str) or not s for s in sites):
@@ -983,6 +1002,37 @@ def _build_arc_segments(arc_table: pa.Table, site_id: str) -> dict[str, tuple[di
     }
 
 
+def _load_receptor_anchors(path: Path) -> dict[str, tuple[float, float, float | None]]:
+    """讀正式釋放設定 YAML 的 ``study_sites[].anchor_lonlat``（權威來源）。
+
+    回傳 ``{站: (經度, 緯度, receptor_core_radius_m 或 None)}``。這是研究點的定義位置
+    （見 ``config.StudySiteConfig``）；後處理由各受體釋放點平均反推的位置不是權威值，
+    因為 20 個受體是在錨點周圍的核心半徑內隨機取點。任何缺漏或非有限值都 fail-closed。
+    """
+
+    import yaml
+
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise FiguresError(f"無法讀取釋放設定檔：{exc}") from exc
+    sites = payload.get("study_sites") if isinstance(payload, dict) else None
+    if not isinstance(sites, list) or not sites:
+        raise FiguresError("釋放設定檔缺少 study_sites 清單")
+    result: dict[str, tuple[float, float, float | None]] = {}
+    for index, item in enumerate(sites):
+        try:
+            site_id = str(item["study_site_id"])
+            lon, lat = (float(v) for v in item["anchor_lonlat"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FiguresError(f"釋放設定檔 study_sites[{index}] 缺少 study_site_id／anchor_lonlat") from exc
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            raise FiguresError(f"釋放設定檔 study_sites[{index}] 的 anchor_lonlat 必須是有限數值")
+        radius_raw = item.get("receptor_core_radius_m")
+        result[site_id] = (lon, lat, float(radius_raw) if radius_raw is not None else None)
+    return result
+
+
 def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInputs:
     """讀取並核對一次 native-figures 執行的全部輸入，回傳每站已就緒的繪圖資料。
 
@@ -1135,6 +1185,29 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
         footprint_data, footprint_paths = _load_footprint_figure_inputs(
             postprocess_dir, [site.site_id for site in sites]
         )
+
+    unanchored = config.receptor_config_path is None and not config.allow_unanchored_receptor
+    if footprint_data is not None and unanchored:
+        raise FiguresError(
+            "後處理目錄含足跡產品，但未提供釋放設定（--config）：星號受體必須取自正式設定的 "
+            "study_sites[].anchor_lonlat；僅診斷用途可加 --allow-unanchored-receptor 退回釋放點平均位置"
+        )
+    if config.receptor_config_path is not None:
+        anchors = _load_receptor_anchors(config.receptor_config_path)
+        if footprint_data is not None:
+            missing = [sid for sid in footprint_data if sid not in anchors]
+            if missing:
+                raise FiguresError(f"釋放設定檔沒有這些站的 anchor_lonlat：{missing}")
+            footprint_data = {
+                sid: replace(
+                    fp,
+                    receptor_anchor=(anchors[sid][0], anchors[sid][1]),
+                    receptor_core_radius_m=anchors[sid][2],
+                    receptor_source="release_config_anchor_lonlat",
+                )
+                for sid, fp in footprint_data.items()
+            }
+        footprint_paths = {**footprint_paths, "receptor_config": config.receptor_config_path}
 
     source_paths: dict[str, Path] = {
         **footprint_paths,
@@ -2588,7 +2661,28 @@ _OPEN_BOUNDARY_STYLE: Mapping[str, Any] = {"color": "#d0009f", "linewidth": 1.2,
 _OPEN_BOUNDARY_LABEL_ZH = "流場範圍開放邊界（終止邊界）"
 _OPEN_BOUNDARY_LABEL_EN = "Flow-domain open boundary (terminating boundary)"
 _LAND_COLOR = "#d9d9d9"
-_ISOBATH_COLOR = "#7a7a7a"
+_ISOBATH_COLOR = "#7f7f7f"
+_ISOBATH_LINEWIDTH = 0.4
+# 等深線線型依水深由淺到深：實線、虛線、點虛線、點線（預設 200 m 實線、1000 m 虛線）；
+# 顏色是中灰、線寬 0.4 pt，和 HDR 的深棕色粗線明顯區隔，HDR 才是圖上的主角。
+_ISOBATH_LINESTYLES: tuple[str, ...] = ("-", "--", "-.", ":")
+_ISOBATH_STYLE_ZH: tuple[str, ...] = ("實線", "虛線", "點虛線", "點線")
+_ISOBATH_STYLE_EN: tuple[str, ...] = ("solid", "dashed", "dash-dot", "dotted")
+
+# 座標軸範圍向外擴到刻度間距的整數倍；間距依範圍大小在下列值中挑最小且刻度間隔數不超過上限者。
+# 每軸刻度數 4～7 個（間隔數 3～6）；2×2 快照的小面板上限放寬為最多 6 個刻度（間隔數 5）。
+_TICK_STEP_CHOICES_DEG: tuple[float, ...] = (0.1, 0.2, 0.25, 0.5, 1.0)
+_MIN_INTERVALS = 3
+_RESIDENCE_MAX_INTERVALS = 6
+_SNAPSHOT_MAX_INTERVALS = 5
+
+# 粒子釋放範圍（全部釋放點的凸包）：淡紫半透明填色加細框，畫在密度與 HDR 之上、陸地與星號之間，
+# 只是位置參考，不搶 HDR 等值線的視覺重心。
+_RELEASE_FACE = (0.42, 0.24, 0.60, 0.14)
+_RELEASE_EDGE = "#6a3d9a"
+_RELEASE_LINEWIDTH = 0.7
+COLORBAR_ALIGNMENT_TOLERANCE_PX = 1.0
+"""色條與主圖上下緣對齊的驗收容差（顯示座標，像素）。"""
 
 _EDGE_NAME_ZH: Mapping[str, str] = {"west": "西", "east": "東", "south": "南", "north": "北"}
 
@@ -2617,6 +2711,17 @@ class FootprintSiteFigureData:
     open_boundary_parts: tuple[np.ndarray, ...]
     receptor_center: tuple[float, float] | None
     summary: Mapping[str, Any]
+    receptor_anchor: tuple[float, float] | None = None
+    receptor_core_radius_m: float | None = None
+    receptor_source: str = "postprocess_release_point_mean"
+    release_points: np.ndarray | None = None
+    """全部相異釋放點（受體水平位置）的經緯度，形狀 ``(n, 2)``；來自後處理的足跡幾何表。"""
+
+    @property
+    def receptor_lonlat(self) -> tuple[float, float] | None:
+        """星號位置：有正式釋放設定的錨點就用錨點，否則退回釋放點平均位置。"""
+
+        return self.receptor_anchor if self.receptor_anchor is not None else self.receptor_center
 
     @property
     def lon_edges(self) -> np.ndarray:
@@ -2747,6 +2852,15 @@ def _load_footprint_figure_inputs(
             )
             for p in sorted(parts)
         )
+        release = [r for r in geometry if r["element"] == "receptor"]
+        release_points = (
+            np.asarray(
+                [[r["lon_deg"], r["lat_deg"]] for r in sorted(release, key=lambda r: r["vertex_index"])],
+                dtype=np.float64,
+            )
+            if release
+            else None
+        )
         centers = [r for r in geometry if r["element"] == "receptor_center"]
         receptor_center = (float(centers[0]["lon_deg"]), float(centers[0]["lat_deg"])) if centers else None
 
@@ -2767,6 +2881,7 @@ def _load_footprint_figure_inputs(
             open_boundary_parts=boundary_parts,
             receptor_center=receptor_center,
             summary=summary_rows[0],
+            release_points=release_points,
         )
     return result, paths
 
@@ -2817,20 +2932,69 @@ def _load_isobaths(path: Path | None) -> tuple[dict[str, dict[float, list[np.nda
     return result, {"status": "loaded", "features": len(payload.get("features", []))}
 
 
-def _site_extent(
-    fp: FootprintSiteFigureData, margin_fraction: float = 0.04
-) -> tuple[float, float, float, float]:
+def _axis_ticks(lo: float, hi: float, *, max_intervals: int) -> np.ndarray:
+    """把 ``[lo, hi]`` 向外擴到刻度間距的整數倍，回傳等間距刻度（首末刻度即軸範圍）。
+
+    間距在 :data:`_TICK_STEP_CHOICES_DEG`（0.1、0.2、0.25、0.5、1 度）中挑最小、且刻度間隔數不超過
+    ``max_intervals`` 者；範圍太小、間隔數不到 :data:`_MIN_INTERVALS`（即刻度少於 4 個）時，
+    在兩側輪流多擴一格。範圍一定完整包含 ``[lo, hi]``，首末刻度正好落在框邊，沒有無刻度的空白段。
+    """
+
+    step = _TICK_STEP_CHOICES_DEG[-1]
+    k0 = k1 = 0
+    for step in _TICK_STEP_CHOICES_DEG:
+        k0 = math.floor(lo / step + 1e-9)
+        k1 = math.ceil(hi / step - 1e-9)
+        if k1 - k0 <= max_intervals:
+            break
+    if k1 <= k0:
+        k1 = k0 + 1
+    grow_high = True
+    while k1 - k0 < _MIN_INTERVALS:
+        if grow_high:
+            k1 += 1
+        else:
+            k0 -= 1
+        grow_high = not grow_high
+    return np.round(np.arange(k0, k1 + 1) * step, 10)
+
+
+def _site_axis_ticks(
+    fp: FootprintSiteFigureData, margin_fraction: float = 0.04, max_intervals: int = _RESIDENCE_MAX_INTERVALS
+) -> tuple[np.ndarray, np.ndarray]:
+    """地圖的經度、緯度刻度；範圍是流場範圍外框加邊界餘量後向外擴到刻度倍數。"""
+
     lon = fp.domain_lonlat[:, 0]
     lat = fp.domain_lonlat[:, 1]
-    lon_min, lon_max, lat_min, lat_max = (
-        float(lon.min()),
-        float(lon.max()),
-        float(lat.min()),
-        float(lat.max()),
+    dx = (float(lon.max()) - float(lon.min())) * margin_fraction
+    dy = (float(lat.max()) - float(lat.min())) * margin_fraction
+    return (
+        _axis_ticks(float(lon.min()) - dx, float(lon.max()) + dx, max_intervals=max_intervals),
+        _axis_ticks(float(lat.min()) - dy, float(lat.max()) + dy, max_intervals=max_intervals),
     )
-    dx = (lon_max - lon_min) * margin_fraction
-    dy = (lat_max - lat_min) * margin_fraction
-    return lon_min - dx, lon_max + dx, lat_min - dy, lat_max + dy
+
+
+def _site_extent(
+    fp: FootprintSiteFigureData, margin_fraction: float = 0.04, max_intervals: int = _RESIDENCE_MAX_INTERVALS
+) -> tuple[float, float, float, float]:
+    xt, yt = _site_axis_ticks(fp, margin_fraction, max_intervals)
+    return float(xt[0]), float(xt[-1]), float(yt[0]), float(yt[-1])
+
+
+def _nice_ceiling_axis(value: float, *, max_intervals: int) -> tuple[float, np.ndarray]:
+    """從 0 起算、向上取整到「漂亮間距」的軸：回傳 ``(軸上限, 刻度)``，刻度間隔數不超過上限。"""
+
+    if not math.isfinite(value) or value <= 0:
+        return 1.0, np.asarray([0.0, 1.0])
+    exponent = math.floor(math.log10(value / max_intervals)) - 1
+    while True:
+        for mantissa in (1.0, 2.0, 2.5, 5.0):
+            step = mantissa * 10.0**exponent
+            n = math.ceil(value / step - 1e-9)
+            if n <= max_intervals:
+                n = max(n, 1)
+                return round(n * step, 10), np.round(np.arange(n + 1) * step, 10)
+        exponent += 1
 
 
 def _inside_runs(seg: np.ndarray, extent: tuple[float, float, float, float]) -> list[np.ndarray]:
@@ -2853,54 +3017,45 @@ def _inside_runs(seg: np.ndarray, extent: tuple[float, float, float, float]) -> 
     return runs
 
 
+def _isobath_linestyle(depth: float, levels: Sequence[float]) -> str:
+    ordered = sorted(levels)
+    idx = min(range(len(ordered)), key=lambda i: abs(ordered[i] - depth)) if ordered else 0
+    return _ISOBATH_LINESTYLES[idx % len(_ISOBATH_LINESTYLES)]
+
+
 def _draw_isobaths(
     ax,
     site_isobaths: Mapping[float, list[np.ndarray]],
     extent: tuple[float, float, float, float],
-    font: Any,
-    *,
-    label_fontsize: float = 6.5,
+    levels: Sequence[float],
 ) -> list[float]:
-    """畫等深線（細灰線，200 公尺稍粗）並標注水深；回傳實際畫出的水深清單。"""
+    """畫指定水深的等深線（中灰 0.4 pt，最淺一條實線、其次虛線），回傳實際畫出的水深。
+
+    地圖上不放水深數字標籤（標籤是干擾高密度區間的主要來源）；水深與線型改由圖例與圖說交代。
+    圖層順序在密度色塊之上、HDR 等值線之下。
+    """
 
     drawn: list[float] = []
-    diag = math.hypot(extent[1] - extent[0], extent[3] - extent[2])
-    for depth in sorted(site_isobaths):
+    for depth in sorted(levels):
+        key = next((d for d in site_isobaths if abs(d - depth) < 1e-9), None)
+        if key is None:
+            continue
         runs: list[np.ndarray] = []
-        for seg in site_isobaths[depth]:
+        for seg in site_isobaths[key]:
             runs.extend(_inside_runs(seg, extent))
         if not runs:
             continue
-        width = 0.9 if abs(depth - 200.0) < 1e-9 else 0.45
+        style = _isobath_linestyle(depth, levels)
         for run in runs:
             ax.plot(
-                run[:, 0], run[:, 1], color=_ISOBATH_COLOR, linewidth=width, zorder=4, solid_capstyle="round"
+                run[:, 0],
+                run[:, 1],
+                color=_ISOBATH_COLOR,
+                linewidth=_ISOBATH_LINEWIDTH,
+                linestyle=style,
+                zorder=3,
             )
         drawn.append(depth)
-        # 標注：取最長的兩段，兩個標注點要相隔夠遠。
-        lengths = [float(np.sum(np.hypot(np.diff(r[:, 0]), np.diff(r[:, 1])))) for r in runs]
-        placed: list[tuple[float, float]] = []
-        for idx in np.argsort(lengths)[::-1][:2]:
-            if lengths[int(idx)] < 0.12 * diag:
-                continue
-            run = runs[int(idx)]
-            mid = run[run.shape[0] // 2]
-            if any(math.hypot(mid[0] - p[0], mid[1] - p[1]) < 0.3 * diag for p in placed):
-                continue
-            placed.append((float(mid[0]), float(mid[1])))
-            ax.text(
-                float(mid[0]),
-                float(mid[1]),
-                f"{depth:g} m",
-                fontsize=label_fontsize,
-                color="#3c3c3c",
-                ha="center",
-                va="center",
-                zorder=4.5,
-                fontproperties=font,
-                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.4},
-                clip_on=True,
-            )
     return drawn
 
 
@@ -2912,24 +3067,111 @@ def _lat_formatter(value: float, _pos: int | None = None) -> str:
     return f"{value:.2f}°N"
 
 
+def _release_hull(points: np.ndarray | None):
+    """全部釋放點的凸包（shapely 幾何）；設定檔只定義受體核心圓（錨點加半徑），沒有釋放多邊形，
+    所以「實際釋放範圍」取後處理表中各受體釋放點的外包絡。沒有釋放點時回傳 ``None``。"""
+
+    from shapely.geometry import MultiPoint
+
+    if points is None or len(points) == 0:
+        return None
+    return MultiPoint([(float(x), float(y)) for x, y in points]).convex_hull
+
+
+_EARTH_RADIUS_KM = 6371.0088
+
+
+def _haversine_km(lon1, lat1, lon2, lat2):
+    """兩點（或點與陣列）的球面大圓距離（km，地球半徑取 6371.0088 km）。"""
+
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dphi = p2 - p1
+    dlmb = np.radians(np.asarray(lon2) - lon1)
+    h = np.sin(dphi / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlmb / 2.0) ** 2
+    return 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(h))
+
+
+def _release_geometry_record(
+    fp: FootprintSiteFigureData, land_geometries: Sequence[Polygon | MultiPolygon]
+) -> dict[str, Any]:
+    """粒子釋放範圍與錨點的核對數值，寫入 manifest。
+
+    ``anchor_to_release_centroid_km``：錨點到釋放點重心（經緯度算術平均）的距離；
+    ``release_max_radius_km``：釋放點到重心的最大距離；``release_max_distance_from_anchor_km``：
+    釋放點到錨點的最大距離（應不超過受體核心半徑）；``anchor_on_sea``：錨點不在海岸線 GeoJSON
+    的任何陸地多邊形內。沒有釋放設定（無錨點）或沒有釋放點時對應欄位為 ``None``。
+    """
+
+    from shapely.geometry import Point
+
+    pts = fp.release_points
+    anchor = fp.receptor_anchor
+    record: dict[str, Any] = {
+        "release_point_count": int(len(pts)) if pts is not None else 0,
+        "release_points_lonlat": [[float(x), float(y)] for x, y in pts] if pts is not None else [],
+        "distance_method": f"球面大圓（haversine，地球半徑 {_EARTH_RADIUS_KM} km）",
+        "release_area_definition": (
+            "全部相異釋放點（後處理足跡幾何表的受體水平位置）的凸包；設定檔只定義受體核心圓"
+            "（錨點加 receptor_core_radius_m），沒有釋放多邊形"
+        ),
+    }
+    if pts is not None and len(pts):
+        centroid = (float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])))
+        record["release_centroid_lonlat"] = list(centroid)
+        to_centroid = _haversine_km(centroid[0], centroid[1], pts[:, 0], pts[:, 1])
+        record["release_max_radius_km"] = float(np.max(to_centroid))
+        hull = _release_hull(pts)
+        record["release_hull_vertex_count"] = (
+            len(hull.exterior.coords) - 1 if hull is not None and hull.geom_type == "Polygon" else 0
+        )
+        record["release_points_on_land_count"] = int(
+            sum(any(g.contains(Point(float(x), float(y))) for g in land_geometries) for x, y in pts)
+        )
+    else:
+        centroid = None
+    if anchor is not None:
+        record["anchor_lonlat"] = list(anchor)
+        record["anchor_on_sea"] = not any(g.contains(Point(anchor[0], anchor[1])) for g in land_geometries)
+        if centroid is not None and pts is not None:
+            record["anchor_to_release_centroid_km"] = float(
+                _haversine_km(anchor[0], anchor[1], centroid[0], centroid[1])
+            )
+            record["release_max_distance_from_anchor_km"] = float(
+                np.max(_haversine_km(anchor[0], anchor[1], pts[:, 0], pts[:, 1]))
+            )
+    else:
+        record["anchor_lonlat"] = None
+        record["anchor_on_sea"] = None
+    return record
+
+
+def _hdr_masks(density: np.ndarray, thresholds: Mapping[float, float]) -> list[np.ndarray]:
+    return [density >= thresholds[level] * (1.0 - 1e-9) for level in sorted(thresholds)]
+
+
 def _draw_footprint_base_map(
     ax,
     fp: FootprintSiteFigureData,
     land_geometries: Sequence[Polygon | MultiPolygon],
     site_isobaths: Mapping[float, list[np.ndarray]],
-    t: _Labeler,
-    font: Any,
     *,
-    site_label: str,
-    label_fontsize: float = 6.5,
+    isobath_levels: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
+    max_intervals: int = _RESIDENCE_MAX_INTERVALS,
     tick_fontsize: float = 8.0,
 ) -> tuple[tuple[float, float, float, float], list[float]]:
-    """陸地（灰）、海岸線（黑 0.5 pt）、等深線、開放邊界（洋紅虛線）與受體星號。"""
+    """陸地（灰）、海岸線（黑 0.5 pt）、等深線、開放邊界（洋紅虛線）、粒子釋放範圍與受體星號。
 
-    from matplotlib.ticker import FuncFormatter, MaxNLocator
+    圖面不寫站名（星號旁沒有文字標籤，圖例只寫「受體（研究點錨點）」）；受體位置用
+    ``fp.receptor_lonlat``，粒子釋放範圍是全部釋放點的凸包（見 :func:`_release_hull`）。
+    座標軸範圍與刻度見 :func:`_axis_ticks`：首末刻度就是四個框邊。回傳
+    ``(座標軸範圍, 實際畫出的等深線水深)``。
+    """
+
+    from matplotlib.ticker import FuncFormatter
     from shapely.plotting import plot_polygon
 
-    extent = _site_extent(fp)
+    xticks, yticks = _site_axis_ticks(fp, max_intervals=max_intervals)
+    extent = (float(xticks[0]), float(xticks[-1]), float(yticks[0]), float(yticks[-1]))
     for land in land_geometries:
         plot_polygon(
             land,
@@ -2940,14 +3182,30 @@ def _draw_footprint_base_map(
             linewidth=0.5,
             zorder=5.5,  # 陸地蓋在密度與 HDR 線之上，密度不會畫到陸地上
         )
-    drawn = _draw_isobaths(ax, site_isobaths, extent, font, label_fontsize=label_fontsize)
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_aspect(1.0 / math.cos(math.radians((extent[2] + extent[3]) / 2.0)), adjustable="box")
+    drawn = _draw_isobaths(ax, site_isobaths, extent, isobath_levels)
     for part in fp.open_boundary_parts:
         ax.plot(part[:, 0], part[:, 1], zorder=6, **_OPEN_BOUNDARY_STYLE)
-    if fp.receptor_center is not None:
-        lon, lat = fp.receptor_center
+    hull = _release_hull(fp.release_points)
+    if hull is not None:
+        if hull.geom_type == "Polygon":
+            ax.fill(
+                *hull.exterior.xy,
+                facecolor=_RELEASE_FACE,
+                edgecolor=_RELEASE_EDGE,
+                linewidth=_RELEASE_LINEWIDTH,
+                zorder=7,
+            )
+        else:  # 釋放點不足三個或共線：以線段或點表示
+            xy = np.asarray(hull.coords)
+            ax.plot(xy[:, 0], xy[:, 1], color=_RELEASE_EDGE, linewidth=_RELEASE_LINEWIDTH, zorder=7)
+    receptor = fp.receptor_lonlat
+    if receptor is not None:
         ax.plot(
-            lon,
-            lat,
+            receptor[0],
+            receptor[1],
             marker="*",
             markersize=13,
             markerfacecolor="#ffd92f",
@@ -2956,21 +3214,8 @@ def _draw_footprint_base_map(
             linestyle="none",
             zorder=8,
         )
-        ax.annotate(
-            site_label,
-            xy=(lon, lat),
-            xytext=(7, 7),
-            textcoords="offset points",
-            fontproperties=font,
-            fontsize=9,
-            zorder=9,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8, "pad": 1.0},
-        )
-    ax.set_xlim(extent[0], extent[1])
-    ax.set_ylim(extent[2], extent[3])
-    ax.set_aspect(1.0 / math.cos(math.radians((extent[2] + extent[3]) / 2.0)), adjustable="box")
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
-    ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.set_xticks(xticks)
+    ax.set_yticks(yticks)
     ax.xaxis.set_major_formatter(FuncFormatter(_lon_formatter))
     ax.yaxis.set_major_formatter(FuncFormatter(_lat_formatter))
     ax.tick_params(labelsize=tick_fontsize)
@@ -2979,9 +3224,16 @@ def _draw_footprint_base_map(
 
 
 def _footprint_legend_handles(
-    t: _Labeler, hdr_levels: Sequence[float], *, isobaths_drawn: bool, site_label: str
+    t: _Labeler,
+    hdr_levels: Sequence[float],
+    *,
+    isobath_levels_drawn: Sequence[float],
+    isobath_levels: Sequence[float],
+    receptor_is_anchor: bool = True,
+    has_release_range: bool = True,
 ) -> list[Any]:
     from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
     handles = [
         Line2D(
@@ -3004,28 +3256,197 @@ def _footprint_legend_handles(
             markerfacecolor="#ffd92f",
             markeredgecolor="black",
             linestyle="none",
-            label=t.t(f"受體（{site_label}）", f"Receptor ({site_label})"),
+            label=(
+                t.t("受體（研究點錨點）", "Receptor (study-site anchor)")
+                if receptor_is_anchor
+                else t.t("受體（釋放點平均位置）", "Receptor (mean release position)")
+            ),
         )
     )
-    if isobaths_drawn:
+    if has_release_range:
         handles.append(
-            Line2D([], [], color=_ISOBATH_COLOR, linewidth=0.7, label=t.t("等深線（公尺）", "Isobath (m)"))
+            Patch(
+                facecolor=_RELEASE_FACE,
+                edgecolor=_RELEASE_EDGE,
+                linewidth=_RELEASE_LINEWIDTH,
+                label=t.t("粒子釋放範圍", "Particle release area"),
+            )
+        )
+    ordered = sorted(isobath_levels)
+    for depth in sorted(isobath_levels_drawn):
+        idx = min(range(len(ordered)), key=lambda i: abs(ordered[i] - depth))
+        k = idx % len(_ISOBATH_LINESTYLES)
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color=_ISOBATH_COLOR,
+                linewidth=_ISOBATH_LINEWIDTH,
+                linestyle=_ISOBATH_LINESTYLES[k],
+                label=t.t(
+                    f"等深線 {depth:g} m（{_ISOBATH_STYLE_ZH[k]}）",
+                    f"Isobath {depth:g} m ({_ISOBATH_STYLE_EN[k]})",
+                ),
+            )
         )
     return handles
 
 
 def _log_colorbar_ticks(vmin: float, vmax: float) -> list[float]:
-    lo, hi = math.ceil(math.log10(vmin) - 1e-9), math.floor(math.log10(vmax) + 1e-9)
+    """對數色條刻度：上下限之間每個 10 的整數次方一個刻度，兩端一定在內。"""
+
+    lo, hi = round(math.log10(vmin)), round(math.log10(vmax))
     ticks = [10.0**e for e in range(lo, hi + 1)]
-    return ticks if len(ticks) >= 2 else [vmin, vmax]
+    if len(ticks) < 2:
+        return [vmin, vmax]
+    ticks[0], ticks[-1] = vmin, vmax
+    return ticks
 
 
 def _decade_formatter(value: float, _pos: int | None = None) -> str:
-    return f"{value:g}"
+    """色條刻度文字：``10^-4`` 的數學排版形式。"""
+
+    if value <= 0:
+        return ""
+    return f"$10^{{{round(math.log10(value))}}}$"
+
+
+def _decade_limits(vmax_raw: float) -> tuple[float, float]:
+    """對數色階上下限：上限＝大於或等於最大值的 10 的整數次方，下限＝上限的 1/10000。
+
+    上限一定 >= 資料最大值（浮點誤差時多進一位），所以不會有格子高於上限。
+    """
+
+    if not math.isfinite(vmax_raw) or vmax_raw <= 0:
+        return 10.0**-4, 1.0
+    exponent = math.ceil(math.log10(vmax_raw) - 1e-9)
+    while 10.0**exponent < vmax_raw:
+        exponent += 1
+    return 10.0 ** (exponent - 4), 10.0**exponent
 
 
 def _residence_color_limits(vmax: float) -> tuple[float, float]:
-    return vmax * RESIDENCE_COLOR_FLOOR_FRACTION, vmax
+    return _decade_limits(vmax)
+
+
+def _pow10_text(value: float) -> str:
+    return f"10^{round(math.log10(value))}"
+
+
+def _snapshot_color_limits(fp: FootprintSiteFigureData) -> tuple[float, float]:
+    """快照圖四個面板共用的上下限：四個面板最大密度向上取整到 10 的整數次方。"""
+
+    peaks = [
+        float(s["density_pct_per_km2"].max())
+        for s in fp.snapshots[:4]
+        if s["density_pct_per_km2"] is not None
+    ]
+    return _decade_limits(max(peaks, default=0.0))
+
+
+def _limit_stats(
+    fp: FootprintSiteFigureData, density: np.ndarray, vmin: float, vmax: float
+) -> dict[str, Any]:
+    """低於下限與高於上限的網格數，及其占全部停留時數（或該面板質量）的比例。
+
+    色階不做視覺裁切（低於下限者透明、高於上限者本應為 0），越界情形只記錄在這裡。
+    """
+
+    res = float(fp.grid["resolution_deg"])
+    lat_centers = float(fp.grid["lat0_deg"]) + (np.arange(int(fp.grid["ny"])) + 0.5) * res
+    area = cell_area_km2_by_row(lat_centers, res, res)[:, None]
+    mass = np.where(np.isfinite(density), density, 0.0) * area
+    total = float(mass.sum())
+    positive = density > 0
+    below = positive & (density < vmin)
+    above = density > vmax
+    return {
+        "cells_with_density": int(positive.sum()),
+        "cells_below_lower_limit": int(below.sum()),
+        "mass_fraction_below_lower_limit": float(mass[below].sum() / total) if total > 0 else 0.0,
+        "cells_above_upper_limit": int(above.sum()),
+        "mass_fraction_above_upper_limit": float(mass[above].sum() / total) if total > 0 else 0.0,
+    }
+
+
+def _add_aligned_colorbar(
+    fig,
+    mesh,
+    map_axes: Sequence[Any],
+    *,
+    vmin: float,
+    vmax: float,
+    label: str,
+    font: Any,
+    tick_fontsize: float = 8.0,
+    width: float = 0.018,
+    pad: float = 0.014,
+):
+    """矩形色條（``extend='neither'``），上緣、下緣與實際畫出的地圖軸對齊。
+
+    先讓每個地圖軸套用等比例（aspect）取得實際位置，再依這些位置決定色條軸的位置；
+    不使用 ``fig.colorbar`` 的預設版面。多個地圖軸（2×2 快照）時，色條從最上排的上緣
+    量到最下排的下緣，四個面板共用同一條色條。
+    """
+
+    from matplotlib.ticker import FuncFormatter
+
+    for a in map_axes:
+        a.apply_aspect()
+    pos = [a.get_position() for a in map_axes]
+    bottom = min(p.y0 for p in pos)
+    top = max(p.y1 for p in pos)
+    right = max(p.x1 for p in pos)
+    cax = fig.add_axes((right + pad, bottom, width, top - bottom))
+    cbar = fig.colorbar(mesh, cax=cax, extend="neither")
+    cbar.set_ticks(_log_colorbar_ticks(vmin, vmax))
+    cbar.ax.yaxis.set_major_formatter(FuncFormatter(_decade_formatter))
+    cbar.ax.minorticks_off()
+    cbar.ax.set_ylim(vmin, vmax)
+    cbar.ax.tick_params(labelsize=tick_fontsize)
+    cbar.set_label(label, fontproperties=font)
+    return cbar
+
+
+def _layout_record(fig, map_axes: Sequence[Any], label_axes, cbar=None) -> dict[str, Any]:
+    """畫完後量測並記錄版面：色條與地圖軸的上下緣顯示座標、座標軸範圍與刻度、色條端點刻度。
+
+    ``label_axes`` 是有刻度文字的那個軸（2×2 快照為左下面板）。像素是 ``fig.dpi`` 下的顯示
+    座標；版面以圖的比例座標決定，不隨輸出 dpi 改變。
+    """
+
+    fig.canvas.draw()
+    top_map = max(a.get_window_extent().y1 for a in map_axes)
+    bottom_map = min(a.get_window_extent().y0 for a in map_axes)
+    ax = label_axes
+    record: dict[str, Any] = {
+        "measure_dpi": float(fig.dpi),
+        "map_axes_top_px": float(top_map),
+        "map_axes_bottom_px": float(bottom_map),
+        "xlim": [float(v) for v in ax.get_xlim()],
+        "ylim": [float(v) for v in ax.get_ylim()],
+        "xticks": [float(v) for v in ax.get_xticks()],
+        "yticks": [float(v) for v in ax.get_yticks()],
+        "xtick_labels": [tl.get_text() for tl in ax.get_xticklabels()],
+        "ytick_labels": [tl.get_text() for tl in ax.get_yticklabels()],
+    }
+    if cbar is not None:
+        cb = cbar.ax.get_window_extent()
+        record.update(
+            {
+                "colorbar_top_px": float(cb.y1),
+                "colorbar_bottom_px": float(cb.y0),
+                "top_diff_px": float(cb.y1 - top_map),
+                "bottom_diff_px": float(cb.y0 - bottom_map),
+                "colorbar": {
+                    "extend": "neither",
+                    "ylim": [float(v) for v in cbar.ax.get_ylim()],
+                    "ticks": [float(v) for v in cbar.ax.get_yticks()],
+                    "tick_labels": [tl.get_text() for tl in cbar.ax.get_yticklabels()],
+                },
+            }
+        )
+    return record
 
 
 def _domain_clip_patch(ax, fp: FootprintSiteFigureData):
@@ -3074,22 +3495,26 @@ def _plot_source_footprint_residence(
     vmax: float,
     *,
     scale_kind: str,
+    isobath_levels: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
 ) -> dict[str, Any]:
-    """停留時數密度圖：對數色階、HDR 50／75／90%、底圖與受體。回傳繪圖紀錄。"""
+    """停留時數密度圖：對數色階（上限取 10 的整數次方、下限為上限的 1/10000）、HDR 50／75／90%、
+    底圖與受體。色條與地圖軸同高。回傳繪圖紀錄（含色階越界統計與版面量測）。"""
 
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
-    from matplotlib.ticker import FuncFormatter
 
     fig, ax = plt.subplots(figsize=(9.6, 8.6), dpi=150)
-    extent, drawn = _draw_footprint_base_map(
-        ax, fp, land_geometries, site_isobaths, t, font, site_label=site.site_label_zh
+    fig.subplots_adjust(left=0.1, bottom=0.14, right=0.86, top=_title_top_margin(figure_text, full=0.86))
+    density = fp.density_pct_per_km2
+    levels = sorted(fp.hdr_threshold_pct_per_km2)
+    masks = _hdr_masks(density, fp.hdr_threshold_pct_per_km2)
+    _extent, drawn = _draw_footprint_base_map(
+        ax, fp, land_geometries, site_isobaths, isobath_levels=isobath_levels
     )
     vmin, vmax_used = _residence_color_limits(vmax)
-    density = fp.density_pct_per_km2
     masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
     cmap = plt.get_cmap(_RESIDENCE_CMAP).with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
     mesh = ax.pcolormesh(
@@ -3103,26 +3528,29 @@ def _plot_source_footprint_residence(
     )
     clip_patch = _domain_clip_patch(ax, fp)
     mesh.set_clip_path(clip_patch)
-    cbar = fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.02)
-    cbar.set_ticks(_log_colorbar_ticks(vmin, vmax_used))
-    cbar.ax.yaxis.set_major_formatter(FuncFormatter(_decade_formatter))
-    cbar.ax.minorticks_off()
-    cbar.set_label(
-        t.t("停留時數密度（% 停留時數／km²）", "Residence density (% of particle-hours / km^2)"),
-        fontproperties=font,
+    cbar = _add_aligned_colorbar(
+        fig,
+        mesh,
+        [ax],
+        vmin=vmin,
+        vmax=vmax_used,
+        label=t.t("停留時數密度（% 停留時數／km²）", "Residence density (% of particle-hours / km^2)"),
+        font=font,
     )
-
     lon_c = 0.5 * (fp.lon_edges[:-1] + fp.lon_edges[1:])
     lat_c = 0.5 * (fp.lat_edges[:-1] + fp.lat_edges[1:])
-    levels = sorted(fp.hdr_threshold_pct_per_km2)
-    masks = [density >= fp.hdr_threshold_pct_per_km2[level] * (1.0 - 1e-9) for level in levels]
     _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
 
     ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
     ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
     ax.legend(
         handles=_footprint_legend_handles(
-            t, levels, isobaths_drawn=bool(drawn), site_label=site.site_label_zh
+            t,
+            levels,
+            isobath_levels_drawn=drawn,
+            isobath_levels=isobath_levels,
+            receptor_is_anchor=fp.receptor_anchor is not None,
+            has_release_range=fp.release_points is not None,
         ),
         loc="upper center",
         bbox_to_anchor=(0.5, -0.09),
@@ -3152,10 +3580,18 @@ def _plot_source_footprint_residence(
         ),
         figure_text=figure_text,
     )
-    fig.subplots_adjust(left=0.1, bottom=0.14, right=0.95, top=_title_top_margin(figure_text, full=0.86))
+    layout = _layout_record(fig, [ax], ax, cbar)
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
-    return {"isobath_levels_m": drawn, "vmin": vmin, "vmax": vmax_used, "scale": scale_kind}
+    return {
+        "isobath_levels_m": drawn,
+        "vmin": vmin,
+        "vmax": vmax_used,
+        "raw_max": float(vmax),
+        "scale": scale_kind,
+        "limit_stats": _limit_stats(fp, density, vmin, vmax_used),
+        "layout": layout,
+    }
 
 
 def _plot_lookback_snapshot(
@@ -3168,41 +3604,53 @@ def _plot_lookback_snapshot(
     path: Path,
     dpi: int,
     figure_text: str,
+    *,
+    isobath_levels: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
 ) -> dict[str, Any]:
-    """2×2 回溯快照圖：各面板是該回溯時刻仍在漂流的粒子的條件式來源足跡（與停留時數密度同網格）。"""
+    """2×2 回溯快照圖：各面板是該回溯時刻仍在漂流的粒子的條件式來源足跡（與停留時數密度同網格）。
+    四個面板共用一條色條，從最上排上緣量到最下排下緣。"""
 
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
-    from matplotlib.ticker import FuncFormatter
 
     snapshots = list(fp.snapshots)[:4]
     fig, axes = plt.subplots(2, 2, figsize=(13.0, 9.6), dpi=150, sharex=True, sharey=True)
+    fig.subplots_adjust(
+        left=0.07,
+        bottom=0.13,
+        right=0.86,
+        top=_title_top_margin(figure_text, full=0.91, none=0.96),
+        hspace=0.10,
+        wspace=0.08,
+    )
     flat_axes = list(axes.ravel())
 
     densities: list[np.ndarray | None] = [snap["density_pct_per_km2"] for snap in snapshots]
-    available = [d for d in densities if d is not None]
-    vmax = max((float(d.max()) for d in available), default=0.0)
-    vmin = vmax * RESIDENCE_COLOR_FLOOR_FRACTION
+    vmin, vmax = _snapshot_color_limits(fp)
+    has_density = any(d is not None for d in densities)
     cmap = plt.get_cmap(_RESIDENCE_CMAP).with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
     mesh = None
     drawn_levels: list[float] = []
+    panel_stats: list[dict[str, Any]] = []
     levels = sorted(fp.hdr_threshold_pct_per_km2) or [0.5, 0.75, 0.9]
     lon_c = 0.5 * (fp.lon_edges[:-1] + fp.lon_edges[1:])
     lat_c = 0.5 * (fp.lat_edges[:-1] + fp.lat_edges[1:])
 
     for ax, snap, density in zip(flat_axes, snapshots, densities, strict=False):
+        masks: list[np.ndarray] = []
+        if density is not None:
+            thresholds = snap["hdr_threshold_pct_per_km2"]
+            masks = _hdr_masks(density, thresholds)
         _extent, drawn = _draw_footprint_base_map(
             ax,
             fp,
             land_geometries,
             site_isobaths,
-            t,
-            font,
-            site_label=site.site_label_zh,
-            label_fontsize=6.5,
+            isobath_levels=isobath_levels,
+            max_intervals=_SNAPSHOT_MAX_INTERVALS,
             tick_fontsize=7.5,
         )
         drawn_levels = drawn or drawn_levels
@@ -3225,9 +3673,8 @@ def _plot_lookback_snapshot(
             )
             clip_patch = _domain_clip_patch(ax, fp)
             mesh.set_clip_path(clip_patch)
-            thresholds = snap["hdr_threshold_pct_per_km2"]
-            masks = [density >= thresholds[level] * (1.0 - 1e-9) for level in sorted(thresholds)]
             _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
+            panel_stats.append({"snapshot_hours": hours, **_limit_stats(fp, density, vmin, vmax)})
         else:
             ax.text(
                 0.5,
@@ -3252,26 +3699,34 @@ def _plot_lookback_snapshot(
         ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
     for ax in axes[:, 0]:
         ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
-    if mesh is not None:
-        cax = fig.add_axes((0.915, 0.28, 0.016, 0.44))
-        cbar = fig.colorbar(mesh, cax=cax)
-        cbar.set_ticks(_log_colorbar_ticks(vmin, vmax))
-        cbar.ax.yaxis.set_major_formatter(FuncFormatter(_decade_formatter))
-        cbar.ax.minorticks_off()
-        cbar.set_label(
-            t.t(
+    visible_axes = [a for a in flat_axes if a.get_visible()]
+    cbar = None
+    if mesh is not None and has_density:
+        cbar = _add_aligned_colorbar(
+            fig,
+            mesh,
+            visible_axes,
+            vmin=vmin,
+            vmax=vmax,
+            label=t.t(
                 "條件式來源足跡密度（% 仍在漂流粒子／km²）",
                 "Conditional footprint density (% of drifting particles / km^2)",
             ),
-            fontproperties=font,
+            font=font,
+            tick_fontsize=7.5,
         )
     fig.legend(
         handles=_footprint_legend_handles(
-            t, levels, isobaths_drawn=bool(drawn_levels), site_label=site.site_label_zh
+            t,
+            levels,
+            isobath_levels_drawn=drawn_levels,
+            isobath_levels=isobath_levels,
+            receptor_is_anchor=fp.receptor_anchor is not None,
+            has_release_range=fp.release_points is not None,
         ),
         loc="lower center",
         bbox_to_anchor=(0.5, 0.005),
-        ncol=3,
+        ncol=4,
         prop=font,
         frameon=True,
     )
@@ -3286,14 +3741,7 @@ def _plot_lookback_snapshot(
         _site_subtitle(site, t),
         figure_text=figure_text,
     )
-    fig.subplots_adjust(
-        left=0.07,
-        bottom=0.09,
-        right=0.88,
-        top=_title_top_margin(figure_text, full=0.91, none=0.96),
-        hspace=0.10,
-        wspace=0.08,
-    )
+    layout = _layout_record(fig, visible_axes, axes[1, 0], cbar)
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
     return {
@@ -3304,10 +3752,12 @@ def _plot_lookback_snapshot(
         "panels_estimated": [
             int(s["snapshot_hours"]) for s, d in zip(snapshots, densities, strict=False) if d is not None
         ],
+        "limit_stats_by_panel": panel_stats,
         "smoothing_sigma_km": float(snapshots[0]["smoothing_sigma_km"]) if snapshots else None,
         "minimum_active_particle_count": (
             int(snapshots[0]["minimum_active_particle_count"]) if snapshots else None
         ),
+        "layout": layout,
     }
 
 
@@ -3320,18 +3770,29 @@ def _plot_boundary_departure_along_arc(
     dpi: int,
     figure_text: str,
 ) -> dict[str, Any]:
-    """沿開放邊界弧長的一維穿越分布：直條圖（每 bin 占比）＋累積曲線，標出各邊與轉角。"""
+    """沿開放邊界弧長的一維穿越分布：直條圖（每 bin 占比）＋累積曲線，標出各邊與轉角。
+
+    三條軸都從 0 起算並向上取整到刻度倍數：橫軸 0 到邊界全長向上取整；左縱軸 0 到最大占比
+    向上取整；右縱軸 0–100%；首末刻度就是軸的兩端，兩端都標值。
+    """
 
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
 
     fig, ax = plt.subplots(figsize=(12.0, 5.6), dpi=150)
+    fig.subplots_adjust(
+        left=0.07, bottom=0.14, right=0.93, top=_title_top_margin(figure_text, full=0.80, none=0.96)
+    )
     bins = list(fp.arc_bins)
     total = sum(int(b["crossed_particle_count"]) for b in bins)
     length_km = float(bins[0]["boundary_length_km"]) if bins else 0.0
     bin_km = float(bins[0]["bin_km"]) if bins else 0.0
+    xmax, xticks = _nice_ceiling_axis(length_km, max_intervals=10)
+    ax2 = ax.twinx()
+    ymax = 1.0
     if not bins or total == 0:
         ax.text(
             0.5,
@@ -3342,7 +3803,7 @@ def _plot_boundary_departure_along_arc(
             transform=ax.transAxes,
             fontproperties=font,
         )
-        ax.set_xlim(0.0, max(length_km, 1.0))
+        yticks = np.asarray([0.0, 1.0])
     else:
         starts = np.asarray([float(b["s_start_km"]) for b in bins])
         ends = np.asarray([float(b["s_end_km"]) for b in bins])
@@ -3363,14 +3824,9 @@ def _plot_boundary_departure_along_arc(
             linewidth=0.4,
             zorder=2,
         )
-        ax2 = ax.twinx()
         ax2.plot(ends, cum, color="#3b2314", linewidth=1.6, zorder=3)
         ax2.plot([0.0, float(ends[0])], [0.0, float(cum[0])], color="#3b2314", linewidth=1.6, zorder=3)
-        ax2.set_ylim(0.0, 100.0)
-        ax2.set_ylabel(t.t("累積比例（%）", "Cumulative share (%)"), fontproperties=font)
-        ymax = float(share.max()) * 1.25
-        ax.set_ylim(0.0, ymax)
-        ax.set_xlim(0.0, length_km)
+        ymax, yticks = _nice_ceiling_axis(float(share.max()) * 1.2, max_intervals=5)
         for e in edges:
             centre = 0.5 * (float(e["s_start_km"]) + float(e["s_end_km"]))
             ax.text(
@@ -3385,10 +3841,10 @@ def _plot_boundary_departure_along_arc(
                 zorder=4,
             )
         for c in (e for e in fp.edge_intervals if e["kind"] == "corner"):
-            s = float(c["s_start_km"])
-            ax.axvline(s, color="#555555", linewidth=0.8, linestyle="--", zorder=1)
+            sk = float(c["s_start_km"])
+            ax.axvline(sk, color="#555555", linewidth=0.8, linestyle="--", zorder=1)
             ax.text(
-                s,
+                sk,
                 ymax * 0.02,
                 t.t(_corner_name_zh(str(c["name"])), str(c["name"])),
                 rotation=90,
@@ -3399,6 +3855,17 @@ def _plot_boundary_departure_along_arc(
                 color="#444444",
                 zorder=4,
             )
+    number = FuncFormatter(lambda v, _p=None: f"{v:g}")
+    ax.set_xlim(0.0, float(xticks[-1]))
+    ax.set_xticks(xticks)
+    ax.set_ylim(0.0, float(yticks[-1]))
+    ax.set_yticks(yticks)
+    ax.xaxis.set_major_formatter(number)
+    ax.yaxis.set_major_formatter(number)
+    ax2.set_ylim(0.0, 100.0)
+    ax2.set_yticks(np.arange(0.0, 100.0 + 1e-9, 20.0))
+    ax2.yaxis.set_major_formatter(number)
+    ax2.set_ylabel(t.t("累積比例（%）", "Cumulative share (%)"), fontproperties=font)
     ax.set_xlabel(
         t.t(
             "沿流場範圍開放邊界的弧長（km，自邊界折線起點量起）",
@@ -3436,12 +3903,27 @@ def _plot_boundary_departure_along_arc(
         ),
         figure_text=figure_text,
     )
-    fig.subplots_adjust(
-        left=0.07, bottom=0.14, right=0.93, top=_title_top_margin(figure_text, full=0.80, none=0.96)
-    )
+    fig.canvas.draw()
+    layout = {
+        "measure_dpi": float(fig.dpi),
+        "xlim": [float(v) for v in ax.get_xlim()],
+        "ylim_left": [float(v) for v in ax.get_ylim()],
+        "ylim_right": [float(v) for v in ax2.get_ylim()],
+        "xticks": [float(v) for v in ax.get_xticks()],
+        "yticks_left": [float(v) for v in ax.get_yticks()],
+        "yticks_right": [float(v) for v in ax2.get_yticks()],
+        "xtick_labels": [tl.get_text() for tl in ax.get_xticklabels()],
+        "ytick_labels_left": [tl.get_text() for tl in ax.get_yticklabels()],
+        "ytick_labels_right": [tl.get_text() for tl in ax2.get_yticklabels()],
+    }
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
-    return {"crossed_particle_count": total, "boundary_length_km": length_km, "bin_km": bin_km}
+    return {
+        "crossed_particle_count": total,
+        "boundary_length_km": length_km,
+        "bin_km": bin_km,
+        "layout": layout,
+    }
 
 
 def _footprint_residence_color_scales(
@@ -3461,6 +3943,23 @@ def _hdr_area_text(fp: FootprintSiteFigureData) -> str:
     return "、".join(parts)
 
 
+def _receptor_text_zh(fp: FootprintSiteFigureData) -> str:
+    """圖說用的受體位置說明；有正式釋放設定就寫研究點錨點，否則明示是釋放點平均位置。"""
+
+    lonlat = fp.receptor_lonlat
+    if lonlat is None:
+        return "受體位置未記錄"
+    pos = f"{lonlat[0]:.4f}°E, {lonlat[1]:.4f}°N"
+    if fp.receptor_anchor is not None:
+        radius = (
+            f"半徑 {fp.receptor_core_radius_m / 1000.0:g} km 的受體核心範圍內的各受體點"
+            if fp.receptor_core_radius_m
+            else "周圍的各受體點"
+        )
+        return f"受體位置（星號）為研究點錨點 {pos}（取自正式釋放設定），粒子自錨點周圍{radius}釋放"
+    return f"受體位置（星號）為各釋放點的平均位置 {pos}（本批圖未提供釋放設定，不是研究點錨點）"
+
+
 def _footprint_caption_zh(
     stem: str,
     site: SiteData,
@@ -3472,6 +3971,7 @@ def _footprint_caption_zh(
     isobath_reason: str | None,
     shared_vmax: float,
     site_vmax: float,
+    isobath_requested: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
 ) -> str:
     """WP-38 三種新圖的圖說。全部用直述句，不出現程式識別字與檔名。"""
 
@@ -3479,7 +3979,8 @@ def _footprint_caption_zh(
     member_count = int(site.summary["ensemble_member_count"])
     member_text_zh, _ = _ensemble_member_count_text(member_count)
     settings_tail = (
-        f"{site.site_label_zh}，{total:,} 顆粒子，{member_text_zh}，終止邊界為流場範圍開放邊界，"
+        f"站點：{site.site_label_zh}（{site.site_id}），{_receptor_text_zh(fp)}，"
+        f"{total:,} 顆粒子，{member_text_zh}，終止邊界為流場範圍開放邊界，"
         f"物理案例：{experiment_case.physics_case_zh}"
     )
     if experiment_case.bed_no_deposition_zh is not None:
@@ -3492,31 +3993,44 @@ def _footprint_caption_zh(
     arrival_zh = "回溯起點（到達時刻）的位置計入" if arrival_included else "回溯起點（到達時刻）的位置不計入"
     res = float(fp.grid["resolution_deg"])
     km = res * 111.19
+    release_zh = (
+        f"淡紫色半透明範圍為粒子釋放範圍（{len(fp.release_points)} 個釋放點的凸包）"
+        if fp.release_points is not None and len(fp.release_points)
+        else "本站沒有可用的釋放點資料，未繪粒子釋放範圍"
+    )
     if isobath_levels:
-        levels_txt = "、".join(f"{v:g}" for v in isobath_levels)
+        ordered = sorted(isobath_requested)
+        style_parts = []
+        for v in sorted(isobath_levels):
+            k = min(range(len(ordered)), key=lambda i: abs(ordered[i] - v)) % len(_ISOBATH_STYLE_ZH)
+            style_parts.append(f"{v:g} 公尺（{_ISOBATH_STYLE_ZH[k]}）")
+        shelf_zh = "，200 公尺為陸棚邊緣" if any(abs(v - 200.0) < 1e-9 for v in isobath_levels) else ""
         base_zh = (
-            f"底圖為陸地（灰）與海岸線（黑），細灰線為 {levels_txt} 公尺等深線"
-            "（200 公尺線稍粗；水深取自計算網格的"
-            "節點水深），星號為受體位置，洋紅色虛線為流場範圍開放邊界（終止邊界）。"
+            "底圖為陸地（灰）與海岸線（黑），中灰細線為 "
+            f"{'、'.join(style_parts)}等深線{shelf_zh}（水深取自計算網格的節點水深；"
+            "為避免干擾高密度區間，只畫這些水深，地圖上不標水深數字，水深與線型見圖例），"
+            f"星號為受體位置，{release_zh}，洋紅色虛線為流場範圍開放邊界（終止邊界）。"
         )
     else:
         base_zh = (
             "底圖為陸地（灰）與海岸線（黑），"
             f"本圖未繪等深線（{isobath_reason or '本站沒有可用的水深資料'}），"
-            "星號為受體位置，洋紅色虛線為流場範圍開放邊界（終止邊界）。"
+            f"星號為受體位置，{release_zh}，洋紅色虛線為流場範圍開放邊界（終止邊界）。"
         )
 
     if stem in ("source_footprint_residence", "source_footprint_residence_site_scale"):
         if stem == "source_footprint_residence":
             scale_zh = (
-                f"本圖採用跨站共用色階（色階上限為各站最大值 {shared_vmax:.3g} % 停留時數／km²），"
+                f"本圖採用跨站共用色階（各站最大值中的最大者為 {shared_vmax:.3g} % 停留時數／km²），"
                 "各站顏色深淺可直接比較"
             )
         else:
             scale_zh = (
-                f"本圖採用本站自訂色階（色階上限為本站最大值 {site_vmax:.3g} % 停留時數／km²），"
+                f"本圖採用本站自訂色階（本站最大值為 {site_vmax:.3g} % 停留時數／km²），"
                 "只適合看本站內部的分布形狀；跨站比較請看共用色階版本"
             )
+        scale_vmax = shared_vmax if stem == "source_footprint_residence" else site_vmax
+        lo_c, hi_c = _residence_color_limits(scale_vmax)
         body = (
             "停留時數密度圖，呈現回溯過程中這一站全部粒子逐小時所在位置的累計分布。"
             "停留時數的定義：每顆粒子在回溯的每個整點時刻，只要仍在漂流（尚未穿越開放邊界、擱淺、沉底或因其他原因"
@@ -3524,7 +4038,9 @@ def _footprint_caption_zh(
             "各網格的粒子小時數除以本站粒子小時總數，再除以網格面積（km²），單位為「% 停留時數／km²」，"
             "全部網格對面積積分為 100%。"
             f"網格為經緯度規則網格，解析度 {res:.2f}°（約 {km:.1f} km），面積依緯度以 cos φ 計算。"
-            f"色階為對數色階，下限為色階上限的 1/10000，低於下限的網格不著色；{scale_zh}。"
+            f"色階為對數色階，上限為最大值向上取整到 10 的整數次方（{_pow10_text(hi_c)}），"
+            f"下限為上限的 1/10000（{_pow10_text(lo_c)}），每個 10 的次方標一個刻度，色條與地圖同高；"
+            f"低於下限的網格不著色（其數量與所占停留時數比例記錄在 manifest）；{scale_zh}。"
             "圖上的線為高密度區間（Highest Density Region, HDR）50%、75%、90%：依密度由高到低累加網格，"
             f"累計到該比例的停留時數所需的最小面積範圍；本站三個區間的面積依序為 {_hdr_area_text(fp)}。"
             "與舊版邊界核密度圖的差別：舊圖的輸入只有粒子穿越開放邊界的那一個點，這些點全部落在一維的邊界線上，"
@@ -3542,6 +4058,7 @@ def _footprint_caption_zh(
             if sigma > 0
             else f"密度直接累加到與停留時數密度相同的 {res:.2f}° 網格，不做平滑。"
         )
+        lo_s, hi_s = _snapshot_color_limits(fp)
         body = (
             f"回溯快照圖，2×2 四個面板依序為回溯第 {hours} 小時仍在漂流的粒子所在位置的條件式來源足跡。"
             f"{smooth_zh}"
@@ -3549,8 +4066,10 @@ def _footprint_caption_zh(
             "因此各面板的總和都是 1；已經終止的粒子（含回溯總時間不足該時刻者）不在面板內，"
             "各面板標題列出仍在漂流的比例（分母是本站全部粒子）。"
             f"仍在漂流的粒子少於 {min_n} 顆時該面板不畫密度，並在面板中註明粒子數。"
-            "色階為對數色階，四個面板共用同一組上下限，單位為「% 仍在漂流粒子／km²」，下限為上限的 1/10000，"
-            "低於下限的位置不著色；線為該面板的高密度區間（HDR）50%、75%、90%，算法與停留時數密度相同。"
+            "色階為對數色階，四個面板共用同一組上下限與一條和面板同高的色條，單位為「% 仍在漂流粒子／km²」，"
+            f"上限為四個面板最大值向上取整到 10 的整數次方（{_pow10_text(hi_s)}），"
+            f"下限為上限的 1/10000（{_pow10_text(lo_s)}），低於下限的位置不著色；"
+            "線為該面板的高密度區間（HDR）50%、75%、90%，算法與停留時數密度相同。"
             "陸地畫在密度之上，密度不會出現在陸地上。"
             f"{base_zh}"
         )
@@ -3563,6 +4082,8 @@ def _footprint_caption_zh(
             f"起點與前進方向取自邊界折線的頂點順序，邊界全長 {length_km:.0f} km；"
             f"直條為每 {bin_km:g} km 弧長內穿越的粒子占全部穿越粒子的百分比，棕色曲線與右軸為累積百分比；"
             f"淡色底色區分西、南、東、北各邊，虛線標出各邊之間的轉角。本站共 {crossed:,} 顆粒子穿越開放邊界。"
+            "橫軸從 0 起算到邊界全長向上取整，左縱軸從 0 起算到最大占比向上取整，右縱軸為 0 到 100%，"
+            "三條軸的兩端都標值。"
             "穿越點全部落在一維的邊界線上，因此以一維分布呈現，取代舊版把這些點做二維核密度的圖。"
         )
     else:  # pragma: no cover - FOOTPRINT_FIGURE_STEMS 是唯一呼叫來源
@@ -3783,15 +4304,19 @@ class _FootprintFigurePlan:
     site_isobath_reason: Mapping[str, str | None]
     shared_vmax: float
     site_vmax: Mapping[str, float]
+    isobath_levels_requested: tuple[float, ...] = ISOBATH_LEVELS_DEFAULT
 
 
 def _isobath_levels_in_extent(
-    site_isobaths: Mapping[float, list[np.ndarray]], extent: tuple[float, float, float, float]
+    site_isobaths: Mapping[float, list[np.ndarray]],
+    extent: tuple[float, float, float, float],
+    levels: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
 ) -> tuple[float, ...]:
     return tuple(
         depth
         for depth in sorted(site_isobaths)
-        if any(_inside_runs(seg, extent) for seg in site_isobaths[depth])
+        if any(abs(depth - v) < 1e-9 for v in levels)
+        and any(_inside_runs(seg, extent) for seg in site_isobaths[depth])
     )
 
 
@@ -3806,7 +4331,17 @@ def _plan_footprint_figures(
     for site in inputs.sites:
         fp = inputs.footprint[site.site_id]
         site_isobaths = isobaths.get(site.site_id, {})
-        found = _isobath_levels_in_extent(site_isobaths, _site_extent(fp))
+        found = tuple(
+            sorted(
+                {
+                    depth
+                    for max_intervals in (_RESIDENCE_MAX_INTERVALS, _SNAPSHOT_MAX_INTERVALS)
+                    for depth in _isobath_levels_in_extent(
+                        site_isobaths, _site_extent(fp, max_intervals=max_intervals), config.isobath_levels_m
+                    )
+                }
+            )
+        )
         levels[site.site_id] = found
         if found:
             reasons[site.site_id] = None
@@ -3824,6 +4359,7 @@ def _plan_footprint_figures(
         site_isobath_reason=reasons,
         shared_vmax=shared_vmax,
         site_vmax=site_vmax,
+        isobath_levels_requested=tuple(config.isobath_levels_m),
     )
 
 
@@ -3853,6 +4389,7 @@ def _build_captions(inputs: NativeFiguresInputs, plan: _FootprintFigurePlan | No
                     isobath_reason=plan.site_isobath_reason[site.site_id],
                     shared_vmax=plan.shared_vmax,
                     site_vmax=plan.site_vmax[site.site_id],
+                    isobath_requested=plan.isobath_levels_requested,
                 )
     return captions
 
@@ -4071,7 +4608,8 @@ def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigur
         "後處理目錄含足跡產品（`native-postprocess --with-footprint`）時，每站另外輸出四張圖：\n\n"
         "1. `source_footprint_residence.png`：停留時數密度（跨站共用對數色階）。停留時數＝回溯過程中逐小時、"
         "仍在漂流（尚未終止）的粒子所在網格的粒子小時數，終止後凍結的位置不計入；色階單位 % 停留時數／km²，"
-        "下限為上限的 1/10000，低於下限不著色；疊高密度區間（HDR）50%／75%／90%。\n"
+        "上限為最大值向上取整到 10 的整數次方、下限為上限的 1/10000，每個 10 的次方標一個刻度，"
+        "低於下限不著色；疊高密度區間（HDR）50%／75%／90%。\n"
         "2. `source_footprint_residence_site_scale.png`：同一份資料，色階上限改用各站自己的最大值，"
         "只適合看單站"
         "內部形狀；跨站比較請看上一張。\n"
@@ -4083,8 +4621,12 @@ def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigur
         "轉角。\n\n"
         "舊的 `source_footprint_kde.png` 照常輸出，但不再是報告主圖：它的輸入只有粒子穿越開放邊界的那一點，"
         "這些點全部落在一維的邊界線上，二維核密度不適用。\n\n"
-        f"{bathy_line}底圖為陸地（灰）、海岸線（黑 0.5 pt）、星號（受體）與洋紅色虛線（流場範圍開放邊界）。"
-        "`manifest.json` 的 `footprint_figures` 區塊記錄各圖的色階類型與上下限、等深線狀態。\n\n"
+        f"{bathy_line}底圖為陸地（灰）、海岸線（黑 0.5 pt）、中灰細等深線"
+        "（預設只畫 200 m 實線與 1000 m 虛線，地圖上不標水深數字）、淡紫色粒子釋放範圍、"
+        "星號（受體，位置取自正式釋放設定的研究點錨點，圖面不寫站名）與洋紅色虛線（流場範圍開放邊界）。"
+        "色條與地圖軸同高，座標軸範圍向外擴到刻度倍數、首末刻度落在框邊。"
+        "`manifest.json` 的 `footprint_figures` 區塊記錄各圖的色階上下限、低於下限的網格統計、"
+        "色條與地圖軸的上下緣量測值、座標軸範圍與刻度、等深線狀態，以及每站受體位置與來源。\n\n"
     )
 
 
@@ -4106,8 +4648,29 @@ def _build_readme(
     )
 
 
+def _receptor_manifest_record(
+    fp: FootprintSiteFigureData, land_geometries: Sequence[Polygon | MultiPolygon]
+) -> dict[str, Any]:
+    star = fp.receptor_lonlat
+    return {
+        "source": fp.receptor_source,
+        "anchor_lonlat": list(fp.receptor_anchor) if fp.receptor_anchor is not None else None,
+        "receptor_core_radius_m": fp.receptor_core_radius_m,
+        "star_lonlat": list(star) if star is not None else None,
+        "postprocess_release_point_mean_lonlat": (
+            list(fp.receptor_center) if fp.receptor_center is not None else None
+        ),
+        "formal_anchor_used": fp.receptor_anchor is not None,
+        "release_geometry": _release_geometry_record(fp, land_geometries),
+    }
+
+
 def _build_footprint_figures_manifest(
-    inputs: NativeFiguresInputs, plan: _FootprintFigurePlan, records: Mapping[str, Any]
+    inputs: NativeFiguresInputs,
+    plan: _FootprintFigurePlan,
+    records: Mapping[str, Any],
+    land_geometries: Sequence[Polygon | MultiPolygon] = (),
+    receptor_config_path: Path | None = None,
 ) -> dict[str, Any]:
     """``manifest.json`` 的 ``footprint_figures`` 區塊：色階類型與上下限、等深線狀態。"""
 
@@ -4117,29 +4680,69 @@ def _build_footprint_figures_manifest(
             "unit": "% 停留時數／km²",
             "norm": "log",
             "lower_limit_fraction_of_upper_limit": lower,
+            "limit_rule": (
+                "上限＝大於或等於最大值的 10 的整數次方；下限＝上限的 1/10000；每個 10 的次方一個刻度"
+            ),
             "cells_below_lower_limit": "transparent",
+            "out_of_limit_handling": "metadata_only_no_visual_clipping",
+            "colorbar": {"shape": "rectangular", "extend": "neither"},
             "colormap": _RESIDENCE_CMAP,
             "variants": {
                 "source_footprint_residence": {
                     "scale": "shared_across_sites",
-                    "upper_limit": plan.shared_vmax,
-                    "lower_limit": plan.shared_vmax * lower,
+                    "raw_max": plan.shared_vmax,
+                    "upper_limit": _decade_limits(plan.shared_vmax)[1],
+                    "lower_limit": _decade_limits(plan.shared_vmax)[0],
                 },
                 "source_footprint_residence_site_scale": {
                     "scale": "per_site",
-                    "upper_limit_by_site": dict(plan.site_vmax),
-                    "lower_limit_by_site": {k: v * lower for k, v in plan.site_vmax.items()},
+                    "raw_max_by_site": dict(plan.site_vmax),
+                    "upper_limit_by_site": {k: _decade_limits(v)[1] for k, v in plan.site_vmax.items()},
+                    "lower_limit_by_site": {k: _decade_limits(v)[0] for k, v in plan.site_vmax.items()},
                 },
             },
         },
+        "receptors": {
+            "authority": "正式釋放設定 study_sites[].anchor_lonlat（config.StudySiteConfig）",
+            "by_site": {
+                site.site_id: _receptor_manifest_record(inputs.footprint[site.site_id], land_geometries)
+                for site in inputs.sites
+            },
+            "config_path": str(receptor_config_path) if receptor_config_path is not None else None,
+            "config_sha256": (
+                inputs.sources_before["receptor_config"]["sha256"]
+                if receptor_config_path is not None and "receptor_config" in inputs.sources_before
+                else None
+            ),
+            "land_geometry_for_sea_check": "海岸線 GeoJSON 的陸地多邊形；點落在任一多邊形內即視為在陸上",
+        },
+        "axes_rule": "座標軸範圍向外擴到刻度間距（0.1／0.2／0.5°）的整數倍，首末刻度即框邊，四個端點都標值",
+        "colorbar_alignment_tolerance_px": COLORBAR_ALIGNMENT_TOLERANCE_PX,
         "snapshot_color_scale": {
             "unit": "% 仍在漂流粒子／km²",
             "norm": "log",
             "lower_limit_fraction_of_upper_limit": lower,
             "scale": "shared_across_the_four_panels_of_each_site",
+            "limit_rule": "上限＝四個面板最大值向上取整到 10 的整數次方；下限＝上限的 1/10000",
+            "limits_by_site": {
+                site.site_id: dict(
+                    zip(
+                        ("lower_limit", "upper_limit"),
+                        _snapshot_color_limits(inputs.footprint[site.site_id]),
+                        strict=True,
+                    )
+                )
+                for site in inputs.sites
+            },
         },
         "bathymetry": {
             **dict(plan.bathymetry_record),
+            "requested_levels_m": list(plan.isobath_levels_requested),
+            "style": {
+                "color": _ISOBATH_COLOR,
+                "linewidth_pt": _ISOBATH_LINEWIDTH,
+                "linestyles_by_level_order": list(_ISOBATH_LINESTYLES),
+            },
             "by_site": {
                 site.site_id: {
                     "status": "drawn" if plan.site_isobath_levels[site.site_id] else "not_drawn",
@@ -4232,6 +4835,7 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
                         config.figure_text,
                         footprint_plan.shared_vmax,
                         scale_kind="shared",
+                        isobath_levels=config.isobath_levels_m,
                     )
                 elif stem == "source_footprint_residence_site_scale":
                     record = _plot_source_footprint_residence(
@@ -4246,6 +4850,7 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
                         config.figure_text,
                         footprint_plan.site_vmax[site.site_id],
                         scale_kind="per_site",
+                        isobath_levels=config.isobath_levels_m,
                     )
                 elif stem == "lookback_snapshot":
                     record = _plot_lookback_snapshot(
@@ -4258,6 +4863,7 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
                         png_path,
                         config.dpi,
                         config.figure_text,
+                        isobath_levels=config.isobath_levels_m,
                     )
                 else:
                     record = _plot_boundary_departure_along_arc(
@@ -4312,12 +4918,21 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
             "dpi": config.dpi,
             "sites_filter": list(config.sites) if config.sites is not None else None,
             "figure_text": config.figure_text,
+            "isobath_levels_m": list(config.isobath_levels_m),
+            "allow_unanchored_receptor": config.allow_unanchored_receptor,
+            "receptor_config_basename": config.receptor_config_path.name
+            if config.receptor_config_path is not None
+            else None,
         },
     }
     if footprint_plan is not None:
         manifest["footprint_figure_stems"] = list(FOOTPRINT_FIGURE_STEMS)
         manifest["footprint_figures"] = _build_footprint_figures_manifest(
-            inputs, footprint_plan, footprint_figure_records
+            inputs,
+            footprint_plan,
+            footprint_figure_records,
+            land_geometries,
+            config.receptor_config_path,
         )
     manifest_path = output_dir / "manifest.json"
     with manifest_path.open("x", encoding="utf-8") as stream:

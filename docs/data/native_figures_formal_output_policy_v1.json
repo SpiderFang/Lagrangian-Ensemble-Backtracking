@@ -1,7 +1,7 @@
 {
   "schema_name": "lbt_native_figures_formal_output_policy",
-  "schema_version": "1.0.0",
-  "approved_date": "2026-09-24",
+  "schema_version": "1.1.0",
+  "approved_date": "2026-09-29",
   "status": "current",
   "rules_document_path": "docs/results/17_native_figures_formal_output_rules.md",
   "consistency_check": "tests/test_native_figures.py::test_json_policy_matches_figures_py_runtime_constants",
@@ -11,6 +11,11 @@
       "version": "1.0.0",
       "date": "2026-09-24",
       "change": "首次建立。對齊 OCM-SVD-Analysis water_column_svd_formal_spatial_figure_policy_v1.json（schema_version 1.8.5）之雙格式輸出、固定色階與超限記錄、跨站色階一致化三項規則；記錄任務 0（水平軌跡圖移除 local domain 圖層）之範圍與資料層不變承諾。figures.py 未在執行期讀取本檔——LBT 現有實作已在 WP-25 之前完成並通過完整測試，改用本檔逐項對照的自動化測試機制以避免對已驗證程式碼做非必要的重構風險；本檔的每一個數值欄位對應 figures.py 的一個具名常數或函式行為，欄位旁以 source 標明出處。"
+    },
+    {
+      "version": "1.1.0",
+      "date": "2026-09-29",
+      "change": "新增 wp38_footprint_figures 區塊，涵蓋 WP-38 三種新圖（停留時數密度含 site_scale 版、回溯快照、邊界弧長分布）的等深線、受體與粒子釋放範圍、座標軸、色條與弧長分布圖規則；對齊 OCM-SVD-Analysis 的『經緯度軸與色條把實際上下限列為首尾刻度』與『矩形色條 extend=neither、超限只記 metadata』。既有欄位（1.0.0）不變。"
     }
   ],
   "scope": {
@@ -44,12 +49,18 @@
   },
   "figure_text_modes": {
     "source": "figures.FIGURE_TEXT_MODES",
-    "value": ["full", "none"],
+    "value": [
+      "full",
+      "none"
+    ],
     "note_zh": "WP-24b 建立，本次 WP-25 未變更此行為；full＝標題／副標／圖例／座標軸標籤全部畫出，none＝只畫座標軸與圖例，文字改由 captions.md 承載。"
   },
   "task0_local_domain_layer_removal": {
     "status": "completed",
-    "affected_figure_stems": ["horizontal_overview", "horizontal_local"],
+    "affected_figure_stems": [
+      "horizontal_overview",
+      "horizontal_local"
+    ],
     "removed_from_figure": [
       "local domain 橘色點線邊界",
       "local 首次離開橘色空心菱形標記",
@@ -73,12 +84,19 @@
   },
   "output_format": {
     "adopted_from": "OCM-SVD-Analysis water_column_svd_formal_spatial_figure_policy_v1.json formal_delivery",
-    "formats": ["png", "svg"],
+    "formats": [
+      "png",
+      "svg"
+    ],
     "png_dpi": 600,
     "png_dpi_source": "cli.py --dpi flag default (line ~1996)",
     "save_function": "figures._save_exclusive",
     "save_mode": "exclusive_write_no_overwrite",
-    "manifest_fields": ["output_formats", "output_png_sha256", "output_svg_sha256"]
+    "manifest_fields": [
+      "output_formats",
+      "output_png_sha256",
+      "output_svg_sha256"
+    ]
   },
   "color_scale_policy": {
     "adopted_from": "OCM-SVD-Analysis fixed vmin/vmax + over-limit saturation (no data clipping)",
@@ -91,7 +109,11 @@
     "colorbar_extend": "neither",
     "data_clipping": false,
     "display_saturation_mechanism": "matplotlib Normalize(vmin, vmax) 內建飽和語意，不額外裁切資料",
-    "over_limit_metadata_fields": ["over_limit_count", "over_limit_fraction", "display_saturation"],
+    "over_limit_metadata_fields": [
+      "over_limit_count",
+      "over_limit_fraction",
+      "display_saturation"
+    ],
     "over_limit_denominator": "finite_value_count_only",
     "hard_limit_stop_and_resubmit": null,
     "hard_limit_rationale_zh": "OCM-SVD-Analysis 之 1% 硬性上限機制以審查過的固定 vmax 為前提；LBT 目前 vmax 取自本次執行實際最大值，數學上不會產生超限，套用相同硬性門檻無實質意義，見 rules_document 第 4 節。"
@@ -128,5 +150,152 @@
   "unchanged_existing_behavior": {
     "figure_text_flag": "--figure-text {full,none} 行為不變",
     "captions_md": "captions.md 機制不變，僅同步更新 horizontal_overview/horizontal_local 圖說文字以反映任務 0"
+  },
+  "rules_document_version": "1.1.0",
+  "wp38_footprint_figures": {
+    "note_zh": "WP-38 三種新圖的規則；每個欄位對應 figures.py 的具名常數，由 tests/test_footprint_figures.py::test_json_policy_wp38_constants_match_figures_py 逐項比對。",
+    "figure_stems": {
+      "source": "figures.FOOTPRINT_FIGURE_STEMS",
+      "value": [
+        "source_footprint_residence",
+        "source_footprint_residence_site_scale",
+        "lookback_snapshot",
+        "boundary_departure_along_arc"
+      ]
+    },
+    "isobath": {
+      "levels_m_default": {
+        "source": "figures.ISOBATH_LEVELS_DEFAULT",
+        "value": [
+          200.0,
+          1000.0
+        ]
+      },
+      "linestyles_by_level_order": {
+        "source": "figures._ISOBATH_LINESTYLES",
+        "value": [
+          "-",
+          "--",
+          "-.",
+          ":"
+        ]
+      },
+      "color": {
+        "source": "figures._ISOBATH_COLOR",
+        "value": "#7f7f7f"
+      },
+      "linewidth_pt": {
+        "source": "figures._ISOBATH_LINEWIDTH",
+        "value": 0.4
+      },
+      "number_labels_on_map": false,
+      "legend_text_zh": "等深線 200 m（實線）／等深線 1000 m（虛線）；範圍內沒有該水深的等深線就不列",
+      "layer_order": "密度色面之上、HDR 等值線之下",
+      "rationale_zh": "標籤與密集等深線是干擾高密度區間的主因；水深與線型改由圖例與 captions 交代"
+    },
+    "receptor": {
+      "position_source": "正式設定 study_sites[].anchor_lonlat（--config）",
+      "config_required": true,
+      "fallback_flag": "--allow-unanchored-receptor（診斷用，圖例改寫『釋放點平均位置』，manifest 標註 formal_anchor_used=false）",
+      "legend_text_zh": "受體（研究點錨點）",
+      "site_name_on_map_or_legend": false,
+      "manifest_fields": [
+        "anchor_lonlat",
+        "star_lonlat",
+        "receptor_core_radius_m",
+        "formal_anchor_used",
+        "release_geometry",
+        "config_path",
+        "config_sha256"
+      ]
+    },
+    "release_range": {
+      "definition": "全部相異釋放點的凸包（設定檔只定義受體核心圓，無釋放多邊形）",
+      "legend_text_zh": "粒子釋放範圍",
+      "face_rgba": {
+        "source": "figures._RELEASE_FACE",
+        "value": [
+          0.42,
+          0.24,
+          0.6,
+          0.14
+        ]
+      },
+      "edge_color": {
+        "source": "figures._RELEASE_EDGE",
+        "value": "#6a3d9a"
+      },
+      "linewidth_pt": {
+        "source": "figures._RELEASE_LINEWIDTH",
+        "value": 0.7
+      },
+      "manifest_fields": [
+        "anchor_to_release_centroid_km",
+        "release_max_radius_km",
+        "release_max_distance_from_anchor_km",
+        "anchor_on_sea",
+        "release_points_on_land_count"
+      ]
+    },
+    "map_axes": {
+      "tick_step_choices_deg": {
+        "source": "figures._TICK_STEP_CHOICES_DEG",
+        "value": [
+          0.1,
+          0.2,
+          0.25,
+          0.5,
+          1.0
+        ]
+      },
+      "min_intervals": {
+        "source": "figures._MIN_INTERVALS",
+        "value": 3
+      },
+      "residence_max_intervals": {
+        "source": "figures._RESIDENCE_MAX_INTERVALS",
+        "value": 6
+      },
+      "snapshot_max_intervals": {
+        "source": "figures._SNAPSHOT_MAX_INTERVALS",
+        "value": 5
+      },
+      "ticks_per_axis": "4 至 7 個（快照面板 4 至 6 個）",
+      "first_last_tick_equal_limits": true,
+      "graticule_grid": false
+    },
+    "colorbar": {
+      "shape": "rectangular",
+      "extend": "neither",
+      "norm": "log",
+      "lower_limit_fraction_of_upper_limit": {
+        "source": "figures.RESIDENCE_COLOR_FLOOR_FRACTION",
+        "value": 0.0001
+      },
+      "upper_limit_rule": "大於或等於資料最大值的 10 的整數次方",
+      "ticks": "每個 10 的次方一個刻度，首尾刻度就是 vmin／vmax",
+      "below_lower_limit": "透明，manifest 記錄格數與占比",
+      "over_limit_metadata_only": true,
+      "alignment_tolerance_px": {
+        "source": "figures.COLORBAR_ALIGNMENT_TOLERANCE_PX",
+        "value": 1.0
+      },
+      "alignment_reference": "色條上下緣與地圖軸上下緣（2x2 快照為整個面板網格）在 display 座標下之差",
+      "alignment_measured_after_draw": true
+    },
+    "arc_distribution": {
+      "x_axis": "0 到總弧長向上取整到刻度倍數",
+      "left_y_axis": "0 到最大占比向上取整到刻度倍數",
+      "right_y_axis_percent": [
+        0.0,
+        100.0
+      ],
+      "first_last_tick_equal_limits": true
+    },
+    "ocm_svd_sources": [
+      "OCM-SVD-Analysis/docs/gongliao_2025_svd_report_interpretation.md 約第 56 行",
+      "OCM-SVD-Analysis/docs/svd_figure_reference_log.md 約第 316 行",
+      "OCM-SVD-Analysis/docs/water_column_svd_formal_spatial_figure_rules.md 第 3.3 節"
+    ]
   }
 }
