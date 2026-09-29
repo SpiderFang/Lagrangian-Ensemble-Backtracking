@@ -3624,7 +3624,7 @@ def _plot_lookback_snapshot(
         right=0.86,
         top=_title_top_margin(figure_text, full=0.91, none=0.96),
         hspace=0.10,
-        wspace=0.08,
+        wspace=0.17,
     )
     flat_axes = list(axes.ravel())
 

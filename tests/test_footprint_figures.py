@@ -374,6 +374,18 @@ def test_land_crossing_the_frame_is_still_filled_inside_the_frame():
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _count_tick_label_overlaps(fig, axes) -> int:
+    """畫完後，所有座標軸可見刻度文字的外框兩兩相交的對數（含相鄰面板的首末刻度）。"""
+
+    boxes = []
+    renderer = fig.canvas.get_renderer()
+    for ax in axes:
+        for tick_label in [*ax.get_xticklabels(), *ax.get_yticklabels()]:
+            if tick_label.get_visible() and tick_label.get_text():
+                boxes.append(tick_label.get_window_extent(renderer))
+    return sum(1 for i in range(len(boxes)) for j in range(i + 1, len(boxes)) if boxes[i].overlaps(boxes[j]))
+
+
 def _describe_figure(fig) -> dict:
     """在存檔前量測實際版面：地圖軸、色條軸的顯示座標、座標軸範圍與刻度、星號與等深線。"""
 
@@ -402,6 +414,7 @@ def _describe_figure(fig) -> dict:
             if ln.get_color() == native_figures._ISOBATH_COLOR
         ],
         "collections": [(type(c).__name__, c.get_zorder()) for a in maps for c in a.collections],
+        "tick_label_overlaps": _count_tick_label_overlaps(fig, maps),
         "axes_texts": [t.get_text() for a in maps for t in a.texts],
         "legend_texts": [
             t.get_text()
@@ -989,3 +1002,14 @@ def test_json_policy_wp38_constants_match_figures_py():
     lo, hi = native_figures._decade_limits(0.37)
     assert lo / hi == pytest.approx(bar["lower_limit_fraction_of_upper_limit"]["value"])
     assert block["receptor"]["config_required"] is True
+
+
+def test_tick_labels_do_not_overlap_including_neighbouring_snapshot_panels(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    described = _capture_figures(monkeypatch)
+    _build(tmp_path, postprocess_dir, coastline, isobaths)
+    figs = _wp38_colorbar_figs(described)
+    assert len(figs) == 3 * len(SITES) and any(d["n_maps"] == 4 for d in figs)
+    assert all(d["tick_label_overlaps"] == 0 for d in figs)
