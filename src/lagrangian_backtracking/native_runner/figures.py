@@ -2848,12 +2848,26 @@ def _residence_color_limits(vmax: float) -> tuple[float, float]:
     return vmax * RESIDENCE_COLOR_FLOOR_FRACTION, vmax
 
 
-def _draw_hdr_contours(ax, lon: np.ndarray, lat: np.ndarray, masks: Sequence[np.ndarray]) -> None:
+def _domain_clip_patch(ax, fp: FootprintSiteFigureData):
+    """流場範圍（flow domain）外框的裁切用多邊形；密度只畫在流場範圍內。"""
+
+    from matplotlib.patches import Polygon as MplPolygon
+
+    patch = MplPolygon(
+        fp.domain_lonlat, closed=True, transform=ax.transData, facecolor="none", edgecolor="none"
+    )
+    ax.add_patch(patch)
+    return patch
+
+
+def _draw_hdr_contours(
+    ax, lon: np.ndarray, lat: np.ndarray, masks: Sequence[np.ndarray], clip_patch: Any = None
+) -> None:
     for i, mask in enumerate(masks):
         if not mask.any():
             continue
         style = _HDR_LINE_STYLES[i % len(_HDR_LINE_STYLES)]
-        ax.contour(
+        contour = ax.contour(
             lon,
             lat,
             mask.astype(np.float64),
@@ -2863,6 +2877,8 @@ def _draw_hdr_contours(ax, lon: np.ndarray, lat: np.ndarray, masks: Sequence[np.
             linewidths=[style["linewidth"]],
             zorder=5,
         )
+        if clip_patch is not None:
+            contour.set_clip_path(clip_patch)
 
 
 def _plot_source_footprint_residence(
@@ -2905,6 +2921,8 @@ def _plot_source_footprint_residence(
         shading="flat",
         zorder=2,
     )
+    clip_patch = _domain_clip_patch(ax, fp)
+    mesh.set_clip_path(clip_patch)
     cbar = fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.02)
     cbar.set_ticks(_log_colorbar_ticks(vmin, vmax_used))
     cbar.ax.yaxis.set_major_formatter(FuncFormatter(_decade_formatter))
@@ -2918,7 +2936,7 @@ def _plot_source_footprint_residence(
     lat_c = 0.5 * (fp.lat_edges[:-1] + fp.lat_edges[1:])
     levels = sorted(fp.hdr_threshold_pct_per_km2)
     masks = [density >= fp.hdr_threshold_pct_per_km2[level] * (1.0 - 1e-9) for level in levels]
-    _draw_hdr_contours(ax, lon_c, lat_c, masks)
+    _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
 
     ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
     ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
@@ -2981,7 +2999,7 @@ def _plot_lookback_snapshot(
     from matplotlib.ticker import FuncFormatter
 
     snapshots = list(fp.snapshots)[:4]
-    fig, axes = plt.subplots(2, 2, figsize=(13.0, 11.6), dpi=150, sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(13.0, 9.6), dpi=150, sharex=True, sharey=True)
     flat_axes = list(axes.ravel())
 
     unit_scale = 1.0e8  # 每平方公尺機率密度 -> % 快照粒子／km²
@@ -3011,7 +3029,7 @@ def _plot_lookback_snapshot(
             t,
             font,
             site_label=site.site_label_zh,
-            label_fontsize=5.5,
+            label_fontsize=6.5,
             tick_fontsize=7.5,
         )
         drawn_levels = drawn or drawn_levels
@@ -3029,20 +3047,23 @@ def _plot_lookback_snapshot(
             mesh = ax.pcolormesh(
                 lon, lat, masked, cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax), shading="auto", zorder=2
             )
+            clip_patch = _domain_clip_patch(ax, fp)
+            mesh.set_clip_path(clip_patch)
             hdr_flat = np.asarray(snap["hdr_masks_flat"], dtype=bool)
             n_cells = rows_ * cols_
             n_levels = len(snap["hdr_levels"])
             masks = [hdr_flat[i * n_cells : (i + 1) * n_cells].reshape(rows_, cols_) for i in range(n_levels)]
-            _draw_hdr_contours(ax, lon, lat, masks)
+            _draw_hdr_contours(ax, lon, lat, masks, clip_patch)
             outside = snap["outside_domain_mass_fraction"]
             if snap["outside_mass_warning"] and outside is not None:
                 title += t.t(
-                    f"｜範圍外 {float(outside) * 100:.0f}%", f" | outside {float(outside) * 100:.0f}%"
+                    f"｜範圍外 {float(outside) * 100:.0f}% 未繪",
+                    f" | {float(outside) * 100:.0f}% outside domain (not drawn)",
                 )
         else:
             ax.text(
                 0.5,
-                0.5,
+                0.9,
                 t.t(
                     f"仍在漂流的粒子只有 {int(snap['active_particle_count'])} 顆，數量不足，未估計",
                     f"Only {int(snap['active_particle_count'])} particles still drifting; not estimated",
@@ -3101,7 +3122,7 @@ def _plot_lookback_snapshot(
         bottom=0.09,
         right=0.88,
         top=_title_top_margin(figure_text, full=0.91, none=0.96),
-        hspace=0.16,
+        hspace=0.10,
         wspace=0.08,
     )
     _save_exclusive(fig, path, dpi=dpi)
@@ -3201,7 +3222,7 @@ def _plot_boundary_departure_along_arc(
                 ha="right",
                 va="bottom",
                 fontproperties=font,
-                fontsize=8,
+                fontsize=9,
                 color="#444444",
                 zorder=4,
             )
@@ -3236,14 +3257,14 @@ def _plot_boundary_departure_along_arc(
             site,
             t,
             extra=t.t(
-                f"｜穿越粒子 {total:,} 顆｜邊界長 {length_km:.0f} km{origin_zh}",
-                f" | {total:,} crossed | length {length_km:.0f} km{origin_en}",
+                f"\n穿越粒子 {total:,} 顆｜邊界長 {length_km:.0f} km{origin_zh}",
+                f"\n{total:,} crossed | length {length_km:.0f} km{origin_en}",
             ),
         ),
         figure_text=figure_text,
     )
     fig.subplots_adjust(
-        left=0.07, bottom=0.14, right=0.93, top=_title_top_margin(figure_text, full=0.86, none=0.96)
+        left=0.07, bottom=0.14, right=0.93, top=_title_top_margin(figure_text, full=0.80, none=0.96)
     )
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
@@ -3346,7 +3367,8 @@ def _footprint_caption_zh(
             "仍在漂流的粒子太少時該面板不估計密度，並在面板中註明粒子數。"
             "色階為對數色階，四個面板共用同一組上下限，單位為「% 仍在漂流粒子／km²」，下限為上限的 1/10000，"
             "低於下限的位置不著色；線為該面板的高密度區間（HDR）50%、75%、90%。"
-            "核密度估計不受流場範圍限制，落在流場範圍外的密度質量超過 10% 時，面板標題會標註範圍外的比例。"
+            "核密度估計不受流場範圍限制，但流場範圍外的部分不繪出；"
+            "該部分的密度質量超過 10% 時，面板標題會標註範圍外的比例。"
             f"{base_zh}"
         )
     elif stem == "boundary_departure_along_arc":
