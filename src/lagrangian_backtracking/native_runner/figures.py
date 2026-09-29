@@ -1574,7 +1574,8 @@ def _add_two_line_title(
     if figure_text == "none":
         return
     fig.suptitle(title, fontproperties=font, fontsize=17, y=0.985)
-    fig.text(0.5, 0.945, subtitle, ha="center", va="top", fontproperties=font, fontsize=10)
+    subtitle_y = 0.945 if "\n" not in subtitle else 0.915
+    fig.text(0.5, subtitle_y, subtitle, ha="center", va="top", fontproperties=font, fontsize=10)
 
 
 def _title_top_margin(figure_text: str, *, full: float, none: float = 0.97) -> float:
@@ -2966,13 +2967,13 @@ def _plot_source_footprint_residence(
             site,
             t,
             extra=t.t(
-                f"｜總停留時數：{total_hours:,} 粒子小時｜網格 {resolution:.2f}°｜{scale_text}",
-                f" | {total_hours:,} particle-hours | grid {resolution:.2f} deg | {scale_text}",
+                f"\n總停留時數：{total_hours:,} 粒子小時｜網格 {resolution:.2f}°｜{scale_text}",
+                f"\n{total_hours:,} particle-hours | grid {resolution:.2f} deg | {scale_text}",
             ),
         ),
         figure_text=figure_text,
     )
-    fig.subplots_adjust(left=0.1, bottom=0.14, right=0.95, top=_title_top_margin(figure_text, full=0.9))
+    fig.subplots_adjust(left=0.1, bottom=0.14, right=0.95, top=_title_top_margin(figure_text, full=0.86))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
     return {"isobath_levels_m": drawn, "vmin": vmin, "vmax": vmax_used, "scale": scale_kind}
@@ -3085,7 +3086,8 @@ def _plot_lookback_snapshot(
     for ax in axes[:, 0]:
         ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
     if mesh is not None:
-        cbar = fig.colorbar(mesh, ax=flat_axes, fraction=0.03, pad=0.02, shrink=0.8)
+        cax = fig.add_axes((0.915, 0.28, 0.016, 0.44))
+        cbar = fig.colorbar(mesh, cax=cax)
         cbar.set_ticks(_log_colorbar_ticks(vmin, vmax))
         cbar.ax.yaxis.set_major_formatter(FuncFormatter(_decade_formatter))
         cbar.ax.minorticks_off()
