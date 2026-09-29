@@ -1706,7 +1706,7 @@ def _plot_horizontal_overview(
         handles.append(
             Line2D(
                 [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
-                label=t.t("flow domain 開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
+                label=t.t("流場範圍開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
             )
         )
     if "other" in boundary_kinds_present:
@@ -1826,7 +1826,7 @@ def _plot_horizontal_local(
         handles.append(
             Line2D(
                 [], [], **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
-                label=t.t("flow domain 開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
+                label=t.t("流場範圍開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
             )
         )
     fig.legend(
@@ -2201,7 +2201,7 @@ def _plot_source_footprint_kde(
         hdr_handles = [
             Line2D(
                 [], [], color=hdr_colors[i % len(hdr_colors)], linewidth=1.6,
-                label=f"HDR {level * 100:.0f}%",
+                label=t.t(f"高密度區間 {level * 100:.0f}%", f"HDR {level * 100:.0f}%"),
             )
             for i, level in enumerate(hdr_levels)
         ]
