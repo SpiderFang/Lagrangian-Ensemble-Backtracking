@@ -1942,11 +1942,19 @@ def _subset_identity_table(identity_table: Any, keep_rows: np.ndarray) -> Any:
         for field in dataclasses.fields(identity_table)
         if isinstance(getattr(identity_table, field.name), np.ndarray)
     }
+    # WP-51：逐粒子標籤是 dict[str, ndarray]（不是 ndarray 欄位），子集化時必須同步取列，
+    # 否則試產子集的後處理會悄悄少掉沉底時刻標籤分組表。
+    labels = (
+        {name: array[keep_rows] for name, array in identity_table.labels.items()}
+        if identity_table.labels is not None
+        else None
+    )
     return ParticleIdentityTable(
         **arrays,
         experiment_case_id=identity_table.experiment_case_id,
         master_seed=identity_table.master_seed,
         random_stream_id=identity_table.random_stream_id,
+        labels=labels,
     )
 
 
