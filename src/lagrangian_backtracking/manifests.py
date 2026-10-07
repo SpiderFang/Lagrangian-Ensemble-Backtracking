@@ -60,6 +60,12 @@ from .config import (
     ProjectConfig,
     resolve_flow_domain_id,
 )
+from .deposition_label_arrivals import (
+    DEPOSITION_LABEL_BOOL_KEYS,
+    DEPOSITION_LABEL_PROVENANCE_KEY,
+    validate_deposition_label_metadata,
+)
+from .deposition_labels import DEPOSITION_LABEL_POLICY_ID
 from .gap_policy import (
     EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
     GAP_CENSORED_BED_RESIDENCE_INPUT_SCHEMA_VERSION,
@@ -398,6 +404,7 @@ def _metadata(value: Any, label: str) -> dict[str, Any]:
     一般 row metadata 維持 scalar-only，避免任意未登錄 JSON 結構進入正式 identity。
     唯一例外是新版條件式沉底抽樣的 ``bed_residence_availability_rejection_audit``，
     其 nested mapping 會在 bed-residence validator 依 root provenance 逐欄 exact 比對。
+    WP-51 B 的三個沉底事件旗標（``DEPOSITION_LABEL_BOOL_KEYS``）是唯一允許的 bool。
     """
 
     if not isinstance(value, dict):
@@ -406,6 +413,11 @@ def _metadata(value: Any, label: str) -> dict[str, Any]:
     for key, item in value.items():
         clean_key = _nonempty_string(key, f"{label} key")
         if clean_key == "bed_residence_availability_rejection_audit" and isinstance(item, dict):
+            result[clean_key] = item
+            continue
+        if clean_key in DEPOSITION_LABEL_BOOL_KEYS and isinstance(item, bool):
+            # WP-51 B：沉底時刻事件旗標是唯一允許 bool 的 metadata 鍵；值域與全有全無由
+            # validate_deposition_label_metadata 在 per_member arrival 驗證中檢查。
             result[clean_key] = item
             continue
         if isinstance(item, bool) or item is None or isinstance(item, (list, dict)):
@@ -2252,6 +2264,7 @@ def _validate_bed_residence_member_arrival_records(
         site_id: {} for site_id in expected_site_ids
     }
     observation_by_id: dict[str, ArrivalTime] = {}
+    label_presence: set[bool] = set()
     hour_ns = 3_600_000_000_000
     design_hash = sha256(config.design_version.encode("utf-8")).hexdigest()
     for arrival in arrivals:
@@ -2295,6 +2308,8 @@ def _validate_bed_residence_member_arrival_records(
             raise ValueError(f"{tag} 年齡或分層與 provenance 矩陣不一致")
         if dict(metadata.get("bed_residence_availability_rejection_audit") or {}) != dict(audits[slot]):
             raise ValueError(f"{tag} rejection audit 與 root provenance 不一致")
+        # WP-51 B：沉底時刻標籤是選用的，但全有或全無（逐筆與全案皆然）。
+        label_presence.add(validate_deposition_label_metadata(metadata, label=tag))
         if deposition_ns != arrival.time_utc_ns or deposition_ns != observation_ns - age * hour_ns:
             raise ValueError(f"{tag} observation/deposition UTC 關係不一致")
         for text_key, ns_value in (
@@ -2369,6 +2384,22 @@ def _validate_bed_residence_member_arrival_records(
                 _obs_ns, age, slot, _stratum = entries[(observation_id, member)]
                 if slot != rank * member_count + member or age != matrix[rank][member]:
                     raise ValueError(f"{site_id} age 矩陣與其他站點或 seed 抽樣結果不一致")
+    if len(label_presence) > 1:
+        raise ValueError("per_member arrival 的沉底時刻標籤必須全部具備或全部省略，不可混用")
+    if label_presence == {True}:
+        label_provenance = provenance.get(DEPOSITION_LABEL_PROVENANCE_KEY)
+        if (
+            not isinstance(label_provenance, Mapping)
+            or label_provenance.get("policy_id") != DEPOSITION_LABEL_POLICY_ID
+            or not isinstance(label_provenance.get("labels_sha256"), str)
+            or {
+                item.get("study_site_id")
+                for item in label_provenance.get("sites", ())
+                if isinstance(item, Mapping)
+            }
+            != expected_site_ids
+        ):
+            raise ValueError("per_member arrival 帶有沉底時刻標籤，但 root provenance 缺少對應的標註模型紀錄")
     if {"gongliao", "guishan"} <= expected_site_ids:
         paired = {
             site_id: sorted({value[0] for value in per_site[site_id].values()})

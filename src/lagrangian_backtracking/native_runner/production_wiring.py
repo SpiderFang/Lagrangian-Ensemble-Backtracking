@@ -1000,7 +1000,9 @@ def member_arrival_labels(arrival: Any) -> dict[str, object]:
     ``deposition_tide_class``／``deposition_tide_phase``／``deposition_high_wave``／
     ``deposition_strong_current`` 只在 input-build 已寫入沉底時刻標籤（WP-51 B 項，見
     ``deposition_labels`` 模組）時才出現，缺其中任何一個就整組省略，不以觀測時刻標籤
-    頂替。``observation_*`` 欄位保留舊的觀測時刻標籤供對照，**不可**用來分組解讀。
+    頂替；``deposition_wave_available`` 是第五個選用標籤（NWW 在沉底時刻是否有有效 Hs，
+    ``False`` 時 ``deposition_high_wave`` 不代表「沒有大浪」），存在就一併帶入。
+    ``observation_*`` 欄位保留舊的觀測時刻標籤供對照，**不可**用來分組解讀。
     """
 
     metadata = arrival.metadata
@@ -1020,6 +1022,8 @@ def member_arrival_labels(arrival: Any) -> dict[str, object]:
     if all(key in metadata for key in deposition_keys):
         for key in deposition_keys:
             labels[key] = metadata[key]
+        if "deposition_wave_available" in metadata:
+            labels["deposition_wave_available"] = metadata["deposition_wave_available"]
     return labels
 
 
