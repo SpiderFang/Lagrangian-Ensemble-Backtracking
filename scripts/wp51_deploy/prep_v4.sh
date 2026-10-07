@@ -35,7 +35,13 @@ record_provenance_pre
 cd "$CODE"
 
 log "[1/3] 建立 v4 母體與 release suite：$DEST"
-time "$LBT" horizon-suite-create \
+# release config 建立時 validator 會讀「環境變數指到的資料根目錄」；v4_env.sh 為執行階段設的是
+# lbt-local-data（只暫存 2024-07 起的月份，且含符號連結），inventory 卻涵蓋 2024-01 起，會讓
+# validator 回報 source_unreadable:ocm_native:FileNotFoundError（run05b 的實際失敗）。母體建置本來就
+# 只用下面三個 --*-root 參數指向 /data（與 v3 的 build_v3.sh 一致、不設這些環境變數），所以這裡只對
+# 這一個指令取消設定；後面 native-plan 仍用 v4_env.sh 的 local-data。
+time env -u OCM_NATIVE_ROOT -u NWW_ANALYSIS_ROOT -u OCM_RECONSTRUCTION_ROOT -u OCM_SURFACE_ROOT \
+  "$LBT" horizon-suite-create \
   --config-template "$TEMPLATE" \
   --backtrack-days 30 60 90 \
   --destination "$DEST" \
