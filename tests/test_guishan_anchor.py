@@ -114,8 +114,8 @@ def test_guishan_core_and_local_domain_keep_safe_distance_from_flow_domain() -> 
     assert local_gap_m > 7_000.0
 
 
-def test_guishan_anchor_moved_from_land_by_about_one_point_three_km() -> None:
-    """新舊錨點的距離符合推導紀錄（約 1,288 m），確認沒有誤用其他候選面。"""
+def test_guishan_anchor_moved_from_land_by_about_one_point_five_km() -> None:
+    """新舊錨點的距離符合推導紀錄（約 1,490 m），確認沒有誤用其他候選面。"""
 
     site, _ = _guishan(FORMAL_CONFIG)
     projection = DomainProjection(*A_CENTER_LON_LAT)
@@ -158,7 +158,7 @@ def test_current_design_requires_anchor_policy_and_corridor_membership(
         ProjectConfig.model_validate(payload)
 
     # 走廊外的點即使通過 anchor exact 檢核（此處同步改寫常數表以隔離這一項），仍須被擋。
-    outside = (121.99, 24.845304)
+    outside = (121.99, 24.850326)
     payload = _payload()
     _site(payload)["anchor_lonlat"] = list(outside)
     monkeypatch.setattr(
@@ -309,3 +309,57 @@ def test_guishan_anchor_provenance_is_json_serializable() -> None:
     provenance = (site.model_extra or {})["anchor_snap_provenance"]
     encoded = json.dumps(copy.deepcopy(provenance), sort_keys=True)
     assert json.loads(encoded) == provenance
+
+
+# ── WP-51 整合：錨點距校閱海岸陸地至少 500 m ─────────────────────────────────
+
+
+def test_guishan_anchor_provenance_records_min_land_distance() -> None:
+    """推導紀錄保存最小離岸距離規則與實測值：≥ 500 m，且新舊錨點是不同的網格面。"""
+
+    site, _ = _guishan(FORMAL_CONFIG)
+    provenance = (site.model_extra or {})["anchor_snap_provenance"]
+    assert provenance["min_land_distance_m"] == 500
+    assert provenance["distance_to_land_m"] >= provenance["min_land_distance_m"]
+    # 原先「只要求不在陸地內」的版本選到全域面 486610（距陸地 146 m），不得再是錨點。
+    assert provenance["snapped_source_face_global_index"] == 493182
+    assert provenance["snapped_source_face_local_index"] == 114356
+    assert provenance["distance_to_candidate_region_boundary_m"] >= provenance["boundary_margin_m"]
+    assert tuple(site.anchor_lonlat) == (121.939148, 24.850326)
+
+
+def _load_derive_script():
+    import importlib.util
+
+    path = ROOT / "scripts" / "derive_guishan_anchor.py"
+    spec = importlib.util.spec_from_file_location("derive_guishan_anchor_for_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_derive_script_requires_coastline_when_min_land_distance_positive(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """最小離岸距離大於 0 卻沒給海岸線時，腳本必須在讀任何資料前就報錯（不得靜默略過檢核）。"""
+
+    module = _load_derive_script()
+    base = [
+        "derive_guishan_anchor.py",
+        "--config", str(FORMAL_CONFIG),
+        "--arrival", "unused",
+        "--ocm-native-root", "unused",
+        "--ocm-surface-root", "unused",
+        "--nww-root", "unused",
+    ]
+    for extra in (["--min-land-distance-m", "500"], []):  # 預設值 500 同樣需要海岸線
+        monkeypatch.setattr("sys.argv", base + extra)
+        with pytest.raises(SystemExit) as exc:
+            module.main()
+        assert exc.value.code == 2
+        assert "--coastline" in capsys.readouterr().err
+    monkeypatch.setattr("sys.argv", base + ["--min-land-distance-m", "-1"])
+    with pytest.raises(SystemExit) as exc:
+        module.main()
+    assert exc.value.code == 2

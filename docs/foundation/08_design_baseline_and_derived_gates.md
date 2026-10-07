@@ -44,7 +44,7 @@
 | `study_site_id` | 中文名稱 | region | logical local_domain_id | 幾何政策 | anchor |
 |---|---|---|---|---|---|
 | `gongliao` | 貢寮 | A | `gongliao_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.9223889, 25.0964444]` |
-| `guishan` | 龜山島西側 | A | `guishan_west_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.939084, 24.845304]`（WP-51 C 由陸地錨點 `[121.951606, 24.843127]` 搬到島西側海上；`anchor_policy=snap_to_persistent_wet_mesh_within_priority_polygon`，座標寫死並於設定 `anchor_snap_provenance` 與受體 provenance 保存推導依據） |
+| `guishan` | 龜山島西側 | A | `guishan_west_local_domain_v1` | 本期 policy 的 anchor 公尺制半徑 20 km buffer 與靜態 OCM 海域 polygon 的交集 | `[121.939148, 24.850326]`（WP-51 C 由陸地錨點 `[121.951606, 24.843127]` 搬到島西側海上，WP-51 整合再要求距校閱海岸陸地至少 500 m（實測 579 m）；`anchor_policy=snap_to_persistent_wet_mesh_within_priority_polygon`，座標寫死並於設定 `anchor_snap_provenance` 與受體 provenance 保存推導依據） |
 | `hsinchu` | 新竹外海 | B | `hsinchu_flow_domain_v1` | local domain 與 flow domain 相同；受體候選為 `[120.45,24.75]` 半徑 12.5 km 核心與既有 local 候選區的交集 | `[120.45, 24.75]` |
 | `nanwan` | 南灣 | C | `houwan_flow_domain_v1` | local domain 與 flow domain 相同；forcing ID 保留歷史 houwan 名稱 | `[120.763161, 21.946577]` |
 | `lienchiang` | 連江 | D | `lienchiang_flow_domain_v1` | local domain 與 flow domain 相同 | flow-domain center 經 wet-mesh snap |

@@ -9,7 +9,12 @@
 3. 距離候選區邊界（走廊 ∩ 靜態海域 ∩ flow domain）至少 ``margin`` 公尺，
    ``margin`` = ``minimum_flow_domain_margin_local_grid_scales`` × OCM 三角形邊長中位數
    （與 ``prepare_horizontal_receptor_candidates`` 的 boundary margin 完全相同的定義）；
-4. 該點的 NWW 逐時四角支撐（exact-hour）在 50 個到達時刻皆有效。
+4. 該點的 NWW 逐時四角支撐（exact-hour）在 50 個到達時刻皆有效；
+5. （WP-51 整合新增）距離校閱海岸線的陸地至少 ``--min-land-distance-m`` 公尺（預設 500 m，
+   且不在陸地內）。先前的版本只要求「不在陸地內」，第一名候選離島岸只有 146 m，星號
+   貼著龜山島西岸；要求至少 500 m 後第一個符合者是離原錨點約 1.49 km、距陸地約 579 m
+   的面中心。距離以公尺制運算座標（以 flow domain 中心為圓心的等距方位投影）計算，
+   陸地取校閱海岸 GeoJSON 在原錨點周圍 0.5 度視窗內的多邊形。
 
 重用 ``receptors.rank_anchor_snap_candidates``（與正式受體候選池同一個 persistent-wet、
 覆蓋與邊界距離判定）排序，再逐一套用 NWW、OCM surface 與校閱海岸線檢核，取第一個全部
@@ -59,7 +64,16 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--check-surface", action="store_true")
     ap.add_argument("--coastline", default=None, help="校閱海岸 GeoJSON（CRS84）；提供時要求錨點不在陸地內")
+    ap.add_argument("--min-land-distance-m", type=float, default=500.0,
+                    help="錨點距校閱海岸線陸地的最小距離（公尺，預設 500；0 代表只要求不在陸地內）。"
+                         "大於 0 時必須提供 --coastline")
+    ap.add_argument("--max-examine", type=int, default=3000,
+                    help="最多逐一檢核幾個排序後的候選（預設 3000，涵蓋全部通過幾何篩選的候選）")
     args = ap.parse_args()
+    if args.min_land_distance_m < 0:
+        ap.error("--min-land-distance-m 不可為負")
+    if args.min_land_distance_m > 0 and not args.coastline:
+        ap.error("--min-land-distance-m 大於 0 時必須提供 --coastline")
 
     config = load_config(args.config)
     site = next(s for s in config.study_sites if s.study_site_id == "guishan")
@@ -121,7 +135,7 @@ def main() -> None:
             "dist_to_orig_anchor_m": c.distance_to_original_anchor_m,
             "dist_to_region_boundary_m": float(Point(c.x_m, c.y_m).distance(region_poly.boundary)),
         }
-        for c in ranked[: args.top]
+        for c in ranked[: args.max_examine]
     ]
     print(f"[info] 通過 persistent-wet+靜態海域+走廊+邊界距離 的候選面：{len(ranked)}", file=sys.stderr)
     n_candidates = len(ranked)
@@ -142,6 +156,8 @@ def main() -> None:
     out = []
     first_pass = None
     for rank, c in enumerate(cands):
+        if first_pass is not None and rank >= args.top:
+            break  # 已找到錨點，且已列出前 top 名供審查
         _hs, valid = idv._nww_exact_hour_samples(nww_cache, lon=c["lon"], lat=c["lat"], requested_times=times)
         c["nww_all_valid"] = bool(all(valid.get(t, False) for t in times))
         c["rank"] = rank
@@ -149,7 +165,12 @@ def main() -> None:
             p = Point(c["x"], c["y"])
             c["on_land_per_coastline"] = bool(land_metric.contains(p))
             c["distance_to_land_m"] = float(land_metric.distance(p))
-        if args.check_surface and c["nww_all_valid"] and first_pass is None and not c.get("on_land_per_coastline", False):
+            c["land_distance_ok"] = bool(
+                (not c["on_land_per_coastline"]) and c["distance_to_land_m"] >= args.min_land_distance_m
+            )
+        land_ok = c.get("land_distance_ok", True)
+        if (args.check_surface and c["nww_all_valid"] and first_pass is None
+                and land_ok and not c.get("on_land_per_coastline", False)):
             surface_root = Path(args.ocm_surface_root)
             sid = idv._resolve_flow_product_id(config, region, surface_root, formal=True)
             surf = idv._load_product(
@@ -159,7 +180,7 @@ def main() -> None:
             ok = all(np.isfinite(elev.get(t, float("nan"))) and np.isfinite(speed.get(t, float("nan"))) for t in times)
             c["surface_all_finite_at_arrivals"] = bool(ok)
         if (c["nww_all_valid"] and first_pass is None and c.get("surface_all_finite_at_arrivals", True)
-                and not c.get("on_land_per_coastline", False)):
+                and land_ok):
             first_pass = c
         out.append(c)
     # 輸出
@@ -167,6 +188,7 @@ def main() -> None:
         "original_anchor_lonlat": list(orig),
         "median_triangle_edge_m": median_edge,
         "margin_m": margin_m,
+        "min_land_distance_m": args.min_land_distance_m,
         "candidate_count": n_candidates,
         "top": out,
         "selected": first_pass,

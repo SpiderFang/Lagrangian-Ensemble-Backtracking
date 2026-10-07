@@ -36,7 +36,7 @@
 | 南灣 | C | 使用 `houwan_nmmba_cache_v3` C 區流場；`forcing` 產品 ID 保留歷史名稱，現行 study site 為 `nanwan` |
 | 連江 | D | 使用 D 流場區域 |
 
-現行五站 anchor（WGS84，經度／緯度）固定為：貢寮 `[121.9223889,25.0964444]`、龜山島 `[121.939084,24.845304]`（WP-51 C：由原陸地錨點 `[121.951606,24.843127]` 移到島西側海上，規則見下）、新竹 `[120.45,24.75]`、南灣 `[120.763161,21.946577]`、連江 `[119.95,26.2]`。正式母體五站的水平受體均由各站 persistent-wet/core 候選池以 `seeded_uniform_random_without_replacement_v1` 無放回抽樣；新竹 24 小時試跑的五個固定點只作歷史位置核對，不進 current formal。每個水平 face 再以獨立 stream 依 `seeded_uniform_random_open_interval_v1` 抽四個 `(0,1)` normalized fraction，random rank 不代表物理水層。C 區只改研究站 anchor 與名稱，不改 `houwan_nmmba_cache_v3` 的 `forcing bbox`。
+現行五站 anchor（WGS84，經度／緯度）固定為：貢寮 `[121.9223889,25.0964444]`、龜山島 `[121.939148,24.850326]`（WP-51 C 由原陸地錨點 `[121.951606,24.843127]` 移到島西側海上；WP-51 整合再加「距校閱海岸陸地至少 500 m」規則，實測 579 m，規則見下）、新竹 `[120.45,24.75]`、南灣 `[120.763161,21.946577]`、連江 `[119.95,26.2]`。正式母體五站的水平受體均由各站 persistent-wet/core 候選池以 `seeded_uniform_random_without_replacement_v1` 無放回抽樣；新竹 24 小時試跑的五個固定點只作歷史位置核對，不進 current formal。每個水平 face 再以獨立 stream 依 `seeded_uniform_random_open_interval_v1` 抽四個 `(0,1)` normalized fraction，random rank 不代表物理水層。C 區只改研究站 anchor 與名稱，不改 `houwan_nmmba_cache_v3` 的 `forcing bbox`。
 
 龜山島錨點搬移（WP-51 C）：舊錨點落在龜山島陸地內，改為「`receptor_priority_polygon` 走廊內離舊錨點最近、50 個到達時刻皆為濕（persistent-wet）、距候選區邊界不小於 2 倍網格尺度、NWW 與 OCM surface 支撐有效且不在校閱海岸陸地內的 OCM 原生網格面中心」。因 geometry 在到達時刻與濕乾資料載入前就需要錨點，座標寫死於設定（`anchor_policy: snap_to_persistent_wet_mesh_within_priority_polygon`），推導腳本為 `scripts/derive_guishan_anchor.py`，推導紀錄（原錨點、面編號、距離、候選數）保存在設定的 `anchor_snap_provenance`，並寫入受體 manifest 的 `priority_receptors_by_site.guishan`。12.5 km 受體核心與 20 km local domain 都以新錨點為圓心；貢寮錨點與幾何不變。
 

@@ -205,11 +205,13 @@ study_sites:
     #      即 60.3 m），使錨點本身也是 input-build 受體候選池的成員；
     #   5. 該點的 NWW 逐時四角支撐與 OCM surface 指標在 50 個到達時刻皆有效，且不在校閱
     #      海岸線的陸地內（與 WP-38 星號 anchor_on_sea 檢核同一份海岸線）；
-    #   6. 在通過上述檢核者中取離原錨點最近者（平面公尺距離 1,288 m）。
+    #   6. 距校閱海岸線的陸地至少 500 m（--min-land-distance-m，預設 500；僅「不在陸地內」
+    #      不足以避免星號貼著島岸，原版錨點距陸地僅 146 m 即因此被排除）；
+    #   7. 在通過上述檢核者中取離原錨點最近者（平面公尺距離 1,490 m；距陸地 578.8 m）。
     # 推導依據的母體：common_m10_v3 的 arrival.json（sha256 6bf8f6d4…，50 個龜山島到達時刻）。
     # 受體核心圓（12.5 km）與 local domain（20 km）都以此新錨點為圓心重建；貢寮錨點與幾何
     # 完全不變。anchor_lonlat 為面中心四捨五入至小數 6 位（約 0.1 m）。
-    anchor_lonlat: [121.939084, 24.845304]
+    anchor_lonlat: [121.939148, 24.850326]
     anchor_policy: snap_to_persistent_wet_mesh_within_priority_polygon
     anchor_snap_provenance:
       original_anchor_lonlat: [121.951606, 24.843127]
@@ -217,12 +219,16 @@ study_sites:
       derivation_script: scripts/derive_guishan_anchor.py
       source_flow_domain_id: northeast_taiwan_common_cache_v3
       source_arrival_manifest_sha256: 6bf8f6d4dd046fb2cf0ecf54bc05a53475f5502cb6f8ed23ec5d090e0db51c4a
-      snapped_source_face_global_index: 486610
-      snapped_source_face_local_index: 113232
-      snapped_face_center_lonlat_full_precision: [121.93908437093098, 24.845304489135742]
-      distance_from_original_anchor_m: 1288.4
+      snapped_source_face_global_index: 493182
+      snapped_source_face_local_index: 114356
+      snapped_face_center_lonlat_full_precision: [121.93914794921875, 24.85032590230306]
+      distance_from_original_anchor_m: 1490.5
       candidate_face_count_before_ranking: 2967
       boundary_margin_m: 60.3
+      distance_to_candidate_region_boundary_m: 86.1
+      min_land_distance_m: 500
+      distance_to_land_m: 578.8
+      land_distance_reference: reviewed_coastline_taiwan_geojson_planar_aeqd_m
     receptor_core_radius_m: 12500
     local_domain_baseline_radius_m: 20000
     local_domain_sensitivity_radii_m: []

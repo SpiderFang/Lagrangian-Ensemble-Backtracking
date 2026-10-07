@@ -164,12 +164,14 @@ LEGACY_FORMAL_STUDY_SITE_IDS = frozenset(
 # 釋放在島西側約 6 km 外，故改為海上點。新 anchor 是 ``scripts/derive_guishan_anchor.py``
 # 以伺服器真實 OCM 網格（northeast_taiwan_common_cache_v3）離線推導出的「走廊內離舊
 # anchor 最近、50 個到達時刻皆濕、距候選區邊界至少兩倍網格尺度、NWW／OCM surface
-# 支撐有效且不在校閱海岸陸地內」的原生網格面中心，座標四捨五入到小數 6 位（約 0.1 m）。
+# 支撐有效且距校閱海岸陸地至少 500 m」的原生網格面中心（最小離岸距離為 WP-51 整合新增：
+# 原版只要求「不在陸地內」，所選點距島岸僅 146 m，星號仍貼岸），座標四捨五入到小數 6 位
+# （約 0.1 m）。新錨點距舊陸地錨點 1,490 m、距陸地 579 m。
 # 這是寫死的座標而非執行期 snap：geometry 在 arrival 與 wetdry 載入前就需要 anchor，
 # 寫死可讓 local domain、受體核心、星號與 NWW 指標位置都用同一個可審計的值。
 FORMAL_STUDY_SITE_ANCHORS_LON_LAT = {
     "gongliao": (121.9223889, 25.0964444),
-    "guishan": (121.939084, 24.845304),
+    "guishan": (121.939148, 24.850326),
     "hsinchu": (120.45, 24.75),
     "nanwan": (120.763161, 21.946577),
     "lienchiang": (119.95, 26.2),
