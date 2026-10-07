@@ -344,6 +344,26 @@ WP-38 在 :meth:`PostprocessAccumulator.add_batch` 內另外以串流方式累�
    原始分類欄位，目前唯一有這個非終止事件的兩站（貢寮、龜山島）粒子數遠小於
    主表的五站規模，若確實需要方位／弧段細分，應由 report 層直接從這份原始表
    聚合，而不是在 WP-23 這個縮小範圍的子任務裡再造一組平行表。
+
+WP-51 B2：沉底時刻標籤與觀測時刻標籤的分組統計
+----------------------------------------------
+上面「不做的事」第 2 點的四個一維分組表維持原樣（``boundary_flux_by_season`` 的季節本來就是
+以 ``identity_table.arrival_time_utc_ns``，亦即沉底時刻計算）。per_member 的粒子身分表另帶
+逐粒子標籤（見 ``production_wiring.member_arrival_labels``）時，本模組額外輸出：
+
+- ``boundary_flux_by_deposition_{season,tide_class,tide_phase,high_wave,strong_current}``：
+  依**沉底時刻**標籤分組，這是潮汐／事件分組的結論依據。標籤在 input-build 階段以沉底 UTC 計算
+  （規則見 ``deposition_labels``），postprocess 讀不到原始流場，只從身分表取用。
+- ``boundary_flux_by_observation_{season,tide_class,phase_or_event}``：依觀測錨點被選出時的舊標籤
+  分組，僅供與舊版結果對照；觀測時刻與沉底時刻相差最多 90 天，標籤與軌跡沒有物理關聯。
+- 以上每張另有逐站版 ``boundary_flux_by_site_<欄名>``（大小潮與事件門檻都是逐站定義）。
+- 每張表都含各組粒子數 ``total_particle_count`` 與占比（合併表 ``particle_fraction_of_total``、
+  逐站表 ``particle_fraction_within_site``），因為分組不平衡（例如事件旗標約佔 5%）。
+- ``departures.parquet``／``local_domain_departures.parquet`` 在既有欄位之後附上全部標籤欄，
+  供下游自行重新聚合。
+- ``manifest.json`` 的 ``config`` 多出 ``label_group_summary``（各組粒子數與占比）等欄位。
+
+沒有標籤的身分表（per_observation 既有流程）不輸出上述任何新表／新欄，既有輸出逐位元不變。
 """
 
 from __future__ import annotations
@@ -1037,6 +1057,132 @@ def _seasons_for_arrival(identity_table: ParticleIdentityTable) -> np.ndarray:
     months = utc_ns.astype("datetime64[ns]").astype("datetime64[M]").astype(np.int64) % 12 + 1
     season_by_month_index = np.array([SEASON_BY_MONTH[month] for month in range(1, 13)])
     return season_by_month_index[months - 1]
+
+
+# ── WP-51 B2：逐粒子標籤（沉底時刻／觀測時刻）欄位與分組統計 ───────────────
+
+_LABEL_GROUPING_COLUMNS_DEPOSITION: tuple[str, ...] = (
+    "deposition_season",
+    "deposition_tide_class",
+    "deposition_tide_phase",
+    "deposition_high_wave",
+    "deposition_strong_current",
+)
+_LABEL_GROUPING_COLUMNS_OBSERVATION: tuple[str, ...] = (
+    "observation_season",
+    "observation_tide_class",
+    "observation_phase_or_event",
+)
+"""WP-51 B2 的分組欄位名（同時是統計表的第一欄欄名與表名後綴）。``deposition_*`` 是以
+**沉底時刻**（粒子回溯起點）計算的標籤，是結論依據；``observation_*`` 是觀測錨點被選出時
+的舊標籤，與粒子軌跡沒有物理關聯，只保留供對照，不可用來解讀軌跡。"""
+
+LABEL_FLUX_TABLE_NOTE_ZH = (
+    "deposition_* 分組以粒子的沉底時刻（回溯起點）標註，是潮汐／事件分組的依據；"
+    "observation_* 分組沿用觀測錨點選出時的標籤，沉底時刻與觀測時刻相差最多 90 天，"
+    "兩者沒有物理關聯，僅供與舊版結果對照。分組粒子數不平衡，解讀比例時必須同時看 "
+    "total_particle_count 與 particle_fraction_of_total。"
+)
+
+
+def _label_pyarrow_type(array: np.ndarray) -> pa.DataType:
+    """逐粒子標籤陣列 dtype → Parquet 欄位型別（字串／布林／int64）。"""
+
+    kind = array.dtype.kind
+    if kind == "U":
+        return pa.string()
+    if kind == "b":
+        return pa.bool_()
+    if kind == "i":
+        return pa.int64()
+    raise PostprocessError(f"不支援的標籤 dtype：{array.dtype}")
+
+
+def _label_columns_for_identity(
+    identity_table: ParticleIdentityTable,
+) -> tuple[tuple[str, np.ndarray, pa.DataType], ...]:
+    """依標籤名稱排序回傳 ``(欄名, 陣列, 型別)``；沒有標籤時回傳空 tuple。
+
+    標籤欄名不得與離開紀錄表既有欄位同名（否則會悄悄覆蓋既有欄位），撞名一律 fail-closed。
+    """
+
+    labels = identity_table.labels
+    if labels is None:
+        return ()
+    reserved = {field.name for field in DEPARTURE_TABLE_SCHEMA} | {
+        field.name for field in LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA
+    }
+    columns: list[tuple[str, np.ndarray, pa.DataType]] = []
+    for name in sorted(labels):
+        if name in reserved:
+            raise PostprocessError(f"標籤欄名 {name!r} 與離開紀錄表既有欄位同名")
+        array = labels[name]
+        columns.append((name, array, _label_pyarrow_type(array)))
+    return tuple(columns)
+
+
+def _label_groupings(labels: Mapping[str, np.ndarray]) -> list[tuple[str, np.ndarray]]:
+    """由逐粒子標籤組出分組統計用的 ``(分組欄名, 字串分組值)``，順序固定。
+
+    布林事件旗標轉成可讀字串；``deposition_wave_available`` 存在時，NWW 在沉底時刻沒有有效
+    Hs 的粒子獨立成 ``wave_unavailable`` 組，不與「沒有大浪」混在一起。
+    """
+
+    groupings: list[tuple[str, np.ndarray]] = []
+    for name in _LABEL_GROUPING_COLUMNS_DEPOSITION:
+        if name not in labels:
+            continue
+        values = labels[name]
+        if name == "deposition_high_wave":
+            grouped = np.where(values, "high_wave", "not_high_wave")
+            if "deposition_wave_available" in labels:
+                grouped = np.where(labels["deposition_wave_available"], grouped, "wave_unavailable")
+            groupings.append((name, grouped))
+        elif name == "deposition_strong_current":
+            groupings.append((name, np.where(values, "strong_current", "not_strong_current")))
+        else:
+            groupings.append((name, values))
+    for name in _LABEL_GROUPING_COLUMNS_OBSERVATION:
+        if name in labels:
+            groupings.append((name, labels[name]))
+    return groupings
+
+
+def _insert_share_column(table: pa.Table, denominator: int, name: str) -> pa.Table:
+    """在 ``total_particle_count`` 之後插入「該組粒子數 ÷ denominator」欄。"""
+
+    position = table.schema.get_field_index("total_particle_count") + 1
+    totals = table.column("total_particle_count").to_numpy()
+    return table.add_column(position, name, pa.array(totals.astype(np.float64) / float(denominator)))
+
+
+def _label_flux_table(
+    group_values: np.ndarray, group_column_name: str, final_status: np.ndarray
+) -> pa.Table:
+    """標籤分組的邊界通量表：既有欄位＋各組占全部粒子的比例 ``particle_fraction_of_total``。"""
+
+    table = _flux_table_for_grouping(group_values, group_column_name, final_status)
+    return _insert_share_column(table, int(final_status.shape[0]), "particle_fraction_of_total")
+
+
+def _label_flux_table_by_site(
+    site_values: np.ndarray,
+    group_values: np.ndarray,
+    group_column_name: str,
+    final_status: np.ndarray,
+) -> pa.Table:
+    """逐站再分組的標籤通量表（標籤的大小潮、事件門檻都是逐站定義，分組在站內才可比）。
+
+    每站各算一次，附 ``particle_fraction_within_site``（該組占該站全部粒子的比例）。
+    """
+
+    tables: list[pa.Table] = []
+    for site in np.unique(site_values):
+        mask = site_values == site
+        table = _flux_table_for_grouping(group_values[mask], group_column_name, final_status[mask])
+        table = table.add_column(0, "study_site_id", pa.array([str(site)] * table.num_rows))
+        tables.append(_insert_share_column(table, int(mask.sum()), "particle_fraction_within_site"))
+    return pa.concat_tables(tables)
 
 
 def _write_table_with_csv(table: pa.Table, output_dir: Path, stem: str) -> None:
@@ -1927,6 +2073,17 @@ class PostprocessAccumulator:
                     self._local_equals_flow_by_site[site_id] = bool(geometry.local_equals_flow)
 
         self._season = _seasons_for_arrival(identity_table)
+        # WP-51 B2：逐粒子標籤（per_member 身分表才有；per_observation 為 None，輸出完全不變）。
+        self._label_columns = _label_columns_for_identity(identity_table)
+        self._label_group_summary: dict[str, Any] | None = None
+        self._departure_schema = DEPARTURE_TABLE_SCHEMA
+        self._local_departure_schema = LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA
+        if self._label_columns:
+            label_fields = [
+                pa.field(name, kind, nullable=False) for name, _array, kind in self._label_columns
+            ]
+            self._departure_schema = pa.schema([*DEPARTURE_TABLE_SCHEMA, *label_fields])
+            self._local_departure_schema = pa.schema([*LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA, *label_fields])
         self._depth_quartile = _assign_depth_quartile(
             identity_table, bin_count=self._config.depth_quartile_count
         )
@@ -1973,12 +2130,12 @@ class PostprocessAccumulator:
 
         departure_path = self._output_dir / "departures.parquet"
         self._departure_path = departure_path
-        self._departure_writer = pq.ParquetWriter(str(departure_path), DEPARTURE_TABLE_SCHEMA)
+        self._departure_writer = pq.ParquetWriter(str(departure_path), self._departure_schema)
 
         local_departure_path = self._output_dir / "local_domain_departures.parquet"
         self._local_departure_path = local_departure_path
         self._local_departure_writer = pq.ParquetWriter(
-            str(local_departure_path), LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA
+            str(local_departure_path), self._local_departure_schema
         )
 
     # -- 批次寫入 ---------------------------------------------------------
@@ -2293,7 +2450,9 @@ class PostprocessAccumulator:
             "boundary_arc_segment_index": pa.array(arc_indices, type=pa.int32()),
             "boundary_arc_length_position_m": pa.array(arc_positions_m, type=pa.float64()),
         }
-        table = pa.table(columns, schema=DEPARTURE_TABLE_SCHEMA)
+        for name, array, _kind in self._label_columns:
+            columns[name] = pa.array(array[rows])
+        table = pa.table(columns, schema=self._departure_schema)
         self._departure_writer.write_table(table)
 
     def _write_local_domain_departure_batch(self, rows: np.ndarray, result: BackwardDriverResult) -> None:
@@ -2415,7 +2574,9 @@ class PostprocessAccumulator:
             "local_boundary_arc_segment_index": pa.array(arc_indices, type=pa.int32()),
             "local_boundary_arc_length_position_m": pa.array(arc_positions_m, type=pa.float64()),
         }
-        table = pa.table(columns, schema=LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA)
+        for name, array, _kind in self._label_columns:
+            columns[name] = pa.array(array[local_global_rows])
+        table = pa.table(columns, schema=self._local_departure_schema)
         self._local_departure_writer.write_table(table)
 
     def _update_trajectory_samples(self, rows: np.ndarray, result: BackwardDriverResult) -> None:
@@ -2524,6 +2685,13 @@ class PostprocessAccumulator:
             "peak_rss_kib": peak_rss_kib,
         }
 
+        label_config: dict[str, Any] = {}
+        if self._label_group_summary is not None:
+            label_config = {
+                "label_flux_tables_note_zh": LABEL_FLUX_TABLE_NOTE_ZH,
+                "label_group_summary": self._label_group_summary,
+                "label_columns_in_departures": [name for name, _array, _kind in self._label_columns],
+            }
         manifest = PostprocessManifest(
             experiment_case_id=self._identity_table.experiment_case_id,
             master_seed=self._identity_table.master_seed,
@@ -2594,6 +2762,7 @@ class PostprocessAccumulator:
                     "summary_by_site.parquet 的 local_first_exit_source 欄位，逐站標出分子來源）。"
                 ),
                 "local_equals_flow_by_site": dict(self._local_equals_flow_by_site),
+                **label_config,
             },
             kde_bandwidth_method=(
                 "scipy.stats.gaussian_kde 預設 Scott 法則（factor = n**(-1/(d+4))，d=2），"
@@ -2637,6 +2806,9 @@ class PostprocessAccumulator:
             table = _flux_table_for_grouping(values, column_name, self._final_status)
             _write_table_with_csv(table, self._output_dir, stem)
 
+        if self._label_columns:
+            self._write_label_flux_tables()
+
         if self._boundary_geometries is not None:
             by_site_table = _boundary_entry_table(
                 self._boundary_entry_counts_by_site, ("study_site_id",)
@@ -2652,6 +2824,38 @@ class PostprocessAccumulator:
             self._write_boundary_subdivision_tables()
 
         self._write_site_summary_table()
+
+    def _write_label_flux_tables(self) -> None:
+        """WP-51 B2：輸出依沉底時刻／觀測時刻標籤分組的邊界通量表（每張同時寫 Parquet 與 CSV）。
+
+        每個分組欄各兩張：全站合併的 ``boundary_flux_by_<欄名>`` 與逐站的
+        ``boundary_flux_by_site_<欄名>``。兩者都帶各組粒子數（``total_particle_count``）與占比
+        （合併表是 ``particle_fraction_of_total``，逐站表是 ``particle_fraction_within_site``）；
+        分組本來就不平衡（例如事件旗標只佔約 5%），沒有粒子數與占比就無法判斷某組的比例估計
+        是否可靠。既有 ``boundary_flux_by_season``（以 ``arrival_time_utc_ns`` 即沉底時刻計季節）
+        完全不動。
+        """
+
+        labels = self._identity_table.labels
+        assert labels is not None  # 呼叫端已確認 self._label_columns 非空
+        sites = self._identity_table.study_site_id
+        summary: dict[str, Any] = {}
+        for column_name, values in _label_groupings(labels):
+            table = _label_flux_table(values, column_name, self._final_status)
+            _write_table_with_csv(table, self._output_dir, f"boundary_flux_by_{column_name}")
+            by_site = _label_flux_table_by_site(sites, values, column_name, self._final_status)
+            _write_table_with_csv(by_site, self._output_dir, f"boundary_flux_by_site_{column_name}")
+            groups = table.column(column_name).to_pylist()
+            counts = table.column("total_particle_count").to_pylist()
+            fractions = table.column("particle_fraction_of_total").to_pylist()
+            summary[column_name] = {
+                "groups": {
+                    str(group): {"particle_count": int(count), "particle_fraction_of_total": float(fraction)}
+                    for group, count, fraction in zip(groups, counts, fractions, strict=True)
+                },
+                "smallest_group_particle_count": int(min(counts)),
+            }
+        self._label_group_summary = summary
 
     def _write_boundary_subdivision_tables(self) -> None:
         """輸出 WP-20 開放邊界再細分（方位扇區／沿邊界弧長位置）的統計表與幾何表。

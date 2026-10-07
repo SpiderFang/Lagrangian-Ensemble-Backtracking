@@ -87,6 +87,7 @@ from .config import (
     load_config,
     resolve_flow_domain_id,
 )
+from .deposition_label_arrivals import DEPOSITION_LABEL_PROVENANCE_KEY, attach_deposition_labels
 from .gap_policy import (
     APPROVED_OCM_HYBRID_RECONSTRUCTION_POLICY_ID,
     EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID,
@@ -5602,6 +5603,7 @@ def _arrival_payload(
     strict: bool,
     horizon_settings: HorizonSettings | None = None,
     pilot_selection: Mapping[str, Any] | None = None,
+    deposition_label_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """將 ArrivalTime dataclass 轉成 strict schema 1 manifest。
 
@@ -5609,6 +5611,10 @@ def _arrival_payload(
     ``selection_method_id`` 與 provenance，並由單筆 record metadata 保存原／替換 identity。
     因此 artifact hash、release binding 與 run-create 仍可沿用既有 loader，而 formal
     arrival strata loader 會因 pilot-only 非潮汐標籤明確拒絕升格。
+
+    ``deposition_label_provenance``（WP-51 B）只用於 per_member：每筆沉底 arrival metadata 已帶
+    ``deposition_*`` 標籤時，由 ``attach_deposition_labels`` 回傳的標註模型描述（政策、門檻、
+    各（年, 季）格潮汐強度中位數）寫進 root provenance，供 loader 與事後稽核重算。
     """
 
     bed_config = config.scenarios.bed_residence_time
@@ -5727,6 +5733,8 @@ def _arrival_payload(
                 horizon_settings=horizon_settings,
                 arrivals=arrivals,
             )
+            if deposition_label_provenance is not None:
+                provenance_extra[DEPOSITION_LABEL_PROVENANCE_KEY] = dict(deposition_label_provenance)
         metadata_rows = [
             item.metadata
             for item in arrivals
@@ -7699,6 +7707,7 @@ def build_input_derivatives(
     all_arrivals = tuple(item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site])
     if len(all_arrivals) != EXPECTED_ARRIVAL_COUNT:
         raise InputDerivationError(f"arrival 應有 250 筆，實際 {len(all_arrivals)}")
+    deposition_label_provenance: dict[str, Any] | None = None
     if bed_residence is not None:
         # 五站先各完成 50 筆 observation-anchor selector，A 區的 paired UTC 也已定案；
         # 現在才依單一 seed 產生共用的 50 個整點沉底年齡，並把 runtime 起點轉為沉底 UTC。
@@ -7725,6 +7734,15 @@ def build_input_derivatives(
             all_arrivals = tuple(
                 item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site]
             )
+            if _per_member_count(config) is not None:
+                # WP-51 B：每筆沉底 arrival 以「沉底 UTC」計算大小潮、潮相與事件旗標，寫進
+                # metadata（隨 arrival.json 與粒子身分表流到後處理）。序列直接取 arrival selector
+                # 已讀入的各站 OCM／NWW 字典，不另外讀流場；理由見 deposition_label_arrivals。
+                deposition_label_provenance = attach_deposition_labels(
+                    arrivals_by_site,
+                    arrival_contexts,
+                    tidal_strength_window_hours=selection_tidal_strength_window_hours,
+                )
         except Exception as exc:
             raise InputDerivationError(
                 f"random bed-residence observation-to-deposition transformation failed: "
@@ -7786,6 +7804,7 @@ def build_input_derivatives(
         strict=strict_mode,
         horizon_settings=horizon_settings,
         pilot_selection=pilot_selection,
+        deposition_label_provenance=deposition_label_provenance,
     )
     dynamic_payload = _dynamic_initial_payload(
         config=config,
