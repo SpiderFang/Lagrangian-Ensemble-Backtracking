@@ -1058,6 +1058,18 @@ def _native_run_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--worker-count", type=int)
     parser.add_argument(
+        "--unit-costs",
+        type=Path,
+        default=None,
+        help=(
+            "（WP-51）JSON 檔 {unit_id: 預估成本（任意單位，只比大小）}，覆寫計畫檔內建的"
+            " manifest.extra.unit_costs，只影響「動態佇列的提交順序」（成本由大到小）；"
+            "不改變任何工作單元、粒子、seed 或物理結果。必須涵蓋計畫檔的每一個工作單元且不得有"
+            "計畫檔以外的 ID，否則 fail-closed。用途：以實測單位成本把真正長的分段排在前面，"
+            "縮短長尾（見 scripts/wp51_deploy/make_unit_costs_v4.py）"
+        ),
+    )
+    parser.add_argument(
         "--auto-worker-count", action="store_true", help="依可用記憶體與 CPU 數自動估算 worker 數"
     )
     parser.add_argument("--per-worker-memory-bytes", type=int, help="--auto-worker-count 時必須提供")
@@ -1539,6 +1551,8 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
     unit_costs: Mapping[str, float] | None = None
     if isinstance(raw_unit_costs, Mapping):
         unit_costs = {str(k): float(v) for k, v in raw_unit_costs.items()}
+    if getattr(args, "unit_costs", None) is not None:
+        unit_costs = load_unit_costs_override(args.unit_costs, [u.unit_id for u in units])
 
     staged_kwargs: dict[str, Any] = {}
     if args.wait_for_staged is not None:
@@ -1560,6 +1574,36 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
     report["worker_count"] = worker_count
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if summary.all_succeeded else 2
+
+
+def load_unit_costs_override(path: Path, plan_unit_ids: Sequence[str]) -> dict[str, float]:
+    """讀取 ``native-run --unit-costs`` 的成本覆寫檔（只影響提交順序），嚴格核對。
+
+    JSON 必須是 ``{unit_id: 有限、非負的數值}``，鍵集合必須與計畫檔的工作單元 ID 集合
+    完全相同（缺少或多出都 ``ValueError``）；這樣覆寫檔不可能默默只排序一部分單元，
+    也不可能夾帶計畫檔以外的單元。
+    """
+
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise ValueError("--unit-costs 必須是 {unit_id: 成本} 的 JSON 物件")
+    costs: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"--unit-costs 的成本必須是數值：{key!r}")
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"--unit-costs 的成本必須是有限且非負：{key!r}")
+        costs[str(key)] = number
+    expected = set(plan_unit_ids)
+    missing = sorted(expected - set(costs))
+    extra = sorted(set(costs) - expected)
+    if missing or extra:
+        raise ValueError(
+            f"--unit-costs 的單元集合與計畫檔不一致：缺少 {len(missing)} 個、多出 {len(extra)} 個"
+            f"（例：缺少 {missing[:2]}、多出 {extra[:2]}）"
+        )
+    return costs
 
 
 def run_native_status(argv: Sequence[str] | None = None) -> int:

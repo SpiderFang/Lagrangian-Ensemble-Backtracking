@@ -1720,3 +1720,94 @@ def test_native_run_without_bed_no_deposition_field_is_unaffected(tmp_path, monk
         pytest.fail("舊計畫檔（沒有 bed_no_deposition 欄位）不應該觸發 WP-28 的比對")
     except Exception:
         pass  # 其餘失敗（例如 provider 不合法）不是本測試要驗證的範圍。
+
+
+# ── WP-51：native-run --unit-costs（只改提交順序的成本覆寫） ──────────────────────────
+
+
+def test_load_unit_costs_override_accepts_exact_unit_set_and_rejects_mismatch(tmp_path) -> None:
+    import json
+
+    import pytest
+
+    from lagrangian_backtracking.cli import load_unit_costs_override
+
+    ids = ["hourmajor::a__seg0of2__x", "hourmajor::a__seg1of2__y", "hourmajor::b__seg0of1__z"]
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({ids[0]: 3.5, ids[1]: 10, ids[2]: 0}), encoding="utf-8")
+    assert load_unit_costs_override(good, ids) == {ids[0]: 3.5, ids[1]: 10.0, ids[2]: 0.0}
+
+    def write(name: str, payload: object):
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    with pytest.raises(ValueError, match="缺少 1"):
+        load_unit_costs_override(write("missing.json", {ids[0]: 1, ids[1]: 2}), ids)
+    with pytest.raises(ValueError, match="多出 1"):
+        load_unit_costs_override(write("extra.json", {**{i: 1 for i in ids}, "other": 2}), ids)
+    with pytest.raises(ValueError, match="非負"):
+        load_unit_costs_override(write("neg.json", {**{i: 1 for i in ids}, ids[0]: -1}), ids)
+    with pytest.raises(ValueError, match="數值"):
+        load_unit_costs_override(write("str.json", {**{i: 1 for i in ids}, ids[0]: "9"}), ids)
+    with pytest.raises(ValueError, match="JSON 物件"):
+        load_unit_costs_override(write("list.json", [1, 2, 3]), ids)
+
+
+def test_native_run_parser_accepts_unit_costs_option(tmp_path) -> None:
+    from lagrangian_backtracking.cli import _native_run_parser
+
+    args = _native_run_parser().parse_args(
+        [
+            str(tmp_path / "plan.json"),
+            "--output",
+            str(tmp_path / "out"),
+            "--resource-provider",
+            "m:f",
+            "--worker-count",
+            "2",
+            "--unit-costs",
+            str(tmp_path / "costs.json"),
+        ]
+    )
+    assert args.unit_costs == tmp_path / "costs.json"
+    default = _native_run_parser().parse_args(
+        [str(tmp_path / "p.json"), "--output", str(tmp_path / "o"), "--resource-provider", "m:f"]
+    )
+    assert default.unit_costs is None
+
+
+def test_make_unit_costs_v4_smooths_neighbours_and_rejects_unmatched() -> None:
+    import importlib.util
+    import sys
+
+    import pytest
+
+    spec = importlib.util.spec_from_file_location(
+        "make_unit_costs_v4", Path(__file__).resolve().parents[1] / "scripts" / "wp51_deploy" / "make_unit_costs_v4.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["make_unit_costs_v4"] = module
+    spec.loader.exec_module(module)
+
+    rows = [
+        {
+            "experiment_case_id": "c",
+            "flow_domain_id": "d",
+            "segment_index": str(i),
+            "segment_count": "5",
+            "elapsed_seconds_this_invocation": str(100.0 * (i + 1)),
+        }
+        for i in range(5)
+    ]
+    ids = [f"hourmajor::d__seg{i}of5__abc{i}" for i in range(5)]
+    costs = module.build_unit_costs(ids, rows, "c", window=1, scale=2.0)
+    # 第 0 段：(100+200)/2×2；第 2 段：(200+300+400)/3×2
+    assert costs[ids[0]] == pytest.approx(300.0)
+    assert costs[ids[2]] == pytest.approx(600.0)
+    with pytest.raises(ValueError, match="段數"):
+        module.build_unit_costs(["hourmajor::d__seg0of9__abc"], rows, "c")
+    with pytest.raises(ValueError, match="沒有案例"):
+        module.build_unit_costs(ids, rows, "other")
+    with pytest.raises(ValueError, match="無法解析"):
+        module.build_unit_costs(["not-a-unit"], rows, "c")
