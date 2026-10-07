@@ -248,6 +248,7 @@ __all__ = [
     "load_hour_major_checkpoint",
     "hour_major_config_to_backward_driver_config",
     "validate_diffusion_scheme",
+    "diffusion_scheme_signature",
 ]
 
 
@@ -362,6 +363,71 @@ def validate_diffusion_scheme(config: HourMajorConfig) -> None:
         np.isfinite(config.kz_constant_m2ps) and config.kz_constant_m2ps > 0.0
     ):
         raise HourMajorError("kz_constant_m2ps 必須是有限的正值")
+
+
+# WP-51 整合：續跑檢查點必須綁定擴散組態。正式預設已從舊的「高斯水平擴散、無垂向擴散」
+# 改成「均勻雜訊＋常數垂向擴散」，若用新程式續跑舊 checkpoint（或中途改了環境變數），同一批
+# 粒子的前半段與後半段會用不同的隨機漫步而沒有任何警告，因此 checkpoint 的 meta 記下下列
+# 簽章，載入時逐項比對，不一致就明確報錯、拒絕續跑。
+_DIFFUSION_SCHEME_COMPARED_KEYS: tuple[str, ...] = (
+    "diffusion_noise",
+    "vertical_diffusion",
+    "kz_constant_m2ps",
+    "visser_correction",
+)
+# 本欄位新增之前寫出的 checkpoint 沒有簽章；它們只可能出自「高斯水平擴散、關閉垂向擴散、
+# 無 Visser 修正」的舊程式，所以缺簽章的 checkpoint 視為這一組。
+_LEGACY_DIFFUSION_SCHEME: dict[str, Any] = {
+    "diffusion_noise": "gaussian",
+    "vertical_diffusion": "off",
+    "kz_constant_m2ps": None,
+    "visser_correction": False,
+}
+
+
+def diffusion_scheme_signature(config: HourMajorConfig) -> dict[str, Any]:
+    """checkpoint 用的擴散組態簽章：雜訊型態、垂向擴散、常數 Kz、Visser 修正與水平擴散開關。
+
+    ``kz_constant_m2ps`` 只在 ``vertical_diffusion == "constant"`` 時記錄數值，其餘為 ``None``，
+    讓「關閉垂向擴散」的簽章不受預設 Kz 影響。``enable_diffusion`` 一併記錄，但只在 checkpoint
+    本身有記錄時才比對（舊 checkpoint 沒有這一項）。
+    """
+
+    return {
+        "diffusion_noise": config.diffusion_noise,
+        "vertical_diffusion": config.vertical_diffusion,
+        "kz_constant_m2ps": (
+            float(config.kz_constant_m2ps) if config.vertical_diffusion == "constant" else None
+        ),
+        "visser_correction": bool(config.visser_correction),
+        "enable_diffusion": bool(config.enable_diffusion),
+    }
+
+
+def _require_checkpoint_diffusion_scheme(
+    meta: Mapping[str, Any], expected: Mapping[str, Any], *, meta_path: Path
+) -> None:
+    """核對 checkpoint 記錄的擴散組態與目前執行是否一致；不一致即 fail closed。"""
+
+    recorded = meta.get("diffusion_scheme")
+    legacy = recorded is None
+    if legacy:
+        recorded = dict(_LEGACY_DIFFUSION_SCHEME)
+    keys = list(_DIFFUSION_SCHEME_COMPARED_KEYS)
+    if not legacy:
+        keys.append("enable_diffusion")
+    problems = [
+        f"{key}：checkpoint={recorded.get(key)!r}，本次執行={expected.get(key)!r}"
+        for key in keys
+        if recorded.get(key) != expected.get(key)
+    ]
+    if problems:
+        origin = "（此 checkpoint 沒有擴散簽章，視為舊版高斯水平擴散／無垂向擴散）" if legacy else ""
+        raise HourMajorError(
+            f"{meta_path} 記錄的擴散組態與本次執行不同，拒絕續跑，以免同一批粒子前後半段混用兩種"
+            f"隨機漫步{origin}：" + "；".join(problems)
+            + "。請改用與 checkpoint 相同的擴散設定續跑，或刪除 checkpoint 目錄後從頭重算"
+        )
 
 
 def hour_major_config_to_backward_driver_config(
@@ -1010,7 +1076,12 @@ def run_flow_domain_hour_major(
     master_hours_walked = 0
 
     if checkpoint_dir is not None:
-        loaded = load_hour_major_checkpoint(Path(checkpoint_dir), batch=batch, handles=handles)
+        loaded = load_hour_major_checkpoint(
+            Path(checkpoint_dir),
+            batch=batch,
+            handles=handles,
+            diffusion_scheme=diffusion_scheme_signature(config),
+        )
         if loaded is not None:
             groups, current_utc, master_hours_walked = loaded
 
@@ -1368,6 +1439,7 @@ def run_flow_domain_hour_major(
                 save_hour_major_checkpoint(
                     Path(checkpoint_dir), groups=groups, current_utc=current_utc,
                     master_hours_walked=master_hours_walked,
+                    diffusion_scheme=diffusion_scheme_signature(config),
                 )
             return _package_partial_result(groups, domain_overhead, kernel_call_count, master_hours_walked)
 
@@ -1379,12 +1451,14 @@ def run_flow_domain_hour_major(
             save_hour_major_checkpoint(
                 Path(checkpoint_dir), groups=groups, current_utc=current_utc,
                 master_hours_walked=master_hours_walked,
+                diffusion_scheme=diffusion_scheme_signature(config),
             )
 
     if checkpoint_dir is not None:
         save_hour_major_checkpoint(
             Path(checkpoint_dir), groups=groups, current_utc=current_utc,
             master_hours_walked=master_hours_walked,
+            diffusion_scheme=diffusion_scheme_signature(config),
         )
 
     unit_results = {
@@ -1900,8 +1974,13 @@ def save_hour_major_checkpoint(
     groups: Sequence[_GroupState],
     current_utc: int,
     master_hours_walked: int,
+    diffusion_scheme: Mapping[str, Any] | None = None,
 ) -> None:
     """把目前完整的小時主軸執行期狀態原子性寫進 ``checkpoint_dir``。
+
+    ``diffusion_scheme``（WP-51 整合）：目前執行的擴散組態簽章（``diffusion_scheme_signature``），
+    寫進 ``meta.json`` 的 ``diffusion_scheme``，續跑時逐項比對；省略代表呼叫端沒有提供，
+    不寫入（讀回時視為舊版高斯水平擴散）。
 
     每個沉降速度分組各自一個 ``group_<i>.npz``（粒子陣列、``native_status``
     ／``released``／``deposit_streak``／計數器型擴散種子與步數、上一小時
@@ -1927,6 +2006,8 @@ def save_hour_major_checkpoint(
         "master_hours_walked": int(master_hours_walked),
         "groups": [],
     }
+    if diffusion_scheme is not None:
+        meta["diffusion_scheme"] = dict(diffusion_scheme)
     for gi, group in enumerate(groups):
         npz_payload: dict[str, np.ndarray] = {}
         for name in _PA_FLOAT_FIELDS:
@@ -2020,12 +2101,17 @@ def load_hour_major_checkpoint(
     *,
     batch: HourMajorDomainBatch,
     handles: BayTraceModuleHandles,
+    diffusion_scheme: Mapping[str, Any] | None = None,
 ) -> tuple[list[_GroupState], int, int] | None:
     """讀回 ``save_hour_major_checkpoint`` 寫出的狀態；沒有 checkpoint 時回傳 ``None``。
 
     讀回後會核對分組數、每組的沉降速度與單元順序是否與目前傳入的
     ``batch`` 完全一致，任何不一致都 fail-closed 直接拒絕（代表呼叫端傳入
     了與寫出當時不同的粒子輸入，續跑沒有意義）。
+
+    ``diffusion_scheme``（WP-51 整合）：提供時，核對 checkpoint 記錄的擴散組態與它是否一致
+    （見 ``diffusion_scheme_signature``）；不一致或 checkpoint 沒有簽章（舊版，視為高斯水平
+    擴散／無垂向擴散）卻要以不同組態續跑，都丟出 ``HourMajorError``，不得靜默混用。
     """
 
     meta_path = checkpoint_dir / "meta.json"
@@ -2041,6 +2127,8 @@ def load_hour_major_checkpoint(
         )
     if meta.get("checkpoint_kind") != "hour_major_domain_checkpoint_v2":
         raise HourMajorError(f"{meta_path} 不是本模組的 checkpoint 格式")
+    if diffusion_scheme is not None:
+        _require_checkpoint_diffusion_scheme(meta, diffusion_scheme, meta_path=meta_path)
     if len(meta["groups"]) != len(batch.groups):
         raise HourMajorError("checkpoint 的沉降速度分組數與目前輸入不一致，拒絕續跑")
 

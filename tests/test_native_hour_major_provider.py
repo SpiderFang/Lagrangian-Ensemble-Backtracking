@@ -1152,3 +1152,47 @@ def clean_k1_run_output_result_paths(two_domain_env, baytrace_root, numba_cache_
         env_base, two_domain_env["plan_k1_path"], numba_cache_dir, tmp_path_factory, "default_case_control"
     )
     return sorted(run["output_dir"].glob("*.result.json"))
+
+
+def test_native_plan_records_diffusion_scheme_and_run_rejects_mismatch(
+    two_domain_env, tmp_path, monkeypatch
+) -> None:
+    """WP-51 整合：計畫檔的 physics_case 記錄擴散組態；native-run 啟動前若實際組態不同，
+    明確拒絕（不靜默混用），並可由承認旗標放行。純規劃層測試，不需要 BayTrace。"""
+
+    from lagrangian_backtracking.native_runner import physics_case as pc
+
+    _units, payload = orch.read_native_plan_file(two_domain_env["plan_k1_path"])
+    scheme = payload["physics_case"]["diffusion_scheme"]
+    assert scheme == {
+        "diffusion_noise": "uniform",
+        "vertical_diffusion": "constant",
+        "kz_constant_m2ps": 3.0e-4,
+        "visser_correction": False,
+        "kz_source": "default",
+    }
+    for key in (
+        "LBT_NATIVE_DIFFUSION_NOISE",
+        "LBT_NATIVE_VERTICAL_DIFFUSION",
+        "LBT_NATIVE_KZ_CONSTANT_M2PS",
+        "LBT_NATIVE_VISSER",
+        "LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LBT_NATIVE_CONFIG", str(two_domain_env["config_path"]))
+    monkeypatch.setenv("LBT_NATIVE_VERTICAL_DIFFUSION", "off")
+    argv = [
+        str(two_domain_env["plan_k1_path"]),
+        "--output",
+        str(tmp_path / "out"),
+        "--resource-provider",
+        "no_such_module:factory",
+        "--worker-count",
+        "1",
+    ]
+    with pytest.raises(pc.PhysicsCaseError, match="擴散組態"):
+        cli.run_native_run(argv)
+    # 承認旗標只放行此項不一致；之後會在載入（不存在的）資源提供者時才失敗，證明已通過擴散檢查
+    monkeypatch.setenv("LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH", "1")
+    with pytest.raises(ModuleNotFoundError):
+        cli.run_native_run(argv)

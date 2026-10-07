@@ -31,8 +31,8 @@ source template 只預填已核定 scalar；其餘 H30/H60/H90 的 suite 欄位�
 
 | 區段 | 核定值 |
 |---|---|
-| `physics` | `constant_kh_m2ps=0.4429482105965188`；`constant_kz_m2ps=0.0013526236792521886` |
-| `integration` | `output_interval_seconds=300`；`dt_min_seconds=0.1`；`dt_max_seconds=30` |
+| `physics` | `constant_kh_m2ps=0.4429482105965188`（native 路徑水平擴散用 Smagorinsky，不讀此值）；`constant_kz_m2ps=0.0003`（WP-51 整合：native-run 實際採用的垂向擴散係數，設定檔為唯一來源；原 pilot 候選值 0.0013526… 從未被 native-run 採用而移除） |
+| `integration` | `output_interval_seconds=3600`；`dt_min_seconds=0.1`；`dt_max_seconds=30` |
 | `scenarios` | `members_per_scenario=10`；`master_seed=20260916` |
 | `execution` | `ocm_interpolation_backend=numba_ocm_v1`；`physics_kernel_backend=numba_cpu_v1`；`shard_scenario_count=100`；`checkpoint_interval_sweeps=10000`；`active_chunk_size=100` |
 

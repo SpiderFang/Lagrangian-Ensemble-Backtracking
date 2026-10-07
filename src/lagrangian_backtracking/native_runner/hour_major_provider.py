@@ -75,9 +75,10 @@ WP-11 可修改檔案清單內，因此本模組退回 ``hour_major.HourMajorCon
 - ``LBT_NATIVE_VERTICAL_DIFFUSION``（WP-51 D 新增）：``constant``（預設，垂向隨機漫步，
   Kv 取 ``LBT_NATIVE_KZ_CONSTANT_M2PS``）或 ``off``（舊版，不做垂向擴散）；``ocm_field``
   尚未接線（.203 沒有 OCM diffusivity 場），會 fail-closed 拒絕。
-- ``LBT_NATIVE_KZ_CONSTANT_M2PS``：常數 Kv，預設 ``3.0e-4``（BayTrace ``kv_const`` 預設）。
-  **注意**：正式設定 YAML 的 ``physics.vertical_diffusion.constant_kz_m2ps`` 是另一個數值
-  （0.00135…），本模組目前**不讀取**該欄位（見 ``reports/WP-51.md`` 待決事項）。
+- ``LBT_NATIVE_KZ_CONSTANT_M2PS``：常數 Kv。**設定檔是唯一來源**：設定檔
+  ``physics.vertical_diffusion.constant_kz_m2ps`` 有值就用它（環境變數若同時設了不同值，
+  啟動時 fail closed）；設定檔沒有該值時才讀本環境變數，再沒有則用預設 ``3.0e-4``
+  （BayTrace ``kv_const`` 預設）。見 ``physics_case.resolve_diffusion_scheme``。
 - ``LBT_NATIVE_VISSER``：``"0"``（預設，BayTrace 預設 ``imixing=0``）／``"1"``（Visser 修正）。
 - ``LBT_NATIVE_BACKTRACK_MODE``（WP-17 新增）：``"full_horizon_from_deposition"``
   （預設）或 ``"fixed_calendar_window"``，見 ``backtrack_horizon.py`` 模組文件。
@@ -294,7 +295,12 @@ from .hour_major import (
 )
 from .orchestrator import NativeWorkUnit, NativeWorkUnitSpec
 from .particle_input import ParticleIdentityTable, load_particle_identity_table_npz
-from .physics_case import resolve_physics_case
+from .physics_case import (
+    PhysicsCaseError,
+    config_kz_constant_m2ps,
+    resolve_diffusion_scheme,
+    resolve_physics_case,
+)
 from .resources import DomainResources
 
 __all__ = [
@@ -500,6 +506,14 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
     # 唯讀的 v3 範本）寫的是 0.25，若改成讀取會讓子步縮小一半、成本加倍，改變既有行為。
     # 實際 CFL 上限＝環境變數 LBT_NATIVE_CFL_NUMBER，預設 0.5（HourMajorConfig.cfl_number）；
     # 新的正式設定檔把該欄位改寫成 0.5 以便與實際行為一致。
+    # WP-51 整合：擴散組態由 physics_case.resolve_diffusion_scheme 唯一解析（plan／run／
+    # checkpoint 共用）；常數 Kz 以設定檔 physics.vertical_diffusion.constant_kz_m2ps 為準。
+    try:
+        diffusion_scheme = resolve_diffusion_scheme(
+            env=env, config_kz_constant_m2ps=config_kz_constant_m2ps(config)
+        )
+    except PhysicsCaseError as exc:
+        raise HourMajorProviderError(f"擴散設定無效：{exc}") from exc
     hour_major_config = HourMajorConfig(
         max_backtrack_seconds=float(max_backtrack_seconds),
         dt_max_seconds=float(dt_max_seconds),
@@ -519,14 +533,10 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         master_seed=int(master_seed),
         stokes_depth_threshold_ratio=_env_optional_float(env, "LBT_NATIVE_STOKES_DEPTH_THRESHOLD_RATIO"),
         smagorinsky_impl=_env_smagorinsky_impl(env),
-        diffusion_noise=_env_choice(
-            env, "LBT_NATIVE_DIFFUSION_NOISE", default="uniform", allowed=("uniform", "gaussian")
-        ),
-        vertical_diffusion=_env_choice(
-            env, "LBT_NATIVE_VERTICAL_DIFFUSION", default="constant", allowed=("constant", "off", "ocm_field")
-        ),
-        kz_constant_m2ps=_env_float(env, "LBT_NATIVE_KZ_CONSTANT_M2PS", default=HourMajorConfig().kz_constant_m2ps),
-        visser_correction=_env_flag(env, "LBT_NATIVE_VISSER", default=False),
+        diffusion_noise=diffusion_scheme.diffusion_noise,
+        vertical_diffusion=diffusion_scheme.vertical_diffusion,
+        kz_constant_m2ps=diffusion_scheme.kz_constant_m2ps,
+        visser_correction=diffusion_scheme.visser_correction,
         # WP-26／WP-28：只從環境變數解析實際採用值（不帶 cli_bed_no_deposition，
         # 與上面 resolve_physics_case(cli_experiment_case_id=None, ...) 同一個
         # 理由——「計畫檔宣稱值 vs. 本次執行環境變數」的一致性檢查在 cli.py 的

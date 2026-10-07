@@ -500,7 +500,12 @@ physics:
 
   vertical_diffusion:
     reference_method: constant
-    constant_kz_m2ps: 0.0013526236792521886
+    # WP-51 整合：native-run 實際使用的常數垂向擴散係數就是這個值（hour_major_provider 讀取本欄位，
+    # 設定檔是唯一來源）。3.0e-4 m²/s 為 BayTrace 的 kv_const 預設值；先前的 pilot 候選值
+    # 0.0013526236792521886（Hsinchu 24 小時 pilot，見 docs/results/14_*）從未被 native-run 採用，
+    # 為使設定與實際一致已移除。垂向擴散的雜訊型態與 Visser 修正由環境變數控制，見
+    # native_runner/hour_major_provider.py 模組文件。
+    constant_kz_m2ps: 0.0003
     ocm_candidate_array: diffusivity.npy
     baseline_method_decision_status: decided_constant_value_pending_validation_pilot
     variable_diffusivity_gradient_drift_required: true

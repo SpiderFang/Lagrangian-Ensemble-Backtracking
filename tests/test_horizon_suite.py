@@ -376,7 +376,8 @@ def test_formal_horizon_template_concretizes_only_approved_scalars() -> None:
 
     expected_scalars = {
         ("physics", "horizontal_diffusion", "constant_kh_m2ps"): 0.4429482105965188,
-        ("physics", "vertical_diffusion", "constant_kz_m2ps"): 0.0013526236792521886,
+        # WP-51 整合：改成 native-run 實際採用的 BayTrace kv_const 預設值，設定＝實際。
+        ("physics", "vertical_diffusion", "constant_kz_m2ps"): 0.0003,
         # WP-51：實際軌跡紀錄間隔是每小時一次（小時主軸排程），設定值 300 並未生效，
         # 已改成與實際行為一致的 3600。
         ("integration", "output_interval_seconds"): 3600,

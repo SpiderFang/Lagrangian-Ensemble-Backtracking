@@ -1118,8 +1118,10 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         cli_backtrack_mode=args.backtrack_mode
     )
     config_declared_backtrack_mode: str | None = None
+    plan_config_kz_constant_m2ps: float | None = None
     if args.config is not None:
         plan_config = load_config(str(args.config), formal_release=False)
+        plan_config_kz_constant_m2ps = native_physics_case.config_kz_constant_m2ps(plan_config)
         bed_residence_time = getattr(plan_config.scenarios, "bed_residence_time", None)
         if bed_residence_time is not None:
             config_declared_backtrack_mode = bed_residence_time.backtrack_mode
@@ -1140,6 +1142,11 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
         "include_stokes": resolved_physics_case.include_stokes,
         "diffusion_method": resolved_physics_case.diffusion_method,
         "require_wave_data": bool(args.require_wave_data),
+        # WP-51 整合：擴散組態（雜訊型態、垂向擴散、常數 Kz、Visser 修正）一併寫進計畫檔，
+        # native-run 啟動前核對、checkpoint 也綁同一組；Kz 以設定檔為唯一來源。
+        "diffusion_scheme": native_physics_case.resolve_diffusion_scheme(
+            config_kz_constant_m2ps=plan_config_kz_constant_m2ps
+        ).as_declaration(),
     }
 
     # WP-26／WP-28：bed_no_deposition（海床不沉積）敏感度案例明確化，介面與上面
@@ -1425,6 +1432,33 @@ def run_native_run(argv: Sequence[str] | None = None) -> int:
                 f"native-run 實際採用的 LBT_NATIVE_EXPERIMENT_CASE={run_experiment_case_id!r} "
                 "不一致，拒絕默默執行。請明確設定 LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1 "
                 "承認此差異，或改用與計畫檔一致的實驗案例"
+            )
+
+    # WP-51 整合：計畫檔記錄了 native-plan 當初採用的擴散組態（physics_case.diffusion_scheme）；
+    # 啟動前以本次 native-run 實際會採用的組態（環境變數＋設定檔 Kz，與每個 worker 的
+    # hour_major_provider 同一套解析）比對，不一致就拒絕，避免同一批結果混入兩種隨機漫步。
+    # 沒有 diffusion_scheme 的舊計畫檔（WP-51 之前）略過此檢查。
+    if isinstance(plan_physics_case, Mapping) and plan_physics_case.get("diffusion_scheme") is not None:
+        run_config_path = os.environ.get("LBT_NATIVE_CONFIG")
+        run_config_kz = (
+            native_physics_case.config_kz_constant_m2ps(
+                load_config(run_config_path, formal_release=False)
+            )
+            if run_config_path
+            else None
+        )
+        run_scheme = native_physics_case.resolve_diffusion_scheme(
+            config_kz_constant_m2ps=run_config_kz
+        ).as_declaration()
+        scheme_problems = native_physics_case.diffusion_scheme_mismatches(
+            plan_physics_case["diffusion_scheme"], run_scheme
+        )
+        if scheme_problems and not acknowledge_mismatch:
+            raise native_physics_case.PhysicsCaseError(
+                "計畫檔的擴散組態與本次 native-run 實際採用的不一致，拒絕默默執行："
+                + "；".join(scheme_problems)
+                + "。請讓環境變數與設定檔和計畫檔一致，或明確設定 "
+                "LBT_NATIVE_ACKNOWLEDGE_CONFIG_MODE_MISMATCH=1 承認此差異"
             )
 
     # WP-26／WP-28：計畫檔記錄了 native-plan 當初是否啟用 bed_no_deposition（海床
