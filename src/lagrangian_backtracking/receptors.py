@@ -456,6 +456,85 @@ def prepare_horizontal_receptor_candidates(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class AnchorSnapCandidate:
+    """錨點搬移（snap）的一個候選：通過檢核的原生網格面中心與它到原錨點的距離。
+
+    ``x_m``、``y_m`` 是面中心在站點 AEQD 公尺座標的位置；``lon``、``lat`` 是同一個面
+    的節點經緯度平均（與水平受體候選池採同一個定義，因此這個點本身就是候選池的成員）；
+    ``distance_to_original_anchor_m`` 是公尺座標下到原錨點的直線距離，是排序的主要依據。
+    """
+
+    source_face_local_index: int
+    source_face_global_index: int
+    x_m: float
+    y_m: float
+    lon: float
+    lat: float
+    distance_to_original_anchor_m: float
+
+
+def rank_anchor_snap_candidates(
+    *,
+    study_site_id: str,
+    mesh: NativeMesh,
+    region_polygon_metric: Polygon,
+    original_anchor_xy: tuple[float, float],
+    wetdry_at_arrivals: np.ndarray,
+    boundary_margin_m: float = 0.0,
+    wet_value: float = 0.0,
+) -> list[AnchorSnapCandidate]:
+    """列出可作為新錨點的網格面中心，依到原錨點的公尺距離由近到遠排序。
+
+    WP-51 C 用於龜山島：原錨點落在島上，需要把錨點搬到海上。搬移規則是「在
+    ``region_polygon_metric``（走廊 ∩ 靜態海域 ∩ flow domain）內，取離原錨點最近、且
+    通過與受體候選池相同 persistent-wet 判定的面中心」。這裡直接重用
+    ``prepare_horizontal_receptor_candidates``，因此「50 個到達時刻皆為濕」、「面中心
+    被候選區覆蓋」與「距候選區邊界不小於 ``boundary_margin_m``」三項檢核與正式受體
+    選點逐字相同，被選中的錨點本身也一定是正式候選池的成員，而不是另一套標準。
+
+    排序依據為（距離、經度、緯度、全域面編號），同距離時結果仍可重現。此函式只做
+    幾何與濕乾檢核；NWW 四角支撐、OCM surface 指標與校閱海岸線等外部資料檢核，由
+    呼叫端（``scripts/derive_guishan_anchor.py``）對排序結果由近到遠逐一套用，取第一個
+    全部通過者。沒有任何候選時回傳空串列，由呼叫端決定如何 fail closed，不以最近點或
+    放寬邊界補值。
+    """
+
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id=study_site_id,
+        mesh=mesh,
+        candidate_polygon_metric=region_polygon_metric,
+        anchor_xy=original_anchor_xy,
+        wetdry_at_arrivals=wetdry_at_arrivals,
+        boundary_margin_m=boundary_margin_m,
+        wet_value=wet_value,
+    )
+    anchor = np.asarray(original_anchor_xy, dtype=np.float64)
+    candidates: list[AnchorSnapCandidate] = []
+    for position in range(pool.candidate_face_local_indices.size):
+        x_m, y_m = (float(value) for value in pool.candidate_xy_m[position])
+        candidates.append(
+            AnchorSnapCandidate(
+                source_face_local_index=int(pool.candidate_face_local_indices[position]),
+                source_face_global_index=int(pool.candidate_face_global_indices[position]),
+                x_m=x_m,
+                y_m=y_m,
+                lon=float(pool.candidate_lon[position]),
+                lat=float(pool.candidate_lat[position]),
+                distance_to_original_anchor_m=float(np.hypot(x_m - anchor[0], y_m - anchor[1])),
+            )
+        )
+    candidates.sort(
+        key=lambda item: (
+            item.distance_to_original_anchor_m,
+            item.lon,
+            item.lat,
+            item.source_face_global_index,
+        )
+    )
+    return candidates
+
+
 def select_horizontal_receptors_from_pool(
     pool: HorizontalReceptorCandidatePool,
     *,

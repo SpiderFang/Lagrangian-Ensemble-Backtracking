@@ -132,6 +132,12 @@ def _legacy_example_payload() -> dict:
     )
     # 舊 A anchor 也是 frozen v3 hash 的一部分；現行正式核對圖才改成高精度 anchor。
     payload["study_sites"][0]["anchor_lonlat"] = [121.92807, 25.11245]
+    # 龜山島錨點在 WP-51 C 才由陸地移到海上；legacy fixture 要還原舊錨點並移除新增的
+    # anchor_policy／anchor_snap_provenance，歷史 canonical hash 才不會漂移。
+    guishan_legacy = next(site for site in payload["study_sites"] if site["study_site_id"] == "guishan")
+    guishan_legacy["anchor_lonlat"] = [121.951606, 24.843127]
+    guishan_legacy.pop("anchor_policy", None)
+    guishan_legacy.pop("anchor_snap_provenance", None)
     for site in payload["study_sites"]:
         for field in (
             "horizontal_receptor_coordinates",
