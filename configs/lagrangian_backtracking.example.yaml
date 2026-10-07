@@ -482,9 +482,11 @@ integration:
   output_interval_seconds: null
   dt_min_seconds: null
   dt_max_seconds: null
-  maximum_horizontal_cfl_fraction: 0.25
-  maximum_vertical_layer_fraction: 0.25
-  maximum_diffusive_rms_fraction: 0.25
+  # WP-51：實際子步上限＝0.5 × 局部網格邊長（HourMajorConfig.cfl_number，可由環境變數
+  # LBT_NATIVE_CFL_NUMBER 覆寫）；native_runner 不讀取本欄位。其餘兩項沒有對應的強制機制。
+  maximum_horizontal_cfl_fraction: 0.5
+  maximum_vertical_layer_fraction: null
+  maximum_diffusive_rms_fraction: null
   forcing_time_boundary_substep: true
 
 boundaries:

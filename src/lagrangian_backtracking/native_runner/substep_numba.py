@@ -83,6 +83,30 @@ run 只編譯一次，不是每小時、每個分組都重新觸發 Numba JIT �
    （其餘細項欄位固定為 0），呼叫端若需要細項拆解，仍必須改用
    ``mirror_rk4_substep_loop``（見該函式與本模組差異的權衡說明）。
 
+WP-51 D：對齊 BayTrace 的擴散雜訊與垂向隨機漫步
+------------------------------------------------
+BayTrace v4.7.2 的 **passive 模式（``mod_part=0``）完全沒有隨機漫步**
+（``batch_move_passive``，``batch_interp.py`` 1086–1119 行，只做 ``x0 + ibf*dtb*u``）；
+擴散只存在於 oil 模式（``mod_part=1``，``batch_move_oil``，1397–1549 行），而 LBT 的
+Smagorinsky 水平擴散本來就取自 oil 模式的機制，因此本專案對齊的是「oil 模式、
+無風、無浮力、無風化」的子集：
+
+- 水平與垂向都用均勻雜訊 ``rnd = 2u - 1``、位移 ``rnd * sqrt(6*K*dtb)``
+  （1510–1532 行）；舊版是 ``sqrt(2*K*dtb)`` 乘常態亂數，單步變異數同為 ``2*K*dtb``。
+- 垂向 Kv 來源：BayTrace 預設 ``ikvmodel=0``（SCHISM ``diffusivity`` 場，``tracker.py``
+  740 行讀入，且只在 ``mod_part=1`` 時讀）；本專案 OCM 目前沒有該場，所以提供
+  ``vertical_diffusion="constant"``（預設 3.0e-4 m²/s，即 BayTrace ``kv_const``／初始 ``dhfz``
+  預設值）與 ``"ocm_field"``（介面＋單元測試，餵 Kv 場給 BayTrace 的
+  ``batch_interpolate_diffusivity``，含垂向梯度）。
+- Visser (1997) 修正（1524–1530 行）只在 ``imixing=1`` 時啟用；BayTrace 預設
+  ``imixing=0``（``tracker.py`` 89 行、``main.py`` 37–41 行），故預設不啟用
+  （``visser_correction=False``）；常數 Kv 時修正量為零。
+- 垂向位移之後由既有 ``batch_clamp_z`` 夾回水柱（BayTrace ``tracker.py`` 1617 行
+  同樣在移動之後呼叫 ``_batch_clamp_z``）。
+- 計數器型亂數維持：每顆粒子每子步消耗一個計數器，``(種子, 計數器)`` 決定三個獨立均勻
+  亂數（見 ``_counter_based_uniform_triple_scalar``），可重現性與批次組成無關性不變。
+- 預設參數（``diffusion_noise="gaussian"``、``vertical_diffusion="off"``）完全保持舊行為。
+
 科學與資料契約
 ----------------
 本模組不改變任何物理假設、公式或求和語意，只是把既有 ``backward_driver``
@@ -132,6 +156,12 @@ def _empty_region_arrays(
     return poly_id, ring_x, ring_y, ring_vertex_offsets, subpoly_ring_offsets, poly_subpoly_offsets
 
 __all__ = [
+    "NOISE_KIND_GAUSSIAN_LEGACY",
+    "NOISE_KIND_UNIFORM_BAYTRACE",
+    "VERTICAL_MODE_CONSTANT",
+    "VERTICAL_MODE_OCM_FIELD",
+    "VERTICAL_MODE_OFF",
+    "baytrace_uniform_diffusion_displacement",
     "InterestRegionArrays",
     "prepare_interest_region_arrays",
     "build_fused_substep_kernel",
@@ -146,6 +176,17 @@ _SPLITMIX64_MUL2 = np.uint64(0x94D049BB133111EB)
 _SPLITMIX64_GOLDEN_GAMMA = np.uint64(0x9E3779B97F4A7C15)
 _SPLITMIX64_SALT = np.uint64(0xD6E8FEB86659FD93)
 _SPLITMIX64_MAX53 = np.float64(2.0**53)
+# WP-51 D：均勻擴散亂數的第三個獨立位元流（垂向）用的鹽值。與 ``_SPLITMIX64_SALT`` 不同，
+# 讓同一個計數器產生的三個均勻亂數（x、y、z）各自來自獨立的 SplitMix64 輸出。
+_SPLITMIX64_SALT_Z = np.uint64(0xC2B2AE3D27D4EB4F)
+
+# 擴散雜訊種類（``noise_kind``）與垂向擴散模式（``vertical_mode``）的整數代碼。
+# 用整數而不是字串，是因為它們要直接傳進 njit kernel（字串在 njit 內不利於分支）。
+NOISE_KIND_GAUSSIAN_LEGACY = 0
+NOISE_KIND_UNIFORM_BAYTRACE = 1
+VERTICAL_MODE_OFF = 0
+VERTICAL_MODE_CONSTANT = 1
+VERTICAL_MODE_OCM_FIELD = 2
 
 
 @njit(cache=True)
@@ -182,6 +223,75 @@ def _counter_based_gaussian_pair_scalar(
     z0 = radius * math.cos(angle)
     z1 = radius * math.sin(angle)
     return z0, z1
+
+
+@njit(cache=True)
+def _counter_based_uniform_triple_scalar(
+    seed_lo: np.uint64, seed_hi: np.uint64, counter: np.uint64
+) -> tuple[float, float, float]:
+    """WP-51 D：同一個計數器產生三個獨立均勻亂數 ``(ux, uy, uz)``，皆落在 ``(0, 1)``。
+
+    與 ``_counter_based_gaussian_pair_scalar`` 共用同一組種子混合與計數器推進
+    （``state = seed_mixed + counter * golden_gamma``），前兩個均勻亂數
+    ``u1``／``u2`` 的位元運算與 Box-Muller 版本完全相同（只是不再做
+    Box-Muller 轉換）；第三個來自 ``state ^ _SPLITMIX64_SALT_Z`` 的獨立
+    SplitMix64 輸出。每個子步每顆粒子只消耗一個計數器，計數器語意與舊版相同，
+    因此「以 (種子, 計數器) 決定亂數」的可重現性與分批獨立性不變。
+    """
+
+    seed_mixed = _splitmix64_finalize_scalar(seed_lo ^ _splitmix64_finalize_scalar(seed_hi))
+    state = seed_mixed + counter * _SPLITMIX64_GOLDEN_GAMMA
+    bits1 = _splitmix64_finalize_scalar(state)
+    bits2 = _splitmix64_finalize_scalar(state ^ _SPLITMIX64_SALT)
+    bits3 = _splitmix64_finalize_scalar(state ^ _SPLITMIX64_SALT_Z)
+    ux = (np.float64(bits1 >> np.uint64(11)) + 1.0) / (_SPLITMIX64_MAX53 + 1.0)
+    uy = (np.float64(bits2 >> np.uint64(11)) + 1.0) / (_SPLITMIX64_MAX53 + 1.0)
+    uz = (np.float64(bits3 >> np.uint64(11)) + 1.0) / (_SPLITMIX64_MAX53 + 1.0)
+    return ux, uy, uz
+
+
+@njit(cache=True)
+def baytrace_uniform_diffusion_displacement(
+    ux: float,
+    uy: float,
+    uz: float,
+    kh: float,
+    kv: float,
+    dkv_dz: float,
+    dtb: float,
+    vertical_on: bool,
+    visser: bool,
+) -> tuple[float, float, float]:
+    """BayTrace ``batch_move_oil`` 的隨機漫步位移（``batch_interp.py`` 1510–1537 行）。
+
+    對 ``ux``／``uy``／``uz`` ∈ (0, 1) 取 ``rnd = 2*u - 1 ∈ (-1, 1)``（BayTrace
+    1510–1512 行 ``2.0 * dx - 1.0``），位移 ``rnd * sqrt(6 * K * dtb)``
+    （1520–1532 行）。均勻分布在 ``(-1, 1)`` 的變異數是 1/3，所以單一子步位移
+    變異數是 ``6*K*dtb/3 = 2*K*dtb``，與高斯雜訊的 ``sqrt(2*K*dtb)`` 同階，
+    累積 ``t`` 秒後變異數為 ``2*K*t``。
+
+    水平 ``kh`` 負值夾到 0（與舊版高斯路徑一致）。垂向（``vertical_on``）：
+    ``visser=False`` 時 ``kv`` 直接代入（BayTrace 預設 ``imixing=0``，1531–1532 行）；
+    ``visser=True`` 時用 Visser (1997) 修正後的 ``kv* = kv + 0.5*dkv_dz**2*dtb``
+    （1524–1530 行，下限 1e-6）。垂向另外加梯度漂移 ``dkv_dz * dtb``（BayTrace 的
+    ``w_total = w + rising + grad_z``，1481 行附近）；常數 Kv 時 ``dkv_dz = 0``，
+    漂移與 Visser 修正皆為零。回傳 ``(dx, dy, dz)``，不含平流。
+    """
+
+    if kh < 0.0:
+        kh = 0.0
+    scale = math.sqrt(6.0 * kh * dtb)
+    dx = (2.0 * ux - 1.0) * scale
+    dy = (2.0 * uy - 1.0) * scale
+    dz = 0.0
+    if vertical_on:
+        kv_eff = kv
+        if visser:
+            kv_eff = kv + dkv_dz * dkv_dz * dtb * 0.5
+        if kv_eff < 1.0e-6:
+            kv_eff = 1.0e-6
+        dz = (2.0 * uz - 1.0) * math.sqrt(6.0 * kv_eff * dtb) + dkv_dz * dtb
+    return dx, dy, dz
 
 
 @njit(cache=True)
@@ -431,7 +541,8 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
         u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
         elem_is_dry_i64,
         ibf, ndeltp, dtb, hdc, h0, enable_diffusion,
-        hf1_field, hf2_field,
+        noise_kind, vertical_mode, kz_const, visser,
+        hf1_field, hf2_field, kv_field1, kv_field2,
         particle_seed_lo, particle_seed_hi, particle_step_counter,
         has_interest_region, poly_id,
         region_ring_x, region_ring_y, region_ring_vertex_offsets,
@@ -452,6 +563,18 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
         fail_substep = -1
         fail_count = 0
         zero_diff_field = np.zeros((nvrt, n_grid_nodes), dtype=np.float64)
+        # WP-51 D：垂向 Kv 來源。``ocm_field`` 模式把呼叫端提供的 Kv 場餵給 BayTrace
+        # ``batch_interpolate_diffusivity``（``ikvmodel=0``，SCHISM 場，含 trat/2 時間內插
+        # 與垂向有限差分梯度）；``constant`` 模式用 ``ikvmodel=3``（使用者常數，梯度為 0）；
+        # 其餘維持舊行為（零場，``ikvmodel=0``）。兩個分支的陣列型別相同，Numba 可合併。
+        if vertical_mode == 2:
+            kv_use1 = kv_field1
+            kv_use2 = kv_field2
+        else:
+            kv_use1 = zero_diff_field
+            kv_use2 = zero_diff_field
+        ikvmodel = 3 if vertical_mode == 1 else 0
+        vertical_on = vertical_mode != 0
 
         for idt in range(1, ndeltp + 1):
             trat = (idt / ndeltp) if ibf == 1 else ((idt - 1) / ndeltp)
@@ -461,12 +584,12 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
                     px, py, pz, p_elem, p_status,
                     i34, elnode, grid_x, grid_y,
                     nvrt, kbp, kbe, sigma_lcl, dp,
-                    zero_diff_field, zero_diff_field, eta_field1,
+                    kv_use1, kv_use2, eta_field1,
                     hf1_field, hf2_field,
                     trat, h0, 1, hdc,
                     p_dhfx, p_dhfy, p_dhfz,
                     p_grdx, p_grdy, p_grdz,
-                    0, 1.2e-5, 3.0e-4, 30.0,
+                    ikvmodel, 1.2e-5, kz_const, 30.0,
                     p_wind_x, p_wind_y,
                 )
 
@@ -482,20 +605,40 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
             )
 
             if enable_diffusion:
-                for ip in range(n):
-                    if p_status[ip] != 1:
-                        continue
-                    z0g, z1g = _counter_based_gaussian_pair_scalar(
-                        particle_seed_lo[ip], particle_seed_hi[ip],
-                        np.uint64(particle_step_counter[ip]),
-                    )
-                    particle_step_counter[ip] += 1
-                    kh = p_dhfx[ip]
-                    if kh < 0.0:
-                        kh = 0.0
-                    scale = math.sqrt(2.0 * kh * dtb)
-                    px[ip] += z0g * scale
-                    py[ip] += z1g * scale
+                if noise_kind == 1:
+                    # WP-51 D：BayTrace 均勻雜訊 ``rnd*sqrt(6*K*dtb)``，水平＋（選用）垂向。
+                    # 每顆粒子每子步仍只消耗一個計數器；垂向位移隨後由
+                    # ``batch_clamp_z`` 夾回水柱內。
+                    for ip in range(n):
+                        if p_status[ip] != 1:
+                            continue
+                        ux, uy, uz = _counter_based_uniform_triple_scalar(
+                            particle_seed_lo[ip], particle_seed_hi[ip],
+                            np.uint64(particle_step_counter[ip]),
+                        )
+                        particle_step_counter[ip] += 1
+                        ddx, ddy, ddz = baytrace_uniform_diffusion_displacement(
+                            ux, uy, uz, p_dhfx[ip], p_dhfz[ip], p_grdz[ip], dtb,
+                            vertical_on, visser,
+                        )
+                        px[ip] += ddx
+                        py[ip] += ddy
+                        pz[ip] += ddz
+                else:
+                    for ip in range(n):
+                        if p_status[ip] != 1:
+                            continue
+                        z0g, z1g = _counter_based_gaussian_pair_scalar(
+                            particle_seed_lo[ip], particle_seed_hi[ip],
+                            np.uint64(particle_step_counter[ip]),
+                        )
+                        particle_step_counter[ip] += 1
+                        kh = p_dhfx[ip]
+                        if kh < 0.0:
+                            kh = 0.0
+                        scale = math.sqrt(2.0 * kh * dtb)
+                        px[ip] += z0g * scale
+                        py[ip] += z1g * scale
 
             for ip in range(n):
                 needs_fallback[ip] = 0
@@ -621,6 +764,12 @@ def mirror_rk4_substep_loop_numba(
     local_region_polygons: np.ndarray | None = None,
     local_first_exit_pending: np.ndarray | None = None,
     local_departures: list[LocalDomainFirstExitRecord] | None = None,
+    diffusion_noise: str = "gaussian",
+    vertical_diffusion: str = "off",
+    kz_constant_m2ps: float = 3.0e-4,
+    visser_correction: bool = False,
+    kv_field1: np.ndarray | None = None,
+    kv_field2: np.ndarray | None = None,
 ) -> SubstepDiagnostics:
     """``mirror_rk4_substep_loop`` 的 WP-16 任務 2 融合版本：整個子步迴圈
     （含對 BayTrace 原版批次核心的呼叫）跑在單一 ``@njit`` 呼叫裡，見模組
@@ -638,11 +787,49 @@ def mirror_rk4_substep_loop_numba(
     兩層判定在融合 kernel 內部依相同順序（local 先於 flow）執行，見
     ``build_fused_substep_kernel`` 內的 ``_kernel`` 實作。
 
+    WP-51 D 新增的四組參數（預設值全部保持舊行為，逐位元相同）：
+
+    - ``diffusion_noise``：``"gaussian"``（預設，舊版，``sqrt(2*K*dtb)`` 乘常態亂數）
+      或 ``"uniform"``（BayTrace 對應：``(2u-1)*sqrt(6*K*dtb)``，``u`` 為均勻亂數；
+      單一子步變異數同為 ``2*K*dtb``，但分布是有界均勻而非常態）。
+    - ``vertical_diffusion``：``"off"``（預設，不做垂向隨機漫步）、``"constant"``
+      （常數 ``kz_constant_m2ps``，預設 3.0e-4 m²/s，與 BayTrace ``kv_const`` 預設相同）
+      或 ``"ocm_field"``（由 ``kv_field1``／``kv_field2`` 這兩個 ``(nvrt, np)`` Kv 場經
+      BayTrace ``batch_interpolate_diffusivity``（``ikvmodel=0``）做 trat/2 時間內插與
+      垂向梯度；本專案目前 OCM 沒有 diffusivity 場，僅提供介面與單元測試）。
+      垂向擴散只在 ``diffusion_noise="uniform"`` 時可用（高斯舊路徑沒有垂向實作）。
+    - ``visser_correction``：``True`` 時用 Visser (1997) 修正 Kv（BayTrace ``imixing=1``）；
+      預設 ``False`` 對應 BayTrace 預設 ``imixing=0``。常數 Kv 時修正量為零。
+    - 垂向位移之後由 kernel 內的 ``batch_clamp_z`` 夾回水柱內，與 BayTrace 一致。
+
     Returns:
         ``SubstepDiagnostics``，``time_move_s`` 是整個融合 kernel 呼叫的
         總秒數（其餘細項欄位固定為 0，見模組文件差異第 5 點）。
     """
 
+    if diffusion_noise not in ("gaussian", "uniform"):
+        raise BackwardDriverError(f"diffusion_noise 只能是 'gaussian' 或 'uniform'，收到 {diffusion_noise!r}")
+    if vertical_diffusion not in ("off", "constant", "ocm_field"):
+        raise BackwardDriverError(
+            f"vertical_diffusion 只能是 'off'、'constant' 或 'ocm_field'，收到 {vertical_diffusion!r}"
+        )
+    if vertical_diffusion != "off" and diffusion_noise != "uniform":
+        raise BackwardDriverError("垂向擴散只支援 diffusion_noise='uniform'（BayTrace 對應路徑）")
+    if vertical_diffusion != "off" and not enable_diffusion:
+        raise BackwardDriverError("啟用垂向擴散必須同時 enable_diffusion=True")
+    if vertical_diffusion == "constant" and not (math.isfinite(kz_constant_m2ps) and kz_constant_m2ps > 0.0):
+        raise BackwardDriverError("kz_constant_m2ps 必須是有限的正值")
+    if vertical_diffusion == "ocm_field":
+        if kv_field1 is None or kv_field2 is None:
+            raise BackwardDriverError("vertical_diffusion='ocm_field' 必須同時提供 kv_field1 與 kv_field2")
+        expected_shape = (driver_grid.schism_grid.nvrt, driver_grid.schism_grid.np)
+        for label, field in (("kv_field1", kv_field1), ("kv_field2", kv_field2)):
+            if tuple(np.shape(field)) != expected_shape:
+                raise BackwardDriverError(
+                    f"{label} 形狀必須是 (nvrt, np)={expected_shape}，收到 {tuple(np.shape(field))}"
+                )
+            if not np.all(np.isfinite(field)):
+                raise BackwardDriverError(f"{label} 含非有限值，fail-closed 拒絕")
     if ibf not in (1, -1):
         raise BackwardDriverError("ibf 只能是 1 或 -1")
     if ndeltp < 1:
@@ -699,6 +886,19 @@ def mirror_rk4_substep_loop_numba(
         seed_lo = np.zeros(n, dtype=np.uint64)
         seed_hi = np.zeros(n, dtype=np.uint64)
         step_counter = np.zeros(n, dtype=np.int64)
+
+    noise_kind_code = NOISE_KIND_UNIFORM_BAYTRACE if diffusion_noise == "uniform" else NOISE_KIND_GAUSSIAN_LEGACY
+    vertical_mode_code = {
+        "off": VERTICAL_MODE_OFF, "constant": VERTICAL_MODE_CONSTANT, "ocm_field": VERTICAL_MODE_OCM_FIELD,
+    }[vertical_diffusion]
+    if vertical_diffusion == "ocm_field":
+        kv1_arr = np.ascontiguousarray(kv_field1, dtype=np.float64)
+        kv2_arr = np.ascontiguousarray(kv_field2, dtype=np.float64)
+    else:
+        # 非 ocm_field 模式 kernel 不會讀這兩個陣列；給同型別（float64、2 維、C 連續）的
+        # 極小陣列，避免每次呼叫配置 (nvrt, np) 大小的暫存。
+        kv1_arr = np.zeros((1, 1), dtype=np.float64)
+        kv2_arr = kv1_arr
 
     needs_utc_ns_values = has_interest_region or has_local_region
 
@@ -785,7 +985,8 @@ def mirror_rk4_substep_loop_numba(
         composed.u_field2, composed.v_field2, composed.w_field2,
         elem_is_dry_i64,
         int(ibf), int(ndeltp), float(dtb), float(hdc), float(driver_grid.h0), bool(enable_diffusion),
-        hf1_arr, hf2_arr,
+        noise_kind_code, vertical_mode_code, float(kz_constant_m2ps), bool(visser_correction),
+        hf1_arr, hf2_arr, kv1_arr, kv2_arr,
         seed_lo, seed_hi, step_counter,
         bool(has_interest_region), poly_id,
         region_ring_x, region_ring_y, region_ring_vertex_offsets,

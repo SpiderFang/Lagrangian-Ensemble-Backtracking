@@ -483,12 +483,19 @@ integration:
   # operator split 加入。split 順序須由解析／統計測試固定，但不再詢問使用者選項。
   stochastic_method: operator_split_euler_maruyama_reference
   stochastic_variance_uses_absolute_dt: true
-  output_interval_seconds: 300
+  # WP-51：本區數值必須等於 native_runner 實際行為（原本的 300 與 0.25 並未生效）。
+  # 小時主軸排程每個流場小時只在小時結束時取樣一次軌跡，因此實際位置紀錄間隔是 3600 秒；
+  # 小於 3600 的設定不會產生更密的紀錄。
+  output_interval_seconds: 3600
   dt_min_seconds: 0.1
   dt_max_seconds: 30
-  maximum_horizontal_cfl_fraction: 0.25
-  maximum_vertical_layer_fraction: 0.25
-  maximum_diffusive_rms_fraction: 0.25
+  # 實際子步上限＝cfl_number × 局部網格邊長；native_runner 預設 cfl_number＝0.5
+  # （HourMajorConfig.cfl_number，可由環境變數 LBT_NATIVE_CFL_NUMBER 覆寫）。本欄位僅記錄
+  # 實際採用值，native_runner 不讀取它。dt_max_seconds 另外限制單一子步不超過 30 秒。
+  maximum_horizontal_cfl_fraction: 0.5
+  # 以下兩項 native_runner 沒有對應的強制機制（不讀取、不影響結果），保留為 null 以免誤導。
+  maximum_vertical_layer_fraction: null
+  maximum_diffusive_rms_fraction: null
   forcing_time_boundary_substep: true
 
 boundaries:

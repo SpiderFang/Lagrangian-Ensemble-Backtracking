@@ -247,6 +247,7 @@ __all__ = [
     "save_hour_major_checkpoint",
     "load_hour_major_checkpoint",
     "hour_major_config_to_backward_driver_config",
+    "validate_diffusion_scheme",
 ]
 
 
@@ -317,6 +318,50 @@ class HourMajorConfig:
     # ``"python"``＝``backward_driver.mirror_rk4_substep_loop``（WP-5 既有版本，完全未修改），
     # 本欄位新增前的唯一行為，與新增前逐位元相同。
     substep_loop_impl: str = "numba"
+    # WP-51 D：擴散雜訊與垂向隨機漫步，對齊 BayTrace ``batch_move_oil``（見
+    # ``substep_numba.mirror_rk4_substep_loop_numba`` 的同名參數說明）。
+    # 函式庫預設維持舊行為（``"gaussian"``／``"off"``），讓 ``substep_loop_impl="python"``
+    # 路徑與既有位元等價測試不受影響；正式 native-run 由 ``hour_major_provider`` 以環境變數
+    # 預設值（``uniform``／``constant``）明確建構，與 BayTrace 對齊。
+    # ``diffusion_noise``：``"gaussian"``＝``sqrt(2*K*dtb)``×常態（舊）；``"uniform"``＝
+    # ``(2u-1)*sqrt(6*K*dtb)``（BayTrace）。
+    diffusion_noise: str = "gaussian"
+    # ``vertical_diffusion``：``"off"``／``"constant"``（``kz_constant_m2ps``）／``"ocm_field"``
+    # （目前 OCM 沒有 diffusivity 場，hour_major 會 fail-closed 拒絕，僅 substep_numba 保留介面）。
+    vertical_diffusion: str = "off"
+    kz_constant_m2ps: float = 3.0e-4
+    # ``visser_correction``：BayTrace ``imixing=1``；預設 False 對應 BayTrace 預設 ``imixing=0``。
+    visser_correction: bool = False
+
+
+def validate_diffusion_scheme(config: HourMajorConfig) -> None:
+    """WP-51 D：檢查擴散雜訊／垂向擴散設定組合，fail-closed 拒絕不支援的組合。"""
+
+    if config.diffusion_noise not in ("gaussian", "uniform"):
+        raise HourMajorError(f"diffusion_noise 必須是 'gaussian' 或 'uniform'，收到 {config.diffusion_noise!r}")
+    if config.vertical_diffusion not in ("off", "constant", "ocm_field"):
+        raise HourMajorError(
+            f"vertical_diffusion 必須是 'off'、'constant' 或 'ocm_field'，收到 {config.vertical_diffusion!r}"
+        )
+    legacy = config.diffusion_noise == "gaussian" and config.vertical_diffusion == "off" and not config.visser_correction
+    if config.substep_loop_impl == "python" and not legacy:
+        raise HourMajorError(
+            "substep_loop_impl='python'（backward_driver.mirror_rk4_substep_loop）只支援舊版高斯水平擴散，"
+            "不支援 uniform 雜訊或垂向擴散；請改用 substep_loop_impl='numba'"
+        )
+    if config.vertical_diffusion != "off" and config.diffusion_noise != "uniform":
+        raise HourMajorError("垂向擴散只支援 diffusion_noise='uniform'")
+    if config.vertical_diffusion != "off" and not config.enable_diffusion:
+        raise HourMajorError("啟用垂向擴散必須同時 enable_diffusion=True")
+    if config.vertical_diffusion == "ocm_field":
+        raise HourMajorError(
+            "vertical_diffusion='ocm_field' 尚未接線：目前沒有 OCM diffusivity 場來源"
+            "（.203 無 diffusivity.npy），hour_major 不提供 Kv 場，fail-closed 拒絕"
+        )
+    if config.vertical_diffusion == "constant" and not (
+        np.isfinite(config.kz_constant_m2ps) and config.kz_constant_m2ps > 0.0
+    ):
+        raise HourMajorError("kz_constant_m2ps 必須是有限的正值")
 
 
 def hour_major_config_to_backward_driver_config(
@@ -954,6 +999,7 @@ def run_flow_domain_hour_major(
     output_interval_ns = int(round(config.output_interval_seconds * 1.0e9))
     if output_interval_ns <= 0:
         raise HourMajorError("output_interval_seconds 必須是正值")
+    validate_diffusion_scheme(config)
     # WP-17：``config.max_backtrack_seconds`` 只在分組的 ``max_backtrack_ns`` 陣列
     # 有 ``-1`` sentinel（單元沒有明示 per-arrival 解析值）時才當退回值使用，見
     # ``HourMajorSettlingGroupInput.max_backtrack_ns`` docstring 與步驟 1 的比較。
@@ -1642,6 +1688,10 @@ def _mirror_rk4_substep_loop_dispatch(
             local_region_polygons=local_region_polygons,
             local_first_exit_pending=local_first_exit_pending,
             local_departures=local_departures,
+            diffusion_noise=config.diffusion_noise,
+            vertical_diffusion=config.vertical_diffusion,
+            kz_constant_m2ps=config.kz_constant_m2ps,
+            visser_correction=config.visser_correction,
         )
     raise HourMajorError(
         f"substep_loop_impl 必須是 'python' 或 'numba'，收到 {config.substep_loop_impl!r}"

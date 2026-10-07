@@ -70,6 +70,15 @@ WP-11 可修改檔案清單內，因此本模組退回 ``hour_major.HourMajorCon
 
 - ``LBT_NATIVE_FORMAL``：``"1"``（預設）／``"0"``，透傳給
   ``production_wiring`` 的 ``formal`` 參數。
+- ``LBT_NATIVE_DIFFUSION_NOISE``（WP-51 D 新增）：``uniform``（預設，BayTrace
+  ``(2u-1)*sqrt(6*K*dtb)``）或 ``gaussian``（舊版 ``sqrt(2*K*dtb)``×常態，只供與舊結果比對）。
+- ``LBT_NATIVE_VERTICAL_DIFFUSION``（WP-51 D 新增）：``constant``（預設，垂向隨機漫步，
+  Kv 取 ``LBT_NATIVE_KZ_CONSTANT_M2PS``）或 ``off``（舊版，不做垂向擴散）；``ocm_field``
+  尚未接線（.203 沒有 OCM diffusivity 場），會 fail-closed 拒絕。
+- ``LBT_NATIVE_KZ_CONSTANT_M2PS``：常數 Kv，預設 ``3.0e-4``（BayTrace ``kv_const`` 預設）。
+  **注意**：正式設定 YAML 的 ``physics.vertical_diffusion.constant_kz_m2ps`` 是另一個數值
+  （0.00135…），本模組目前**不讀取**該欄位（見 ``reports/WP-51.md`` 待決事項）。
+- ``LBT_NATIVE_VISSER``：``"0"``（預設，BayTrace 預設 ``imixing=0``）／``"1"``（Visser 修正）。
 - ``LBT_NATIVE_BACKTRACK_MODE``（WP-17 新增）：``"full_horizon_from_deposition"``
   （預設）或 ``"fixed_calendar_window"``，見 ``backtrack_horizon.py`` 模組文件。
   這是「本次 native-run 實際採用哪個回溯模式」的最終判定，只用來核對與計畫檔
@@ -278,8 +287,10 @@ from .backward_driver import (
 from .bed_no_deposition_case import resolve_bed_no_deposition
 from .hour_major import (
     HourMajorConfig,
+    HourMajorError,
     build_hour_major_domain_batch,
     run_flow_domain_hour_major,
+    validate_diffusion_scheme,
 )
 from .orchestrator import NativeWorkUnit, NativeWorkUnitSpec
 from .particle_input import ParticleIdentityTable, load_particle_identity_table_npz
@@ -406,6 +417,26 @@ def _env_smagorinsky_impl(env: Mapping[str, str]) -> str:
     return value
 
 
+def _env_choice(env: Mapping[str, str], name: str, *, default: str, allowed: tuple[str, ...]) -> str:
+    """讀取字串型環境變數並檢查在允許集合內（大小寫不敏感），否則 fail-closed。"""
+
+    value = (env.get(name) or default).strip().lower()
+    if value not in allowed:
+        raise HourMajorProviderError(f"{name} 只接受 {'／'.join(allowed)}，收到 {value!r}")
+    return value
+
+
+def _diffusion_scheme_provenance(config: HourMajorConfig) -> dict[str, Any]:
+    """WP-51 D：每個排程單元結果記錄實際使用的擴散雜訊與垂向擴散設定。"""
+
+    return {
+        "diffusion_noise": config.diffusion_noise,
+        "vertical_diffusion": config.vertical_diffusion,
+        "kz_constant_m2ps": float(config.kz_constant_m2ps),
+        "visser_correction": bool(config.visser_correction),
+    }
+
+
 def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
     """從環境變數解析出 :class:`HourMajorProviderParams`（見模組文件環境變數契約）。"""
 
@@ -457,6 +488,18 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         if config.integration.output_interval_seconds is not None
         else HourMajorConfig().output_interval_seconds
     )
+    if float(output_interval_seconds) < 3600.0:
+        import warnings
+
+        warnings.warn(
+            f"config.integration.output_interval_seconds={output_interval_seconds} 小於 3600：小時主軸排程"
+            "每個流場小時只取樣一次軌跡，實際位置紀錄間隔仍是 3600 秒（WP-51 起請把設定值改成 3600 以免誤導）",
+            stacklevel=2,
+        )
+    # WP-51 刻意不讀 config.integration.maximum_horizontal_cfl_fraction：既有範本（含伺服器上
+    # 唯讀的 v3 範本）寫的是 0.25，若改成讀取會讓子步縮小一半、成本加倍，改變既有行為。
+    # 實際 CFL 上限＝環境變數 LBT_NATIVE_CFL_NUMBER，預設 0.5（HourMajorConfig.cfl_number）；
+    # 新的正式設定檔把該欄位改寫成 0.5 以便與實際行為一致。
     hour_major_config = HourMajorConfig(
         max_backtrack_seconds=float(max_backtrack_seconds),
         dt_max_seconds=float(dt_max_seconds),
@@ -476,12 +519,25 @@ def _resolve_params(env: Mapping[str, str]) -> HourMajorProviderParams:
         master_seed=int(master_seed),
         stokes_depth_threshold_ratio=_env_optional_float(env, "LBT_NATIVE_STOKES_DEPTH_THRESHOLD_RATIO"),
         smagorinsky_impl=_env_smagorinsky_impl(env),
+        diffusion_noise=_env_choice(
+            env, "LBT_NATIVE_DIFFUSION_NOISE", default="uniform", allowed=("uniform", "gaussian")
+        ),
+        vertical_diffusion=_env_choice(
+            env, "LBT_NATIVE_VERTICAL_DIFFUSION", default="constant", allowed=("constant", "off", "ocm_field")
+        ),
+        kz_constant_m2ps=_env_float(env, "LBT_NATIVE_KZ_CONSTANT_M2PS", default=HourMajorConfig().kz_constant_m2ps),
+        visser_correction=_env_flag(env, "LBT_NATIVE_VISSER", default=False),
         # WP-26／WP-28：只從環境變數解析實際採用值（不帶 cli_bed_no_deposition，
         # 與上面 resolve_physics_case(cli_experiment_case_id=None, ...) 同一個
         # 理由——「計畫檔宣稱值 vs. 本次執行環境變數」的一致性檢查在 cli.py 的
         # run_native_run 裡進行，這裡只需要單純解析出本次要用的值）。
         bed_no_deposition=resolve_bed_no_deposition(cli_bed_no_deposition=None, env=dict(env)),
     )
+    try:
+        # 啟動時就檢查擴散設定組合（例如尚未接線的 ocm_field），不要等跑了數小時才在第一次呼叫時失敗。
+        validate_diffusion_scheme(hour_major_config)
+    except HourMajorError as exc:
+        raise HourMajorProviderError(f"擴散設定無效：{exc}") from exc
     return HourMajorProviderParams(
         config_path=config_path,
         plan_path=_require_env(env, "LBT_NATIVE_PLAN"),
@@ -892,6 +948,7 @@ def _run_unit_entrypoint(
             "domain_kernel_call_count": 0,
             "wave_data_available": None,
             "smagorinsky_impl": params.hour_major_config.smagorinsky_impl,
+            **_diffusion_scheme_provenance(params.hour_major_config),
             "all_members_pre_window_deposition": True,
             "declared_config_backtrack_mode": params.config_declared_backtrack_mode,
             "effective_backtrack_mode": params.effective_backtrack_mode,
@@ -994,6 +1051,7 @@ def _run_unit_entrypoint(
         "wave_data_available": wave_resolver is not None,
         # 每個排程單元都記錄實際使用的 Smagorinsky 實作，後處理與報告可據此區分。
         "smagorinsky_impl": params.hour_major_config.smagorinsky_impl,
+        **_diffusion_scheme_provenance(params.hour_major_config),
         "declared_config_backtrack_mode": params.config_declared_backtrack_mode,
         "effective_backtrack_mode": params.effective_backtrack_mode,
         "requested_horizon_days": params.requested_horizon_days,
