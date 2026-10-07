@@ -4298,7 +4298,10 @@ def _receptor_payload(
     persistent-wet pool 中優先嘗試；走廊有效候選不足五點，或走廊候選經 NWW／OCM
     支援淘汰後無法完成五點時，才回到同一份 core pool。priority 與 fallback 都不會
     改變 local/flow geometry，也不會削弱 50 個 arrival 的 forcing gate；最終選擇
-    範圍、候選計數與 fallback 原因會保留在 site-level provenance。
+    範圍、候選計數與 fallback 原因會保留在 site-level provenance。龜山島的 12.5 km
+    core 以設定的 ``anchor_lonlat`` 為圓心；WP-51 C 起該錨點是離線推導出的海上面中心
+    （見 ``config.GUISHAN_ANCHOR_POLICY_ID``），其座標、``anchor_policy`` 與推導紀錄
+    ``anchor_snap_provenance`` 會一併寫入同一份 site-level provenance。
     """
 
     site_by_id = {site.study_site_id: site for site in config.study_sites}
@@ -5054,6 +5057,24 @@ def _receptor_payload(
                         "priority_selected_count": len(priority_selected),
                         "core_fallback_selected_count": len(horizontal) - len(priority_selected),
                     }
+                    # WP-51 C：受體核心圓與 local domain 的圓心就是 anchor，因此把實際使用的
+                    # anchor、其推導規則與離線推導紀錄一併寫入，審查者不必回頭翻設定檔就能
+                    # 確認「核心圓以海上錨點為圓心」。未明示這些欄位的站點不加入新鍵，維持
+                    # 舊 manifest 的內容與 fingerprint 不變。
+                    site_extra = site.model_extra or {}
+                    if site.anchor_lonlat is not None:
+                        priority_selection_by_site[site_id]["anchor_lonlat"] = [
+                            float(site.anchor_lonlat[0]),
+                            float(site.anchor_lonlat[1]),
+                        ]
+                    if site_extra.get("anchor_policy") is not None:
+                        priority_selection_by_site[site_id]["anchor_policy"] = str(
+                            site_extra["anchor_policy"]
+                        )
+                    if isinstance(site_extra.get("anchor_snap_provenance"), Mapping):
+                        priority_selection_by_site[site_id]["anchor_snap_provenance"] = json.loads(
+                            json.dumps(site_extra["anchor_snap_provenance"], sort_keys=True)
+                        )
 
         for horizontal_order, horizontal_item in enumerate(horizontal):
             face_index = int(horizontal_item.source_face_local_index)

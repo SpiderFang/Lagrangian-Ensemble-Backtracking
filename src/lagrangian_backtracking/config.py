@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon
 
 from .accelerated import PHYSICS_KERNEL_BACKEND_NUMPY_V1
 from .bed_residence import (
@@ -159,9 +159,17 @@ LEGACY_FORMAL_STUDY_SITE_IDS = frozenset(
 # 正式圖面核對後固定的研究站 anchor。這些數值是 WGS84 資料交換座標；受體核心的
 # 公尺距離與 mesh 定位仍由 input derivation 依 flow-domain projection 驗證。A 區
 # 貢寮 anchor 特別保留核對圖的高精度值，不沿用舊版約略位置。
+#
+# 龜山島（WP-51 C）：舊 anchor (121.951606, 24.843127) 落在龜山島陸地內，粒子實際
+# 釋放在島西側約 6 km 外，故改為海上點。新 anchor 是 ``scripts/derive_guishan_anchor.py``
+# 以伺服器真實 OCM 網格（northeast_taiwan_common_cache_v3）離線推導出的「走廊內離舊
+# anchor 最近、50 個到達時刻皆濕、距候選區邊界至少兩倍網格尺度、NWW／OCM surface
+# 支撐有效且不在校閱海岸陸地內」的原生網格面中心，座標四捨五入到小數 6 位（約 0.1 m）。
+# 這是寫死的座標而非執行期 snap：geometry 在 arrival 與 wetdry 載入前就需要 anchor，
+# 寫死可讓 local domain、受體核心、星號與 NWW 指標位置都用同一個可審計的值。
 FORMAL_STUDY_SITE_ANCHORS_LON_LAT = {
     "gongliao": (121.9223889, 25.0964444),
-    "guishan": (121.951606, 24.843127),
+    "guishan": (121.939084, 24.845304),
     "hsinchu": (120.45, 24.75),
     "nanwan": (120.763161, 21.946577),
     "lienchiang": (119.95, 26.2),
@@ -198,6 +206,10 @@ GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT = (
     (121.76, 24.87),
 )
 GUISHAN_SOFT_PRIORITY_POLICY_ID = "guishan_soft_priority_corridor_core_fallback_v1"
+# 龜山島 anchor 的推導規則識別碼（見上方 FORMAL_STUDY_SITE_ANCHORS_LON_LAT 的說明）。
+# 設定檔以 ``anchor_policy`` 明示此值，現行正式設計會核對它，並要求 anchor 本身必須
+# 落在 soft priority 走廊 polygon 內，避免日後有人只改座標、忘了規則或把錨點移出走廊。
+GUISHAN_ANCHOR_POLICY_ID = "snap_to_persistent_wet_mesh_within_priority_polygon"
 
 # 現行正式母體的受體選樣契約。水平與垂向分開命名，讓 manifest 能辨識「從哪一個
 # 候選 face 池抽樣」與「在單一 face 的完整水柱內抽哪四個 normalized fraction」；兩者
@@ -1200,6 +1212,17 @@ class ProjectConfig(StrictModel):
                 "policy_id"
             ) != GUISHAN_SOFT_PRIORITY_POLICY_ID:
                 raise ValueError("龜山島 receptor priority policy 不符")
+            guishan_extra = guishan.model_extra or {}
+            if guishan_extra.get("anchor_policy") != GUISHAN_ANCHOR_POLICY_ID:
+                raise ValueError(
+                    f"龜山島 anchor_policy 必須是 {GUISHAN_ANCHOR_POLICY_ID!r}"
+                )
+            # anchor 必須落在走廊內（含邊界）；走廊以經緯度頂點直接做平面多邊形判定，
+            # 與 input derivation 以 AEQD 投影求交的差異遠小於網格尺度，這裡只擋明顯錯置。
+            if guishan.anchor_lonlat is None or not Polygon(
+                GUISHAN_SOFT_PRIORITY_POLYGON_LON_LAT
+            ).covers(Point(float(guishan.anchor_lonlat[0]), float(guishan.anchor_lonlat[1]))):
+                raise ValueError("龜山島 anchor 必須落在 receptor_priority_polygon 走廊內")
         northeast = {site.study_site_id: site for site in self.study_sites if site.analysis_region_id == "A"}
         if set(northeast) != {"gongliao", "guishan"}:
             raise ValueError("A 區必須恰含獨立的 gongliao 與 guishan 站點")
