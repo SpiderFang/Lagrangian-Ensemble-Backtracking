@@ -85,7 +85,8 @@ for case in ("no_stokes", "finite_depth_stokes"):
     d = json.load(open(f"{B}/{case}/native-plan.json"))
     s = d["summary"]
     units = [m for seg in d["hour_major_members"].values() for m in seg]
-    hrs = np.array([u["resolved_max_backtrack_seconds"] / 3600.0 for u in units if "resolved_max_backtrack_seconds" in u])
+    # full_horizon 模式下工作單元的 resolved_max_backtrack_seconds 為 None（由全域 90 天上限決定；v3 計畫亦同）
+    hrs = np.array([u["resolved_max_backtrack_seconds"] / 3600.0 for u in units if u.get("resolved_max_backtrack_seconds") is not None])
     pre = sum(1 for u in units if u.get("pre_window_deposition"))
     print(case, "工作單元", s["unit_count"], "粒子", s["particle_count_total"], "分段", len(d["hour_major_members"]), "pre_window", pre)
     if hrs.size:

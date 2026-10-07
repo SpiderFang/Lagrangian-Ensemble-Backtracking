@@ -224,3 +224,15 @@ python scripts/make_formal_template_v4.py --base ~/Workspace/lbt-inputs/formal/t
 # 測試（伺服器）
 ulimit -n 65536; PYTHONPATH=src LBT_BAYTRACE_ROOT=~/Workspace/lbt-runs/baytrace-v4.7.2 pytest tests -p no:cacheprovider --basetemp <私有目錄>
 ```
+
+## 12. 增補（2026-10-07）：run05 prep_v4 失敗的診斷與修正、v4 母體建置結果
+
+**失敗**：`prep_v4.sh` 在 `hsinchu/core 垂向支撐淘汰後候選不足：需要 5，實際 0`。診斷（`scripts/diagnose_receptor_face_support.py`，只跑受體池 face_support、五站、真實資料）：per_member 每站 500 個沉底整點，新竹在 2025-04-14T22:00Z 等少數整點於 NWW metric location 本身就無有效值（五站 metric location 無效整點：新竹 73、連江 60、南灣 9、龜山 1、貢寮 0，每站約 17,124 個 canonical 整點），對**所有面**都不可支撐（300 個面全 NWW 時刻無效）。v3（per_observation，只有 50 個沉底整點）對同一函式五站都通過（每站 5 面），排除 B2 標籤接線。屬**時刻層級**問題。
+
+**修正（commit 875df09）**：沉底年齡可用性改為「OCM canonical ∩ NWW metric location 有效」（`restrict_available_times_to_supported`，政策 `nww_metric_location_exact_hour_support_v1`），由抽樣器在缺口拒絕時一併排除；排除整點清單與 SHA-256 寫入 `bed_residence_sampling.deposition_support_conditioning`，manifests 載入器核對並拒絕落在排除集合內的沉底整點。**沒有放寬任何受體檢核**；per_observation 不變。另加 `_summarize_face_support_failures`：失敗原因（NWW／OCM、最集中失敗整點）寫入候選不足的錯誤訊息與 `random_horizontal_receptors_by_site[*].face_support_failure_summary`。
+
+**第二個問題（commit 9359da8）**：修正後 release 階段 validator 報 `source_unreadable:ocm_native:FileNotFoundError`——`v4_env.sh` 的 `OCM_NATIVE_ROOT` 等指到 `lbt-local-data`（只有 2024-07 起），inventory 卻涵蓋 2024-01 起。`prep_v4.sh` 只對 `horizon-suite-create` 取消這些環境變數（與 `build_v3.sh` 一致，母體建置只用 `--*-root` 指到 /data）。
+
+**母體（68 分鐘，NAS 冷快取）**：`~/Workspace/lbt-inputs/formal/v4-per-member/20261007_final-sites_h30-h60-h90_common_m10_v4`。核對：十檔沉降速度 records 與 v3 完全相同；每站 500 筆（相異沉底整點 485–490）；年齡 0–2160 h；Spearman +0.117；沉底整點落在排除集合 0；10–12 月沉底每站 36–61（v3 為 3）；逐槽位拒絕總數每站 18；排列修補：初始不可行 39 槽、修補 37 步（swap 37、matching 0）、改動 72 槽；標籤 `unknown` 僅 `deposition_tide_phase` 0.36%，四季皆非 0（DJF 23.3%、MAM 27.5%、JJA 26.8%、SON 22.4%）；兩案各 500,000 顆、24,400 單元、168 段，pre_window 0、gap 檢查 2,440 筆不安全 0；擴散組態 uniform／constant／3.0e-4／Visser 關；龜山島錨點 (121.939148, 24.850326) 離島岸約 546 m，5 個受體離錨點 6.0–11.6 km（核心半徑 12.5 km 內）、離陸地 2.6–7.3 km，皆在海上。
+
+**未通過的核對（需主代理決定）**：「其他站受體與 v3 相同」不成立。新竹水平位置同 v3 的 5 面（垂向 z 因 template 取自不同的第一個沉底整點而不同）；貢寮 2/5、南灣 3/5、連江 0/5 相同。原因是 v3 選到的面在 500 個沉底整點中有 1–2 個整點 NWW 四角無效（連江 5 面皆有；貢寮 3 面）或 OCM 垂向 zcor 無雙側支撐（南灣 2 面），依同一個種子化隨機順序被淘汰、改由後面的面補上（候選池指紋與 v3 相同）。這是 per_member 把受體檢核從 50 個整點擴大到 500 個的必然結果，不是接線錯誤。
