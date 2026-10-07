@@ -512,3 +512,125 @@ def test_gappy_member_arrival_manifest_rejects_repair_tampering(gappy_member_dir
     path = _mutated_arrival_path(tmp_path, payload, mutate)
     with pytest.raises(ValueError):
         _load_arrival_document(path, config, formal=True)
+
+
+# ── WP-51 整合：沉底整點「受體可支撐」條件的 provenance 與載入器核對 ─────────────────────
+
+
+@pytest.fixture(scope="module")
+def support_member_dir(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, ProjectConfig, dict[str, object]]:
+    """canonical 軸完整、但每三天有一整天「受體不可支撐」（例如 NWW 該日無效）：抽樣器必須把
+    這些整點當成不可用，provenance 記錄各站被排除的整點清單。"""
+
+    from lagrangian_backtracking.bed_residence import restrict_available_times_to_supported
+
+    tmp_path = tmp_path_factory.mktemp("per_member_support")
+    config = _member_config()
+    available, support = restrict_available_times_to_supported(
+        {site: _all_hours() for site in SITES}, {site: _gappy_hours() for site in SITES}
+    )
+    arrival = _member_arrival_payload(config, hours=available[next(iter(SITES))])
+    arrival["provenance"]["bed_residence_sampling"]["deposition_support_conditioning"] = support
+    _write_json(tmp_path / "arrival.json", arrival)
+    return tmp_path, config, arrival
+
+
+def test_support_conditioned_manifest_loads_and_avoids_excluded_hours(support_member_dir) -> None:
+    tmp_path, config, payload = support_member_dir
+    block = payload["provenance"]["bed_residence_sampling"]["deposition_support_conditioning"]
+    assert block["policy_id"] == "nww_metric_location_exact_hour_support_v1"
+    arrivals, _ = _load_arrival_document(tmp_path / "arrival.json", config, formal=True)
+    assert len(arrivals) == 250 * _M
+    for item in arrivals:
+        excluded = set(block["by_site"][item.study_site_id]["excluded_hours_utc_ns"])
+        assert excluded and item.time_utc_ns not in excluded
+
+
+@pytest.mark.parametrize("name", ["policy_id", "unsorted_hours", "hash", "deposition_in_excluded", "missing_site"])
+def test_support_conditioned_manifest_rejects_tampering(support_member_dir, name: str) -> None:
+    tmp_path, config, payload = support_member_dir
+
+    def mutate(clone: dict[str, object]) -> None:
+        block = clone["provenance"]["bed_residence_sampling"]["deposition_support_conditioning"]
+        record = block["by_site"][next(iter(SITES))]
+        if name == "policy_id":
+            block["policy_id"] = "other_policy"
+        elif name == "unsorted_hours":
+            record["excluded_hours_utc_ns"] = list(reversed(record["excluded_hours_utc_ns"]))
+        elif name == "hash":
+            record["excluded_hours_sha256"] = "0" * 64
+        elif name == "missing_site":
+            del block["by_site"][next(iter(SITES))]
+        else:
+            # 把某筆 arrival 的沉底整點加進排除清單（重算雜湊使其他檢查通過）：載入器必須拒絕
+            import hashlib
+
+            target = next(r for r in clone["records"] if r["study_site_id"] == next(iter(SITES)))["time_utc_ns"]
+            hours = sorted(set(record["excluded_hours_utc_ns"]) | {target})
+            record["excluded_hours_utc_ns"] = hours
+            record["excluded_hours_sha256"] = hashlib.sha256(
+                json.dumps(hours, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+
+    path = _mutated_arrival_path(tmp_path, payload, mutate)
+    with pytest.raises(ValueError):
+        _load_arrival_document(path, config, formal=True)
+
+
+def test_arrival_payload_injects_support_provenance_only_for_per_member(support_member_dir) -> None:
+    """``_arrival_payload`` 把受體可支撐稽核寫進 ``bed_residence_sampling``（只在傳入時）。"""
+
+    tmp_path, config, payload = support_member_dir
+    arrivals, _ = _load_arrival_document(tmp_path / "arrival.json", config, formal=True)
+    support = payload["provenance"]["bed_residence_sampling"]["deposition_support_conditioning"]
+    settings = SimpleNamespace(
+        is_generic=False,
+        bed_residence_enabled=True,
+        selection_support_days=180,
+        runtime_support_days=90,
+    )
+    built = input_derivation_module._arrival_payload(
+        config,
+        arrivals,
+        source_hashes={"x": "0" * 64},
+        strict=True,
+        horizon_settings=settings,
+        deposition_support_provenance=support,
+    )
+    block = built["provenance"]["bed_residence_sampling"]["deposition_support_conditioning"]
+    assert block == json.loads(json.dumps(support))
+    without = input_derivation_module._arrival_payload(
+        config,
+        arrivals,
+        source_hashes={"x": "0" * 64},
+        strict=True,
+        horizon_settings=settings,
+    )
+    assert "deposition_support_conditioning" not in without["provenance"]["bed_residence_sampling"]
+
+
+def test_face_support_failure_summary_classifies_nww_and_ocm_and_ranks_times() -> None:
+    """face_support 失敗彙總：NWW／OCM 分類、最集中的失敗整點（時刻層級問題的證據）。"""
+
+    t_bad = 1_744_668_000_000_000_000  # 2025-04-14T22:00:00Z
+    t_other = t_bad + 3_600_000_000_000
+    errors = {
+        1: f"hsinchu receptor face NWW runtime 四角支撐失敗：face=1, utc={t_bad}",
+        2: f"hsinchu receptor face NWW runtime 四角支撐失敗：face=2, utc={t_bad}",
+        3: f"hsinchu receptor face NWW runtime 四角支撐失敗：face=3, utc={t_other}",
+        4: "hsinchu receptor face 垂向支撐失敗：zcor 雙側支撐不足",
+    }
+    summary = input_derivation_module._summarize_face_support_failures(errors)
+    assert summary["policy_id"] == "receptor_face_support_failure_summary_v1"
+    assert summary["failed_face_count"] == 4
+    assert summary["nww_four_corner_failed_faces"] == 3
+    assert summary["ocm_vertical_or_other_failed_faces"] == 1
+    top = summary["top_nww_first_failure_utc"]
+    assert top[0]["utc_ns"] == t_bad and top[0]["failed_faces"] == 2
+    assert top[0]["utc"] == "2025-04-14T22:00:00Z"
+    assert len(summary["examples"]) == 3
+    json.dumps(summary)  # 必須可序列化進 provenance
+    empty = input_derivation_module._summarize_face_support_failures({})
+    assert empty["failed_face_count"] == 0 and empty["top_nww_first_failure_utc"] == []

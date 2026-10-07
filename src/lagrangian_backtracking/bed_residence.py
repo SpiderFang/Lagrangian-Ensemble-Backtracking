@@ -50,6 +50,8 @@ __all__ = [
     "sample_bed_residence_member_ages_conditioned_on_availability",
     "recompute_member_initial_slot_permutation",
     "summarize_member_permutation_repair",
+    "PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID",
+    "restrict_available_times_to_supported",
     "derive_bed_residence_particle_seed",
     "derive_bed_residence_member_seed",
     "resolve_bed_residence_timing",
@@ -1841,3 +1843,55 @@ def apply_bed_residence_member_sampling(
     if len({item.arrival_time_id for item in output}) != len(output):
         raise RuntimeError("per_member 沉底 arrival ID 發生碰撞")
     return tuple(output)
+
+
+# ── WP-51 整合：沉底整點的「受體可支撐」條件 ─────────────────────────────────────────
+#
+# per_member 每站有 50*M 個沉底整點，受體水平候選面必須在每一個沉底整點都通過 NWW exact-hour
+# 四角支撐與 OCM 垂向支撐（任一失敗整個面就被淘汰）。若某個整點在整個候選池都不可支撐（例如
+# NWW 在該小時於站點附近四角無效），再多的面也無法通過，建置會在受體階段 fail closed。
+# 這種「時刻層級」的不可支撐必須在抽樣年齡時就當成「不可用」整點排除（與 OCM 整日缺口同一個
+# 拒絕機制，可重現、寫進逐槽位拒絕稽核），而不是放寬受體檢核。判定用的支撐集合是各站 NWW
+# metric location 的 exact-hour 四角 gate 結果（與觀測錨點選取同一個 gate、同一份資料）。
+
+PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID: Final[str] = "nww_metric_location_exact_hour_support_v1"
+_DEPOSITION_SUPPORT_SOURCE: Final[str] = "nww_metric_location_exact_hour_four_corner_gate"
+
+
+def restrict_available_times_to_supported(
+    canonical_available_time_ns_by_site: Mapping[str, Iterable[int]],
+    supported_time_ns_by_site: Mapping[str, Iterable[int]],
+) -> tuple[dict[str, tuple[int, ...]], dict[str, object]]:
+    """把各站的 canonical 可用整點限制在「受體可支撐」整點，並回傳可寫進 provenance 的稽核。
+
+    回傳 ``(available_by_site, provenance)``：``available_by_site`` 是 canonical 可用 ∩ 支撐的
+    排序 tuple，直接交給 per_member 抽樣器；``provenance`` 記錄政策 ID、支撐來源與每站被排除的
+    整點清單（UTC ns，排序）及其 SHA-256，manifests 載入器據此核對沒有任何沉底整點落在被排除
+    集合內。兩個 mapping 的站點集合必須相同；交集為空時 ``ValueError``。
+    """
+
+    if set(canonical_available_time_ns_by_site) != set(supported_time_ns_by_site):
+        raise ValueError("canonical 可用整點與支撐整點的站點集合不一致")
+    available: dict[str, tuple[int, ...]] = {}
+    by_site: dict[str, object] = {}
+    for site_id in sorted(canonical_available_time_ns_by_site):
+        canonical = sorted({int(value) for value in canonical_available_time_ns_by_site[site_id]})
+        supported = {int(value) for value in supported_time_ns_by_site[site_id]}
+        kept = tuple(value for value in canonical if value in supported)
+        excluded = [value for value in canonical if value not in supported]
+        if not kept:
+            raise ValueError(f"{site_id} 沒有任何同時可用且受體可支撐的整點")
+        available[site_id] = kept
+        by_site[site_id] = {
+            "canonical_available_hour_count": len(canonical),
+            "supported_available_hour_count": len(kept),
+            "excluded_hours_utc_ns": excluded,
+            "excluded_hours_sha256": hashlib.sha256(
+                json.dumps(excluded, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        }
+    return available, {
+        "policy_id": PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID,
+        "support_source": _DEPOSITION_SUPPORT_SOURCE,
+        "by_site": by_site,
+    }

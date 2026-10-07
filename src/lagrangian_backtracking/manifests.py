@@ -42,6 +42,7 @@ from .bed_residence import (
     BED_RESIDENCE_POLICY_ID,
     BED_RESIDENCE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
+    PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID,
     recompute_member_initial_slot_permutation,
     sample_bed_residence_age_hours,
     summarize_member_permutation_repair,
@@ -2280,6 +2281,31 @@ def _validate_bed_residence_member_arrival_records(
     if sampling.get("permutation_repair") != expected_repair:
         raise ValueError("per_member provenance 的 permutation_repair 與逐槽位稽核不一致")
 
+    # WP-51 整合：沉底整點的「受體可支撐」條件（選用；input-build 對 per_member 一律寫入）。
+    # 載入器不讀 forcing，所以只能核對稽核本身：政策 ID、各站排除清單排序／唯一／雜湊，以及
+    # 下方逐筆 arrival 的沉底整點沒有落在任何被排除的整點內。
+    excluded_by_site: dict[str, frozenset[int]] = {}
+    support_block = sampling.get("deposition_support_conditioning")
+    if support_block is not None:
+        if (
+            not isinstance(support_block, Mapping)
+            or support_block.get("policy_id") != PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID
+            or not isinstance(support_block.get("by_site"), Mapping)
+            or set(support_block["by_site"]) != set(_config_sites(config))
+        ):
+            raise ValueError("per_member provenance 的 deposition_support_conditioning 格式或政策不符")
+        for support_site, record in support_block["by_site"].items():
+            hours = record.get("excluded_hours_utc_ns") if isinstance(record, Mapping) else None
+            if (
+                not isinstance(hours, list)
+                or any(type(value) is not int for value in hours)
+                or hours != sorted(set(hours))
+                or record.get("excluded_hours_sha256")
+                != sha256(json.dumps(hours, separators=(",", ":")).encode("utf-8")).hexdigest()
+            ):
+                raise ValueError(f"{support_site} 的受體可支撐排除整點清單格式或雜湊不符")
+            excluded_by_site[str(support_site)] = frozenset(hours)
+
     expected_site_ids = set(_config_sites(config))
     # site -> (observation_id, member_id) -> (observation_ns, age, slot, stratum)
     per_site: dict[str, dict[tuple[str, int], tuple[int, int, int, int]]] = {
@@ -2334,6 +2360,8 @@ def _validate_bed_residence_member_arrival_records(
         label_presence.add(validate_deposition_label_metadata(metadata, label=tag))
         if deposition_ns != arrival.time_utc_ns or deposition_ns != observation_ns - age * hour_ns:
             raise ValueError(f"{tag} observation/deposition UTC 關係不一致")
+        if deposition_ns in excluded_by_site.get(site_id, frozenset()):
+            raise ValueError(f"{tag} 的沉底整點落在受體不可支撐的排除整點內")
         for text_key, ns_value in (
             ("observation_time_utc", observation_ns),
             ("deposition_time_utc", deposition_ns),

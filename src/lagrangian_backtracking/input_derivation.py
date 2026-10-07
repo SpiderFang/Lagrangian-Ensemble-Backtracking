@@ -58,6 +58,7 @@ from .bed_residence import (
     BED_RESIDENCE_SAMPLING_POLICY_ID,
     apply_bed_residence_member_sampling,
     apply_bed_residence_sampling,
+    restrict_available_times_to_supported,
     sample_bed_residence_age_hours,
     sample_bed_residence_member_ages_conditioned_on_availability,
     summarize_member_permutation_repair,
@@ -2814,6 +2815,57 @@ def _nww_exact_hour_sample_rows(
     return np.where(valid, hs, np.nan), valid
 
 
+FACE_SUPPORT_FAILURE_SUMMARY_POLICY_ID = "receptor_face_support_failure_summary_v1"
+_FACE_SUPPORT_UTC_PATTERN = re.compile(r"utc=(-?\d+)")
+
+
+def _summarize_face_support_failures(
+    errors: Mapping[int, str],
+    *,
+    top_times: int = 5,
+    max_examples: int = 3,
+) -> dict[str, Any]:
+    """把 face_support 的失敗訊息彙總成可稽核的原因統計（WP-51）。
+
+    face 一旦在任一沉底時刻失敗就整個淘汰；若只留下「候選不足」而不說明原因，無法分辨是
+    NWW 四角支撐、OCM 垂向支撐還是時刻層級問題。此函式依訊息分成 NWW 與 OCM／其他，統計
+    NWW 失敗最集中的 UTC 整點（若同一整點讓大量面失敗，代表是時刻層級問題）與範例訊息。
+    """
+
+    nww_faces = 0
+    other_faces = 0
+    time_counts: dict[int, int] = {}
+    examples: list[str] = []
+    for message in errors.values():
+        text = str(message)
+        if "NWW" in text:
+            nww_faces += 1
+            match = _FACE_SUPPORT_UTC_PATTERN.search(text)
+            if match is not None:
+                key = int(match.group(1))
+                time_counts[key] = time_counts.get(key, 0) + 1
+        else:
+            other_faces += 1
+        if len(examples) < max_examples and text not in examples:
+            examples.append(text)
+    ranked = sorted(time_counts.items(), key=lambda item: (-item[1], item[0]))[: int(top_times)]
+    return {
+        "policy_id": FACE_SUPPORT_FAILURE_SUMMARY_POLICY_ID,
+        "failed_face_count": int(len(errors)),
+        "nww_four_corner_failed_faces": int(nww_faces),
+        "ocm_vertical_or_other_failed_faces": int(other_faces),
+        "top_nww_first_failure_utc": [
+            {
+                "utc_ns": int(key),
+                "utc": datetime.fromtimestamp(int(key) / 1e9, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "failed_faces": int(count),
+            }
+            for key, count in ranked
+        ],
+        "examples": examples,
+    }
+
+
 def _nww_exact_hour_samples(
     cache: _NWWRuntimeCache,
     *,
@@ -4905,9 +4957,11 @@ def _receptor_payload(
                                 return selected_supported
                     if allow_partial and selected_supported:
                         return selected_supported
+                    _summary = _summarize_face_support_failures(_face_support_errors)
                     raise InputDerivationError(
                         f"{_site_id}/{scope_label} 垂向支撐淘汰後候選不足："
-                        f"需要 {count}，實際 {len(selected_supported)}"
+                        f"需要 {count}，實際 {len(selected_supported)}；"
+                        f"face_support 失敗彙總：{json.dumps(_summary, ensure_ascii=False, sort_keys=True)}"
                     )
 
                 # current formal 的 priority 是 soft preference，不是固定座標或第二個
@@ -5026,6 +5080,9 @@ def _receptor_payload(
                         ],
                         "priority_selected_count": len(priority_selected),
                         "core_fallback_selected_count": len(horizontal) - len(priority_selected),
+                        "face_support_failure_summary": _summarize_face_support_failures(
+                            face_support_errors
+                        ),
                     }
                 if site.receptor_priority_polygon is not None:
                     priority_selection_by_site[site_id] = {
@@ -5058,6 +5115,9 @@ def _receptor_payload(
                         ],
                         "priority_selected_count": len(priority_selected),
                         "core_fallback_selected_count": len(horizontal) - len(priority_selected),
+                        "face_support_failure_summary": _summarize_face_support_failures(
+                            face_support_errors
+                        ),
                     }
                     # WP-51 C：受體核心圓與 local domain 的圓心就是 anchor，因此把實際使用的
                     # anchor、其推導規則與離線推導紀錄一併寫入，審查者不必回頭翻設定檔就能
@@ -5626,6 +5686,7 @@ def _arrival_payload(
     horizon_settings: HorizonSettings | None = None,
     pilot_selection: Mapping[str, Any] | None = None,
     deposition_label_provenance: Mapping[str, Any] | None = None,
+    deposition_support_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """將 ArrivalTime dataclass 轉成 strict schema 1 manifest。
 
@@ -5637,6 +5698,8 @@ def _arrival_payload(
     ``deposition_label_provenance``（WP-51 B）只用於 per_member：每筆沉底 arrival metadata 已帶
     ``deposition_*`` 標籤時，由 ``attach_deposition_labels`` 回傳的標註模型描述（政策、門檻、
     各（年, 季）格潮汐強度中位數）寫進 root provenance，供 loader 與事後稽核重算。
+    ``deposition_support_provenance``（WP-51 整合）同樣只用於 per_member：沉底年齡抽樣把「受體可支撐」
+    整點納入可用性條件後，各站被排除的整點清單與政策 ID 寫進 ``bed_residence_sampling``。
     """
 
     bed_config = config.scenarios.bed_residence_time
@@ -5755,6 +5818,10 @@ def _arrival_payload(
                 horizon_settings=horizon_settings,
                 arrivals=arrivals,
             )
+            if deposition_support_provenance is not None:
+                provenance_extra["bed_residence_sampling"]["deposition_support_conditioning"] = json.loads(
+                    json.dumps(deposition_support_provenance)
+                )
             if deposition_label_provenance is not None:
                 provenance_extra[DEPOSITION_LABEL_PROVENANCE_KEY] = dict(deposition_label_provenance)
         metadata_rows = [
@@ -7736,12 +7803,39 @@ def build_input_derivatives(
     if len(all_arrivals) != EXPECTED_ARRIVAL_COUNT:
         raise InputDerivationError(f"arrival 應有 250 筆，實際 {len(all_arrivals)}")
     deposition_label_provenance: dict[str, Any] | None = None
+    deposition_support_provenance: dict[str, Any] | None = None
     if bed_residence is not None:
         # 五站先各完成 50 筆 observation-anchor selector，A 區的 paired UTC 也已定案；
         # 現在才依單一 seed 產生共用的 50 個整點沉底年齡，並把 runtime 起點轉為沉底 UTC。
         # 這個位置刻意早於 receptor 與 receptor×arrival dynamic 初始條件建置，使後續
         # OCM/NWW 驗證、實際水深與初始粒子時刻都引用同一個沉底時次。
         try:
+            canonical_available_by_site = {
+                site.study_site_id: tuple(
+                    int(value)
+                    for value in ocm_by_region[site.analysis_region_id].canonical.time_utc_ns
+                )
+                for site in config.study_sites
+            }
+            if _per_member_count(config) is not None:
+                # WP-51 整合：per_member 每站有 50*M 個沉底整點，受體水平候選面必須在每一個
+                # 沉底整點通過 NWW exact-hour 四角支撐。某整點在站點 NWW metric location 無效
+                # （與觀測錨點選取同一個 gate、同一份序列）時，整個候選池都無法通過，所以把它
+                # 當成不可用整點，由抽樣器在缺口拒絕時一併排除（可重現、寫進拒絕稽核），而不是
+                # 放寬受體檢核。per_observation 維持原行為（只有 50 個沉底整點，未見此問題）。
+                canonical_available_by_site, deposition_support_provenance = (
+                    restrict_available_times_to_supported(
+                        canonical_available_by_site,
+                        {
+                            site_id: [
+                                int(time_ns)
+                                for time_ns, supported in arrival_contexts[site_id].nww_valid.items()
+                                if supported
+                            ]
+                            for site_id in canonical_available_by_site
+                        },
+                    )
+                )
             # helper 逐站傳入一樣的年齡向量，並以回傳 mapping 完整取代 observation
             # rows；後續 receptor/dynamic、arrival manifest 與 gap gate 因而共同使用
             # deposition UTC，不會只有 all_arrivals 改了、站點 mapping 卻仍留觀測時刻。
@@ -7749,13 +7843,7 @@ def build_input_derivatives(
                 arrivals_by_site,
                 bed_residence=bed_residence,
                 design_version=config.design_version,
-                canonical_available_time_ns_by_site={
-                    site.study_site_id: tuple(
-                        int(value)
-                        for value in ocm_by_region[site.analysis_region_id].canonical.time_utc_ns
-                    )
-                    for site in config.study_sites
-                },
+                canonical_available_time_ns_by_site=canonical_available_by_site,
                 gap_censoring_enabled=gap_censoring_enabled,
                 member_count=_per_member_count(config),
             )
@@ -7833,6 +7921,7 @@ def build_input_derivatives(
         horizon_settings=horizon_settings,
         pilot_selection=pilot_selection,
         deposition_label_provenance=deposition_label_provenance,
+        deposition_support_provenance=deposition_support_provenance,
     )
     dynamic_payload = _dynamic_initial_payload(
         config=config,

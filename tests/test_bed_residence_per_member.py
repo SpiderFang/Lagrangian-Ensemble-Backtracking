@@ -537,3 +537,68 @@ def test_repair_leaves_feasible_permutation_untouched() -> None:
         generator=bed_residence_module._member_repair_generator(1),
     )
     assert permutation == (1, 0, 2) and steps == ()
+
+
+# ── WP-51 整合：沉底整點的「受體可支撐」條件 ─────────────────────────────────────────
+
+
+def test_restrict_available_times_to_supported_builds_available_set_and_audit() -> None:
+    from lagrangian_backtracking.bed_residence import (
+        PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID,
+        restrict_available_times_to_supported,
+    )
+
+    canonical = {"a": [5, 3, 1, 2, 4], "b": [1, 2, 3]}
+    supported = {"a": [1, 2, 4, 99], "b": [1, 2, 3]}
+    available, provenance = restrict_available_times_to_supported(canonical, supported)
+    assert available == {"a": (1, 2, 4), "b": (1, 2, 3)}
+    assert provenance["policy_id"] == PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID
+    site_a = provenance["by_site"]["a"]
+    assert site_a["excluded_hours_utc_ns"] == [3, 5]
+    assert site_a["canonical_available_hour_count"] == 5 and site_a["supported_available_hour_count"] == 3
+    import hashlib
+
+    assert site_a["excluded_hours_sha256"] == hashlib.sha256(b"[3,5]").hexdigest()
+    assert provenance["by_site"]["b"]["excluded_hours_utc_ns"] == []
+    json.dumps(provenance)  # 可序列化
+    with pytest.raises(ValueError, match="站點集合"):
+        restrict_available_times_to_supported({"a": [1]}, {"b": [1]})
+    with pytest.raises(ValueError, match="沒有任何"):
+        restrict_available_times_to_supported({"a": [1, 2]}, {"a": [9]})
+
+
+@pytest.mark.parametrize("seed", [_SEED, 1, 2, 20261007])
+def test_unsupported_hours_are_never_sampled_when_excluded_from_availability(seed: int) -> None:
+    """模擬 NWW 在特定整點對站點無效：把這些整點從可用集合拿掉後，抽樣器不會把任何沉底整點
+    配到它們身上，而且拒絕稽核真的記錄了被排除的候選（與整日缺口同一個拒絕機制）。"""
+
+    from lagrangian_backtracking.bed_residence import restrict_available_times_to_supported
+
+    full = _full_axis()
+    # 每個站、每 37 小時有一個整點不可支撐，另外把 2025-01-01 整天（24 小時）也標為不可支撐。
+    unsupported: dict[str, set[int]] = {}
+    for site, hours in full.items():
+        ordered = sorted(hours)
+        bad = {value for index, value in enumerate(ordered) if index % 37 == 0}
+        bad |= {value for value in ordered if _ns(2025, 1, 1) <= value < _ns(2025, 1, 2)}
+        unsupported[site] = bad
+    available, provenance = restrict_available_times_to_supported(
+        {site: hours for site, hours in full.items()},
+        {site: hours - unsupported[site] for site, hours in full.items()},
+    )
+    result = sample_bed_residence_member_ages_conditioned_on_availability(
+        observation_times_by_site=_observation_times_by_site(),
+        available_time_ns_by_site=available,
+        maximum_age_days=_MAX_AGE_DAYS,
+        sample_count=50,
+        member_count=_M,
+        seed=seed,
+    )
+    ages = np.asarray(result.age_hours)
+    for site, observations in _observation_times_by_site().items():
+        excluded = set(provenance["by_site"][site]["excluded_hours_utc_ns"])
+        assert excluded == unsupported[site] & full[site]
+        for rank, observation in enumerate(observations):
+            for member in range(_M):
+                assert observation - int(ages[rank, member]) * _HOUR_NS not in excluded
+    assert any(audit.rejected_age_hours for audit in result.rejection_audit), "排除整點應造成可稽核的拒絕"
