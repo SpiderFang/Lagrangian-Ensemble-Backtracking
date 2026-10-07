@@ -41,6 +41,11 @@ _FORMAL_TEMPLATE_SCALAR_PATHS: tuple[tuple[str, ...], ...] = (
     ("integration", "output_interval_seconds"),
     ("integration", "dt_min_seconds"),
     ("integration", "dt_max_seconds"),
+    # WP-51：這三個數值在 formal template 改成與 native_runner 實際行為一致
+    # （子步上限 0.5×格長；另兩項沒有對應的強制機制），example 保留原值以維持歷史 config hash。
+    ("integration", "maximum_horizontal_cfl_fraction"),
+    ("integration", "maximum_vertical_layer_fraction"),
+    ("integration", "maximum_diffusive_rms_fraction"),
     ("scenarios", "members_per_scenario"),
     ("scenarios", "master_seed"),
     ("execution", "ocm_interpolation_backend"),
@@ -372,7 +377,9 @@ def test_formal_horizon_template_concretizes_only_approved_scalars() -> None:
     expected_scalars = {
         ("physics", "horizontal_diffusion", "constant_kh_m2ps"): 0.4429482105965188,
         ("physics", "vertical_diffusion", "constant_kz_m2ps"): 0.0013526236792521886,
-        ("integration", "output_interval_seconds"): 300,
+        # WP-51：實際軌跡紀錄間隔是每小時一次（小時主軸排程），設定值 300 並未生效，
+        # 已改成與實際行為一致的 3600。
+        ("integration", "output_interval_seconds"): 3600,
         ("integration", "dt_min_seconds"): 0.1,
         ("integration", "dt_max_seconds"): 30,
         ("scenarios", "members_per_scenario"): 10,
@@ -398,6 +405,11 @@ def test_formal_horizon_template_concretizes_only_approved_scalars() -> None:
             ("execution", "physics_kernel_backend"),
         }:
             assert example_value is None
+    # WP-51：與 native_runner 實際行為對齊的數值（example 保留原值，不是 null）
+    assert formal["integration"]["maximum_horizontal_cfl_fraction"] == 0.5
+    assert formal["integration"]["maximum_vertical_layer_fraction"] is None
+    assert formal["integration"]["maximum_diffusive_rms_fraction"] is None
+    assert example["integration"]["maximum_horizontal_cfl_fraction"] == 0.25
 
     assert _without_formal_template_scalars(formal) == _without_formal_template_scalars(
         example
