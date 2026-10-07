@@ -36,13 +36,17 @@ __all__ = [
     "BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER",
     "BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID",
     "BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID",
+    "BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID",
     "BedResidenceAvailabilitySampling",
+    "BedResidenceMemberAvailabilitySampling",
     "BedResidenceStratumRejectionAudit",
     "BedResidenceMode",
     "BedResidenceAgeSamplingScope",
     "BedResidenceTiming",
     "ParticleBedResidenceAgeSample",
     "apply_bed_residence_sampling",
+    "apply_bed_residence_member_sampling",
+    "sample_bed_residence_member_ages_conditioned_on_availability",
     "derive_bed_residence_particle_seed",
     "derive_bed_residence_member_seed",
     "resolve_bed_residence_timing",
@@ -131,11 +135,16 @@ class BedResidenceStratumRejectionAudit:
     rejected_age_hours: tuple[int, ...]
     rejected_by_site: tuple[tuple[int, tuple[str, ...]], ...]
     selected_age_hours: int
+    # WP-51：per_member 抽樣是逐「觀測 rank × 成員」的槽位稽核，所以多兩個選填欄位。
+    # per_observation 不帶這兩欄（維持 None），as_metadata 也不輸出，輸出位元組與
+    # 舊版完全相同。
+    member_id: int | None = None
+    slot_index: int | None = None
 
     def as_metadata(self) -> dict[str, object]:
         """轉為 JSON manifest 可保存的純 Python mapping。"""
 
-        return {
+        payload: dict[str, object] = {
             "stratum_index": self.stratum_index,
             "observation_rank": self.observation_rank,
             "candidate_count": self.candidate_count,
@@ -147,6 +156,11 @@ class BedResidenceStratumRejectionAudit:
             "selected_age_hours": self.selected_age_hours,
             "rejection_count": len(self.rejected_age_hours),
         }
+        if self.member_id is not None:
+            payload["member_id"] = self.member_id
+        if self.slot_index is not None:
+            payload["slot_index"] = self.slot_index
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +509,13 @@ def _source_metadata(metadata: object) -> dict[str, object]:
         "bed_residence_availability_rejection_audit",
         "bed_residence_sampling_seed",
         "observation_arrival_time_id",
+        # WP-51 per_member 新增的欄位；同樣不可在轉換前就存在。
+        "bed_residence_age_sampling_scope",
+        "bed_residence_member_id",
+        "bed_residence_member_count",
+        "bed_residence_observation_rank",
+        "bed_residence_slot_index",
+        "bed_residence_stratum_count",
     }
     if generated.intersection(copied):
         raise ValueError("ArrivalTime 已含沉底抽樣 metadata，禁止再次轉換")
@@ -1147,3 +1168,374 @@ def sample_bed_residence_age_hours_for_member(
         "bed residence per_member 條件式抽樣無可用候選："
         f"observation_time_utc_ns={observation_time_utc_ns}, candidate_count={len(candidates)}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-51：逐成員（per_member）分層抽樣＋隨機配對＋缺口條件。
+#
+# 為什麼要有第二套 per_member 抽樣？既有的 per_observation 缺口條件式抽樣
+# （``sample_bed_residence_age_hours_conditioned_on_availability``）把第 n 層年齡
+# 固定配給「依時間排序的第 n 個觀測時刻」，於是年齡與觀測時刻的 Spearman 相關
+# 係數恰為 1.0：最早的觀測永遠配到最年輕的年齡、最晚的觀測永遠配到最老的年齡，
+# 沉底時刻只集中在 1–9 月（見 ``claude/diagnosis-20261007``）。本節的新方法有三個
+# 關鍵設計：
+#
+# 1. 槽位（slot）：每站 50 個觀測時刻 × M 個成員 = 50M 個槽位，槽位編號為
+#    ``rank * M + member_id``（rank 是觀測時刻依 UTC 與原始 ID 穩定排序後的名次）。
+# 2. 分層：整段 ``0..maximum_age_days*24`` 小時切成 50M 個連續分層（每層一個年齡），
+#    因此年齡在整段 90 天內是「分層均勻」的，而不是只在 50 層內各抽一個。
+# 3. 隨機配對：用一個種子固定的 PCG64DXSM 產生一個隨機排列，把 50M 個分層分配到
+#    50M 個槽位。排列對五站共用（沿用 ``shared_age_offsets_across_sites: true``
+#    的成對設計）；同一個槽位在五站使用同一個年齡。
+#
+# 缺口條件：配對之後，對每個槽位在被配到的分層內以同一個產生器的隨機順序逐一嘗試
+# 候選年齡，接受第一個「五站在該 rank 的觀測 UTC 減年齡後的沉底整點，皆落在各自
+# 正式可用時間集合（canonical available-time set）」的年齡；該層完全沒有可用候選
+# 時直接丟出例外（fail closed），不使用最近值、補零或跨缺口外插。每個槽位都保留
+# 拒絕稽核（被拒絕的候選與缺少該整點的站點）。
+# ══════════════════════════════════════════════════════════════════════════
+
+# 新的 method id：與 per_observation 的缺口條件式 method、WP-18／WP-27 的逐粒子與
+# 逐成員（整段 permutation）原語都不同，避免下游把不同抽樣結果混用。
+BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID: Final[str] = (
+    "numpy_pcg64dxsm_per_member_stratified_shared_permutation_v1"
+)
+_PER_MEMBER_STRATIFIED_ROLE: Final[str] = "bed_residence_age_per_member_stratified_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class BedResidenceMemberAvailabilitySampling:
+    """逐成員分層抽樣的完整結果：年齡矩陣、分層配對與逐槽位拒絕稽核。
+
+    欄位的二維索引一律是 ``[observation_rank][member_id]``：``observation_rank`` 是
+    每站觀測時刻依 UTC 與原始 ID 穩定排序後的名次（0..sample_count-1），
+    ``member_id`` 是系集成員編號（0..member_count-1）。五站共用同一個矩陣。
+    ``slot_permutation[slot]`` 是槽位（``rank * member_count + member_id``）被配到的
+    年齡分層；它是 ``0..slot_count-1`` 的一個排列。``rejection_audit`` 依槽位順序
+    （rank 主序、member 次序）列出每個槽位的候選拒絕稽核。
+    """
+
+    member_count: int
+    age_hours: tuple[tuple[int, ...], ...]
+    stratum_index: tuple[tuple[int, ...], ...]
+    slot_permutation: tuple[int, ...]
+    rejection_audit: tuple[BedResidenceStratumRejectionAudit, ...]
+    sampling_method_id: str = BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID
+    availability_conditioning_policy: str = (
+        REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+    )
+
+    @property
+    def sample_count(self) -> int:
+        """每站觀測時刻數（矩陣的列數）。"""
+
+        return len(self.age_hours)
+
+    @property
+    def slot_count(self) -> int:
+        """槽位總數 ``sample_count * member_count``，也就是年齡分層數。"""
+
+        return self.sample_count * self.member_count
+
+    def age_matrix_sha256(self) -> str:
+        """年齡矩陣的 SHA-256（以緊湊 JSON 序列化），供 provenance 綁定。"""
+
+        payload = json.dumps(
+            [list(row) for row in self.age_hours],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _member_stratified_generator(seed: int) -> np.random.Generator:
+    """以角色標籤衍生種子，建立 per_member 分層抽樣專用的 PCG64DXSM 產生器。
+
+    直接用 ``PCG64DXSM(seed)`` 會讓這個方法與既有 per_observation 抽樣在同一個設定
+    種子（例如 20260916）下取得完全相同的亂數流起點；為了讓兩種抽樣互相獨立，
+    這裡先把角色標籤與種子一起做 SHA-256，取前 16 位元組作為產生器種子。
+    """
+
+    material = json.dumps(
+        [_PER_MEMBER_STRATIFIED_ROLE, str(seed)], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    derived = int.from_bytes(hashlib.sha256(material).digest()[:16], "big", signed=False)
+    return np.random.Generator(np.random.PCG64DXSM(derived))
+
+
+def sample_bed_residence_member_ages_conditioned_on_availability(
+    *,
+    observation_times_by_site: Mapping[str, Sequence[int]],
+    available_time_ns_by_site: Mapping[str, Iterable[int]],
+    maximum_age_days: int,
+    sample_count: int,
+    member_count: int,
+    seed: int,
+) -> BedResidenceMemberAvailabilitySampling:
+    """逐成員分層抽樣沉底年齡：50M 層、隨機配對槽位、逐槽位缺口條件。
+
+    流程（對應本節開頭說明）：
+
+    1. 每站觀測 UTC 以 ``(time_utc_ns, 原始輸入順序)`` 穩定排序，得到共同 rank；
+       槽位 ``rank * member_count + member_id``，共 ``sample_count * member_count`` 個。
+    2. ``0..maximum_age_days*24`` 小時（含兩端）切成與槽位等數的連續分層；
+    3. 用同一個種子固定的產生器先抽一個 ``slot_count`` 的隨機排列，決定每個槽位
+       被配到哪一層（五站共用）；
+    4. 再依槽位順序，對該層所有整點候選做無放回隨機順序，接受第一個使「五站在該
+       rank 的觀測 UTC 減年齡」都屬於各自 canonical available-time set 的年齡；
+       被拒絕的候選與缺少該整點的站點逐項記錄於稽核；整層都不可用則丟出
+       ``ValueError``（fail closed）。
+
+    參數的單位：``observation_times_by_site`` 與 ``available_time_ns_by_site`` 是
+    UTC 奈秒（原生 int、必須落在整點）；``maximum_age_days`` 是天；``seed`` 是非負整數
+    （例如 config 的 ``effective_sampling_seed``）。產生器種子由
+    ``seed`` 與角色標籤雜湊衍生（見 ``_member_stratified_generator``）。
+    """
+
+    maximum_age_days = _strict_int(maximum_age_days, label="maximum_age_days", minimum=1)
+    sample_count = _strict_int(sample_count, label="sample_count", minimum=1)
+    member_count = _strict_int(member_count, label="member_count", minimum=1)
+    seed = _strict_int(seed, label="seed", minimum=0)
+    if sample_count != _SAMPLE_COUNT:
+        raise ValueError("per_member 分層抽樣每站必須使用 50 個觀測時刻")
+    slot_count = sample_count * member_count
+    total_hours = maximum_age_days * _HOURS_PER_DAY + 1
+    if slot_count > total_hours:
+        raise ValueError(
+            "槽位數（觀測時刻數 × 成員數）不可大於可抽取的唯一整點小時數："
+            f"{slot_count} > {total_hours}"
+        )
+    site_ids, observation_ranks = _sorted_observation_rank_times(
+        observation_times_by_site, sample_count=sample_count
+    )
+    if set(available_time_ns_by_site) != set(site_ids):
+        raise ValueError(
+            "available_time_ns_by_site 必須與 observation_times_by_site 站點集合 exact 相同"
+        )
+    available_by_site = {
+        site_id: _available_hour_set(
+            available_time_ns_by_site[site_id],
+            site_id=site_id,
+            field_name="available_time_ns_by_site",
+        )
+        for site_id in site_ids
+    }
+
+    generator = _member_stratified_generator(seed)
+    # 先決定「槽位 → 分層」的共用排列，再逐槽位挑年齡；兩段使用同一個產生器並固定
+    # 先後順序，使 seed、站點集合與 canonical axis 一起決定唯一的稽核結果。
+    slot_permutation = tuple(int(value) for value in generator.permutation(slot_count))
+    ages: list[list[int]] = [[0] * member_count for _ in range(sample_count)]
+    strata: list[list[int]] = [[0] * member_count for _ in range(sample_count)]
+    audits: list[BedResidenceStratumRejectionAudit] = []
+    for slot in range(slot_count):
+        rank, member = divmod(slot, member_count)
+        stratum = slot_permutation[slot]
+        start, stop = _stratum_bounds(
+            maximum_age_days=maximum_age_days,
+            sample_count=slot_count,
+            stratum_index=stratum,
+        )
+        if stop <= start:
+            raise ValueError(f"bed residence per_member 分層 {stratum} 不可為空")
+        candidates = tuple(
+            int(value)
+            for value in generator.permutation(np.arange(start, stop, dtype=np.int64))
+        )
+        rank_observation = tuple(times[rank] for times in observation_ranks)
+        rejected: list[int] = []
+        rejected_by_site: list[tuple[int, tuple[str, ...]]] = []
+        selected: int | None = None
+        for age in candidates:
+            missing_sites = tuple(
+                site_id
+                for site_id, observation_ns in zip(site_ids, rank_observation, strict=True)
+                if observation_ns - age * _NANOSECONDS_PER_HOUR not in available_by_site[site_id]
+            )
+            if missing_sites:
+                rejected.append(age)
+                rejected_by_site.append((age, missing_sites))
+                continue
+            selected = age
+            break
+        if selected is None:
+            raise ValueError(
+                "bed residence per_member 缺口條件式抽樣無可用候選："
+                f"slot={slot}, observation_rank={rank}, member_id={member}, "
+                f"stratum={stratum}, candidate_count={len(candidates)}"
+            )
+        ages[rank][member] = selected
+        strata[rank][member] = stratum
+        audits.append(
+            BedResidenceStratumRejectionAudit(
+                stratum_index=stratum,
+                observation_rank=rank,
+                candidate_count=len(candidates),
+                rejected_age_hours=tuple(rejected),
+                rejected_by_site=tuple(rejected_by_site),
+                selected_age_hours=selected,
+                member_id=member,
+                slot_index=slot,
+            )
+        )
+    flat = [age for row in ages for age in row]
+    if len(set(flat)) != slot_count or any(not 0 <= age <= maximum_age_days * _HOURS_PER_DAY for age in flat):
+        raise RuntimeError("per_member 分層抽樣產生重複或超出範圍的年齡，拒絕輸出不完整母體")
+    return BedResidenceMemberAvailabilitySampling(
+        member_count=member_count,
+        age_hours=tuple(tuple(row) for row in ages),
+        stratum_index=tuple(tuple(row) for row in strata),
+        slot_permutation=slot_permutation,
+        rejection_audit=tuple(audits),
+    )
+
+
+def apply_bed_residence_member_sampling(
+    arrivals: Sequence[ArrivalTime],
+    *,
+    sampling: BedResidenceMemberAvailabilitySampling,
+    sampling_seed: int,
+    maximum_age_days: int,
+    design_version: str,
+) -> tuple[ArrivalTime, ...]:
+    """把單站 50 個觀測錨點展開成 ``50 * M`` 筆「逐成員沉底」到達紀錄。
+
+    對每個（觀測錨點、成員）建立一筆 ``ArrivalTime``：``time_utc_ns`` 是該成員自己
+    的沉底 UTC（觀測 UTC 減年齡）；``year``／``season`` 依沉底 UTC 重算；
+    ``tide_class``／``phase_or_event`` 保留觀測錨點原標籤（沿用 per_observation 的
+    欄位語意，沉底時刻的標籤另由 metadata 的 ``deposition_*`` 欄位保存，見
+    ``deposition_labels`` 模組）。metadata 保存兩個 UTC、年齡、成員編號、槽位、
+    被配到的分層、算法版本、seed、設計版本與逐槽位拒絕稽核。
+
+    輸出順序：先依輸入 ``arrivals`` 的順序，每筆觀測內再依 ``member_id`` 遞增。
+    觀測 rank 的對應（依 UTC 與原始 ID 穩定排序）與抽樣函式完全一致，因此輸入列順序
+    改變不會改變抽樣對應。ArrivalTime ID 把觀測 ID、沉底 UTC、method、成員編號、
+    seed 與設計版本雜湊在一起，不同成員必然不同。
+    """
+
+    maximum_age_days = _strict_int(maximum_age_days, label="maximum_age_days", minimum=1)
+    sampling_seed = _strict_int(sampling_seed, label="sampling_seed", minimum=0)
+    design_version = _nonempty_text(design_version, label="design_version")
+    if not isinstance(sampling, BedResidenceMemberAvailabilitySampling):
+        raise TypeError("sampling 必須是 BedResidenceMemberAvailabilitySampling")
+    member_count = sampling.member_count
+    if sampling.sample_count != _SAMPLE_COUNT:
+        raise ValueError("per_member 年齡矩陣必須恰有 50 列")
+    if isinstance(arrivals, (str, bytes, bytearray)):
+        raise TypeError("arrivals 必須是 ArrivalTime 序列")
+    records = tuple(arrivals)
+    if len(records) != _SAMPLE_COUNT:
+        raise ValueError("每站 observation-anchor ArrivalTime 必須恰有 50 筆")
+    if any(type(item) is not ArrivalTime for item in records):
+        raise TypeError("arrivals 的每筆資料都必須是 exact ArrivalTime")
+    if len({item.study_site_id for item in records}) != 1:
+        raise ValueError("apply_bed_residence_member_sampling 一次只能處理單一站點")
+    original_ids = [
+        _nonempty_text(item.arrival_time_id, label="arrival_time_id") for item in records
+    ]
+    if len(set(original_ids)) != _SAMPLE_COUNT:
+        raise ValueError("原始 observation arrival ID 必須唯一")
+    audit_by_slot = {item.slot_index: item for item in sampling.rejection_audit}
+    if set(audit_by_slot) != set(range(sampling.slot_count)):
+        raise ValueError("per_member rejection audit 必須涵蓋每個槽位")
+
+    indexed = sorted(
+        enumerate(records),
+        key=lambda pair: (pair[1].time_utc_ns, pair[1].arrival_time_id),
+    )
+    rank_of_original = {
+        original_index: rank for rank, (original_index, _) in enumerate(indexed)
+    }
+    design_hash = hashlib.sha256(design_version.encode("utf-8")).hexdigest()
+    availability_policy = sampling.availability_conditioning_policy
+    method_id = sampling.sampling_method_id
+    output: list[ArrivalTime] = []
+    for original_index, arrival in enumerate(records):
+        rank = rank_of_original[original_index]
+        observation_ns = _strict_int(arrival.time_utc_ns, label="ArrivalTime.time_utc_ns")
+        if not _INT64_MIN <= observation_ns <= _INT64_MAX:
+            raise ValueError("observation UTC 奈秒超出有號 64 位範圍")
+        _strict_int(arrival.year, label="ArrivalTime.year", minimum=1)
+        _nonempty_text(arrival.season, label="ArrivalTime.season")
+        _nonempty_text(arrival.tide_class, label="ArrivalTime.tide_class")
+        _nonempty_text(arrival.phase_or_event, label="ArrivalTime.phase_or_event")
+        for member in range(member_count):
+            age = sampling.age_hours[rank][member]
+            if not 0 <= age <= maximum_age_days * _HOURS_PER_DAY:
+                raise ValueError("per_member 年齡超過 maximum_age_days")
+            slot = rank * member_count + member
+            audit = audit_by_slot[slot]
+            if audit.selected_age_hours != age or audit.member_id != member or audit.observation_rank != rank:
+                raise ValueError("per_member rejection audit 與年齡矩陣不一致")
+            metadata = _source_metadata(arrival.metadata)
+            deposition_ns = observation_ns - age * _NANOSECONDS_PER_HOUR
+            if not _INT64_MIN <= deposition_ns <= _INT64_MAX:
+                raise ValueError("deposition UTC 奈秒超出有號 64 位範圍")
+            seconds, subsecond_ns = divmod(deposition_ns, _NANOSECONDS_PER_SECOND)
+            try:
+                deposition_dt = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+                    seconds=seconds, microseconds=subsecond_ns // 1_000
+                )
+            except OverflowError as error:
+                raise ValueError("deposition UTC 無法表示為曆法時間") from error
+            metadata.update(
+                {
+                    "observation_year": arrival.year,
+                    "observation_season": arrival.season,
+                    "observation_tide_class": arrival.tide_class,
+                    "observation_phase_or_event": arrival.phase_or_event,
+                    "observation_time_utc_ns": observation_ns,
+                    "observation_time_utc": _format_utc_ns(observation_ns),
+                    "deposition_time_utc_ns": deposition_ns,
+                    "deposition_time_utc": _format_utc_ns(deposition_ns),
+                    "bed_residence_age_hours": age,
+                    "bed_residence_age_sampling_scope": BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
+                    "bed_residence_member_id": member,
+                    "bed_residence_member_count": member_count,
+                    "bed_residence_observation_rank": rank,
+                    "bed_residence_slot_index": slot,
+                    "bed_residence_stratum_index": sampling.stratum_index[rank][member],
+                    "bed_residence_stratum_count": sampling.slot_count,
+                    "bed_residence_policy_id": BED_RESIDENCE_POLICY_ID,
+                    "bed_residence_sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+                    "bed_residence_sampling_method_id": method_id,
+                    "bed_residence_sampling_seed": sampling_seed,
+                    "bed_residence_maximum_age_days": maximum_age_days,
+                    "bed_residence_design_version": design_version,
+                    "bed_residence_design_hash": design_hash,
+                    "observation_arrival_time_id": arrival.arrival_time_id,
+                    "bed_residence_availability_conditioning_policy": availability_policy,
+                    "bed_residence_availability_rejection_audit": audit.as_metadata(),
+                }
+            )
+            new_id = stable_identifier(
+                "arrival_bed",
+                [
+                    arrival.arrival_time_id,
+                    str(deposition_ns),
+                    BED_RESIDENCE_POLICY_ID,
+                    BED_RESIDENCE_SAMPLING_POLICY_ID,
+                    method_id,
+                    availability_policy,
+                    BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
+                    str(member),
+                    str(sampling_seed),
+                    design_hash,
+                ],
+            )
+            output.append(
+                ArrivalTime(
+                    arrival_time_id=new_id,
+                    study_site_id=arrival.study_site_id,
+                    time_utc_ns=deposition_ns,
+                    year=deposition_dt.year,
+                    season=_season_for_month(deposition_dt.month),
+                    tide_class=arrival.tide_class,
+                    phase_or_event=arrival.phase_or_event,
+                    metadata=metadata,  # type: ignore[arg-type]
+                )
+            )
+    if len({item.arrival_time_id for item in output}) != len(output):
+        raise RuntimeError("per_member 沉底 arrival ID 發生碰撞")
+    return tuple(output)

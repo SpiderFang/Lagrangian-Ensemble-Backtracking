@@ -907,7 +907,19 @@ def build_formal_identity_table(
         config_path=resolved_config_path,
         require_dynamic_initial_conditions=True,
         formal=formal,
+        # WP-51：本函式已接線 per_member（逐成員沉底時刻）；其他 caller 預設不支援。
+        per_member_supported=True,
     )
+    per_member_scope = bool(scenario_inputs.member_arrival_by_key)
+    if per_member_scope:
+        configured_members = config.scenarios.members_per_scenario
+        if configured_members != members_per_scenario:
+            raise WiringError(
+                "age_sampling_scope=per_member 的 arrival／初始條件是依 "
+                f"config.scenarios.members_per_scenario={configured_members} 展開的，"
+                f"members_per_scenario={members_per_scenario} 不符；"
+                "請使用與 input-build 相同的成員數"
+            )
 
     case_id = experiment_case_id or config.design_version
     resolved_shard_count = (
@@ -926,6 +938,17 @@ def build_formal_identity_table(
     receptors_by_id = {receptor.receptor_id: receptor for receptor in scenario_inputs.receptors}
     initial_conditions_by_pair = scenario_inputs.initial_conditions_by_pair
 
+    member_arrival_by_key = scenario_inputs.member_arrival_by_key
+
+    def _member_arrival(unit: RunUnit) -> Any:
+        """per_member：由（情境的觀測錨點 ID, 成員編號）查該成員自己的沉底 arrival。"""
+
+        key = (unit.scenario.arrival_time_id, int(unit.member_id))
+        item = member_arrival_by_key.get(key)
+        if item is None:
+            raise WiringError(f"找不到（觀測錨點, 成員）{key!r} 的沉底 arrival")
+        return item
+
     def resolve_initial_position(unit: RunUnit) -> tuple[float, float, float]:
         """合併受體水平位置模板與 receptor×arrival 正式初始條件的實際初始深度。"""
 
@@ -933,11 +956,16 @@ def build_formal_identity_table(
         receptor = receptors_by_id.get(scenario.receptor_id)
         if receptor is None:
             raise WiringError(f"找不到受體 {scenario.receptor_id!r} 的水平位置模板")
-        condition = initial_conditions_by_pair.get((scenario.receptor_id, scenario.arrival_time_id))
+        # per_member：初始條件是以「該成員自己的沉底 arrival」為鍵（深度分數不變，公尺數
+        # 依該沉底時刻的水柱重算）；per_observation 維持以情境的 arrival 為鍵。
+        arrival_key = (
+            _member_arrival(unit).arrival_time_id if per_member_scope else scenario.arrival_time_id
+        )
+        condition = initial_conditions_by_pair.get((scenario.receptor_id, arrival_key))
         if condition is None:
             raise WiringError(
                 f"找不到 receptor×arrival ({scenario.receptor_id!r}, "
-                f"{scenario.arrival_time_id!r}) 的正式三維初始條件"
+                f"{arrival_key!r}) 的正式三維初始條件"
             )
         projection = site_projection.get(scenario.study_site_id)
         if projection is None:
@@ -945,12 +973,54 @@ def build_formal_identity_table(
         x_m, y_m = projection.project(receptor.lon, receptor.lat)
         return float(x_m), float(y_m), float(condition.z_m_positive_up)
 
+    def resolve_arrival_time_utc_ns(unit: RunUnit) -> int:
+        """per_member：每顆粒子的起算時刻是自己成員的沉底 UTC，不是情境的觀測時刻。"""
+
+        return int(_member_arrival(unit).time_utc_ns)
+
+    def resolve_labels(unit: RunUnit) -> dict[str, object]:
+        """per_member：沉底時刻標籤（deposition_*）與觀測時刻舊標籤（observation_*）。"""
+
+        return member_arrival_labels(_member_arrival(unit))
+
     return build_particle_identity_table(
         shards,
         master_seed=master_seed,
         resolve_initial_position=resolve_initial_position,
         random_stream_id=random_stream_id,
+        resolve_arrival_time_utc_ns=resolve_arrival_time_utc_ns if per_member_scope else None,
+        resolve_labels=resolve_labels if per_member_scope else None,
     )
+
+
+def member_arrival_labels(arrival: Any) -> dict[str, object]:
+    """由 per_member 的成員沉底 ``ArrivalTime`` 組出身分表的逐粒子標籤。
+
+    ``deposition_season`` 一定存在（頂層 ``season`` 已依沉底 UTC 重算）；
+    ``deposition_tide_class``／``deposition_tide_phase``／``deposition_high_wave``／
+    ``deposition_strong_current`` 只在 input-build 已寫入沉底時刻標籤（WP-51 B 項，見
+    ``deposition_labels`` 模組）時才出現，缺其中任何一個就整組省略，不以觀測時刻標籤
+    頂替。``observation_*`` 欄位保留舊的觀測時刻標籤供對照，**不可**用來分組解讀。
+    """
+
+    metadata = arrival.metadata
+    labels: dict[str, object] = {
+        "deposition_season": str(arrival.season),
+        "observation_season": str(metadata["observation_season"]),
+        "observation_tide_class": str(arrival.tide_class),
+        "observation_phase_or_event": str(arrival.phase_or_event),
+        "observation_time_utc_ns": int(metadata["observation_time_utc_ns"]),
+    }
+    deposition_keys = (
+        "deposition_tide_class",
+        "deposition_tide_phase",
+        "deposition_high_wave",
+        "deposition_strong_current",
+    )
+    if all(key in metadata for key in deposition_keys):
+        for key in deposition_keys:
+            labels[key] = metadata[key]
+    return labels
 
 
 # ── 三、正式跑前置檢查 ────────────────────────────────────────────────────
@@ -1061,11 +1131,13 @@ def _try_load_arrival_times_by_site(
             config_path=config_path,
             require_dynamic_initial_conditions=False,
             formal=False,
+            per_member_supported=True,
         )
     except (ValueError, FileNotFoundError):
         return None
     by_site: dict[str, list[Any]] = {}
-    for arrival in scenario_inputs.arrival_times:
+    # per_member 時缺口安全性要查的是每個成員自己的沉底時刻，而不是 250 個觀測錨點。
+    for arrival in scenario_inputs.member_arrival_times or scenario_inputs.arrival_times:
         by_site.setdefault(arrival.study_site_id, []).append(arrival)
     return {site_id: tuple(items) for site_id, items in by_site.items()}
 

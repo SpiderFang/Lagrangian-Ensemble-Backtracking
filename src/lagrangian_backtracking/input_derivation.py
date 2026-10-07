@@ -48,12 +48,18 @@ from shapely.ops import unary_union
 from . import bed_residence as _bed_residence_module
 from .arrival_times import select_arrival_times
 from .bed_residence import (
+    BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
+    BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE,
     BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
+    BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_POLICY_ID,
     BED_RESIDENCE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
+    apply_bed_residence_member_sampling,
     apply_bed_residence_sampling,
     sample_bed_residence_age_hours,
+    sample_bed_residence_member_ages_conditioned_on_availability,
 )
 from .config import (
     ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1,
@@ -146,6 +152,46 @@ EXPECTED_STUDY_SITE_COUNT = 5
 EXPECTED_RECEPTOR_COUNT = 100
 EXPECTED_ARRIVAL_COUNT = 250
 EXPECTED_DYNAMIC_INITIAL_CONDITION_COUNT = 5_000
+
+
+def _per_member_count(config: Any) -> int | None:
+    """若 config 啟用 ``age_sampling_scope: per_member`` 則回傳成員數 M，否則回傳 None。
+
+    WP-51：per_member 時每個「觀測錨點」在每個成員各有自己的沉底時刻，arrival 與
+    dynamic 初始條件 manifest 因而展開成 ``250 * M`` 與 ``5,000 * M`` 筆（flat-record
+    模型：每筆記錄是一個「觀測錨點 × 成員」的沉底到達）。per_observation／
+    per_particle 或沒有 bed residence 設定時回傳 None，既有 250／5,000 契約不變。
+    ``members_per_scenario`` 缺值時 fail closed，避免用猜測的成員數建立母體。
+    """
+
+    if config is None:
+        return None
+    scenarios = getattr(config, "scenarios", None)
+    bed = getattr(scenarios, "bed_residence_time", None)
+    if bed is None or getattr(bed, "age_sampling_scope", None) != (
+        BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER
+    ):
+        return None
+    members = getattr(scenarios, "members_per_scenario", None)
+    if type(members) is not int or members < 1:
+        raise InputDerivationError(
+            "age_sampling_scope=per_member 需要 scenarios.members_per_scenario 為正整數"
+        )
+    return int(members)
+
+
+def _expected_arrival_count(config: Any) -> int:
+    """依 config 回傳 arrival.json／gap-safe 應有的筆數（per_member 時為 250*M）。"""
+
+    members = _per_member_count(config)
+    return EXPECTED_ARRIVAL_COUNT * (members or 1)
+
+
+def _expected_dynamic_initial_condition_count(config: Any) -> int:
+    """依 config 回傳 initial_conditions.json 應有的筆數（per_member 時為 5,000*M）。"""
+
+    members = _per_member_count(config)
+    return EXPECTED_DYNAMIC_INITIAL_CONDITION_COUNT * (members or 1)
 
 # 已知 OCM 缺時無法補齊時，正式 bed-residence 母體採用「走到第一個缺口就截尾」；
 # 這些識別碼會進入 input、release 與報告 provenance。它們刻意在本模組集中宣告，
@@ -5671,115 +5717,126 @@ def _arrival_payload(
         if horizon_settings is None or not horizon_settings.bed_residence_enabled:
             raise InputDerivationError("bed residence arrival manifest 缺少共同 horizon 設定")
         gap_censoring_enabled = _gap_censoring_enabled(config)
+        if bed_config.age_sampling_scope == BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER:
+            # WP-51：per_member 的 arrival 是「觀測錨點 × 成員」展開的 flat records；
+            # root provenance 由 _bed_residence_member_provenance 重組並自我檢查。
+            if not gap_censoring_enabled:
+                raise InputDerivationError("per_member arrival manifest 需要缺時截尾政策")
+            provenance_extra["bed_residence_sampling"] = _bed_residence_member_provenance(
+                bed_config=bed_config,
+                horizon_settings=horizon_settings,
+                arrivals=arrivals,
+            )
         metadata_rows = [
             item.metadata
             for item in arrivals
             if isinstance(item.metadata, Mapping)
         ]
-        observed_hashes = {
-            str(item.get("bed_residence_age_offsets_hours_sha256"))
-            for item in metadata_rows
-            if item.get("bed_residence_age_offsets_hours_sha256") is not None
-        }
-        if gap_censoring_enabled:
-            if len(observed_hashes) != 1:
-                raise InputDerivationError(
-                    "gap-conditioned age vector hash 未在所有 deposition arrival 一致保存"
+        if bed_config.age_sampling_scope != BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER:
+            observed_hashes = {
+                str(item.get("bed_residence_age_offsets_hours_sha256"))
+                for item in metadata_rows
+                if item.get("bed_residence_age_offsets_hours_sha256") is not None
+            }
+            if gap_censoring_enabled:
+                if len(observed_hashes) != 1:
+                    raise InputDerivationError(
+                        "gap-conditioned age vector hash 未在所有 deposition arrival 一致保存"
+                    )
+                age_offsets_hash = next(iter(observed_hashes))
+                # apply_bed_residence_sampling 已把每個分層的 rejection audit 寫到對應
+                # arrival；這裡從五站 rows 重建唯一的 0..49 順序，並確認各站對同一
+                # observation rank 保存完全相同的候選拒絕證據。root provenance 不能只存一
+                # 個「有抽過」旗標，否則 validator 無法重算條件式 age vector。
+                audit_by_stratum: dict[int, dict[str, Any]] = {}
+                age_by_stratum: dict[int, int] = {}
+                for item in metadata_rows:
+                    raw_audit = item.get("bed_residence_availability_rejection_audit")
+                    if not isinstance(raw_audit, Mapping):
+                        raise InputDerivationError(
+                            "gap-conditioned sampler 缺少逐筆 availability rejection audit"
+                        )
+                    stratum_index = raw_audit.get("stratum_index")
+                    if type(stratum_index) is not int or not 0 <= stratum_index < 50:
+                        raise InputDerivationError("gap-conditioned rejection audit stratum index 無效")
+                    age_hours = item.get("bed_residence_age_hours")
+                    if type(age_hours) is not int:
+                        raise InputDerivationError("gap-conditioned arrival age 必須是整數小時")
+                    previous_age = age_by_stratum.get(stratum_index)
+                    if previous_age is None:
+                        age_by_stratum[stratum_index] = age_hours
+                    elif previous_age != age_hours:
+                        raise InputDerivationError(
+                            "gap-conditioned age vector 在站點間不一致"
+                        )
+                    audit_payload = dict(raw_audit)
+                    previous = audit_by_stratum.get(stratum_index)
+                    if previous is None:
+                        audit_by_stratum[stratum_index] = audit_payload
+                    elif previous != audit_payload:
+                        raise InputDerivationError(
+                            "gap-conditioned sampler rejection audit 在站點間不一致"
+                        )
+                if set(audit_by_stratum) != set(range(50)):
+                    raise InputDerivationError("gap-conditioned sampler rejection audit 分層不完整")
+                if set(age_by_stratum) != set(range(50)):
+                    raise InputDerivationError("gap-conditioned age vector 分層不完整")
+                rejection_audit = [audit_by_stratum[index] for index in range(50)]
+                age_offsets = [age_by_stratum[index] for index in range(50)]
+            else:
+                offsets = sample_bed_residence_age_hours(
+                    maximum_age_days=bed_config.maximum_age_days,
+                    sample_count=bed_config.sample_count_per_site,
+                    # WP-26：改讀 effective_sampling_seed，讓 age_sampling_seed 覆寫（若有
+                    # 明示）真正改變抽出的 50 個年齡；未明示時等於 sampling_seed，逐位元
+                    # 相同於此欄位新增前的行為。
+                    seed=bed_config.effective_sampling_seed,
                 )
-            age_offsets_hash = next(iter(observed_hashes))
-            # apply_bed_residence_sampling 已把每個分層的 rejection audit 寫到對應
-            # arrival；這裡從五站 rows 重建唯一的 0..49 順序，並確認各站對同一
-            # observation rank 保存完全相同的候選拒絕證據。root provenance 不能只存一
-            # 個「有抽過」旗標，否則 validator 無法重算條件式 age vector。
-            audit_by_stratum: dict[int, dict[str, Any]] = {}
-            age_by_stratum: dict[int, int] = {}
-            for item in metadata_rows:
-                raw_audit = item.get("bed_residence_availability_rejection_audit")
-                if not isinstance(raw_audit, Mapping):
-                    raise InputDerivationError(
-                        "gap-conditioned sampler 缺少逐筆 availability rejection audit"
-                    )
-                stratum_index = raw_audit.get("stratum_index")
-                if type(stratum_index) is not int or not 0 <= stratum_index < 50:
-                    raise InputDerivationError("gap-conditioned rejection audit stratum index 無效")
-                age_hours = item.get("bed_residence_age_hours")
-                if type(age_hours) is not int:
-                    raise InputDerivationError("gap-conditioned arrival age 必須是整數小時")
-                previous_age = age_by_stratum.get(stratum_index)
-                if previous_age is None:
-                    age_by_stratum[stratum_index] = age_hours
-                elif previous_age != age_hours:
-                    raise InputDerivationError(
-                        "gap-conditioned age vector 在站點間不一致"
-                    )
-                audit_payload = dict(raw_audit)
-                previous = audit_by_stratum.get(stratum_index)
-                if previous is None:
-                    audit_by_stratum[stratum_index] = audit_payload
-                elif previous != audit_payload:
-                    raise InputDerivationError(
-                        "gap-conditioned sampler rejection audit 在站點間不一致"
-                    )
-            if set(audit_by_stratum) != set(range(50)):
-                raise InputDerivationError("gap-conditioned sampler rejection audit 分層不完整")
-            if set(age_by_stratum) != set(range(50)):
-                raise InputDerivationError("gap-conditioned age vector 分層不完整")
-            rejection_audit = [audit_by_stratum[index] for index in range(50)]
-            age_offsets = [age_by_stratum[index] for index in range(50)]
-        else:
-            offsets = sample_bed_residence_age_hours(
-                maximum_age_days=bed_config.maximum_age_days,
-                sample_count=bed_config.sample_count_per_site,
-                # WP-26：改讀 effective_sampling_seed，讓 age_sampling_seed 覆寫（若有
-                # 明示）真正改變抽出的 50 個年齡；未明示時等於 sampling_seed，逐位元
-                # 相同於此欄位新增前的行為。
-                seed=bed_config.effective_sampling_seed,
-            )
-            age_offsets_hash = sha256(
-                json.dumps(
-                    list(offsets), ensure_ascii=False, separators=(",", ":"), allow_nan=False
-                ).encode("utf-8")
-            ).hexdigest()
-            rejection_audit = {"policy": BED_RESIDENCE_SAMPLING_POLICY_ID, "rejected_candidates": 0}
-        provenance_extra["bed_residence_sampling"] = {
-            "policy_id": BED_RESIDENCE_POLICY_ID,
-            # sampling_policy_id 描述離散整點分層抽樣本身；缺時條件式另以
-            # availability_conditioning_policy 綁定，不能把兩個不同層次的 policy
-            # 混成一個 ID，否則既有 manifest loader 無法辨識抽樣算法。
-            "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
-            "sampling_method_id": (
-                BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID
-                if gap_censoring_enabled
-                else BED_RESIDENCE_SAMPLING_METHOD_ID
-            ),
-            "maximum_age_days": bed_config.maximum_age_days,
-            "sample_count_per_site": bed_config.sample_count_per_site,
-            # WP-26：provenance 保存的是實際用來抽樣的種子（effective_sampling_seed），
-            # 讓 manifests.py 之後可以只用同一個欄位重算與驗證，不需要另外知道
-            # age_sampling_seed 這個覆寫欄位存在。
-            "sampling_seed": bed_config.effective_sampling_seed,
-            "shared_age_offsets_across_sites": bed_config.shared_age_offsets_across_sites,
-            "age_offsets_hours_sha256": age_offsets_hash,
-            "selection_support_days": horizon_settings.selection_support_days,
-            "runtime_support_days": horizon_settings.runtime_support_days,
-            "pre_window_policy": bed_config.pre_window_policy,
-            "observation_anchor_selection_method_id": ARRIVAL_SELECTION_METHOD_ID,
-        }
-        if gap_censoring_enabled:
-            provenance_extra["bed_residence_sampling"].update(
-                {
-                    # 新版 loader 需要完整向量與 hash 同時存在；hash 只證明 bytes
-                    # 一致，不能取代分層與可用性拒絕 audit。
-                    "age_offsets_hours": [
-                        int(value) for value in age_offsets
-                    ],
-                    "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
-                    "deposition_availability_policy_id": DEPOSITION_AVAILABILITY_POLICY_ID,
-                    "denominator_policy_id": DENOMINATOR_POLICY_ID,
-                    "availability_conditioning_policy": DEPOSITION_AVAILABILITY_POLICY_ID,
-                    "rejection_audit": rejection_audit,
-                }
-            )
+                age_offsets_hash = sha256(
+                    json.dumps(
+                        list(offsets), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                    ).encode("utf-8")
+                ).hexdigest()
+                rejection_audit = {"policy": BED_RESIDENCE_SAMPLING_POLICY_ID, "rejected_candidates": 0}
+            provenance_extra["bed_residence_sampling"] = {
+                "policy_id": BED_RESIDENCE_POLICY_ID,
+                # sampling_policy_id 描述離散整點分層抽樣本身；缺時條件式另以
+                # availability_conditioning_policy 綁定，不能把兩個不同層次的 policy
+                # 混成一個 ID，否則既有 manifest loader 無法辨識抽樣算法。
+                "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+                "sampling_method_id": (
+                    BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID
+                    if gap_censoring_enabled
+                    else BED_RESIDENCE_SAMPLING_METHOD_ID
+                ),
+                "maximum_age_days": bed_config.maximum_age_days,
+                "sample_count_per_site": bed_config.sample_count_per_site,
+                # WP-26：provenance 保存的是實際用來抽樣的種子（effective_sampling_seed），
+                # 讓 manifests.py 之後可以只用同一個欄位重算與驗證，不需要另外知道
+                # age_sampling_seed 這個覆寫欄位存在。
+                "sampling_seed": bed_config.effective_sampling_seed,
+                "shared_age_offsets_across_sites": bed_config.shared_age_offsets_across_sites,
+                "age_offsets_hours_sha256": age_offsets_hash,
+                "selection_support_days": horizon_settings.selection_support_days,
+                "runtime_support_days": horizon_settings.runtime_support_days,
+                "pre_window_policy": bed_config.pre_window_policy,
+                "observation_anchor_selection_method_id": ARRIVAL_SELECTION_METHOD_ID,
+            }
+            if gap_censoring_enabled:
+                provenance_extra["bed_residence_sampling"].update(
+                    {
+                        # 新版 loader 需要完整向量與 hash 同時存在；hash 只證明 bytes
+                        # 一致，不能取代分層與可用性拒絕 audit。
+                        "age_offsets_hours": [
+                            int(value) for value in age_offsets
+                        ],
+                        "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+                        "deposition_availability_policy_id": DEPOSITION_AVAILABILITY_POLICY_ID,
+                        "denominator_policy_id": DENOMINATOR_POLICY_ID,
+                        "availability_conditioning_policy": DEPOSITION_AVAILABILITY_POLICY_ID,
+                        "rejection_audit": rejection_audit,
+                    }
+                )
     return {
         "manifest_kind": "arrival_time_manifest",
         "schema_version": (
@@ -6878,10 +6935,16 @@ def _apply_bed_residence_sampling_by_site(
     design_version: str,
     canonical_available_time_ns_by_site: Mapping[str, Sequence[int]] | None = None,
     gap_censoring_enabled: bool = False,
+    member_count: int | None = None,
 ) -> dict[str, list[ArrivalTime]]:
     """把五站 observation anchors 轉為 deposition UTC，回傳供後續 builder 共用的新 mapping。
 
-    每個 mapping value 必須是一站恰好 50 筆的 ArrivalTime；此函式只在 A 區 paired UTC
+    ``age_sampling_scope`` 決定抽樣粒度：``per_observation``（預設）下面的既有路徑；
+    ``per_member`` 走 :func:`_apply_bed_residence_member_sampling_by_site`，每站回傳
+    ``50 * member_count`` 筆（觀測錨點 × 成員）；``per_particle`` 尚未接線，fail closed。
+
+    以下說明針對 ``per_observation`` 路徑：每個 mapping value 必須是一站恰好 50 筆的
+    ArrivalTime；此函式只在 A 區 paired UTC
     已完成後呼叫。抽樣器只產生一次共用的 50 個整點小時 age vector，再依站點逐一套用，
     因而保留各站 identity 並讓同一 observation 時序使用同一組沉底年齡。回傳值會取代
     builder 後續使用的 arrivals_by_site，故 receptor 選點、dynamic OCM 初始條件、arrival
@@ -6889,6 +6952,22 @@ def _apply_bed_residence_sampling_by_site(
     180/90 日 window，該證據仍由 selector 和 gap validator 建立。
     """
 
+    if bed_residence.age_sampling_scope == BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER:
+        return _apply_bed_residence_member_sampling_by_site(
+            arrivals_by_site,
+            bed_residence=bed_residence,
+            design_version=design_version,
+            member_count=member_count,
+            canonical_available_time_ns_by_site=canonical_available_time_ns_by_site,
+            gap_censoring_enabled=gap_censoring_enabled,
+        )
+    if bed_residence.age_sampling_scope == BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE:
+        # per_particle 在 bed_residence 只有抽樣原語，初始條件、工作單元與 manifest 都
+        # 沒有接線；寧可 fail closed，也不要靜默退回 per_observation 讓人誤以為已逐粒子。
+        raise InputDerivationError(
+            "age_sampling_scope=per_particle 尚未接線（WP-51 只接 per_member）；"
+            "拒絕以 per_observation 取代"
+        )
     age_offsets, _, sampling_audit_records = _sample_bed_residence_age_offsets(
         arrivals_by_site,
         bed_residence=bed_residence,
@@ -6942,6 +7021,178 @@ def _apply_bed_residence_sampling_by_site(
             )
         transformed[site_id] = converted
     return transformed
+
+
+def _apply_bed_residence_member_sampling_by_site(
+    arrivals_by_site: Mapping[str, Sequence[ArrivalTime]],
+    *,
+    bed_residence: BedResidenceTimeConfig,
+    design_version: str,
+    member_count: int | None,
+    canonical_available_time_ns_by_site: Mapping[str, Sequence[int]] | None,
+    gap_censoring_enabled: bool,
+) -> dict[str, list[ArrivalTime]]:
+    """WP-51：per_member 沉底抽樣。每站 50 個觀測 × M 個成員，各自一個沉底時刻。
+
+    與 per_observation 的差別（也是這個工作包要修的缺陷）：年齡不再與觀測時刻的
+    排序綁死，而是把 0..maximum_age_days*24 小時切成 ``50*M`` 層，用種子固定的排列把
+    分層隨機配給（觀測 rank × 成員）槽位，五站共用同一組配對；每個槽位再做缺口條件
+    （五站該 rank 的沉底整點都必須在各自 canonical available-time set）。回傳的每站
+    list 是「觀測錨點 × 成員」展開的 ``50*M`` 筆 ``ArrivalTime``：``time_utc_ns`` 為
+    該成員自己的沉底時刻，metadata 保存觀測錨點 ID、成員編號、槽位與拒絕稽核。
+
+    只支援 ``full_horizon_from_deposition`` 回溯模式與條件式（availability）抽樣：
+    固定日曆窗模式的 ``resolve_bed_residence_timing`` 假設 50 個分層，不適用 per_member。
+    """
+
+    if member_count is None or type(member_count) is not int or member_count < 1:
+        raise InputDerivationError("per_member 抽樣需要正整數 members_per_scenario")
+    if bed_residence.backtrack_mode != BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION:
+        raise InputDerivationError(
+            "age_sampling_scope=per_member 目前只支援 backtrack_mode=full_horizon_from_deposition"
+        )
+    if not gap_censoring_enabled:
+        raise InputDerivationError(
+            "age_sampling_scope=per_member 必須啟用缺口條件式抽樣"
+            "（availability_conditioning_policy 與缺時截尾政策）"
+        )
+    if canonical_available_time_ns_by_site is None:
+        raise InputDerivationError("per_member 抽樣缺少五站 canonical available-time set")
+    observation_times: dict[str, tuple[int, ...]] = {}
+    for site_id in sorted(arrivals_by_site):
+        rows = sorted(
+            arrivals_by_site[site_id],
+            key=lambda item: (int(item.time_utc_ns), item.arrival_time_id),
+        )
+        if len(rows) != bed_residence.sample_count_per_site:
+            raise InputDerivationError(f"{site_id} observation rank 數量不符 bed sample_count")
+        observation_times[site_id] = tuple(int(item.time_utc_ns) for item in rows)
+    available = {
+        str(site_id): tuple(sorted({int(value) for value in values}))
+        for site_id, values in canonical_available_time_ns_by_site.items()
+    }
+    try:
+        sampling = sample_bed_residence_member_ages_conditioned_on_availability(
+            observation_times_by_site=observation_times,
+            available_time_ns_by_site=available,
+            maximum_age_days=bed_residence.maximum_age_days,
+            sample_count=bed_residence.sample_count_per_site,
+            member_count=member_count,
+            # 與 per_observation 相同：讀 effective_sampling_seed，age_sampling_seed 覆寫
+            # 也套用在這裡。
+            seed=bed_residence.effective_sampling_seed,
+        )
+    except Exception as exc:
+        raise InputDerivationError(
+            f"per_member bed sampler failed closed：{type(exc).__name__}: {exc}"
+        ) from exc
+    matrix_hash = sampling.age_matrix_sha256()
+    transformed: dict[str, list[ArrivalTime]] = {}
+    for site_id in sorted(arrivals_by_site):
+        site_arrivals = tuple(arrivals_by_site[site_id])
+        if any(arrival.study_site_id != site_id for arrival in site_arrivals):
+            raise InputDerivationError(f"bed-residence site mapping key mismatch: {site_id}")
+        converted = list(
+            apply_bed_residence_member_sampling(
+                site_arrivals,
+                sampling=sampling,
+                sampling_seed=bed_residence.effective_sampling_seed,
+                maximum_age_days=bed_residence.maximum_age_days,
+                design_version=design_version,
+            )
+        )
+        for arrival in converted:
+            arrival.metadata.update({"bed_residence_age_offsets_hours_sha256": matrix_hash})
+        transformed[site_id] = converted
+    return transformed
+
+
+def _bed_residence_member_provenance(
+    *,
+    bed_config: BedResidenceTimeConfig,
+    horizon_settings: HorizonSettings,
+    arrivals: Sequence[ArrivalTime],
+) -> dict[str, Any]:
+    """由五站 ``50*M`` 筆沉底 arrival 重建 per_member 的 root provenance。
+
+    root provenance 必須能讓 manifests loader 不讀 forcing 就驗證：年齡矩陣、槽位→分層
+    排列與逐槽位拒絕稽核。這裡從各筆 arrival 的 metadata 重組並確認五站對同一槽位
+    保存完全相同的年齡、分層與稽核，任何不一致都 fail closed。
+    """
+
+    member_counts = {item.metadata.get("bed_residence_member_count") for item in arrivals}
+    if len(member_counts) != 1 or type(next(iter(member_counts))) is not int:
+        raise InputDerivationError("per_member arrival 的 bed_residence_member_count 不一致")
+    member_count = int(next(iter(member_counts)))
+    sample_count = bed_config.sample_count_per_site
+    slot_count = sample_count * member_count
+    age_by_slot: dict[int, int] = {}
+    stratum_by_slot: dict[int, int] = {}
+    audit_by_slot: dict[int, dict[str, Any]] = {}
+    hashes: set[str] = set()
+    for item in arrivals:
+        meta = item.metadata
+        slot = meta.get("bed_residence_slot_index")
+        age = meta.get("bed_residence_age_hours")
+        stratum = meta.get("bed_residence_stratum_index")
+        raw_audit = meta.get("bed_residence_availability_rejection_audit")
+        if (
+            type(slot) is not int
+            or type(age) is not int
+            or type(stratum) is not int
+            or not isinstance(raw_audit, Mapping)
+        ):
+            raise InputDerivationError("per_member arrival metadata 缺少槽位、年齡、分層或 audit")
+        audit = dict(raw_audit)
+        if slot in age_by_slot:
+            if (
+                age_by_slot[slot] != age
+                or stratum_by_slot[slot] != stratum
+                or audit_by_slot[slot] != audit
+            ):
+                raise InputDerivationError("per_member 年齡／分層／audit 在站點間不一致")
+        else:
+            age_by_slot[slot], stratum_by_slot[slot], audit_by_slot[slot] = age, stratum, audit
+        hashes.add(str(meta.get("bed_residence_age_offsets_hours_sha256")))
+    if set(age_by_slot) != set(range(slot_count)):
+        raise InputDerivationError("per_member 槽位集合不完整")
+    age_matrix = [
+        [age_by_slot[rank * member_count + member] for member in range(member_count)]
+        for rank in range(sample_count)
+    ]
+    matrix_hash = sha256(
+        json.dumps(age_matrix, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if hashes != {matrix_hash}:
+        raise InputDerivationError("per_member 年齡矩陣 hash 與各筆 arrival 保存的不一致")
+    return {
+        "policy_id": BED_RESIDENCE_POLICY_ID,
+        "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+        "sampling_method_id": BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID,
+        "age_sampling_scope": BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
+        "member_count": member_count,
+        "slot_count": slot_count,
+        "maximum_age_days": bed_config.maximum_age_days,
+        "sample_count_per_site": sample_count,
+        "sampling_seed": bed_config.effective_sampling_seed,
+        "shared_age_offsets_across_sites": bed_config.shared_age_offsets_across_sites,
+        # 為了與既有 provenance 欄位名對齊，沿用 age_offsets_hours_sha256 這個鍵，但內容
+        # 是整個 50×M 年齡矩陣的 hash。
+        "age_offsets_hours_sha256": matrix_hash,
+        "age_matrix_hours": age_matrix,
+        "slot_permutation": [stratum_by_slot[slot] for slot in range(slot_count)],
+        "rejection_audit": [audit_by_slot[slot] for slot in range(slot_count)],
+        "selection_support_days": horizon_settings.selection_support_days,
+        "runtime_support_days": horizon_settings.runtime_support_days,
+        "pre_window_policy": bed_config.pre_window_policy,
+        "observation_anchor_selection_method_id": ARRIVAL_SELECTION_METHOD_ID,
+        "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_POLICY_ID,
+        "deposition_availability_policy_id": DEPOSITION_AVAILABILITY_POLICY_ID,
+        "denominator_policy_id": DENOMINATOR_POLICY_ID,
+        "availability_conditioning_policy": DEPOSITION_AVAILABILITY_POLICY_ID,
+    }
 
 
 def _sample_bed_residence_age_offsets(
@@ -7469,16 +7720,21 @@ def build_input_derivatives(
                     for site in config.study_sites
                 },
                 gap_censoring_enabled=gap_censoring_enabled,
+                member_count=_per_member_count(config),
             )
             all_arrivals = tuple(
                 item for site in sorted(arrivals_by_site) for item in arrivals_by_site[site]
             )
         except Exception as exc:
             raise InputDerivationError(
-                f"random bed-residence observation-to-deposition transformation failed: {type(exc).__name__}"
+                f"random bed-residence observation-to-deposition transformation failed: "
+                f"{type(exc).__name__}: {exc}"
             ) from exc
-        if len(all_arrivals) != EXPECTED_ARRIVAL_COUNT:
-            raise InputDerivationError("bed-residence 轉換不得改變正式 250 筆 arrival 母體")
+        if len(all_arrivals) != _expected_arrival_count(config):
+            raise InputDerivationError(
+                "bed-residence 轉換後的 arrival 母體筆數不符："
+                f"{len(all_arrivals)} != {_expected_arrival_count(config)}"
+            )
     pilot_selection = _pilot_selection_summary(all_arrivals)
     if pilot_selection is None:
         pilot_horizon_overrides: dict[str, float] = {}
@@ -7542,6 +7798,11 @@ def build_input_derivatives(
         ocm_pair_caches=ocm_pair_caches,
         native_mesh_bindings=native_mesh_bindings,
         vertical_support_cache=vertical_support_cache,
+        expected_pair_count=(
+            _expected_dynamic_initial_condition_count(config)
+            if _per_member_count(config) is not None
+            else None
+        ),
     )
     max_days = (
         float(horizon_settings.runtime_support_days)
@@ -8302,9 +8563,16 @@ def validate_input_derivatives(
         errors.append("material_count_invalid")
     if not isinstance(receptor_rows, list) or len(receptor_rows) != EXPECTED_RECEPTOR_COUNT:
         errors.append("receptor_count_invalid")
-    if not isinstance(arrival_rows, list) or len(arrival_rows) != EXPECTED_ARRIVAL_COUNT:
+    try:
+        expected_arrival_count = _expected_arrival_count(config)
+        expected_dynamic_count = _expected_dynamic_initial_condition_count(config)
+    except InputDerivationError:
+        errors.append("per_member_members_per_scenario_invalid")
+        expected_arrival_count = EXPECTED_ARRIVAL_COUNT
+        expected_dynamic_count = EXPECTED_DYNAMIC_INITIAL_CONDITION_COUNT
+    if not isinstance(arrival_rows, list) or len(arrival_rows) != expected_arrival_count:
         errors.append("arrival_count_invalid")
-    if not isinstance(dynamic_rows, list) or len(dynamic_rows) != EXPECTED_DYNAMIC_INITIAL_CONDITION_COUNT:
+    if not isinstance(dynamic_rows, list) or len(dynamic_rows) != expected_dynamic_count:
         errors.append("dynamic_initial_condition_count_invalid")
     if isinstance(receptor_rows, list) and isinstance(arrival_rows, list) and isinstance(dynamic_rows, list):
         receptor_ids = {row.get("receptor_id") for row in receptor_rows if isinstance(row, Mapping)}
@@ -8330,7 +8598,7 @@ def validate_input_derivatives(
         if len(receptor_ids) != len(receptor_rows) or len(arrival_ids) != len(arrival_rows):
             errors.append("component_identifier_not_unique")
     gap_rows = gap.get("records")
-    if not isinstance(gap_rows, list) or len(gap_rows) != EXPECTED_ARRIVAL_COUNT:
+    if not isinstance(gap_rows, list) or len(gap_rows) != expected_arrival_count:
         errors.append("gap_safe_arrival_count_invalid")
     elif any(not isinstance(row, Mapping) for row in gap_rows):
         errors.append("gap_safe_record_invalid")

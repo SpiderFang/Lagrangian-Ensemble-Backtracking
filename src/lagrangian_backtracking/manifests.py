@@ -34,9 +34,11 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from .bed_residence import (
+    BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
     BED_RESIDENCE_AVAILABILITY_CONDITIONED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_MODE_FIXED_CALENDAR_WINDOW,
     BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION,
+    BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID,
     BED_RESIDENCE_POLICY_ID,
     BED_RESIDENCE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
@@ -1621,6 +1623,74 @@ def _season_for_observation_month(month: int) -> str:
     return "SON"
 
 
+def _check_observation_arrival_identity(
+    arrival: ArrivalTime,
+    metadata: Mapping[str, Any],
+    *,
+    site_id: str,
+    observation_ns: int,
+    observation_id: str,
+    selection_contract: _ArrivalSelectionContract,
+    config: ProjectConfig,
+) -> None:
+    """重算觀測錨點的 ``arr`` 識別碼並與 metadata 保存的 observation ID 比對。
+
+    per_observation 與 per_member 兩種沉底 arrival 驗證共用同一份規則（原本內嵌在
+    ``_validate_bed_residence_arrival_records``，WP-51 原封不動抽出）；不一致即
+    ``ValueError``，代表 observation 時間、標籤或設計版本被改寫。
+    """
+
+    # 一般 event selector 的 ID 使用 event 名稱四欄；A 區龜山 paired clone 則刻意
+    # 以潮汐類別與 phase 保留來源站位的 paired identity，包含兩筆 event 也使用五欄。
+    # 必須依 clone provenance 判斷，不能只看 tide_class == "event"。
+    is_paired_a_clone = (
+        metadata.get("shared_A_forcing_reference_site") == "gongliao"
+        and metadata.get("shared_A_forcing_policy") == "gongliao_paired_utc_reference_v1"
+    )
+    if arrival.tide_class == "event" and is_paired_a_clone and selection_contract.enabled:
+        # 新版 selector 的 A 區 paired clone 將 policy 放進 event identity；舊版
+        # 沒有 policy 時則維持下方固定五欄 hash。分流依 metadata/config 判定，不能
+        # 僅因 tide_class=event 就套用一般四欄 event identity。
+        observation_identity_fields = [
+            site_id,
+            str(observation_ns),
+            arrival.phase_or_event,
+            str(selection_contract.policy_id),
+            config.design_version,
+        ]
+    elif arrival.tide_class == "event" and not is_paired_a_clone:
+        observation_identity_fields = [
+            site_id,
+            str(observation_ns),
+            arrival.phase_or_event,
+            *(([selection_contract.policy_id]) if selection_contract.enabled else []),
+            config.design_version,
+        ]
+    elif selection_contract.enabled and arrival.tide_class != "event":
+        rank = _replicate_rank(metadata)
+        if rank is None:
+            raise ValueError(f"arrival[{arrival.arrival_time_id}] observation replicate rank 缺失")
+        observation_identity_fields = [
+            site_id,
+            str(observation_ns),
+            arrival.tide_class,
+            arrival.phase_or_event,
+            str(rank),
+            str(selection_contract.policy_id),
+            config.design_version,
+        ]
+    else:
+        observation_identity_fields = [
+            site_id,
+            str(observation_ns),
+            arrival.tide_class,
+            arrival.phase_or_event,
+            config.design_version,
+        ]
+    if observation_id != stable_identifier("arr", observation_identity_fields):
+        raise ValueError(f"arrival[{arrival.arrival_time_id}] observation arrival identity 不可重算")
+
+
 def _validate_bed_residence_arrival_records(
     arrivals: tuple[ArrivalTime, ...],
     provenance: Mapping[str, Any],
@@ -1912,55 +1982,15 @@ def _validate_bed_residence_arrival_records(
             metadata.get("observation_arrival_time_id"),
             f"arrival[{arrival.arrival_time_id}].metadata.observation_arrival_time_id",
         )
-        # 一般 event selector 的 ID 使用 event 名稱四欄；A 區龜山 paired clone 則刻意
-        # 以潮汐類別與 phase 保留來源站位的 paired identity，包含兩筆 event 也使用五欄。
-        # 必須依 clone provenance 判斷，不能只看 tide_class == "event"。
-        is_paired_a_clone = (
-            metadata.get("shared_A_forcing_reference_site") == "gongliao"
-            and metadata.get("shared_A_forcing_policy") == "gongliao_paired_utc_reference_v1"
+        _check_observation_arrival_identity(
+            arrival,
+            metadata,
+            site_id=site_id,
+            observation_ns=observation_ns,
+            observation_id=observation_id,
+            selection_contract=selection_contract,
+            config=config,
         )
-        if arrival.tide_class == "event" and is_paired_a_clone and selection_contract.enabled:
-            # 新版 selector 的 A 區 paired clone 將 policy 放進 event identity；舊版
-            # 沒有 policy 時則維持下方固定五欄 hash。分流依 metadata/config 判定，不能
-            # 僅因 tide_class=event 就套用一般四欄 event identity。
-            observation_identity_fields = [
-                site_id,
-                str(observation_ns),
-                arrival.phase_or_event,
-                str(selection_contract.policy_id),
-                config.design_version,
-            ]
-        elif arrival.tide_class == "event" and not is_paired_a_clone:
-            observation_identity_fields = [
-                site_id,
-                str(observation_ns),
-                arrival.phase_or_event,
-                *(([selection_contract.policy_id]) if selection_contract.enabled else []),
-                config.design_version,
-            ]
-        elif selection_contract.enabled and arrival.tide_class != "event":
-            rank = _replicate_rank(metadata)
-            if rank is None:
-                raise ValueError(f"arrival[{arrival.arrival_time_id}] observation replicate rank 缺失")
-            observation_identity_fields = [
-                site_id,
-                str(observation_ns),
-                arrival.tide_class,
-                arrival.phase_or_event,
-                str(rank),
-                str(selection_contract.policy_id),
-                config.design_version,
-            ]
-        else:
-            observation_identity_fields = [
-                site_id,
-                str(observation_ns),
-                arrival.tide_class,
-                arrival.phase_or_event,
-                config.design_version,
-            ]
-        if observation_id != stable_identifier("arr", observation_identity_fields):
-            raise ValueError(f"arrival[{arrival.arrival_time_id}] observation arrival identity 不可重算")
         if observation_id in observation_ids[site_id]:
             raise ValueError(f"{site_id} observation_arrival_time_id 重複：{observation_id}")
         observation_ids[site_id].add(observation_id)
@@ -2048,6 +2078,312 @@ def _validate_bed_residence_arrival_records(
     return tuple(observation_arrivals)
 
 
+def _per_member_count(config: ProjectConfig) -> int | None:
+    """若 config 啟用 ``age_sampling_scope: per_member`` 回傳成員數 M，否則回傳 None。
+
+    WP-51：per_member 的 arrival／dynamic 初始條件 manifest 是「觀測錨點 × 成員」展開
+    的 flat records，筆數為 ``250 * M`` 與 ``5,000 * M``。成員數取
+    ``scenarios.members_per_scenario``，缺值時 fail closed，不猜測。
+    """
+
+    bed = config.scenarios.bed_residence_time
+    if bed is None or bed.age_sampling_scope != BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER:
+        return None
+    members = config.scenarios.members_per_scenario
+    if type(members) is not int or members < 1:
+        raise ValueError("age_sampling_scope=per_member 需要 scenarios.members_per_scenario 為正整數")
+    return int(members)
+
+
+def observation_arrival_from_member_arrival(arrival: ArrivalTime) -> ArrivalTime:
+    """由 per_member 的「觀測錨點 × 成員」沉底 arrival 還原其觀測錨點 ``ArrivalTime``。
+
+    還原結果的 ID 是 ``metadata["observation_arrival_time_id"]``，時間是觀測 UTC，
+    year／season 是觀測年季；它就是 per_member 情境（``Scenario.arrival_time_id``）的
+    錨點，同一個觀測錨點的 M 個成員共用它。metadata 完整保留（含 replicate rank 等選時
+    資訊）供 formal 48+2 分層驗證使用。
+    """
+
+    metadata = dict(arrival.metadata)
+    return ArrivalTime(
+        arrival_time_id=_nonempty_string(
+            metadata.get("observation_arrival_time_id"), "metadata.observation_arrival_time_id"
+        ),
+        study_site_id=arrival.study_site_id,
+        time_utc_ns=_integer(
+            metadata.get("observation_time_utc_ns"), "metadata.observation_time_utc_ns"
+        ),
+        year=_integer(metadata.get("observation_year"), "metadata.observation_year"),
+        season=_nonempty_string(metadata.get("observation_season"), "metadata.observation_season"),
+        tide_class=arrival.tide_class,
+        phase_or_event=arrival.phase_or_event,
+        metadata=metadata,
+    )
+
+
+def _validate_bed_residence_member_arrival_records(
+    arrivals: tuple[ArrivalTime, ...],
+    provenance: Mapping[str, Any],
+    config: ProjectConfig,
+    member_count: int,
+) -> tuple[ArrivalTime, ...]:
+    """驗證 per_member 的 ``250*M`` 筆沉底 arrival，回傳 250 筆觀測錨點供 48+2 驗證。
+
+    與 per_observation 版 ``_validate_bed_residence_arrival_records`` 的差別：年齡不是
+    一個 50 維向量，而是 ``50 × M`` 的矩陣，加上槽位→分層的排列與逐槽位拒絕稽核，三者
+    都保存在 root provenance。本函式逐項核對：矩陣形狀與 hash、每個年齡落在其槽位被
+    配到的分層（``50*M`` 層）、稽核與矩陣一致、每列 arrival 的沉底／觀測 UTC 關係、
+    ID 可由觀測錨點 ID＋成員編號＋seed 重算、每站恰有 50 個觀測錨點 × M 個成員，且
+    各站對同一（觀測 rank, 成員）使用相同年齡（``shared_age_offsets_across_sites``）。
+    任何一項被竄改，即使重簽 JSON hash 也會在此被拒絕。
+    """
+
+    bed = config.scenarios.bed_residence_time
+    if bed is None:
+        raise ValueError("bed residence loader 缺少 config.scenarios.bed_residence_time")
+    if bed.backtrack_mode != BED_RESIDENCE_MODE_FULL_HORIZON_FROM_DEPOSITION:
+        raise ValueError("per_member 只支援 backtrack_mode=full_horizon_from_deposition")
+    if bed.shared_age_offsets_across_sites is not True:
+        raise ValueError("正式五站設計必須共用同一 50×M 年齡矩陣")
+    if (
+        bed.availability_conditioning_policy
+        != REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+    ):
+        raise ValueError("per_member 必須使用 availability 條件式抽樣")
+    selection_contract = _arrival_selection_contract(config)
+    sample_count = bed.sample_count_per_site
+    slot_count = sample_count * member_count
+    max_age_hours = bed.maximum_age_days * 24
+    total_hour_count = max_age_hours + 1
+    sampling = provenance.get("bed_residence_sampling")
+    if not isinstance(sampling, Mapping):
+        raise ValueError("per_member bed residence 缺少 sampling provenance")
+    expected_fields = {
+        "policy_id": BED_RESIDENCE_POLICY_ID,
+        "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
+        "sampling_method_id": BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID,
+        "age_sampling_scope": BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
+        "member_count": member_count,
+        "slot_count": slot_count,
+        "maximum_age_days": bed.maximum_age_days,
+        "sample_count_per_site": sample_count,
+        "sampling_seed": bed.effective_sampling_seed,
+        "shared_age_offsets_across_sites": True,
+        "availability_conditioning_policy": REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+        "gap_policy_id": OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
+        "deposition_availability_policy_id": (
+            REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
+        ),
+        "denominator_policy_id": (
+            EXCLUDE_DATA_GAP_NUMERICAL_FAILURE_AND_PRE_WINDOW_DEPOSITION_DENOMINATOR_POLICY_ID
+        ),
+        "observation_anchor_selection_method_id": (
+            "server_v3_48_strata_plus_two_events_gap_safe_nww_metric_location_v2"
+        ),
+    }
+    for field_name, expected in expected_fields.items():
+        if sampling.get(field_name) != expected:
+            raise ValueError(f"per_member arrival provenance 欄位不符：{field_name}")
+    if provenance.get("method_id") != _BED_RESIDENCE_ARRIVAL_SELECTION_METHOD_ID:
+        raise ValueError("arrival provenance 未登錄 bed residence observation selector")
+    selection_support = config.inputs.backtrack_support_days
+    runtime_support = bed.runtime_horizon_support_days
+    if runtime_support is None:
+        requested = config.boundaries.max_backtrack_days
+        runtime_support = int(requested) if requested is not None and float(requested).is_integer() else None
+    if (
+        selection_support is None
+        or sampling.get("selection_support_days") != selection_support
+        or sampling.get("runtime_support_days") != runtime_support
+        or sampling.get("pre_window_policy") != bed.pre_window_policy
+    ):
+        raise ValueError("arrival provenance 的 selection/runtime support 與 config 不一致")
+
+    matrix = sampling.get("age_matrix_hours")
+    permutation = sampling.get("slot_permutation")
+    audits = sampling.get("rejection_audit")
+    if (
+        not isinstance(matrix, list)
+        or len(matrix) != sample_count
+        or any(not isinstance(row, list) or len(row) != member_count for row in matrix)
+        or any(type(age) is not int for row in matrix for age in row)
+    ):
+        raise ValueError("per_member provenance 的 age_matrix_hours 形狀不符")
+    flat_ages = [age for row in matrix for age in row]
+    if len(set(flat_ages)) != slot_count or any(not 0 <= age <= max_age_hours for age in flat_ages):
+        raise ValueError("per_member 年齡矩陣必須是範圍內互異的整數小時")
+    if (
+        not isinstance(permutation, list)
+        or any(type(value) is not int for value in permutation)
+        or sorted(permutation) != list(range(slot_count))
+    ):
+        raise ValueError("per_member slot_permutation 必須是 0..50M-1 的排列")
+    matrix_hash = sha256(
+        json.dumps(matrix, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if sampling.get("age_offsets_hours_sha256") != matrix_hash:
+        raise ValueError("per_member 年齡矩陣 hash 與 provenance 不一致")
+    if not isinstance(audits, list) or len(audits) != slot_count:
+        raise ValueError("per_member provenance 必須保存每個槽位的 rejection audit")
+    for slot in range(slot_count):
+        rank, member = divmod(slot, member_count)
+        stratum = permutation[slot]
+        start = (stratum * total_hour_count) // slot_count
+        stop = ((stratum + 1) * total_hour_count) // slot_count
+        age = matrix[rank][member]
+        audit = audits[slot]
+        if not start <= age < stop:
+            raise ValueError(f"per_member 槽位 {slot} 的年齡不在其分層內")
+        if (
+            not isinstance(audit, Mapping)
+            or audit.get("slot_index") != slot
+            or audit.get("member_id") != member
+            or audit.get("observation_rank") != rank
+            or audit.get("stratum_index") != stratum
+            or audit.get("selected_age_hours") != age
+        ):
+            raise ValueError(f"per_member 槽位 {slot} 的 rejection audit 與年齡矩陣不一致")
+
+    expected_site_ids = set(_config_sites(config))
+    # site -> (observation_id, member_id) -> (observation_ns, age, slot, stratum)
+    per_site: dict[str, dict[tuple[str, int], tuple[int, int, int, int]]] = {
+        site_id: {} for site_id in expected_site_ids
+    }
+    observation_by_id: dict[str, ArrivalTime] = {}
+    hour_ns = 3_600_000_000_000
+    design_hash = sha256(config.design_version.encode("utf-8")).hexdigest()
+    for arrival in arrivals:
+        metadata = arrival.metadata
+        site_id = arrival.study_site_id
+        tag = f"arrival[{arrival.arrival_time_id}]"
+        if site_id not in per_site:
+            raise ValueError(f"bed residence arrival 出現未設定站點：{site_id}")
+        observation_ns = _integer(metadata.get("observation_time_utc_ns"), f"{tag}.metadata.observation_time_utc_ns")
+        deposition_ns = _integer(metadata.get("deposition_time_utc_ns"), f"{tag}.metadata.deposition_time_utc_ns")
+        age = _integer(metadata.get("bed_residence_age_hours"), f"{tag}.metadata.bed_residence_age_hours")
+        member = _integer(metadata.get("bed_residence_member_id"), f"{tag}.metadata.bed_residence_member_id")
+        rank = _integer(metadata.get("bed_residence_observation_rank"), f"{tag}.metadata.bed_residence_observation_rank")
+        slot = _integer(metadata.get("bed_residence_slot_index"), f"{tag}.metadata.bed_residence_slot_index")
+        stratum = _integer(metadata.get("bed_residence_stratum_index"), f"{tag}.metadata.bed_residence_stratum_index")
+        seed = _integer(metadata.get("bed_residence_sampling_seed"), f"{tag}.metadata.bed_residence_sampling_seed")
+        for key, expected in (
+            ("bed_residence_policy_id", BED_RESIDENCE_POLICY_ID),
+            ("bed_residence_sampling_policy_id", BED_RESIDENCE_SAMPLING_POLICY_ID),
+            ("bed_residence_sampling_method_id", BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID),
+            ("bed_residence_age_sampling_scope", BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER),
+            (
+                "bed_residence_availability_conditioning_policy",
+                REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+            ),
+            ("bed_residence_member_count", member_count),
+            ("bed_residence_stratum_count", slot_count),
+            ("bed_residence_maximum_age_days", bed.maximum_age_days),
+            ("bed_residence_design_version", config.design_version),
+            ("bed_residence_design_hash", design_hash),
+        ):
+            if metadata.get(key) != expected:
+                raise ValueError(f"{tag} {key} 不符")
+        if seed != bed.effective_sampling_seed:
+            raise ValueError(f"{tag} bed residence seed 與 config 不一致")
+        if not 0 <= member < member_count or not 0 <= rank < sample_count:
+            raise ValueError(f"{tag} member／rank 超出範圍")
+        if slot != rank * member_count + member:
+            raise ValueError(f"{tag} slot index 與（rank, member）不一致")
+        if age != matrix[rank][member] or stratum != permutation[slot]:
+            raise ValueError(f"{tag} 年齡或分層與 provenance 矩陣不一致")
+        if dict(metadata.get("bed_residence_availability_rejection_audit") or {}) != dict(audits[slot]):
+            raise ValueError(f"{tag} rejection audit 與 root provenance 不一致")
+        if deposition_ns != arrival.time_utc_ns or deposition_ns != observation_ns - age * hour_ns:
+            raise ValueError(f"{tag} observation/deposition UTC 關係不一致")
+        for text_key, ns_value in (
+            ("observation_time_utc", observation_ns),
+            ("deposition_time_utc", deposition_ns),
+        ):
+            expected_text = _utc_datetime(ns_value, text_key).isoformat().replace("+00:00", "Z")
+            if _nonempty_string(metadata.get(text_key), f"{tag}.metadata.{text_key}") != expected_text:
+                raise ValueError(f"{tag} UTC 字串與 nanoseconds 不一致")
+        observation_id = _nonempty_string(
+            metadata.get("observation_arrival_time_id"), f"{tag}.metadata.observation_arrival_time_id"
+        )
+        _check_observation_arrival_identity(
+            arrival,
+            metadata,
+            site_id=site_id,
+            observation_ns=observation_ns,
+            observation_id=observation_id,
+            selection_contract=selection_contract,
+            config=config,
+        )
+        observation = _utc_datetime(observation_ns, "observation_time_utc_ns")
+        deposition = _utc_datetime(deposition_ns, "deposition_time_utc_ns")
+        if (
+            _integer(metadata.get("observation_year"), f"{tag}.metadata.observation_year") != observation.year
+            or _nonempty_string(metadata.get("observation_season"), f"{tag}.metadata.observation_season")
+            != _season_for_observation_month(observation.month)
+        ):
+            raise ValueError(f"{tag} observation 年份／季節 metadata 不符")
+        if observation.year not in selection_contract.observation_years:
+            raise ValueError(f"{tag} observation UTC 不在設定 observation_years")
+        if arrival.year != deposition.year or arrival.season != _season_for_observation_month(deposition.month):
+            raise ValueError(f"{tag} 頂層年份／季節未依 deposition UTC 重算")
+        expected_id = stable_identifier(
+            "arrival_bed",
+            [
+                observation_id,
+                str(deposition_ns),
+                BED_RESIDENCE_POLICY_ID,
+                BED_RESIDENCE_SAMPLING_POLICY_ID,
+                BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID,
+                REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
+                BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
+                str(member),
+                str(bed.effective_sampling_seed),
+                design_hash,
+            ],
+        )
+        if arrival.arrival_time_id != expected_id:
+            raise ValueError(f"{tag} bed residence identity 不可重算")
+        key = (observation_id, member)
+        if key in per_site[site_id]:
+            raise ValueError(f"{site_id} 的（觀測錨點, 成員）重複：{key}")
+        per_site[site_id][key] = (observation_ns, age, slot, stratum)
+        if observation_id not in observation_by_id or member == 0:
+            observation_by_id[observation_id] = observation_arrival_from_member_arrival(arrival)
+
+    for site_id, entries in per_site.items():
+        observation_ids = {key[0] for key in entries}
+        if len(observation_ids) != sample_count or len(entries) != slot_count:
+            raise ValueError(
+                f"{site_id} per_member arrival 必須恰有 {sample_count} 個觀測錨點 × {member_count} 個成員："
+                f"{len(observation_ids)} 個錨點、{len(entries)} 筆"
+            )
+        obs_time_by_id: dict[str, int] = {}
+        for (observation_id, _member), value in entries.items():
+            if obs_time_by_id.setdefault(observation_id, value[0]) != value[0]:
+                raise ValueError(f"{site_id} 同一觀測錨點的 observation UTC 不一致")
+        ordered_ids = sorted(obs_time_by_id, key=lambda oid: (obs_time_by_id[oid], oid))
+        for rank, observation_id in enumerate(ordered_ids):
+            for member in range(member_count):
+                _obs_ns, age, slot, _stratum = entries[(observation_id, member)]
+                if slot != rank * member_count + member or age != matrix[rank][member]:
+                    raise ValueError(f"{site_id} age 矩陣與其他站點或 seed 抽樣結果不一致")
+    if {"gongliao", "guishan"} <= expected_site_ids:
+        paired = {
+            site_id: sorted({value[0] for value in per_site[site_id].values()})
+            for site_id in ("gongliao", "guishan")
+        }
+        if paired["gongliao"] != paired["guishan"]:
+            raise ValueError("A 區 paired observation UTC 不一致")
+    observation_arrivals = tuple(
+        sorted(observation_by_id.values(), key=lambda item: (item.study_site_id, item.time_utc_ns, item.arrival_time_id))
+    )
+    if len(observation_arrivals) != sample_count * len(expected_site_ids):
+        raise ValueError("per_member 還原的觀測錨點數量不符")
+    return observation_arrivals
+
+
 def _load_arrival_document(
     path: str | Path, config: ProjectConfig, *, formal: bool
 ) -> tuple[tuple[ArrivalTime, ...], _ManifestDocument]:
@@ -2114,6 +2450,8 @@ def _load_arrival_document(
         time_ns = _integer(row["time_utc_ns"], f"{label}.time_utc_ns")
         utc = _utc_datetime(time_ns, f"{label}.time_utc_ns")
         if (site.study_site_id, time_ns) in site_times and not bed_gap_censored:
+            # per_member 一定同時是 bed_gap_censored（見下方檢查），同站不同成員可能抽到
+            # 相同沉底整點，因此這條「同站 UTC 唯一」只對 per_observation 之前的設計成立。
             raise ValueError(f"同一 study_site 的 UTC 必須唯一：{site.study_site_id}/{time_ns}")
         site_times.add((site.study_site_id, time_ns))
         year = _integer(row["year"], f"{label}.year")
@@ -2164,12 +2502,27 @@ def _load_arrival_document(
         )
         counts[site.study_site_id] += 1
     site_ids = set(counts)
+    member_count = _per_member_count(config)
+    if member_count is not None and not bed_gap_censored:
+        raise ValueError("age_sampling_scope=per_member 需要 availability 條件式抽樣設定")
     if formal:
-        _validate_formal_counts(site_ids, counts, config, per_site=50, total=250, label="arrival")
-    if bed_residence_enabled:
-        observation_arrivals = _validate_bed_residence_arrival_records(
-            tuple(arrivals), provenance, config
+        _validate_formal_counts(
+            site_ids,
+            counts,
+            config,
+            per_site=50 * (member_count or 1),
+            total=250 * (member_count or 1),
+            label="arrival",
         )
+    if bed_residence_enabled:
+        if member_count is not None:
+            observation_arrivals = _validate_bed_residence_member_arrival_records(
+                tuple(arrivals), provenance, config, member_count
+            )
+        else:
+            observation_arrivals = _validate_bed_residence_arrival_records(
+                tuple(arrivals), provenance, config
+            )
         if formal:
             # bed-residence arrival 的執行 UTC 已轉為沉底時刻；正式 48+2 統計仍以 metadata
             # 可重建的 observation anchor 分層，避免沉底年齡跨季或跨年改寫原始選時設計。
@@ -2284,12 +2637,15 @@ def _dynamic_template_indexes(
         raise ValueError("dynamic initial conditions 的 receptor/arrival 站點集合不一致")
     if formal:
         expected_sites = set(_config_sites(config))
+        arrivals_per_site = 50 * (_per_member_count(config) or 1)
         if receptor_sites != expected_sites:
             raise ValueError("dynamic initial conditions formal 必須涵蓋 config 五站")
         if any(receptor_counts[site] != 20 for site in expected_sites):
             raise ValueError("dynamic initial conditions formal receptor 必須每站 20 筆")
-        if any(arrival_counts[site] != 50 for site in expected_sites):
-            raise ValueError("dynamic initial conditions formal arrival 必須每站 50 筆")
+        if any(arrival_counts[site] != arrivals_per_site for site in expected_sites):
+            raise ValueError(
+                f"dynamic initial conditions formal arrival 必須每站 {arrivals_per_site} 筆"
+            )
     else:
         _validate_pilot_sites(receptor_sites, config, "dynamic initial conditions")
     return receptors_by_id, arrivals_by_id, receptor_sites
@@ -2480,7 +2836,7 @@ def _load_receptor_arrival_initial_condition_document(
         raise ValueError(
             f"dynamic initial conditions pair coverage 不完整：missing={missing}, extra={extra}"
         )
-    expected_count = 5_000 if formal else len(expected_pairs)
+    expected_count = 5_000 * (_per_member_count(config) or 1) if formal else len(expected_pairs)
     if len(result) != expected_count:
         raise ValueError(
             f"dynamic initial conditions {'formal' if formal else 'pilot'} row count 不符："
@@ -2554,6 +2910,14 @@ class ScenarioInputs:
     initial_conditions_by_pair: Mapping[
         tuple[str, str], ReceptorArrivalInitialCondition
     ] = field(default_factory=dict)
+    # WP-51 per_member：``arrival_times`` 是 250 個觀測錨點（情境以它建立，
+    # ``Scenario.arrival_time_id`` 就是觀測錨點 ID）；``member_arrival_times`` 是展開後
+    # 「觀測錨點 × 成員」的 ``250*M`` 筆沉底 arrival，``initial_conditions`` 的
+    # ``arrival_time_id`` 指向它們；``member_arrival_by_key`` 以
+    # ``(觀測錨點 arrival_time_id, member_id)`` 查該成員自己的沉底 arrival。
+    # per_observation 時三者皆為空，行為與既有完全相同。
+    member_arrival_times: tuple[ArrivalTime, ...] = ()
+    member_arrival_by_key: Mapping[tuple[str, int], ArrivalTime] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """將所有 component container 與 hash mapping 固定為不可重新賦值的 tuple/proxy。"""
@@ -2563,6 +2927,10 @@ class ScenarioInputs:
         object.__setattr__(self, "arrival_times", tuple(self.arrival_times))
         object.__setattr__(self, "scenarios", tuple(self.scenarios))
         object.__setattr__(self, "initial_conditions", tuple(self.initial_conditions))
+        object.__setattr__(self, "member_arrival_times", tuple(self.member_arrival_times))
+        object.__setattr__(
+            self, "member_arrival_by_key", MappingProxyType(dict(self.member_arrival_by_key))
+        )
         object.__setattr__(self, "file_sha256", MappingProxyType(dict(self.file_sha256)))
         object.__setattr__(
             self,
@@ -2617,6 +2985,7 @@ def load_scenario_inputs(
     initial_condition_path: str | Path | None = None,
     require_dynamic_initial_conditions: bool | None = None,
     formal: bool = False,
+    per_member_supported: bool = False,
 ) -> ScenarioInputs:
     """讀取 component manifest、建 scenarios 並回傳 hash-bound bundle。
 
@@ -2629,8 +2998,21 @@ def load_scenario_inputs(
     ``require_dynamic_initial_conditions=True`` 強制載入並驗證所選站點的完整 Cartesian
     pairs。explicit path 與 config fallback 若不一致會 fail-fast；dynamic loader 只讀
     OCM 上游已產出的 JSON，不讀取 OCM 或接 runtime。
+
+    ``per_member_supported``（WP-51）：config 啟用 ``age_sampling_scope: per_member`` 時，
+    ``arrival_times`` 是 250 個觀測錨點、``initial_conditions_by_pair`` 的 arrival 鍵則是
+    「觀測錨點 × 成員」的沉底 arrival；不知道這個差別的舊 caller（legacy runtime、
+    pilot、engineering window）若直接拿 ``(receptor_id, scenario.arrival_time_id)`` 去查
+    會在錯誤的時刻取得初始條件。因此 caller 必須明示 ``per_member_supported=True``
+    才允許載入 per_member 設定，否則 fail closed。
     """
 
+    member_count = _per_member_count(config)
+    if member_count is not None and not per_member_supported:
+        raise ValueError(
+            "age_sampling_scope=per_member 的輸入只能由已接線 per_member 的 caller 載入"
+            "（需明示 per_member_supported=True）；舊 runtime／pilot／engineering 路徑不支援"
+        )
     if require_dynamic_initial_conditions is not None and not isinstance(
         require_dynamic_initial_conditions, bool
     ):
@@ -2694,6 +3076,23 @@ def load_scenario_inputs(
         )
     if {item.study_site_id for item in receptors} != {item.study_site_id for item in arrivals}:
         raise ValueError("receptor 與 arrival 的 study_site_id 集合必須一致")
+    member_arrivals: tuple[ArrivalTime, ...] = ()
+    member_arrival_by_key: dict[tuple[str, int], ArrivalTime] = {}
+    if member_count is not None:
+        # per_member：情境以 250 個觀測錨點建立（scenario_id 規則不變），每個成員自己的
+        # 沉底 arrival 另存於 member_arrival_*。
+        member_arrivals = arrivals
+        for item in member_arrivals:
+            key = (
+                str(item.metadata["observation_arrival_time_id"]),
+                int(item.metadata["bed_residence_member_id"]),
+            )
+            member_arrival_by_key[key] = item
+        by_observation_id: dict[str, ArrivalTime] = {}
+        for item in member_arrivals:
+            observation = observation_arrival_from_member_arrival(item)
+            by_observation_id.setdefault(observation.arrival_time_id, observation)
+        arrivals = tuple(by_observation_id.values())
     scenario_list = build_scenarios(
         behaviors=materials,
         receptors=receptors,
@@ -2743,6 +3142,8 @@ def load_scenario_inputs(
         canonical_component_hashes=canonical_component_hashes,
         design_version=config.design_version,
         initial_conditions=initial_conditions,
+        member_arrival_times=member_arrivals,
+        member_arrival_by_key=member_arrival_by_key,
     )
 
 

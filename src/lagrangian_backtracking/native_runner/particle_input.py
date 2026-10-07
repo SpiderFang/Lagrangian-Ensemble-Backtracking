@@ -79,6 +79,8 @@ import numpy as np
 from ..runner import RunUnit, ScenarioShard, iter_run_units
 
 __all__ = [
+    "ArrivalTimeResolver",
+    "LabelResolver",
     "InitialPositionResolver",
     "ParticleIdentityTable",
     "ParticleInputError",
@@ -124,6 +126,61 @@ InitialPositionResolver = Callable[[RunUnit], tuple[float, float, float]]
 3. 同一個 ``(study_site_id, receptor_id, arrival_time_id)`` 組合每次呼叫都
    回傳相同結果（可重現性），因為本模組只呼叫一次並把結果寫入不可變身分表。
 """
+
+
+ArrivalTimeResolver = Callable[[RunUnit], int]
+"""WP-51：逐粒子解析「起算（沉底）UTC 奈秒」的選用 callable。
+
+per_observation 時每個情境只有一個起算時刻，直接取 ``unit.scenario.arrival_time_utc_ns``，
+不需要這個 resolver。per_member 時同一個情境的 M 個成員各自有不同的沉底時刻，
+由 ``(unit.scenario.arrival_time_id, unit.member_id)`` 查得；回傳值必須是落在整點的
+正整數 UTC 奈秒，找不到時必須丟出例外（fail-closed），不得回傳情境的觀測時刻頂替。
+"""
+
+LabelResolver = Callable[[RunUnit], "dict[str, object]"]
+"""WP-51：逐粒子解析附加標籤欄位（例如沉底時刻的季節／大小潮／潮相／事件旗標）。
+
+回傳 mapping 的鍵集合在所有粒子上必須完全相同；值只能是 ``str``、``bool`` 或
+``int``，同一個鍵的值型別必須一致（字串→固定寬度 unicode、布林→bool、整數→int64）。
+標籤只進入身分表的選用 ``labels`` 欄位，且只在存在時才進入內容雜湊，因此沒有標籤的
+既有流程（per_observation）雜湊與先前位元相同。
+"""
+
+_LABEL_STR_DTYPE = "<U32"
+
+
+def _labels_to_arrays(rows: Sequence[dict[str, object]]) -> dict[str, np.ndarray]:
+    """把逐粒子標籤 dict 序列轉為「欄名 → 一維陣列」，並檢查鍵集合與型別一致。"""
+
+    if not rows:
+        raise ParticleInputError("標籤列不可為空")
+    keys = sorted(rows[0])
+    if not keys:
+        raise ParticleInputError("標籤 resolver 回傳空 mapping")
+    key_set = set(keys)
+    if any(row.keys() != key_set for row in rows):
+        raise ParticleInputError("標籤欄位的鍵集合在粒子間不一致")
+    arrays: dict[str, np.ndarray] = {}
+    for key in keys:
+        column = [row[key] for row in rows]
+        first = column[0]
+        if isinstance(first, bool):
+            if any(not isinstance(value, bool) for value in column):
+                raise ParticleInputError(f"標籤 {key!r} 的值型別在粒子間不一致（應為 bool）")
+            arrays[key] = np.asarray(column, dtype=np.bool_)
+        elif isinstance(first, int):
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in column):
+                raise ParticleInputError(f"標籤 {key!r} 的值型別在粒子間不一致（應為 int）")
+            arrays[key] = np.asarray(column, dtype=np.int64)
+        elif isinstance(first, str):
+            if any(not isinstance(value, str) or not value for value in column):
+                raise ParticleInputError(f"標籤 {key!r} 必須是非空字串")
+            if max(len(value) for value in column) > 32:
+                raise ParticleInputError(f"標籤 {key!r} 超過 {_LABEL_STR_DTYPE} 寬度")
+            arrays[key] = np.asarray(column, dtype=_LABEL_STR_DTYPE)
+        else:
+            raise ParticleInputError(f"標籤 {key!r} 的值型別不支援：{type(first).__name__}")
+    return arrays
 
 
 # ── 粒子身分表：固定欄位、內容雜湊、可序列化保存 ──────────────────────────
@@ -225,6 +282,11 @@ class ParticleIdentityTable:
     master_seed: int
     random_stream_id: str | None
     content_sha256: str = field(init=False, default="")
+    # WP-51：選用的逐粒子標籤欄位（沉底時刻的 season／tide_class／潮相／事件旗標與
+    # 觀測時刻的舊標籤）。None 表示沒有標籤（per_observation 既有流程）；有標籤時每個
+    # 陣列都必須是長度 N 的一維陣列，並納入內容雜湊與 .npz。刻意放在 content_sha256
+    # 之後的預設值欄位，讓既有以位置或關鍵字建構的呼叫端完全不受影響。
+    labels: dict[str, np.ndarray] | None = None
 
     def __post_init__(self) -> None:
         """一次性驗證欄位形狀、型別、唯一性與有限性，並計算內容雜湊。
@@ -288,6 +350,22 @@ class ParticleIdentityTable:
         if np.any(seed_hex_lengths != 32):
             raise ParticleInputError("seed_hex 必須恰為 32 個十六進位字元")
 
+        if self.labels is not None:
+            if not isinstance(self.labels, dict) or not self.labels:
+                raise ParticleInputError("labels 必須是非空 dict 或 None")
+            for name, array in self.labels.items():
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or not isinstance(array, np.ndarray)
+                    or array.ndim != 1
+                    or array.shape[0] != n
+                ):
+                    raise ParticleInputError(f"labels[{name!r}] 必須是長度 {n} 的一維陣列")
+                if array.dtype.kind not in {"U", "b", "i"}:
+                    raise ParticleInputError(f"labels[{name!r}] dtype 不支援：{array.dtype}")
+                if not array.flags["C_CONTIGUOUS"]:
+                    self.labels[name] = np.ascontiguousarray(array)
         if not isinstance(self.experiment_case_id, str) or not self.experiment_case_id.strip():
             raise ParticleInputError("experiment_case_id 不可空白")
         seed = self.master_seed
@@ -328,6 +406,14 @@ def _compute_identity_table_hash(table: ParticleIdentityTable) -> str:
         digest.update(str(array.dtype).encode("utf-8"))
         digest.update(str(array.shape).encode("utf-8"))
         digest.update(array.tobytes())
+    if table.labels is not None:
+        # 只有存在標籤時才納入雜湊；沒有標籤的身分表雜湊與 WP-51 之前逐位元相同。
+        for name in sorted(table.labels):
+            array = table.labels[name]
+            digest.update(b"label:" + name.encode("utf-8"))
+            digest.update(str(array.dtype).encode("utf-8"))
+            digest.update(str(array.shape).encode("utf-8"))
+            digest.update(array.tobytes())
     metadata = {
         "experiment_case_id": table.experiment_case_id,
         "master_seed": int(table.master_seed),
@@ -345,8 +431,17 @@ def build_particle_identity_table(
     master_seed: int,
     resolve_initial_position: InitialPositionResolver,
     random_stream_id: str | None = None,
+    resolve_arrival_time_utc_ns: ArrivalTimeResolver | None = None,
+    resolve_labels: LabelResolver | None = None,
 ) -> ParticleIdentityTable:
     """把一或多個既有 ``ScenarioShard`` 展開成全案粒子身分表。
+
+    WP-51 新增兩個選用 resolver（預設 None，行為與先前完全相同）：
+    ``resolve_arrival_time_utc_ns`` 讓每顆粒子自己的起算（沉底）時刻取代情境的
+    ``arrival_time_utc_ns``（per_member 用）；``resolve_labels`` 提供逐粒子標籤欄位。
+    ``resolve_initial_position`` 的介面仍是 ``(RunUnit) -> (x, y, z)``，RunUnit 已含
+    ``member_id``，因此 per_member 的逐成員水平位置（延後項目）只需改 resolver 內容，
+    不必改這個介面。
 
     這是本模組唯一的建構入口，刻意只接受既有 ``runner.ScenarioShard``（而不是
     重新接受原始 ``Scenario`` 清單），因為 shard 切分、排序與批次識別碼已經是
@@ -404,6 +499,7 @@ def build_particle_identity_table(
     arrival_time_id: list[str] = []
     settling_velocity_mps: list[float] = []
     arrival_time_utc_ns: list[int] = []
+    label_rows: list[dict[str, object]] = []
     seed_hex: list[str] = []
     x0_m: list[float] = []
     y0_m: list[float] = []
@@ -427,7 +523,17 @@ def build_particle_identity_table(
             material_id.append(scenario.material_id)
             arrival_time_id.append(scenario.arrival_time_id)
             settling_velocity_mps.append(scenario.settling_velocity_mps)
-            arrival_time_utc_ns.append(scenario.arrival_time_utc_ns)
+            if resolve_arrival_time_utc_ns is None:
+                arrival_time_utc_ns.append(scenario.arrival_time_utc_ns)
+            else:
+                resolved_utc = resolve_arrival_time_utc_ns(unit)
+                if isinstance(resolved_utc, bool) or not isinstance(resolved_utc, (int, np.integer)):
+                    raise ParticleInputError(
+                        f"粒子 {unit.particle_id} 的 resolve_arrival_time_utc_ns 必須回傳整數"
+                    )
+                arrival_time_utc_ns.append(int(resolved_utc))
+            if resolve_labels is not None:
+                label_rows.append(dict(resolve_labels(unit)))
             seed_hex.append(f"{unit.seed:032x}")
             x0_m.append(x_value)
             y0_m.append(y_value)
@@ -457,6 +563,7 @@ def build_particle_identity_table(
         experiment_case_id=experiment_case_id,
         master_seed=master_seed,
         random_stream_id=random_stream_id,
+        labels=_labels_to_arrays(label_rows) if resolve_labels is not None else None,
     )
 
 
@@ -482,6 +589,12 @@ def save_particle_identity_table_npz(table: ParticleIdentityTable, path: str | P
         "content_sha256": table.content_sha256,
         "particle_count": len(table),
     }
+    label_arrays: dict[str, np.ndarray] = {}
+    if table.labels is not None:
+        # 標籤欄位以 ``label__`` 前綴存放；只在有標籤時才增加這些項目與 metadata 鍵，
+        # 沒有標籤的檔案格式與先前完全相同。
+        metadata["label_names"] = sorted(table.labels)
+        label_arrays = {f"label__{name}": array for name, array in table.labels.items()}
     np.savez(
         str(path),
         particle_id=table.particle_id,
@@ -499,6 +612,7 @@ def save_particle_identity_table_npz(table: ParticleIdentityTable, path: str | P
         y0_m=table.y0_m,
         z0_m=table.z0_m,
         __metadata__=np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True)),
+        **label_arrays,
     )
 
 
@@ -532,6 +646,11 @@ def load_particle_identity_table_npz(path: str | Path) -> ParticleIdentityTable:
             experiment_case_id=metadata["experiment_case_id"],
             master_seed=int(metadata["master_seed"]),
             random_stream_id=metadata["random_stream_id"],
+            labels=(
+                {name: npz[f"label__{name}"] for name in metadata["label_names"]}
+                if "label_names" in metadata
+                else None
+            ),
         )
     if table.content_sha256 != metadata["content_sha256"]:
         raise ParticleInputError(
