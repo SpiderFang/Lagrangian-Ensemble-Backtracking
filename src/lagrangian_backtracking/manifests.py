@@ -42,7 +42,9 @@ from .bed_residence import (
     BED_RESIDENCE_POLICY_ID,
     BED_RESIDENCE_SAMPLING_METHOD_ID,
     BED_RESIDENCE_SAMPLING_POLICY_ID,
+    recompute_member_initial_slot_permutation,
     sample_bed_residence_age_hours,
+    summarize_member_permutation_repair,
 )
 from .boundaries import BoundaryGeometry
 from .config import (
@@ -2257,6 +2259,26 @@ def _validate_bed_residence_member_arrival_records(
             or audit.get("selected_age_hours") != age
         ):
             raise ValueError(f"per_member 槽位 {slot} 的 rejection audit 與年齡矩陣不一致")
+    # WP-51 整合：排列後可行性修補稽核。修補前的排列只由種子與槽位數決定，載入器重算
+    # 它並與每個槽位稽核保存的 initial_stratum_index 核對；沒被任何修補步驟動到的槽位
+    # 修補前後分層必須相同，原本不可行的槽位修補後分層必須不同；摘要則由逐槽位稽核重算。
+    initial_permutation = recompute_member_initial_slot_permutation(
+        bed.effective_sampling_seed, slot_count
+    )
+    for slot in range(slot_count):
+        audit = audits[slot]
+        if audit.get("initial_stratum_index") != initial_permutation[slot]:
+            raise ValueError(f"per_member 槽位 {slot} 的修補前分層與種子重算結果不一致")
+        steps = audit.get("repair_steps")
+        if not isinstance(steps, list):
+            raise ValueError(f"per_member 槽位 {slot} 缺少 repair_steps")
+        if not steps and permutation[slot] != initial_permutation[slot]:
+            raise ValueError(f"per_member 槽位 {slot} 分層已改變但沒有修補步驟紀錄")
+        if audit.get("initially_infeasible") is True and permutation[slot] == initial_permutation[slot]:
+            raise ValueError(f"per_member 槽位 {slot} 原本整層無可用整點卻沒有被修補")
+    expected_repair = summarize_member_permutation_repair(audits, slot_permutation=permutation)
+    if sampling.get("permutation_repair") != expected_repair:
+        raise ValueError("per_member provenance 的 permutation_repair 與逐槽位稽核不一致")
 
     expected_site_ids = set(_config_sites(config))
     # site -> (observation_id, member_id) -> (observation_ns, age, slot, stratum)

@@ -10,13 +10,20 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
+from lagrangian_backtracking import bed_residence as bed_residence_module
 from lagrangian_backtracking.bed_residence import (
+    BED_RESIDENCE_PER_MEMBER_PERMUTATION_REPAIR_ALGORITHM_ID,
     BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID,
     apply_bed_residence_member_sampling,
+    recompute_member_initial_slot_permutation,
     sample_bed_residence_member_ages_conditioned_on_availability,
+    summarize_member_permutation_repair,
 )
 from lagrangian_backtracking.gap_policy import (
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
@@ -200,7 +207,9 @@ def test_member_gap_conditioning_rejects_unavailable_hours_with_audit() -> None:
 
 
 def test_member_gap_conditioning_fails_closed_when_whole_stratum_unavailable() -> None:
-    with pytest.raises(ValueError, match="無可用候選"):
+    # 整個可用時間軸為空：可行性矩陣全為假，修補（單次交換與二分圖匹配）都找不到解，
+    # 必須 fail closed，不可補零、取最近值或外插。
+    with pytest.raises(ValueError, match="無法完全配對"):
         _sample(available={site: set() for site in _SITES})
 
 
@@ -312,3 +321,219 @@ def test_conversion_is_independent_of_input_row_order_and_rejects_double_convers
             sampling=sampling, sampling_seed=_SEED,
             maximum_age_days=_MAX_AGE_DAYS, design_version="wp51-test",
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WP-51 整合：排列後可行性修補（真實 OCM 整日缺口形狀的回歸測試）
+# ══════════════════════════════════════════════════════════════════════════
+
+_GAP_FIXTURE = Path(__file__).parent / "fixtures" / "wp51_real_ocm_gap_shape.json"
+
+
+def _parse_utc_ns(text: str) -> int:
+    return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()) * 10**9
+
+
+@pytest.fixture(scope="module")
+def real_gap_case() -> dict:
+    """真實 OCM 可用時間軸的缺口形狀（四區相同：48 段、缺 419 h，其中 15 段約 24 h 整日缺口）
+    與 v3 正式母體五站各 50 個觀測時刻；不含流場資料。"""
+
+    payload = json.loads(_GAP_FIXTURE.read_text(encoding="utf-8"))
+    assert payload["四區缺口相同"] is True
+    start = _parse_utc_ns(payload["time_start_utc"])
+    end = _parse_utc_ns(payload["time_end_utc"])
+    axis = set(range(start, end + _HOUR_NS, _HOUR_NS))
+    for before, after in payload["gaps_before_after_utc"]:
+        lo, hi = _parse_utc_ns(before), _parse_utc_ns(after)
+        axis -= set(range(lo + _HOUR_NS, hi, _HOUR_NS))
+    assert len(axis) == 17124, "重建的可用時間軸應與 forcing_inventory 的 canonical_time_count 相符"
+    observations = {
+        site: tuple(values) for site, values in payload["observation_time_utc_ns_by_site"].items()
+    }
+    return {"axis": axis, "observations": observations}
+
+
+def _sample_real(case: dict, *, seed: int = _SEED, member_count: int = _M):
+    sites = sorted(case["observations"])
+    return sample_bed_residence_member_ages_conditioned_on_availability(
+        observation_times_by_site={site: case["observations"][site] for site in sites},
+        available_time_ns_by_site={site: set(case["axis"]) for site in sites},
+        maximum_age_days=_MAX_AGE_DAYS,
+        sample_count=50,
+        member_count=member_count,
+        seed=seed,
+    )
+
+
+def _random_permutation_infeasible_slots(case: dict, *, seed: int, member_count: int) -> list[int]:
+    """純隨機排列（不修補）之下，整層沒有五站皆可用整點的槽位。"""
+
+    slot_count = 50 * member_count
+    permutation = recompute_member_initial_slot_permutation(seed, slot_count)
+    sites = sorted(case["observations"])
+    times = {site: sorted(case["observations"][site]) for site in sites}
+    total_hours = _MAX_AGE_DAYS * 24 + 1
+    bad = []
+    for slot in range(slot_count):
+        rank = slot // member_count
+        start = (permutation[slot] * total_hours) // slot_count
+        stop = ((permutation[slot] + 1) * total_hours) // slot_count
+        if not any(
+            all(times[site][rank] - age * _HOUR_NS in case["axis"] for site in sites)
+            for age in range(start, stop)
+        ):
+            bad.append(slot)
+    return bad
+
+
+def test_real_gap_shape_makes_pure_random_permutation_infeasible(real_gap_case) -> None:
+    """回歸測試的前提：沒有修補時，設定檔種子與其他種子的純隨機排列都有整層無候選的槽位
+    （真實資料上舊版抽樣器必定 fail closed，見 reports/WP-51-V.md §3）。"""
+
+    for seed in (_SEED, 1, 2, 3, 20261007):
+        bad = _random_permutation_infeasible_slots(real_gap_case, seed=seed, member_count=_M)
+        assert len(bad) >= 10, (seed, len(bad))
+
+
+@pytest.mark.parametrize("seed", [_SEED, 1, 2, 3, 7, 20261007])
+def test_real_gap_shape_sampling_succeeds_with_repair_and_stays_random(real_gap_case, seed) -> None:
+    """含整日缺口的真實形狀下，設定檔種子與多個種子都能成功，且修補不破壞隨機配對性質。"""
+
+    initially_bad = _random_permutation_infeasible_slots(real_gap_case, seed=seed, member_count=_M)
+    sampling = _sample_real(real_gap_case, seed=seed)
+    sites = sorted(real_gap_case["observations"])
+    times = {site: sorted(real_gap_case["observations"][site]) for site in sites}
+    ages = np.array(sampling.age_hours)
+    assert ages.shape == (50, _M)
+    assert len(set(ages.ravel().tolist())) == 500
+    assert sorted(sampling.slot_permutation) == list(range(500))
+    assert sorted(sampling.initial_slot_permutation) == list(range(500))
+    # 每個槽位的五站沉底整點都在各自可用軸內（不外插、不補零）
+    for rank in range(50):
+        for member in range(_M):
+            for site in sites:
+                deposition = times[site][rank] - int(ages[rank, member]) * _HOUR_NS
+                assert deposition in real_gap_case["axis"], (seed, rank, member, site)
+    # 修補只動必要的槽位；稽核與純隨機排列的不可行槽位完全對得上
+    audits = {audit.slot_index: audit for audit in sampling.rejection_audit}
+    flagged = sorted(slot for slot, audit in audits.items() if audit.initially_infeasible)
+    assert flagged == initially_bad
+    assert flagged, "此形狀下必須真的發生過修補，測試才有意義"
+    changed = [
+        slot
+        for slot in range(500)
+        if sampling.slot_permutation[slot] != sampling.initial_slot_permutation[slot]
+    ]
+    assert set(flagged) <= set(changed) and len(changed) <= 2 * len(flagged)
+    for slot in range(500):
+        audit = audits[slot]
+        assert audit.initial_stratum_index == sampling.initial_slot_permutation[slot]
+        assert (slot in changed) == bool(audit.repair_steps)
+    # 隨機性：年齡與觀測 rank 幾乎無相關（舊缺陷為 1.0；500 點理論標準差約 0.045）
+    rho = _spearman(np.repeat(np.arange(50), _M).astype(float), ages.ravel().astype(float))
+    assert abs(rho) < 0.2, (seed, rho)
+    # 沉底月份涵蓋 10–12 月（舊 per_observation 沒有；觀測在 2025-01..12，年齡到 90 日）
+    obs_ns = np.array(times[sites[0]], dtype=np.int64)[:, None]
+    months = {
+        datetime.fromtimestamp(int(value) / 1e9, tz=UTC).month
+        for value in (obs_ns - ages.astype(np.int64) * _HOUR_NS).ravel()
+    }
+    assert {10, 11, 12}.issubset(months), (seed, sorted(months))
+    # 年齡仍涵蓋整段 0..90 日（層層各用一次）
+    assert ages.min() <= 5 and ages.max() >= _MAX_AGE_DAYS * 24 - 5
+
+
+@pytest.mark.parametrize("member_count", [1, 2, 5])
+def test_real_gap_shape_sampling_succeeds_for_other_member_counts(real_gap_case, member_count) -> None:
+    """V 報告：M=1 為 15/20、M=2 為 2/20、M=5 為 0/20 個種子成功；修補後都應成功。"""
+
+    for seed in (_SEED, 11, 12):
+        sampling = _sample_real(real_gap_case, seed=seed, member_count=member_count)
+        assert sampling.slot_count == 50 * member_count
+        assert len(set(age for row in sampling.age_hours for age in row)) == 50 * member_count
+
+
+def test_repair_is_reproducible_and_matches_audit_summary(real_gap_case) -> None:
+    first = _sample_real(real_gap_case)
+    assert first == _sample_real(real_gap_case)
+    audits = [audit.as_metadata() for audit in first.rejection_audit]
+    summary = summarize_member_permutation_repair(audits, slot_permutation=first.slot_permutation)
+    assert summary["algorithm_id"] == BED_RESIDENCE_PER_MEMBER_PERMUTATION_REPAIR_ALGORITHM_ID
+    assert summary["initially_infeasible_slot_count"] == len(
+        _random_permutation_infeasible_slots(real_gap_case, seed=_SEED, member_count=_M)
+    )
+    assert summary["repair_step_count"] == len(first.repair_steps)
+    assert summary["swap_step_count"] + summary["matching_step_count"] == len(first.repair_steps)
+    assert summary["changed_slot_count"] >= summary["initially_infeasible_slot_count"]
+    # method id 已升版；排列修補不應動到不需修補的槽位亂數流
+    assert "feasibility_repair" in BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID
+    # 修補前排列由種子重算，載入器據此核對
+    assert first.initial_slot_permutation == recompute_member_initial_slot_permutation(_SEED, 500)
+    # 無缺口時修補是空操作：與沒有任何不可行槽位的結果一致
+    clean = _sample()
+    assert clean.repair_steps == () and clean.slot_permutation == clean.initial_slot_permutation
+    assert all(audit.initially_infeasible is False for audit in clean.rejection_audit)
+
+
+def test_summary_rejects_malformed_repair_audit() -> None:
+    clean = _sample()
+    audits = [audit.as_metadata() for audit in clean.rejection_audit]
+    summarize_member_permutation_repair(audits, slot_permutation=clean.slot_permutation)
+    broken = [dict(item) for item in audits]
+    del broken[3]["repair_steps"]
+    with pytest.raises(ValueError, match="修補稽核欄位"):
+        summarize_member_permutation_repair(broken, slot_permutation=clean.slot_permutation)
+    broken = [dict(item) for item in audits]
+    broken[0]["initial_stratum_index"] = broken[1]["initial_stratum_index"]
+    with pytest.raises(ValueError, match="排列"):
+        summarize_member_permutation_repair(broken, slot_permutation=clean.slot_permutation)
+
+
+def _feasible_from_sets(allowed: list[set[int]]) -> list[list[bool]]:
+    size = len(allowed)
+    return [[stratum in allowed[rank] for stratum in range(size)] for rank in range(size)]
+
+
+def test_repair_falls_back_to_augmenting_path_when_no_single_swap_exists() -> None:
+    """單次交換無解、但完全配對存在的小例子：必須改用增廣路徑而且結果可行。
+
+    三個槽位（member_count=1，rank=槽位）：槽位 0 可用分層 {0,1}、槽位 1 只能用 {1}、
+    槽位 2 可用 {1,2}。完全配對只有 (0→0, 1→1, 2→2)。修補前排列 [1, 2, 0]：槽位 1 與
+    槽位 2 都不可行；槽位 1 沒有任何單次交換夥伴，必須用增廣路徑讓槽位 2 讓出分層 1。
+    """
+
+    feasible = _feasible_from_sets([{0, 1}, {1}, {1, 2}])
+    permutation, steps = bed_residence_module._repair_member_slot_permutation(
+        initial_permutation=(1, 2, 0),
+        feasible=feasible,
+        member_count=1,
+        generator=bed_residence_module._member_repair_generator(5),
+    )
+    assert permutation == (0, 1, 2)
+    kinds = {kind for kind, _ in steps}
+    assert "matching_path" in kinds
+
+
+def test_repair_raises_when_no_perfect_matching_exists() -> None:
+    """兩個槽位都只能用同一分層：資料本身不允許，必須丟例外而不是輸出不完整排列。"""
+
+    feasible = _feasible_from_sets([{0}, {0}])
+    with pytest.raises(ValueError, match="無法完全配對"):
+        bed_residence_module._repair_member_slot_permutation(
+            initial_permutation=(0, 1),
+            feasible=feasible,
+            member_count=1,
+            generator=bed_residence_module._member_repair_generator(5),
+        )
+
+
+def test_repair_leaves_feasible_permutation_untouched() -> None:
+    feasible = _feasible_from_sets([{0, 1}, {0, 1}, {2}])
+    permutation, steps = bed_residence_module._repair_member_slot_permutation(
+        initial_permutation=(1, 0, 2),
+        feasible=feasible,
+        member_count=1,
+        generator=bed_residence_module._member_repair_generator(1),
+    )
+    assert permutation == (1, 0, 2) and steps == ()

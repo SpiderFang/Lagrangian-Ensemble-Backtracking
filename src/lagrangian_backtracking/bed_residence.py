@@ -37,6 +37,7 @@ __all__ = [
     "BED_RESIDENCE_PER_PARTICLE_SAMPLING_METHOD_ID",
     "BED_RESIDENCE_PER_MEMBER_SAMPLING_METHOD_ID",
     "BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID",
+    "BED_RESIDENCE_PER_MEMBER_PERMUTATION_REPAIR_ALGORITHM_ID",
     "BedResidenceAvailabilitySampling",
     "BedResidenceMemberAvailabilitySampling",
     "BedResidenceStratumRejectionAudit",
@@ -47,6 +48,8 @@ __all__ = [
     "apply_bed_residence_sampling",
     "apply_bed_residence_member_sampling",
     "sample_bed_residence_member_ages_conditioned_on_availability",
+    "recompute_member_initial_slot_permutation",
+    "summarize_member_permutation_repair",
     "derive_bed_residence_particle_seed",
     "derive_bed_residence_member_seed",
     "resolve_bed_residence_timing",
@@ -140,6 +143,14 @@ class BedResidenceStratumRejectionAudit:
     # 舊版完全相同。
     member_id: int | None = None
     slot_index: int | None = None
+    # WP-51 整合：per_member 的「排列後可行性修補」稽核（見下方第二節說明）。
+    # ``initial_stratum_index`` 是隨機排列（修補前）配給此槽位的分層；
+    # ``initially_infeasible`` 表示該分層對此槽位原本整層無五站皆可用的整點；
+    # ``repair_steps`` 依序列出動到此槽位分層的修補步驟（步驟序號與種類）。三者
+    # 皆為 None 代表沒有修補稽核（per_observation 與舊版），as_metadata 不輸出。
+    initial_stratum_index: int | None = None
+    initially_infeasible: bool | None = None
+    repair_steps: tuple[tuple[int, str], ...] | None = None
 
     def as_metadata(self) -> dict[str, object]:
         """轉為 JSON manifest 可保存的純 Python mapping。"""
@@ -160,6 +171,12 @@ class BedResidenceStratumRejectionAudit:
             payload["member_id"] = self.member_id
         if self.slot_index is not None:
             payload["slot_index"] = self.slot_index
+        if self.initial_stratum_index is not None:
+            payload["initial_stratum_index"] = self.initial_stratum_index
+            payload["initially_infeasible"] = bool(self.initially_infeasible)
+            payload["repair_steps"] = [
+                {"step": step, "kind": kind} for step, kind in (self.repair_steps or ())
+            ]
         return payload
 
 
@@ -1193,14 +1210,39 @@ def sample_bed_residence_age_hours_for_member(
 # 正式可用時間集合（canonical available-time set）」的年齡；該層完全沒有可用候選
 # 時直接丟出例外（fail closed），不使用最近值、補零或跨缺口外插。每個槽位都保留
 # 拒絕稽核（被拒絕的候選與缺少該整點的站點）。
+#
+# 排列後可行性修補（WP-51 整合，method id 升為 ``..._feasibility_repair_v1``）：
+# 真實 OCM 每年有約 15 段整日（約 24 小時）缺口，而 per_member 的分層只有 4–5 個整點
+# 寬，所以「純隨機排列」之後約 8%（M=10 時約 39 個）槽位會剛好配到整層都無五站皆可用
+# 整點的分層，若直接 fail closed 則真實資料上必定失敗（見 reports/WP-51-V.md §3）。
+# 但「槽位 × 分層」的可行性矩陣存在完全配對，問題只在隨機排列沒有顧及它。修補規則：
+#
+# 1. 先照舊產生共用隨機排列（亂數流不變），並預先算出可行性矩陣
+#    ``feasible[rank][stratum]``（該分層對該觀測 rank 是否至少有一個五站皆可用的整點）；
+# 2. 依槽位編號遞增處理每個仍不可行的槽位，用另一個獨立衍生、種子固定的產生器給
+#    出其他槽位的候選順序，與第一個「交換後兩邊都可行」的槽位交換分層（單次交換）；
+# 3. 若沒有任何單次交換可行，改以二分圖增廣路徑（Kuhn／廣度優先）對剩餘不可行槽位
+#    做最大配對，最後仍無法完全配對才丟出例外（fail closed）。
+#
+# 修補只在隨機排列上做最少的更動，五站仍共用同一個排列，且仍是「500 層各用一次」。
+# 修補前的排列、每個槽位是否原本不可行、哪些修補步驟動到它，都寫進該槽位的稽核，
+# manifests 載入器可由種子重算修補前排列並核對。
 # ══════════════════════════════════════════════════════════════════════════
 
 # 新的 method id：與 per_observation 的缺口條件式 method、WP-18／WP-27 的逐粒子與
 # 逐成員（整段 permutation）原語都不同，避免下游把不同抽樣結果混用。
 BED_RESIDENCE_PER_MEMBER_STRATIFIED_SAMPLING_METHOD_ID: Final[str] = (
-    "numpy_pcg64dxsm_per_member_stratified_shared_permutation_v1"
+    "numpy_pcg64dxsm_per_member_stratified_shared_permutation_feasibility_repair_v1"
 )
 _PER_MEMBER_STRATIFIED_ROLE: Final[str] = "bed_residence_age_per_member_stratified_v1"
+# 修補用的產生器與抽樣用的產生器各自由角色標籤衍生，互不共用亂數流：沒有任何槽位需要
+# 修補時，抽樣結果與沒有修補機制的 v1 完全相同。
+_PER_MEMBER_REPAIR_ROLE: Final[str] = "bed_residence_age_per_member_permutation_repair_v1"
+BED_RESIDENCE_PER_MEMBER_PERMUTATION_REPAIR_ALGORITHM_ID: Final[str] = (
+    "single_swap_then_augmenting_path_matching_v1"
+)
+_REPAIR_KIND_SWAP: Final[str] = "swap"
+_REPAIR_KIND_MATCHING: Final[str] = "matching_path"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1224,6 +1266,10 @@ class BedResidenceMemberAvailabilitySampling:
     availability_conditioning_policy: str = (
         REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID
     )
+    # 修補前的隨機排列（槽位 → 分層）與依序執行的修補步驟（種類, 動到的槽位）。
+    # 沒有修補時 ``initial_slot_permutation == slot_permutation`` 且 ``repair_steps`` 為空。
+    initial_slot_permutation: tuple[int, ...] = ()
+    repair_steps: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
     @property
     def sample_count(self) -> int:
@@ -1264,6 +1310,235 @@ def _member_stratified_generator(seed: int) -> np.random.Generator:
     return np.random.Generator(np.random.PCG64DXSM(derived))
 
 
+def _member_repair_generator(seed: int) -> np.random.Generator:
+    """建立排列修補專用的 PCG64DXSM 產生器（角色標籤與抽樣產生器不同，亂數流獨立）。"""
+
+    material = json.dumps(
+        [_PER_MEMBER_REPAIR_ROLE, str(seed)], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    derived = int.from_bytes(hashlib.sha256(material).digest()[:16], "big", signed=False)
+    return np.random.Generator(np.random.PCG64DXSM(derived))
+
+
+def recompute_member_initial_slot_permutation(seed: int, slot_count: int) -> tuple[int, ...]:
+    """由種子重算 per_member 修補前的隨機排列（槽位 → 分層）。
+
+    抽樣器在做任何修補與逐槽位抽年齡之前，先用抽樣產生器抽一次 ``slot_count`` 的隨機
+    排列；這個排列只由種子與槽位數決定，所以 manifests 載入器可以不讀任何流場資料就
+    重算它，並與 provenance 稽核保存的「修補前分層」核對。
+    """
+
+    seed = _strict_int(seed, label="seed", minimum=0)
+    slot_count = _strict_int(slot_count, label="slot_count", minimum=1)
+    generator = _member_stratified_generator(seed)
+    return tuple(int(value) for value in generator.permutation(slot_count))
+
+
+def _member_feasibility_matrix(
+    *,
+    observation_ranks: Sequence[Sequence[int]],
+    site_ids: Sequence[str],
+    available_by_site: Mapping[str, frozenset[int] | set[int]],
+    maximum_age_days: int,
+    sample_count: int,
+    slot_count: int,
+) -> list[list[bool]]:
+    """預先計算 ``feasible[rank][stratum]``：該分層對該觀測 rank 是否至少有一個可用整點。
+
+    「可用」的定義與逐槽位挑年齡時完全相同：五站在該 rank 的觀測 UTC 減去候選年齡後的
+    沉底整點，都落在各自正式可用時間集合內。這裡只回答「有沒有候選」，不挑哪一個。
+    """
+
+    matrix: list[list[bool]] = [[False] * slot_count for _ in range(sample_count)]
+    for stratum in range(slot_count):
+        start, stop = _stratum_bounds(
+            maximum_age_days=maximum_age_days, sample_count=slot_count, stratum_index=stratum
+        )
+        for rank in range(sample_count):
+            rank_observation = tuple(times[rank] for times in observation_ranks)
+            for age in range(start, stop):
+                if all(
+                    observation_ns - age * _NANOSECONDS_PER_HOUR in available_by_site[site_id]
+                    for site_id, observation_ns in zip(site_ids, rank_observation, strict=True)
+                ):
+                    matrix[rank][stratum] = True
+                    break
+    return matrix
+
+
+def _repair_member_slot_permutation(
+    *,
+    initial_permutation: Sequence[int],
+    feasible: Sequence[Sequence[bool]],
+    member_count: int,
+    generator: np.random.Generator,
+) -> tuple[tuple[int, ...], tuple[tuple[str, tuple[int, ...]], ...]]:
+    """排列後可行性修補：回傳（修補後排列, 依序的修補步驟）。
+
+    ``initial_permutation[slot]`` 是槽位 ``slot`` 被配到的分層；槽位對應的觀測 rank 為
+    ``slot // member_count``。步驟一：依槽位遞增處理仍不可行的槽位，以 ``generator``
+    給出的順序找第一個使「兩邊交換後都可行」的槽位互換分層（單次交換；交換後兩個槽位
+    都可行，因此不會弄壞已可行的槽位）。步驟二：若某槽位找不到任何單次交換，用二分圖
+    增廣路徑（廣度優先，鄰居順序由 ``generator`` 以每個 rank 一次的隨機排列固定）補
+    上剩餘不可行槽位，必要時沿路徑改派其他槽位的分層。無法完全配對時丟出
+    ``ValueError``（資料本身不允許每個槽位都有可用整點）。
+    """
+
+    slot_count = len(initial_permutation)
+    permutation = [int(value) for value in initial_permutation]
+
+    def is_feasible(slot: int, stratum: int) -> bool:
+        return bool(feasible[slot // member_count][stratum])
+
+    steps: list[tuple[str, tuple[int, ...]]] = []
+    for slot in range(slot_count):
+        if is_feasible(slot, permutation[slot]):
+            continue
+        # 每個要處理的不可行槽位固定消耗一個 slot_count 長度的隨機排列，所以修補結果
+        # 不受「前面的交換是否順帶修好了其他槽位」以外的因素影響，且可重現。
+        order = generator.permutation(slot_count)
+        for candidate in order:
+            partner = int(candidate)
+            if partner == slot:
+                continue
+            if is_feasible(slot, permutation[partner]) and is_feasible(
+                partner, permutation[slot]
+            ):
+                permutation[slot], permutation[partner] = (
+                    permutation[partner],
+                    permutation[slot],
+                )
+                steps.append((_REPAIR_KIND_SWAP, (slot, partner)))
+                break
+
+    remaining = [slot for slot in range(slot_count) if not is_feasible(slot, permutation[slot])]
+    if remaining:
+        assigned: dict[int, int] = {
+            slot: permutation[slot]
+            for slot in range(slot_count)
+            if is_feasible(slot, permutation[slot])
+        }
+        owner: dict[int, int] = {stratum: slot for slot, stratum in assigned.items()}
+        neighbor_order: dict[int, list[int]] = {}
+
+        def neighbors(slot: int) -> list[int]:
+            rank = slot // member_count
+            if rank not in neighbor_order:
+                shuffled = [int(value) for value in generator.permutation(slot_count)]
+                neighbor_order[rank] = [
+                    stratum for stratum in shuffled if bool(feasible[rank][stratum])
+                ]
+            return neighbor_order[rank]
+
+        for start_slot in remaining:
+            reached_from: dict[int, int] = {}
+            queue = [start_slot]
+            seen_slots = {start_slot}
+            free_stratum: int | None = None
+            head = 0
+            while head < len(queue) and free_stratum is None:
+                current = queue[head]
+                head += 1
+                for stratum in neighbors(current):
+                    if stratum in reached_from:
+                        continue
+                    reached_from[stratum] = current
+                    holder = owner.get(stratum)
+                    if holder is None:
+                        free_stratum = stratum
+                        break
+                    if holder not in seen_slots:
+                        seen_slots.add(holder)
+                        queue.append(holder)
+            if free_stratum is None:
+                raise ValueError(
+                    "bed residence per_member 缺口條件式抽樣無法完全配對："
+                    f"slot={start_slot}, observation_rank={start_slot // member_count}；"
+                    "可行性矩陣不存在使每個槽位都有可用整點的完全配對"
+                )
+            path_slots: list[int] = []
+            stratum = free_stratum
+            while True:
+                slot = reached_from[stratum]
+                previous = assigned.get(slot)
+                owner[stratum] = slot
+                assigned[slot] = stratum
+                path_slots.append(slot)
+                if slot == start_slot:
+                    break
+                assert previous is not None
+                stratum = previous
+            steps.append((_REPAIR_KIND_MATCHING, tuple(reversed(path_slots))))
+        permutation = [assigned[slot] for slot in range(slot_count)]
+
+    if sorted(permutation) != list(range(slot_count)) or any(
+        not is_feasible(slot, permutation[slot]) for slot in range(slot_count)
+    ):
+        raise RuntimeError("per_member 排列修補後仍不是可行的完全排列，拒絕輸出")
+    return tuple(permutation), tuple(steps)
+
+
+def summarize_member_permutation_repair(
+    audits: Sequence[Mapping[str, object]],
+    *,
+    slot_permutation: Sequence[int],
+) -> dict[str, object]:
+    """由逐槽位稽核（``as_metadata`` 的輸出）重建排列修補的整體摘要。
+
+    抽樣器與 manifests 載入器都呼叫這個函式：前者把摘要寫進 root provenance，後者以
+    同一個函式重算並比對，所以兩邊對「哪些槽位被修補、修補了幾步」的定義不會分歧。
+    ``audits`` 必須依槽位編號排列且每筆都含修補稽核欄位，否則丟出 ``ValueError``。
+    """
+
+    slot_count = len(slot_permutation)
+    if len(audits) != slot_count:
+        raise ValueError("排列修補摘要需要每個槽位恰一筆稽核")
+    initial: list[int] = []
+    infeasible = 0
+    changed = 0
+    steps: dict[int, tuple[str, list[int]]] = {}
+    for slot, audit in enumerate(audits):
+        stratum = audit.get("initial_stratum_index")
+        flag = audit.get("initially_infeasible")
+        step_rows = audit.get("repair_steps")
+        if type(stratum) is not int or type(flag) is not bool or not isinstance(step_rows, list):
+            raise ValueError(f"per_member 槽位 {slot} 缺少排列修補稽核欄位")
+        initial.append(stratum)
+        infeasible += int(flag)
+        if stratum != slot_permutation[slot]:
+            changed += 1
+        for row in step_rows:
+            if (
+                not isinstance(row, Mapping)
+                or type(row.get("step")) is not int
+                or row.get("kind") not in {_REPAIR_KIND_SWAP, _REPAIR_KIND_MATCHING}
+            ):
+                raise ValueError(f"per_member 槽位 {slot} 的修補步驟格式不符")
+            kind, members = steps.setdefault(int(row["step"]), (str(row["kind"]), []))
+            if kind != row["kind"]:
+                raise ValueError("同一修補步驟的種類不一致")
+            members.append(slot)
+    if sorted(initial) != list(range(slot_count)):
+        raise ValueError("per_member 修補前分層必須是 0..50M-1 的排列")
+    if sorted(steps) != list(range(len(steps))):
+        raise ValueError("per_member 修補步驟序號必須連續")
+    swap_steps = sum(1 for kind, _ in steps.values() if kind == _REPAIR_KIND_SWAP)
+    if any(kind == _REPAIR_KIND_SWAP and len(members) != 2 for kind, members in steps.values()):
+        raise ValueError("單次交換步驟必須恰好動到兩個槽位")
+    initial_hash = hashlib.sha256(
+        json.dumps(initial, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "algorithm_id": BED_RESIDENCE_PER_MEMBER_PERMUTATION_REPAIR_ALGORITHM_ID,
+        "initial_slot_permutation_sha256": initial_hash,
+        "initially_infeasible_slot_count": infeasible,
+        "changed_slot_count": changed,
+        "repair_step_count": len(steps),
+        "swap_step_count": swap_steps,
+        "matching_step_count": len(steps) - swap_steps,
+    }
+
+
 def sample_bed_residence_member_ages_conditioned_on_availability(
     *,
     observation_times_by_site: Mapping[str, Sequence[int]],
@@ -1281,7 +1556,9 @@ def sample_bed_residence_member_ages_conditioned_on_availability(
        槽位 ``rank * member_count + member_id``，共 ``sample_count * member_count`` 個。
     2. ``0..maximum_age_days*24`` 小時（含兩端）切成與槽位等數的連續分層；
     3. 用同一個種子固定的產生器先抽一個 ``slot_count`` 的隨機排列，決定每個槽位
-       被配到哪一層（五站共用）；
+       被配到哪一層（五站共用）；接著做「排列後可行性修補」：整層沒有五站皆可用整點
+       的槽位，與其他槽位交換分層（單次交換，不行時改用二分圖增廣路徑），修補的步驟
+       與修補前排列都寫進逐槽位稽核；
     4. 再依槽位順序，對該層所有整點候選做無放回隨機順序，接受第一個使「五站在該
        rank 的觀測 UTC 減年齡」都屬於各自 canonical available-time set 的年齡；
        被拒絕的候選與缺少該整點的站點逐項記錄於稽核；整層都不可用則丟出
@@ -1325,7 +1602,27 @@ def sample_bed_residence_member_ages_conditioned_on_availability(
     generator = _member_stratified_generator(seed)
     # 先決定「槽位 → 分層」的共用排列，再逐槽位挑年齡；兩段使用同一個產生器並固定
     # 先後順序，使 seed、站點集合與 canonical axis 一起決定唯一的稽核結果。
-    slot_permutation = tuple(int(value) for value in generator.permutation(slot_count))
+    initial_slot_permutation = tuple(int(value) for value in generator.permutation(slot_count))
+    # 排列後可行性修補（見本節開頭說明）：先算可行性矩陣，再把整層無候選的槽位與其他
+    # 槽位交換分層；修補用獨立產生器，所以不需要修補時結果與修補前的做法完全相同。
+    feasible = _member_feasibility_matrix(
+        observation_ranks=observation_ranks,
+        site_ids=site_ids,
+        available_by_site=available_by_site,
+        maximum_age_days=maximum_age_days,
+        sample_count=sample_count,
+        slot_count=slot_count,
+    )
+    slot_permutation, repair_steps = _repair_member_slot_permutation(
+        initial_permutation=initial_slot_permutation,
+        feasible=feasible,
+        member_count=member_count,
+        generator=_member_repair_generator(seed),
+    )
+    steps_by_slot: dict[int, list[tuple[int, str]]] = {}
+    for step_index, (kind, step_slots) in enumerate(repair_steps):
+        for step_slot in step_slots:
+            steps_by_slot.setdefault(step_slot, []).append((step_index, kind))
     ages: list[list[int]] = [[0] * member_count for _ in range(sample_count)]
     strata: list[list[int]] = [[0] * member_count for _ in range(sample_count)]
     audits: list[BedResidenceStratumRejectionAudit] = []
@@ -1377,6 +1674,9 @@ def sample_bed_residence_member_ages_conditioned_on_availability(
                 selected_age_hours=selected,
                 member_id=member,
                 slot_index=slot,
+                initial_stratum_index=initial_slot_permutation[slot],
+                initially_infeasible=not feasible[rank][initial_slot_permutation[slot]],
+                repair_steps=tuple(steps_by_slot.get(slot, ())),
             )
         )
     flat = [age for row in ages for age in row]
@@ -1388,6 +1688,8 @@ def sample_bed_residence_member_ages_conditioned_on_availability(
         stratum_index=tuple(tuple(row) for row in strata),
         slot_permutation=slot_permutation,
         rejection_audit=tuple(audits),
+        initial_slot_permutation=initial_slot_permutation,
+        repair_steps=repair_steps,
     )
 
 

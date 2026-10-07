@@ -123,13 +123,24 @@ def _all_hours() -> tuple[int, ...]:
     return tuple(range(start, stop, _HOUR_NS))
 
 
-def _member_arrival_payload(config: ProjectConfig) -> dict[str, object]:
+def _gappy_hours() -> tuple[int, ...]:
+    """每三天缺一整天（連續 24 小時）的可用時間軸：讓隨機排列必然配到整層無候選的槽位，
+    用來走過「排列後可行性修補」的稽核與載入器驗證。"""
+
+    return tuple(
+        value for index, value in enumerate(_all_hours()) if (index // 24) % 3 != 0
+    )
+
+
+def _member_arrival_payload(
+    config: ProjectConfig, *, hours: tuple[int, ...] | None = None
+) -> dict[str, object]:
     """以正式 sampler／apply／provenance 函式組出 per_member 的 arrival manifest payload。"""
 
     bed = config.scenarios.bed_residence_time
     members = config.scenarios.members_per_scenario
     observations = _observation_arrivals(config)
-    hours = _all_hours()
+    hours = _all_hours() if hours is None else hours
     sampling = sample_bed_residence_member_ages_conditioned_on_availability(
         observation_times_by_site={s: tuple(a.time_utc_ns for a in rows) for s, rows in observations.items()},
         available_time_ns_by_site={s: hours for s in observations},
@@ -222,6 +233,10 @@ def _mutated_arrival_path(tmp_path: Path, payload: dict[str, object], mutate) ->
         "row_utc",
         "provenance_member_count",
         "audit_selected_age",
+        "audit_initial_stratum",
+        "audit_repair_steps_removed",
+        "repair_summary",
+        "repair_algorithm",
     ],
 )
 def test_member_arrival_manifest_rejects_tampering(member_dir, name: str) -> None:
@@ -246,6 +261,17 @@ def test_member_arrival_manifest_rejects_tampering(member_dir, name: str) -> Non
             sampling["member_count"] = _M + 1
         elif name == "audit_selected_age":
             sampling["rejection_audit"][3]["selected_age_hours"] += 1
+        elif name == "audit_initial_stratum":
+            # 修補前分層必須等於由種子重算的排列
+            audit = sampling["rejection_audit"][3]
+            audit["initial_stratum_index"] = (audit["initial_stratum_index"] + 1) % (50 * _M)
+        elif name == "audit_repair_steps_removed":
+            # 年齡不變，但把某個槽位標成「原本不可行」而沒有任何修補步驟
+            sampling["rejection_audit"][3]["initially_infeasible"] = True
+        elif name == "repair_summary":
+            sampling["permutation_repair"]["changed_slot_count"] += 1
+        elif name == "repair_algorithm":
+            sampling["permutation_repair"]["algorithm_id"] = "something_else"
 
     path = _mutated_arrival_path(tmp_path, payload, mutate)
     with pytest.raises(ValueError):
@@ -433,3 +459,56 @@ def test_per_particle_scope_fails_closed_in_input_build() -> None:
         input_derivation_module._apply_bed_residence_sampling_by_site(
             {}, bed_residence=bed, design_version=config.design_version
         )
+
+
+@pytest.fixture(scope="module")
+def gappy_member_dir(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, ProjectConfig, dict[str, object]]:
+    """可用時間軸含整日缺口：隨機排列必然有不可行槽位，抽樣器必須走修補才建得出母體。"""
+
+    tmp_path = tmp_path_factory.mktemp("per_member_gappy")
+    config = _member_config()
+    arrival = _member_arrival_payload(config, hours=_gappy_hours())
+    _write_json(tmp_path / "arrival.json", arrival)
+    return tmp_path, config, arrival
+
+
+def test_gappy_member_arrival_manifest_records_repair_and_loads(gappy_member_dir) -> None:
+    """含缺口的母體：provenance 記錄修補摘要，載入器（含種子重算修補前排列）接受。"""
+
+    tmp_path, config, payload = gappy_member_dir
+    sampling = payload["provenance"]["bed_residence_sampling"]
+    repair = sampling["permutation_repair"]
+    assert repair["initially_infeasible_slot_count"] > 0, "測試資料必須真的觸發修補"
+    assert repair["repair_step_count"] >= 1
+    assert repair["changed_slot_count"] >= repair["initially_infeasible_slot_count"]
+    assert "feasibility_repair" in sampling["sampling_method_id"]
+    arrivals, _ = _load_arrival_document(tmp_path / "arrival.json", config, formal=True)
+    assert len(arrivals) == 250 * _M
+    hours = set(_gappy_hours())
+    for item in arrivals:
+        assert item.time_utc_ns in hours, "沉底整點必須落在可用軸內"
+
+
+@pytest.mark.parametrize("name", ["audit_initial_stratum", "audit_repair_steps_removed", "repair_summary"])
+def test_gappy_member_arrival_manifest_rejects_repair_tampering(gappy_member_dir, name: str) -> None:
+    tmp_path, config, payload = gappy_member_dir
+
+    def mutate(clone: dict[str, object]) -> None:
+        sampling = clone["provenance"]["bed_residence_sampling"]
+        if name == "audit_initial_stratum":
+            audit = sampling["rejection_audit"][3]
+            audit["initial_stratum_index"] = (audit["initial_stratum_index"] + 1) % (50 * _M)
+        elif name == "audit_repair_steps_removed":
+            # 把一個被修補過的槽位的修補步驟清空（分層已改變卻沒有紀錄）
+            for audit in sampling["rejection_audit"]:
+                if audit["repair_steps"]:
+                    audit["repair_steps"] = []
+                    break
+        else:
+            sampling["permutation_repair"]["initially_infeasible_slot_count"] -= 1
+
+    path = _mutated_arrival_path(tmp_path, payload, mutate)
+    with pytest.raises(ValueError):
+        _load_arrival_document(path, config, formal=True)

@@ -60,6 +60,7 @@ from .bed_residence import (
     apply_bed_residence_sampling,
     sample_bed_residence_age_hours,
     sample_bed_residence_member_ages_conditioned_on_availability,
+    summarize_member_permutation_repair,
 )
 from .config import (
     ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1,
@@ -7196,6 +7197,8 @@ def _bed_residence_member_provenance(
     ).hexdigest()
     if hashes != {matrix_hash}:
         raise InputDerivationError("per_member 年齡矩陣 hash 與各筆 arrival 保存的不一致")
+    slot_permutation = [stratum_by_slot[slot] for slot in range(slot_count)]
+    rejection_audit = [audit_by_slot[slot] for slot in range(slot_count)]
     return {
         "policy_id": BED_RESIDENCE_POLICY_ID,
         "sampling_policy_id": BED_RESIDENCE_SAMPLING_POLICY_ID,
@@ -7211,8 +7214,12 @@ def _bed_residence_member_provenance(
         # 是整個 50×M 年齡矩陣的 hash。
         "age_offsets_hours_sha256": matrix_hash,
         "age_matrix_hours": age_matrix,
-        "slot_permutation": [stratum_by_slot[slot] for slot in range(slot_count)],
-        "rejection_audit": [audit_by_slot[slot] for slot in range(slot_count)],
+        "slot_permutation": slot_permutation,
+        "rejection_audit": rejection_audit,
+        # WP-51 整合：排列後可行性修補的整體摘要（由逐槽位稽核重算，載入器會再核對）。
+        "permutation_repair": summarize_member_permutation_repair(
+            rejection_audit, slot_permutation=slot_permutation
+        ),
         "selection_support_days": horizon_settings.selection_support_days,
         "runtime_support_days": horizon_settings.runtime_support_days,
         "pre_window_policy": bed_config.pre_window_policy,
