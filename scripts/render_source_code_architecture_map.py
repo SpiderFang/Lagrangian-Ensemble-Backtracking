@@ -114,6 +114,8 @@ GROUPS: tuple[dict[str, Any], ...] = (
             "receptors",
             "arrival_times",
             "bed_residence",
+            "deposition_labels",
+            "deposition_label_arrivals",
             "manifests",
             "input_derivation",
             "input_horizon",
@@ -303,6 +305,7 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "select_horizontal_receptors_random_from_pool",
             "sample_random_vertical_draws",
             "build_vertical_targets",
+            "rank_anchor_snap_candidates",
         ],
         "read_first": (
             "先看 current formal 如何以站點獨立 seeded random 無放回抽 5 個水平 face，"
@@ -325,12 +328,45 @@ MODULE_INFO: dict[str, dict[str, Any]] = {
             "sample_bed_residence_age_hours",
             "apply_bed_residence_sampling",
             "resolve_bed_residence_timing",
+            "sample_bed_residence_member_ages_conditioned_on_availability",
+            "apply_bed_residence_member_sampling",
         ],
         "read_first": (
             "先分清 observation UTC 與 deposition UTC；五站共用同一組 50 個年齡偏移，"
             "沉底時刻落在固定日曆窗之外時，fixed_calendar_window 會產生不讀 forcing 的 "
             "pre_window_deposition，full_horizon_from_deposition 則從沉底日向前走滿指定 "
-            "horizon。"
+            "horizon。age_sampling_scope=per_member 時改為 50×M 層、隨機排列配給（觀測 rank × "
+            "成員）槽位，並在排列後做可行性修補（整層無五站皆可用整點的槽位與他槽位交換分層，"
+            "必要時用二分圖增廣路徑）；修補前排列與修補步驟逐槽位寫入稽核。"
+        ),
+    },
+    "deposition_labels": {
+        "role": "以沉底時刻（而非觀測時刻）計算季節、大小潮、潮相與事件旗標的標註規則（WP-51 B）",
+        "inputs": "站點 OCM 表層潮位／流速序列、NWW 有效波高序列與沉底 UTC",
+        "outputs": "DepositionLabelModel 與逐沉底時刻的 DepositionLabels（季節、大小潮 proxy、潮相、高浪／強流旗標）",
+        "entrypoints": [
+            "build_deposition_label_model",
+            "DepositionLabelModel",
+            "season_for_utc_ns",
+            "labels_digest",
+        ],
+        "read_first": (
+            "先看模組 docstring 的標註規則：大小潮沿用 v2 selector 的 25 小時潮汐強度中位數切分，"
+            "潮相是區間分類（rising／slack／falling），事件旗標用整段序列的 0.95 分位數；"
+            "它們描述沉底當下的海況，不是粒子沿軌跡的條件。純數值、不讀 forcing 檔。"
+        ),
+    },
+    "deposition_label_arrivals": {
+        "role": "把沉底時刻標籤在 input-build 階段寫進 per_member 沉底 arrival 的 metadata 並驗證（WP-51 B2）",
+        "inputs": "per_member 沉底 ArrivalTime、各站 arrival 選取脈絡（OCM 表層、NWW）",
+        "outputs": "附有 deposition_* 標籤的 ArrivalTime 與 arrival provenance 的標籤模型紀錄",
+        "entrypoints": [
+            "attach_deposition_labels",
+            "validate_deposition_label_metadata",
+        ],
+        "read_first": (
+            "標籤在 input-build 算而不在 native-postprocess 算：序列已在記憶體、native-run 不受影響、"
+            "模型參數受 manifest hash 保護；標籤規則本身在 deposition_labels。"
         ),
     },
     "models": {
@@ -1429,6 +1465,9 @@ FLOW_EDGES: tuple[dict[str, str], ...] = (
     {"source": "arrival_times", "target": "bed_residence", "label": "observation UTC／共同 50 筆"},
     {"source": "config", "target": "bed_residence", "label": "年齡抽樣與雙模式契約"},
     {"source": "bed_residence", "target": "input_derivation", "label": "deposition UTC／年齡 provenance"},
+    {"source": "deposition_labels", "target": "deposition_label_arrivals", "label": "標註規則／標籤模型"},
+    {"source": "deposition_label_arrivals", "target": "input_derivation", "label": "沉底時刻標籤 metadata／provenance"},
+    {"source": "deposition_label_arrivals", "target": "manifests", "label": "標籤 metadata 驗證"},
     {"source": "bed_residence", "target": "runtime", "label": "積分期間／pre-window 判定"},
     {"source": "config", "target": "horizon_suite", "label": "未綁定 template／suite 設定"},
     {"source": "input_horizon", "target": "horizon_suite", "label": "最大 horizon／gap-safe 支援"},
