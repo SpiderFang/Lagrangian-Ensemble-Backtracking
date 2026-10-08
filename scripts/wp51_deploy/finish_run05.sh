@@ -13,6 +13,10 @@
 #   → 監看到重啟後的流程（含後處理與兩版出圖）結束並記錄結果。
 # 副本異常結束時：寫明原因、停下，不動任何正式程序。
 #
+# 程序偵測範圍（2026-10-09 加註）：本腳本所有「程序」判斷都限定 run05——行程樹以 PID（MAIN_PID/新主程序）展開，
+# native-run 計數只算新主程序子孫且命令列含 $RUN/ 者，孤兒清掃只清 cwd 為 $CODE（lbt-repo-wp51-int）者，
+# 單元／checkpoint 狀態只讀 $RUN；與 run06（lbt-repo-wp52、run06-h90-m10-v5）互不影響。
+#
 # 用法：finish_run05.sh --dry-run   只印出條件狀態與將執行的動作（寫入 finish_run05.dryrun.log），不改任何東西
 #       setsid nohup finish_run05.sh > /dev/null 2>&1 &     正式背景啟動（日誌 finish_run05.log）
 set -uo pipefail
@@ -209,8 +213,13 @@ restart_run() {
   echo "已啟動 run_formal_v4.sh，PID $NEW_MAIN"
   sleep 90
   alive $NEW_MAIN || { echo "新主程序 90 秒內就結束了，見 $OUT"; return 1; }
-  local n; n=$(pgrep -f "lbt native-run .*run05-h90-m10-v4" | wc -l)
-  echo "native-run 行程數：$n"
+  # 只計算「新主程序的子孫」中、命令列含 run05 輸出目錄路徑的 native-run；run06 等其他批次的 native-run
+  # （不同 PID 樹、不同輸出目錄）不會被計入，也不會被誤判為 run05 已重啟。
+  local n=0 p
+  for p in $(desc $NEW_MAIN | sort -un); do
+    if tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "lbt native-run $RUN/"; then n=$((n+1)); fi
+  done
+  echo "run05 的 native-run 行程數（新主程序 $NEW_MAIN 的子孫、路徑含 $RUN/）：$n"
   [ "$n" -ge 2 ] || return 1
 }
 
