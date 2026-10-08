@@ -2026,3 +2026,22 @@ def test_derive_horizon_rejects_target_longer_than_source() -> None:
     )
     with pytest.raises(hd.HorizonDerivationError):
         hd.derive_backward_driver_result(fake_result, resolved=resolved, source_requested_horizon_days=5.0)
+
+
+# ── 子步數上限守門（WP-51 run05：重建流場發散使 ndeltp 爆量、單小時成本呈指數成長）──────
+
+
+def test_substep_ceiling_fail_closed() -> None:
+    import pytest
+
+    from lagrangian_backtracking.native_runner.hour_major import (
+        MAX_SUBSTEPS_PER_HOUR,
+        HourMajorError,
+        _check_substep_ceiling,
+    )
+
+    utc = 1_763_679_600_000_000_000  # 2025-11-20T23:00:00Z
+    _check_substep_ceiling(10_363, utc)  # run05 實測的正常上界附近，不得觸發
+    _check_substep_ceiling(MAX_SUBSTEPS_PER_HOUR, utc)
+    with pytest.raises(HourMajorError, match="2025-11-20T23:00:00Z"):
+        _check_substep_ceiling(MAX_SUBSTEPS_PER_HOUR + 1, utc)

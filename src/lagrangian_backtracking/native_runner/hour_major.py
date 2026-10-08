@@ -249,14 +249,36 @@ __all__ = [
     "hour_major_config_to_backward_driver_config",
     "validate_diffusion_scheme",
     "diffusion_scheme_signature",
+    "MAX_SUBSTEPS_PER_HOUR",
 ]
 
 
 _HOUR_NS = 3_600_000_000_000
 
+#: 單一主迴圈小時允許的子步數上限（``ndeltp``）。
+#:
+#: 局部 CFL 估計的 ``ndeltp`` 與該小時最大流速成正比，正常資料（台灣周邊流速
+#: ≲ 3 m/s，最小邊長數公尺）約 4e3–1e4。流場出現不可能的巨大值（例如重建 patch
+#: 的 AR 外推發散，WP-51 run05 診斷）時 ``ndeltp`` 會爆量，單小時成本呈指數成長，
+#: 外觀上就是「卡住不動、沒有錯誤訊息」。超過此上限時改為明確丟出 ``HourMajorError``
+#: （fail-closed），而不是默默跑數日；上限相當於約 70 m/s 的流速，正常資料不會觸發。
+MAX_SUBSTEPS_PER_HOUR: int = 100_000
+
 
 class HourMajorError(RuntimeError):
     """本模組專用例外，與 ``BackwardDriverError``／``NativeOrchestratorError`` 區分責任層。"""
+
+
+def _check_substep_ceiling(ndeltp: int, utc_ns: int) -> None:
+    """``ndeltp`` 超過 ``MAX_SUBSTEPS_PER_HOUR`` 時 fail-closed，見該常數說明。"""
+
+    if int(ndeltp) > MAX_SUBSTEPS_PER_HOUR:
+        stamp = np.datetime_as_string(np.datetime64(int(utc_ns), "ns"), unit="s")
+        raise HourMajorError(
+            f"主迴圈小時 {stamp}Z 的子步數 ndeltp={int(ndeltp)} 超過上限 "
+            f"{MAX_SUBSTEPS_PER_HOUR}，流場含不合理的巨大流速（常見原因：重建 patch 的 "
+            "AR 外推發散）；拒絕繼續，避免單小時成本爆量。請檢查該小時的 hvel 並隔離資料"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1331,6 +1353,7 @@ def run_flow_domain_hour_major(
                         cfl_number=config.cfl_number,
                     )
                 hour_overhead.time_substep_count_s += _time.perf_counter() - t0
+                _check_substep_ceiling(ndeltp, current_utc)
                 dtb = 3600.0 / ndeltp
                 hour_start_utc = current_utc
 

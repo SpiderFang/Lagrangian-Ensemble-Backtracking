@@ -151,6 +151,7 @@ substep 迴圈的 ``trat`` 是「``idt``／``ndeltp`` 的計數比例」。兩�
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -163,6 +164,7 @@ from ..mesh import NativeMesh
 from ..ocm_reconstruction import HOURLY_NS, GapSpec, discover_hourly_gaps
 
 __all__ = [
+    "RECONSTRUCTED_MAX_PLAUSIBLE_SPEED_MPS",
     "ForcingBridgeError",
     "UnregisteredForcingGapError",
     "UnresolvedForcingGapError",
@@ -172,6 +174,25 @@ __all__ = [
     "inventory_forcing_gaps",
     "project_face_dryness_to_nodes",
 ]
+
+
+_LOG = logging.getLogger(__name__)
+
+#: 重建 patch 列的水平流速合理性上限（m/s，``hypot(u, v)``）。
+#:
+#: 背景（WP-51 run05 診斷）：``ocm_multivariate_eof_harmonic_state_space_smoother_v1``
+#: 對較長缺口的 AR(2) 外推會數值發散（例如東北區 2025-11-19T00:00Z–2025-11-21T00:00Z
+#: 的 49 小時缺口，``|hvel|`` 從缺口端點起每小時約 ×2.5 放大到 1e18 m/s；2024-02-19
+#: 缺口放大到 2.9e6 m/s）。這些列不是物理流場。局部 CFL 子步數 ``ndeltp`` 與最大
+#: 流速成正比，單小時成本隨之呈指數成長，實際上等同無窮迴圈。
+#: 觀測（``ocm_native``）端的品質報告以 5 m/s 為「異常」門檻（``abs_u_gt_5_mps``），
+#: 台灣周邊實際最大流速約 3 m/s；這裡取 10 m/s，只攔下明顯不可能的發散值，不動
+#: 一般重建列（已掃描全部四區重建 patch：未發散的重建列最大約 6.8 m/s）。
+#: 超過門檻的格點在快照中改為 ``NaN`` 並計入 ``missing_mask``，依既有政策在濕節點
+#: 上視為「未解釋的缺值」（``UnresolvedForcingGapError`` → 粒子以 FORCING_MISSING
+#: 終止），不填補、不截斷、不外插。只作用於重建列（``time_origin == "reconstructed"``），
+#: 觀測列完全不受影響。
+RECONSTRUCTED_MAX_PLAUSIBLE_SPEED_MPS: float = 10.0
 
 
 class ForcingBridgeError(RuntimeError):
@@ -448,7 +469,11 @@ class _HourSnapshot:
 
 
 def _build_snapshot(
-    merged: _MergedMonth, local_index: int, *, load_diffusivity: bool = True
+    merged: _MergedMonth,
+    local_index: int,
+    *,
+    load_diffusivity: bool = True,
+    max_reconstructed_speed_mps: float | None = RECONSTRUCTED_MAX_PLAUSIBLE_SPEED_MPS,
 ) -> _HourSnapshot:
     """讀取並轉置單一 UTC 小時的全部欄位；呼叫端必須確保同一小時只呼叫一次。
 
@@ -459,6 +484,11 @@ def _build_snapshot(
     記憶體配置，而不是原陣列的 strided view。``load_diffusivity=False`` 時
     完全不讀取、不轉置 diffusivity 列，``missing_mask`` 也不再把它計入缺值
     判定（見模組 docstring「``load_diffusivity`` 開關」）。
+
+    ``max_reconstructed_speed_mps``（預設 ``RECONSTRUCTED_MAX_PLAUSIBLE_SPEED_MPS``）：
+    只對重建 patch 列生效；``hypot(u, v)`` 超過此值（或為 ``inf``）的格點，其
+    ``u/v/w`` 改為 ``NaN`` 並計入 ``missing_mask``，理由見該常數的說明。傳 ``None``
+    關閉此檢查（僅供測試與對照）。觀測列永遠不套用這個檢查。
     """
 
     utc_ns = int(merged.time_utc_ns[local_index])
@@ -472,7 +502,26 @@ def _build_snapshot(
     v = np.ascontiguousarray(np.asarray(hvel_row[:, :, 1], dtype=np.float64).T)
     w = np.ascontiguousarray(np.asarray(w_row, dtype=np.float64).T)
     zcor = np.asarray(zcor_row, dtype=np.float64).T
+    kind = int(merged.source_kind[local_index])
     finite_terms = np.isfinite(u) & np.isfinite(v) & np.isfinite(w) & np.isfinite(zcor)
+    if kind != 0 and max_reconstructed_speed_mps is not None:
+        # ``NaN > limit`` 為 False（NaN 本來就已在 finite_terms 排除）；``inf`` 會被抓到。
+        with np.errstate(invalid="ignore", over="ignore"):
+            implausible = np.hypot(u, v) > float(max_reconstructed_speed_mps)
+        if np.any(implausible):
+            # np.where 一律產生新陣列（來源可能是唯讀 memmap 的零拷貝視圖，不可原地改寫）。
+            u = np.where(implausible, np.nan, u)
+            v = np.where(implausible, np.nan, v)
+            w = np.where(implausible, np.nan, w)
+            finite_terms = finite_terms & ~implausible
+            _LOG.warning(
+                "重建列 %s（%s）有 %d 個格點流速超過 %.1f m/s（疑似 AR 外推發散），"
+                "已改為缺值；濕節點上的缺值會使粒子以 FORCING_MISSING 終止",
+                _iso(utc_ns),
+                merged.month_id,
+                int(np.count_nonzero(implausible)),
+                float(max_reconstructed_speed_mps),
+            )
     diffusivity: np.ndarray | None = None
     if load_diffusivity:
         diff_row = _merged_row(merged, local_index, "diffusivity")
@@ -481,7 +530,6 @@ def _build_snapshot(
     missing_mask = ~finite_terms
     eta = np.ascontiguousarray(np.asarray(elev_row, dtype=np.float64))
     dry_face_flag = np.ascontiguousarray(np.asarray(wetdry_row, dtype=np.float64))
-    kind = int(merged.source_kind[local_index])
 
     return _HourSnapshot(
         utc_ns=utc_ns,
@@ -876,6 +924,7 @@ class NativeForcingBridgeReader:
         ibf: int,
         patches: Mapping[str, OCMReconstructionPatchMonth] | None = None,
         load_diffusivity: bool = True,
+        max_reconstructed_speed_mps: float | None = RECONSTRUCTED_MAX_PLAUSIBLE_SPEED_MPS,
     ) -> None:
         if ibf not in (1, -1):
             raise ForcingBridgeError(f"ibf 只能是 1（正向）或 -1（逆向），收到 {ibf}")
@@ -883,6 +932,7 @@ class NativeForcingBridgeReader:
             raise ForcingBridgeError("month_dirs 不得為空")
         self.ibf = int(ibf)
         self._load_diffusivity = bool(load_diffusivity)
+        self._max_reconstructed_speed_mps = max_reconstructed_speed_mps
         patches = patches or {}
         self._months: dict[str, _MergedMonth] = {}
         for month_id, path in month_dirs.items():
@@ -913,7 +963,10 @@ class NativeForcingBridgeReader:
             raise ForcingBridgeError(f"canonical 時間軸不含 {_iso(utc_ns)}")
         month_id, local_index = location
         snapshot = _build_snapshot(
-            self._months[month_id], local_index, load_diffusivity=self._load_diffusivity
+            self._months[month_id],
+            local_index,
+            load_diffusivity=self._load_diffusivity,
+            max_reconstructed_speed_mps=self._max_reconstructed_speed_mps,
         )
         self._snapshot_cache[utc_ns] = snapshot
         self.read_counts[utc_ns] = self.read_counts.get(utc_ns, 0) + 1

@@ -551,3 +551,96 @@ def test_reader_rejects_out_of_range_query(tmp_path: Path) -> None:
     reader = NativeForcingBridgeReader({"202401": tmp_path / "202401"}, ibf=1)
     with pytest.raises(ForcingBridgeError):
         reader.resolve(_t(0) - HOUR_NS)
+
+
+# ── 重建 patch 發散值守門（WP-51 run05：東北區 2025-11-19/20 缺口 hvel 到 1e18 m/s）──────────
+
+
+def _patch_with_hvel(month_id: str, hour: int, hvel_value: tuple[float, float], node_count: int,
+                     layer_count: int, face_count: int) -> OCMReconstructionPatchMonth:
+    """單一重建小時，全部格點 (u, v) = hvel_value。"""
+
+    base = _minimal_patch_for_gap(month_id, hour, node_count, layer_count, face_count)
+    hvel = np.empty((1, node_count, layer_count, 2), dtype=np.float64)
+    hvel[..., 0] = hvel_value[0]
+    hvel[..., 1] = hvel_value[1]
+    return OCMReconstructionPatchMonth(
+        month_id=base.month_id,
+        time_utc_ns=base.time_utc_ns,
+        hvel=hvel,
+        vertical_velocity=base.vertical_velocity,
+        zcor=base.zcor,
+        elev=base.elev,
+        wetdry_elem=base.wetdry_elem,
+        diffusivity=base.diffusivity,
+        origin_code=base.origin_code,
+        quality_flags=base.quality_flags,
+        metadata=base.metadata,
+    )
+
+
+def _merged_with_patch(tmp_path: Path, patch: OCMReconstructionPatchMonth, *, observed_hvel_value: float):
+    node_count, layer_count, face_count = 3, 2, 1
+    hvel = np.full((3, node_count, layer_count, 2), observed_hvel_value, dtype=np.float64)
+    _write_month(
+        tmp_path, "202401", time_hours=[0, 1, 3], node_count=node_count, layer_count=layer_count,
+        face_count=face_count, hvel=hvel,
+    )
+    raw = _load_raw_month(tmp_path / "202401")
+    return _merge_month_with_patch("202401", raw, patch)  # 時間軸：0,1 觀測；2 重建；3 觀測
+
+
+def test_reconstructed_diverged_cells_become_missing_but_observed_untouched(tmp_path: Path) -> None:
+    patch = _patch_with_hvel("202401", 2, (1.0e18, -1.0e18), 3, 2, 1)
+    merged = _merged_with_patch(tmp_path, patch, observed_hvel_value=50.0)  # 觀測列 50 m/s 也不得被動到
+
+    recon_idx = int(np.flatnonzero(merged.source_kind == 1)[0])
+    snap = _build_snapshot(merged, recon_idx)
+    assert snap.time_origin == "reconstructed"
+    assert np.all(np.isnan(snap.u)) and np.all(np.isnan(snap.v)) and np.all(np.isnan(snap.w))
+    assert np.all(snap.missing_mask)
+
+    obs_idx = int(np.flatnonzero(merged.source_kind == 0)[0])
+    obs = _build_snapshot(merged, obs_idx)
+    assert obs.time_origin == "observed"
+    np.testing.assert_array_equal(obs.u, 50.0)
+    assert not np.any(obs.missing_mask)
+
+    # 關閉守門（None）時行為與修正前完全相同
+    raw_snap = _build_snapshot(merged, recon_idx, max_reconstructed_speed_mps=None)
+    np.testing.assert_array_equal(raw_snap.u, 1.0e18)
+    assert not np.any(raw_snap.missing_mask)
+
+
+def test_reconstructed_plausible_values_are_bit_identical_to_ungated(tmp_path: Path) -> None:
+    patch = _patch_with_hvel("202401", 2, (3.0, -4.0), 3, 2, 1)  # |v| = 5 m/s，在門檻之內
+    merged = _merged_with_patch(tmp_path, patch, observed_hvel_value=1.0)
+    recon_idx = int(np.flatnonzero(merged.source_kind == 1)[0])
+    gated = _build_snapshot(merged, recon_idx)
+    ungated = _build_snapshot(merged, recon_idx, max_reconstructed_speed_mps=None)
+    for name in ("u", "v", "w", "eta", "missing_mask", "dry_face_flag"):
+        np.testing.assert_array_equal(getattr(gated, name), getattr(ungated, name))
+    assert not np.any(gated.missing_mask)
+
+
+def test_reader_fail_closed_on_diverged_reconstruction(tmp_path: Path) -> None:
+    """端到端：發散重建小時 → HourlyFieldPair 在濕節點留下缺值 → UnresolvedForcingGapError。"""
+
+    patch = _patch_with_hvel("202401", 2, (2.5e6, 0.0), 3, 2, 1)
+    node_count, layer_count, face_count = 3, 2, 1
+    _write_month(
+        tmp_path, "202401", time_hours=[0, 1, 3], node_count=node_count, layer_count=layer_count,
+        face_count=face_count,
+    )
+    reader = NativeForcingBridgeReader({"202401": tmp_path / "202401"}, ibf=-1, patches={"202401": patch})
+    pair = reader.resolve(_t(3))  # field 為 (2 重建, 3 觀測)
+    assert "reconstructed" in (pair.time_origin1, pair.time_origin2)
+    with pytest.raises(UnresolvedForcingGapError):
+        pair.raise_if_unresolved_gap()
+
+    # 對照：關閉守門時不會 fail closed（這正是修正前讓 CFL 子步數爆量的路徑）
+    reader_off = NativeForcingBridgeReader(
+        {"202401": tmp_path / "202401"}, ibf=-1, patches={"202401": patch}, max_reconstructed_speed_mps=None
+    )
+    pair_off = reader_off.resolve(_t(3))
+    pair_off.raise_if_unresolved_gap()
