@@ -33,6 +33,13 @@ import numpy as np
 
 HOURLY_NS = np.int64(3_600_000_000_000)
 RECONSTRUCTION_SCHEMA_VERSION = "ocm_reconstruction_patch_v1"
+#: patch 月份 metadata 中，明列「patch 列取代觀測列」的 UTC 清單所在的鍵。
+#:
+#: 背景（WP-53）：供應者部分日檔是前一日的整檔複本，這些小時在觀測月份裡仍有一列，但內容
+#: 不是該小時的真實流場（重播列）。把它們從數百 GiB 的觀測月檔實體刪除不可行，所以由重建
+#: patch 在 metadata 宣告 ``{"policy": ..., "time_utc_ns": [...]}``：讀取端遇到這些 UTC 時，
+#: 忽略觀測列、改用 patch 列。不在宣告內的重疊仍一律拒絕。
+SUPERSEDES_OBSERVED_KEY = "supersedes_observed"
 RECONSTRUCTION_METHOD_ID = "ocm_multivariate_eof_harmonic_state_space_smoother_v1"
 ORIGIN_RECONSTRUCTED_SHORT = np.uint8(1)
 ORIGIN_RECONSTRUCTED_STATE_SPACE = np.uint8(2)
@@ -166,6 +173,22 @@ class SequenceSource(Protocol):
         flat_start: int | None = None,
         flat_stop: int | None = None,
     ) -> np.ndarray: ...
+
+
+def superseded_observed_times_from_metadata(metadata: Mapping[str, Any] | None) -> np.ndarray:
+    """從 patch 月份 metadata 取出「取代觀測列」的 UTC 奈秒清單；沒有宣告時回傳空陣列。
+
+    清單內容是已排序、不重複的 ``int64``。此函式只讀 metadata 的小型欄位，不載入任何物理
+    陣列；宣告的語意見 ``SUPERSEDES_OBSERVED_KEY``。
+    """
+
+    if not metadata:
+        return np.empty(0, dtype=np.int64)
+    block = metadata.get(SUPERSEDES_OBSERVED_KEY)
+    if not isinstance(block, Mapping):
+        return np.empty(0, dtype=np.int64)
+    values = block.get("time_utc_ns", [])
+    return np.unique(np.asarray([int(value) for value in values], dtype=np.int64))
 
 
 def _canonical_json_bytes(document: Mapping[str, Any]) -> bytes:
@@ -1423,12 +1446,14 @@ __all__ = [
     "RECONSTRUCTION_ARRAY_NAMES",
     "RECONSTRUCTION_METHOD_ID",
     "RECONSTRUCTION_SCHEMA_VERSION",
+    "SUPERSEDES_OBSERVED_KEY",
     "ReconstructionConfig",
     "ReconstructionError",
     "SequenceSource",
     "build_reconstruction_patch",
     "discover_hourly_gaps",
     "sha256_file",
+    "superseded_observed_times_from_metadata",
     "validate_blocked_masks",
     "validate_reconstruction_patch",
 ]

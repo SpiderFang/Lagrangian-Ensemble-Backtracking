@@ -32,6 +32,7 @@ from .diffusion import (
 )
 from .geometry import DomainProjection
 from .mesh import MeshLocation, NativeMesh
+from .ocm_reconstruction import superseded_observed_times_from_metadata
 from .models import (
     SURFACE_BOUNDARY_TOLERANCE_M,
     VERTICAL_BOUNDARY_TOLERANCE_M,
@@ -622,8 +623,14 @@ class OCMNativeMonth:
                     f"{reconstruction_patch.month_id} != {month_id}"
                 )
             patch_times = np.asarray(reconstruction_patch.time_utc_ns)
-            if np.intersect1d(self._observed_time_utc_ns, patch_times).size:
+            # 只有 patch 在 metadata 明列「取代觀測列」的 UTC（供應者重播日的錯誤觀測列）才允許與
+            # observed 重疊；其餘重疊一律拒絕。宣告的語意見 ``ocm_reconstruction.SUPERSEDES_OBSERVED_KEY``。
+            superseded = superseded_observed_times_from_metadata(reconstruction_patch.metadata)
+            overlap = np.intersect1d(self._observed_time_utc_ns, patch_times)
+            if np.setdiff1d(overlap, superseded).size:
                 raise ValueError("OCM reconstruction patch 不得與 observed UTC 重複")
+            if np.setdiff1d(superseded, patch_times).size:
+                raise ValueError("OCM reconstruction patch 宣告取代的 observed UTC 不在 patch 時間軸內")
             if reconstruction_patch.hvel.shape[1:] != self.hvel.shape[1:]:
                 raise ValueError("OCM reconstruction patch hvel 網格 shape 與 observed 不一致")
             if reconstruction_patch.vertical_velocity.shape[1:] != self.vertical_velocity.shape[1:]:
@@ -636,21 +643,18 @@ class OCMNativeMonth:
                 raise ValueError("OCM reconstruction patch elev 網格 shape 不一致")
             if reconstruction_patch.wetdry_elem.shape[1:] != self.wetdry_elem.shape[1:]:
                 raise ValueError("OCM reconstruction patch wetdry_elem 網格 shape 不一致")
-            merged_times = np.concatenate((self._observed_time_utc_ns, patch_times))
+            keep = ~np.isin(self._observed_time_utc_ns, superseded)
+            observed_rows = np.flatnonzero(keep).astype(np.int64)
+            merged_times = np.concatenate((self._observed_time_utc_ns[keep], patch_times))
             order = np.argsort(merged_times, kind="stable")
             self.time_utc_ns = merged_times[order]
             source_kind = np.concatenate(
                 (
-                    np.zeros(self._observed_time_utc_ns.size, dtype=np.int8),
+                    np.zeros(observed_rows.size, dtype=np.int8),
                     np.ones(patch_times.size, dtype=np.int8),
                 )
             )
-            source_index = np.concatenate(
-                (
-                    np.arange(self._observed_time_utc_ns.size, dtype=np.int64),
-                    np.arange(patch_times.size, dtype=np.int64),
-                )
-            )
+            source_index = np.concatenate((observed_rows, np.arange(patch_times.size, dtype=np.int64)))
             self._time_source_kind = source_kind[order]
             self._time_source_index = source_index[order]
 

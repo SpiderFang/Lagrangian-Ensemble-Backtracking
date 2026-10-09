@@ -161,7 +161,12 @@ import numpy as np
 
 from ..forcing import OCMReconstructionPatchMonth
 from ..mesh import NativeMesh
-from ..ocm_reconstruction import HOURLY_NS, GapSpec, discover_hourly_gaps
+from ..ocm_reconstruction import (
+    HOURLY_NS,
+    GapSpec,
+    discover_hourly_gaps,
+    superseded_observed_times_from_metadata,
+)
 
 __all__ = [
     "RECONSTRUCTED_MAX_PLAUSIBLE_SPEED_MPS",
@@ -351,6 +356,19 @@ class _MergedMonth:
     source_index: np.ndarray
 
 
+def _patch_superseded_observed(patch: object) -> np.ndarray:
+    """取得 patch 宣告取代的觀測 UTC；支援完整 patch 與規劃階段只含時間軸的替身。
+
+    完整 ``OCMReconstructionPatchMonth`` 由 ``metadata`` 讀取；規劃階段替身
+    （``production_wiring.ReconstructionPatchTimeAxis``）直接帶 ``superseded_observed_utc_ns``。
+    """
+
+    explicit = getattr(patch, "superseded_observed_utc_ns", None)
+    if explicit is not None:
+        return np.unique(np.asarray(explicit, dtype=np.int64))
+    return superseded_observed_times_from_metadata(getattr(patch, "metadata", None))
+
+
 def _merge_month_with_patch(
     month_id: str,
     raw: _RawMonth,
@@ -389,9 +407,16 @@ def _merge_month_with_patch(
 
     _require(patch.month_id == month_id, f"重建 patch month_id 與月份不符：{patch.month_id} != {month_id}")
     patch_times = np.asarray(patch.time_utc_ns, dtype=np.int64)
+    superseded = _patch_superseded_observed(patch)
+    overlap = np.intersect1d(raw.time_utc_ns, patch_times)
     _require(
-        np.intersect1d(raw.time_utc_ns, patch_times).size == 0,
-        f"{month_id} 的重建 patch 與觀測 UTC 重疊，不得覆寫觀測資料",
+        np.setdiff1d(overlap, superseded).size == 0,
+        f"{month_id} 的重建 patch 與觀測 UTC 重疊，且重疊的 UTC 未被 patch 宣告為取代觀測列，"
+        "不得覆寫觀測資料",
+    )
+    _require(
+        np.setdiff1d(superseded, patch_times).size == 0,
+        f"{month_id} 的 patch 宣告取代的觀測 UTC 不在 patch 自己的時間軸內",
     )
     shape_check_fields = ["hvel", "vertical_velocity", "zcor"]
     if load_diffusivity:
@@ -410,14 +435,17 @@ def _merge_month_with_patch(
         f"{month_id} 重建 patch 的 wetdry_elem 網格 shape 與觀測不一致",
     )
 
-    merged_times = np.concatenate((raw.time_utc_ns, patch_times))
+    # 被宣告取代的觀測列（重播列）從月內時間軸移除；``raw_rows`` 保留未被取代的觀測列在
+    # 原陣列中的列號，讓 ``source_index`` 仍指向原始 memmap 的正確列（陣列本身不複製）。
+    keep = ~np.isin(raw.time_utc_ns, superseded)
+    raw_rows = np.flatnonzero(keep).astype(np.int64)
+    raw_times = raw.time_utc_ns[keep]
+    merged_times = np.concatenate((raw_times, patch_times))
     order = np.argsort(merged_times, kind="stable")
     source_kind = np.concatenate(
-        (np.zeros(raw.time_utc_ns.size, dtype=np.int8), np.ones(patch_times.size, dtype=np.int8))
+        (np.zeros(raw_times.size, dtype=np.int8), np.ones(patch_times.size, dtype=np.int8))
     )[order]
-    source_index = np.concatenate(
-        (np.arange(raw.time_utc_ns.size, dtype=np.int64), np.arange(patch_times.size, dtype=np.int64))
-    )[order]
+    source_index = np.concatenate((raw_rows, np.arange(patch_times.size, dtype=np.int64)))[order]
     return _MergedMonth(
         month_id=month_id,
         raw=raw,
@@ -860,16 +888,20 @@ def inventory_forcing_gaps(
     reconstructed_hour_count = 0
     for month_id, path in month_dirs.items():
         observed_times = _load_month_time_axis(path)
-        observed_hour_count += int(observed_times.size)
         patch = patches.get(month_id)
         if patch is None:
+            observed_hour_count += int(observed_times.size)
             merged_time_axes[month_id] = observed_times
             continue
         patch_times = np.asarray(patch.time_utc_ns, dtype=np.int64)
+        superseded = _patch_superseded_observed(patch)
         _require(
-            np.intersect1d(observed_times, patch_times).size == 0,
-            f"{month_id} 的重建 patch 與觀測 UTC 重疊",
+            np.setdiff1d(np.intersect1d(observed_times, patch_times), superseded).size == 0,
+            f"{month_id} 的重建 patch 與觀測 UTC 重疊，且重疊的 UTC 未被 patch 宣告為取代觀測列",
         )
+        # 被取代的觀測列（重播列）不算觀測小時，改計入已核准重建。
+        observed_times = observed_times[~np.isin(observed_times, superseded)]
+        observed_hour_count += int(observed_times.size)
         reconstructed_hour_count += int(patch_times.size)
         merged_time_axes[month_id] = np.sort(np.concatenate((observed_times, patch_times)))
 

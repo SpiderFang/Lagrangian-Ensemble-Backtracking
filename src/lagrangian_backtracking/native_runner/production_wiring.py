@@ -125,9 +125,10 @@ pipeline 的既定定義，本工作包只負責依裁決正確重用，若研�
 from __future__ import annotations
 
 import functools
+import json
 import os
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -141,6 +142,7 @@ from ..forcing_window import _ReconstructionPatchStore
 from ..geometry import DomainProjection
 from ..manifests import load_boundary_geometries, load_scenario_inputs
 from ..mesh import NativeMesh
+from ..ocm_reconstruction import superseded_observed_times_from_metadata
 from ..runner import RunUnit, plan_scenario_shards
 from .backward_driver import build_native_backward_driver_grid, load_baytrace_modules
 from .forcing_bridge import (
@@ -729,10 +731,18 @@ def _domain_resources_factory_entrypoint(
 
 @dataclass(frozen=True, slots=True)
 class ReconstructionPatchTimeAxis:
-    """規劃階段用的重建 patch「時間軸」替身：只含 ``time_utc_ns``，不含任何流場陣列。"""
+    """規劃階段用的重建 patch「時間軸」替身：只含 ``time_utc_ns``，不含任何流場陣列。
+
+    ``superseded_observed_utc_ns`` 是 patch 在月份 metadata 宣告「取代觀測列（重播列）」的
+    UTC（見 ``ocm_reconstruction.SUPERSEDES_OBSERVED_KEY``）；缺口盤點據此把這些觀測列視為
+    不存在、改由 patch 提供。沒有宣告時為空陣列，行為與舊版完全相同。
+    """
 
     month_id: str
     time_utc_ns: np.ndarray
+    superseded_observed_utc_ns: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64)
+    )
 
 
 def load_domain_reconstruction_patch_time_axes(
@@ -761,8 +771,16 @@ def load_domain_reconstruction_patch_time_axes(
     for month_id in months:
         time_path = domain_root / "months" / month_id / "time_utc_ns.npy"
         if time_path.is_file():
+            metadata_path = domain_root / "months" / month_id / "metadata.json"
+            superseded = (
+                superseded_observed_times_from_metadata(json.loads(metadata_path.read_text(encoding="utf-8")))
+                if metadata_path.is_file()
+                else np.empty(0, dtype=np.int64)
+            )
             axes[month_id] = ReconstructionPatchTimeAxis(
-                month_id=month_id, time_utc_ns=np.asarray(np.load(time_path), dtype=np.int64)
+                month_id=month_id,
+                time_utc_ns=np.asarray(np.load(time_path), dtype=np.int64),
+                superseded_observed_utc_ns=superseded,
             )
     return axes
 
