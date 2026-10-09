@@ -23,7 +23,7 @@ rng = np.random.default_rng(53)
 ok = True
 checked = 0
 for m, a in axes.items():
-    if m < "202501" or not (v5 / m).is_dir():
+    if m < "202410" or not (v5 / m).is_dir():
         continue
     t5 = np.load(v5 / m / "time_utc_ns.npy")
     s5 = {int(t): i for i, t in enumerate(t5)}

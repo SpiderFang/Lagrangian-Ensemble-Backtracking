@@ -43,11 +43,16 @@ def build(args, dom: str, log) -> dict:
     ap5 = Path(args.aprime_v5) / dom
     patch = Path(args.patch_root) / dom / "months"
     out = Path(args.output_root) / dom
-    if out.exists():
+    only = set(args.only_months or ())
+    if only:
+        if not out.exists():
+            raise SystemExit(f"--only-months 需要既有輸出：{out}")
+    elif out.exists():
         raise SystemExit(f"輸出已存在，拒絕覆寫：{out}")
     bad = {int(v) for v in json.load(open(Path(args.replay_dir) / f"bad_replay_{dom}.json"))["bad"]}
-    (out / "months").mkdir(parents=True)
-    hardlink_tree(ap5 / "grid", out / "grid")
+    if not only:
+        (out / "months").mkdir(parents=True)
+        hardlink_tree(ap5 / "grid", out / "grid")
     months = sorted(p.name for p in (ap5 / "months").iterdir() if p.is_dir())
     axes = {m: np.load(ap5 / "months" / m / "time_utc_ns.npy") for m in months}
     present = {int(t) for a in axes.values() for t in a}
@@ -64,7 +69,15 @@ def build(args, dom: str, log) -> dict:
     for m in months:
         dest = out / "months" / m
         affected = m in inserted or (m in axes and any(int(t) in bad for t in axes[m]))
-        if not affected:
+        if only:
+            # 只重寫指定月份：該月須為受影響月份（目前是稀疏佔位版），砍掉本根內的舊檔（只解除本根的連結，不動 v5）後重建
+            if m not in only:
+                continue
+            if not affected:
+                log(f"[{dom}] 月份 {m} 非受影響月份，略過")
+                continue
+            shutil.rmtree(dest)
+        elif not affected:
             hardlink_tree(ap5 / "months" / m, dest)
             continue
         t0 = axes[m]
@@ -130,7 +143,8 @@ def main() -> int:
     ap.add_argument("--replay-dir", required=True)
     ap.add_argument("--output-root", required=True)
     ap.add_argument("--domain", required=True)
-    ap.add_argument("--real-from", default="202501", help="此月份（含）以後的受影響月份寫入真實 zcor/elev/wetdry；更早者為稀疏佔位檔（到達時刻只在 2025 年，母體建置不讀）")
+    ap.add_argument("--real-from", default="202410", help="此月份（含）以後的受影響月份寫入真實 zcor/elev/wetdry；更早者為稀疏佔位檔。注意：到達時刻（沉底時刻）可早至觀測前 90 天（2024-10），故 --real-from 須 <= 202410")
+    ap.add_argument("--only-months", nargs="*", default=None, help="只重寫這些受影響月份（輸出根須已存在）；用於把稀疏佔位月份補成真實值")
     ap.add_argument("--report", required=True)
     a = ap.parse_args()
 
