@@ -169,10 +169,15 @@ def run(args: argparse.Namespace) -> dict:
             context_hours=168, constituents=("M2", "S2", "N2", "K1", "O1", "M4"), source_fingerprint="validation"
         ),
     }
+    # 隨機片段的挑選固定以 240 小時前後文為準（與全部變體並行驗證時相同），所以 --final-only 與完整驗證用同一批片段。
+    pick_context = max(v.context_hours for v in variants.values())
+    if args.final_only:
+        variants = {"final_w96": HarmonicBridgeConfig(context_hours=96, source_fingerprint="validation")}
+    primary_name = "final_w96" if args.final_only else "primary_w168"
     times = base.times_utc_ns
     results: dict = {"domain": domain_root.name, "node_blocks": blocks_n, "node_block_size": args.node_block,
                      "face_blocks": blocks_f, "face_block_size": args.face_block, "segments": {}, "metrics": {}}
-    starts_all = pick_starts(times, max(args.lengths), max(v.context_hours for v in variants.values()), args.segments, rng)
+    starts_all = pick_starts(times, max(args.lengths), pick_context, args.segments, rng)
     for length in args.lengths:
         starts = starts_all
         results["segments"][str(length)] = [int(s) for s in starts]
@@ -228,7 +233,7 @@ def run(args: argparse.Namespace) -> dict:
                         est_parts.append(out)
                     key = (name, field)
                     acc.setdefault(key, Acc()).add(np.concatenate(truth_cache[field], axis=1), np.concatenate(est_parts, axis=1))
-                    if name == "primary_w168":
+                    if name == primary_name:
                         truth = np.concatenate(truth_cache[field], axis=1)
                         est = np.concatenate(est_parts, axis=1)
                         if field == "hvel":
@@ -286,6 +291,7 @@ def main() -> int:
     p.add_argument("--node-block", type=int, default=800)
     p.add_argument("--face-block", type=int, default=1600)
     p.add_argument("--seed", type=int, default=20261009)
+    p.add_argument("--final-only", action="store_true", help="只跑定案設定（context 96 小時），並對它計算相位與極值等額外指標；片段與完整驗證相同")
     args = p.parse_args()
     result = run(args)
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=1))
