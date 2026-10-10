@@ -183,7 +183,13 @@ from .backward_driver import (
     NATIVE_STATUS_STRANDED,
 )
 from .footprint import cell_area_km2_by_row
-from .postprocess import DEFAULT_AZIMUTH_SECTOR_COUNT, NON_CROSSING_STATUS_CATEGORY_ZH
+from .postprocess import (
+    DEFAULT_AZIMUTH_SECTOR_COUNT,
+    KDE_STATUS_AVAILABLE,
+    KDE_STATUS_COLLINEAR_POINTS,
+    KDE_STATUS_INSUFFICIENT_POINTS,
+    NON_CROSSING_STATUS_CATEGORY_ZH,
+)
 
 __all__ = [
     "FiguresError",
@@ -218,6 +224,15 @@ def _site_label_zh(site_id: str) -> str:
     return SITE_LABELS_ZH.get(site_id, site_id)
 
 
+# WP-47：條件式來源足跡（KDE）狀態值的中文說法。``site.kde["status"]`` 只可能是
+# ``postprocess`` 定義的三個常數之一（``build_source_footprint_kde`` 內僅這三個
+# ``status=`` 賦值）；沒有可用 KDE 時圖面只寫這裡的中文，不印狀態碼識別字串。
+_KDE_STATUS_LABELS_ZH: Mapping[str, str] = {
+    KDE_STATUS_AVAILABLE: "可用",
+    KDE_STATUS_INSUFFICIENT_POINTS: "樣本點不足",
+    KDE_STATUS_COLLINEAR_POINTS: "樣本點共線",
+}
+
 # ── 停止狀態：中英文標籤、固定順序、顏色與標記形狀 ──────────────────────────
 #
 # ``NON_CROSSING_STATUS_CATEGORY_ZH`` 直接重用 postprocess 既有的六種「未穿越」
@@ -231,6 +246,12 @@ _CROSSED_LABEL_EN = "Crossed open boundary"
 _STATUS_LABELS_ZH: Mapping[int, str] = {
     NATIVE_STATUS_LEFT_INTEREST_REGION: _CROSSED_LABEL_ZH,
     **NON_CROSSING_STATUS_CATEGORY_ZH,
+    # WP-47：明確覆寫這一個鍵。``postprocess.NON_CROSSING_STATUS_CATEGORY_ZH`` 把
+    # 此狀態寫成「……的沉底（pre_window_deposition）」，括號內的原始狀態碼名稱是
+    # 後處理輸出欄位命名的資料契約（既有成果 CSV 欄名已使用，須保留原始名稱以利
+    # 稽核），所以不能改 postprocess；但圖面是對外交付文件，不宜出現程式識別字串，
+    # 因此只在圖例這一層改成純中文。兩者的分工：欄位命名保留識別字、圖面只用中文。
+    NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "固定日曆回溯窗之外的沉底",
 }
 
 _STATUS_LABELS_EN: Mapping[int, str] = {
@@ -1692,7 +1713,7 @@ def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
     member_count = int(site.summary["ensemble_member_count"])
     member_text_zh, member_text_en = _ensemble_member_count_text(member_count)
     base = t.t(
-        f"站點：{site.site_label_zh}（{site.site_id}）｜粒子數：{total}｜穿越開放邊界比例："
+        f"站點：{site.site_label_zh}｜粒子數：{total}｜穿越開放邊界比例："
         f"{crossed_fraction * 100:.1f}%｜{member_text_zh}",
         f"Site: {site.site_id} | N={total} | crossed fraction: "
         f"{crossed_fraction * 100:.1f}% | {member_text_en}",
@@ -1901,7 +1922,15 @@ def _plot_horizontal_local(
 
     fig, ax = plt.subplots(figsize=(9, 8), dpi=150)
     if not site.trajectories:
-        ax.text(0.5, 0.5, t.t("無代表軌跡樣本", "No trajectory samples"), ha="center", va="center")
+        # WP-47：中文字串必須明確傳入字型物件，否則畫成缺字方框（同檔其他文字皆如此）。
+        ax.text(
+            0.5,
+            0.5,
+            t.t("無代表軌跡樣本", "No trajectory samples"),
+            ha="center",
+            va="center",
+            fontproperties=font,
+        )
         _save_exclusive(fig, path, dpi=dpi)
         plt.close(fig)
         return
@@ -2219,6 +2248,43 @@ def _short_boundary_label(base_boundary_segment_id: str) -> str:
     return kind if kind in ("local", "flow") else base_boundary_segment_id
 
 
+def _tick_font_kwargs(t: _Labeler, font: Any) -> dict[str, Any]:
+    """刻度標籤的字型參數（WP-47）：中文模式回傳 ``{"fontproperties": font}``，英文模式回傳空 dict。
+
+    ``set_xticklabels`` 等刻度標籤函式若不指定字型，會用 matplotlib 預設字型族；
+    刻度內容含中文時必須明確傳入與其他中文文字相同的字型物件（``font``，由
+    :func:`_resolve_font` 解析），否則在有中文字型的機器上仍會畫成缺字方框。
+    刻度全是 ASCII／數字時不需要，也就不必傳。
+    """
+
+    return {"fontproperties": font} if t.cjk_available else {}
+
+
+_ARC_BOUNDARY_KIND_LABEL_ZH: Mapping[str, str] = {"local": "局部邊界", "flow": "流場邊界"}
+
+
+def _arc_tick_label(base_boundary_segment_id: str, arc_segment_index: int, t: _Labeler) -> str:
+    """弧段長條圖的 x 軸刻度標籤（WP-47）。
+
+    英文模式維持既有的 ``flow#0``、``local#3``（0-based，與資料表的
+    ``arc_segment_index`` 逐字對得上）。中文模式改成 ``流場邊界 1``、``局部邊界 4``：
+    對外交付的圖面不宜印程式識別字串，且讀者不會預期編號從 0 開始，所以中文的序號是
+    ``arc_segment_index + 1``（1-based）；對照資料表時請把圖上的序號減 1（圖說已註明）。
+
+    只改標籤字串，不改變刻度位置、排序與資料的對應關係（``all_labels`` 與
+    ``all_values`` 仍逐項平行）。無法辨識邊界類別時（``"other"``，正常資料不會出現）
+    維持原樣印出完整識別字串與 0-based 索引，不臆測名稱。
+    """
+
+    kind = _boundary_kind(base_boundary_segment_id)
+    if kind in _ARC_BOUNDARY_KIND_LABEL_ZH:
+        return t.t(
+            f"{_ARC_BOUNDARY_KIND_LABEL_ZH[kind]} {arc_segment_index + 1}",
+            f"{kind}#{arc_segment_index}",
+        )
+    return f"{base_boundary_segment_id}#{arc_segment_index}"
+
+
 def _plot_boundary_arc_segments(
     site: SiteData,
     t: _Labeler,
@@ -2264,7 +2330,7 @@ def _plot_boundary_arc_segments(
                 solid_capstyle="butt",
                 zorder=3,
             )
-            all_labels.append(f"{_short_boundary_label(base_id)}#{index}")
+            all_labels.append(_arc_tick_label(base_id, index, t))
             all_values.append(value)
     ax_map.set_xlabel(t.t("經度（°E）", "Longitude (deg E)"), fontproperties=font)
     ax_map.set_ylabel(t.t("緯度（°N）", "Latitude (deg N)"), fontproperties=font)
@@ -2311,7 +2377,14 @@ def _plot_boundary_arc_segments(
         color=[cmap(norm(all_values[i])) for i in order],
     )
     ax_bar.set_xticks(range(len(order)))
-    ax_bar.set_xticklabels([all_labels[i] for i in order], rotation=90, fontsize=6)
+    # WP-47：中文刻度（「流場邊界 1」）必須明確套用中文字型：刻度標籤不傳
+    # ``fontproperties`` 時 matplotlib 會用預設字型族，該字型沒有中文字符，會畫成缺字方框。
+    # 只在中文模式套用；英文模式（``flow#0``）維持原樣、不傳字型。
+    # 注意參數順序：``fontproperties`` 必須排在 ``fontsize`` 之前，否則字型物件的預設字級
+    # 會蓋掉 ``fontsize=6``（同檔 ``set_xticklabels(..., fontproperties=font, fontsize=8)`` 同理）。
+    ax_bar.set_xticklabels(
+        [all_labels[i] for i in order], **_tick_font_kwargs(t, font), rotation=90, fontsize=6
+    )
     ax_bar.set_ylim(color_scale.vmin, color_scale.vmax)
     ax_bar.set_ylabel(
         t.t("相對來源權重（跨站共用色階）", "Relative source weight (shared cross-site scale)"),
@@ -2362,11 +2435,13 @@ def _plot_source_footprint_kde(
 
     if site.kde is None or site.kde["status"] != "available":
         status_text = "" if site.kde is None else str(site.kde["status"])
+        # 中文圖面把狀態碼譯成中文；查無對照（理論上不會發生）時保留原值，不臆測。
+        status_text_zh = _KDE_STATUS_LABELS_ZH.get(status_text, status_text)
         ax.text(
             0.5,
             0.5,
             t.t(
-                f"此站無可用條件式來源足跡（狀態：{status_text or '缺席'}）",
+                f"此站無可用條件式來源足跡（狀態：{status_text_zh or '缺席'}）",
                 f"No source footprint available (status: {status_text or 'missing'})",
             ),
             ha="center",
@@ -3981,7 +4056,7 @@ def _footprint_caption_zh(
     member_count = int(site.summary["ensemble_member_count"])
     member_text_zh, _ = _ensemble_member_count_text(member_count)
     settings_tail = (
-        f"站點：{site.site_label_zh}（{site.site_id}），{_receptor_text_zh(fp)}，"
+        f"站點：{site.site_label_zh}，{_receptor_text_zh(fp)}，"
         f"{total:,} 顆粒子，{member_text_zh}，終止邊界為流場範圍開放邊界，"
         f"物理案例：{experiment_case.physics_case_zh}"
     )
@@ -4273,6 +4348,8 @@ def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case: _Experimen
             "flow=False 的測站則是各自站點獨立的 local domain 邊界。資料來源："
             "boundary_arc_segments_geometry_by_site 的弧段幾何與 departures.parquet 的 "
             "boundary_segment_id、boundary_arc_segment_index。"
+            "長條圖橫軸的「流場邊界 n」「局部邊界 n」，n 為資料表 arc_segment_index 加 1"
+            "（圖面序號從 1 起算，資料表從 0 起算）。"
         )
     elif stem == "source_footprint_kde":
         body = (
