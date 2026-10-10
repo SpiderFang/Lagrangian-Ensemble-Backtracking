@@ -1410,6 +1410,18 @@ def _status_counts(departures: Mapping[str, np.ndarray]) -> dict[int, int]:
     return counts
 
 
+def _status_codes_present(departures: Mapping[str, np.ndarray]) -> tuple[int, ...]:
+    """本站實際出現（計數大於 0）的終止類別，依 _STATUS_ORDER 排序。
+
+    終止類別圖例與停止類別長條圖只呈現實際出現的類別；計數為 0 的類別不畫。
+    全部計數為 0（正常資料不會發生）時退回只列成功穿越一類，避免空圖例與空長條圖。
+    """
+
+    counts = _status_counts(departures)
+    present = tuple(code for code in _STATUS_ORDER if counts.get(code, 0) > 0)
+    return present or (NATIVE_STATUS_LEFT_INTEREST_REGION,)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # WP-25：跨站共用色階（對齊 OCM-SVD-Analysis 的「四海域共同尺度」規則，見
 # docs/results/17_native_figures_formal_output_rules.md 與模組 docstring）
@@ -1869,7 +1881,7 @@ def _plot_horizontal_overview(
                 label=t.t("未分類開放邊界", "Unclassified open boundary"),
             )
         )
-    for code in _STATUS_ORDER:
+    for code in _status_codes_present(site.departures):
         handles.append(
             Line2D(
                 [],
@@ -2108,11 +2120,12 @@ def _plot_terminal_counts(
     counts = _status_counts(site.departures)
     total = int(site.summary["total_particle_count"])
     fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
-    labels = [t.t(_STATUS_LABELS_ZH[code], _STATUS_LABELS_EN[code]) for code in _STATUS_ORDER]
-    values = [counts.get(code, 0) for code in _STATUS_ORDER]
+    codes = _status_codes_present(site.departures)
+    labels = [t.t(_STATUS_LABELS_ZH[code], _STATUS_LABELS_EN[code]) for code in codes]
+    values = [counts.get(code, 0) for code in codes]
     fractions = [v / total if total else 0.0 for v in values]
-    colors = [_STATUS_COLORS[code] for code in _STATUS_ORDER]
-    bars = ax.bar(range(len(_STATUS_ORDER)), fractions, color=colors, edgecolor="white")
+    colors = [_STATUS_COLORS[code] for code in codes]
+    bars = ax.bar(range(len(codes)), fractions, color=colors, edgecolor="white")
     for bar, value, fraction in zip(bars, values, fractions, strict=True):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -2123,7 +2136,7 @@ def _plot_terminal_counts(
             fontsize=8,
             fontproperties=font,
         )
-    ax.set_xticks(range(len(_STATUS_ORDER)))
+    ax.set_xticks(range(len(codes)))
     ax.set_xticklabels(labels, rotation=25, ha="right", fontproperties=font, fontsize=8)
     ax.set_ylabel(t.t("佔全站粒子數比例", "Fraction of all particles at this site"), fontproperties=font)
     ax.set_ylim(0, max(fractions + [0.05]) * 1.25)
@@ -4307,7 +4320,7 @@ def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case: _Experimen
         )
     elif stem == "terminal_counts":
         body = (
-            "七種未穿越邊界的停止類別與一種成功穿越開放邊界的粒子計數與比例長條圖，分母為 "
+            "本站實際出現之停止類別（含成功穿越開放邊界）的粒子計數與比例長條圖，計數為 0 的類別不畫，分母為 "
             "boundary_summary_by_site.total_particle_count。資料來源：departures.parquet 的 "
             "final_status_code 逐列統計，並與 boundary_summary_by_site 的 fraction_* 欄位 "
             "互相核對。"
@@ -4537,9 +4550,8 @@ breakdown` 四張圖改用同一批被選取站點共同的色階上下限與刻
   時刻等情境設定後，代表粒子穿越各方位扇區／各邊界弧段的相對頻率，是描述這批
   M 個系集成員在既定設定下分布的統計量。來源機率與因果歸因是另一層科學推論，
   需要另外建立先驗、概似與觀測驗證，本批圖表不提供這一層推論。
-- 圖上的終止標記位置是回溯積分停止處的座標，對應 `final_status_code` 七種
-  互斥狀態之一（成功穿越 flow domain 開放邊界、達回溯上限、擱淺、沉底、流場
-  缺值、數值失敗、`pre_window_deposition`）；停止處是積分終止的座標，不是另外
+- 圖上的終止標記位置是回溯積分停止處的座標，對應 `final_status_code` 互斥
+  狀態之一（圖例只列本站實際出現者）；停止處是積分終止的座標，不是另外
   查證過的實際污染來源。
 - 海岸與開放邊界幾何目前的版本狀態是工程生成版：由既有海岸資料與弧段幾何直接
   取得，尚未經研究團隊另立正式核准發布流程。
@@ -4591,7 +4603,7 @@ flow=False`）與新竹／南灣／連江（`local_equals_flow=True`）五站的
 3. `depth_age.png`：深度（`z_m`，海面為 0、向上為正）對回溯時齡（小時）曲線，
    顏色依代表粒子的垂向抽樣序位分色——**序位不代表固定物理水層**，native 後
    處理沒有保留原始的 `vertical_id`。資料來源：`trajectory_samples_by_site`。
-4. `terminal_counts.png`：七種未穿越邊界的停止類別＋一種成功穿越開放邊界，計數
+4. `terminal_counts.png`：本站實際出現之停止類別（含成功穿越開放邊界，計數為 0 者不畫），計數
    與佔全站粒子比例；分母＝`boundary_summary_by_site.total_particle_count`，與
    該表的 `fraction_*` 欄位互相印證。資料來源：`departures.parquet`（逐列統計）、
    `boundary_summary_by_site`（分母核對）。

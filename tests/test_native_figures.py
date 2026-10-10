@@ -1500,3 +1500,78 @@ def test_json_policy_over_limit_metadata_fields_match_manifest_keys(
                 continue
             for field in declared_fields:
                 assert field in site_record
+
+
+def test_status_codes_present_lists_only_nonzero_categories_in_fixed_order() -> None:
+    departures = {
+        "final_status_code": np.array(
+            [
+                NATIVE_STATUS_DEPOSITED,
+                NATIVE_STATUS_LEFT_INTEREST_REGION,
+                NATIVE_STATUS_LEFT_INTEREST_REGION,
+                NATIVE_STATUS_MAX_BACKTRACK,
+            ],
+            dtype=np.int64,
+        )
+    }
+    assert native_figures._status_codes_present(departures) == (
+        NATIVE_STATUS_LEFT_INTEREST_REGION,
+        NATIVE_STATUS_MAX_BACKTRACK,
+        NATIVE_STATUS_DEPOSITED,
+    )
+    # 全部為 0 的退回情形：只列成功穿越一類
+    empty = {"final_status_code": np.array([], dtype=np.int64)}
+    assert native_figures._status_codes_present(empty) == (NATIVE_STATUS_LEFT_INTEREST_REGION,)
+
+
+def test_terminal_status_legend_and_bars_omit_zero_count_categories(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """終止類別圖例（水平軌跡總覽）與停止類別長條圖只呈現計數大於 0 的類別。
+
+    合成資料六種未穿越狀態都有，因此以替身把流場缺值、數值失敗、沉底三類的計數歸零，
+    檢查圖例與長條圖都不再出現這三類，且長條圖每一根的計數皆大於 0。
+    """
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    dropped = (NATIVE_STATUS_FORCING_MISSING, NATIVE_STATUS_NUMERICAL_FAILURE, NATIVE_STATUS_DEPOSITED)
+    original_counts = native_figures._status_counts
+
+    def _counts_without_dropped(departures):
+        counts = original_counts(departures)
+        return {code: n for code, n in counts.items() if code not in dropped}
+
+    monkeypatch.setattr(native_figures, "_status_counts", _counts_without_dropped)
+    dropped_labels = {
+        label
+        for code in dropped
+        for label in (native_figures._STATUS_LABELS_ZH[code], native_figures._STATUS_LABELS_EN[code])
+    }
+    kept_labels = {
+        label
+        for code in (NATIVE_STATUS_LEFT_INTEREST_REGION, NATIVE_STATUS_MAX_BACKTRACK, NATIVE_STATUS_STRANDED)
+        for label in (native_figures._STATUS_LABELS_ZH[code], native_figures._STATUS_LABELS_EN[code])
+    }
+    seen: dict[str, list[str]] = {"legend": [], "ticks": [], "bar_texts": []}
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        if path.stem == "horizontal_overview":
+            seen["legend"] += [t.get_text() for leg in fig.legends for t in leg.get_texts()]
+        if path.stem == "terminal_counts":
+            ax = fig.axes[0]
+            seen["ticks"] += [t.get_text() for t in ax.get_xticklabels()]
+            seen["bar_texts"] += [t.get_text() for t in ax.texts]
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+
+    assert seen["legend"] and seen["ticks"] and seen["bar_texts"]
+    for group in ("legend", "ticks"):
+        assert not (set(seen[group]) & dropped_labels), (group, seen[group])
+        assert kept_labels & set(seen[group]), (group, seen[group])
+    assert all(not text.startswith("0\n") for text in seen["bar_texts"]), seen["bar_texts"]
