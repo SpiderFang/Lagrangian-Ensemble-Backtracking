@@ -1191,9 +1191,9 @@ def test_color_scales_manifest_has_fixed_vmin_and_seven_ticks_for_four_stems(
     for record in color_scales.values():
         assert record["vmin"] == 0.0
         assert record["vmax"] > 0.0
-        assert len(record["ticks"]) == 7
         assert record["ticks"][0] == pytest.approx(0.0)
         assert record["ticks"][-1] == pytest.approx(record["vmax"])
+        assert len(record["ticks"]) == 7 or record["vmax"] == 0.5
         assert record["colorbar_extend"] == "neither"
         assert set(record["per_site"]) == {"site_a", "site_b"}
         for site_record in record["per_site"].values():
@@ -1252,17 +1252,48 @@ def test_compute_shared_color_scales_pools_across_sites_not_just_one_site() -> N
     site_high = _make_site("site_high", crossed_count=100, sector_index=0)
 
     scales = native_figures._compute_shared_color_scales((site_low, site_high))
-    rose_scale = scales["boundary_azimuth_rose"]
-    assert rose_scale.vmax == pytest.approx(0.99)
-    assert rose_scale.vmin == 0.0
+    # 玫瑰圖與沉降速度細分熱圖固定 0.0～0.5、六個刻度（0.0、0.1、…、0.5），不隨資料變動。
+    for stem in ("boundary_azimuth_rose", "settling_velocity_breakdown"):
+        assert scales[stem].vmin == 0.0
+        assert scales[stem].vmax == pytest.approx(0.5)
+        assert scales[stem].ticks() == pytest.approx((0.0, 0.1, 0.2, 0.3, 0.4, 0.5))
+    # 其餘兩種仍為跨站最大值，不是固定常數。
+    assert scales["boundary_arc_segments"].vmax != pytest.approx(0.5)
 
-    # 兩站共用同一個 ColorScale 物件的 vmax，不是各自獨立算出 0.9／0.99。
     manifest_block = native_figures._build_color_scale_manifest((site_low, site_high), scales)
-    assert manifest_block["boundary_azimuth_rose"]["vmax"] == pytest.approx(0.99)
-    low_over_limit = manifest_block["boundary_azimuth_rose"]["per_site"]["site_low"]
-    high_over_limit = manifest_block["boundary_azimuth_rose"]["per_site"]["site_high"]
-    assert low_over_limit["over_limit_count"] == 0  # 0.9 < 0.99，不超限
-    assert high_over_limit["over_limit_count"] == 0  # 0.99 就是上限本身，不超限
+    assert manifest_block["boundary_azimuth_rose"]["vmax"] == pytest.approx(0.5)
+    assert manifest_block["boundary_azimuth_rose"]["vmax_basis"] == "fixed_0_to_0.5"
+    assert manifest_block["boundary_arc_segments"]["vmax_basis"].startswith("max_of")
+    # 本測試資料之主要扇區權重 0.9／0.99 超過 0.5：不裁切，只在 manifest 記超限。
+    assert manifest_block["boundary_azimuth_rose"]["per_site"]["site_high"]["over_limit_count"] > 0
+
+
+def test_weight_colorbar_labels_have_no_parenthetical_and_fixed_ticks(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    postprocess_dir, coastline_path = synthetic_inputs
+    seen: dict[str, dict] = {}
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        if path.stem in ("boundary_azimuth_rose", "settling_velocity_breakdown"):
+            cax = fig.axes[-1]
+            seen[path.stem] = {
+                "label": cax.get_ylabel(),
+                "ticks": [float(t.get_text().replace("\u2212", "-")) for t in cax.get_yticklabels() if t.get_text()],
+                "ylim": cax.get_ylim(),
+            }
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+    assert set(seen) == {"boundary_azimuth_rose", "settling_velocity_breakdown"}
+    for stem, rec in seen.items():
+        assert "跨站共用" not in rec["label"] and "（" not in rec["label"] and "shared" not in rec["label"], rec
+        assert rec["ylim"] == pytest.approx((0.0, 0.5)), (stem, rec)
 
 
 def test_color_scale_over_limit_reports_saturation_without_clipping_data() -> None:

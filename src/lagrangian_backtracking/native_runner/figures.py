@@ -1444,6 +1444,14 @@ _SHARED_COLOR_SCALE_STEMS: tuple[str, ...] = (
 額外的「共用色階」機制。"""
 
 
+# 方位扇區相對來源權重的兩類圖（玫瑰圖、沉降速度細分熱圖）固定使用 0.0～0.5、
+# 刻度 0.0、0.1、…、0.5（六個），不隨該次資料最大值變動。超過 0.5 的值不裁切
+# （matplotlib 以最頂端顏色顯示），超限狀況仍記入 manifest 的 over_limit 欄位。
+_FIXED_WEIGHT_SCALE_STEMS: tuple[str, ...] = ("boundary_azimuth_rose", "settling_velocity_breakdown")
+_FIXED_WEIGHT_SCALE_VMAX = 0.5
+_FIXED_WEIGHT_SCALE_TICK_COUNT = 6
+
+
 @dataclass(frozen=True, slots=True)
 class ColorScale:
     """一張圖在跨站比較情境下共用的色階上下限與刻度。
@@ -1571,6 +1579,10 @@ def _compute_shared_color_scales(sites: tuple[SiteData, ...]) -> dict[str, Color
         if not math.isfinite(vmax) or vmax <= 0.0:
             vmax = _COLOR_SCALE_DEFAULT_VMAX
         scales[stem] = ColorScale(vmin=0.0, vmax=vmax)
+    for stem in _FIXED_WEIGHT_SCALE_STEMS:
+        scales[stem] = ColorScale(
+            vmin=0.0, vmax=_FIXED_WEIGHT_SCALE_VMAX, tick_count=_FIXED_WEIGHT_SCALE_TICK_COUNT
+        )
     return scales
 
 
@@ -1600,7 +1612,11 @@ def _build_color_scale_manifest(
         result[stem] = {
             "vmin": scale.vmin,
             "vmax": scale.vmax,
-            "vmax_basis": "max_of_finite_values_across_selected_sites_this_run",
+            "vmax_basis": (
+                "fixed_0_to_0.5"
+                if stem in _FIXED_WEIGHT_SCALE_STEMS
+                else "max_of_finite_values_across_selected_sites_this_run"
+            ),
             "ticks": list(scale.ticks()),
             "colorbar_extend": "neither",
             "per_site": per_site,
@@ -2210,7 +2226,7 @@ def _plot_boundary_azimuth_rose(
     cbar = fig.colorbar(sm, ax=ax, fraction=0.045, pad=0.09, shrink=0.75)
     cbar.set_ticks(color_scale.ticks())
     cbar.set_label(
-        t.t("相對來源權重（跨站共用色階）", "Relative source weight (shared cross-site scale)"),
+        t.t("相對來源權重", "Relative source weight"),
         fontproperties=font,
     )
 
@@ -2646,10 +2662,7 @@ def _plot_settling_velocity_breakdown(
     cbar = fig.colorbar(im, ax=ax_heat, fraction=0.045, pad=0.02)
     cbar.set_ticks(color_scale.ticks())
     cbar.set_label(
-        t.t(
-            "相對來源權重（同沉降速度分組內，跨站共用色階）",
-            "Relative source weight (within same settling velocity, shared cross-site scale)",
-        ),
+        t.t("相對來源權重", "Relative source weight"),
         fontproperties=font,
     )
 
