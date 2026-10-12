@@ -4705,7 +4705,7 @@ def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigur
     return (
         "## WP-38：停留時數密度、回溯快照與邊界弧長分布\n\n"
         "後處理目錄含足跡產品（`native-postprocess --with-footprint`）時，每站另外輸出四張圖：\n\n"
-        "1. `source_footprint_residence.png`：停留時數密度（跨站共用對數色階）。停留時數＝回溯過程中逐小時、"
+        "1. `source_footprint_residence.png`：停留時數密度（對數色階）。停留時數＝回溯過程中逐小時、"
         "仍在漂流（尚未終止）的粒子所在網格的粒子小時數，終止後凍結的位置不計入；色階單位 % 停留時數／km²，"
         "上限為最大值向上取整到 10 的整數次方、下限為上限的 1/10000，每個 10 的次方標一個刻度，"
         "低於下限不著色；疊高密度區間（HDR）50%／75%／90%。\n"
