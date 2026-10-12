@@ -1451,6 +1451,7 @@ def test_horizontal_overview_caption_no_longer_mentions_local_domain_layer(
             assert "疊 local／flow 兩條開放邊界" not in caption
             assert "local_domain_departures.parquet 的 local 首次" not in caption
             assert "不畫 local domain" in caption
+            assert "五站" not in caption and "跨站" not in caption
 
 
 # ═══════════════════════════════════════════════════════════════════════════

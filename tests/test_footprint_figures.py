@@ -227,6 +227,7 @@ def test_captions_cover_definition_normalisation_measured_m_and_wording(tmp_path
         assert "一維" in residence and "二維核密度不適用" in residence
         assert "跨站共用色階" not in residence and "本站自訂色階" in site_scale
         assert "跨站共用色階" not in site_scale
+        assert "跨站" not in residence and "跨站" not in site_scale
         assert "回溯" in snapshot and "仍在漂流" in snapshot
         assert "沿流場範圍開放邊界折線" in arc
     captions_md = (out / "captions.md").read_text(encoding="utf-8")

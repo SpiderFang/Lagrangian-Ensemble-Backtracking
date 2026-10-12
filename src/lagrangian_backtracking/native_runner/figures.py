@@ -4124,7 +4124,7 @@ def _footprint_caption_zh(
         else:
             scale_zh = (
                 f"本圖採用本站自訂色階（本站最大值為 {site_vmax:.3g} % 停留時數／km²），"
-                "只適合看本站內部的分布形狀；跨站比較請看停留時數密度圖"
+                "只適合看本站內部的分布形狀"
             )
         scale_tail = f"；{scale_zh}。" if scale_zh else "。"
         scale_vmax = shared_vmax if stem == "source_footprint_residence" else site_vmax
@@ -4304,7 +4304,7 @@ def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case: _Experimen
     if stem == "horizontal_overview":
         body = (
             "代表粒子水平軌跡總覽，涵蓋整個 flow domain 範圍，標示 flow domain 開放邊界"
-            "（終止邊界）與依 final_status_code 著色的終止標記；五站圖面版式一致，不畫 "
+            "（終止邊界）與依 final_status_code 著色的終止標記；不畫 "
             "local domain 邊界或 local domain 首次離開標記（WP-25 裁決，該事件仍完整"
             "保存於 local_domain_departures.parquet 等資料表，只是不在這張圖呈現）。"
             "資料來源：trajectory_samples_by_site.parquet 的軌跡座標與時間、"
@@ -4538,12 +4538,12 @@ _README_TEMPLATE = """\
 輸入檔**；輸入檔前後 SHA-256 已核對一致（見 `manifest.json`）。文字層級為
 `--figure-text {figure_text}`（見下方「每站八張圖」一節）。
 
-**WP-25：輸出格式與跨站色階**——每張圖同時輸出 `.png`（{dpi} dpi）與同名
+**WP-25：輸出格式與色階**——每張圖同時輸出 `.png`（{dpi} dpi）與同名
 `.svg`（向量），對齊相鄰專案 `OCM-SVD-Analysis` 的正式成圖規範（見
 `docs/results/17_native_figures_formal_output_rules.md`）；`source_footprint_
 kde`、`boundary_arc_segments`、`boundary_azimuth_rose`、`settling_velocity_
-breakdown` 四張圖改用同一批被選取站點共同的色階上下限與刻度，讓站間可直接
-比較，超過上限的值以最高色顯示、不裁切資料，實際狀態記錄於 `manifest.json`
+breakdown` 四張圖之色階上下限與刻度固定，
+超過上限的值以最高色顯示、不裁切資料，實際狀態記錄於 `manifest.json`
 的 `color_scales` 區塊（`over_limit_count`／`over_limit_fraction`／
 `display_saturation`）。
 
@@ -4573,16 +4573,13 @@ breakdown` 四張圖改用同一批被選取站點共同的色階上下限與刻
 研究團隊裁決（`AGENTS.md`、`docs/development/05_decisions_and_risks.md`
 D008）：**終止一律以 flow domain 開放邊界為準；離開站點 local domain 是非終止
 事件，只記錄、粒子繼續回溯**。`departures.parquet` 的 `crossed_interest_region_
-boundary`／`final_status_code` 因此一律是 flow domain 語意，五站可直接互相
-比較；`local_domain_departures.parquet`、`local_domain_first_exit_summary_by_
+boundary`／`final_status_code` 因此一律是 flow domain 語意；`local_domain_departures.parquet`、`local_domain_first_exit_summary_by_
 site` 與 `departures.parquet` 的 `also_local_domain_first_exit` 欄位完整保存
 每顆粒子「首次離開自己站點 local domain」的位置與統計，不受下一段圖面裁決
 影響。
 
 **WP-25 裁決**：`horizontal_overview.png`／`horizontal_local.png` 不再畫 local
-domain 邊界或 local domain 首次離開標記，讓貢寮／龜山島（`local_equals_
-flow=False`）與新竹／南灣／連江（`local_equals_flow=True`）五站的圖面版式
-完全一致——圖上只保留 **flow domain 開放邊界**（藍色虛線，真正的終止邊界，
+domain 邊界或 local domain 首次離開標記，圖上只保留 **flow domain 開放邊界**（藍色虛線，真正的終止邊界，
 `terminal_counts.png` 等圖的「穿越開放邊界（正常結束）」指的就是這裡）與依
 `final_status_code` 著色的終止標記。若需要 local domain 首次離開的空間分布，
 請直接查詢 `local_domain_departures.parquet`（僅 `local_equals_flow=False`
@@ -4599,7 +4596,7 @@ flow=False`）與新竹／南灣／連江（`local_equals_flow=True`）五站的
 
 1. `horizontal_overview.png`：代表粒子水平軌跡總覽（經緯度顯示，涵蓋整個 flow
    domain 範圍），**只畫 flow domain 開放邊界**（見上一節；WP-25 起不再畫
-   local domain 邊界或首次離開標記，五站版式一致）。資料來源：
+   local domain 邊界或首次離開標記）。資料來源：
    `trajectory_samples_by_site`（軌跡座標、狀態）、`departures.parquet`
    （`final_status_code`）、`boundary_arc_segments_geometry_by_site`
    （開放邊界折線）。綠點＝回溯起點（受體到達位置）；終點依
@@ -4710,8 +4707,7 @@ def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigur
         "上限為最大值向上取整到 10 的整數次方、下限為上限的 1/10000，每個 10 的次方標一個刻度，"
         "低於下限不著色；疊高密度區間（HDR）50%／75%／90%。\n"
         "2. `source_footprint_residence_site_scale.png`：同一份資料，色階上限改用各站自己的最大值，"
-        "只適合看單站"
-        "內部形狀；跨站比較請看上一張。\n"
+        "只適合看單站內部形狀。\n"
         "3. `lookback_snapshot.png`：回溯 72／168／336／720 小時仍在漂流的粒子的條件式來源足跡（2×2 面板，"
         "與停留時數密度同網格的直方圖，可選海域遮罩下的輕度平滑），標題列出仍在漂流的比例；"
         "仍在漂流粒子數低於門檻的面板不畫密度。\n"
