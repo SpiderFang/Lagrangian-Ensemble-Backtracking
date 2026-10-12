@@ -600,10 +600,10 @@ def test_colorbar_end_ticks_equal_limits_are_decades_and_labelled(tmp_path, foot
     for bar in bars:
         vmin, vmax = bar["ylim"]
         assert bar["ticks"][0] == pytest.approx(vmin) and bar["ticks"][-1] == pytest.approx(vmax)
-        assert vmax / vmin == pytest.approx(1e4)
+        assert vmax / vmin == pytest.approx(1e4) or vmax / vmin == pytest.approx(1e5)  # 停留時數密度 1e4；回溯快照 1e5
         exps = np.log10(bar["ticks"])
         assert np.allclose(exps, np.round(exps)) and np.allclose(np.diff(exps), 1.0)  # 每個 10 的次方一個刻度
-        assert len(bar["ticks"]) == 5
+        assert len(bar["ticks"]) == round(np.log10(vmax / vmin)) + 1
         assert all(label.startswith("$10^{") for label in bar["labels"])  # 兩端與中間都有顯示文字
         assert bar["labels"][0] and bar["labels"][-1]
 
@@ -1034,3 +1034,28 @@ def test_arc_edge_and_corner_names_sit_above_the_frame_without_overlap(
         assert not any(
             boxes[i].overlaps(boxes[j]) for i in range(len(boxes)) for j in range(i + 1, len(boxes))
         )
+
+
+def test_arc_distribution_and_snapshot_use_fixed_limits_for_every_site(tmp_path, footprint_inputs, monkeypatch):
+    """沿邊界弧長分布圖左縱軸固定 0～50%；回溯快照色階固定 10^-4～10^1；各站相同。"""
+
+    seen: dict[str, dict[str, tuple]] = {}
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        if path.stem == "boundary_departure_along_arc":
+            ax = fig.axes[0]
+            seen.setdefault("arc", {})[path.parent.name] = (ax.get_ylim(), [float(v) for v in ax.get_yticks()])
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths)
+    values = list(seen["arc"].values())
+    assert len(values) == len(SITES) and all(v == values[0] for v in values)
+    assert values[0][0] == pytest.approx((0.0, 50.0)) and values[0][1][-1] == 50.0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    limits = manifest["footprint_figures"]["snapshot_color_scale"]["limits_by_site"]
+    assert len({(v["lower_limit"], v["upper_limit"]) for v in limits.values()}) == 1
+    for v in limits.values():
+        assert v["lower_limit"] == pytest.approx(1e-4) and v["upper_limit"] == pytest.approx(10.0)

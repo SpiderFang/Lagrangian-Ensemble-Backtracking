@@ -1193,7 +1193,7 @@ def test_color_scales_manifest_has_fixed_vmin_and_seven_ticks_for_four_stems(
         assert record["vmax"] > 0.0
         assert record["ticks"][0] == pytest.approx(0.0)
         assert record["ticks"][-1] == pytest.approx(record["vmax"])
-        assert len(record["ticks"]) == 7 or record["vmax"] == 0.5
+        assert len(record["ticks"]) in (6, 7, 8)
         assert record["colorbar_extend"] == "neither"
         assert set(record["per_site"]) == {"site_a", "site_b"}
         for site_record in record["per_site"].values():
@@ -1202,9 +1202,10 @@ def test_color_scales_manifest_has_fixed_vmin_and_seven_ticks_for_four_stems(
             # （見 _compute_shared_color_scales docstring 對「與 OCM-SVD-Analysis
             # 差異」的誠實揭露）；仍要求欄位存在，供未來改用外部固定常數時沿用
             # 同一套統計與紀錄邏輯。
-            assert site_record["over_limit_count"] == 0
-            assert site_record["over_limit_fraction"] == 0.0
-            assert site_record["display_saturation"] is False
+            # 玫瑰圖、沉降速度對照圖、弧段權重圖與來源足跡密度圖皆為固定色階（不取自資料）：
+            # 合成資料可能超限（只記錄、不裁切），故只要求欄位存在且自洽。
+            assert 0 <= site_record["over_limit_count"] <= site_record["sample_count"]
+            assert (site_record["over_limit_count"] > 0) == site_record["display_saturation"]
 
 
 def test_compute_shared_color_scales_pools_across_sites_not_just_one_site() -> None:
@@ -1257,13 +1258,19 @@ def test_compute_shared_color_scales_pools_across_sites_not_just_one_site() -> N
         assert scales[stem].vmin == 0.0
         assert scales[stem].vmax == pytest.approx(0.5)
         assert scales[stem].ticks() == pytest.approx((0.0, 0.1, 0.2, 0.3, 0.4, 0.5))
-    # 其餘兩種仍為跨站最大值，不是固定常數。
-    assert scales["boundary_arc_segments"].vmax != pytest.approx(0.5)
+    # 弧段權重圖固定 0.0～0.6（七個刻度）；來源足跡密度固定 0～3.5e-9（八個刻度）。
+    assert scales["boundary_arc_segments"].vmax == pytest.approx(0.6)
+    assert scales["boundary_arc_segments"].ticks() == pytest.approx((0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6))
+    assert scales["source_footprint_kde"].vmax == pytest.approx(3.5e-9)
+    assert scales["source_footprint_kde"].ticks() == pytest.approx(
+        tuple(0.5e-9 * i for i in range(8))
+    )
 
     manifest_block = native_figures._build_color_scale_manifest((site_low, site_high), scales)
     assert manifest_block["boundary_azimuth_rose"]["vmax"] == pytest.approx(0.5)
     assert manifest_block["boundary_azimuth_rose"]["vmax_basis"] == "fixed_0_to_0.5"
-    assert manifest_block["boundary_arc_segments"]["vmax_basis"].startswith("max_of")
+    assert manifest_block["boundary_arc_segments"]["vmax_basis"] == "fixed_0_to_0.6"
+    assert manifest_block["source_footprint_kde"]["vmax_basis"] == "fixed_0_to_3.5e-09"
     # 本測試資料之主要扇區權重 0.9／0.99 超過 0.5：不裁切，只在 manifest 記超限。
     assert manifest_block["boundary_azimuth_rose"]["per_site"]["site_high"]["over_limit_count"] > 0
 
@@ -1325,6 +1332,60 @@ def test_arc_segments_and_kde_colorbar_titles_have_no_shared_scale_wording(
         assert "跨站共用" not in joined and "shared scale" not in joined.lower(), (stem, joined)
     assert any(t == "相對來源權重" for t in seen["boundary_arc_segments"])
     assert any(t.startswith("條件式來源足跡密度") for t in seen["source_footprint_kde"])
+
+
+def test_numeric_axes_use_the_same_fixed_limits_for_every_site(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """停止類別比例、深度—時齡、沉降速度對照左側長條、弧段權重長條的數值軸範圍，
+    各站必須完全相同（不隨資料自動縮放），且首末刻度就是軸的兩端。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    seen: dict[str, dict[str, dict]] = {}
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        stem, site = path.stem, path.parent.name
+        rec = None
+        if stem == "terminal_counts":
+            ax = fig.axes[0]
+            rec = {"ylim": ax.get_ylim(), "yticks": [round(float(v), 6) for v in ax.get_yticks()]}
+        elif stem == "depth_age":
+            ax = fig.axes[0]
+            rec = {
+                "xlim": ax.get_xlim(), "ylim": ax.get_ylim(),
+                "xticks": [float(v) for v in ax.get_xticks()],
+                "yticks": [float(v) for v in ax.get_yticks()],
+            }
+        elif stem == "settling_velocity_breakdown":
+            rec = {"xlim": fig.axes[0].get_xlim(), "xticks": [round(float(v), 6) for v in fig.axes[0].get_xticks()]}
+        elif stem == "boundary_arc_segments":
+            ax_bar = fig.axes[-1]
+            rec = {"ylim": ax_bar.get_ylim(), "yticks": [round(float(v), 6) for v in ax_bar.get_yticks()]}
+        if rec is not None:
+            seen.setdefault(stem, {})[site] = rec
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+    assert set(seen) == {"terminal_counts", "depth_age", "settling_velocity_breakdown", "boundary_arc_segments"}
+    for stem, per_site in seen.items():
+        records = list(per_site.values())
+        assert len(records) == 2
+        assert records[0] == records[1], (stem, per_site)
+    tc = next(iter(seen["terminal_counts"].values()))
+    assert tc["ylim"] == pytest.approx((0.0, 1.2)) and tc["yticks"][0] == 0.0 and tc["yticks"][-1] == 1.2
+    da = next(iter(seen["depth_age"].values()))
+    assert da["xlim"] == pytest.approx((0.0, 2400.0)) and da["ylim"] == pytest.approx((-200.0, 25.0))
+    assert da["xticks"][0] == 0.0 and da["xticks"][-1] == 2400.0
+    assert da["yticks"][0] == -200.0 and da["yticks"][-1] == 25.0
+    sv = next(iter(seen["settling_velocity_breakdown"].values()))
+    assert sv["xlim"] == pytest.approx((0.0, 1.0)) and sv["xticks"][-1] == 1.0
+    ar = next(iter(seen["boundary_arc_segments"].values()))
+    assert ar["ylim"] == pytest.approx((0.0, 0.6)) and ar["yticks"][-1] == pytest.approx(0.6)
 
 
 def test_color_scale_over_limit_reports_saturation_without_clipping_data() -> None:

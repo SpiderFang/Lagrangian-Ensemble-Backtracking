@@ -1451,6 +1451,13 @@ _FIXED_WEIGHT_SCALE_STEMS: tuple[str, ...] = ("boundary_azimuth_rose", "settling
 _FIXED_WEIGHT_SCALE_VMAX = 0.5
 _FIXED_WEIGHT_SCALE_TICK_COUNT = 6
 
+_FIXED_RANGE_SCALES: dict[str, tuple[float, int]] = {
+    "boundary_arc_segments": (0.6, 7),
+    "source_footprint_kde": (3.5e-9, 8),
+}
+"""固定上限與刻度數的色階（``vmin`` 皆為 0）：弧段權重 0.0～0.6、刻度 0.1 一格；
+條件式來源足跡密度 0～3.5×10⁻⁹ 每平方公尺、刻度 0.5×10⁻⁹ 一格。五站、兩案共用，不隨資料變動。"""
+
 
 @dataclass(frozen=True, slots=True)
 class ColorScale:
@@ -1583,6 +1590,8 @@ def _compute_shared_color_scales(sites: tuple[SiteData, ...]) -> dict[str, Color
         scales[stem] = ColorScale(
             vmin=0.0, vmax=_FIXED_WEIGHT_SCALE_VMAX, tick_count=_FIXED_WEIGHT_SCALE_TICK_COUNT
         )
+    for stem, (fixed_vmax, fixed_ticks) in _FIXED_RANGE_SCALES.items():
+        scales[stem] = ColorScale(vmin=0.0, vmax=fixed_vmax, tick_count=fixed_ticks)
     return scales
 
 
@@ -1615,6 +1624,8 @@ def _build_color_scale_manifest(
             "vmax_basis": (
                 "fixed_0_to_0.5"
                 if stem in _FIXED_WEIGHT_SCALE_STEMS
+                else f"fixed_0_to_{_FIXED_RANGE_SCALES[stem][0]:g}"
+                if stem in _FIXED_RANGE_SCALES
                 else "max_of_finite_values_across_selected_sites_this_run"
             ),
             "ticks": list(scale.ticks()),
@@ -2092,6 +2103,10 @@ def _plot_depth_age(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int
         color = cmap(0.0 if sample.rank_total <= 1 else (sample.rank_index - 1) / (sample.rank_total - 1))
         ax.plot(sample.age_hours, sample.z_m, color=color, linewidth=1.2, alpha=0.85)
     ax.axhline(0.0, color="#888888", linewidth=0.8, linestyle=":")
+    ax.set_xlim(*_DEPTH_AGE_XLIM)
+    ax.set_xticks(np.arange(_DEPTH_AGE_XLIM[0], _DEPTH_AGE_XLIM[1] + 1e-9, _DEPTH_AGE_XSTEP))
+    ax.set_ylim(*_DEPTH_AGE_YLIM)
+    ax.set_yticks(np.arange(_DEPTH_AGE_YLIM[0], _DEPTH_AGE_YLIM[1] + 1e-9, _DEPTH_AGE_YSTEP))
     ax.set_xlabel(t.t("回溯時齡（小時）", "Backtrack age (hours)"), fontproperties=font)
     ax.set_ylabel(
         t.t("深度 z（公尺，海面為 0，向上為正）", "Depth z (m, sea surface = 0, up positive)"),
@@ -2121,6 +2136,18 @@ def _plot_depth_age(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int
     fig.subplots_adjust(left=0.02, bottom=0.12, right=0.98, top=_title_top_margin(figure_text, full=0.90))
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
+
+
+_TERMINAL_COUNTS_YMAX = 1.2
+_DEPTH_AGE_XLIM = (0.0, 2400.0)
+_DEPTH_AGE_XSTEP = 400.0
+_DEPTH_AGE_YLIM = (-200.0, 25.0)
+_DEPTH_AGE_YSTEP = 25.0
+_ARC_SHARE_YMAX = 50.0
+_ARC_SHARE_YSTEP = 10.0
+_SNAPSHOT_FIXED_LIMITS = (1e-4, 10.0)
+"""五站、兩案固定的數值軸範圍：停止類別比例 0～1.2；深度—時齡圖時齡 0～2400 小時、
+深度 −200～25 公尺；沿邊界弧長分布圖左縱軸 0～50%；回溯快照圖色階 10⁻⁴～10¹。"""
 
 
 def _plot_terminal_counts(
@@ -2155,7 +2182,8 @@ def _plot_terminal_counts(
     ax.set_xticks(range(len(codes)))
     ax.set_xticklabels(labels, rotation=25, ha="right", fontproperties=font, fontsize=8)
     ax.set_ylabel(t.t("佔全站粒子數比例", "Fraction of all particles at this site"), fontproperties=font)
-    ax.set_ylim(0, max(fractions + [0.05]) * 1.25)
+    ax.set_ylim(0.0, _TERMINAL_COUNTS_YMAX)
+    ax.set_yticks(np.arange(0.0, _TERMINAL_COUNTS_YMAX + 1e-9, 0.2))
     ax.grid(axis="y", color="#dddddd", linewidth=0.6)
 
     _add_two_line_title(
@@ -2415,6 +2443,7 @@ def _plot_boundary_arc_segments(
         [all_labels[i] for i in order], **_tick_font_kwargs(t, font), rotation=90, fontsize=6
     )
     ax_bar.set_ylim(color_scale.vmin, color_scale.vmax)
+    ax_bar.set_yticks(list(color_scale.ticks()))
     ax_bar.set_ylabel(
         t.t("相對來源權重", "Relative source weight"),
         fontproperties=font,
@@ -2632,6 +2661,8 @@ def _plot_settling_velocity_breakdown(
     ax_bar.barh(range(len(sv_values)), crossing_fractions, color="#4c78a8")
     ax_bar.set_yticks(range(len(sv_values)))
     ax_bar.set_yticklabels(sv_labels, fontsize=8)
+    ax_bar.set_xlim(0.0, 1.0)
+    ax_bar.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax_bar.set_xlabel(t.t("穿越開放邊界比例", "Fraction crossing open boundary"), fontproperties=font)
     ax_bar.set_ylabel(
         t.t("沉降速度（公尺/秒，負值為下沉）", "Settling velocity (m/s, negative = sinking)"),
@@ -3435,14 +3466,9 @@ def _pow10_text(value: float) -> str:
 
 
 def _snapshot_color_limits(fp: FootprintSiteFigureData) -> tuple[float, float]:
-    """快照圖四個面板共用的上下限：四個面板最大密度向上取整到 10 的整數次方。"""
+    """快照圖固定的上下限：下限 10⁻⁴、上限 10¹（單位 % 仍在漂流粒子／km²），五站、兩案相同。"""
 
-    peaks = [
-        float(s["density_pct_per_km2"].max())
-        for s in fp.snapshots[:4]
-        if s["density_pct_per_km2"] is not None
-    ]
-    return _decade_limits(max(peaks, default=0.0))
+    return _SNAPSHOT_FIXED_LIMITS
 
 
 def _limit_stats(
@@ -3902,7 +3928,7 @@ def _plot_boundary_departure_along_arc(
             transform=ax.transAxes,
             fontproperties=font,
         )
-        yticks = np.asarray([0.0, 1.0])
+        yticks = np.arange(0.0, _ARC_SHARE_YMAX + 1e-9, _ARC_SHARE_YSTEP)
     else:
         starts = np.asarray([float(b["s_start_km"]) for b in bins])
         ends = np.asarray([float(b["s_end_km"]) for b in bins])
@@ -3925,7 +3951,8 @@ def _plot_boundary_departure_along_arc(
         )
         ax2.plot(ends, cum, color="#3b2314", linewidth=1.6, zorder=3)
         ax2.plot([0.0, float(ends[0])], [0.0, float(cum[0])], color="#3b2314", linewidth=1.6, zorder=3)
-        ymax, yticks = _nice_ceiling_axis(float(share.max()) * 1.2, max_intervals=5)
+        ymax = _ARC_SHARE_YMAX
+        yticks = np.arange(0.0, _ARC_SHARE_YMAX + 1e-9, _ARC_SHARE_YSTEP)
         for e in edges:
             centre = 0.5 * (float(e["s_start_km"]) + float(e["s_end_km"]))
             ax.text(
@@ -4165,8 +4192,7 @@ def _footprint_caption_zh(
             "各面板標題列出仍在漂流的比例（分母是本站全部粒子）。"
             f"仍在漂流的粒子少於 {min_n} 顆時該面板不畫密度，並在面板中註明粒子數。"
             "色階為對數色階，四個面板共用同一組上下限與一條和面板同高的色條，單位為「% 仍在漂流粒子／km²」，"
-            f"上限為四個面板最大值向上取整到 10 的整數次方（{_pow10_text(hi_s)}），"
-            f"下限為上限的 1/10000（{_pow10_text(lo_s)}），低於下限的位置不著色；"
+            f"上限為 {_pow10_text(hi_s)}，下限為 {_pow10_text(lo_s)}，低於下限的位置不著色；"
             "線為該面板的高密度區間（HDR）50%、75%、90%，算法與停留時數密度相同。"
             "陸地畫在密度之上，密度不會出現在陸地上。"
             f"{base_zh}"
@@ -4180,7 +4206,7 @@ def _footprint_caption_zh(
             f"起點與前進方向取自邊界折線的頂點順序，邊界全長 {length_km:.0f} km；"
             f"直條為每 {bin_km:g} km 弧長內穿越的粒子占全部穿越粒子的百分比，棕色曲線與右軸為累積百分比；"
             f"淡色底色區分西、南、東、北各邊，虛線標出各邊之間的轉角。本站共 {crossed:,} 顆粒子穿越開放邊界。"
-            "橫軸從 0 起算到邊界全長向上取整，左縱軸從 0 起算到最大占比向上取整，右縱軸為 0 到 100%，"
+            "橫軸從 0 起算到邊界全長向上取整，左縱軸為 0 到 50%，右縱軸為 0 到 100%，"
             "三條軸的兩端都標值。"
             "穿越點全部落在一維的邊界線上，因此以一維分布呈現，取代舊版把這些點做二維核密度的圖。"
         )
@@ -4816,9 +4842,8 @@ def _build_footprint_figures_manifest(
         "snapshot_color_scale": {
             "unit": "% 仍在漂流粒子／km²",
             "norm": "log",
-            "lower_limit_fraction_of_upper_limit": lower,
-            "scale": "shared_across_the_four_panels_of_each_site",
-            "limit_rule": "上限＝四個面板最大值向上取整到 10 的整數次方；下限＝上限的 1/10000",
+            "scale": "fixed_for_all_sites_and_panels",
+            "limit_rule": "固定：上限＝10 的 1 次方；下限＝10 的 −4 次方（五站、兩案相同）",
             "limits_by_site": {
                 site.site_id: dict(
                     zip(
