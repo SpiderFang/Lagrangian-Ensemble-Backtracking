@@ -2395,7 +2395,7 @@ def _plot_boundary_arc_segments(
     cbar = fig.colorbar(sm, ax=ax_map, fraction=0.05, pad=0.02)
     cbar.set_ticks(color_scale.ticks())
     cbar.set_label(
-        t.t("相對來源權重（跨站共用色階）", "Relative source weight (shared cross-site scale)"),
+        t.t("相對來源權重", "Relative source weight"),
         fontproperties=font,
     )
 
@@ -2416,7 +2416,7 @@ def _plot_boundary_arc_segments(
     )
     ax_bar.set_ylim(color_scale.vmin, color_scale.vmax)
     ax_bar.set_ylabel(
-        t.t("相對來源權重（跨站共用色階）", "Relative source weight (shared cross-site scale)"),
+        t.t("相對來源權重", "Relative source weight"),
         fontproperties=font,
     )
     ax_bar.grid(axis="y", color="#dddddd", linewidth=0.6)
@@ -2504,8 +2504,8 @@ def _plot_source_footprint_kde(
         cbar.set_ticks(color_scale.ticks())
         cbar.set_label(
             t.t(
-                "條件式來源足跡密度（每平方公尺，跨站共用色階）",
-                "Conditional source footprint density (per m^2, shared cross-site scale)",
+                "條件式來源足跡密度（每平方公尺）",
+                "Conditional source footprint density (per m^2)",
             ),
             fontproperties=font,
         )
@@ -3661,11 +3661,8 @@ def _plot_source_footprint_residence(
     )
     total_hours = int(fp.grid["total_particle_hours"])
     resolution = float(fp.grid["resolution_deg"])
-    scale_text = (
-        t.t("跨站共用色階", "shared cross-site scale")
-        if scale_kind == "shared"
-        else t.t("本站自訂色階", "per-site scale")
-    )
+    # 跨站共用色階為預設，副標不另標示；只有本站自訂色階版本才標明。
+    scale_text = "" if scale_kind == "shared" else "｜" + t.t("本站自訂色階", "per-site scale")
     _add_two_line_title(
         fig,
         t,
@@ -3675,8 +3672,8 @@ def _plot_source_footprint_residence(
             site,
             t,
             extra=t.t(
-                f"\n總停留時數：{total_hours:,} 粒子小時｜網格 {resolution:.2f}°｜{scale_text}",
-                f"\n{total_hours:,} particle-hours | grid {resolution:.2f} deg | {scale_text}",
+                f"\n總停留時數：{total_hours:,} 粒子小時｜網格 {resolution:.2f}°{scale_text}",
+                f"\n{total_hours:,} particle-hours | grid {resolution:.2f} deg{scale_text}",
             ),
         ),
         figure_text=figure_text,
@@ -4123,15 +4120,13 @@ def _footprint_caption_zh(
 
     if stem in ("source_footprint_residence", "source_footprint_residence_site_scale"):
         if stem == "source_footprint_residence":
-            scale_zh = (
-                f"本圖採用跨站共用色階（各站最大值中的最大者為 {shared_vmax:.3g} % 停留時數／km²），"
-                "各站顏色深淺可直接比較"
-            )
+            scale_zh = ""  # 共用色階為預設，圖說不另述
         else:
             scale_zh = (
                 f"本圖採用本站自訂色階（本站最大值為 {site_vmax:.3g} % 停留時數／km²），"
-                "只適合看本站內部的分布形狀；跨站比較請看共用色階版本"
+                "只適合看本站內部的分布形狀；跨站比較請看停留時數密度圖"
             )
+        scale_tail = f"；{scale_zh}。" if scale_zh else "。"
         scale_vmax = shared_vmax if stem == "source_footprint_residence" else site_vmax
         lo_c, hi_c = _residence_color_limits(scale_vmax)
         body = (
@@ -4143,7 +4138,7 @@ def _footprint_caption_zh(
             f"網格為經緯度規則網格，解析度 {res:.2f}°（約 {km:.1f} km），面積依緯度以 cos φ 計算。"
             f"色階為對數色階，上限為最大值向上取整到 10 的整數次方（{_pow10_text(hi_c)}），"
             f"下限為上限的 1/10000（{_pow10_text(lo_c)}），每個 10 的次方標一個刻度，色條與地圖同高；"
-            f"低於下限的網格不著色（其數量與所占停留時數比例記錄在 manifest）；{scale_zh}。"
+            f"低於下限的網格不著色（其數量與所占停留時數比例記錄在 manifest）{scale_tail}"
             "圖上的線為高密度區間（Highest Density Region, HDR）50%、75%、90%：依密度由高到低累加網格，"
             f"累計到該比例的停留時數所需的最小面積範圍；本站三個區間的面積依序為 {_hdr_area_text(fp)}。"
             "與舊版邊界核密度圖的差別：舊圖的輸入只有粒子穿越開放邊界的那一個點，這些點全部落在一維的邊界線上，"

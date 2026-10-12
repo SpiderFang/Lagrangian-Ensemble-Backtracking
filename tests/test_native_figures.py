@@ -1296,6 +1296,37 @@ def test_weight_colorbar_labels_have_no_parenthetical_and_fixed_ticks(
         assert rec["ylim"] == pytest.approx((0.0, 0.5)), (stem, rec)
 
 
+def test_arc_segments_and_kde_colorbar_titles_have_no_shared_scale_wording(
+    tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """邊界弧段權重圖與來源足跡密度圖的色條標題不得帶「（跨站共用色階）」字樣。"""
+
+    postprocess_dir, coastline_path = synthetic_inputs
+    seen: dict[str, list[str]] = {}
+    original_save = native_figures._save_exclusive
+
+    def _checking_save(fig, path, *, dpi):
+        if path.stem in ("boundary_arc_segments", "source_footprint_kde"):
+            texts = []
+            for ax in fig.axes:
+                texts.extend([ax.get_ylabel(), ax.get_xlabel(), ax.get_title()])
+            texts.extend(t.get_text() for t in fig.texts)
+            seen.setdefault(path.stem, []).extend(texts)
+        return original_save(fig, path, dpi=dpi)
+
+    monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
+    config = native_figures.NativeFiguresConfig(
+        postprocess_dir=postprocess_dir, coastline_path=coastline_path, output_dir=tmp_path / "out",
+    )
+    native_figures.build_native_figures(config, command="lbt native-figures --test")
+    assert set(seen) == {"boundary_arc_segments", "source_footprint_kde"}
+    for stem, texts in seen.items():
+        joined = "; ".join(texts)
+        assert "跨站共用" not in joined and "shared scale" not in joined.lower(), (stem, joined)
+    assert any(t == "相對來源權重" for t in seen["boundary_arc_segments"])
+    assert any(t.startswith("條件式來源足跡密度") for t in seen["source_footprint_kde"])
+
+
 def test_color_scale_over_limit_reports_saturation_without_clipping_data() -> None:
     """直接單元測試 :meth:`ColorScale.over_limit`：提供一個刻意小於實際資料
     最大值的 ``vmax``（模擬未來若採用外部核定的固定常數，新資料可能超過它），
