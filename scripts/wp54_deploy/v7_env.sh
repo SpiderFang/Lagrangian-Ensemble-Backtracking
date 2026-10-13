@@ -87,6 +87,8 @@ require_clean_code() {
 # 資料根檢查（唯讀）：reconstruction 根必須是 v2 方法、四區齊全、manifest 雜湊與索引一致，且 ocm_native 與 nww3_analysis 存在。
 # 不建立任何檔案。與 v6 完全相同（資料根不變）。
 require_v6_data_root() {
+  # 完整檢查約需 6～7 分鐘（逐區驗證 patch 雜湊）。只有小規模試跑可設 LBT_SKIP_DATA_ROOT_CHECK=1 略過驗證；正式執行不得設定。
+  if [ "${LBT_SKIP_DATA_ROOT_CHECK:-0}" = 1 ]; then log "注意：略過 reconstruction 根的完整驗證（LBT_SKIP_DATA_ROOT_CHECK=1，僅限試跑）"; return 0; fi
   [ -d "$D/ocm_native" ] && [ -d "$D/nww3_analysis" ] && [ -d "$D/reconstruction" ] || die "資料根 $D 缺少 ocm_native／nww3_analysis／reconstruction"
   "$PY" - <<PYEOF || die "reconstruction 根檢查失敗（見上方訊息）"
 import json, os, sys
