@@ -11,6 +11,7 @@ import pytest
 
 from lagrangian_backtracking.scenarios import (
     BASELINE_BEHAVIORS,
+    SETTLING_CANDIDATE_COUNT,
     ArrivalTime,
     Receptor,
     build_scenarios,
@@ -118,37 +119,48 @@ def _round_to_3_significant_figures(value: float) -> float:
 
 
 def test_baseline_behaviors_match_settling_velocity_derivation_source() -> None:
-    """WP-35 來源一致性測試：BASELINE_BEHAVIORS 的十個定案值必須可由推導來源重算。
+    """v7 來源一致性測試：每類 10 個候選沉降速度必須與推導來源逐值一致。
 
-    直接讀 ``data/settling_velocity_derivation/results.csv``（稽核來源、本工作包不得
-    修改），逐 ``class_id`` 收集該類全部 3 個情境 × 2 個阻力係數界的 6 個沉降速度解，
-    重算幾何平均（取三位有效數字）與最小／最大值，並與 ``BASELINE_BEHAVIORS`` 對應
-    索引的 ``settling_velocity_mps``、``settling_velocity_slow_bound_mps``、
-    ``settling_velocity_fast_bound_mps`` 比對，讓「報告上的數字就是程式算出來的」
-    成為機器強制、日後不會悄悄漂移的檢查。
+    直接讀 ``data/settling_velocity_derivation/results.csv``（50 列＝10 類 × 5 個
+    代表物件，每列有 ``w_lo_ms`` 與 ``w_hi_ms`` 兩個解），逐 ``class_id`` 收集該類
+    全部 10 個沉降速度解，檢查：
+
+    1. 每類恰有 10 個解，``BASELINE_BEHAVIORS`` 的 ``settling_velocity_candidates_mps``
+       由小到大（以量值計）逐值等於這 10 個解（取負號，六位小數）。
+    2. 代表值為 10 個解的幾何平均取三位有效數字（只作摘要與圖表標示用）。
+    3. 慢／快界為 10 個解的最小／最大值。
 
     類別對應刻意用 CSV 的 ``class_id``（1–10，對應 ``BASELINE_BEHAVIORS`` 索引
     0–9），不用中文類別名稱：CSV 使用全形斜線的「其他／不可回收」，若用中文名稱比對
-    很容易因全形／半形斜線不一致而誤判失敗或誤判通過。
+    很容易因全形／半形斜線不一致而誤判。
     """
 
     csv_path = ROOT / "data" / "settling_velocity_derivation" / "results.csv"
-    # 檔案帶 UTF-8 BOM（一般編輯器與試算表另存出來的常見型態），必須用
-    # utf-8-sig 開啟，否則第一欄欄名會被誤讀成 "﻿class_id" 而抓不到值。
+    # 檔案帶 UTF-8 BOM，必須用 utf-8-sig 開啟。
     solutions_by_class_id: dict[int, list[float]] = {}
+    row_count = 0
     with csv_path.open(encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
+            row_count += 1
             class_id = int(row["class_id"])
             solutions_by_class_id.setdefault(class_id, []).extend(
                 (float(row["w_lo_ms"]), float(row["w_hi_ms"]))
             )
 
+    assert row_count == 50
     assert len(solutions_by_class_id) == 10
     assert set(solutions_by_class_id) == set(range(1, 11))
 
     for class_id, solutions in solutions_by_class_id.items():
-        assert len(solutions) == 6, f"class_id={class_id} 應有 3 情境 x 2 界＝6 個解"
+        assert len(solutions) == SETTLING_CANDIDATE_COUNT, (
+            f"class_id={class_id} 應有 5 個代表物件 x 2 界＝10 個解"
+        )
         behavior = BASELINE_BEHAVIORS[class_id - 1]
+
+        expected_candidates = tuple(-round(value, 6) for value in sorted(solutions))
+        assert tuple(behavior.settling_velocity_candidates_mps) == pytest.approx(
+            expected_candidates, abs=1e-9
+        ), f"class_id={class_id} 候選速度與 results.csv 不符"
 
         geometric_mean = math.prod(solutions) ** (1.0 / len(solutions))
         expected_representative = _round_to_3_significant_figures(geometric_mean)
@@ -156,17 +168,29 @@ def test_baseline_behaviors_match_settling_velocity_derivation_source() -> None:
             abs(behavior.settling_velocity_mps), rel=1e-9
         ), f"class_id={class_id} 代表值與 results.csv 重算不符"
 
-        # CSV 原始值只有五位小數，慢／快界比對前先做相同的四捨五入，避免浮點尾數
-        # 造成假性不一致。
-        assert round(min(solutions), 5) == pytest.approx(
+        assert round(min(solutions), 6) == pytest.approx(
             abs(behavior.settling_velocity_slow_bound_mps), abs=1e-9
         ), f"class_id={class_id} slow_bound 與 results.csv min 不符"
-        assert round(max(solutions), 5) == pytest.approx(
+        assert round(max(solutions), 6) == pytest.approx(
             abs(behavior.settling_velocity_fast_bound_mps), abs=1e-9
         ), f"class_id={class_id} fast_bound 與 results.csv max 不符"
 
         source_path = ROOT / behavior.derivation_source
         assert source_path.is_file(), f"derivation_source 指向的檔案不存在：{source_path}"
+
+
+def test_baseline_candidates_are_sorted_negative_and_cover_bounds() -> None:
+    """每類恰 10 個候選：嚴格為負、量值非遞減，端點等於慢／快界，代表值落在其間。"""
+
+    for behavior in BASELINE_BEHAVIORS:
+        candidates = behavior.settling_velocity_candidates_mps
+        assert len(candidates) == SETTLING_CANDIDATE_COUNT
+        assert all(value < 0.0 for value in candidates)
+        magnitudes = [abs(value) for value in candidates]
+        assert magnitudes == sorted(magnitudes)
+        assert candidates[0] == behavior.settling_velocity_slow_bound_mps
+        assert candidates[-1] == behavior.settling_velocity_fast_bound_mps
+        assert magnitudes[0] <= abs(behavior.settling_velocity_mps) <= magnitudes[-1]
 
 
 def test_seed_is_stable_and_member_specific() -> None:

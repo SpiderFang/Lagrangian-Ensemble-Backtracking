@@ -401,24 +401,27 @@ def test_baseline_material_contract_keeps_ten_negative_speed_proxies() -> None:
     改動」的原始意圖不變——見
     ``tests/test_scenarios.py::test_baseline_behaviors_match_settling_velocity_derivation_source``
     對這些新值與推導來源的機器強制比對。
+
+    WP-54（v7）把每類擴充為 5 個代表物件 × 阻力係數上下界共 10 個候選速度，類別代表值
+    改為 10 個候選的幾何平均（三位有效數字）；此處固定值同步更新，原始意圖不變。
     """
 
     validate_non_rising_behaviors(BASELINE_BEHAVIORS)
     assert len(BASELINE_BEHAVIORS) == 10
     assert tuple(item.settling_velocity_mps for item in BASELINE_BEHAVIORS) == (
-        -0.0359,
-        -0.0684,
-        -0.0384,
-        -0.0142,
-        -0.0434,
-        -0.0782,
-        -0.128,
-        -0.132,
-        -0.301,
-        -0.472,
+        -0.0482,
+        -0.0885,
+        -0.0406,
+        -0.0114,
+        -0.0504,
+        -0.0712,
+        -0.0959,
+        -0.108,
+        -0.257,
+        -0.48,
     )
     fishing_gear = next(
         item for item in BASELINE_BEHAVIORS if item.material_id == FISHING_GEAR_MATERIAL_ID
     )
-    assert fishing_gear.settling_velocity_mps == -0.0434
+    assert fishing_gear.settling_velocity_mps == -0.0504
     assert all(item.settling_velocity_mps < 0.0 for item in BASELINE_BEHAVIORS)

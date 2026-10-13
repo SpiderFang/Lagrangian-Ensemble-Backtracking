@@ -413,8 +413,11 @@ def test_per_observation_identity_table_hash_is_unchanged() -> None:
     )
     table = build_particle_identity_table(shards, master_seed=12345, resolve_initial_position=resolve)
     assert table.labels is None
+    # WP-54（v7）把十類代表速度改為 10 個候選的幾何平均，身分表內容雜湊因此改變；雜湊演算法與欄位
+    # 格式沒有變動：以 v6 的舊代表速度重算，仍得到 WP-51 之前的黃金值
+    # e4017f21a7fd7b5cd7e1f828962efe8aabafe48aa4e3cdbea4e3c7b8a37d410e（已於 .203 實測核對）。
     assert table.content_sha256 == (
-        "e4017f21a7fd7b5cd7e1f828962efe8aabafe48aa4e3cdbea4e3c7b8a37d410e"
+        "3bf9f46f6176c8be84023c98a72ce991ae96759e86cc4f49dd8ae014f2ffb752"
     )
 
 

@@ -15,6 +15,19 @@ iOcean 類別作名稱銜接，但速度是待校準的敏感度格點，不是�
 位元相同，不代表這十個名稱在目前 M=1 的成果中彼此可分辨。2026-09-24／25 改版後的
 新值仍全數落在該診斷所指的快沉降區間（十值皆 ≥ 0.01 m/s），因此上述「彼此統計上不可
 分辨」的警語在改版後依然成立，不因換算新的力平衡推導值而自動失效。
+
+2026-10-13（WP-54，v7）再把「每類一個速度」擴充為「每類 10 個候選速度」：推導來源
+（``data/settling_velocity_derivation``）每類改為 5 種代表物件（由小到大）× 阻力係數上下界
+＝ 10 個沉降速度解，這 10 個解寫進 ``Behavior.settling_velocity_candidates_mps``，正式計算時
+每顆粒子在所屬類別的 10 個候選速度中平衡抽樣取其一（見
+``native_runner/settling_sampling.py``）。``Behavior.settling_velocity_mps`` 因此降為
+「類別代表值」（10 個解的幾何平均，取三位有效數字）：它仍是類別的分組鍵（情境識別碼、
+工作單元識別碼、後處理與圖表的分組都以它代表「這是哪一類」），在
+``representative`` 抽樣模式下也仍是粒子實際使用的速度（完全重現 v6 以前每類一個速度的
+行為）；在 ``class_candidates_balanced`` 模式下，粒子實際使用的速度另存於粒子身分表的
+``particle_settling_velocity_mps`` 欄位，不再等於類別代表值。注意上一段「十值皆 ≥ 0.01 m/s」
+只適用於 2026-09-24／25 的代表值；v7 的候選速度跨度更大（例如其他／不可回收最慢約
+0.0009 m/s），其可分辨性必須以 v7 成果重新檢視，不能沿用上段結論。
 """
 
 from __future__ import annotations
@@ -23,6 +36,30 @@ import json
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+
+SETTLING_CANDIDATE_COUNT = 10
+"""每個類別的候選沉降速度個數（5 種代表物件 × 阻力係數上下界）。"""
+
+SETTLING_VELOCITY_SAMPLING_REPRESENTATIVE = "representative"
+"""每個類別所有粒子都使用該類別的代表速度（v6 以前的行為，逐位重現）。"""
+
+SETTLING_VELOCITY_SAMPLING_CLASS_CANDIDATES_BALANCED = "class_candidates_balanced"
+"""同一站、同一類別的粒子在該類別的 10 個候選速度中平衡抽樣，各候選分得相同顆數。"""
+
+SETTLING_VELOCITY_SAMPLING_MODES: tuple[str, ...] = (
+    SETTLING_VELOCITY_SAMPLING_REPRESENTATIVE,
+    SETTLING_VELOCITY_SAMPLING_CLASS_CANDIDATES_BALANCED,
+)
+
+
+def validate_settling_velocity_sampling_mode(mode: object) -> str:
+    """確認沉降速度抽樣模式是已登錄的字串，否則丟出 ``ValueError``（不做任何自動修正）。"""
+
+    if type(mode) is not str or mode not in SETTLING_VELOCITY_SAMPLING_MODES:
+        raise ValueError(
+            f"沉降速度抽樣模式 {mode!r} 不合法，只接受 {SETTLING_VELOCITY_SAMPLING_MODES}"
+        )
+    return mode
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +74,7 @@ class Behavior:
 
     2026-09-24／25 改版（見
     ``claude/decision-20260924-十檔沉降速度定案與重算交辦.md``）新增三個欄位，記錄
-    ``settling_velocity_mps``（該類 6 個解的幾何平均代表值）在推導來源中實際涵蓋的
+    ``settling_velocity_mps``（v7 起為該類 10 個解的幾何平均代表值）在推導來源中實際涵蓋的
     速度範圍：
 
     * ``settling_velocity_slow_bound_mps``：該類推導區間中絕對值最小者（沉得最慢），
@@ -52,6 +89,17 @@ class Behavior:
     檢查都會把 ``fast_bound``（數值較小）誤判成下界、``slow_bound``（數值較大）誤判成
     上界，方向恰好相反。正確的數值關係固定是
     ``fast_bound <= settling_velocity_mps <= slow_bound``（三者皆為負值）。
+
+    2026-10-13（WP-54，v7）新增 ``settling_velocity_candidates_mps``：該類 5 種代表物件 ×
+    阻力係數上下界的 10 個沉降速度解（單位 m/s、z 軸向上為正，因此皆為嚴格負值），依
+    **絕對值由小到大**（最慢到最快）排列，位置序號 0–9 即「候選序號」。``slow_bound`` 恆為
+    序號 0 的值、``fast_bound`` 恆為序號 9 的值；``settling_velocity_mps`` 為這 10 個解絕對值的
+    幾何平均、取三位有效數字（只作類別代表值與 ``representative`` 模式使用）。三個類別
+    （寶特瓶、鋁罐、鐵罐）的「壓扁」與「嚴重壓扁」兩種物件，殼重與外包絡體積使有效密度與
+    厚度的乘積相同，因此兩者的 ``w_lo``／``w_hi`` 逐位相同，候選值中各有 2 組數值重複
+    （物理必然，不是錯誤）；候選序號仍各自獨立，平衡抽樣以序號分配顆數。
+    預設空 tuple 僅為讀取 v6 以前 manifest 的相容性而保留（此時只能使用 ``representative``
+    模式），``BASELINE_BEHAVIORS`` 一律有 10 個候選值。
     """
 
     material_id: str
@@ -66,6 +114,7 @@ class Behavior:
     settling_velocity_slow_bound_mps: float
     settling_velocity_fast_bound_mps: float
     derivation_source: str
+    settling_velocity_candidates_mps: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,140 +211,180 @@ BASELINE_BEHAVIORS: tuple[Behavior, ...] = (
         "保麗龍",
         "發泡聚苯乙烯（EPS）",
         "吸水或生物附著之多孔不規則碎塊",
-        -0.0359,
+        -0.0482,
         "sinking",
         "限已吸水或生物附著、整體仍完全沉沒且呈負浮力者",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.00527,
-        -0.15006,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.005274,
+        -0.187049,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.005274, -0.006292, -0.030493, -0.038718, -0.053909,
+            -0.069663, -0.114480, -0.141766, -0.150064, -0.187049,
+        ),
     ),
     Behavior(
         "oca_wood_waterlogged_elongated",
         "竹木",
         "竹材或木材",
         "水浸飽和之細長枝條或片狀木屑",
-        -0.0684,
+        -0.0885,
         "sinking",
         "限水浸後整體密度已高於周圍海水者",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.01350,
-        -0.23115,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.013503,
+        -0.303349,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.013503, -0.015205, -0.056465, -0.065310, -0.097057,
+            -0.113218, -0.196277, -0.231153, -0.256543, -0.303349,
+        ),
     ),
     Behavior(
         "oca_wastepaper_folded_fiber",
         "廢紙",
         "吸水纖維材料",
         "濕潤摺疊紙片或纖維團",
-        -0.0384,
+        -0.0406,
         "sinking",
         "固定形狀與速度，不模擬持續解體、溶散或團聚",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.00661,
-        -0.16236,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.006610,
+        -0.162364,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.006610, -0.007942, -0.020341, -0.025649, -0.048532,
+            -0.062636, -0.074154, -0.097400, -0.123786, -0.162364,
+        ),
     ),
     Behavior(
         "oca_nonrecyclable_flexible_sheet",
         "其他/不可回收",
         "混合塑膠或複合包材",
         "進水薄膜、軟片或皺摺包裝片",
-        -0.0142,
+        -0.0114,
         "sinking",
         "只作異質類別的條件代理，不解讀為類別平均物性",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.00090,
-        -0.10772,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.000897,
+        -0.107722,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.000897, -0.001064, -0.001405, -0.001724, -0.027185,
+            -0.035293, -0.038879, -0.050796, -0.081720, -0.107722,
+        ),
     ),
     Behavior(
         "oca_fishinggear_open_mesh_bundle",
         "廢漁網漁具",
         "尼龍、聚乙烯或混合漁具材料",
         "網片、繩索或繩結纖維束",
-        -0.0434,
+        -0.0504,
         "sinking",
         "不顯式解析網目開孔、纏繞、展開與姿態變化",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.00795,
-        -0.22341,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.007950,
+        -0.223412,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.007950, -0.008676, -0.029639, -0.033541, -0.044512,
+            -0.051101, -0.116965, -0.136675, -0.189684, -0.223412,
+        ),
     ),
     Behavior(
         "oca_pet_waterfilled_bottle",
         "寶特瓶",
         "聚對苯二甲酸乙二酯（PET）",
         "進水或壓扁之中空瓶體",
-        -0.0782,
+        -0.0712,
         "sinking",
         "只納入已進水且向下運動者；密閉含氣瓶體必須排除",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.05630,
-        -0.13353,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.029300,
+        -0.133527,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.029300, -0.037568, -0.056303, -0.056303, -0.073531,
+            -0.073531, -0.099252, -0.099889, -0.133143, -0.133527,
+        ),
     ),
     Behavior(
         "oca_other_recyclable_irregular_fragment",
         "其他/可回收",
         "混合可回收塑膠、橡膠或複合材料",
         "不規則片塊或零組件",
-        -0.128,
+        -0.0959,
         "sinking",
         "只作異質類別代理；正式校準前應再依材質與形狀分群",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.04300,
-        -0.34474,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.034223,
+        -0.344737,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.034223, -0.043001, -0.043534, -0.055415, -0.088343,
+            -0.116511, -0.123786, -0.162364, -0.260350, -0.344737,
+        ),
     ),
     Behavior(
         "oca_aluminum_crushed_cylinder",
         "鋁罐",
         "鋁合金",
         "進水壓扁之薄壁中空圓筒",
-        -0.132,
+        -0.108,
         "sinking",
         "只納入已進水或壓扁者；密閉含氣罐體必須排除",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.10787,
-        -0.17528,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.036715,
+        -0.175479,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.036715, -0.047057, -0.107871, -0.107871, -0.130788,
+            -0.130897, -0.141024, -0.141024, -0.175279, -0.175479,
+        ),
     ),
     Behavior(
         "oca_steel_rigid_cylinder",
         "鐵罐",
         "鋼鐵或鍍錫鋼板",
         "進水之剛性圓筒或金屬片",
-        -0.301,
+        -0.257,
         "sinking",
         "姿態、開口、塗層與腐蝕效應尚未顯式解析",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.23780,
-        -0.42735,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.107413,
+        -0.427352,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.107413, -0.139479, -0.237796, -0.237796, -0.288447,
+            -0.313089, -0.313089, -0.315346, -0.389421, -0.427352,
+        ),
     ),
     Behavior(
         "oca_glass_bottle_or_fragment",
         "玻璃瓶",
         "玻璃",
         "進水瓶體或緻密銳角碎片",
-        -0.472,
+        -0.48,
         "sinking",
         "完整瓶與碎片幾何差異留待樣本量測校準",
         "derived_uncalibrated",
-        "B_force_balance_derived_representative_geometry",
-        -0.19542,
-        -0.92040,
+        "B_force_balance_derived_5_objects_x_drag_bounds_10_candidates",
+        -0.195421,
+        -0.920397,
         "data/settling_velocity_derivation/results.csv",
+        (
+            -0.195421, -0.255255, -0.355430, -0.466427, -0.509251,
+            -0.517654, -0.672576, -0.691764, -0.693677, -0.920397,
+        ),
     ),
 )
 
@@ -331,6 +420,39 @@ def validate_non_rising_behaviors(behaviors: Sequence[Behavior]) -> None:
             raise ValueError(f"{item.material_id or '<missing>'} 缺少材質、形狀或證據欄位")
         if item.behavior_class != "sinking" or item.settling_velocity_mps >= 0.0:
             raise ValueError(f"{item.material_id} 必須是 sinking 且 settling_velocity_mps 嚴格小於 0")
+        _validate_candidate_velocities(item)
+
+
+def _validate_candidate_velocities(item: Behavior) -> None:
+    """檢查候選速度：空 tuple（舊 manifest）略過；否則必須 10 個嚴格負值、由慢到快、與界限一致。
+
+    只驗證設計一致性，不重算力平衡（重算由 ``tests/test_scenarios.py`` 對照
+    ``data/settling_velocity_derivation/results.csv`` 完成）。慢界必須等於序號 0、快界必須
+    等於序號 9，代表值必須落在兩界之間，避免候選值與界限各自漂移。
+    """
+
+    candidates = item.settling_velocity_candidates_mps
+    if len(candidates) == 0:
+        return
+    if not isinstance(candidates, tuple):
+        raise ValueError(f"{item.material_id} 的 settling_velocity_candidates_mps 必須是 tuple")
+    if len(candidates) != SETTLING_CANDIDATE_COUNT:
+        raise ValueError(
+            f"{item.material_id} 的 settling_velocity_candidates_mps 必須恰有 "
+            f"{SETTLING_CANDIDATE_COUNT} 個，實際 {len(candidates)} 個"
+        )
+    for value in candidates:
+        if isinstance(value, bool) or not isinstance(value, float) or value != value or abs(value) == float("inf"):
+            raise ValueError(f"{item.material_id} 的候選沉降速度必須是有限浮點數")
+        if value >= 0.0:
+            raise ValueError(f"{item.material_id} 的候選沉降速度必須嚴格小於 0")
+    magnitudes = [abs(value) for value in candidates]
+    if magnitudes != sorted(magnitudes):
+        raise ValueError(f"{item.material_id} 的候選沉降速度必須依絕對值由小到大排列")
+    if item.settling_velocity_slow_bound_mps != candidates[0] or item.settling_velocity_fast_bound_mps != candidates[-1]:
+        raise ValueError(f"{item.material_id} 的慢／快界必須等於候選序號 0 與 9 的值")
+    if not (candidates[-1] <= item.settling_velocity_mps <= candidates[0]):
+        raise ValueError(f"{item.material_id} 的代表速度必須落在候選速度的慢界與快界之間")
 
 
 def stable_identifier(namespace: str, fields: Sequence[str], *, length: int = 24) -> str:

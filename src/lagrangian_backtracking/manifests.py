@@ -143,6 +143,13 @@ _MATERIAL_RECORD_KEYS = frozenset(
         "derivation_source",
     }
 )
+_MATERIAL_CANDIDATES_KEY = "settling_velocity_candidates_mps"
+"""WP-54（v7）新增的選用欄位：該類 10 個候選沉降速度（負值、絕對值由小到大）。
+
+v6 以前產生的 manifest 沒有這個欄位，載入端仍須接受（此時只能使用 ``representative``
+抽樣模式）；v7 起 manifest 一律有此欄位，且必須與 config 的同名欄位完全一致。
+"""
+_MATERIAL_RECORD_KEYS_WITH_CANDIDATES = _MATERIAL_RECORD_KEYS | {_MATERIAL_CANDIDATES_KEY}
 _RECEPTOR_ROOT_KEYS = frozenset(
     {
         "manifest_kind",
@@ -582,7 +589,11 @@ def _load_material_document(
     behaviors: list[Behavior] = []
     for index, row in enumerate(rows):
         label = f"material.records[{index}]"
-        _expect_exact_keys(row, _MATERIAL_RECORD_KEYS, label)
+        _expect_exact_keys(
+            row,
+            _MATERIAL_RECORD_KEYS_WITH_CANDIDATES if _MATERIAL_CANDIDATES_KEY in row else _MATERIAL_RECORD_KEYS,
+            label,
+        )
         text_fields = (
             "material_id",
             "oca_category_zh",
@@ -606,6 +617,15 @@ def _load_material_document(
             row["settling_velocity_fast_bound_mps"], f"{label}.settling_velocity_fast_bound_mps"
         )
         derivation_source = _nonempty_string(row["derivation_source"], f"{label}.derivation_source")
+        candidates: tuple[float, ...] = ()
+        if _MATERIAL_CANDIDATES_KEY in row:
+            raw_candidates = row[_MATERIAL_CANDIDATES_KEY]
+            if not isinstance(raw_candidates, (list, tuple)) or len(raw_candidates) == 0:
+                raise ValueError(f"{label}.{_MATERIAL_CANDIDATES_KEY} 必須是非空陣列")
+            candidates = tuple(
+                _finite_float(value, f"{label}.{_MATERIAL_CANDIDATES_KEY}[{position}]")
+                for position, value in enumerate(raw_candidates)
+            )
         if slow_bound >= 0.0 or fast_bound >= 0.0:
             raise ValueError(f"{label} 的沉降速度慢／快界必須嚴格小於 0")
         if not (fast_bound <= velocity <= slow_bound):
@@ -627,6 +647,7 @@ def _load_material_document(
                 settling_velocity_slow_bound_mps=slow_bound,
                 settling_velocity_fast_bound_mps=fast_bound,
                 derivation_source=derivation_source,
+                settling_velocity_candidates_mps=candidates,
             )
         )
     try:
@@ -655,8 +676,21 @@ def _load_material_document(
             expected = configured_by_id.get(item.material_id)
             if expected is None:
                 raise ValueError(f"material {item.material_id} 不存在於 config")
-            for field in _MATERIAL_RECORD_KEYS:
+            # WP-54：候選速度是選用欄位，但 config 與 manifest 必須「同有或同無」，且逐值相同。
+            if (_MATERIAL_CANDIDATES_KEY in expected) != bool(item.settling_velocity_candidates_mps):
+                raise ValueError(
+                    f"material {item.material_id} 的 {_MATERIAL_CANDIDATES_KEY} 在 config 與 manifest 之間"
+                    "不是同有或同無"
+                )
+            compared_fields = (
+                _MATERIAL_RECORD_KEYS_WITH_CANDIDATES
+                if item.settling_velocity_candidates_mps
+                else _MATERIAL_RECORD_KEYS
+            )
+            for field in compared_fields:
                 expected_value = expected.get(field)
+                if isinstance(expected_value, list):
+                    expected_value = tuple(expected_value)
                 actual_value = getattr(
                     item,
                     {
@@ -672,6 +706,7 @@ def _load_material_document(
                         "settling_velocity_slow_bound_mps": "settling_velocity_slow_bound_mps",
                         "settling_velocity_fast_bound_mps": "settling_velocity_fast_bound_mps",
                         "derivation_source": "derivation_source",
+                        _MATERIAL_CANDIDATES_KEY: _MATERIAL_CANDIDATES_KEY,
                     }[field],
                 )
                 if actual_value != expected_value:

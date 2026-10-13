@@ -37,6 +37,12 @@ from .gap_policy import (
     OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
 )
+from .scenarios import (
+    SETTLING_CANDIDATE_COUNT,
+    SETTLING_VELOCITY_SAMPLING_CLASS_CANDIDATES_BALANCED,
+    SETTLING_VELOCITY_SAMPLING_REPRESENTATIVE,
+    validate_settling_velocity_sampling_mode,
+)
 
 # 這組名稱取自海洋保育署 iOcean 海洋廢棄物管理頁於 2026-08-27 顯示的查詢類別。
 # 常數只用來驗證臺灣情境的分類追溯是否完整；該網站的清除重量與件數不含單體物性，
@@ -258,6 +264,50 @@ NWW_METRIC_LOCATION_POLICY_ID = (
 NWW_METRIC_LOCATION_MAX_GRID_SCALES = 2.0
 
 
+def _validate_config_candidate_velocities(
+    record: dict[str, Any], *, velocity: float, sampling_mode: str
+) -> None:
+    """驗證設定檔材質紀錄的 10 個候選沉降速度（WP-54，選用欄位）。
+
+    ``class_candidates_balanced`` 模式要求每筆紀錄都有候選速度；``representative`` 模式下
+    欄位可有可無（有就一併檢查）。檢查項目與 ``scenarios.validate_non_rising_behaviors`` 的候選
+    速度檢查相同：恰 10 個、嚴格負值、絕對值由小到大、慢／快界等於序號 0／9、代表值落在其間。
+    """
+
+    candidates = record.get("settling_velocity_candidates_mps")
+    material_id = record["material_id"]
+    if candidates is None:
+        if sampling_mode == SETTLING_VELOCITY_SAMPLING_CLASS_CANDIDATES_BALANCED:
+            raise ValueError(
+                f"{material_id} 缺少 settling_velocity_candidates_mps，"
+                f"無法使用沉降速度抽樣模式 {sampling_mode}"
+            )
+        return
+    if not isinstance(candidates, list) or len(candidates) != SETTLING_CANDIDATE_COUNT:
+        raise ValueError(
+            f"{material_id} 的 settling_velocity_candidates_mps 必須是恰有 "
+            f"{SETTLING_CANDIDATE_COUNT} 個數值的陣列"
+        )
+    for value in candidates:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value >= 0.0
+        ):
+            raise ValueError(f"{material_id} 的候選沉降速度必須是嚴格小於 0 的有限數值")
+    magnitudes = [abs(float(value)) for value in candidates]
+    if magnitudes != sorted(magnitudes):
+        raise ValueError(f"{material_id} 的候選沉降速度必須依絕對值由小到大排列")
+    if (
+        record.get("settling_velocity_slow_bound_mps") != candidates[0]
+        or record.get("settling_velocity_fast_bound_mps") != candidates[-1]
+    ):
+        raise ValueError(f"{material_id} 的慢／快界必須等於候選序號 0 與 9 的值")
+    if not (candidates[-1] <= velocity <= candidates[0]):
+        raise ValueError(f"{material_id} 的代表速度必須落在候選速度的慢界與快界之間")
+
+
 def _validate_non_rising_material_contract(settling: Any, *, expected_count: int) -> None:
     """驗證設定中的十類材質／形狀代理均為嚴格負值且可追溯。
 
@@ -279,6 +329,10 @@ def _validate_non_rising_material_contract(settling: Any, *, expected_count: int
     records = settling.get("material_classes")
     if not isinstance(records, list) or len(records) != expected_count:
         raise ValueError(f"physics.settling.material_classes 必須恰有 {expected_count} 筆")
+    # WP-54：沉降速度抽樣模式；缺省為 representative（v6 以前的行為，每類一個速度）。
+    sampling_mode = validate_settling_velocity_sampling_mode(
+        settling.get("velocity_sampling", SETTLING_VELOCITY_SAMPLING_REPRESENTATIVE)
+    )
     material_ids: list[str] = []
     categories: list[str] = []
     for index, record in enumerate(records):
@@ -302,6 +356,7 @@ def _validate_non_rising_material_contract(settling: Any, *, expected_count: int
             raise ValueError(f"{record['material_id']} 的 settling_velocity_mps 必須嚴格小於 0")
         if record.get("behavior_class") != "sinking":
             raise ValueError(f"{record['material_id']} 的 behavior_class 必須是 sinking")
+        _validate_config_candidate_velocities(record, velocity=float(velocity), sampling_mode=sampling_mode)
         material_ids.append(record["material_id"])
         categories.append(record["oca_category_zh"])
     if len(set(material_ids)) != len(material_ids):

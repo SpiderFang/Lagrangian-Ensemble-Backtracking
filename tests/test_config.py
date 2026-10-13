@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -346,7 +347,9 @@ def test_example_material_table_matches_runtime_baseline() -> None:
 
     payload = _payload()
     assert payload["design_version"] == CURRENT_DESIGN_VERSION
-    assert payload["physics"]["settling"]["material_classes"] == [asdict(item) for item in BASELINE_BEHAVIORS]
+    assert payload["physics"]["settling"]["material_classes"] == json.loads(
+        json.dumps([asdict(item) for item in BASELINE_BEHAVIORS])
+    )
 
 
 def test_example_registers_current_random_receptor_contract_and_anchors() -> None:
@@ -458,6 +461,29 @@ def test_config_rejects_zero_or_rising_material_velocity(invalid_velocity: float
     payload["physics"]["settling"]["material_classes"][0]["settling_velocity_mps"] = invalid_velocity
     with pytest.raises(ValueError, match="嚴格小於 0"):
         ProjectConfig.model_validate(payload)
+
+
+def test_config_accepts_balanced_velocity_sampling_with_candidates_and_rejects_without() -> None:
+    """WP-54：velocity_sampling 預設為 representative；balanced 需要每類十個候選，缺候選或模式拼錯必須拒絕。"""
+
+    payload = _payload()
+    assert "velocity_sampling" not in payload["physics"]["settling"]
+    ProjectConfig.model_validate(payload)  # 缺省 representative
+
+    balanced = deepcopy(payload)
+    balanced["physics"]["settling"]["velocity_sampling"] = "class_candidates_balanced"
+    config = ProjectConfig.model_validate(balanced)
+    assert config.config_hash() != ProjectConfig.model_validate(payload).config_hash()
+
+    no_candidates = deepcopy(balanced)
+    no_candidates["physics"]["settling"]["material_classes"][0].pop("settling_velocity_candidates_mps")
+    with pytest.raises(ValueError, match="settling_velocity_candidates_mps"):
+        ProjectConfig.model_validate(no_candidates)
+
+    bogus = deepcopy(payload)
+    bogus["physics"]["settling"]["velocity_sampling"] = "per_particle_random"
+    with pytest.raises(ValueError, match="抽樣模式"):
+        ProjectConfig.model_validate(bogus)
 
 
 def test_config_hash_is_independent_of_mapping_order() -> None:
@@ -753,7 +779,7 @@ def test_omitted_backtrack_support_keeps_legacy_hash() -> None:
     """明確移除新欄位的舊 fixture 維持歷史 hash 與 normalized payload 語意。"""
 
     config = ProjectConfig.model_validate(_legacy_example_payload())
-    assert config.config_hash() == "8b6b1b92c66c7fe05e01d80fd53cdae6ae907bdd674951c1b3f99183b708026d"
+    assert config.config_hash() == "6420dada9d9500aa9cb1a711dbb3eaf2d8b36be73037a09b31188eedfc1def42"
     assert "backtrack_support_days" not in config.normalized_payload()["inputs"]
     assert "bed_residence_time" not in config.normalized_payload()["scenarios"]
 
@@ -764,7 +790,7 @@ def test_omitted_ocm_interpolation_backend_keeps_numpy_and_current_hash() -> Non
     config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.ocm_interpolation_backend == "numpy_v1"
     assert "ocm_interpolation_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "8b6b1b92c66c7fe05e01d80fd53cdae6ae907bdd674951c1b3f99183b708026d"
+    assert config.config_hash() == "6420dada9d9500aa9cb1a711dbb3eaf2d8b36be73037a09b31188eedfc1def42"
 
 
 def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
@@ -773,7 +799,7 @@ def test_omitted_physics_kernel_backend_keeps_numpy_and_current_hash() -> None:
     config = ProjectConfig.model_validate(_legacy_example_payload())
     assert config.execution.physics_kernel_backend == "numpy_v1"
     assert "physics_kernel_backend" not in config.normalized_payload()["execution"]
-    assert config.config_hash() == "8b6b1b92c66c7fe05e01d80fd53cdae6ae907bdd674951c1b3f99183b708026d"
+    assert config.config_hash() == "6420dada9d9500aa9cb1a711dbb3eaf2d8b36be73037a09b31188eedfc1def42"
 
 
 @pytest.mark.parametrize("backend", ["numpy_v1", "numba_cpu_v1"])
@@ -863,7 +889,7 @@ def test_legacy_config_hash_preserves_omitted_policy_semantics() -> None:
 
     config = ProjectConfig.model_validate(_legacy_hash_payload())
     assert config.config_hash() == (
-        "c43d100bc8c7d1011b4fc98c7ec8dab4b0bf4f215dbdde2107ddcb4d62112209"
+        "efd1ab81de667b719b0df61ed38c557cd461ab21933560d551cf06e55df3a3c0"
     )
     assert config.domains[0].formal_domain_policy == "expanded_domain_v1"
     assert "formal_domain_policy" not in config.domains[0].model_fields_set
