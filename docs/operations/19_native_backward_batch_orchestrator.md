@@ -1007,3 +1007,35 @@ uv run lbt native-postprocess \
 （`native-run` 的 worker 子程序透過 `LBT_NATIVE_BED_NO_DEPOSITION` 環境變數讀到這個設定，
 `--bed-no-deposition` 只是 `native-plan` 的 CLI 旗標，本身不會傳遞到 `native-run` 的子
 程序，兩者必須各自設定，見 9.15.2 節的一致性檢查。）
+
+
+## 9.16 WP-54：v7 逐粒子沉降速度
+
+### 9.16.1 背景與設定
+
+v6 以前每個類別只有一個沉降速度（代表值）。v7 把每類擴充為 5 個代表物件、各依阻力係數的上下界求一個解，共 **10 個候選速度**（`data/settling_velocity_derivation/results.csv`，`scenarios.Behavior.settling_velocity_candidates_mps`）。設定檔 `physics.settling.velocity_sampling`：
+
+- `representative`（缺省）：每顆粒子使用類別代表速度；行為與 v6 以前逐位元相同，身分表與 `.npz` 格式、內容雜湊也不變；
+- `class_candidates_balanced`：每顆粒子取自所屬類別的 10 個候選之一。設定檔每類必須帶 `settling_velocity_candidates_mps`（10 個嚴格為負、幅度遞增的值），且必須與 `scenarios.BASELINE_BEHAVIORS` 一致；缺任何一項即 fail closed。舊的參考實作 runtime（`runtime.py`）不支援此模式，會直接拒絕。
+
+### 9.16.2 均衡抽樣（`native_runner/settling_sampling.py`）
+
+在 `production_wiring.build_formal_identity_table` 的最後一步套用。以（`study_site_id`，`material_id`）分組（正式規模每組 10,000 顆），組內依（`receptor_id`、`arrival_time_id`、`member_id`）排序後，以由主種子導出的 `PCG64DXSM` 亂數排列把 10 個候選各指派給恰好 1/10 的粒子（正式規模每候選 1,000 顆）。種子由 `scenarios.derive_member_seed` 以固定串流名稱 `settling_velocity_sampling_class_candidates_balanced_v1` 導出；串流名稱不含實驗案例，因此 `no_stokes` 與 `finite_depth_stokes` 兩案的指派完全相同，且與身分表列順序無關。粒子數不是 10 的整數倍時，正式建置 fail closed。抽樣結果（模式、串流、主種子、候選清單、每組種子與計數）存在身分表的 `settling_sampling`，並寫入 `native-plan` 與後處理 manifest。
+
+身分表多三個必須同時出現的選用欄位：`particle_settling_velocity_mps`（float64，每顆粒子實際速度）、`settling_candidate_index`（int16，0–9）、`settling_sampling`（上述中繼資料）；三者進入內容雜湊與 `.npz`，僅在 balanced 模式出現。
+
+### 9.16.3 核心如何使用逐粒子速度
+
+類別代表值仍是分組鍵（`group_indices_by_settling_velocity`、工作單元、checkpoint 檔名都不變）。小時主軸迴圈對帶逐粒子速度的分組不再呼叫 `apply_settling_velocity` 複製並改寫整個垂向場（每小時每組約 6 ms 的場複製成本），而是用 `composed_pair_without_settling` 取得不含沉降的零複製場對，並把 `settle_mask`（`effective_mask`）與逐粒子速度傳進核心。核心在內插（`batch_interpolate_velocity`）與四階 Runge-Kutta 平流（`batch_move_rk4`）取得節點垂向速度時，於 `effective_mask` 為真的節點對每顆粒子加上自己的速度。這與「先把速度烤進場」做相同的浮點運算，結果逐位元相同，並由測試核對。
+
+BayTrace 本體不修改。`native_runner/settling_kernels.py` 以 BayTrace v4.7.2 的 `batch_interp.py` 原始碼為基礎，在載入時重建兩個 njit 函式（加上 `effective_mask`、`p_settle` 兩個末端參數）；`FORKED_BATCH_INTERP_SHA256` 記錄所依據的原始檔雜湊，載入的 BayTrace 若不符即拒絕（避免上游更動後悄悄用到過期的複本）。融合子步核心 `substep_numba.build_fused_substep_kernel(handles, per_particle_settling=True)` 使用這兩個函式；代表模式使用原本的 BayTrace 函式，編譯結果與快取不變。python 子步迴圈（`substep_impl=python`）不支援逐粒子速度，會 `HourMajorError`。
+
+續跑：帶逐粒子速度的分組，checkpoint 的 meta 另存 `particle_settling_velocity_sha256`；續跑時與目前輸入的指紋不符就拒絕。
+
+### 9.16.4 輸出
+
+`departures.parquet`、`local_domain_departures.parquet` 在身分表帶逐粒子速度時多兩欄 `particle_settling_velocity_mps`（float64）與 `settling_candidate_index`（int16），位於標籤欄之後；其餘欄位與順序不變。後處理 manifest 的 `config.settling_velocity_sampling` 保存抽樣中繼資料。彙整、足跡與圖表仍以類別（代表速度）分組。
+
+### 9.16.5 部署腳本
+
+`scripts/wp54_deploy/`：`make_template_v7.py`（由 v6 範本產生 v7 範本，不覆蓋既有檔案）、`v7_env.sh`、`prep_v7.sh`、`run_formal_v7.sh`（皆有 `--check` 模式與磁碟空間檢查）、`check_identity_table_v7.py`（核對每站每類每候選粒子數）。流場資料根與 v6 共用（唯讀）。
