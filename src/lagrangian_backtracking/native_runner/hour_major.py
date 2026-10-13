@@ -183,10 +183,31 @@ BayTrace RK4 的相容性」一節）。這樣「固定開銷」全案只需要�
    ``arrival_time_utc_ns`` 恰好等於某個小時邊界（與 ``arrival_times.py``
    的既有保證一致，見該模組 docstring），並在 ``build_hour_major_domain_batch``
    建構期間 fail-closed 驗證這件事，不假設呼叫端一定正確傳入。
+
+逐粒子沉降速度（WP-54，v7 ``class_candidates_balanced``）
+---------------------------------------------------------
+上面「沉降速度必須疊進 ``w_field``，因此是唯一必要的分批維度」只在同一分組
+共用單一沉降速度時成立。v7 讓同一類別的粒子各自擁有 10 個候選值之一，
+身分表因此新增選用欄位 ``particle_settling_velocity_mps``（逐粒子實際沉降
+速度）；分組鍵仍是類別代表速度 ``settling_velocity_mps``（工作單元規劃與
+後處理分組不變），但 ``HourMajorSettlingGroupInput.particle_settling_
+velocity_mps`` 不為 ``None`` 時，該分組的 ``w_field`` **不烤進沉降速度**
+（``composed_pair_without_settling``，零複製），改把 ``base.effective_mask`` 與
+逐粒子速度陣列交給 ``settling_kernels`` 的逐粒子 kernel，在內插時才加（與
+``apply_settling_velocity`` 同一個浮點運算，結果逐位元相同）。因此：
+
+- 每個分組、每個小時仍然只有一次 kernel 呼叫（與 run07 相同），也省下
+  ``apply_settling_velocity`` 的兩次 ``(nvrt, nnode)`` 場複製；
+- 逐粒子亂數是計數器型（每顆粒子自己的種子與步數），與分組內的其他粒子
+  是否同批無關，所以沉降速度不同的粒子放進同一次呼叫不會改變任何粒子的
+  亂數序列；
+- ``particle_settling_velocity_mps`` 為 ``None`` 的分組（``representative``
+  模式）完全走原路徑，與先前逐位元相同。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -219,6 +240,7 @@ from .backward_driver import (
     WaveFieldAtNodes,
     apply_settling_velocity,
     build_local_cfl_spatial_index,
+    composed_pair_without_settling,
     compose_current_and_stokes_fields,
     compute_smagorinsky_kh_field,
     compute_wet_dry_flags,
@@ -233,6 +255,7 @@ from .backward_driver import (
 from .forcing_bridge import HourlyFieldPair, UnresolvedForcingGapError
 from .orchestrator import NativeWorkUnit
 from .particle_input import ParticleIdentityTable
+from .settling_kernels import build_settling_kernels
 from .substep_numba import mirror_rk4_substep_loop_numba
 
 __all__ = [
@@ -547,10 +570,29 @@ class HourMajorSettlingGroupInput:
     ``HourMajorUnitInput`` 對應單一測站，因此同一個單元底下的列這個值必為
     常數。"""
     units: tuple[HourMajorUnitInput, ...]
+    particle_settling_velocity_mps: np.ndarray | None = None
+    """WP-54 新增。``(n,)`` float64，每顆粒子自己的沉降速度（m/s，負值向下），
+    與其他逐列陣列列位置一一對應；``None`` 代表整個分組共用
+    ``settling_velocity_mps``（既有行為，完全走原路徑）。不為 ``None`` 時
+    ``settling_velocity_mps`` 仍是分組鍵（類別代表速度），但實際位移使用這個
+    逐粒子陣列，見模組文件「逐粒子沉降速度」一節。"""
 
     @property
     def particle_count(self) -> int:
         return int(self.x0_m.shape[0])
+
+    @property
+    def has_per_particle_settling(self) -> bool:
+        return self.particle_settling_velocity_mps is not None
+
+    def particle_settling_digest(self) -> str | None:
+        """逐粒子沉降速度陣列的 SHA-256（checkpoint 續跑一致性核對用）；無則 ``None``。"""
+
+        if self.particle_settling_velocity_mps is None:
+            return None
+        return hashlib.sha256(
+            np.ascontiguousarray(self.particle_settling_velocity_mps, dtype=np.float64).tobytes()
+        ).hexdigest()
 
     @property
     def needs_local_domain_check(self) -> bool:
@@ -656,6 +698,10 @@ def build_hour_major_domain_batch(
     for unit in units:
         by_settling.setdefault(float(unit.settling_velocity_mps), []).append(unit)
 
+    # WP-54：身分表帶有逐粒子沉降速度時，每個分組一併帶出逐列陣列（與 x0_m 等逐列
+    # 陣列同一個串接順序）；沒有時（既有 representative 模式、測試用假身分表）為 None。
+    table_particle_settling = getattr(table, "particle_settling_velocity_mps", None)
+
     groups: list[HourMajorSettlingGroupInput] = []
     for settling in sorted(by_settling):
         group_units = sorted(
@@ -670,6 +716,7 @@ def build_hour_major_domain_batch(
         polygon_parts: list[np.ndarray] = []
         local_polygon_parts: list[np.ndarray] = []
         local_equals_flow_parts: list[np.ndarray] = []
+        particle_settling_parts: list[np.ndarray] = []
         unit_inputs: list[HourMajorUnitInput] = []
         cursor = 0
         for unit in group_units:
@@ -679,6 +726,10 @@ def build_hour_major_domain_batch(
             y0_parts.append(table.y0_m[rows])
             z0_parts.append(table.z0_m[rows])
             seed_parts.append(table.seed_hex[rows])
+            if table_particle_settling is not None:
+                particle_settling_parts.append(
+                    np.asarray(table_particle_settling[rows], dtype=np.float64)
+                )
             arrival_parts.append(np.full(n_unit, int(unit.arrival_time_utc_ns), dtype=np.int64))
             unit_max_backtrack_ns = (
                 int(round(unit.resolved_max_backtrack_seconds * 1.0e9))
@@ -717,6 +768,11 @@ def build_hour_major_domain_batch(
                 local_region_polygons=np.concatenate(local_polygon_parts),
                 local_equals_flow_mask=np.concatenate(local_equals_flow_parts),
                 units=tuple(unit_inputs),
+                particle_settling_velocity_mps=(
+                    np.ascontiguousarray(np.concatenate(particle_settling_parts))
+                    if table_particle_settling is not None
+                    else None
+                ),
             )
         )
 
@@ -1399,13 +1455,24 @@ def run_flow_domain_hour_major(
                         continue
 
                     t0 = _time.perf_counter()
-                    composed = apply_settling_velocity(
-                        base, group.inp.settling_velocity_mps, kbp=driver_grid.grid.kbp
-                    )
+                    if group.inp.has_per_particle_settling:
+                        # WP-54：沉降速度不烤進場，改在 kernel 內插時逐粒子加上。
+                        composed = composed_pair_without_settling(base)
+                        settle_mask = base.effective_mask
+                        settle_row = group.inp.particle_settling_velocity_mps
+                    else:
+                        composed = apply_settling_velocity(
+                            base, group.inp.settling_velocity_mps, kbp=driver_grid.grid.kbp
+                        )
+                        settle_mask = None
+                        settle_row = None
                     hour_overhead.time_apply_settling_s += _time.perf_counter() - t0
 
                     if n_new > 0:
-                        _prime_new_arrivals(handles, driver_grid, group, newly_mask, composed=composed)
+                        _prime_new_arrivals(
+                            handles, driver_grid, group, newly_mask, composed=composed,
+                            settle_mask=settle_mask, settle_row=settle_row,
+                        )
 
                     needs_split = config.enable_diffusion and n_new > 0 and n_continuing > 0
                     kernel_call_count += _run_group_hour(
@@ -1414,6 +1481,7 @@ def run_flow_domain_hour_major(
                         hour_start_utc=hour_start_utc, hf2_now=hf2_now,
                         newly_mask=newly_mask if needs_split else None,
                         continuing_mask=continuing_mask if needs_split else None,
+                        settle_mask=settle_mask, settle_row=settle_row,
                     )
 
                     group.prev_hf2 = hf2_now
@@ -1625,8 +1693,15 @@ def _prime_new_arrivals(
     newly_mask: np.ndarray,
     *,
     composed: Any,
+    settle_mask: np.ndarray | None = None,
+    settle_row: np.ndarray | None = None,
 ) -> None:
     """對剛釋放且定位成功的列，用合成後總速度場重新內插一次起點速度。
+
+    WP-54：``settle_mask``／``settle_row`` 同時提供時（逐粒子沉降速度分組），
+    ``composed`` 的 ``w`` 場不含沉降速度，改用 ``settling_kernels`` 的逐粒子版本
+    ``batch_interpolate_velocity`` 在內插時加上每顆粒子自己的沉降速度；兩者皆
+    省略時行為與先前相同。
 
     對應 ``run_backward_batch`` 的「priming」步驟；用暫時把其餘列的
     ``pa.status`` 設成 0 的方式，把 ``batch_interpolate_velocity`` 的作用
@@ -1646,15 +1721,27 @@ def _prime_new_arrivals(
     group.pa.status[other_active] = 0
     try:
         grid = driver_grid.schism_grid
-        handles.batch_interpolate_velocity(
-            group.pa.x, group.pa.y, group.pa.z, group.pa.element, group.pa.status,
-            grid.i34, grid.elnode, grid.x, grid.y,
-            grid.nvrt, grid.kbp, grid.kbe, grid.sigma_lcl, grid.dp,
-            composed.u_field1, composed.v_field1, composed.w_field1, composed.eta_field1,
-            composed.u_field2, composed.v_field2, composed.w_field2,
-            0.0, driver_grid.h0,
-            group.pa.u, group.pa.v, group.pa.w,
-        )
+        if settle_row is None:
+            handles.batch_interpolate_velocity(
+                group.pa.x, group.pa.y, group.pa.z, group.pa.element, group.pa.status,
+                grid.i34, grid.elnode, grid.x, grid.y,
+                grid.nvrt, grid.kbp, grid.kbe, grid.sigma_lcl, grid.dp,
+                composed.u_field1, composed.v_field1, composed.w_field1, composed.eta_field1,
+                composed.u_field2, composed.v_field2, composed.w_field2,
+                0.0, driver_grid.h0,
+                group.pa.u, group.pa.v, group.pa.w,
+            )
+        else:
+            build_settling_kernels(handles).batch_interpolate_velocity(
+                group.pa.x, group.pa.y, group.pa.z, group.pa.element, group.pa.status,
+                grid.i34, grid.elnode, grid.x, grid.y,
+                grid.nvrt, grid.kbp, grid.kbe, grid.sigma_lcl, grid.dp,
+                composed.u_field1, composed.v_field1, composed.w_field1, composed.eta_field1,
+                composed.u_field2, composed.v_field2, composed.w_field2,
+                0.0, driver_grid.h0,
+                group.pa.u, group.pa.v, group.pa.w,
+                settle_mask, settle_row,
+            )
     finally:
         group.pa.status[other_active] = saved_status
         _restore_fields(group.pa, other_rows, saved_velocity)
@@ -1738,8 +1825,13 @@ def _mirror_rk4_substep_loop_dispatch(
     local_region_polygons: np.ndarray | None = None,
     local_first_exit_pending: np.ndarray | None = None,
     local_departures: list[LocalDomainFirstExitRecord] | None = None,
+    settle_mask: np.ndarray | None = None,
+    settle_row: np.ndarray | None = None,
 ) -> SubstepDiagnostics:
     """WP-16 任務 2：依 ``config.substep_loop_impl`` 選擇子步迴圈實作。
+
+    WP-54：``settle_mask``／``settle_row``（逐粒子沉降速度）只有 numba 實作支援；
+    ``substep_loop_impl="python"`` 搭配逐粒子沉降速度會 fail-closed 拒絕。
 
     兩個呼叫端（``_run_group_hour`` 的「單次呼叫」與「拆成新到達／延續中
     兩次呼叫」分支）共用同一個參數組合，這裡集中一次，避免兩處分岔各自
@@ -1753,6 +1845,11 @@ def _mirror_rk4_substep_loop_dispatch(
     """
 
     if config.substep_loop_impl == "python":
+        if settle_row is not None:
+            raise HourMajorError(
+                "逐粒子沉降速度（class_candidates_balanced）只支援 substep_loop_impl='numba'，"
+                "python 版子步迴圈不支援，fail-closed 拒絕"
+            )
         return mirror_rk4_substep_loop(
             driver_grid, handles, pa,
             ibf=ibf, ndeltp=ndeltp, dtb=dtb, composed=composed,
@@ -1789,6 +1886,8 @@ def _mirror_rk4_substep_loop_dispatch(
             vertical_diffusion=config.vertical_diffusion,
             kz_constant_m2ps=config.kz_constant_m2ps,
             visser_correction=config.visser_correction,
+            particle_settling_mps=settle_row,
+            settling_effective_mask=settle_mask,
         )
     raise HourMajorError(
         f"substep_loop_impl 必須是 'python' 或 'numba'，收到 {config.substep_loop_impl!r}"
@@ -1808,8 +1907,13 @@ def _run_group_hour(
     hf2_now: np.ndarray | None,
     newly_mask: np.ndarray | None,
     continuing_mask: np.ndarray | None,
+    settle_mask: np.ndarray | None = None,
+    settle_row: np.ndarray | None = None,
 ) -> int:
     """對這個分組跑完這一小時的子步迴圈，回傳實際發出的 kernel 呼叫次數。
+
+    ``settle_mask``／``settle_row``（WP-54）：逐粒子沉降速度，原樣透傳給子步迴圈，
+    見 ``_mirror_rk4_substep_loop_dispatch``；省略時行為與先前相同。
 
     ``newly_mask``／``continuing_mask`` 只在「這一小時同時有新到達與延續中
     的作用中粒子、且啟用擴散」時才會非 ``None``（見模組文件「新到達粒子與
@@ -1855,6 +1959,7 @@ def _run_group_hour(
             local_region_polygons=group.inp.local_region_polygons if needs_local else None,
             local_first_exit_pending=group.local_first_exit_pending if needs_local else None,
             local_departures=local_departures if needs_local else None,
+            settle_mask=settle_mask, settle_row=settle_row,
         )
         _dispatch_departure_records(group, departures)
         if needs_local:
@@ -1900,6 +2005,7 @@ def _run_group_hour(
                 local_region_polygons=group.inp.local_region_polygons if needs_local else None,
                 local_first_exit_pending=group.local_first_exit_pending if needs_local else None,
                 local_departures=local_departures if needs_local else None,
+                settle_mask=settle_mask, settle_row=settle_row,
             )
         finally:
             group.pa.status[other_active] = saved_status
@@ -2108,6 +2214,12 @@ def save_hour_major_checkpoint(
         meta["groups"].append(
             {
                 "settling_velocity_mps": group.inp.settling_velocity_mps,
+                # WP-54：逐粒子沉降速度的指紋；省略（None）時不寫入，檔案格式與先前相同。
+                **(
+                    {"particle_settling_velocity_sha256": group.inp.particle_settling_digest()}
+                    if group.inp.has_per_particle_settling
+                    else {}
+                ),
                 "has_diffusion_state": has_diffusion_state,
                 "has_prev_hf2": has_prev_hf2,
                 "units": units_meta,
@@ -2159,6 +2271,10 @@ def load_hour_major_checkpoint(
     for gi, (group_meta, inp) in enumerate(zip(meta["groups"], batch.groups, strict=True)):
         if float(group_meta["settling_velocity_mps"]) != inp.settling_velocity_mps:
             raise HourMajorError(f"checkpoint 分組 {gi} 的沉降速度與目前輸入不一致，拒絕續跑")
+        if group_meta.get("particle_settling_velocity_sha256") != inp.particle_settling_digest():
+            raise HourMajorError(
+                f"checkpoint 分組 {gi} 的逐粒子沉降速度與目前輸入不一致（指紋不同或一邊缺少），拒絕續跑"
+            )
 
         with np.load(str(checkpoint_dir / f"group_{gi}.npz"), allow_pickle=False) as npz:
             n = inp.particle_count

@@ -2204,6 +2204,18 @@ class RuntimeRequestFactory:
         if type(run_kind) is not str or run_kind not in _RUNTIME_RUN_KINDS:
             raise ValueError("run_kind 只允許 pilot 或 formal；未知模式禁止 fallback")
         self._run_kind = run_kind
+        # WP-54：逐粒子沉降速度（class_candidates_balanced）只有 native_runner 的小時主軸路徑
+        # 支援；本舊式 reference 引擎每個 scenario 只有一個純量沉降速度，若悄悄沿用會把
+        # 「每類 10 個候選」靜默退化成類別代表值，因此明確拒絕。
+        configured_sampling = config.physics.get("settling", {}).get(
+            "velocity_sampling", "representative"
+        )
+        if configured_sampling != "representative":
+            raise ValueError(
+                f"physics.settling.velocity_sampling={configured_sampling!r} 只支援 "
+                "native_runner 小時主軸路徑；舊式 reference runtime 每個 scenario 只有單一純量"
+                "沉降速度，拒絕靜默退化為 representative"
+            )
         if type(continuous_time_fallback) is not bool:
             raise TypeError("continuous_time_fallback 必須是 bool")
         self._continuous_time_fallback = continuous_time_fallback

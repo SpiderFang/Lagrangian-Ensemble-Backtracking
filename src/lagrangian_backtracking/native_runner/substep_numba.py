@@ -137,6 +137,7 @@ from .backward_driver import (
     NativeBackwardDriverGrid,
     SubstepDiagnostics,
 )
+from .settling_kernels import build_settling_kernels
 
 
 def _empty_region_arrays(
@@ -504,7 +505,7 @@ def prepare_interest_region_arrays(
 # ── njit 融合 kernel 工廠：見模組文件「BayTrace 原版批次核心怎麼在 njit
 # 函式裡呼叫另一個 njit 函式」一節。──────────────────────────────────────
 
-_KERNEL_CACHE: dict[int, Callable[..., None]] = {}
+_KERNEL_CACHE: dict[tuple[int, bool], Callable[..., None]] = {}
 """以 ``id(handles)`` 為鍵的融合 kernel 快取。``handles``（
 ``BayTraceModuleHandles``）在正式用途裡由 ``load_baytrace_modules`` 在
 整個 run 開始時建立一次、之後一路傳遞使用，生命週期涵蓋整個 run，
@@ -515,19 +516,92 @@ _KERNEL_CACHE: dict[int, Callable[..., None]] = {}
 呼叫模式（``handles`` 長駐整個 run）下不會發生。"""
 
 
-def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., None]:
-    """建立（或取回快取的）融合子步迴圈 njit kernel，見模組文件。"""
+def build_fused_substep_kernel(
+    handles: BayTraceModuleHandles, per_particle_settling: bool = False
+) -> Callable[..., None]:
+    """建立（或取回快取的）融合子步迴圈 njit kernel，見模組文件。
 
-    cache_key = id(handles)
+    ``per_particle_settling``（WP-54）：``False`` 時行為與先前完全相同，速度與
+    位移全部走 BayTrace 原版 ``batch_move_rk4``／``batch_interpolate_velocity``，
+    kernel 末端兩個額外引數 ``settle_mask``／``settle`` 被忽略；``True`` 時改走
+    ``settling_kernels`` 的逐粒子沉降版本，``settle_mask`` 是 ``(nvrt, np)`` bool
+    的 ``effective_mask``，``settle`` 是 ``(n,)`` float64 的每顆粒子自己的沉降
+    速度，且 ``w_field`` 必須是**沒有**烤進沉降速度的合成場，見
+    ``settling_kernels`` 模組文件。兩種模式的 kernel 簽章相同，各自獨立快取。
+    """
+
+    cache_key = (id(handles), bool(per_particle_settling))
     cached = _KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    batch_move_rk4 = handles.batch_move_rk4
     batch_check_boundaries = handles.batch_check_boundaries
     batch_clamp_z = handles.batch_clamp_z
-    batch_interpolate_velocity = handles.batch_interpolate_velocity
     batch_interpolate_diffusivity = handles.batch_interpolate_diffusivity
+
+    if per_particle_settling:
+        _settle_kernels = build_settling_kernels(handles)
+        _move_impl = _settle_kernels.batch_move_rk4
+        _interp_impl = _settle_kernels.batch_interpolate_velocity
+
+        @njit(cache=False)
+        def batch_move_rk4(
+            px, py, pz, p_u, p_v, p_w, p_x_prev, p_y_prev, p_elem, p_status, x0, y0, z0,
+            i34, elnode, grid_x, grid_y, ic3, nvrt, kbp, kbe, sigma_lcl, dp,
+            u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+            ibf, dtb, trat, settle_mask, settle,
+        ):
+            _move_impl(
+                px, py, pz, p_u, p_v, p_w, p_x_prev, p_y_prev, p_elem, p_status, x0, y0, z0,
+                i34, elnode, grid_x, grid_y, ic3, nvrt, kbp, kbe, sigma_lcl, dp,
+                u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+                ibf, dtb, trat, settle_mask, settle,
+            )
+
+        @njit(cache=False)
+        def batch_interpolate_velocity(
+            px, py, pz, p_elem, p_status, i34, elnode, grid_x, grid_y,
+            nvrt, kbp, kbe, sigma_lcl, dp,
+            u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+            trat, h0, p_u, p_v, p_w, settle_mask, settle,
+        ):
+            _interp_impl(
+                px, py, pz, p_elem, p_status, i34, elnode, grid_x, grid_y,
+                nvrt, kbp, kbe, sigma_lcl, dp,
+                u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+                trat, h0, p_u, p_v, p_w, settle_mask, settle,
+            )
+    else:
+        _move_orig = handles.batch_move_rk4
+        _interp_orig = handles.batch_interpolate_velocity
+
+        @njit(cache=False)
+        def batch_move_rk4(
+            px, py, pz, p_u, p_v, p_w, p_x_prev, p_y_prev, p_elem, p_status, x0, y0, z0,
+            i34, elnode, grid_x, grid_y, ic3, nvrt, kbp, kbe, sigma_lcl, dp,
+            u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+            ibf, dtb, trat, settle_mask, settle,
+        ):
+            _move_orig(
+                px, py, pz, p_u, p_v, p_w, p_x_prev, p_y_prev, p_elem, p_status, x0, y0, z0,
+                i34, elnode, grid_x, grid_y, ic3, nvrt, kbp, kbe, sigma_lcl, dp,
+                u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+                ibf, dtb, trat,
+            )
+
+        @njit(cache=False)
+        def batch_interpolate_velocity(
+            px, py, pz, p_elem, p_status, i34, elnode, grid_x, grid_y,
+            nvrt, kbp, kbe, sigma_lcl, dp,
+            u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+            trat, h0, p_u, p_v, p_w, settle_mask, settle,
+        ):
+            _interp_orig(
+                px, py, pz, p_elem, p_status, i34, elnode, grid_x, grid_y,
+                nvrt, kbp, kbe, sigma_lcl, dp,
+                u_field1, v_field1, w_field1, eta_field1, u_field2, v_field2, w_field2,
+                trat, h0, p_u, p_v, p_w,
+            )
 
     native_status_left_flow_domain = np.int32(NATIVE_STATUS_LEFT_FLOW_DOMAIN)
 
@@ -554,7 +628,7 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
         native_status, substep_utc_ns_values,
         dep_row, dep_x, dep_y, dep_z, dep_utc_ns,
         local_dep_row, local_dep_x, local_dep_y, local_dep_z, local_dep_utc_ns,
-        needs_fallback,
+        needs_fallback, settle_mask, settle,
     ):
         n = px.shape[0]
         n_grid_nodes = grid_x.shape[0]
@@ -601,7 +675,7 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
                 nvrt, kbp, kbe, sigma_lcl, dp,
                 u_field1, v_field1, w_field1, eta_field1,
                 u_field2, v_field2, w_field2,
-                ibf, dtb, trat,
+                ibf, dtb, trat, settle_mask, settle,
             )
 
             if enable_diffusion:
@@ -673,7 +747,7 @@ def build_fused_substep_kernel(handles: BayTraceModuleHandles) -> Callable[..., 
                 u_field1, v_field1, w_field1, eta_field1,
                 u_field2, v_field2, w_field2,
                 trat, h0,
-                p_u, p_v, p_w,
+                p_u, p_v, p_w, settle_mask, settle,
             )
 
             if has_local_region:
@@ -770,6 +844,8 @@ def mirror_rk4_substep_loop_numba(
     visser_correction: bool = False,
     kv_field1: np.ndarray | None = None,
     kv_field2: np.ndarray | None = None,
+    particle_settling_mps: np.ndarray | None = None,
+    settling_effective_mask: np.ndarray | None = None,
 ) -> SubstepDiagnostics:
     """``mirror_rk4_substep_loop`` 的 WP-16 任務 2 融合版本：整個子步迴圈
     （含對 BayTrace 原版批次核心的呼叫）跑在單一 ``@njit`` 呼叫裡，見模組
@@ -802,6 +878,13 @@ def mirror_rk4_substep_loop_numba(
       預設 ``False`` 對應 BayTrace 預設 ``imixing=0``。常數 Kv 時修正量為零。
     - 垂向位移之後由 kernel 內的 ``batch_clamp_z`` 夾回水柱內，與 BayTrace 一致。
 
+    WP-54：``particle_settling_mps``（``(n,)`` float64，每顆粒子自己的沉降速度，
+    負值向下）與 ``settling_effective_mask``（``(nvrt, np)`` bool，``base.
+    effective_mask``）必須同時提供或同時省略。提供時 ``composed`` 的 ``w_field1``／
+    ``w_field2`` 必須是**沒有**烤進沉降速度的合成場（``backward_driver.
+    composed_pair_without_settling``），kernel 改走 ``settling_kernels`` 的逐粒子
+    沉降版本；省略時行為與先前逐位元相同。
+
     Returns:
         ``SubstepDiagnostics``，``time_move_s`` 是整個融合 kernel 呼叫的
         總秒數（其餘細項欄位固定為 0，見模組文件差異第 5 點）。
@@ -830,6 +913,21 @@ def mirror_rk4_substep_loop_numba(
                 )
             if not np.all(np.isfinite(field)):
                 raise BackwardDriverError(f"{label} 含非有限值，fail-closed 拒絕")
+    if (particle_settling_mps is None) != (settling_effective_mask is None):
+        raise BackwardDriverError(
+            "particle_settling_mps 與 settling_effective_mask 必須同時提供或同時省略"
+        )
+    per_particle_settling = particle_settling_mps is not None
+    if per_particle_settling:
+        if particle_settling_mps.shape != (pa.n,) or particle_settling_mps.dtype != np.float64:
+            raise BackwardDriverError("particle_settling_mps 必須是長度等於粒子數的 float64 一維陣列")
+        if not np.all(np.isfinite(particle_settling_mps)):
+            raise BackwardDriverError("particle_settling_mps 含非有限值，fail-closed 拒絕")
+        expected_mask_shape = (driver_grid.schism_grid.nvrt, driver_grid.schism_grid.np)
+        if settling_effective_mask.shape != expected_mask_shape or settling_effective_mask.dtype != np.bool_:
+            raise BackwardDriverError(
+                f"settling_effective_mask 必須是形狀 {expected_mask_shape} 的 bool 陣列"
+            )
     if ibf not in (1, -1):
         raise BackwardDriverError("ibf 只能是 1 或 -1")
     if ndeltp < 1:
@@ -867,7 +965,7 @@ def mirror_rk4_substep_loop_numba(
 
     grid = driver_grid.schism_grid
     n = pa.n
-    kernel = build_fused_substep_kernel(handles)
+    kernel = build_fused_substep_kernel(handles, per_particle_settling)
 
     x0 = pa.x.copy()
     y0 = pa.y.copy()
@@ -974,6 +1072,14 @@ def mirror_rk4_substep_loop_numba(
 
     elem_is_dry_i64 = np.ascontiguousarray(composed.elem_is_dry, dtype=np.int64)
 
+    if per_particle_settling:
+        settle_mask_arg = np.ascontiguousarray(settling_effective_mask)
+        settle_arg = np.ascontiguousarray(particle_settling_mps)
+    else:
+        # 非逐粒子模式 kernel 不會讀這兩個引數；給同型別的極小陣列即可。
+        settle_mask_arg = np.zeros((1, 1), dtype=np.bool_)
+        settle_arg = np.zeros(1, dtype=np.float64)
+
     dep_count, local_dep_count, fail_substep, fail_count = kernel(
         pa.x, pa.y, pa.z, pa.u, pa.v, pa.w, pa.x_prev, pa.y_prev, pa.element, pa.status, pa.inbr, pa.rnds,
         pa.dhfx, pa.dhfy, pa.dhfz, pa.grdx, pa.grdy, pa.grdz, pa.wind_x, pa.wind_y,
@@ -999,7 +1105,7 @@ def mirror_rk4_substep_loop_numba(
         substep_utc_ns_values,
         dep_row, dep_x, dep_y, dep_z, dep_utc_ns,
         local_dep_row, local_dep_x, local_dep_y, local_dep_z, local_dep_utc_ns,
-        needs_fallback,
+        needs_fallback, settle_mask_arg, settle_arg,
     )
 
     if fail_substep >= 0:

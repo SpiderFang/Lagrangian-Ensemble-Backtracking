@@ -1255,6 +1255,13 @@ def run_native_plan_command(argv: Sequence[str] | None = None) -> int:
             "gap_check_skipped": bool(args.skip_gap_check),
             "schedule": args.schedule,
             "gap_check_reconstruction_patch_months": patch_months_used,
+            # WP-54：v7 逐粒子沉降速度抽樣的模式、種子與各組候選計數；representative 模式
+            # 沒有這個鍵，計畫檔與先前逐位元相同。
+            **(
+                {"settling_velocity_sampling": table.settling_sampling}
+                if getattr(table, "settling_sampling", None) is not None
+                else {}
+            ),
         },
     )
 
@@ -2033,6 +2040,9 @@ def _subset_identity_table(identity_table: Any, keep_rows: np.ndarray) -> Any:
         master_seed=identity_table.master_seed,
         random_stream_id=identity_table.random_stream_id,
         labels=labels,
+        # WP-54：逐粒子沉降速度與候選序號已隨 ndarray 欄位一併取列；抽樣中繼資料描述的是
+        # 完整身分表，子集（試產專用）沿用原樣，不重算計數。
+        settling_sampling=identity_table.settling_sampling,
     )
 
 

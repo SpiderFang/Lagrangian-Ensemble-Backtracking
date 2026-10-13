@@ -287,6 +287,16 @@ class ParticleIdentityTable:
     # 陣列都必須是長度 N 的一維陣列，並納入內容雜湊與 .npz。刻意放在 content_sha256
     # 之後的預設值欄位，讓既有以位置或關鍵字建構的呼叫端完全不受影響。
     labels: dict[str, np.ndarray] | None = None
+    # WP-54（v7 ``class_candidates_balanced``）：選用的逐粒子實際沉降速度。``settling_velocity_mps``
+    # 仍是「類別代表速度」，維持工作單元規劃、分組與後處理依類別分組的語意；這三個欄位
+    # 只在 v7 抽樣模式下才有值：
+    #   particle_settling_velocity_mps：每顆粒子實際使用的沉降速度（m/s，嚴格為負）；
+    #   settling_candidate_index：該速度在類別 10 個候選值中的序號（0 為最慢、9 為最快）；
+    #   settling_sampling：抽樣中繼資料（模式、種子、各站各類別計數等，可 JSON 序列化）。
+    # 三者必須同時提供或同時省略；省略時內容雜湊、.npz 格式與 WP-54 之前逐位元相同。
+    particle_settling_velocity_mps: np.ndarray | None = None
+    settling_candidate_index: np.ndarray | None = None
+    settling_sampling: dict | None = None
 
     def __post_init__(self) -> None:
         """一次性驗證欄位形狀、型別、唯一性與有限性，並計算內容雜湊。
@@ -366,6 +376,43 @@ class ParticleIdentityTable:
                     raise ParticleInputError(f"labels[{name!r}] dtype 不支援：{array.dtype}")
                 if not array.flags["C_CONTIGUOUS"]:
                     self.labels[name] = np.ascontiguousarray(array)
+        per_particle = (
+            self.particle_settling_velocity_mps,
+            self.settling_candidate_index,
+            self.settling_sampling,
+        )
+        if any(item is not None for item in per_particle):
+            if any(item is None for item in per_particle):
+                raise ParticleInputError(
+                    "particle_settling_velocity_mps／settling_candidate_index／settling_sampling "
+                    "必須同時提供或同時省略"
+                )
+            velocities = self.particle_settling_velocity_mps
+            indices = self.settling_candidate_index
+            for name, array in (
+                ("particle_settling_velocity_mps", velocities),
+                ("settling_candidate_index", indices),
+            ):
+                if not isinstance(array, np.ndarray) or array.ndim != 1 or array.shape[0] != n:
+                    raise ParticleInputError(f"{name} 必須是長度 {n} 的一維陣列")
+                if not array.flags["C_CONTIGUOUS"]:
+                    object.__setattr__(self, name, np.ascontiguousarray(array))
+            velocities = self.particle_settling_velocity_mps
+            indices = self.settling_candidate_index
+            if velocities.dtype != np.float64:
+                raise ParticleInputError("particle_settling_velocity_mps dtype 必須是 float64")
+            if indices.dtype != np.int16:
+                raise ParticleInputError("settling_candidate_index dtype 必須是 int16")
+            if not np.all(np.isfinite(velocities)) or np.any(velocities >= 0.0):
+                raise ParticleInputError("particle_settling_velocity_mps 必須全部是嚴格小於 0 的有限值")
+            if np.any(indices < 0):
+                raise ParticleInputError("settling_candidate_index 不可為負")
+            if not isinstance(self.settling_sampling, dict) or not self.settling_sampling:
+                raise ParticleInputError("settling_sampling 必須是非空 dict")
+            try:
+                json.dumps(self.settling_sampling, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError) as error:
+                raise ParticleInputError(f"settling_sampling 必須可序列化成 JSON：{error}") from error
         if not isinstance(self.experiment_case_id, str) or not self.experiment_case_id.strip():
             raise ParticleInputError("experiment_case_id 不可空白")
         seed = self.master_seed
@@ -420,6 +467,15 @@ def _compute_identity_table_hash(table: ParticleIdentityTable) -> str:
         "random_stream_id": table.random_stream_id,
         "particle_count": int(table.particle_id.shape[0]),
     }
+    if table.particle_settling_velocity_mps is not None:
+        # WP-54：只有 v7 逐粒子沉降速度存在時才納入雜湊；沒有時雜湊與先前逐位元相同。
+        for name in ("particle_settling_velocity_mps", "settling_candidate_index"):
+            array = getattr(table, name)
+            digest.update(b"per_particle:" + name.encode("utf-8"))
+            digest.update(str(array.dtype).encode("utf-8"))
+            digest.update(str(array.shape).encode("utf-8"))
+            digest.update(array.tobytes())
+        metadata["settling_sampling"] = table.settling_sampling
     canonical_metadata = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest.update(canonical_metadata.encode("utf-8"))
     return digest.hexdigest()
@@ -595,6 +651,11 @@ def save_particle_identity_table_npz(table: ParticleIdentityTable, path: str | P
         # 沒有標籤的檔案格式與先前完全相同。
         metadata["label_names"] = sorted(table.labels)
         label_arrays = {f"label__{name}": array for name, array in table.labels.items()}
+    if table.particle_settling_velocity_mps is not None:
+        # WP-54：逐粒子沉降速度與抽樣中繼資料；沒有時檔案格式與先前相同。
+        metadata["settling_sampling"] = table.settling_sampling
+        label_arrays["particle_settling_velocity_mps"] = table.particle_settling_velocity_mps
+        label_arrays["settling_candidate_index"] = table.settling_candidate_index
     np.savez(
         str(path),
         particle_id=table.particle_id,
@@ -651,6 +712,13 @@ def load_particle_identity_table_npz(path: str | Path) -> ParticleIdentityTable:
                 if "label_names" in metadata
                 else None
             ),
+            particle_settling_velocity_mps=(
+                npz["particle_settling_velocity_mps"] if "settling_sampling" in metadata else None
+            ),
+            settling_candidate_index=(
+                npz["settling_candidate_index"] if "settling_sampling" in metadata else None
+            ),
+            settling_sampling=metadata.get("settling_sampling"),
         )
     if table.content_sha256 != metadata["content_sha256"]:
         raise ParticleInputError(

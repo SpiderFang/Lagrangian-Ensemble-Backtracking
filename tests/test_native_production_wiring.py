@@ -653,6 +653,64 @@ def test_build_formal_identity_table_members_per_scenario_ten(formal_identity_co
     assert set(np.unique(table.member_id).tolist()) == set(range(10))
 
 
+@pytest.fixture
+def formal_identity_config_balanced(tmp_path: Path) -> tuple[ProjectConfig, Path]:
+    """同 ``formal_identity_config``，但 ``physics.settling.velocity_sampling`` 設為 v7 的均衡抽樣。"""
+
+    from test_manifests import (
+        _arrival_payload,
+        _initial_condition_payload,
+        _receptor_payload,
+        _write_json,
+        _material_payload,
+    )
+
+    payload = _config_payload(with_paths=True)
+    payload["scenarios"]["master_seed"] = 424242
+    payload["execution"]["shard_scenario_count"] = 2_500
+    payload["physics"]["settling"]["velocity_sampling"] = "class_candidates_balanced"
+    config = ProjectConfig.model_validate(payload)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("placeholder: true\n", encoding="utf-8")
+    _write_json(tmp_path / "material.json", _material_payload())
+    receptor_payload = _receptor_payload()
+    arrival_payload = _arrival_payload()
+    _write_json(tmp_path / "receptor.json", receptor_payload)
+    _write_json(tmp_path / "arrival.json", arrival_payload)
+    _write_json(
+        tmp_path / "initial_conditions.json",
+        _initial_condition_payload(config, receptors=receptor_payload, arrivals=arrival_payload),
+    )
+    return config, config_path
+
+
+def test_build_formal_identity_table_balanced_sampling_each_site_class_candidate_1000(
+    formal_identity_config, formal_identity_config_balanced
+) -> None:
+    """WP-54：formal + M=10 + class_candidates_balanced → 每站每類 10 個候選各恰 1,000 顆；
+    類別代表速度欄位與 representative 模式的身分表完全相同，只多逐粒子欄位。"""
+
+    config, config_path = formal_identity_config_balanced
+    table = pw.build_formal_identity_table(
+        config, members_per_scenario=10, config_path=config_path, formal=True
+    )
+    assert len(table) == 500_000
+    assert table.particle_settling_velocity_mps is not None
+    assert table.settling_sampling["mode"] == "class_candidates_balanced"
+    for site in np.unique(table.study_site_id):
+        for material in np.unique(table.material_id):
+            rows = (table.study_site_id == site) & (table.material_id == material)
+            assert int(rows.sum()) == 10_000
+            counts = np.bincount(table.settling_candidate_index[rows], minlength=10)
+            assert counts.tolist() == [1000] * 10
+
+    rep_config, rep_path = formal_identity_config
+    rep = pw.build_formal_identity_table(rep_config, members_per_scenario=10, config_path=rep_path, formal=True)
+    assert rep.particle_settling_velocity_mps is None
+    assert np.array_equal(rep.settling_velocity_mps, table.settling_velocity_mps)
+    assert np.array_equal(rep.particle_id, table.particle_id)
+
+
 def test_build_formal_identity_table_rejects_missing_master_seed(tmp_path: Path) -> None:
     """master_seed 尚未核定（沿用範例設定的 null）時必須 fail-closed，且不必等
     manifest 讀完才發現——見 production_wiring.py 對這個檢查順序的說明。

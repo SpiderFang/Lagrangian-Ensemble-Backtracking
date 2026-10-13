@@ -154,6 +154,7 @@ from .grid_bridge import build_native_grid_arrays
 from .orchestrator import derive_backward_window_available
 from .particle_input import ParticleIdentityTable, build_particle_identity_table
 from .resources import DomainResources, DomainResourcesFactory
+from .settling_sampling import apply_settling_velocity_sampling
 from .wave_bridge import NativeWaveBridgeReader, build_nww3_node_interpolation_weights
 
 __all__ = [
@@ -1001,13 +1002,20 @@ def build_formal_identity_table(
 
         return member_arrival_labels(_member_arrival(unit))
 
-    return build_particle_identity_table(
+    table = build_particle_identity_table(
         shards,
         master_seed=master_seed,
         resolve_initial_position=resolve_initial_position,
         random_stream_id=random_stream_id,
         resolve_arrival_time_utc_ns=resolve_arrival_time_utc_ns if per_member_scope else None,
         resolve_labels=resolve_labels if per_member_scope else None,
+    )
+    # WP-54：沉降速度抽樣模式（``physics.settling.velocity_sampling``，預設 representative
+    # 即舊行為）。class_candidates_balanced 時把各站各類別的 10 個候選速度均衡分配給
+    # 粒子；正式（formal=True）要求每組粒子數為 10 的整數倍。
+    sampling_mode = config.physics.get("settling", {}).get("velocity_sampling", "representative")
+    return apply_settling_velocity_sampling(
+        table, scenario_inputs.materials, mode=sampling_mode, require_exact_balance=bool(formal)
     )
 
 

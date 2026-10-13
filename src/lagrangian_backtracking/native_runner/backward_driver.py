@@ -538,6 +538,7 @@ __all__ = [
     "ComposedFieldEndpoint",
     "compose_current_and_stokes_fields",
     "apply_settling_velocity",
+    "composed_pair_without_settling",
     "compose_total_velocity_fields",
     "compute_smagorinsky_kh_field",
     "zeroed_current_field2_for_smagorinsky",
@@ -1859,6 +1860,32 @@ def apply_settling_velocity(
         u_field2=base.u_field2,
         v_field2=base.v_field2,
         w_field2=np.ascontiguousarray(w2),
+        node_is_dry=base.node_is_dry,
+        elem_is_dry=base.elem_is_dry,
+        stokes_ok_fraction=base.stokes_ok_fraction,
+    )
+
+
+def composed_pair_without_settling(base: ComposedCurrentAndStokesFields) -> ComposedFieldPair:
+    """把 ``base`` 包成 ``ComposedFieldPair``，但**不加**任何沉降速度，也不複製陣列。
+
+    WP-54：v7 逐粒子沉降速度（``native_runner.settling_kernels``）在 kernel 內插
+    時才把每顆粒子自己的沉降速度加到 ``effective_mask`` 內，因此傳給 kernel 的
+    ``w_field1``／``w_field2`` 必須是沒有烤進沉降速度的合成場，也就是 ``base``
+    的 ``w_field1_no_settling``／``w_field2_no_settling`` 本身。本函式直接沿用
+    ``base`` 的陣列參考（零複製、零成本），回傳值只供唯讀使用，呼叫端與下游
+    kernel 都不得原地修改這些陣列（``apply_settling_velocity`` 也只複製 ``w``、
+    從不修改 ``base``，兩者共用同一份 ``base`` 是安全的）。
+    """
+
+    return ComposedFieldPair(
+        u_field1=base.u_field1,
+        v_field1=base.v_field1,
+        w_field1=base.w_field1_no_settling,
+        eta_field1=base.eta_field1,
+        u_field2=base.u_field2,
+        v_field2=base.v_field2,
+        w_field2=base.w_field2_no_settling,
         node_is_dry=base.node_is_dry,
         elem_is_dry=base.elem_is_dry,
         stokes_ok_fraction=base.stokes_ok_fraction,

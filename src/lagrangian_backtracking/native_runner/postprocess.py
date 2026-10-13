@@ -558,6 +558,14 @@ domain 終止」與「首次離開 local domain」兩件事，因此**不會**�
 docstring「WP-23」一節。"""
 
 
+PARTICLE_SETTLING_VELOCITY_COLUMN = "particle_settling_velocity_mps"
+"""WP-54：逐粒子實際沉降速度欄（m/s，負值向下），只在 v7 ``class_candidates_balanced``
+身分表才會出現在離開紀錄表與 local domain 首次離開表。"""
+
+SETTLING_CANDIDATE_INDEX_COLUMN = "settling_candidate_index"
+"""WP-54：該速度在類別 10 個候選值中的序號（0 最慢、9 最快），與上一欄同時出現。"""
+
+
 LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA: pa.Schema = pa.schema(
     [
         pa.field("particle_id", pa.string(), nullable=False),
@@ -1111,7 +1119,7 @@ def _label_columns_for_identity(
         return ()
     reserved = {field.name for field in DEPARTURE_TABLE_SCHEMA} | {
         field.name for field in LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA
-    }
+    } | {PARTICLE_SETTLING_VELOCITY_COLUMN, SETTLING_CANDIDATE_INDEX_COLUMN}
     columns: list[tuple[str, np.ndarray, pa.DataType]] = []
     for name in sorted(labels):
         if name in reserved:
@@ -2084,6 +2092,21 @@ class PostprocessAccumulator:
             ]
             self._departure_schema = pa.schema([*DEPARTURE_TABLE_SCHEMA, *label_fields])
             self._local_departure_schema = pa.schema([*LOCAL_DOMAIN_DEPARTURE_TABLE_SCHEMA, *label_fields])
+        # WP-54：v7 逐粒子沉降速度（class_candidates_balanced）。身分表帶有該欄位時，離開
+        # 紀錄表與 local domain 首次離開表各多兩個欄位（附在標籤欄之後）；沒有時（既有
+        # representative 模式）欄位與輸出逐位元不變。``settling_velocity_mps`` 欄仍是
+        # 類別代表速度，後處理與圖面依類別分組不變。
+        self._particle_settling_columns: tuple[tuple[str, np.ndarray, pa.DataType], ...] = ()
+        if identity_table.particle_settling_velocity_mps is not None:
+            self._particle_settling_columns = (
+                (PARTICLE_SETTLING_VELOCITY_COLUMN, identity_table.particle_settling_velocity_mps, pa.float64()),
+                (SETTLING_CANDIDATE_INDEX_COLUMN, identity_table.settling_candidate_index, pa.int16()),
+            )
+            settle_fields = [
+                pa.field(name, kind, nullable=False) for name, _array, kind in self._particle_settling_columns
+            ]
+            self._departure_schema = pa.schema([*self._departure_schema, *settle_fields])
+            self._local_departure_schema = pa.schema([*self._local_departure_schema, *settle_fields])
         self._depth_quartile = _assign_depth_quartile(
             identity_table, bin_count=self._config.depth_quartile_count
         )
@@ -2452,6 +2475,8 @@ class PostprocessAccumulator:
         }
         for name, array, _kind in self._label_columns:
             columns[name] = pa.array(array[rows])
+        for name, array, _kind in self._particle_settling_columns:
+            columns[name] = pa.array(array[rows])
         table = pa.table(columns, schema=self._departure_schema)
         self._departure_writer.write_table(table)
 
@@ -2575,6 +2600,8 @@ class PostprocessAccumulator:
             "local_boundary_arc_length_position_m": pa.array(arc_positions_m, type=pa.float64()),
         }
         for name, array, _kind in self._label_columns:
+            columns[name] = pa.array(array[local_global_rows])
+        for name, array, _kind in self._particle_settling_columns:
             columns[name] = pa.array(array[local_global_rows])
         table = pa.table(columns, schema=self._local_departure_schema)
         self._local_departure_writer.write_table(table)
@@ -2738,6 +2765,13 @@ class PostprocessAccumulator:
                 # PostprocessAccumulator.__init__ 對兩種 experiment_case_id 語意
                 # 差異的說明。
                 "runtime_physics_case": self._runtime_physics_case,
+                # WP-54：v7 沉降速度逐粒子抽樣的中繼資料（模式、種子、各站各類別候選計數）；
+                # representative 模式沒有這個鍵，manifest 與先前逐位元相同。
+                **(
+                    {"settling_velocity_sampling": self._identity_table.settling_sampling}
+                    if self._identity_table.settling_sampling is not None
+                    else {}
+                ),
                 # WP-26／WP-28：native-plan 計畫檔的 bed_no_deposition（海床不沉積）
                 # 敏感度案例聲明（若呼叫端提供 --plan）。None 表示呼叫端未提供計畫
                 # 檔，不代表「未啟用」，見 PostprocessAccumulator.__init__ 的說明。
