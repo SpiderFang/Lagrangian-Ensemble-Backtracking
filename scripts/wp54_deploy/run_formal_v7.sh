@@ -71,21 +71,26 @@ if [ ! -e "$ISO" ]; then
     --output "$ISO" > "$B/logs/isobaths.log" 2>&1 || { log "等深線匯出失敗，停止"; exit 3; }
 fi
 
-# 提交順序成本：run07 實測的分段成本（unit-costs.json）只在「分段 id 集合完全相同」時沿用（只影響動態佇列順序，不改物理結果）；
-# 分段 id 含內容雜湊，v7 身分表不同時 id 不會相同，則沿用計畫檔內建估計。
+# 提交順序成本：沿用 run07 實測的分段成本（unit-costs.json，只影響動態佇列的提交順序，不改任何物理結果）。
+# 分段 id 形如 hourmajor::<流場>__seg<K>of<N>__<內容雜湊>，v7 身分表不同、雜湊部分會變，所以以去掉雜湊的前綴
+# 對應；前綴集合必須與 v7 計畫完全相同才沿用，否則沿用計畫檔內建估計。
 reuse_unit_costs() {
   local CASE=$1
   local SRC=$RUN07/$CASE/unit-costs.json DST=$B/$CASE/unit-costs.json
   [ -f "$SRC" ] && [ ! -e "$DST" ] || return 0
   "$PY" - "$SRC" "$B/$CASE/native-plan.json" "$DST" <<'PYEOF'
-import json, shutil, sys
+import json, sys
 src, plan, dst = sys.argv[1:4]
-keys = set(json.load(open(src)))
-plan_keys = set("hourmajor::" + k if not k.startswith("hourmajor::") else k for k in json.load(open(plan))["hour_major_members"])
-if keys == plan_keys:
-    shutil.copyfile(src, dst); print("沿用 run07 的 unit-costs.json")
+old = json.load(open(src))
+plan_keys = list(json.load(open(plan))["hour_major_members"])
+strip = lambda k: k.rsplit("__", 1)[0]
+old_by_prefix = {strip(k): v for k, v in old.items()}
+new_prefixes = {strip(k): k for k in plan_keys}
+if len(old_by_prefix) == len(old) and len(new_prefixes) == len(plan_keys) and set(old_by_prefix) == set(new_prefixes):
+    json.dump({new_prefixes[p]: old_by_prefix[p] for p in new_prefixes}, open(dst, "w"), indent=1)
+    print("沿用 run07 的 unit-costs.json（%d 段，依去雜湊前綴對應）" % len(plan_keys))
 else:
-    print("run07 的 unit-costs 分段 id 與 v7 計畫不同（%d 對 %d），不沿用" % (len(keys), len(plan_keys)))
+    print("run07 的 unit-costs 分段前綴與 v7 計畫不同（%d 對 %d），不沿用" % (len(old_by_prefix), len(new_prefixes)))
 PYEOF
 }
 
