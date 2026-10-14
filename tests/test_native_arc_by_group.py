@@ -347,6 +347,7 @@ def test_build_end_to_end_writes_registered_figures_tables_and_manifest(tmp_path
         readme = (out / "README.md").read_text(encoding="utf-8")
         for text in (captions, readme):
             assert "機率" not in text
+            assert "））" not in text
             assert "跨站" not in text and "五站一致" not in text
         # 圖說可以有站名（站名只出現在檔名與圖說）。
         assert "site_a" in captions
@@ -452,6 +453,7 @@ def test_captions_describe_ten_speeds_only_for_per_particle_data(tmp_path):
         captions = (out / "captions.md").read_text(encoding="utf-8")
         table = json.loads((out / "tables" / "site_a" / "class_summary.json").read_text(encoding="utf-8"))
         assert ("每類有 10 個沉降速度，各占該類粒子的十分之一" in captions) is flag
+        assert "））" not in captions and "（（" not in captions
         assert ("每類只有一個沉降速度" in captions) is (not flag)
         assert all(
             ("particle_actual" if flag else "class_representative") == g["settling_speed_mps"]["source"]
@@ -465,3 +467,18 @@ def test_three_significant_digits_keep_trailing_zero():
     assert abgf._three_sig(0.107722) == "0.108"
     assert abgf._three_sig(0.0142) == "0.0142"
     assert abgf._three_sig(0.1) == "0.100"
+
+
+def test_season_captions_have_no_nested_parentheses(tmp_path):
+    _write_postprocess(tmp_path / "pp", closed=True)
+    config = abgf.ArcByGroupConfig(
+        cases=(abgf.ArcByGroupCase("c", tmp_path / "pp", tmp_path / "out"),),
+        params=abg.ArcByGroupParams(sigma_km=5.0, n_grid=200, n_resamples=5, seed=1),
+        groupings=("season",),
+        dpi=40,
+    )
+    (out,) = abgf.build_arc_by_group(config, command="test")
+    captions = (out / "captions.md").read_text(encoding="utf-8")
+    assert "總變異距離（兩分布差的絕對值總和之半）最大為" in captions
+    assert "））" not in captions
+    assert "冬季與" in captions or "春季與" in captions or "夏季與" in captions

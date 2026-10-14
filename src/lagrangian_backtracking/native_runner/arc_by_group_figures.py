@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -451,14 +452,14 @@ def _caption_zh(
     )
     if result.grouping == "class":
         group_zh = (
-            f"沉降速度類別（{groups_n} 類；圖例由上而下依類別代表沉降速度由慢到快排序，顏色由深紫到黃綠；"
+            f"沉降速度類別，共 {groups_n} 類，圖例由上而下依類別代表沉降速度由慢到快排序，顏色由深紫到黃綠；"
             + (
                 "每類有 10 個沉降速度，各占該類粒子的十分之一，圖例與分格標題標示的是該類穿越粒子實際用到的"
-                "最小與最大沉降速度（取絕對值，單位 m/s）"
+                "最小與最大沉降速度，取絕對值，單位為 m/s"
                 if _has_speed_range(result)
-                else "每類只有一個沉降速度，標示的是該速度（取絕對值，單位 m/s）"
+                else "每類只有一個沉降速度，標示的是該速度，取絕對值，單位為 m/s"
             )
-            + "）。"
+            + "。"
             "類別名稱為圖面顯示名稱：「不可回收塑膠」對應材質清冊的「其他/不可回收」，"
             "「可回收塑膠」對應「其他/可回收」，材質識別碼與清冊記錄不受影響"
         )
@@ -476,7 +477,8 @@ def _caption_zh(
     summary = table["summary"]
     pair = summary["max_tvd_pair"]
     if pair is not None:
-        label_of = dict(zip(result.group_ids, result.labels_zh, strict=True))
+        # 圖說句子本身已用括號，組名去掉自帶的括號（例如「冬季（12–2 月）」寫成「冬季」），避免巢狀括號。
+        label_of = {g: re.sub(r"（[^）]*）", "", lab) for g, lab in zip(result.group_ids, result.labels_zh, strict=True)}
         verdict = "超過" if summary["max_tvd"] > summary["max_tvd_pair_null_p95"] else "未超過"
         null_zh = "同釋放點交換類別標籤的配對置換" if result.grouping == "class" else "沉底事件層級的標籤置換"
         pooled = summary["half_split_particle_pooled"]
