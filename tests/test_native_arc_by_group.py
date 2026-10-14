@@ -210,7 +210,7 @@ def test_cli_parser_accepts_multiple_cases():
     assert args.sigma_km == 5.0
 
 
-def _write_postprocess(root: Path, *, closed: bool) -> None:
+def _write_postprocess(root: Path, *, closed: bool, per_particle: bool = False) -> None:
     """寫一個最小的合成後處理目錄：兩站、四個類別、四季、兩種潮況。"""
 
     rng = np.random.default_rng(11)
@@ -244,6 +244,10 @@ def _write_postprocess(root: Path, *, closed: bool) -> None:
                         rows["study_site_id"].append(site)
                         rows["material_id"].append(material)
                         rows["settling_velocity_mps"].append(-0.01 * (m_i + 1))
+                        if per_particle:
+                            # 每類 10 個候選速度（等比排列），每顆粒子抽一個；範圍 = 代表速度 × [0.1, 3]。
+                            cand = -0.01 * (m_i + 1) * np.geomspace(0.1, 3.0, 10)
+                            rows.setdefault("particle_settling_velocity_mps", []).append(float(cand[rng.integers(0, 10)]))
                         rows["crossed_interest_region_boundary"].append(True)
                         rows["boundary_arc_length_position_m"].append(s_km * 1000.0)
                         rows["receptor_id"].append(f"r{receptor}")
@@ -369,3 +373,95 @@ def test_axes_are_shared_across_sites_and_cases(tmp_path):
     ticks = manifest["axes"]["y_ticks_pct_per_km"]["season"]
     assert ticks[0] == 0.0 and ticks[-1] == manifest["axes"]["y_max_pct_per_km"]["season"]
     assert manifest["axes"]["x_max_km"] == 500.0 and manifest["axes"]["x_ticks_km"][-1] == 500.0
+
+
+# ── 速度標示：有、無逐粒子速度欄位 ───────────────────────────────────────
+
+
+def _sample_with_speeds(per_particle: bool) -> abg.SiteArcSample:
+    """兩類：甲類代表速度較慢、實際速度範圍 0.000897–0.107722；乙類代表速度較快、範圍 0.0342–0.345。"""
+
+    base = _sample(same=False)
+    n = base.s_km.size // 2
+    rng = np.random.default_rng(5)
+    cand_a = -np.geomspace(0.000897, 0.107722, 10)
+    cand_b = -np.geomspace(0.034223, 0.344737, 10)
+    actual = np.concatenate([cand_a[rng.integers(0, 10, n)], cand_b[rng.integers(0, 10, n)]])
+    base.velocity_mps = np.where(base.material_id == "oca_a", -0.0114, -0.0959)
+    base.particle_velocity_mps = actual if per_particle else None
+    return base
+
+
+def test_speed_text_is_a_range_when_particle_speeds_exist():
+    res = abg.analyze_grouping(_sample_with_speeds(True), "class", _PARAMS)
+    assert res is not None and res.velocity_summary is not None
+    assert [abgf._speed_text(v) for v in res.velocity_summary] == ["0.000897–0.108 m/s", "0.0342–0.345 m/s"]
+    assert abgf._has_speed_range(res)
+    assert all(v["per_particle_speeds"] for v in res.velocity_summary)
+
+
+def test_speed_text_is_a_single_value_without_particle_speeds():
+    res = abg.analyze_grouping(_sample_with_speeds(False), "class", _PARAMS)
+    assert res is not None and res.velocity_summary is not None
+    assert [abgf._speed_text(v) for v in res.velocity_summary] == ["0.0114 m/s", "0.0959 m/s"]
+    assert not abgf._has_speed_range(res)
+    assert not any(v["per_particle_speeds"] for v in res.velocity_summary)
+
+
+def test_classes_are_ordered_by_representative_speed_not_by_actual_minimum():
+    sample = _sample_with_speeds(True)
+    # 讓甲類代表速度變成較快，但實際範圍不變：排序應跟著代表速度改變。
+    sample.velocity_mps = np.where(sample.material_id == "oca_a", -0.5, -0.0959)
+    res = abg.analyze_grouping(sample, "class", _PARAMS)
+    assert res is not None
+    assert res.group_ids == ("oca_b", "oca_a")
+
+
+def test_summary_table_records_min_max_and_distinct_speeds():
+    res = abg.analyze_grouping(_sample_with_speeds(True), "class", _PARAMS)
+    assert res is not None
+    table = abg.grouping_table_dict(res, case_id="c")
+    rec = table["groups"][0]["settling_speed_mps"]
+    assert rec["abs_min_mps"] == pytest.approx(0.000897) and rec["abs_max_mps"] == pytest.approx(0.107722)
+    assert rec["distinct_values"] == 10 and rec["source"] == "particle_actual"
+    assert rec["representative_abs_mps"] == pytest.approx(0.0114)
+    plain = abg.grouping_table_dict(abg.analyze_grouping(_sample_with_speeds(False), "class", _PARAMS), case_id="c")
+    rec2 = plain["groups"][0]["settling_speed_mps"]
+    assert rec2["distinct_values"] == 1 and rec2["source"] == "class_representative"
+
+
+def test_loader_reads_particle_speed_column_only_when_present(tmp_path):
+    _write_postprocess(tmp_path / "plain", closed=True)
+    _write_postprocess(tmp_path / "per", closed=True, per_particle=True)
+    plain = abg.load_site_arc_samples(tmp_path / "plain")["site_a"]
+    per = abg.load_site_arc_samples(tmp_path / "per")["site_a"]
+    assert plain.particle_velocity_mps is None
+    assert per.particle_velocity_mps is not None and per.particle_velocity_mps.shape == per.s_km.shape
+
+
+def test_captions_describe_ten_speeds_only_for_per_particle_data(tmp_path):
+    for name, flag in (("with", True), ("without", False)):
+        _write_postprocess(tmp_path / f"pp_{name}", closed=True, per_particle=flag)
+        config = abgf.ArcByGroupConfig(
+            cases=(abgf.ArcByGroupCase("c", tmp_path / f"pp_{name}", tmp_path / f"out_{name}"),),
+            params=abg.ArcByGroupParams(sigma_km=5.0, n_grid=200, n_resamples=5, seed=1),
+            groupings=("class",),
+            dpi=40,
+        )
+        (out,) = abgf.build_arc_by_group(config, command="test")
+        captions = (out / "captions.md").read_text(encoding="utf-8")
+        table = json.loads((out / "tables" / "site_a" / "class_summary.json").read_text(encoding="utf-8"))
+        assert ("每類有 10 個沉降速度，各占該類粒子的十分之一" in captions) is flag
+        assert ("每類只有一個沉降速度" in captions) is (not flag)
+        assert all(
+            ("particle_actual" if flag else "class_representative") == g["settling_speed_mps"]["source"]
+            for g in table["groups"]
+        )
+
+
+def test_three_significant_digits_keep_trailing_zero():
+    assert abgf._three_sig(0.920397) == "0.920"
+    assert abgf._three_sig(0.000897) == "0.000897"
+    assert abgf._three_sig(0.107722) == "0.108"
+    assert abgf._three_sig(0.0142) == "0.0142"
+    assert abgf._three_sig(0.1) == "0.100"

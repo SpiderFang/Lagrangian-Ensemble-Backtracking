@@ -201,12 +201,22 @@ def _plan_axes(results: Sequence[GroupingResult]) -> _AxesPlan:
 # ── 繪圖 ─────────────────────────────────────────────────────────────────
 
 
-def _speed_text(summary: Mapping[str, float]) -> str:
-    """類別的沉降速度文字（絕對值，m/s）：單一值寫一個數，多個候選值寫範圍。"""
+def _three_sig(value: float) -> str:
+    """三位有效數字的數字字串（保留尾端的 0，例如 0.920、0.0142、0.000897）。"""
+
+    return f"{value:#.3g}".rstrip(".")
+
+
+def _speed_text(summary: Mapping[str, Any]) -> str:
+    """類別的沉降速度文字（絕對值，m/s，三位有效數字）。
+
+    該類穿越粒子實際使用的速度只有一個（每類單一速度的舊版資料）時，寫單一值；
+    有多個速度（每顆粒子在該類 10 個速度中抽一個）時，寫「最小值–最大值」。
+    """
 
     if int(summary["distinct_values"]) <= 1:
-        return f"{summary['abs_median_mps']:.3g} m/s"
-    return f"{summary['abs_min_mps']:.3g}–{summary['abs_max_mps']:.3g} m/s"
+        return f"{_three_sig(summary['abs_median_mps'])} m/s"
+    return f"{_three_sig(summary['abs_min_mps'])}–{_three_sig(summary['abs_max_mps'])} m/s"
 
 
 def _group_colors(result: GroupingResult) -> list[Any]:
@@ -231,6 +241,12 @@ def _legend_entries(result: GroupingResult) -> list[str]:
         else:
             out.append(f"{result.labels_zh[k]}　{int(result.n_crossed[k]):,} 顆")
     return out
+
+
+def _has_speed_range(result: GroupingResult) -> bool:
+    """類別分組中是否有任一類在穿越粒子上出現多個沉降速度（需以範圍標示）。"""
+
+    return bool(result.velocity_summary) and any(int(v["distinct_values"]) > 1 for v in result.velocity_summary)
 
 
 def _decorate_axis(ax: Any, result: GroupingResult, plan: _AxesPlan, font: Any, *, small: bool) -> None:
@@ -343,8 +359,13 @@ def _plot_overlay(
     _edge_labels_above(ax, result, t, font)
     ax.set_xlabel(_x_label(t), fontproperties=font)
     ax.set_ylabel(_y_label(t), fontproperties=font)
+    class_range = result.grouping == "class" and _has_speed_range(result)
     legend_title = {
-        "class": t.t("類別　沉降速度（由慢到快）", "Class and settling speed (slow to fast)"),
+        "class": (
+            t.t("類別　沉降速度範圍", "Class and settling speed range")
+            if class_range
+            else t.t("類別　沉降速度（由慢到快）", "Class and settling speed (slow to fast)")
+        ),
         "season": t.t("沉底時刻的季節　穿越粒子數", "Season of deposition"),
         "tide": t.t("沉底時刻的潮況　穿越粒子數", "Tide class at deposition"),
     }[result.grouping]
@@ -430,7 +451,14 @@ def _caption_zh(
     )
     if result.grouping == "class":
         group_zh = (
-            f"沉降速度類別（{groups_n} 類；圖例由左上起依沉降速度中位數由慢到快排序，顏色由深紫到黃綠）。"
+            f"沉降速度類別（{groups_n} 類；圖例由上而下依類別代表沉降速度由慢到快排序，顏色由深紫到黃綠；"
+            + (
+                "每類有 10 個沉降速度，各占該類粒子的十分之一，圖例與分格標題標示的是該類穿越粒子實際用到的"
+                "最小與最大沉降速度（取絕對值，單位 m/s）"
+                if _has_speed_range(result)
+                else "每類只有一個沉降速度，標示的是該速度（取絕對值，單位 m/s）"
+            )
+            + "）。"
             "類別名稱為圖面顯示名稱：「不可回收塑膠」對應材質清冊的「其他/不可回收」，"
             "「可回收塑膠」對應「其他/可回收」，材質識別碼與清冊記錄不受影響"
         )

@@ -2447,6 +2447,10 @@ def _native_arc_by_group_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resamples", type=int, default=200, help="每個雜訊基準的隨機重抽次數（預設 200）")
     parser.add_argument("--seed", type=int, default=20261014, help="雜訊基準的亂數種子（預設 20261014）")
     parser.add_argument(
+        "--min-group-particles", type=int, default=50,
+        help="組別穿越粒子數低於此值就略過該組（預設 50；只有小規模試跑才需要調低）",
+    )
+    parser.add_argument(
         "--font-path", type=Path, default=None,
         help="可選：自備中文字型檔；省略時呼叫 resolve_cjk_font()，找不到合格字型時圖面改用英文標籤",
     )
@@ -2468,7 +2472,8 @@ def run_native_arc_by_group_command(argv: Sequence[str] | None = None) -> int:
         sites=tuple(args.sites) if args.sites is not None else None,
         groupings=tuple(args.groupings),
         params=native_arc_by_group.ArcByGroupParams(
-            sigma_km=args.sigma_km, n_grid=args.grid_points, n_resamples=args.resamples, seed=args.seed
+            sigma_km=args.sigma_km, n_grid=args.grid_points, n_resamples=args.resamples, seed=args.seed,
+            min_group_particles=args.min_group_particles,
         ),
         font_path=args.font_path,
         dpi=args.dpi,

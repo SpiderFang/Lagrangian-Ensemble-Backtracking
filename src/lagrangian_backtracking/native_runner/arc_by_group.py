@@ -333,7 +333,9 @@ class SiteArcSample:
 
     ``s_km``：沿邊界折線自起點量起的弧長（公里）。``material_id`` / ``season`` / ``tide``：
     逐粒子組別標籤（``season`` 與 ``tide`` 來自 ``deposition_*`` 欄位，缺欄位時為 ``None``）。
-    ``velocity_mps``：該粒子實際使用的沉降速度（負值，m/s）。``release_code``：釋放點編號
+    ``velocity_mps``：該粒子所屬類別的代表沉降速度（負值，m/s；類別排序用）。
+    ``particle_velocity_mps``：該粒子實際使用的沉降速度（負值，m/s）；後處理表有逐粒子速度欄位
+    （``particle_settling_velocity_mps``，每類 10 個候選速度逐粒子抽樣）時才有值，否則為 ``None``。``release_code``：釋放點編號
     （受體 × 到達時刻 × 成員，同值代表同一釋放點，供類別配對置換）。``event_code``：沉底事件
     編號（到達時刻 × 成員）。``edges``：各邊 ``(名稱, 起點 km, 終點 km)``；``corners``：各轉角
     ``(名稱, 弧長 km)``。``closed`` / ``closure_gap_m``：折線首尾是否閉合與首尾距離。
@@ -357,6 +359,7 @@ class SiteArcSample:
     n_crossed: int
     arc_table_crossed_total: int = 0
     notes: list[str] = field(default_factory=list)
+    particle_velocity_mps: np.ndarray | None = None
 
     @property
     def end_treatment(self) -> str:
@@ -373,6 +376,20 @@ def _codes(*arrays: np.ndarray) -> np.ndarray:
         joined = np.char.add(np.char.add(joined, "|"), np.asarray(extra).astype(str))
     _, inverse = np.unique(joined, return_inverse=True)
     return inverse.astype(np.int64)
+
+
+def _particle_velocity(site: str, col: Any, optional: Sequence[str]) -> np.ndarray | None:
+    """取出逐粒子沉降速度（欄位 ``particle_settling_velocity_mps``）；沒有該欄位時回傳 ``None``。
+
+    欄位存在但穿越粒子中有缺值或非有限值時，代表後處理資料不完整，拋出錯誤而不是悄悄略過。
+    """
+
+    if "particle_settling_velocity_mps" not in optional:
+        return None
+    values = col("particle_settling_velocity_mps").astype(np.float64)
+    if values.size and not np.all(np.isfinite(values)):
+        raise ArcByGroupError(f"站 {site}：逐粒子沉降速度欄位含缺值或非有限值，fail-closed")
+    return values
 
 
 def _read_table(postprocess_dir: Path, stem: str, columns: Sequence[str] | None = None) -> pa.Table:
@@ -413,7 +430,11 @@ def load_site_arc_samples(
     missing = [c for c in base_columns if c not in schema_names]
     if missing:
         raise ArcByGroupError(f"departures.parquet 缺少必要欄位：{missing}")
-    optional = [c for c in ("deposition_season", "deposition_tide_class") if c in schema_names]
+    optional = [
+        c
+        for c in ("deposition_season", "deposition_tide_class", "particle_settling_velocity_mps")
+        if c in schema_names
+    ]
     dep = _read_table(root, "departures", base_columns + optional)
 
     sites_in_data = sorted(set(pc.unique(dep.column("study_site_id")).to_pylist()))
@@ -489,6 +510,7 @@ def load_site_arc_samples(
             s_km=s_km,
             material_id=col("material_id").astype(str),
             velocity_mps=col("settling_velocity_mps").astype(np.float64),
+            particle_velocity_mps=_particle_velocity(site, col, optional),
             season=col("deposition_season").astype(str) if "deposition_season" in optional else None,
             tide=col("deposition_tide_class").astype(str) if "deposition_tide_class" in optional else None,
             release_code=_codes(receptor, arrival, member),
@@ -527,7 +549,7 @@ class GroupingResult:
     group_ids: tuple[str, ...]
     labels_zh: tuple[str, ...]
     n_crossed: np.ndarray
-    velocity_summary: tuple[Mapping[str, float], ...] | None
+    velocity_summary: tuple[Mapping[str, Any], ...] | None
     x_km: np.ndarray
     density_pct_per_km: np.ndarray
     density_all_pct_per_km: np.ndarray
@@ -596,18 +618,23 @@ def analyze_grouping(
         else:
             kept[g] = sel
 
-    velocity_summary: tuple[Mapping[str, float], ...] | None = None
+    velocity_summary: tuple[Mapping[str, Any], ...] | None = None
     if spec.canonical_order is not None:
         order = [g for g in spec.canonical_order if g in kept] + sorted(g for g in kept if g not in spec.canonical_order)
     else:
+        # 排序一律依「類別代表速度」（後處理表的類別沉降速度）由慢到快；逐粒子速度只用來標示範圍。
         med = {g: float(np.median(np.abs(sample.velocity_mps[kept[g]]))) for g in kept}
         order = sorted(kept, key=lambda g: (med[g], g))
+        actual = sample.particle_velocity_mps if sample.particle_velocity_mps is not None else sample.velocity_mps
+        per_particle = sample.particle_velocity_mps is not None
         velocity_summary = tuple(
             {
-                "abs_median_mps": med[g],
-                "abs_min_mps": float(np.min(np.abs(sample.velocity_mps[kept[g]]))),
-                "abs_max_mps": float(np.max(np.abs(sample.velocity_mps[kept[g]]))),
-                "distinct_values": int(np.unique(sample.velocity_mps[kept[g]]).size),
+                "abs_median_mps": float(np.median(np.abs(actual[kept[g]]))),
+                "abs_min_mps": float(np.min(np.abs(actual[kept[g]]))),
+                "abs_max_mps": float(np.max(np.abs(actual[kept[g]]))),
+                "distinct_values": int(np.unique(actual[kept[g]]).size),
+                "representative_abs_mps": med[g],
+                "per_particle_speeds": per_particle,
             }
             for g in order
         )
@@ -771,7 +798,10 @@ def grouping_table_dict(result: GroupingResult, *, case_id: str) -> dict[str, An
             "curve_integral_pct": float(result.density_pct_per_km[k].sum() * dx),
         }
         if result.velocity_summary is not None:
-            rec["settling_speed_mps"] = dict(result.velocity_summary[k])
+            rec["settling_speed_mps"] = {
+                **dict(result.velocity_summary[k]),
+                "source": "particle_actual" if result.velocity_summary[k]["per_particle_speeds"] else "class_representative",
+            }
         groups.append(rec)
     pairs = [dict(r) for r in result.pair_rows]
     worst = max(pairs, key=lambda r: r["tvd"]) if pairs else None
