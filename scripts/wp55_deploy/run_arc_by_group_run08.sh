@@ -9,7 +9,8 @@
 # 該子目錄必須尚不存在（指令本身也會拒絕覆寫）；不會碰 run08 自己的 figures、figures-notext 與任何其他檔案。
 # 程式碼來自 lbt-repo-wp55-fig（WP-55 分支），與 run08 使用的 lbt-repo-wp54 是兩份獨立工作樹，互不修改。
 # 可用環境變數覆寫：LBT_RUN08（run08 根目錄）、LBT_CODE55（本程式碼 clone）、LBT_ARC_DPI（預設 600）、
-#   LBT_ARC_FORCE_WHILE_RUNNING=1（略過「chain 仍在執行」的檢查，不建議）。
+#   LBT_ARC_FORCE_WHILE_RUNNING=1（略過「chain 仍在執行」的檢查，不建議）、
+#   LBT_ARC_EXTRA_ARGS（附加給 native-arc-by-group 的額外參數，例如 "--sites gongliao --resamples 20"，只供試跑）。
 
 set -u
 W=$HOME/Workspace
@@ -18,6 +19,7 @@ B=${LBT_RUN08:-$W/lbt-runs/run08-h90-m10-v7}
 PY=$W/lbt-repo/.venv/bin/python
 LBT=$W/lbt-repo/.venv/bin/lbt
 DPI=${LBT_ARC_DPI:-600}
+EXTRA_ARGS=${LBT_ARC_EXTRA_ARGS:-}
 OUTNAME=figures-arc-by-group
 
 log() { echo "[$(date -u "+%F %T")Z] $*"; }
@@ -50,7 +52,8 @@ mkdir -p "$MPLCONFIGDIR"
 log "程式碼 $CODE55 @ $(git -C "$CODE55" rev-parse --short HEAD)；輸出 $B/<案例>/$OUTNAME；dpi $DPI"
 mkdir -p "$B/logs"
 LOG=$B/logs/arc-by-group.log
-time "$LBT" native-arc-by-group "${ARGS[@]}" --dpi "$DPI" > "$LOG" 2>&1
+# shellcheck disable=SC2086  # EXTRA_ARGS 刻意以空白分詞
+time "$LBT" native-arc-by-group "${ARGS[@]}" --dpi "$DPI" $EXTRA_ARGS > "$LOG" 2>&1
 RC=$?
 log "native-arc-by-group 離開碼 $RC（日誌 $LOG）"
 exit $RC
