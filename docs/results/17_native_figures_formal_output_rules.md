@@ -237,9 +237,31 @@ LBT 目前是第一次建立這套跨站共用色階機制，**沒有一個經�
 地圖無等深線數字標籤與站名、圖例無站名、星號等於錨點、釋放範圍包含全部釋放點、缺 `--config`
 時拒絕，以及 JSON 契約與常數一致。
 
+## 6.1 沿開放邊界之相對來源權重曲線（WP-55，`native-arc-by-group`）
+
+獨立指令 `lbt native-arc-by-group`（程式 `native_runner/arc_by_group.py`、`arc_by_group_figures.py`），只讀後處理輸出，
+不屬於 `native-figures` 的八張＋四張清單，檔名另行登記於 `ARC_BY_GROUP_FIGURE_STEMS`。每站每案六張圖：
+依沉降速度類別、依沉底時刻的季節、依沉底時刻的大潮／小潮，各一張疊圖（`*_overlay`）與一張分格圖（`*_panels`，
+類別 2×5、季節 2×2、大小潮 1×2），各自輸出含文字（`figures/`）與無文字（`figures-notext/`）兩版，PNG 與 SVG 並出。
+
+1. 縱軸為「相對來源權重（%／km）」，每條曲線對弧長積分為 100%（分母為該組穿越粒子數）；不使用「機率」一詞。
+2. 平滑為一維高斯核，頻寬預設 5 km（`--sigma-km`）。邊界折線首尾閉合時環狀接續；未閉合時於端點鏡射（質量守恆）。
+   閉合與否由 `footprint_geometry_by_site` 的折線頂點判定，每站各自記錄於輸出表與圖說。
+3. 季節與大小潮只用沉底時刻計算的 `deposition_season`、`deposition_tide_class`；`observation_*` 一律不用。
+4. 圖上不寫站名（站名只在檔名與圖說）；X、Y 軸兩端都標數字；同一分組的圖在本次執行的全部站與全部案例共用
+   同一組軸範圍與刻度（記錄於 manifest 的 `axes`），圖面與圖說不另加說明。
+5. 類別名稱走 `native_runner/display_names.py` 的顯示名稱對照表（只有「其他/不可回收」顯示為「不可回收塑膠」、
+   「其他/可回收」顯示為「可回收塑膠」）；`material_id`、材質清冊的 `oca_category_zh` 與所有指紋、雜湊不變。
+6. 量化表（`tables/<站>/<分組>_summary.json` 與 `_curves.csv`，摘要同時寫入 `manifest.json`）：各組曲線格點值、
+   南／東／北／西各邊占比、組間兩兩總變異距離，以及抽樣雜訊基準：同組隨機對半切（粒子層級與沉底事件層級）；
+   類別另有「同一釋放點交換類別標籤」的配對置換，季節與大小潮另有沉底事件層級的標籤置換。
+7. 驗證：`tests/test_native_arc_by_group.py`（環狀與鏡射平滑積分為 100%、閉合判定、總變異距離、置換基準、
+   圖檔名登記、端到端輸出）與 `tests/test_native_display_names.py`（顯示名稱不影響識別值）。
+
 ## 7. 版本異動紀錄
 
 | 版本 | 日期 | 異動內容 |
 |---|---|---|
 | v1.0.0 | 2026-09-24 | 首次核定。完成任務 0（水平軌跡圖移除 local domain 圖層）；建立本規則文件與對應 JSON 契約 `docs/data/native_figures_formal_output_policy_v1.json`；採納 OCM-SVD-Analysis 的雙格式輸出（PNG 600 dpi＋SVG）、固定色階＋超限記錄、跨站色階一致化三項規則；明確排除八項判定不適用的規則（第 4 節）。 |
 | v1.1.0 | 2026-09-29 | 新增第 6 節，涵蓋 WP-38 三種新圖（停留時數密度含各站色階版、回溯快照、邊界弧長分布）：等深線只畫 200 m 實線與 1000 m 虛線且不標數字、星號取研究點錨點並強制 `--config`、圖上畫粒子釋放範圍（釋放點凸包）且 manifest 記錄錨點與釋放範圍核對數值、地圖與圖例不寫站名、色條與地圖同高（1 px 內，量測寫入 manifest）、對數色階上限取 10 的整數次方且下限為 10⁻⁴、座標軸首尾刻度即框邊、弧長分布圖三軸取整；附 OCM-SVD-Analysis 出處。JSON 契約升為 1.1.0，新增 `wp38_footprint_figures` 區塊。 |
+| v1.2.0 | 2026-10-14 | 新增第 6.1 節：WP-55 沿開放邊界之相對來源權重曲線（依類別、季節、大小潮分線）。僅文件說明；`docs/data/native_figures_formal_output_policy_v1.json` 未更動。 |
