@@ -262,6 +262,23 @@ LBT 目前是第一次建立這套跨站共用色階機制，**沒有一個經�
 8. 驗證：`tests/test_native_arc_by_group.py`（環狀與鏡射平滑積分為 100%、閉合判定、總變異距離、置換基準、
    圖檔名登記、端到端輸出）與 `tests/test_native_display_names.py`（顯示名稱不影響識別值）。
 
+## 6.2 沉降速度細分圖的類別標示（WP-56，`native-figures`）
+
+`settling_velocity_breakdown` 的列仍以類別代表速度（`settling_velocity_mps`）分組，排序不變（由上而下由慢到快）。
+縱軸刻度與軸名依資料而定：
+
+1. 後處理表有逐粒子沉降速度欄位 `particle_settling_velocity_mps`（v7，每類 10 個候選速度逐粒子抽樣）時，
+   左側長條圖的刻度寫「類別顯示名稱＋該類粒子實際用到的速度範圍（最小值–最大值，絕對值，三位有效數字）」，
+   例如「不可回收塑膠 0.000897–0.108」，軸名為「沉降速度類別（下沉速度範圍，公尺／秒）」；右側熱圖只標類別顯示名稱。
+   類別名稱走 `native_runner/display_names.py`，沒有中文字型而退成英文時改用 `material_id`。
+   代表速度只是分組鍵，不再當刻度。該欄位含缺值或非有限值時 fail-closed。
+2. 沒有該欄位（v6 以前，每類單一速度）時，刻度、軸名、圖說與 README 與歷來逐字相同。
+3. 圖說與 README 在 v7 模式改寫為「N 個沉降速度類別、每類 10 個候選沉降速度、各占該類粒子十分之一，
+   比例與權重以類別為單位彙整」；舊版「十個未校準沉降速度敏感度格點」只用於舊版資料。
+   `manifest.json` 另有 `settling_velocity_breakdown_labels` 區塊，記錄每列的 `material_id`、顯示名稱、代表速度與實際速度範圍。
+4. 終止類別圖（`terminal_counts`）規則不變：只畫實際出現的終止類別（例如南灣含 Stokes 案的 2 顆「沉底」），標籤為中文。
+5. 驗證：`tests/test_native_figures_velocity_labels.py`（有、無逐粒子速度欄位、英文退場、缺值 fail-closed）。
+
 ## 7. 版本異動紀錄
 
 | 版本 | 日期 | 異動內容 |

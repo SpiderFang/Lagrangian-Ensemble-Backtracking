@@ -46,6 +46,8 @@
 
 沉降速度的取法（WP-54，v7）：每類由 5 個代表物件、各依阻力係數上下界求得 10 個候選沉降速度（推導與稽核見 `data/settling_velocity_derivation/`，寫死於 `scenarios.py` 並由測試核對）。設定檔 `physics.settling.velocity_sampling` 有兩種模式：`representative`（預設，每類一個代表速度，與 v6 以前逐位元相同）與 `class_candidates_balanced`（v7 正式採用：同一站、同一類別的粒子，10 個候選速度各分得恰好 1/10，由主種子導出的固定亂數排列決定，抽樣種子與計數寫入身分表與後處理 manifest）。類別代表值仍是工作單元的分組鍵；每顆粒子實際使用的速度與候選序號由身分表帶入核心，並以 `particle_settling_velocity_mps`、`settling_candidate_index` 兩欄寫入 `departures.parquet` 與 `local_domain_departures.parquet`。後處理與圖表仍以類別為單位彙整。細節與限制見[native 逆向批次 orchestrator 操作契約 9.16 節](docs/operations/19_native_backward_batch_orchestrator.md#916-wp-54v7-逐粒子沉降速度)。
 
+沉降速度細分圖（WP-56）：`native-figures` 的 `settling_velocity_breakdown` 在後處理表含逐粒子沉降速度欄位（v7）時，縱軸改標「類別顯示名稱＋該類實際速度範圍」，圖說與 README 改寫為「每類 10 個候選沉降速度」；沒有該欄位（v6 以前）時維持舊寫法。規則見[成圖規則 6.2 節](docs/results/17_native_figures_formal_output_rules.md)。
+
 沿開放邊界的相對來源權重曲線（WP-55）：`lbt native-arc-by-group` 讀取後處理輸出，依沉降速度類別、沉底時刻的季節、沉底時刻的大潮／小潮分線，輸出沿邊界弧長的相對來源權重曲線（含文字與無文字兩版）與量化表（各邊占比、組間總變異距離、抽樣雜訊基準）。圖上類別名稱由顯示名稱對照表決定（`native_runner/display_names.py`），不改動材質識別碼與材質清冊。規則見[成圖規則 6.1 節](docs/results/17_native_figures_formal_output_rules.md)。
 
 貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。A 區沿用 `northeast_taiwan_common_cache_v3`、以 anchor 半徑 12.5 km 受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`；龜山島另有核定的 soft-priority 走廊，只在同一 12.5 km core 的 persistent-wet 候選中優先選點。A 區正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`：OCM 或 NWW3 在實際查詢位置／時間無有效支援時立即停止，保留 `data_gap` 等原始狀態，不以零值、最近值或擴張資料域補齊。完整範圍歷史沿革、既有 24 小時 DEMO 產物邊界與正式 30 天重建需求見[全部可得資料與時間重建](docs/operations/10_available_data_time_reconstruction_and_a_expansion.md)。
@@ -192,7 +194,7 @@ ABCD 第一次 24 小時試跑的結果與限制見[四區試跑稽核](docs/res
 
 1. 本專案沿用 BayTrace 可對應的工程思路：CPU SoA／batch／chunk、每粒子可重現亂數、triangle hint、可暫停 engine 與可驗證 I/O；不承諾整包 tracker output 的格式或物理範圍，也不把 BayTrace 的工程參照當成本案科學驗證。
 2. 在沒有先驗、似然、調查努力量與獨立觀測前，任何逆向結果都不可稱為絕對來源機率、法律責任或因果歸因；報告必須保留原始分子／分母、有效分母、低樣本、零分母、`DATA_GAP` 與 `NUMERICAL_FAILURE`，不得將不可用狀態改成 0。
-3. 確定性海流、Stokes 與沉降沿正向物理速度積分，時間方向由 signed-time step 表示；隨機擴散獨立於 RK4，不能插入 RK4 階段。十個沉降速度是「未校準的沉降速度敏感度格點」，iOcean 材質名稱只是附註，不是來源先驗；正式成果須以速度數值或極慢／慢／中／快分群為主詞，不得以材質名稱直接對應單一來源方向（例如不得寫「寶特瓶來自 SSE」）；`deposit_on_first_contact_and_stop` 沒有再懸浮或底流搬運參數，會使足跡系統性偏向較近來源。完整限制、依據數據與 `M` 下限估計見[科學方法與驗證第 11 節](docs/foundation/03_scientific_method_and_validation.md)。
+3. 確定性海流、Stokes 與沉降沿正向物理速度積分，時間方向由 signed-time step 表示；隨機擴散獨立於 RK4，不能插入 RK4 階段。十類沉降速度（v6 以前每類一個速度，v7 起每類 10 個候選速度逐粒子抽樣）是「未校準的沉降速度敏感度設定」，iOcean 材質名稱只是附註，不是來源先驗；正式成果須以速度數值或極慢／慢／中／快分群為主詞，不得以材質名稱直接對應單一來源方向（例如不得寫「寶特瓶來自 SSE」）；`deposit_on_first_contact_and_stop` 沒有再懸浮或底流搬運參數，會使足跡系統性偏向較近來源。完整限制、依據數據與 `M` 下限估計見[科學方法與驗證第 11 節](docs/foundation/03_scientific_method_and_validation.md)。
 
 ## 9. B 區海岸預覽（既有示範）
 

@@ -182,6 +182,7 @@ from .backward_driver import (
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
     NATIVE_STATUS_STRANDED,
 )
+from .display_names import material_display_name_zh
 from .footprint import cell_area_km2_by_row
 from .postprocess import (
     DEFAULT_AZIMUTH_SECTOR_COUNT,
@@ -851,10 +852,32 @@ def _filter_site(table: pa.Table, site_id: str) -> pa.Table:
     return table.filter(mask)
 
 
-def _build_departure_arrays(site_table: pa.Table) -> dict[str, np.ndarray]:
-    """把一站的離開紀錄表攤平成欄名到 NumPy 陣列的 dict，供各圖獨立重新聚合。"""
+_DEPARTURE_OPTIONAL_COLUMNS: tuple[str, ...] = (
+    "material_id",
+    "particle_settling_velocity_mps",
+)
+"""``departures.parquet`` 的「可選」欄位：舊版（run07 以前，每類一個沉降速度）的表沒有，
+v7（run08，每類 10 個候選速度逐粒子抽樣）的表才有。
 
-    return {name: _column_to_numpy(site_table, name) for name in _DEPARTURE_REQUIRED_COLUMNS}
+* ``material_id``：類別識別碼（十類海廢類別的唯一鍵），用來查圖面顯示名稱；
+* ``particle_settling_velocity_mps``：每顆粒子實際使用的沉降速度（負值，公尺／秒）。
+  ``settling_velocity_mps`` 在 v7 仍是「類別代表速度」，用來分組與排序，不是粒子實際速度。
+
+兩欄只有存在時才讀進繪圖用的陣列；缺席時所有圖與圖說逐字維持舊版寫法。"""
+
+
+def _build_departure_arrays(site_table: pa.Table) -> dict[str, np.ndarray]:
+    """把一站的離開紀錄表攤平成欄名到 NumPy 陣列的 dict，供各圖獨立重新聚合。
+
+    必要欄位一律讀入；可選欄位（:data:`_DEPARTURE_OPTIONAL_COLUMNS`）只在表內有時才讀入，
+    後續程式以「鍵是否存在」判斷是舊版（每類一個速度）還是 v7（逐粒子速度）資料。
+    """
+
+    arrays = {name: _column_to_numpy(site_table, name) for name in _DEPARTURE_REQUIRED_COLUMNS}
+    for name in _DEPARTURE_OPTIONAL_COLUMNS:
+        if name in site_table.column_names:
+            arrays[name] = _column_to_numpy(site_table, name)
+    return arrays
 
 
 def _build_trajectory_samples(
@@ -2614,6 +2637,97 @@ def _plot_source_footprint_kde(
     plt.close(fig)
 
 
+@dataclass(frozen=True, slots=True)
+class _ClassVelocityRow:
+    """沉降速度細分圖的一列（一個沉降速度類別）的標示資料。
+
+    ``representative_mps`` 是類別代表速度（負值，``departures`` 的 ``settling_velocity_mps``），
+    用於分組與排序；``abs_min_mps``／``abs_max_mps`` 是該類全部粒子實際使用速度的絕對值之最小與
+    最大（公尺／秒）；``distinct_values`` 是該類實際出現的相異速度個數；``particle_count`` 是該類
+    粒子數；``material_id`` 是類別識別碼，該類出現多個識別碼（正常資料不會發生）時為 ``None``。
+    """
+
+    representative_mps: float
+    material_id: str | None
+    abs_min_mps: float
+    abs_max_mps: float
+    distinct_values: int
+    particle_count: int
+
+
+def _three_sig(value: float) -> str:
+    """三位有效數字的數字字串，保留尾端的 0（例如 0.920、0.0142、0.000897）。"""
+
+    return f"{value:#.3g}".rstrip(".")
+
+
+def _class_velocity_rows(
+    departures: Mapping[str, np.ndarray], sv_values: Sequence[float]
+) -> tuple[_ClassVelocityRow, ...] | None:
+    """依類別代表速度，彙整每類實際使用的速度範圍；表內沒有逐粒子速度欄位時回傳 ``None``。
+
+    ``None`` 代表舊版資料（每類只有一個速度），呼叫端必須維持舊版圖面與圖說。有欄位時，逐類（以
+    ``np.isclose`` 對代表速度分組，與長條圖／熱圖的分組方式相同）計算實際速度的絕對值範圍。
+    逐粒子速度含缺值或非有限值屬於資料破損，不以零或其他值補，直接 fail-closed。
+    """
+
+    if "particle_settling_velocity_mps" not in departures:
+        return None
+    representative = np.asarray(departures["settling_velocity_mps"], dtype=np.float64)
+    particle = np.asarray(departures["particle_settling_velocity_mps"], dtype=np.float64)
+    material = departures.get("material_id")
+    rows: list[_ClassVelocityRow] = []
+    for sv in sv_values:
+        mask = np.isclose(representative, sv)
+        speeds = np.abs(particle[mask])
+        if speeds.size == 0 or not np.all(np.isfinite(speeds)):
+            raise FiguresError(
+                "particle_settling_velocity_mps 含缺值或非有限值，無法標示速度範圍，fail-closed"
+            )
+        ids = sorted({str(m) for m in material[mask]}) if material is not None else []
+        rows.append(
+            _ClassVelocityRow(
+                representative_mps=float(sv),
+                material_id=ids[0] if len(ids) == 1 else None,
+                abs_min_mps=float(speeds.min()),
+                abs_max_mps=float(speeds.max()),
+                distinct_values=int(np.unique(speeds).size),
+                particle_count=int(speeds.size),
+            )
+        )
+    return tuple(rows)
+
+
+def _class_name_text(row: _ClassVelocityRow, *, cjk: bool) -> str:
+    """類別的圖面名稱：有繁體中文字型時用顯示名稱對照表（只管呈現），否則用識別碼；不明則空字串。"""
+
+    if row.material_id is None:
+        return ""
+    return material_display_name_zh(row.material_id) if cjk else row.material_id
+
+
+def _class_speed_text(row: _ClassVelocityRow) -> str:
+    """該類實際速度的文字（絕對值、三位有效數字）：只有一個值寫單一值，否則寫「最小值–最大值」。"""
+
+    if row.distinct_values <= 1 or row.abs_min_mps == row.abs_max_mps:
+        return _three_sig(row.abs_min_mps)
+    return f"{_three_sig(row.abs_min_mps)}–{_three_sig(row.abs_max_mps)}"
+
+
+def _class_tick_label(row: _ClassVelocityRow, *, cjk: bool) -> str:
+    """縱軸刻度文字：類別顯示名稱加上該類實際速度範圍，例如「不可回收塑膠 0.000897–0.108」。"""
+
+    name = _class_name_text(row, cjk=cjk)
+    speed = _class_speed_text(row)
+    return f"{name} {speed}" if name else speed
+
+
+def _zh_class_count(n: int) -> str:
+    """類別數的中文寫法：10 寫「十」，其餘寫阿拉伯數字（圖說用）。"""
+
+    return "十" if n == 10 else str(n)
+
+
 def _plot_settling_velocity_breakdown(
     site: SiteData,
     t: _Labeler,
@@ -2623,7 +2737,17 @@ def _plot_settling_velocity_breakdown(
     figure_text: str,
     color_scale: ColorScale,
 ) -> None:
-    """十種沉降速度的穿越比例（長條圖）與主要方位扇區權重比較（熱圖）。
+    """各沉降速度類別的穿越比例（長條圖）與各類方位扇區權重比較（熱圖）。
+
+    列的分組與排序一律依「類別代表速度」（``settling_velocity_mps``），由下而上為代表速度由小
+    （下沉最快）到大（下沉最慢），也就是由上往下由慢到快。縱軸刻度依資料而定：
+
+    * 舊版資料（每類一個沉降速度，無 ``particle_settling_velocity_mps``）：刻度為該速度值，
+      軸名「沉降速度（公尺/秒，負值為下沉）」，與歷來完全相同；
+    * v7 資料（每類 10 個候選速度逐粒子抽樣）：刻度為「類別顯示名稱 + 該類粒子實際使用的速度範圍
+      （絕對值）」，軸名「沉降速度類別（下沉速度範圍，公尺／秒）」。代表速度只是類別的分組鍵，不
+      是粒子實際速度，所以不再當成刻度。右側熱圖只標類別顯示名稱，避免長標籤擠壓版面；兩個子圖的
+      列互相對齊。
 
     ``color_scale``（WP-25）固定熱圖色階上下限與刻度，讓五站可直接比較顏色
     深淺（見 :data:`_SHARED_COLOR_SCALE_STEMS`）。
@@ -2657,17 +2781,29 @@ def _plot_settling_velocity_breakdown(
     fig, (ax_bar, ax_heat) = plt.subplots(
         1, 2, figsize=(15, 6.5), dpi=150, gridspec_kw={"width_ratios": [0.55, 1.0]}
     )
-    sv_labels = [f"{sv:g}" for sv in sv_values]
+    class_rows = _class_velocity_rows(site.departures, sv_values)
+    if class_rows is None:
+        sv_labels = [f"{sv:g}" for sv in sv_values]
+        heat_labels = sv_labels
+        ylabel_text = t.t("沉降速度（公尺/秒，負值為下沉）", "Settling velocity (m/s, negative = sinking)")
+    else:
+        sv_labels = [_class_tick_label(r, cjk=t.cjk_available) for r in class_rows]
+        heat_labels = [
+            _class_name_text(r, cjk=True) if t.cjk_available else "" for r in class_rows
+        ]
+        ylabel_text = t.t(
+            "沉降速度類別（下沉速度範圍，公尺／秒）", "Settling-velocity class (speed range, m/s)"
+        )
     ax_bar.barh(range(len(sv_values)), crossing_fractions, color="#4c78a8")
     ax_bar.set_yticks(range(len(sv_values)))
-    ax_bar.set_yticklabels(sv_labels, fontsize=8)
+    if class_rows is None:
+        ax_bar.set_yticklabels(sv_labels, fontsize=8)
+    else:
+        ax_bar.set_yticklabels(sv_labels, fontsize=8, fontproperties=font)
     ax_bar.set_xlim(0.0, 1.0)
     ax_bar.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax_bar.set_xlabel(t.t("穿越開放邊界比例", "Fraction crossing open boundary"), fontproperties=font)
-    ax_bar.set_ylabel(
-        t.t("沉降速度（公尺/秒，負值為下沉）", "Settling velocity (m/s, negative = sinking)"),
-        fontproperties=font,
-    )
+    ax_bar.set_ylabel(ylabel_text, fontproperties=font)
     ax_bar.grid(axis="x", color="#dddddd", linewidth=0.6)
 
     sector_labels = (
@@ -2688,7 +2824,10 @@ def _plot_settling_velocity_breakdown(
     ax_heat.set_xticks(range(len(sector_labels)))
     ax_heat.set_xticklabels(sector_labels, fontsize=7, rotation=90)
     ax_heat.set_yticks(range(len(sv_values)))
-    ax_heat.set_yticklabels(sv_labels, fontsize=8)
+    if class_rows is None:
+        ax_heat.set_yticklabels(heat_labels, fontsize=8)
+    else:
+        ax_heat.set_yticklabels(heat_labels, fontsize=8, fontproperties=font)
     ax_heat.set_xlabel(t.t("方位扇區", "Azimuth sector"), fontproperties=font)
     cbar = fig.colorbar(im, ax=ax_heat, fraction=0.045, pad=0.02)
     cbar.set_ticks(color_scale.ticks())
@@ -4405,12 +4544,29 @@ def _figure_caption_zh(stem: str, site: SiteData, *, experiment_case: _Experimen
             "kde_by_site.parquet。"
         )
     elif stem == "settling_velocity_breakdown":
-        body = (
-            "十個未校準沉降速度敏感度格點各自的穿越開放邊界比例長條圖，與各沉降速度分組內 "
-            "方位扇區相對來源權重熱圖並列比較。資料來源：departures.parquet 的 "
-            "settling_velocity_mps 與 departure_azimuth_sector_index，逐沉降速度重新分組 "
-            "聚合。"
+        class_rows = _class_velocity_rows(
+            site.departures, sorted({float(v) for v in site.departures["settling_velocity_mps"]})
         )
+        if class_rows is None:
+            body = (
+                "十個未校準沉降速度敏感度格點各自的穿越開放邊界比例長條圖，與各沉降速度分組內 "
+                "方位扇區相對來源權重熱圖並列比較。資料來源：departures.parquet 的 "
+                "settling_velocity_mps 與 departure_azimuth_sector_index，逐沉降速度重新分組 "
+                "聚合。"
+            )
+        else:
+            body = (
+                f"{_zh_class_count(len(class_rows))}個沉降速度類別各自的穿越開放邊界比例長條圖，與各類別內"
+                "方位扇區相對來源權重熱圖並列比較；縱軸每一列是一個類別，刻度為類別顯示名稱加上該類粒子"
+                "實際用到的沉降速度範圍（最小值–最大值，取絕對值，單位公尺／秒），由上而下依類別代表沉降"
+                "速度由慢到快排列。每類有 10 個候選沉降速度，每顆粒子抽用其中一個，各占該類粒子的十分之一；"
+                "比例與權重以類別為單位彙整，不拆到個別速度。"
+                "類別名稱為圖面顯示名稱：「不可回收塑膠」對應材質清冊的「其他/不可回收」，"
+                "「可回收塑膠」對應「其他/可回收」，材質識別碼與清冊記錄不受影響。"
+                "資料來源：departures.parquet 的 settling_velocity_mps（類別代表沉降速度，用於分組與排序）、"
+                "particle_settling_velocity_mps（逐粒子實際速度，用於標示範圍）、material_id（類別識別）"
+                "與 departure_azimuth_sector_index，依類別重新分組聚合。"
+            )
     else:  # pragma: no cover - FIGURE_STEMS 是唯一呼叫來源，這裡只是防禦
         raise FiguresError(f"未知圖表代號：{stem}")
     return f"{body} {settings_tail}"
@@ -4652,9 +4808,7 @@ domain 邊界或 local domain 首次離開標記，圖上只保留 **flow domain
    核密度（每平方公尺），疊加 50%／75%／90% HDR（高密度區間，Highest Density
    Region）等值線，再疊海岸線與開放邊界作地理參照。**這是條件式來源足跡，不是
    絕對來源機率**。
-8. `settling_velocity_breakdown.png`：十種沉降速度（`settling_velocity_mps`）各
-   自的穿越開放邊界比例（長條圖）與各沉降速度分組內的方位扇區相對來源權重
-   （熱圖）。資料來源：`departures.parquet`（逐沉降速度重新分組聚合）。
+8. {settling_item}
 
 {footprint_readme}## 已知限制與方法揭露
 
@@ -4751,6 +4905,35 @@ def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigur
     )
 
 
+_SETTLING_README_ITEM_LEGACY = (
+    "`settling_velocity_breakdown.png`：十種沉降速度（`settling_velocity_mps`）各\n"
+    "   自的穿越開放邊界比例（長條圖）與各沉降速度分組內的方位扇區相對來源權重\n"
+    "   （熱圖）。資料來源：`departures.parquet`（逐沉降速度重新分組聚合）。"
+)
+"""舊版（每類一個沉降速度）資料的 README 第 8 項說明，與歷來逐字相同。"""
+
+
+def _settling_breakdown_readme_item(inputs: NativeFiguresInputs) -> str:
+    """README 第 8 項（沉降速度細分圖）的說明；依資料是否含逐粒子沉降速度欄位而不同。
+
+    全部被選取站點的離開紀錄都含 ``particle_settling_velocity_mps`` 時（v7，每類 10 個候選速度
+    逐粒子抽樣），改寫成「類別」語意；否則維持舊版文字，讓舊成果重新出圖時 README 不變。
+    """
+
+    if not inputs.sites or not all("particle_settling_velocity_mps" in s.departures for s in inputs.sites):
+        return _SETTLING_README_ITEM_LEGACY
+    return (
+        "`settling_velocity_breakdown.png`：沉降速度類別（十類，每類 10 個候選沉降速度、每顆粒子\n"
+        "   抽用其中一個，各占該類粒子的十分之一）各自的穿越開放邊界比例（長條圖）與各類別內的方位扇區\n"
+        "   相對來源權重（熱圖）。縱軸每一列是一個類別，刻度為類別顯示名稱（「不可回收塑膠」「可回收\n"
+        "   塑膠」等圖面顯示名稱，材質識別碼與材質清冊不變）加上該類粒子實際用到的沉降速度範圍\n"
+        "   （最小值–最大值，絕對值，公尺／秒），由上而下依類別代表沉降速度由慢到快排列；比例與\n"
+        "   權重以類別為單位彙整，不拆到個別速度。資料來源：`departures.parquet` 的\n"
+        "   `settling_velocity_mps`（類別代表速度，分組與排序）、`particle_settling_velocity_mps`\n"
+        "   （逐粒子實際速度，標示範圍）與 `material_id`（類別識別）。"
+    )
+
+
 def _build_readme(
     inputs: NativeFiguresInputs,
     config: NativeFiguresConfig,
@@ -4760,6 +4943,7 @@ def _build_readme(
     site_list = "\n".join(f"- `{s.site_id}`（{s.site_label_zh}）" for s in inputs.sites)
     return _README_TEMPLATE.format(
         footprint_readme=_footprint_readme_section(inputs, plan),
+        settling_item=_settling_breakdown_readme_item(inputs),
         generated_at_utc=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         figure_text=config.figure_text,
         site_list=site_list,
@@ -4783,6 +4967,41 @@ def _receptor_manifest_record(
         ),
         "formal_anchor_used": fp.receptor_anchor is not None,
         "release_geometry": _release_geometry_record(fp, land_geometries),
+    }
+
+
+def _build_settling_label_manifest(sites: Sequence[SiteData]) -> dict[str, Any] | None:
+    """``manifest.json`` 的 ``settling_velocity_breakdown_labels`` 區塊；沒有逐粒子速度欄位時回傳 ``None``。
+
+    記錄沉降速度細分圖縱軸每一列的類別識別碼、圖面顯示名稱、類別代表速度，以及該類實際速度的
+    絕對值範圍，方便稽核圖上標示的範圍與資料一致。顯示名稱只供呈現，不是資料契約欄位。
+    """
+
+    per_site: dict[str, Any] = {}
+    for site in sites:
+        rows = _class_velocity_rows(
+            site.departures, sorted({float(v) for v in site.departures["settling_velocity_mps"]})
+        )
+        if rows is None:
+            continue
+        per_site[site.site_id] = [
+            {
+                "material_id": r.material_id,
+                "display_name_zh": material_display_name_zh(r.material_id) if r.material_id else None,
+                "representative_settling_velocity_mps": r.representative_mps,
+                "particle_abs_min_mps": r.abs_min_mps,
+                "particle_abs_max_mps": r.abs_max_mps,
+                "distinct_velocity_count": r.distinct_values,
+                "particle_count": r.particle_count,
+                "tick_label_zh": _class_tick_label(r, cjk=True),
+            }
+            for r in rows
+        ]
+    if not per_site:
+        return None
+    return {
+        "note": "縱軸以類別顯示名稱加實際速度範圍標示；顯示名稱只供呈現，material_id 與材質清冊不變",
+        "per_site": per_site,
     }
 
 
@@ -5045,6 +5264,9 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
             else None,
         },
     }
+    settling_labels = _build_settling_label_manifest(inputs.sites)
+    if settling_labels is not None:
+        manifest["settling_velocity_breakdown_labels"] = settling_labels
     if footprint_plan is not None:
         manifest["footprint_figure_stems"] = list(FOOTPRINT_FIGURE_STEMS)
         manifest["footprint_figures"] = _build_footprint_figures_manifest(
