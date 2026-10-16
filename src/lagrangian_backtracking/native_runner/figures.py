@@ -214,7 +214,7 @@ class FiguresError(RuntimeError):
 # 這是純呈現用的中文別名表，不是資料契約，未知站名不代表輸入有誤。
 SITE_LABELS_ZH: Mapping[str, str] = {
     "gongliao": "貢寮",
-    "guishan": "龜山島西側",
+    "guishan": "龜山島",
     "hsinchu": "新竹外海",
     "nanwan": "南灣",
     "lienchiang": "連江",
@@ -2947,24 +2947,26 @@ _MIN_INTERVALS = 3
 _RESIDENCE_MAX_INTERVALS = 6
 _SNAPSHOT_MAX_INTERVALS = 5
 
-# 抽樣範圍（WP-58）：與報告 3-4-3 圖 2、表 2 的深藍虛線框一致，取代 WP-38 的釋放點凸包。
-# 規則（與 3-4-3 表 2 相同）：錨點先取到 0.01°，再取經度 ±0.13°、緯度 ±0.12°，不填色。
-# 錨點取自正式釋放設定（run07 以來龜山島西側為 121.939148, 24.850326，取到 0.01° 為 121.94, 24.85）。
-SAMPLING_RANGE_ROUND_DEG = 0.01
-SAMPLING_RANGE_HALF_WIDTH_LON_DEG = 0.13
-SAMPLING_RANGE_HALF_WIDTH_LAT_DEG = 0.12
-SAMPLING_RANGE_BOXES_LONLAT: Mapping[str, tuple[float, float, float, float]] = {
-    # 站代號: (經度下界, 經度上界, 緯度下界, 緯度上界)；出圖時以 round(錨點, 2) ± (0.13, 0.12) 核對。
-    "gongliao": (121.79, 122.05, 24.98, 25.22),
-    "guishan": (121.81, 122.07, 24.73, 24.97),
-    "hsinchu": (120.32, 120.58, 24.63, 24.87),
-    "nanwan": (120.63, 120.89, 21.83, 22.07),
-    "lienchiang": (119.82, 120.08, 26.08, 26.32),
+# 抽樣範圍（WP-59）：以研究地點錨點為圓心、受體核心半徑 12.5 km 的測地線圓（深藍虛線，不填色），
+# 取代 WP-58 的 3-4-3 矩形虛線框。半徑就是正式釋放設定的 receptor_core_radius_m（12500 m）：
+# 受體水平位置由錨點周圍 12.5 km 的核心範圍內抽出，所以抽樣範圍畫成同一個圓；不再有 0.01° 取整的矩形。
+# 圓以 WGS84 測地線正算（每 1° 方位一個頂點，共 361 點、首尾閉合）再轉回經緯度，不是在經緯度平面上畫圓。
+SAMPLING_RANGE_RADIUS_M = 12500.0
+SAMPLING_RANGE_AZIMUTH_STEP_DEG = 1.0
+SAMPLING_RANGE_ANCHORS_LONLAT: Mapping[str, tuple[float, float]] = {
+    # 站代號: (經度, 緯度)＝正式釋放設定的 study_sites[].anchor_lonlat（run07 起龜山島為吸附後的海上錨點）；
+    # 出圖時與設定檔逐項核對，不一致即 fail-closed。
+    "gongliao": (121.9223889, 25.0964444),
+    "guishan": (121.939148, 24.850326),
+    "hsinchu": (120.45, 24.75),
+    "nanwan": (120.763161, 21.946577),
+    "lienchiang": (119.95, 26.2),
 }
-# 線型對齊 3-4-3 圖 2：色 #1F4E79；圖寬 3760 px、約 600 px/in，線寬約 10 px（1.2 pt）、虛線 40 px 畫／20 px 空
-# （4.8 pt／2.4 pt，即線寬的 4 倍畫、2 倍空）。報告中本圖寬約 4.5 in、原圖寬約 9.1 in（縮為約 0.49 倍），
-# 為了在報告頁面上看起來與 3-4-3 同粗，原圖內取線寬 2.4 pt；虛線以線寬倍數 (4, 2) 指定，隨線寬等比。
-# 與 75% 高密度區間（棕色、1.3 pt、預設虛線）及開放邊界（洋紅、1.2 pt）以顏色、線寬與虛線長度區分。
+# 線型沿用 WP-58（對齊 3-4-3 圖 2 的 #1F4E79 虛線）：色 #1F4E79；圖寬 3760 px、約 600 px/in，線寬約 10 px
+# （1.2 pt）、虛線 40 px 畫／20 px 空（4.8 pt／2.4 pt，即線寬的 4 倍畫、2 倍空）。報告中本圖寬約 4.5 in、
+# 原圖寬約 9.1 in（縮為約 0.49 倍），為了在報告頁面上看起來與 3-4-3 同粗，原圖內取線寬 2.4 pt；
+# 虛線以線寬倍數 (4, 2) 指定，隨線寬等比。與 75% 高密度區間（棕色、1.3 pt、預設虛線）及開放邊界
+# （洋紅、1.2 pt）以顏色、線寬與虛線長度區分。
 _SAMPLING_RANGE_STYLE: Mapping[str, Any] = {
     "color": "#1F4E79",
     "linewidth": 2.4,
@@ -2975,32 +2977,69 @@ _SAMPLING_RANGE_LABEL_ZH = "抽樣範圍"
 _SAMPLING_RANGE_LABEL_EN = "Sampling range"
 
 
-def _sampling_range_box(
-    site_id: str, anchor: tuple[float, float] | None
-) -> tuple[float, float, float, float] | None:
-    """抽樣範圍框 ``(經度下界, 經度上界, 緯度下界, 緯度上界)``；沒有錨點時回傳 ``None``。
+def geodesic_circle_lonlat(
+    lon: float,
+    lat: float,
+    radius_m: float,
+    *,
+    azimuth_step_deg: float = SAMPLING_RANGE_AZIMUTH_STEP_DEG,
+) -> np.ndarray:
+    """以 ``(lon, lat)`` 為圓心、測地線距離 ``radius_m`` 的圓，形狀 ``(N, 2)``＝``(經度, 緯度)``。
 
-    依規則由錨點計算；站代號在 :data:`SAMPLING_RANGE_BOXES_LONLAT` 中時，必須與表相符，不符即
-    fail-closed（表與目前正式釋放設定的錨點不一致）。
+    方位角 0°～360°（含）每 ``azimuth_step_deg`` 度一點，以 WGS84 測地線正算（pyproj ``Geod.fwd``）；
+    最後一點強制等於第一點以閉合。
+    """
+
+    from pyproj import Geod
+
+    az = np.arange(0.0, 360.0 + 1e-9, float(azimuth_step_deg))
+    lons, lats, _ = Geod(ellps="WGS84").fwd(
+        np.full_like(az, float(lon)), np.full_like(az, float(lat)), az, np.full_like(az, float(radius_m))
+    )
+    xy = np.column_stack([lons, lats])
+    xy[-1] = xy[0]
+    return xy
+
+
+def geodesic_distance_km(lon0: float, lat0: float, lons, lats) -> np.ndarray:
+    """``(lon0, lat0)`` 到各點的 WGS84 測地線距離（km）。"""
+
+    from pyproj import Geod
+
+    lons = np.atleast_1d(np.asarray(lons, dtype=float))
+    lats = np.atleast_1d(np.asarray(lats, dtype=float))
+    lon_c = np.full_like(lons, float(lon0))
+    lat_c = np.full_like(lats, float(lat0))
+    _, _, dist = Geod(ellps="WGS84").inv(lon_c, lat_c, lons, lats)
+    return np.asarray(dist) / 1000.0
+
+
+def _sampling_range_circle(
+    site_id: str, anchor: tuple[float, float] | None, radius_m: float | None
+) -> np.ndarray | None:
+    """抽樣範圍圓（``(361, 2)`` 的經緯度頂點）；沒有錨點時回傳 ``None``。
+
+    半徑取設定檔的 ``receptor_core_radius_m``（缺少時用 :data:`SAMPLING_RANGE_RADIUS_M`）。站代號在
+    :data:`SAMPLING_RANGE_ANCHORS_LONLAT` 中時，錨點必須與表相符、半徑必須是 12500 m，不符即
+    fail-closed（表與目前正式釋放設定不一致）。
     """
 
     if anchor is None:
         return None
-    lon0 = round(round(float(anchor[0]) / SAMPLING_RANGE_ROUND_DEG) * SAMPLING_RANGE_ROUND_DEG, 2)
-    lat0 = round(round(float(anchor[1]) / SAMPLING_RANGE_ROUND_DEG) * SAMPLING_RANGE_ROUND_DEG, 2)
-    box = (
-        round(lon0 - SAMPLING_RANGE_HALF_WIDTH_LON_DEG, 2),
-        round(lon0 + SAMPLING_RANGE_HALF_WIDTH_LON_DEG, 2),
-        round(lat0 - SAMPLING_RANGE_HALF_WIDTH_LAT_DEG, 2),
-        round(lat0 + SAMPLING_RANGE_HALF_WIDTH_LAT_DEG, 2),
-    )
-    expected = SAMPLING_RANGE_BOXES_LONLAT.get(site_id)
-    if expected is not None and any(abs(a - b) > 1e-9 for a, b in zip(box, expected, strict=True)):
-        raise FiguresError(
-            f"站 {site_id} 的抽樣範圍 {box} 與常數表 {expected} 不一致（錨點 {tuple(anchor)}）；"
-            "釋放設定的錨點已改變，請同步更新 SAMPLING_RANGE_BOXES_LONLAT 與報告 3-4-3 表 2"
-        )
-    return box
+    radius = float(radius_m) if radius_m else SAMPLING_RANGE_RADIUS_M
+    expected = SAMPLING_RANGE_ANCHORS_LONLAT.get(site_id)
+    if expected is not None:
+        if any(abs(float(a) - b) > 1e-7 for a, b in zip(anchor, expected, strict=True)):
+            raise FiguresError(
+                f"站 {site_id} 的錨點 {tuple(anchor)} 與抽樣範圍常數表 {expected} 不一致；"
+                "釋放設定的錨點已改變，請同步更新 SAMPLING_RANGE_ANCHORS_LONLAT 與報告 3-4-3 的圖 1、圖 2"
+            )
+        if abs(radius - SAMPLING_RANGE_RADIUS_M) > 1e-6:
+            raise FiguresError(
+                f"站 {site_id} 的 receptor_core_radius_m={radius} 不是抽樣範圍所用的 "
+                f"{SAMPLING_RANGE_RADIUS_M} m"
+            )
+    return geodesic_circle_lonlat(float(anchor[0]), float(anchor[1]), radius)
 COLORBAR_ALIGNMENT_TOLERANCE_PX = 1.0
 """色條與主圖上下緣對齊的驗收容差（顯示座標，像素）。"""
 
@@ -3412,23 +3451,29 @@ def _haversine_km(lon1, lat1, lon2, lat2):
 
 
 def _sampling_range_record(fp: FootprintSiteFigureData) -> dict[str, Any] | None:
-    """圖上抽樣範圍框的座標、規則與「全部釋放點是否落在框內」的核對（寫入 manifest）。"""
+    """圖上抽樣範圍圓的規格與「全部釋放點是否落在圓內」的核對（寫入 manifest）。"""
 
-    box = _sampling_range_box(fp.site_id, fp.receptor_anchor)
-    if box is None:
+    radius_m = float(fp.receptor_core_radius_m) if fp.receptor_core_radius_m else SAMPLING_RANGE_RADIUS_M
+    circle = _sampling_range_circle(fp.site_id, fp.receptor_anchor, fp.receptor_core_radius_m)
+    if circle is None:
         return None
+    anchor = fp.receptor_anchor
     pts = fp.release_points
     inside = 0
+    max_km: float | None = None
     if pts is not None and len(pts):
-        in_lon = (pts[:, 0] >= box[0]) & (pts[:, 0] <= box[1])
-        in_lat = (pts[:, 1] >= box[2]) & (pts[:, 1] <= box[3])
-        inside = int(np.sum(in_lon & in_lat))
+        dist = geodesic_distance_km(anchor[0], anchor[1], pts[:, 0], pts[:, 1])
+        inside = int(np.sum(dist <= radius_m / 1000.0))
+        max_km = float(np.max(dist))
     return {
-        "box_lonlat": {"lon_min": box[0], "lon_max": box[1], "lat_min": box[2], "lat_max": box[3]},
-        "rule": "錨點取到 0.01° 後，經度 ±0.13°、緯度 ±0.12°（與報告 3-4-3 表 2 相同）",
-        "anchor_lonlat": list(fp.receptor_anchor),
+        "shape": "geodesic_circle",
+        "radius_m": radius_m,
+        "anchor_lonlat": list(anchor),
+        "method": "pyproj Geod(WGS84).fwd；方位角 0°～360° 每 1° 一點，轉回經緯度",
+        "vertex_count": int(len(circle)),
         "release_point_count": int(len(pts)) if pts is not None else 0,
-        "release_points_inside_box": inside,
+        "release_points_inside_circle": inside,
+        "max_release_point_distance_km": max_km,
         "style": {
             "color": _SAMPLING_RANGE_STYLE["color"],
             "linewidth_pt": _SAMPLING_RANGE_STYLE["linewidth"],
@@ -3459,7 +3504,7 @@ def _release_geometry_record(
         "sampling_range": _sampling_range_record(fp),
         "release_area_definition": (
             "全部相異釋放點（後處理足跡幾何表的受體水平位置）的凸包，僅供核對、不再畫在圖上（WP-58 起圖上畫"
-            "抽樣範圍框，見 sampling_range）；設定檔只定義受體核心圓（錨點加 receptor_core_radius_m），"
+            "抽樣範圍圓，見 sampling_range）；設定檔只定義受體核心圓（錨點加 receptor_core_radius_m），"
             "沒有釋放多邊形"
         ),
     }
@@ -3507,10 +3552,11 @@ def _draw_footprint_base_map(
     max_intervals: int = _RESIDENCE_MAX_INTERVALS,
     tick_fontsize: float = 8.0,
 ) -> tuple[tuple[float, float, float, float], list[float]]:
-    """陸地（灰）、海岸線（黑 0.5 pt）、等深線、開放邊界（洋紅虛線）、抽樣範圍（深藍虛線框）與錨點星號。
+    """陸地（灰）、海岸線（黑 0.5 pt）、等深線、開放邊界（洋紅虛線）、抽樣範圍（深藍虛線圓）與錨點星號。
 
     圖面不寫站名（星號旁沒有文字標籤，圖例只寫「研究地點錨點」）；星號位置用
-    ``fp.receptor_lonlat``，抽樣範圍框依錨點計算（見 :func:`_sampling_range_box`，與報告 3-4-3 表 2 相同）。
+    ``fp.receptor_lonlat``，抽樣範圍是以錨點為圓心、受體核心半徑（12.5 km）的測地線圓
+    （見 :func:`_sampling_range_circle`）。
     座標軸範圍與刻度見 :func:`_axis_ticks`：首末刻度就是四個框邊。回傳
     ``(座標軸範圍, 實際畫出的等深線水深)``。
     """
@@ -3536,10 +3582,9 @@ def _draw_footprint_base_map(
     drawn = _draw_isobaths(ax, site_isobaths, extent, isobath_levels)
     for part in fp.open_boundary_parts:
         ax.plot(part[:, 0], part[:, 1], zorder=6, **_OPEN_BOUNDARY_STYLE)
-    sampling_box = _sampling_range_box(fp.site_id, fp.receptor_anchor)
-    if sampling_box is not None:
-        x0, x1, y0, y1 = sampling_box
-        ax.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], zorder=7, **_SAMPLING_RANGE_STYLE)
+    circle = _sampling_range_circle(fp.site_id, fp.receptor_anchor, fp.receptor_core_radius_m)
+    if circle is not None:
+        ax.plot(circle[:, 0], circle[:, 1], zorder=7, **_SAMPLING_RANGE_STYLE)
     receptor = fp.receptor_lonlat
     if receptor is not None:
         ax.plot(
@@ -4326,12 +4371,11 @@ def _footprint_caption_zh(
     arrival_zh = "回溯起點（到達時刻）的位置計入" if arrival_included else "回溯起點（到達時刻）的位置不計入"
     res = float(fp.grid["resolution_deg"])
     km = res * 111.19
-    sampling_box = _sampling_range_box(fp.site_id, fp.receptor_anchor)
+    circle_radius_km = (fp.receptor_core_radius_m or SAMPLING_RANGE_RADIUS_M) / 1000.0
     release_zh = (
-        "深藍色虛線框為抽樣範圍（錨點取到 0.01° 後，經度 ±0.13°、緯度 ±0.12°，與報告 3-4-3 表 2 相同；"
-        f"經度 {sampling_box[0]:.2f}–{sampling_box[1]:.2f}°E，"
-        f"緯度 {sampling_box[2]:.2f}–{sampling_box[3]:.2f}°N）"
-        if sampling_box is not None
+        f"深藍色虛線圓為抽樣範圍（以研究地點錨點為圓心、半徑 {circle_radius_km:g} km 的測地線圓，"
+        "即受體核心範圍）"
+        if fp.receptor_anchor is not None
         else "本批圖未提供釋放設定，未繪抽樣範圍"
     )
     if isobath_levels:
@@ -4967,7 +5011,7 @@ def _footprint_readme_section(inputs: NativeFiguresInputs, plan: _FootprintFigur
         "舊的 `source_footprint_kde.png` 照常輸出，但不再是報告主圖：它的輸入只有粒子穿越開放邊界的那一點，"
         "這些點全部落在一維的邊界線上，二維核密度不適用。\n\n"
         f"{bathy_line}底圖為陸地（灰）、海岸線（黑 0.5 pt）、中灰細等深線"
-        "（預設只畫 200 m 實線與 1000 m 虛線，地圖上不標水深數字）、深藍色虛線框（抽樣範圍）、"
+        "（預設只畫 200 m 實線與 1000 m 虛線，地圖上不標水深數字）、深藍色虛線圓（抽樣範圍）、"
         "星號（研究地點錨點，位置取自正式釋放設定，圖面不寫站名）與洋紅色虛線（流場範圍開放邊界）。"
         "色條與地圖軸同高，座標軸範圍向外擴到刻度倍數、首末刻度落在框邊。"
         "`manifest.json` 的 `footprint_figures` 區塊記錄各圖的色階上下限、低於下限的網格統計、"

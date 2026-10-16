@@ -424,11 +424,11 @@ def _describe_figure(fig) -> dict:
             if legend is not None
             for t in legend.get_texts()
         ],
-        "sampling_boxes": [
+        "sampling_circles": [
             np.asarray(ln.get_xydata())
             for a in maps
             for ln in a.lines
-            if ln.get_color() == native_figures._SAMPLING_RANGE_STYLE["color"] and len(ln.get_xydata()) == 5
+            if ln.get_color() == native_figures._SAMPLING_RANGE_STYLE["color"] and len(ln.get_xydata()) > 5
         ],
         "release_polygons": [
             p for a in maps for p in a.patches if type(p).__name__ == "Polygon" and p.get_zorder() == 7
@@ -850,7 +850,7 @@ def test_legend_omits_isobath_levels_that_are_absent_from_the_site(tmp_path, foo
         assert not any("1000" in text for text in d["legend_texts"])
 
 
-def _footprint_data_for_box(site_id, anchor, points):
+def _footprint_data_for_circle(site_id, anchor, points):
     domain = np.array([[119.0, 21.0], [122.5, 21.0], [122.5, 27.0], [119.0, 27.0]])
     return native_figures.FootprintSiteFigureData(
         site_id=site_id,
@@ -877,14 +877,6 @@ def _footprint_data_for_box(site_id, anchor, points):
     )
 
 
-# 報告 3-4-3 表 2 的抽樣範圍（龜山島西側取目前正式釋放設定的錨點 121.939148, 24.850326 → 121.94, 24.85）
-_SAMPLING_BOX_TABLE_343 = {
-    "gongliao": (121.92, 25.10, (121.79, 122.05), (24.98, 25.22)),
-    "guishan": (121.94, 24.85, (121.81, 122.07), (24.73, 24.97)),
-    "hsinchu": (120.45, 24.75, (120.32, 120.58), (24.63, 24.87)),
-    "nanwan": (120.76, 21.95, (120.63, 120.89), (21.83, 22.07)),
-    "lienchiang": (119.95, 26.20, (119.82, 120.08), (26.08, 26.32)),
-}
 _RUN08_RELEASE_ANCHORS = {
     "gongliao": (121.9223889, 25.0964444),
     "guishan": (121.939148, 24.850326),
@@ -894,67 +886,83 @@ _RUN08_RELEASE_ANCHORS = {
 }
 
 
-def test_sampling_range_box_rule_and_table_match_343_table2():
-    assert set(native_figures.SAMPLING_RANGE_BOXES_LONLAT) == set(_SAMPLING_BOX_TABLE_343)
-    for site, (lon0, lat0, (x0, x1), (y0, y1)) in _SAMPLING_BOX_TABLE_343.items():
-        assert native_figures.SAMPLING_RANGE_BOXES_LONLAT[site] == pytest.approx((x0, x1, y0, y1))
-        # 規則：錨點取到 0.01°，經度 ±0.13°、緯度 ±0.12°
-        assert (x1 - x0, y1 - y0) == pytest.approx((0.26, 0.24))
-        assert ((x0 + x1) / 2, (y0 + y1) / 2) == pytest.approx((lon0, lat0))
-        # 以正式釋放設定的錨點計算，必須落在表內（表與錨點不一致即 fail-closed）
-        box = native_figures._sampling_range_box(site, _RUN08_RELEASE_ANCHORS[site])
-        assert box == pytest.approx((x0, x1, y0, y1))
-    assert native_figures._sampling_range_box("any_site", None) is None
-    # 表外的站只依規則計算
-    assert native_figures._sampling_range_box("other", (120.123, 23.456)) == pytest.approx(
-        (119.99, 120.25, 23.34, 23.58)
-    )
-    # 錨點移動使框與表不一致時必須報錯，而不是默默畫出另一個框
-    with pytest.raises(native_figures.FiguresError, match="抽樣範圍"):
-        native_figures._sampling_range_box("guishan", (121.95, 24.84))
+def test_sampling_range_anchor_table_matches_run08_release_config():
+    assert dict(native_figures.SAMPLING_RANGE_ANCHORS_LONLAT) == _RUN08_RELEASE_ANCHORS
+    assert native_figures.SAMPLING_RANGE_RADIUS_M == 12500.0
+    for site, anchor in _RUN08_RELEASE_ANCHORS.items():
+        circle = native_figures._sampling_range_circle(site, anchor, 12500.0)
+        assert circle.shape == (361, 2)
+        assert tuple(circle[0]) == tuple(circle[-1])  # 閉合
+        # 半徑缺省時取常數 12.5 km
+        assert native_figures._sampling_range_circle(site, anchor, None) == pytest.approx(circle)
+    assert native_figures._sampling_range_circle("any_site", None, 12500.0) is None
+    # 表外的站只依錨點與半徑計算
+    other = native_figures._sampling_range_circle("other", (120.123, 23.456), 5000.0)
+    d = native_figures.geodesic_distance_km(120.123, 23.456, other[:, 0], other[:, 1])
+    assert d == pytest.approx(5.0, abs=1e-6)
+    # 錨點移動或半徑不是 12500 m 時必須報錯，而不是默默畫出另一個圓
+    with pytest.raises(native_figures.FiguresError, match="錨點"):
+        native_figures._sampling_range_circle("guishan", (121.951606, 24.843127), 12500.0)
+    with pytest.raises(native_figures.FiguresError, match="receptor_core_radius_m"):
+        native_figures._sampling_range_circle("guishan", _RUN08_RELEASE_ANCHORS["guishan"], 10000.0)
 
 
-def test_sampling_range_box_is_drawn_and_replaces_release_hull():
+def test_sampling_range_circle_is_geodesic_not_a_lonlat_circle():
+    for site, (lon0, lat0) in _RUN08_RELEASE_ANCHORS.items():
+        circle = native_figures._sampling_range_circle(site, (lon0, lat0), 12500.0)
+        dist = native_figures.geodesic_distance_km(lon0, lat0, circle[:, 0], circle[:, 1])
+        assert dist == pytest.approx(12.5, abs=1e-6)  # 每個頂點離錨點都是 12.5 km
+        half_lon = (circle[:, 0].max() - circle[:, 0].min()) / 2
+        half_lat = (circle[:, 1].max() - circle[:, 1].min()) / 2
+        # 經度半寬應約為緯度半寬除以 cos(緯度)，也就是畫在經緯度平面上不是正圓
+        assert half_lon / half_lat == pytest.approx(1.0 / np.cos(np.radians(lat0)), rel=0.01)
+        # 方位涵蓋一圈
+        dx = (circle[:, 0] - lon0) * np.cos(np.radians(lat0))
+        az = np.degrees(np.arctan2(dx, circle[:, 1] - lat0)) % 360
+        assert np.max(np.diff(np.sort(az[:-1]))) < 1.5
+
+
+def test_sampling_range_circle_is_drawn_and_replaces_box_and_hull():
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # 南灣：5 個水平位置各 4 層深度，全部落在框內
+    # 南灣：5 個水平位置各 4 層深度，全部落在 12.5 km 內
     points = np.array(
-        [[120.722, 21.846], [120.881, 21.923], [120.80, 21.90], [120.76, 21.88], [120.84, 21.92]]
+        [[120.722, 21.867], [120.8807, 21.9229], [120.80, 21.90], [120.76, 21.88], [120.84, 21.92]]
     )
     points = np.repeat(points, 4, axis=0)
-    fp = _footprint_data_for_box("nanwan", (120.763161, 21.946577), points)
+    fp = _footprint_data_for_circle("nanwan", (120.763161, 21.946577), points)
+    fp = dataclasses.replace(fp, receptor_core_radius_m=12500.0)
     fig, ax = plt.subplots()
     try:
         native_figures._draw_footprint_base_map(ax, fp, [], {})
-        boxes = [ln for ln in ax.lines if len(ln.get_xydata()) == 5]
-        assert len(boxes) == 1
-        box = boxes[0]
-        assert box.get_color() == "#1F4E79" and box.get_linestyle() == "--"
-        xy = np.asarray(box.get_xydata())
-        assert xy[0].tolist() == xy[-1].tolist()  # 封閉
-        assert (xy[:, 0].min(), xy[:, 0].max(), xy[:, 1].min(), xy[:, 1].max()) == pytest.approx(
-            (120.63, 120.89, 21.83, 22.07)
-        )
-        # 不填色，且不再有淡紫色凸包多邊形
+        circles = [ln for ln in ax.lines if len(ln.get_xydata()) == 361]
+        assert len(circles) == 1
+        circle = circles[0]
+        assert circle.get_color() == "#1F4E79" and circle.get_linestyle() == "--"
+        assert circle.get_zorder() == 7
+        assert circle.get_linewidth() == pytest.approx(2.4)
+        xy = np.asarray(circle.get_xydata())
+        dist = native_figures.geodesic_distance_km(120.763161, 21.946577, xy[:, 0], xy[:, 1])
+        assert dist == pytest.approx(12.5, abs=1e-6)
+        # 不填色、沒有矩形框（5 點折線）、沒有淡紫色凸包多邊形
         assert not [p for p in ax.patches if type(p).__name__ == "Polygon"]
-        assert box.get_zorder() == 7
-        # 全部釋放點在框內
-        assert np.all((points[:, 0] >= xy[:, 0].min()) & (points[:, 0] <= xy[:, 0].max()))
-        assert np.all((points[:, 1] >= xy[:, 1].min()) & (points[:, 1] <= xy[:, 1].max()))
+        assert not [ln for ln in ax.lines if len(ln.get_xydata()) == 5]
+        # 全部釋放點在圓內
+        pd_km = native_figures.geodesic_distance_km(120.763161, 21.946577, points[:, 0], points[:, 1])
+        assert np.all(pd_km <= 12.5)
         star = [ln for ln in ax.lines if ln.get_marker() == "*"]
         assert len(star) == 1 and tuple(star[0].get_xydata()[0]) == (120.763161, 21.946577)
     finally:
         plt.close(fig)
-    # 沒有錨點（診斷模式）：不畫框，圖例也沒有抽樣範圍
-    fp2 = _footprint_data_for_box("nanwan", (120.763161, 21.946577), points)
-    fp2 = dataclasses.replace(fp2, receptor_anchor=None)
+    # 沒有錨點（診斷模式）：不畫圓，圖例也沒有抽樣範圍
+    fp2 = dataclasses.replace(fp, receptor_anchor=None)
     fig, ax = plt.subplots()
     try:
         native_figures._draw_footprint_base_map(ax, fp2, [], {})
-        assert not [ln for ln in ax.lines if len(ln.get_xydata()) == 5]
+        assert not [ln for ln in ax.lines if len(ln.get_xydata()) == 361]
     finally:
         plt.close(fig)
 
@@ -985,29 +993,22 @@ def test_manifest_records_release_geometry_and_anchor_checks(tmp_path, footprint
         assert geo["release_max_distance_from_anchor_km"] >= geo["anchor_to_release_centroid_km"] - 1e-9
     assert block["by_site"]["site_a"]["release_geometry"]["anchor_on_sea"] is True
     assert block["by_site"]["site_b"]["release_geometry"]["anchor_on_sea"] is False
-    # 圖上畫的是抽樣範圍虛線框（依錨點計算），不再畫釋放點凸包；框與 manifest 記錄一致且框住全部釋放點
+    # 圖上畫的是抽樣範圍虛線圓（以錨點為圓心、半徑＝設定檔 receptor_core_radius_m），不再畫釋放點凸包；
+    # 圓與 manifest 記錄一致，且記錄「全部釋放點是否在圓內」與最遠釋放點距離
     for site, (lon, lat) in anchors.items():
         rec = block["by_site"][site]["release_geometry"]["sampling_range"]
-        b = rec["box_lonlat"]
-        assert (b["lon_min"], b["lon_max"], b["lat_min"], b["lat_max"]) == pytest.approx(
-            (round(lon, 2) - 0.13, round(lon, 2) + 0.13, round(lat, 2) - 0.12, round(lat, 2) + 0.12)
-        )
+        assert rec["shape"] == "geodesic_circle" and rec["radius_m"] == 12500.0
+        assert rec["anchor_lonlat"] == [lon, lat] and rec["vertex_count"] == 361
         pts_geo = np.asarray(block["by_site"][site]["release_geometry"]["release_points_lonlat"])
-        expect_inside = int(
-            np.sum(
-                (pts_geo[:, 0] >= b["lon_min"])
-                & (pts_geo[:, 0] <= b["lon_max"])
-                & (pts_geo[:, 1] >= b["lat_min"])
-                & (pts_geo[:, 1] <= b["lat_max"])
-            )
-        )
+        dist = native_figures.geodesic_distance_km(lon, lat, pts_geo[:, 0], pts_geo[:, 1])
         assert rec["release_point_count"] == len(RECEPTORS)
-        # 合成釋放點不保證在框內；真實資料另行核對 20/20
-        assert rec["release_points_inside_box"] == expect_inside
+        # 合成釋放點不保證在圓內；真實資料另行核對 25/25
+        assert rec["release_points_inside_circle"] == int(np.sum(dist <= 12.5))
+        assert rec["max_release_point_distance_km"] == pytest.approx(float(dist.max()))
         assert rec["style"]["color"] == "#1F4E79"
     for d in _wp38_colorbar_figs(described):
         assert not d["release_polygons"]
-        assert d["sampling_boxes"]
+        assert d["sampling_circles"]
 
 
 def test_missing_config_is_rejected_unless_explicitly_allowed(tmp_path, footprint_inputs):
@@ -1068,11 +1069,11 @@ def test_json_policy_wp38_constants_match_figures_py():
     assert iso["linewidth_pt"]["value"] == native_figures._ISOBATH_LINEWIDTH
     assert iso["number_labels_on_map"] is False
     sampling = block["sampling_range"]
-    assert sampling["round_deg"]["value"] == native_figures.SAMPLING_RANGE_ROUND_DEG
-    assert sampling["half_width_lon_deg"]["value"] == native_figures.SAMPLING_RANGE_HALF_WIDTH_LON_DEG
-    assert sampling["half_width_lat_deg"]["value"] == native_figures.SAMPLING_RANGE_HALF_WIDTH_LAT_DEG
-    assert {k: tuple(v) for k, v in sampling["boxes_lonlat"]["value"].items()} == dict(
-        native_figures.SAMPLING_RANGE_BOXES_LONLAT
+    assert sampling["shape"] == "geodesic_circle"
+    assert sampling["radius_m"]["value"] == native_figures.SAMPLING_RANGE_RADIUS_M
+    assert sampling["azimuth_step_deg"]["value"] == native_figures.SAMPLING_RANGE_AZIMUTH_STEP_DEG
+    assert {k: tuple(v) for k, v in sampling["anchors_lonlat"]["value"].items()} == dict(
+        native_figures.SAMPLING_RANGE_ANCHORS_LONLAT
     )
     style = native_figures._SAMPLING_RANGE_STYLE
     assert sampling["color"]["value"] == style["color"]

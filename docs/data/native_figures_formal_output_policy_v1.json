@@ -21,6 +21,11 @@
       "version": "1.1.0",
       "date": "2026-10-16",
       "change": "WP-58 修訂（版本號不變）：wp38_footprint_figures.release_range 區塊（釋放點凸包，淡紫色）改為 sampling_range 區塊（與報告 3-4-3 一致的深藍色虛線框，圖例『抽樣範圍』）；受體星號圖例改為『研究地點錨點』。"
+    },
+    {
+      "version": "1.1.0",
+      "date": "2026-10-16",
+      "change": "WP-59 修訂（版本號不變）：wp38_footprint_figures.sampling_range 區塊由矩形框（WP-58）改為以錨點為圓心、半徑 12.5 km 的測地線圓；site_labels_zh 的 guishan 由『龜山島西側』改為『龜山島』。"
     }
   ],
   "scope": {
@@ -46,7 +51,7 @@
     "source": "figures.SITE_LABELS_ZH",
     "value": {
       "gongliao": "貢寮",
-      "guishan": "龜山島西側",
+      "guishan": "龜山島",
       "hsinchu": "新竹外海",
       "nanwan": "南灣",
       "lienchiang": "連江"
@@ -215,30 +220,28 @@
       ]
     },
     "sampling_range": {
-      "definition": "與報告 3-4-3 圖 2、表 2 一致的抽樣範圍虛線框：錨點取到 0.01° 後，經度 ±0.13°、緯度 ±0.12°，不填色；取代 WP-38 至 WP-57 的釋放點凸包（淡紫色）",
+      "definition": "抽樣範圍：以研究地點錨點為圓心、半徑 12.5 km（正式釋放設定的 receptor_core_radius_m）的測地線圓，深藍虛線、不填色；取代 WP-58 的 3-4-3 矩形虛線框與 WP-38 至 WP-57 的釋放點凸包（淡紫色）",
+      "shape": "geodesic_circle",
       "legend_text_zh": "抽樣範圍",
       "legend_text_en": "Sampling range",
-      "round_deg": {
-        "source": "figures.SAMPLING_RANGE_ROUND_DEG",
-        "value": 0.01
+      "radius_m": {
+        "source": "figures.SAMPLING_RANGE_RADIUS_M",
+        "value": 12500.0
       },
-      "half_width_lon_deg": {
-        "source": "figures.SAMPLING_RANGE_HALF_WIDTH_LON_DEG",
-        "value": 0.13
+      "azimuth_step_deg": {
+        "source": "figures.SAMPLING_RANGE_AZIMUTH_STEP_DEG",
+        "value": 1.0
       },
-      "half_width_lat_deg": {
-        "source": "figures.SAMPLING_RANGE_HALF_WIDTH_LAT_DEG",
-        "value": 0.12
-      },
-      "boxes_lonlat": {
-        "source": "figures.SAMPLING_RANGE_BOXES_LONLAT",
-        "note_zh": "[經度下界, 經度上界, 緯度下界, 緯度上界]；出圖時由正式釋放設定的錨點重算，與此表不一致即 fail-closed。",
+      "method_zh": "WGS84 測地線正算（pyproj Geod.fwd），方位角 0°～360° 每 1° 一個頂點，共 361 點、首尾閉合，轉回經緯度；不在經緯度平面上直接畫圓",
+      "anchors_lonlat": {
+        "source": "figures.SAMPLING_RANGE_ANCHORS_LONLAT",
+        "note_zh": "[經度, 緯度]＝正式釋放設定的錨點；出圖時與設定檔逐項核對，不一致或半徑不是 12500 m 即 fail-closed。",
         "value": {
-          "gongliao": [121.79, 122.05, 24.98, 25.22],
-          "guishan": [121.81, 122.07, 24.73, 24.97],
-          "hsinchu": [120.32, 120.58, 24.63, 24.87],
-          "nanwan": [120.63, 120.89, 21.83, 22.07],
-          "lienchiang": [119.82, 120.08, 26.08, 26.32]
+          "gongliao": [121.9223889, 25.0964444],
+          "guishan": [121.939148, 24.850326],
+          "hsinchu": [120.45, 24.75],
+          "nanwan": [120.763161, 21.946577],
+          "lienchiang": [119.95, 26.2]
         }
       },
       "color": {
