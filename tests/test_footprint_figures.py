@@ -143,7 +143,7 @@ def test_footprint_figures_are_produced_for_each_site(tmp_path, footprint_inputs
     assert manifest["footprint_figure_stems"] == list(native_figures.FOOTPRINT_FIGURE_STEMS)
     block = manifest["footprint_figures"]
     scales = block["residence_color_scale"]
-    assert scales["unit"] == "% 停留時數／km²"
+    assert scales["unit"] == "% 停留時數/km²"
     assert scales["norm"] == "log"
     assert scales["lower_limit_fraction_of_upper_limit"] == 1e-4
     shared = scales["variants"]["source_footprint_residence"]
@@ -255,7 +255,7 @@ def test_figure_text_none_omits_title_but_keeps_legend_and_panel_titles(
     assert "停留時數密度｜" not in joined and "回溯快照的條件式來源足跡｜" not in joined
     assert "穿越位置沿開放邊界的分布｜" not in joined
     assert "高密度區間 50%" in joined and "流場範圍開放邊界（終止邊界）" in joined
-    assert "回溯 72 小時" in joined  # 面板標題保留
+    assert "回溯 72 h" in joined  # 面板標題保留
     texts.clear()
     _build(tmp_path, postprocess_dir, coastline, isobaths, text="full", name="full")
     joined_full = "\n".join(texts["all"])
@@ -302,7 +302,7 @@ def test_snapshot_panel_with_too_few_particles_is_annotated_not_estimated(
     _build(tmp_path, postprocess_dir, coastline, isobaths)
     # 合成資料的隨機終止使 336 小時面板只剩少數粒子或沒有粒子。
     manifest_text = "\n".join(seen)
-    assert "仍在漂流粒子數不足（n=" in manifest_text or "回溯 336 小時" in manifest_text
+    assert "仍在漂流虛擬質點數不足（n=" in manifest_text or "回溯 336 h" in manifest_text
     # 快照不再有 KDE 的「範圍外未繪」註記。
     assert "範圍外" not in manifest_text and "未繪" not in manifest_text
 
@@ -802,7 +802,7 @@ def test_site_name_is_absent_from_none_mode_figures_but_kept_in_captions(
     # 星號旁沒有站名標籤，圖例只寫「受體」
     for stem in ("source_footprint_residence", "lookback_snapshot"):
         svg_full = (full / "site_a" / f"{stem}.svg").read_text(encoding="utf-8")
-        assert "受體（研究點錨點）" in svg_full and "粒子釋放範圍" in svg_full
+        assert "受體（研究地點錨點）" in svg_full and "虛擬質點釋放範圍" in svg_full
     # 每張新圖的圖說都有站名與受體經緯度
     manifest = json.loads((none / "manifest.json").read_text(encoding="utf-8"))
     for site, (lon, lat) in {"site_a": (120.9, 25.1), "site_b": (121.2, 24.9)}.items():
@@ -835,7 +835,7 @@ def test_map_has_no_isobath_number_labels_and_no_site_names(tmp_path, footprint_
             assert not any(word in text for word in (*names.values(), *SITES)), text
         for text in d["legend_texts"]:
             assert not any(word in text for word in (*names.values(), *SITES)), text
-        assert "受體（研究點錨點）" in d["legend_texts"] and "粒子釋放範圍" in d["legend_texts"]
+        assert "受體（研究地點錨點）" in d["legend_texts"] and "虛擬質點釋放範圍" in d["legend_texts"]
         assert "等深線 200 m（實線）" in d["legend_texts"] and "等深線 1000 m（虛線）" in d["legend_texts"]
 
 
