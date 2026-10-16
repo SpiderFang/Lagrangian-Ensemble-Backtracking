@@ -424,12 +424,14 @@ def _describe_figure(fig) -> dict:
             if legend is not None
             for t in legend.get_texts()
         ],
-        "release_polygons": [
-            np.asarray(p.get_xy())
+        "sampling_boxes": [
+            np.asarray(ln.get_xydata())
             for a in maps
-            for p in a.patches
-            if type(p).__name__ == "Polygon"
-            and np.allclose(p.get_edgecolor(), matplotlib.colors.to_rgba(native_figures._RELEASE_EDGE))
+            for ln in a.lines
+            if ln.get_color() == native_figures._SAMPLING_RANGE_STYLE["color"] and len(ln.get_xydata()) == 5
+        ],
+        "release_polygons": [
+            p for a in maps for p in a.patches if type(p).__name__ == "Polygon" and p.get_zorder() == 7
         ],
     }
     ref = min(maps, key=lambda a: (round(a.get_window_extent().y0), round(a.get_window_extent().x0)))
@@ -802,7 +804,7 @@ def test_site_name_is_absent_from_none_mode_figures_but_kept_in_captions(
     # 星號旁沒有站名標籤，圖例只寫「受體」
     for stem in ("source_footprint_residence", "lookback_snapshot"):
         svg_full = (full / "site_a" / f"{stem}.svg").read_text(encoding="utf-8")
-        assert "受體（研究地點錨點）" in svg_full and "虛擬質點釋放範圍" in svg_full
+        assert "研究地點錨點" in svg_full and "抽樣範圍" in svg_full
     # 每張新圖的圖說都有站名與受體經緯度
     manifest = json.loads((none / "manifest.json").read_text(encoding="utf-8"))
     for site, (lon, lat) in {"site_a": (120.9, 25.1), "site_b": (121.2, 24.9)}.items():
@@ -835,7 +837,7 @@ def test_map_has_no_isobath_number_labels_and_no_site_names(tmp_path, footprint_
             assert not any(word in text for word in (*names.values(), *SITES)), text
         for text in d["legend_texts"]:
             assert not any(word in text for word in (*names.values(), *SITES)), text
-        assert "受體（研究地點錨點）" in d["legend_texts"] and "虛擬質點釋放範圍" in d["legend_texts"]
+        assert "研究地點錨點" in d["legend_texts"] and "抽樣範圍" in d["legend_texts"]
         assert "等深線 200 m（實線）" in d["legend_texts"] and "等深線 1000 m（虛線）" in d["legend_texts"]
 
 
@@ -848,31 +850,19 @@ def test_legend_omits_isobath_levels_that_are_absent_from_the_site(tmp_path, foo
         assert not any("1000" in text for text in d["legend_texts"])
 
 
-def test_release_hull_contains_every_release_point_and_is_drawn():
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from shapely.geometry import Point
-
-    points = np.array([[120.80, 21.90], [120.85, 21.95], [120.78, 22.00], [120.83, 21.98], [120.81, 21.93]])
-    hull = native_figures._release_hull(points)
-    assert hull is not None and hull.geom_type == "Polygon"
-    assert all(hull.buffer(1e-9).contains(Point(x, y)) for x, y in points)
-    assert native_figures._release_hull(None) is None
-    assert native_figures._release_hull(points[:2]).geom_type == "LineString"  # 兩點：線段
-    domain = np.array([[120.5, 21.6], [121.1, 21.6], [121.1, 22.3], [120.5, 22.3]])
-    fp = native_figures.FootprintSiteFigureData(
-        site_id="t",
+def _footprint_data_for_box(site_id, anchor, points):
+    domain = np.array([[119.0, 21.0], [122.5, 21.0], [122.5, 27.0], [119.0, 27.0]])
+    return native_figures.FootprintSiteFigureData(
+        site_id=site_id,
         grid={
-            "lon0_deg": 120.5,
-            "lat0_deg": 21.6,
-            "nx": 6,
-            "ny": 7,
+            "lon0_deg": 119.0,
+            "lat0_deg": 21.0,
+            "nx": 35,
+            "ny": 60,
             "resolution_deg": 0.1,
             "total_particle_hours": 1,
         },
-        density_pct_per_km2=np.zeros((7, 6)),
+        density_pct_per_km2=np.zeros((60, 35)),
         hdr_threshold_pct_per_km2={},
         hdr_area_km2={},
         snapshots=(),
@@ -880,23 +870,91 @@ def test_release_hull_contains_every_release_point_and_is_drawn():
         edge_intervals=(),
         domain_lonlat=domain,
         open_boundary_parts=(),
-        receptor_center=(120.83, 21.89),
+        receptor_center=anchor,
         summary={},
-        receptor_anchor=(120.763161, 21.946577),
+        receptor_anchor=anchor,
         release_points=points,
     )
+
+
+# 報告 3-4-3 表 2 的抽樣範圍（龜山島西側取目前正式釋放設定的錨點 121.939148, 24.850326 → 121.94, 24.85）
+_SAMPLING_BOX_TABLE_343 = {
+    "gongliao": (121.92, 25.10, (121.79, 122.05), (24.98, 25.22)),
+    "guishan": (121.94, 24.85, (121.81, 122.07), (24.73, 24.97)),
+    "hsinchu": (120.45, 24.75, (120.32, 120.58), (24.63, 24.87)),
+    "nanwan": (120.76, 21.95, (120.63, 120.89), (21.83, 22.07)),
+    "lienchiang": (119.95, 26.20, (119.82, 120.08), (26.08, 26.32)),
+}
+_RUN08_RELEASE_ANCHORS = {
+    "gongliao": (121.9223889, 25.0964444),
+    "guishan": (121.939148, 24.850326),
+    "hsinchu": (120.45, 24.75),
+    "nanwan": (120.763161, 21.946577),
+    "lienchiang": (119.95, 26.2),
+}
+
+
+def test_sampling_range_box_rule_and_table_match_343_table2():
+    assert set(native_figures.SAMPLING_RANGE_BOXES_LONLAT) == set(_SAMPLING_BOX_TABLE_343)
+    for site, (lon0, lat0, (x0, x1), (y0, y1)) in _SAMPLING_BOX_TABLE_343.items():
+        assert native_figures.SAMPLING_RANGE_BOXES_LONLAT[site] == pytest.approx((x0, x1, y0, y1))
+        # 規則：錨點取到 0.01°，經度 ±0.13°、緯度 ±0.12°
+        assert (x1 - x0, y1 - y0) == pytest.approx((0.26, 0.24))
+        assert ((x0 + x1) / 2, (y0 + y1) / 2) == pytest.approx((lon0, lat0))
+        # 以正式釋放設定的錨點計算，必須落在表內（表與錨點不一致即 fail-closed）
+        box = native_figures._sampling_range_box(site, _RUN08_RELEASE_ANCHORS[site])
+        assert box == pytest.approx((x0, x1, y0, y1))
+    assert native_figures._sampling_range_box("any_site", None) is None
+    # 表外的站只依規則計算
+    assert native_figures._sampling_range_box("other", (120.123, 23.456)) == pytest.approx(
+        (119.99, 120.25, 23.34, 23.58)
+    )
+    # 錨點移動使框與表不一致時必須報錯，而不是默默畫出另一個框
+    with pytest.raises(native_figures.FiguresError, match="抽樣範圍"):
+        native_figures._sampling_range_box("guishan", (121.95, 24.84))
+
+
+def test_sampling_range_box_is_drawn_and_replaces_release_hull():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # 南灣：5 個水平位置各 4 層深度，全部落在框內
+    points = np.array(
+        [[120.722, 21.846], [120.881, 21.923], [120.80, 21.90], [120.76, 21.88], [120.84, 21.92]]
+    )
+    points = np.repeat(points, 4, axis=0)
+    fp = _footprint_data_for_box("nanwan", (120.763161, 21.946577), points)
     fig, ax = plt.subplots()
     try:
         native_figures._draw_footprint_base_map(ax, fp, [], {})
-        polygons = [p for p in ax.patches if type(p).__name__ == "Polygon"]
-        assert len(polygons) == 1
-        drawn = polygons[0].get_xy()
-        from shapely.geometry import Polygon as ShapelyPolygon
-
-        drawn_hull = ShapelyPolygon(drawn)
-        assert all(drawn_hull.buffer(1e-9).contains(Point(x, y)) for x, y in points)
+        boxes = [ln for ln in ax.lines if len(ln.get_xydata()) == 5]
+        assert len(boxes) == 1
+        box = boxes[0]
+        assert box.get_color() == "#1F4E79" and box.get_linestyle() == "--"
+        xy = np.asarray(box.get_xydata())
+        assert xy[0].tolist() == xy[-1].tolist()  # 封閉
+        assert (xy[:, 0].min(), xy[:, 0].max(), xy[:, 1].min(), xy[:, 1].max()) == pytest.approx(
+            (120.63, 120.89, 21.83, 22.07)
+        )
+        # 不填色，且不再有淡紫色凸包多邊形
+        assert not [p for p in ax.patches if type(p).__name__ == "Polygon"]
+        assert box.get_zorder() == 7
+        # 全部釋放點在框內
+        assert np.all((points[:, 0] >= xy[:, 0].min()) & (points[:, 0] <= xy[:, 0].max()))
+        assert np.all((points[:, 1] >= xy[:, 1].min()) & (points[:, 1] <= xy[:, 1].max()))
         star = [ln for ln in ax.lines if ln.get_marker() == "*"]
         assert len(star) == 1 and tuple(star[0].get_xydata()[0]) == (120.763161, 21.946577)
+    finally:
+        plt.close(fig)
+    # 沒有錨點（診斷模式）：不畫框，圖例也沒有抽樣範圍
+    fp2 = _footprint_data_for_box("nanwan", (120.763161, 21.946577), points)
+    fp2 = dataclasses.replace(fp2, receptor_anchor=None)
+    fig, ax = plt.subplots()
+    try:
+        native_figures._draw_footprint_base_map(ax, fp2, [], {})
+        assert not [ln for ln in ax.lines if len(ln.get_xydata()) == 5]
     finally:
         plt.close(fig)
 
@@ -927,8 +985,29 @@ def test_manifest_records_release_geometry_and_anchor_checks(tmp_path, footprint
         assert geo["release_max_distance_from_anchor_km"] >= geo["anchor_to_release_centroid_km"] - 1e-9
     assert block["by_site"]["site_a"]["release_geometry"]["anchor_on_sea"] is True
     assert block["by_site"]["site_b"]["release_geometry"]["anchor_on_sea"] is False
-    # 兩個釋放點：凸包退化成線段，圖上不畫多邊形，但釋放點仍在 manifest
-    assert all(not d["release_polygons"] for d in _wp38_colorbar_figs(described))
+    # 圖上畫的是抽樣範圍虛線框（依錨點計算），不再畫釋放點凸包；框與 manifest 記錄一致且框住全部釋放點
+    for site, (lon, lat) in anchors.items():
+        rec = block["by_site"][site]["release_geometry"]["sampling_range"]
+        b = rec["box_lonlat"]
+        assert (b["lon_min"], b["lon_max"], b["lat_min"], b["lat_max"]) == pytest.approx(
+            (round(lon, 2) - 0.13, round(lon, 2) + 0.13, round(lat, 2) - 0.12, round(lat, 2) + 0.12)
+        )
+        pts_geo = np.asarray(block["by_site"][site]["release_geometry"]["release_points_lonlat"])
+        expect_inside = int(
+            np.sum(
+                (pts_geo[:, 0] >= b["lon_min"])
+                & (pts_geo[:, 0] <= b["lon_max"])
+                & (pts_geo[:, 1] >= b["lat_min"])
+                & (pts_geo[:, 1] <= b["lat_max"])
+            )
+        )
+        assert rec["release_point_count"] == len(RECEPTORS)
+        # 合成釋放點不保證在框內；真實資料另行核對 20/20
+        assert rec["release_points_inside_box"] == expect_inside
+        assert rec["style"]["color"] == "#1F4E79"
+    for d in _wp38_colorbar_figs(described):
+        assert not d["release_polygons"]
+        assert d["sampling_boxes"]
 
 
 def test_missing_config_is_rejected_unless_explicitly_allowed(tmp_path, footprint_inputs):
@@ -988,10 +1067,20 @@ def test_json_policy_wp38_constants_match_figures_py():
     assert iso["color"]["value"] == native_figures._ISOBATH_COLOR
     assert iso["linewidth_pt"]["value"] == native_figures._ISOBATH_LINEWIDTH
     assert iso["number_labels_on_map"] is False
-    release = block["release_range"]
-    assert tuple(release["face_rgba"]["value"]) == native_figures._RELEASE_FACE
-    assert release["edge_color"]["value"] == native_figures._RELEASE_EDGE
-    assert release["linewidth_pt"]["value"] == native_figures._RELEASE_LINEWIDTH
+    sampling = block["sampling_range"]
+    assert sampling["round_deg"]["value"] == native_figures.SAMPLING_RANGE_ROUND_DEG
+    assert sampling["half_width_lon_deg"]["value"] == native_figures.SAMPLING_RANGE_HALF_WIDTH_LON_DEG
+    assert sampling["half_width_lat_deg"]["value"] == native_figures.SAMPLING_RANGE_HALF_WIDTH_LAT_DEG
+    assert {k: tuple(v) for k, v in sampling["boxes_lonlat"]["value"].items()} == dict(
+        native_figures.SAMPLING_RANGE_BOXES_LONLAT
+    )
+    style = native_figures._SAMPLING_RANGE_STYLE
+    assert sampling["color"]["value"] == style["color"]
+    assert sampling["linewidth_pt"]["value"] == style["linewidth"]
+    assert tuple(sampling["dash_in_linewidth_units"]["value"]) == tuple(style["linestyle"][1])
+    assert sampling["legend_text_zh"] == native_figures._SAMPLING_RANGE_LABEL_ZH
+    assert sampling["legend_text_en"] == native_figures._SAMPLING_RANGE_LABEL_EN
+    assert block["receptor"]["legend_text_zh"] == "研究地點錨點"
     axes = block["map_axes"]
     assert tuple(axes["tick_step_choices_deg"]["value"]) == native_figures._TICK_STEP_CHOICES_DEG
     assert axes["min_intervals"]["value"] == native_figures._MIN_INTERVALS
