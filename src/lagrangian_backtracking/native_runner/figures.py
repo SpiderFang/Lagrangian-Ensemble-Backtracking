@@ -1775,9 +1775,9 @@ def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
     member_count = int(site.summary["ensemble_member_count"])
     member_text_zh, member_text_en = _ensemble_member_count_text(member_count)
     base = t.t(
-        f"站點：{site.site_label_zh}｜粒子數：{total}｜穿越開放邊界比例："
+        f"研究地點：{site.site_label_zh}｜虛擬質點數：{total}｜穿越開放邊界比例："
         f"{crossed_fraction * 100:.1f}%｜{member_text_zh}",
-        f"Site: {site.site_id} | N={total} | crossed fraction: "
+        f"Study site: {site.site_id} | N={total} | crossed fraction: "
         f"{crossed_fraction * 100:.1f}% | {member_text_en}",
     )
     return f"{base}{extra}"
@@ -1958,7 +1958,7 @@ def _plot_horizontal_overview(
         t,
         font,
         t.t(f"水平軌跡總覽｜{site.site_label_zh}", f"Horizontal overview | {site.site_id}"),
-        _site_subtitle(site, t, extra=t.t("｜線色：代表粒子起始深度序位（淺→深）", "")),
+        _site_subtitle(site, t, extra=t.t("｜線色：代表虛擬質點起始深度序位（淺→深）", "")),
         figure_text=figure_text,
     )
     # WP-25：不再畫 local／flow 差異說明副標（圖上已經只剩 flow domain 邊界，
@@ -2057,11 +2057,11 @@ def _plot_horizontal_local(
     center_lat = y0
     ax.set_aspect(1.0 / math.cos(math.radians(center_lat)), adjustable="box")
     ax.set_xlabel(
-        t.t("經度偏移（度，相對代表粒子起點平均）", "Longitude offset (deg, rel. mean start)"),
+        t.t("經度偏移（°，相對代表虛擬質點起點平均）", "Longitude offset (deg, rel. mean start)"),
         fontproperties=font,
     )
     ax.set_ylabel(
-        t.t("緯度偏移（度，相對代表粒子起點平均）", "Latitude offset (deg, rel. mean start)"),
+        t.t("緯度偏移（°，相對代表虛擬質點起點平均）", "Latitude offset (deg, rel. mean start)"),
         fontproperties=font,
     )
     ax.grid(color="white", linewidth=0.8)
@@ -2130,9 +2130,9 @@ def _plot_depth_age(site: SiteData, t: _Labeler, font: Any, path: Path, dpi: int
     ax.set_xticks(np.arange(_DEPTH_AGE_XLIM[0], _DEPTH_AGE_XLIM[1] + 1e-9, _DEPTH_AGE_XSTEP))
     ax.set_ylim(*_DEPTH_AGE_YLIM)
     ax.set_yticks(np.arange(_DEPTH_AGE_YLIM[0], _DEPTH_AGE_YLIM[1] + 1e-9, _DEPTH_AGE_YSTEP))
-    ax.set_xlabel(t.t("回溯時齡（小時）", "Backtrack age (hours)"), fontproperties=font)
+    ax.set_xlabel(t.t("回溯時齡（h）", "Backtrack age (hours)"), fontproperties=font)
     ax.set_ylabel(
-        t.t("深度 z（公尺，海面為 0，向上為正）", "Depth z (m, sea surface = 0, up positive)"),
+        t.t("深度 z（m，海面為 0，向上為正）", "Depth z (m, sea surface = 0, up positive)"),
         fontproperties=font,
     )
     ax.grid(color="#dddddd", linewidth=0.6)
@@ -2204,7 +2204,7 @@ def _plot_terminal_counts(
         )
     ax.set_xticks(range(len(codes)))
     ax.set_xticklabels(labels, rotation=25, ha="right", fontproperties=font, fontsize=8)
-    ax.set_ylabel(t.t("佔全站粒子數比例", "Fraction of all particles at this site"), fontproperties=font)
+    ax.set_ylabel(t.t("佔該研究地點虛擬質點總數的比例", "Fraction of all virtual particles at this study site"), fontproperties=font)
     ax.set_ylim(0.0, _TERMINAL_COUNTS_YMAX)
     ax.set_yticks(np.arange(0.0, _TERMINAL_COUNTS_YMAX + 1e-9, 0.2))
     ax.grid(axis="y", color="#dddddd", linewidth=0.6)
@@ -2286,7 +2286,7 @@ def _plot_boundary_azimuth_rose(
     top_text = (
         separator.join(f"{w.sector_name} {w.relative_source_weight * 100:.1f}%" for w in top3)
         if top3
-        else t.t("無穿越邊界粒子", "No particles crossed the boundary")
+        else t.t("無穿越邊界虛擬質點", "No virtual particles crossed the boundary")
     )
     if figure_text == "full":
         fig.suptitle(
@@ -2522,7 +2522,7 @@ def _plot_source_footprint_kde(
             0.5,
             0.5,
             t.t(
-                f"此站無可用條件式來源足跡（狀態：{status_text_zh or '缺席'}）",
+                f"此研究地點無可用條件式來源足跡（狀態：{status_text_zh or '缺席'}）",
                 f"No source footprint available (status: {status_text or 'missing'})",
             ),
             ha="center",
@@ -2556,7 +2556,7 @@ def _plot_source_footprint_kde(
         cbar.set_ticks(color_scale.ticks())
         cbar.set_label(
             t.t(
-                "條件式來源足跡密度（每平方公尺）",
+                "條件式來源足跡密度（每 m²）",
                 "Conditional source footprint density (per m^2)",
             ),
             fontproperties=font,
@@ -2589,7 +2589,7 @@ def _plot_source_footprint_kde(
                 [],
                 color=hdr_colors[i % len(hdr_colors)],
                 linewidth=1.6,
-                label=t.t(f"高密度區間 {level * 100:.0f}%", f"HDR {level * 100:.0f}%"),
+                label=t.t(f"高密度區間 {level * 100:.0f}%", f"High-density interval {level * 100:.0f}%"),
             )
             for i, level in enumerate(hdr_levels)
         ]
@@ -2785,14 +2785,14 @@ def _plot_settling_velocity_breakdown(
     if class_rows is None:
         sv_labels = [f"{sv:g}" for sv in sv_values]
         heat_labels = sv_labels
-        ylabel_text = t.t("沉降速度（公尺/秒，負值為下沉）", "Settling velocity (m/s, negative = sinking)")
+        ylabel_text = t.t("沉降速度（m/s，負值為下沉）", "Settling velocity (m/s, negative = sinking)")
     else:
         sv_labels = [_class_tick_label(r, cjk=t.cjk_available) for r in class_rows]
         heat_labels = [
             _class_name_text(r, cjk=True) if t.cjk_available else "" for r in class_rows
         ]
         ylabel_text = t.t(
-            "沉降速度類別（下沉速度範圍，公尺／秒）", "Settling-velocity class (speed range, m/s)"
+            "沉降速度（m/s）", "Settling-velocity class (speed range, m/s)"
         )
     ax_bar.barh(range(len(sv_values)), crossing_fractions, color="#4c78a8")
     ax_bar.set_yticks(range(len(sv_values)))
@@ -3510,7 +3510,7 @@ def _footprint_legend_handles(
         Line2D(
             [],
             [],
-            label=t.t(f"高密度區間 {level * 100:.0f}%", f"HDR {level * 100:.0f}%"),
+            label=t.t(f"高密度區間 {level * 100:.0f}%", f"High-density interval {level * 100:.0f}%"),
             **_HDR_LINE_STYLES[i % len(_HDR_LINE_STYLES)],
         )
         for i, level in enumerate(hdr_levels)
@@ -3528,7 +3528,7 @@ def _footprint_legend_handles(
             markeredgecolor="black",
             linestyle="none",
             label=(
-                t.t("受體（研究點錨點）", "Receptor (study-site anchor)")
+                t.t("受體（研究地點錨點）", "Receptor (study-site anchor)")
                 if receptor_is_anchor
                 else t.t("受體（釋放點平均位置）", "Receptor (mean release position)")
             ),
@@ -3540,7 +3540,7 @@ def _footprint_legend_handles(
                 facecolor=_RELEASE_FACE,
                 edgecolor=_RELEASE_EDGE,
                 linewidth=_RELEASE_LINEWIDTH,
-                label=t.t("粒子釋放範圍", "Particle release area"),
+                label=t.t("虛擬質點釋放範圍", "Virtual particle release area"),
             )
         )
     ordered = sorted(isobath_levels)
@@ -3800,7 +3800,7 @@ def _plot_source_footprint_residence(
         [ax],
         vmin=vmin,
         vmax=vmax_used,
-        label=t.t("停留時數密度（% 停留時數／km²）", "Residence density (% of particle-hours / km^2)"),
+        label=t.t("停留時數密度（% 停留時數/km²）", "Residence density (% of particle-hours / km^2)"),
         font=font,
     )
     lon_c = 0.5 * (fp.lon_edges[:-1] + fp.lon_edges[1:])
@@ -3827,7 +3827,7 @@ def _plot_source_footprint_residence(
     total_hours = int(fp.grid["total_particle_hours"])
     resolution = float(fp.grid["resolution_deg"])
     # 跨站共用色階為預設，副標不另標示；只有本站自訂色階版本才標明。
-    scale_text = "" if scale_kind == "shared" else "｜" + t.t("本站自訂色階", "per-site scale")
+    scale_text = "" if scale_kind == "shared" else "｜" + t.t("本研究地點自訂色階", "per-site scale")
     _add_two_line_title(
         fig,
         t,
@@ -3837,7 +3837,7 @@ def _plot_source_footprint_residence(
             site,
             t,
             extra=t.t(
-                f"\n總停留時數：{total_hours:,} 粒子小時｜網格 {resolution:.2f}°{scale_text}",
+                f"\n總停留時數：{total_hours:,} 虛擬質點·h｜網格 {resolution:.2f}°{scale_text}",
                 f"\n{total_hours:,} particle-hours | grid {resolution:.2f} deg{scale_text}",
             ),
         ),
@@ -3920,7 +3920,7 @@ def _plot_lookback_snapshot(
         hours = int(snap["snapshot_hours"])
         active_pct = float(snap["active_fraction"]) * 100.0
         title = t.t(
-            f"回溯 {hours} 小時（{hours / 24:g} 天）｜仍在漂流 {active_pct:.1f}%",
+            f"回溯 {hours} h（{hours / 24:g} d）｜仍在漂流 {active_pct:.1f}%",
             f"{hours} h back ({hours / 24:g} d) | still drifting {active_pct:.1f}%",
         )
         if density is not None:
@@ -3943,7 +3943,7 @@ def _plot_lookback_snapshot(
                 0.5,
                 0.9,
                 t.t(
-                    f"仍在漂流粒子數不足（n={int(snap['active_particle_count'])}）",
+                    f"仍在漂流虛擬質點數不足（n={int(snap['active_particle_count'])}）",
                     f"Too few particles still drifting (n={int(snap['active_particle_count'])})",
                 ),
                 ha="center",
@@ -3972,7 +3972,7 @@ def _plot_lookback_snapshot(
             vmin=vmin,
             vmax=vmax,
             label=t.t(
-                "條件式來源足跡密度（% 仍在漂流粒子／km²）",
+                "條件式來源足跡密度（% 仍在漂流虛擬質點/km²）",
                 "Conditional footprint density (% of drifting particles / km^2)",
             ),
             font=font,
@@ -4061,7 +4061,7 @@ def _plot_boundary_departure_along_arc(
         ax.text(
             0.5,
             0.5,
-            t.t("本站沒有粒子穿越流場範圍開放邊界", "No particle crossed the open boundary"),
+            t.t("本研究地點沒有虛擬質點穿越流場範圍開放邊界", "No virtual particle crossed the open boundary"),
             ha="center",
             va="center",
             transform=ax.transAxes,
@@ -4140,7 +4140,7 @@ def _plot_boundary_departure_along_arc(
         fontproperties=font,
     )
     ax.set_ylabel(
-        t.t(f"穿越粒子占比（%，每 {bin_km:g} km）", f"Share of crossings (%, per {bin_km:g} km)"),
+        t.t(f"穿越虛擬質點占比（%，每 {bin_km:g} km）", f"Share of crossings (%, per {bin_km:g} km)"),
         fontproperties=font,
     )
     ax.grid(axis="y", color="#dddddd", linewidth=0.5, zorder=0)
@@ -4163,7 +4163,7 @@ def _plot_boundary_departure_along_arc(
             site,
             t,
             extra=t.t(
-                f"\n穿越粒子 {total:,} 顆｜邊界長 {length_km:.0f} km{origin_zh}",
+                f"\n穿越虛擬質點 {total:,} 顆｜邊界長 {length_km:.0f} km{origin_zh}",
                 f"\n{total:,} crossed | length {length_km:.0f} km{origin_en}",
             ),
         ),
@@ -5017,7 +5017,7 @@ def _build_footprint_figures_manifest(
     lower = RESIDENCE_COLOR_FLOOR_FRACTION
     return {
         "residence_color_scale": {
-            "unit": "% 停留時數／km²",
+            "unit": "% 停留時數/km²",
             "norm": "log",
             "lower_limit_fraction_of_upper_limit": lower,
             "limit_rule": (
@@ -5059,7 +5059,7 @@ def _build_footprint_figures_manifest(
         "axes_rule": "座標軸範圍向外擴到刻度間距（0.1／0.2／0.5°）的整數倍，首末刻度即框邊，四個端點都標值",
         "colorbar_alignment_tolerance_px": COLORBAR_ALIGNMENT_TOLERANCE_PX,
         "snapshot_color_scale": {
-            "unit": "% 仍在漂流粒子／km²",
+            "unit": "% 仍在漂流虛擬質點/km²",
             "norm": "log",
             "scale": "fixed_for_all_sites_and_panels",
             "limit_rule": "固定：上限＝10 的 1 次方；下限＝10 的 −4 次方（五站、兩案相同）",

@@ -309,7 +309,7 @@ def _x_label(t: _Labeler) -> str:
 
 
 def _y_label(t: _Labeler) -> str:
-    return t.t("相對來源權重（%／km）", "Relative source weight (% per km)")
+    return t.t("相對來源權重（%/km）", "Relative source weight (% per km)")
 
 
 def _join_corner_zh(result: GroupingResult) -> str:
@@ -333,7 +333,7 @@ def _title_pair(result: GroupingResult, t: _Labeler) -> tuple[str, str]:
         f"Relative source weight along open boundary | by {result.grouping}",
     )
     subtitle = t.t(
-        f"穿越粒子 {result.n_all:,} 顆｜邊界全長 {result.length_km:.0f} km｜{_end_note_zh(result)}｜"
+        f"穿越虛擬質點 {result.n_all:,} 顆｜邊界全長 {result.length_km:.0f} km｜{_end_note_zh(result)}｜"
         f"高斯核頻寬 {result.params.sigma_km:g} km｜每條曲線對弧長積分為 100%",
         f"{result.n_all:,} crossed | length {result.length_km:.0f} km | sigma {result.params.sigma_km:g} km",
     )
@@ -367,8 +367,8 @@ def _plot_overlay(
             if class_range
             else t.t("類別　沉降速度（由慢到快）", "Class and settling speed (slow to fast)")
         ),
-        "season": t.t("沉底時刻的季節　穿越粒子數", "Season of deposition"),
-        "tide": t.t("沉底時刻的潮況　穿越粒子數", "Tide class at deposition"),
+        "season": t.t("沉底時刻的季節　穿越虛擬質點數", "Season of deposition"),
+        "tide": t.t("沉底時刻的潮況　穿越虛擬質點數", "Tide class at deposition"),
     }[result.grouping]
     leg = ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, prop=font, title=legend_title)
     leg.get_title().set_fontproperties(font)

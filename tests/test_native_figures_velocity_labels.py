@@ -138,7 +138,7 @@ def test_legacy_departures_without_particle_velocity_keep_old_labels(
         assert got["bar_ticks"] == ["-0.1", "-0.01", "-0.001"]
         assert got["heat_ticks"] == ["-0.1", "-0.01", "-0.001"]
         expected = (
-            "沉降速度（公尺/秒，負值為下沉）" if cjk else "Settling velocity (m/s, negative = sinking)"
+            "沉降速度（m/s，負值為下沉）" if cjk else "Settling velocity (m/s, negative = sinking)"
         )
         assert got["ylabel"] == [expected]
         caption = _caption(output_dir, site_id, "settling_velocity_breakdown")
@@ -178,7 +178,7 @@ def test_particle_velocity_ticks_use_display_names_and_speed_ranges(
             "不可回收塑膠 0.00100–0.00200",
         ]
         assert got["heat_ticks"] == ["可回收塑膠", "竹木", "不可回收塑膠"]
-        assert got["ylabel"] == ["沉降速度類別（下沉速度範圍，公尺／秒）"]
+        assert got["ylabel"] == ["沉降速度（m/s）"]
         assert not any("其他" in label for label in got["bar_ticks"] + got["heat_ticks"])
 
 
