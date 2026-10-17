@@ -6,7 +6,7 @@
 改變的只有：
 
 * 抽樣範圍由矩形虛線框改為以研究地點錨點為圓心、半徑 12.5 km（receptor_core_radius_m）的測地線圓
-  （可用 --radius-km 改半徑，例如 10；非 12.5 時圖上另註「圓半徑 N km」）；
+  （可用 --radius-km 改半徑，例如 10；非 12.5 時那不是抽樣範圍，圖例改標「距錨點 N km」）；
 * 圖 2 每個地點加畫 5 個受體水平位置（取自 common-input/receptor.json，每個位置 4 個深度，
   同一水平點只畫一點）；
 * 圖例：「研究地點錨點」「抽樣範圍」（圖 2 另有「受體水平位置」）；地點名稱是「龜山島」；
@@ -14,7 +14,8 @@
 
 選項：
 
-* ``--radius-km``：抽樣圓半徑（預設 12.5），仍是測地線圓、同樣式；
+* ``--radius-km``：圓半徑（預設 12.5＝實際抽樣半徑，圖例「抽樣範圍」）；其他半徑仍是測地線圓、同樣式，
+  但圖例改標「距錨點 N km」（因為它不是抽樣範圍）；
 * ``--label-points``：圖 2 的 5 個受體水平位置旁加註 1～5（依 horizontal_selection_draw_order）；
 * ``--out-prefix``：輸出檔名前綴（預設 343，輸出 343_fig1_circle.* 等）。
 
@@ -276,8 +277,12 @@ def _label_points(ax, site, ps, lon0, lat0):
         )
 
 
-def _radius_note(radius_km):
-    return f"圓半徑 {radius_km:g} km"
+def _circle_label(radius_m):
+    """圓的圖例文字：12.5 km（實際抽樣半徑）是「抽樣範圍」；其他半徑不是抽樣範圍，改標「距錨點 N km」。"""
+
+    if abs(radius_m - RADIUS_M) <= 1e-6:
+        return "抽樣範圍"
+    return f"距錨點 {radius_m / 1000.0:g} km"
 
 
 def fig1(anchors, coast, flow, out_dir, dpi, radius_m, prefix):
@@ -355,7 +360,7 @@ def fig1(anchors, coast, flow, out_dir, dpi, radius_m, prefix):
     ]
     leg = ax.legend(
         handles,
-        ["流場範圍", "研究地點錨點", "抽樣範圍"],
+        ["流場範圍", "研究地點錨點", _circle_label(radius_m)],
         title="圖例",
         loc="upper right",
         bbox_to_anchor=(FIG1_AX_RIGHT_LEG / FIG1_PT[0], 1.0 - FIG1_LEG_TOP / FIG1_PT[1]),
@@ -375,18 +380,6 @@ def fig1(anchors, coast, flow, out_dir, dpi, radius_m, prefix):
         handler_map={CircleHandle: _circle_handler()},
     )
     leg.get_frame().set_linewidth(0.5)
-    if abs(radius_m - RADIUS_M) > 1e-6:
-        fig.canvas.draw()
-        fb = leg.get_window_extent()
-        fig.text(
-            fb.x0 / fig.bbox.width,
-            (fb.y0 - 4.0 * fig.dpi / 72.0) / fig.bbox.height,
-            _radius_note(radius_m / 1000.0),
-            fontsize=8,
-            ha="left",
-            va="top",
-            color=CIRCLE_C,
-        )
     _save(fig, out_dir / f"{prefix}_fig1_circle", dpi)
 
 
@@ -490,21 +483,8 @@ def fig2(anchors, coast, pos, out_dir, dpi, radius_m, prefix, label_points):
         markeredgecolor="#000000",
         markeredgewidth=0.7,
     )
-    for y, text in zip(rows, ("研究地點錨點", "抽樣範圍", "受體水平位置"), strict=True):
+    for y, text in zip(rows, ("研究地點錨點", _circle_label(radius_m), "受體水平位置"), strict=True):
         lax.text(tx, y + 3.23, text, fontsize=8.5, ha="left", va="baseline")
-    if abs(radius_m - RADIUS_M) > 1e-6:
-        lax.annotate(
-            _radius_note(radius_m / 1000.0),
-            xy=(0.0, 0.0),
-            xycoords="axes fraction",
-            xytext=(0.0, -4.0),
-            textcoords="offset points",
-            fontsize=8.5,
-            ha="left",
-            va="top",
-            color=CIRCLE_C,
-            annotation_clip=False,
-        )
     _save(fig, out_dir / f"{prefix}_fig2_circle", dpi)
 
 
@@ -523,7 +503,10 @@ def main(argv=None):
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--dpi", type=int, default=600)
     ap.add_argument(
-        "--radius-km", type=float, default=DEFAULT_RADIUS_KM, help="抽樣圓半徑（km，測地線圓；預設 12.5）"
+        "--radius-km",
+        type=float,
+        default=DEFAULT_RADIUS_KM,
+        help="圓半徑（km，測地線圓；預設 12.5＝抽樣範圍，其他值圖例改標距錨點 N km）",
     )
     ap.add_argument(
         "--label-points", action="store_true", help="圖 2 的受體水平位置旁加註 1～5（依 draw order）"
@@ -563,6 +546,8 @@ def main(argv=None):
         "radius_m": radius_m,
         "radius_km": args.radius_km,
         "label_points": args.label_points,
+        "circle_legend_label": _circle_label(radius_m),
+        "circle_is_sampling_range": abs(radius_m - RADIUS_M) <= 1e-6,
         "circle": "WGS84 測地線，方位角每 1° 一點（pyproj Geod.fwd）",
         "anchors_lonlat": {s: list(anchors[s][:2]) for s in SITES},
         "horizontal_positions": [
