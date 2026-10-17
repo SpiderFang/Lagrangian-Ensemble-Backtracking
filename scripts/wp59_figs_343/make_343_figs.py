@@ -5,11 +5,21 @@
 座標範圍一致（規格取自原 SVG），
 改變的只有：
 
-* 抽樣範圍由矩形虛線框改為以研究地點錨點為圓心、半徑 12.5 km（receptor_core_radius_m）的測地線圓；
+* 抽樣範圍由矩形虛線框改為以研究地點錨點為圓心、半徑 12.5 km（receptor_core_radius_m）的測地線圓
+  （可用 --radius-km 改半徑，例如 10；非 12.5 時圖上另註「圓半徑 N km」）；
 * 圖 2 每個地點加畫 5 個受體水平位置（取自 common-input/receptor.json，每個位置 4 個深度，
   同一水平點只畫一點）；
 * 圖例：「研究地點錨點」「抽樣範圍」（圖 2 另有「受體水平位置」）；地點名稱是「龜山島」；
 * 龜山島使用吸附後的海上錨點（121.939148, 24.850326）。
+
+選項：
+
+* ``--radius-km``：抽樣圓半徑（預設 12.5），仍是測地線圓、同樣式；
+* ``--label-points``：圖 2 的 5 個受體水平位置旁加註 1～5（依 horizontal_selection_draw_order）；
+* ``--out-prefix``：輸出檔名前綴（預設 343，輸出 343_fig1_circle.* 等）。
+
+受體水平位置永遠取 receptor.json 的實際座標，不移動、不縮放、不裁切，也沒有任何調整點位的選項；
+圓外的點照原位置畫，程式只回報圓外點數與距離（不再要求全部在圓內）。
 
 資料來源：海岸線 coastline-taiwan.geojson（含龜山島輪廓）、流場範圍 common-input/domain.json、
 錨點 release config、受體 common-input/receptor.json。程式不改任何輸入。
@@ -49,7 +59,10 @@ from lagrangian_backtracking.native_runner import figures as nf  # noqa: E402
 
 SITES = ("gongliao", "guishan", "hsinchu", "nanwan", "lienchiang")
 PANEL = dict(zip(SITES, "abcde", strict=True))
-RADIUS_M = 12500.0
+RADIUS_M = 12500.0  # release config 的 receptor_core_radius_m（只用來核對設定檔，繪圖半徑看 --radius-km）
+DEFAULT_RADIUS_KM = 12.5
+LABEL_FS = 7.0
+LABEL_OFFSET_PT = 8.0
 
 # ---- 與原圖（run07 新版 SVG）一致的樣式 ----
 LAND_FC, LAND_EC, LAND_LW = "#d9d9d9", "#333333", 0.4
@@ -188,8 +201,8 @@ def load_inputs(args):
     return anchors, coast, flow, pos
 
 
-def check_positions(anchors, pos):
-    """25 個水平位置全部必須在 12.5 km 測地線圓內。回傳 [(site, index, lon, lat, 距離 km)]。"""
+def horizontal_distances(anchors, pos):
+    """25 個水平位置到各自錨點的測地線距離。回傳 [(site, 繪製順序 1～5, lon, lat, 距離 km)]。"""
 
     rows = []
     for site in SITES:
@@ -200,13 +213,74 @@ def check_positions(anchors, pos):
         d = nf.geodesic_distance_km(lon0, lat0, [p["lon"] for p in ps], [p["lat"] for p in ps])
         for i, (p, dk) in enumerate(zip(ps, d, strict=True), start=1):
             rows.append((site, i, p["lon"], p["lat"], float(dk)))
-    outside = [r for r in rows if r[4] > RADIUS_M / 1000.0]
-    if outside:
-        raise SystemExit(f"有水平位置在 12.5 km 圓外：{outside}")
     return rows
 
 
-def fig1(anchors, coast, flow, out_dir, dpi):
+def outside_report(rows, radius_km):
+    """圓外的水平位置（距離 > 半徑）。只回報，不改位置。"""
+
+    return [r for r in rows if r[4] > radius_km]
+
+
+def check_in_window(pos):
+    """圖 2 的繪圖範圍必須容得下所有點（不裁切、不移動；超出就報錯讓人改視窗）。"""
+
+    for site in SITES:
+        x0, x1, y0, y1 = FIG2_WINDOWS[site]
+        for p in pos[site].values():
+            if not (x0 <= p["lon"] <= x1 and y0 <= p["lat"] <= y1):
+                raise SystemExit(f"{site} 的水平位置 {(p['lon'], p['lat'])} 超出圖 2 的繪圖範圍")
+
+
+def _label_points(ax, site, ps, lon0, lat0):
+    """在每個受體點旁加註 1～5：8 個方向挑離其他點、星號、已放數字最遠者（點位置不動）。"""
+
+    fig = ax.figure
+    k = 72.0 / fig.dpi  # 螢幕像素 → pt
+    to_pt = lambda lon, lat: np.asarray(ax.transData.transform((lon, lat))) * k  # noqa: E731
+    pts = [to_pt(p["lon"], p["lat"]) for p in ps]
+    star = to_pt(lon0, lat0)
+    bb = ax.get_window_extent()
+    box = (bb.x0 * k, bb.y0 * k, bb.x1 * k, bb.y1 * k)
+    margin = 5.0
+    angles = [45, 135, 315, 225, 90, 0, 270, 180]  # 偏好：右上、左上、右下、左下、上、右、下、左
+    placed = []
+    for i, p in enumerate(ps):
+        best, best_score = None, -1e9
+        for rank, a in enumerate(angles):
+            c = pts[i] + LABEL_OFFSET_PT * np.array([np.cos(np.radians(a)), np.sin(np.radians(a))])
+            if not (
+                box[0] + margin <= c[0] <= box[2] - margin and box[1] + margin <= c[1] <= box[3] - margin
+            ):
+                continue
+            dists = [np.hypot(*(c - q)) for j, q in enumerate(pts) if j != i]
+            dists += [np.hypot(*(c - star)) * 0.8]
+            dists += [np.hypot(*(c - q)) for q in placed]
+            score = min(dists) - 0.05 * rank
+            if score > best_score:
+                best, best_score, best_a = c, score, a
+        a = best_a
+        placed.append(best)
+        ax.annotate(
+            str(i + 1),
+            xy=(p["lon"], p["lat"]),
+            xytext=(LABEL_OFFSET_PT * np.cos(np.radians(a)), LABEL_OFFSET_PT * np.sin(np.radians(a))),
+            textcoords="offset points",
+            ha="center",
+            va="center",
+            fontsize=LABEL_FS,
+            fontweight="bold",
+            color="#000000",
+            path_effects=[pe.withStroke(linewidth=2.0, foreground="#ffffff")],
+            zorder=8,
+        )
+
+
+def _radius_note(radius_km):
+    return f"圓半徑 {radius_km:g} km"
+
+
+def fig1(anchors, coast, flow, out_dir, dpi, radius_m, prefix):
     L = FIG1_LAYOUT
     fig = plt.figure(figsize=(FIG1_PT[0] / 72, FIG1_PT[1] / 72), dpi=dpi)
     ax = fig.add_axes(_rc(FIG1_PT, *FIG1_AX))
@@ -226,8 +300,8 @@ def fig1(anchors, coast, flow, out_dir, dpi):
         )
     west = {"hsinchu", "nanwan"}  # 圖 1 原圖中 (c)(d) 的標籤放在左側
     for site in SITES:
-        lon0, lat0, radius = anchors[site]
-        c = nf.geodesic_circle_lonlat(lon0, lat0, radius)
+        lon0, lat0, _ = anchors[site]
+        c = nf.geodesic_circle_lonlat(lon0, lat0, radius_m)
         ax.plot(
             c[:, 0],
             c[:, 1],
@@ -301,14 +375,26 @@ def fig1(anchors, coast, flow, out_dir, dpi):
         handler_map={CircleHandle: _circle_handler()},
     )
     leg.get_frame().set_linewidth(0.5)
-    _save(fig, out_dir / "343_fig1_circle", dpi)
+    if abs(radius_m - RADIUS_M) > 1e-6:
+        fig.canvas.draw()
+        fb = leg.get_window_extent()
+        fig.text(
+            fb.x0 / fig.bbox.width,
+            (fb.y0 - 4.0 * fig.dpi / 72.0) / fig.bbox.height,
+            _radius_note(radius_m / 1000.0),
+            fontsize=8,
+            ha="left",
+            va="top",
+            color=CIRCLE_C,
+        )
+    _save(fig, out_dir / f"{prefix}_fig1_circle", dpi)
 
 
 FIG1_AX_RIGHT_LEG = 285.768  # 圖例框右緣（pt，由左往右）
 FIG1_LEG_TOP = 186.12  # 圖例框上緣（pt，由上往下）
 
 
-def fig2(anchors, coast, pos, out_dir, dpi):
+def fig2(anchors, coast, pos, out_dir, dpi, radius_m, prefix, label_points):
     L = FIG2_LAYOUT
     fig = plt.figure(figsize=(FIG2_PT[0] / 72, FIG2_PT[1] / 72), dpi=dpi)
     for site in SITES:
@@ -324,8 +410,8 @@ def fig2(anchors, coast, pos, out_dir, dpi):
         ax.set_yticklabels([f"{v:.1f}" for v in ax.get_yticks()])
         _style_axes(ax, tick_len=2.5, tick_fs=7.5, label_fs=8, pad=TICK_PAD2, labelpad=LABEL_PAD2)
         ax.add_collection(_land_collection(coast, window=(x0 - 0.1, x1 + 0.1, y0 - 0.1, y1 + 0.1)))
-        lon0, lat0, radius = anchors[site]
-        c = nf.geodesic_circle_lonlat(lon0, lat0, radius)
+        lon0, lat0, _ = anchors[site]
+        c = nf.geodesic_circle_lonlat(lon0, lat0, radius_m)
         ax.plot(
             c[:, 0],
             c[:, 1],
@@ -358,6 +444,8 @@ def fig2(anchors, coast, pos, out_dir, dpi):
             zorder=6,
         )
         ax.set_title(f"({PANEL[site]})", fontsize=10.5, fontweight="bold", pad=3)
+        if label_points:
+            _label_points(ax, site, ps, lon0, lat0)
     # 圖例 axes（右下）：單位用 pt，由上往下
     x_l, y_t, x_r, y_b = FIG2_LEGEND
     lax = fig.add_axes(_rc(FIG2_PT, x_l, y_t, x_r, y_b))
@@ -404,7 +492,20 @@ def fig2(anchors, coast, pos, out_dir, dpi):
     )
     for y, text in zip(rows, ("研究地點錨點", "抽樣範圍", "受體水平位置"), strict=True):
         lax.text(tx, y + 3.23, text, fontsize=8.5, ha="left", va="baseline")
-    _save(fig, out_dir / "343_fig2_circle", dpi)
+    if abs(radius_m - RADIUS_M) > 1e-6:
+        lax.annotate(
+            _radius_note(radius_m / 1000.0),
+            xy=(0.0, 0.0),
+            xycoords="axes fraction",
+            xytext=(0.0, -4.0),
+            textcoords="offset points",
+            fontsize=8.5,
+            ha="left",
+            va="top",
+            color=CIRCLE_C,
+            annotation_clip=False,
+        )
+    _save(fig, out_dir / f"{prefix}_fig2_circle", dpi)
 
 
 def _save(fig, stem: Path, dpi: int):
@@ -421,6 +522,13 @@ def main(argv=None):
     ap.add_argument("--release-config", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--dpi", type=int, default=600)
+    ap.add_argument(
+        "--radius-km", type=float, default=DEFAULT_RADIUS_KM, help="抽樣圓半徑（km，測地線圓；預設 12.5）"
+    )
+    ap.add_argument(
+        "--label-points", action="store_true", help="圖 2 的受體水平位置旁加註 1～5（依 draw order）"
+    )
+    ap.add_argument("--out-prefix", default="343", help="輸出檔名前綴（預設 343）")
     ap.add_argument("--panel-label-fontsize", type=float, default=None, help="僅供校正字級用")
     args = ap.parse_args(argv)
     if args.panel_label_fontsize is not None:
@@ -435,19 +543,47 @@ def main(argv=None):
             "axes.unicode_minus": False,
         }
     )
+    if not 0.0 < args.radius_km <= 50.0:
+        raise SystemExit(f"--radius-km={args.radius_km} 不合理（須在 0～50 之間）")
+    radius_m = args.radius_km * 1000.0
     anchors, coast, flow, pos = load_inputs(args)
-    rows = check_positions(anchors, pos)
+    rows = horizontal_distances(anchors, pos)
+    check_in_window(pos)
     far = max(rows, key=lambda r: r[4])
-    print(f"25/25 水平位置都在 12.5 km 圓內；最遠 {far[0]} #{far[1]} = {far[4]:.3f} km")
-    fig1(anchors, coast, flow, args.out_dir, args.dpi)
-    fig2(anchors, coast, pos, args.out_dir, args.dpi)
+    out = outside_report(rows, args.radius_km)
+    print(
+        f"半徑 {args.radius_km:g} km；25 個水平位置中 {25 - len(out)} 個在圓內、{len(out)} 個在圓外；"
+        f"最遠 {far[0]} #{far[1]} = {far[4]:.3f} km"
+    )
+    for site, i, _lo, _la, d in out:
+        print(f"  圓外：{site} #{i}  距離 {d:.3f} km（超出 {d - args.radius_km:.3f} km）")
+    fig1(anchors, coast, flow, args.out_dir, args.dpi, radius_m, args.out_prefix)
+    fig2(anchors, coast, pos, args.out_dir, args.dpi, radius_m, args.out_prefix, args.label_points)
     manifest = {
-        "radius_m": RADIUS_M,
+        "radius_m": radius_m,
+        "radius_km": args.radius_km,
+        "label_points": args.label_points,
         "circle": "WGS84 測地線，方位角每 1° 一點（pyproj Geod.fwd）",
         "anchors_lonlat": {s: list(anchors[s][:2]) for s in SITES},
         "horizontal_positions": [
-            {"site": s, "index": i, "lon": lo, "lat": la, "distance_km": d} for s, i, lo, la, d in rows
+            {
+                "site": s,
+                "index": i,
+                "lon": lo,
+                "lat": la,
+                "distance_km": d,
+                "inside_circle": d <= args.radius_km,
+            }
+            for s, i, lo, la, d in rows
         ],
+        "outside_circle": {
+            "count": len(out),
+            "by_site": {
+                s: [{"index": i, "distance_km": d} for s2, i, _lo, _la, d in out if s2 == s]
+                for s in SITES
+                if any(r[0] == s for r in out)
+            },
+        },
         "max_distance_km": far[4],
         "inputs_sha256": {
             p.name: _sha(p)
@@ -455,7 +591,7 @@ def main(argv=None):
         },
         "dpi": args.dpi,
     }
-    (args.out_dir / "343_figs_circle_manifest.json").write_text(
+    (args.out_dir / f"{args.out_prefix}_figs_circle_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     return 0
