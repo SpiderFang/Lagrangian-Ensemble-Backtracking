@@ -50,6 +50,7 @@ from .bed_residence import (
 from .boundaries import BoundaryGeometry
 from .config import (
     CURRENT_DESIGN_VERSION,
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN,
     HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_COORDINATES_LON_LAT,
     HSINCHU_FIXED_HORIZONTAL_RECEPTOR_POLICY_ID,
@@ -988,8 +989,13 @@ def _validate_current_random_receptor_manifest(
     master_seed = config.scenarios.master_seed
     if master_seed is None:
         raise ValueError("current formal random receptor manifest 需要 scenarios.master_seed")
-    if config.scenarios.horizontal_receptor_selection_policy != HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID:
+    horizontal_policy = config.scenarios.horizontal_receptor_selection_policy
+    if horizontal_policy not in {
+        HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+        HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN,
+    }:
         raise ValueError("current formal receptor horizontal random policy 不符")
+    is_latin_policy = horizontal_policy == HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN
     if config.scenarios.vertical_receptor_selection_policy != VERTICAL_RECEPTOR_SELECTION_POLICY_ID:
         raise ValueError("current formal receptor vertical random policy 不符")
     if config.scenarios.receptor_selection_seed_policy != RECEPTOR_SELECTION_SEED_POLICY_ID:
@@ -1094,7 +1100,7 @@ def _validate_current_random_receptor_manifest(
         record = random_by_site.get(site_id)
         if not isinstance(record, Mapping):
             raise ValueError(f"{site_id} random horizontal provenance 必須是 object")
-        if record.get("selection_policy") != HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID:
+        if record.get("selection_policy") != horizontal_policy:
             raise ValueError(f"{site_id} random horizontal selection policy 不符")
         if record.get("seed_policy") != RECEPTOR_SELECTION_SEED_POLICY_ID:
             raise ValueError(f"{site_id} random horizontal seed policy 不符")
@@ -1140,7 +1146,7 @@ def _validate_current_random_receptor_manifest(
                 int(metadata["source_face_local_index"]),
                 int(metadata["source_face_global_index"]),
             )
-            if metadata.get("horizontal_selection_policy") != HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID:
+            if metadata.get("horizontal_selection_policy") != horizontal_policy:
                 raise ValueError(f"{site_id} random horizontal row policy 不符")
             order = metadata.get("horizontal_selection_draw_order")
             if isinstance(order, bool) or not isinstance(order, int):
@@ -1159,7 +1165,12 @@ def _validate_current_random_receptor_manifest(
             ),
             "core_fallback": ("horizontal:core_fallback",),
             "core": ("horizontal:core",),
+            "azimuth_distance_latin": ("horizontal:azimuth_distance_latin",),
         }.get(selection_scope)
+        if is_latin_policy != (selection_scope == "azimuth_distance_latin"):
+            raise ValueError(f"{site_id} selection_scope 與 horizontal policy 不一致")
+        if is_latin_policy:
+            _validate_latin_sampling_record(site_id, record, config, selected_global)
         if expected_scopes is None or tuple(
             stream.get("stream_scope") for stream in streams
         ) != expected_scopes:
@@ -1174,7 +1185,7 @@ def _validate_current_random_receptor_manifest(
                 master_seed=int(master_seed),
                 study_site_id=site_id,
                 design_version=config.design_version,
-                selection_policy_id=HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                selection_policy_id=horizontal_policy,
                 stream_scope=scope,
             )
             if stream.get("derived_seed_hex") != f"{seed:032x}" or stream.get(
@@ -1741,6 +1752,223 @@ def _check_observation_arrival_identity(
         raise ValueError(f"arrival[{arrival.arrival_time_id}] observation arrival identity 不可重算")
 
 
+def _a_pair_utc_required(config: ProjectConfig) -> bool:
+    """A 區兩站是否必須共用同一組 observation UTC。
+
+    預設 ``True``（run08 以前、沒有 ``arrival_time_selection`` 區塊的設定一律成立）；只有設定檔明示
+    ``arrival_time_selection.northeast_pair_utc_when_coverage_allows: false`` 時，兩站各自獨立選時，
+    pairing 核對才關閉（WP-63：龜山島與貢寮分開選取）。
+    """
+
+    selection = getattr(config, "arrival_time_selection", None)
+    if selection is None:
+        return True
+    return bool(selection.northeast_pair_utc_when_coverage_allows)
+
+
+def _validate_seam_jump_exclusion_provenance(
+    observation_arrivals: Sequence[ArrivalTime],
+    provenance: Mapping[str, Any],
+    config: ProjectConfig,
+) -> None:
+    """WP-63：核對 OCM 日檔接縫跳動排除的 provenance 與實際 observation 時刻。
+
+    設定檔未啟用 ``arrival_time_selection.seam_jump_exclusion`` 時，provenance 不得帶此鍵（避免偽稱已排除）；
+    啟用時要求：政策／參數與設定一致、各站排除清單為遞增唯一整數且 SHA-256 吻合、全站雜湊吻合，且每一筆
+    observation 時刻都不在該站的排除清單內。
+    """
+
+    selection = getattr(config, "arrival_time_selection", None)
+    configured = None if selection is None else selection.seam_jump_exclusion
+    block = provenance.get("seam_jump_exclusion")
+    if configured is None:
+        if block is not None:
+            raise ValueError("provenance 帶有 seam_jump_exclusion，但設定檔沒有啟用接縫跳動排除")
+        return
+    if not isinstance(block, Mapping):
+        raise ValueError("設定檔啟用接縫跳動排除，但 arrival provenance 缺少 seam_jump_exclusion")
+    if block.get("policy_id") != "ocm_daily_seam_jump_exclusion_v1":
+        raise ValueError("seam_jump_exclusion policy_id 不符")
+    if block.get("parameters") != configured.to_parameters().as_payload():
+        raise ValueError("seam_jump_exclusion 參數與設定檔不一致")
+    sites = block.get("excluded_times_by_site")
+    expected_sites = {site.study_site_id for site in config.study_sites}
+    if not isinstance(sites, Mapping) or set(sites) != expected_sites:
+        raise ValueError("seam_jump_exclusion 的站點集合與設定不一致")
+    excluded: dict[str, frozenset[int]] = {}
+    for site_id, record in sites.items():
+        times = record.get("utc_ns") if isinstance(record, Mapping) else None
+        if (
+            not isinstance(times, list)
+            or any(type(value) is not int for value in times)
+            or times != sorted(set(times))
+            or record.get("count") != len(times)
+            or record.get("sha256")
+            != sha256(json.dumps(times, separators=(",", ":")).encode("utf-8")).hexdigest()
+        ):
+            raise ValueError(f"{site_id} 的接縫跳動排除清單格式或雜湊不符")
+        excluded[str(site_id)] = frozenset(times)
+    all_hash = sha256(
+        json.dumps({s_id: sorted(v) for s_id, v in sorted(excluded.items())}, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if block.get("excluded_times_sha256_all_sites") != all_hash:
+        raise ValueError("seam_jump_exclusion 的全站清單雜湊不符")
+    for arrival in observation_arrivals:
+        if int(arrival.time_utc_ns) in excluded.get(arrival.study_site_id, frozenset()):
+            raise ValueError(
+                f"arrival[{arrival.arrival_time_id}] 的 observation 時刻落在接縫跳動排除清單內"
+            )
+
+
+def _validate_external_exclusion_provenance(
+    support_block: Mapping[str, Any],
+    excluded_by_site: Mapping[str, frozenset[int]],
+    *,
+    bed: Any = None,
+) -> None:
+    """WP-63：核對「壞時刻」外部排除清單的 provenance（只在區塊存在時檢查）。
+
+    外部清單必須是每站遞增唯一的整數、雜湊吻合，且是 ``excluded_hours_utc_ns`` 的子集合
+    （因此既有的「沉底整點不得落在被排除集合」核對自動涵蓋）。
+    """
+
+    block = support_block.get("external_exclusion")
+    rule_config = getattr(bed, "deposition_bad_hour_rule", None)
+    if block is None:
+        if rule_config is not None:
+            raise ValueError("設定檔啟用 deposition_bad_hour_rule，但 provenance 沒有 external_exclusion")
+        return
+    if not isinstance(block, Mapping) or block.get("policy_id") != "external_bad_nww_hour_exclusion_v1":
+        raise ValueError("external_exclusion 的 policy_id 不符")
+    by_site = block.get("by_site")
+    if not isinstance(by_site, Mapping) or set(by_site) != set(excluded_by_site):
+        raise ValueError("external_exclusion 的站點集合不一致")
+    for site_id, record in by_site.items():
+        hours = record.get("excluded_hours_utc_ns") if isinstance(record, Mapping) else None
+        if (
+            not isinstance(hours, list)
+            or any(type(value) is not int for value in hours)
+            or hours != sorted(set(hours))
+            or record.get("excluded_hours_sha256")
+            != sha256(json.dumps(hours, separators=(",", ":")).encode("utf-8")).hexdigest()
+        ):
+            raise ValueError(f"{site_id} 的外部壞時刻清單格式或雜湊不符")
+        if not set(hours) <= set(excluded_by_site[str(site_id)]):
+            raise ValueError(f"{site_id} 的外部壞時刻未全部列入排除整點")
+    source = block.get("source")
+    derived = isinstance(source, Mapping) and source.get("source") == "derived_rule"
+    if rule_config is not None and not derived:
+        raise ValueError("設定檔啟用 deposition_bad_hour_rule，但外部排除清單不是 derived_rule")
+    if derived:
+        if rule_config is None:
+            raise ValueError("provenance 是 derived_rule，但設定檔沒有 deposition_bad_hour_rule")
+        expected_parameters = rule_config.to_parameters().to_dict()
+        audits = source.get("by_site_audit")
+        if (
+            source.get("policy_id") != "failed_area_bad_hour_rule_v1"
+            or source.get("parameters") != expected_parameters
+            or not isinstance(audits, Mapping)
+            or set(audits) != set(by_site)
+        ):
+            raise ValueError("derived_rule 的政策、參數或站點集合與設定檔不一致")
+        for site_id, audit in audits.items():
+            record = by_site[site_id]
+            if (
+                not isinstance(audit, Mapping)
+                or audit.get("policy_id") != "failed_area_bad_hour_rule_v1"
+                or audit.get("parameters") != expected_parameters
+                or audit.get("excluded_hours_sha256") != record.get("excluded_hours_sha256")
+                or audit.get("excluded_hour_count") != len(record["excluded_hours_utc_ns"])
+                or not isinstance(audit.get("failure_matrix_sha256"), str)
+                or len(audit["failure_matrix_sha256"]) != 64
+            ):
+                raise ValueError(f"{site_id} 的 derived_rule 稽核與排除清單不一致")
+
+
+def _validate_latin_sampling_record(
+    site_id: str,
+    record: Mapping[str, Any],
+    config: ProjectConfig,
+    selected_global: Sequence[int],
+) -> None:
+    """WP-63：核對方位×距離等面積拉丁方格分層抽樣的稽核紀錄是否自洽。"""
+
+    sampling_cfg = config.scenarios.horizontal_receptor_sampling
+    if sampling_cfg is None:
+        raise ValueError("使用分層抽樣 policy 時設定檔必須提供 scenarios.horizontal_receptor_sampling")
+    latin = record.get("stratified_sampling")
+    if not isinstance(latin, Mapping):
+        raise ValueError(f"{site_id} 缺少 stratified_sampling 稽核")
+    n = int(sampling_cfg.strata_count)
+    if latin.get("radius_m") != float(sampling_cfg.radius_m) or latin.get("strata_count") != n:
+        raise ValueError(f"{site_id} 分層抽樣的半徑或區間數與設定不一致")
+    az_edges = latin.get("azimuth_edges_deg")
+    d_edges = latin.get("distance_edges_m")
+    permutation = latin.get("permutation_azimuth_bin_to_distance_bin")
+    picks = latin.get("picks")
+    if (
+        not isinstance(az_edges, list)
+        or not isinstance(d_edges, list)
+        or len(az_edges) != n + 1
+        or len(d_edges) != n + 1
+        or not isinstance(permutation, list)
+        or sorted(permutation) != list(range(1, n + 1))
+        or not isinstance(picks, list)
+        or len(picks) != n
+    ):
+        raise ValueError(f"{site_id} 分層抽樣稽核的 bin 邊界、排列或 picks 格式不符")
+    sectors_cfg = sampling_cfg.azimuth_sectors_for(site_id)
+    recorded_sectors = latin.get("azimuth_sectors")
+    if sectors_cfg is None:
+        if recorded_sectors is not None:
+            raise ValueError(f"{site_id} 稽核有 azimuth_sectors，但設定檔沒有方位分配")
+    else:
+        expected_sectors = [
+            {"from_deg": lo, "to_deg": hi, "bin_count": k} for lo, hi, k in sectors_cfg
+        ]
+        edges_f = [float(v) for v in az_edges]
+        boundary_ok = all(
+            any(abs(edge - target) <= 1e-9 for edge in edges_f) for target in (0.0, 180.0, 360.0)
+        )
+        if (
+            recorded_sectors != expected_sectors
+            or edges_f != sorted(edges_f)
+            or not boundary_ok
+            or latin.get("start_azimuth_deg") != 0.0
+            or sum(1 for edge in edges_f if 180.0 < edge < 360.0) != sectors_cfg[1][2] - 1
+            or sum(1 for edge in edges_f if 0.0 < edge < 180.0) != sectors_cfg[0][2] - 1
+        ):
+            raise ValueError(f"{site_id} 方位扇區稽核與設定檔的方位分配不一致")
+    attempts = latin.get("permutation_attempts")
+    log = latin.get("permutation_attempt_log")
+    if (
+        isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts < 1
+        or not isinstance(log, list)
+        or len(log) != attempts - 1
+    ):
+        raise ValueError(f"{site_id} 分層抽樣的排列嘗試紀錄不一致")
+    if any(float(d_edges[i]) > float(d_edges[i + 1]) for i in range(n)) or float(d_edges[0]) != 0.0:
+        raise ValueError(f"{site_id} 距離區間邊界必須由 0 遞增")
+    if float(d_edges[-1]) > float(sampling_cfg.radius_m) + 1e-6:
+        raise ValueError(f"{site_id} 距離區間超出抽樣半徑")
+    if [int(pick.get("face_id")) for pick in picks] != [int(value) for value in selected_global]:
+        raise ValueError(f"{site_id} 分層抽樣 picks 與 selected face 順序不一致")
+    tolerance = 1e-6
+    for index, pick in enumerate(picks):
+        if pick.get("azimuth_bin") != index + 1 or pick.get("distance_bin") != permutation[index]:
+            raise ValueError(f"{site_id} 分層抽樣 pick 的 bin 與排列不一致")
+        distance = float(pick["distance_m"])
+        lo, hi = float(d_edges[permutation[index] - 1]), float(d_edges[permutation[index]])
+        if not (lo - tolerance <= distance <= hi + tolerance) or distance > float(sampling_cfg.radius_m) + tolerance:
+            raise ValueError(f"{site_id} 分層抽樣 pick 的距離不在其距離區間或抽樣半徑內")
+        start, stop = float(az_edges[index]), float(az_edges[index + 1])
+        span = (stop - start) % 360.0 or 360.0
+        if ((float(pick["azimuth_deg"]) - start) % 360.0) > span + tolerance:
+            raise ValueError(f"{site_id} 分層抽樣 pick 的方位不在其方位區間內")
+
+
 def _validate_bed_residence_arrival_records(
     arrivals: tuple[ArrivalTime, ...],
     provenance: Mapping[str, Any],
@@ -2120,7 +2348,7 @@ def _validate_bed_residence_arrival_records(
         actual_offsets = tuple(item[2] for item in ordered)
         if actual_offsets != offsets:
             raise ValueError(f"{site_id} age vector 與其他站點或 seed 抽樣結果不一致")
-    if {"gongliao", "guishan"} <= expected_site_ids:
+    if {"gongliao", "guishan"} <= expected_site_ids and _a_pair_utc_required(config):
         paired_gongliao = sorted(per_site["gongliao"], key=lambda item: (item[0], item[1]))
         paired_guishan = sorted(per_site["guishan"], key=lambda item: (item[0], item[1]))
         if [item[0] for item in paired_gongliao] != [item[0] for item in paired_guishan]:
@@ -2340,6 +2568,7 @@ def _validate_bed_residence_member_arrival_records(
             ):
                 raise ValueError(f"{support_site} 的受體可支撐排除整點清單格式或雜湊不符")
             excluded_by_site[str(support_site)] = frozenset(hours)
+        _validate_external_exclusion_provenance(support_block, excluded_by_site, bed=bed)
 
     expected_site_ids = set(_config_sites(config))
     # site -> (observation_id, member_id) -> (observation_ns, age, slot, stratum)
@@ -2485,7 +2714,7 @@ def _validate_bed_residence_member_arrival_records(
             != expected_site_ids
         ):
             raise ValueError("per_member arrival 帶有沉底時刻標籤，但 root provenance 缺少對應的標註模型紀錄")
-    if {"gongliao", "guishan"} <= expected_site_ids:
+    if {"gongliao", "guishan"} <= expected_site_ids and _a_pair_utc_required(config):
         paired = {
             site_id: sorted({value[0] for value in per_site[site_id].values()})
             for site_id in ("gongliao", "guishan")
@@ -2639,13 +2868,16 @@ def _load_arrival_document(
             observation_arrivals = _validate_bed_residence_arrival_records(
                 tuple(arrivals), provenance, config
             )
+        _validate_seam_jump_exclusion_provenance(observation_arrivals, provenance, config)
         if formal:
             # bed-residence arrival 的執行 UTC 已轉為沉底時刻；正式 48+2 統計仍以 metadata
             # 可重建的 observation anchor 分層，避免沉底年齡跨季或跨年改寫原始選時設計。
             _validate_formal_arrival_strata(observation_arrivals, config)
     elif formal:
+        _validate_seam_jump_exclusion_provenance(tuple(arrivals), provenance, config)
         _validate_formal_arrival_strata(tuple(arrivals), config)
     else:
+        _validate_seam_jump_exclusion_provenance(tuple(arrivals), provenance, config)
         _validate_pilot_sites(site_ids, config, "arrival")
     return tuple(arrivals), document
 

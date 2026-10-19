@@ -11,14 +11,21 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-W = Path("/home/mustlab/Workspace")
-INP = W / "lbt-inputs/formal/v7-class-velocity/20261013_final-sites_h30-h60-h90_common_m10_v7"
-DATA = W / "lbt-wp61/data"
+# WP-63：路徑可由環境變數覆寫（run09 驗證圖改讀 run09 母體與其序列快取）；未設定時與 run08 版完全相同。
+W = Path(os.environ.get("LBT_WORKSPACE", "/home/mustlab/Workspace"))
+INP = Path(
+    os.environ.get(
+        "LBT_ARRIVAL_POP",
+        str(W / "lbt-inputs/formal/v7-class-velocity/20261013_final-sites_h30-h60-h90_common_m10_v7"),
+    )
+)
+DATA = Path(os.environ.get("LBT_ARRIVAL_DATA", str(W / "lbt-wp61/data")))
 SITES = ("gongliao", "guishan", "hsinchu", "lienchiang", "nanwan")
 SEASONS = ("DJF", "MAM", "JJA", "SON")
 SEASON_OF_MONTH = {

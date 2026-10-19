@@ -1858,9 +1858,97 @@ PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID: Final[str] = "nww_metric_location_exact
 _DEPOSITION_SUPPORT_SOURCE: Final[str] = "nww_metric_location_exact_hour_four_corner_gate"
 
 
+EXTERNAL_DEPOSITION_EXCLUSION_POLICY_ID: Final[str] = "external_bad_nww_hour_exclusion_v1"
+
+
+def parse_exclusion_hour(value: object) -> int:
+    """把「壞時刻」清單的一個元素轉成 UTC ns（整點）。
+
+    接受 UTC ns 整數，或 ISO-8601 字串（``2025-03-01T05:00:00Z``、``2025-03-01 05:00``；無時區視為 UTC）。
+    非整點、布林、非有限值一律 ``ValueError``（fail closed）。
+    """
+
+    hour_ns = 3_600_000_000_000
+    if isinstance(value, bool):
+        raise ValueError(f"壞時刻不可是布林：{value!r}")
+    if isinstance(value, int):
+        ns = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(f"壞時刻無法解析為 ISO-8601 UTC：{value!r}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        parsed = parsed.astimezone(UTC)
+        ns = int(parsed.timestamp() // 1) * 1_000_000_000 + parsed.microsecond * 1000
+    else:
+        raise ValueError(f"壞時刻必須是 UTC ns 整數或 ISO-8601 字串：{value!r}")
+    if ns % hour_ns != 0:
+        raise ValueError(f"壞時刻必須落在整點：{value!r}")
+    return ns
+
+
+def load_deposition_exclusion_hours(
+    bed_config: object,
+    *,
+    site_ids: Iterable[str],
+) -> tuple[dict[str, tuple[int, ...]], dict[str, object]] | None:
+    """讀取設定檔的「NWW 壞時刻」排除清單（預設關閉）。
+
+    ``bed_config`` 是 ``BedResidenceTimeConfig``：``deposition_exclusion_hours_by_site`` 內嵌或
+    ``deposition_exclusion_hours_file`` 指向 JSON mapping（``{站點: [時刻…]}``）。兩者皆未設定回傳 ``None``，
+    呼叫端行為與 run08 完全相同。清單中出現未知站點即 ``ValueError``；檔案路徑會連同 SHA-256 寫進回傳的
+    provenance 片段，讓母體可由外部清單版本追溯。回傳 ``(by_site, source_provenance)``，by_site 涵蓋全部
+    ``site_ids``（沒有壞時刻的站為空 tuple）。
+    """
+
+    inline = getattr(bed_config, "deposition_exclusion_hours_by_site", None)
+    file_path = getattr(bed_config, "deposition_exclusion_hours_file", None)
+    if inline is None and file_path is None:
+        return None
+    sites = sorted({str(value) for value in site_ids})
+    source: dict[str, object]
+    if inline is not None:
+        raw: Mapping[str, object] = inline
+        source = {"source": "config_inline"}
+    else:
+        from pathlib import Path
+
+        path = Path(str(file_path)).expanduser()
+        try:
+            payload_bytes = path.read_bytes()
+            raw = json.loads(payload_bytes.decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"無法讀取壞時刻清單檔 {path}：{exc}") from exc
+        if not isinstance(raw, Mapping):
+            raise ValueError("壞時刻清單檔必須是 {站點: [時刻…]} 的 JSON 物件")
+        source = {
+            "source": "external_file",
+            "file_name": path.name,
+            "file_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        }
+    unknown = sorted(set(map(str, raw)) - set(sites))
+    if unknown:
+        raise ValueError(f"壞時刻清單含未設定的站點：{unknown}")
+    by_site: dict[str, tuple[int, ...]] = {}
+    for site_id in sites:
+        values = raw.get(site_id, ())
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(f"{site_id} 的壞時刻必須是清單")
+        by_site[site_id] = tuple(sorted({parse_exclusion_hour(item) for item in values}))
+    return by_site, source
+
+
 def restrict_available_times_to_supported(
     canonical_available_time_ns_by_site: Mapping[str, Iterable[int]],
     supported_time_ns_by_site: Mapping[str, Iterable[int]],
+    *,
+    extra_excluded_time_ns_by_site: Mapping[str, Iterable[int]] | None = None,
+    extra_exclusion_source: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, tuple[int, ...]], dict[str, object]]:
     """把各站的 canonical 可用整點限制在「受體可支撐」整點，並回傳可寫進 provenance 的稽核。
 
@@ -1868,15 +1956,35 @@ def restrict_available_times_to_supported(
     排序 tuple，直接交給 per_member 抽樣器；``provenance`` 記錄政策 ID、支撐來源與每站被排除的
     整點清單（UTC ns，排序）及其 SHA-256，manifests 載入器據此核對沒有任何沉底整點落在被排除
     集合內。兩個 mapping 的站點集合必須相同；交集為空時 ``ValueError``。
+
+    WP-63：``extra_excluded_time_ns_by_site``（預設 ``None``＝run08 行為）是額外的「壞時刻」排除，與
+    NWW 支撐條件在同一層套用：這些整點同樣從可用整點移除並併入 ``excluded_hours_utc_ns``（因此
+    manifests 載入器既有的「沉底整點不得落在被排除集合」核對自動涵蓋它們），另在 provenance 增加
+    ``external_exclusion`` 區塊（每站的清單、SHA-256 與來源）；沒提供時 provenance 不含此鍵，位元不變。
     """
 
     if set(canonical_available_time_ns_by_site) != set(supported_time_ns_by_site):
         raise ValueError("canonical 可用整點與支撐整點的站點集合不一致")
     available: dict[str, tuple[int, ...]] = {}
     by_site: dict[str, object] = {}
+    external_by_site: dict[str, object] = {}
+    if extra_excluded_time_ns_by_site is not None:
+        unknown_extra = set(extra_excluded_time_ns_by_site) - set(canonical_available_time_ns_by_site)
+        if unknown_extra:
+            raise ValueError(f"額外排除清單含未知站點：{sorted(unknown_extra)}")
     for site_id in sorted(canonical_available_time_ns_by_site):
         canonical = sorted({int(value) for value in canonical_available_time_ns_by_site[site_id]})
         supported = {int(value) for value in supported_time_ns_by_site[site_id]}
+        if extra_excluded_time_ns_by_site is not None:
+            extra = sorted({int(value) for value in extra_excluded_time_ns_by_site.get(site_id, ())})
+            supported -= set(extra)
+            external_by_site[site_id] = {
+                "excluded_hours_utc_ns": extra,
+                "excluded_hours_sha256": hashlib.sha256(
+                    json.dumps(extra, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "in_canonical_hour_count": len(set(extra) & set(canonical)),
+            }
         kept = tuple(value for value in canonical if value in supported)
         excluded = [value for value in canonical if value not in supported]
         if not kept:
@@ -1890,8 +1998,15 @@ def restrict_available_times_to_supported(
                 json.dumps(excluded, separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
         }
-    return available, {
+    provenance: dict[str, object] = {
         "policy_id": PER_MEMBER_DEPOSITION_SUPPORT_POLICY_ID,
         "support_source": _DEPOSITION_SUPPORT_SOURCE,
         "by_site": by_site,
     }
+    if extra_excluded_time_ns_by_site is not None:
+        provenance["external_exclusion"] = {
+            "policy_id": EXTERNAL_DEPOSITION_EXCLUSION_POLICY_ID,
+            "source": dict(extra_exclusion_source or {}),
+            "by_site": external_by_site,
+        }
+    return available, provenance

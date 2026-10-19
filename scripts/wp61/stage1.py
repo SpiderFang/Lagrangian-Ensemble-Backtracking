@@ -9,17 +9,25 @@ from pathlib import Path
 
 import numpy as np
 
-W = Path("/home/mustlab/Workspace")
-sys.path.insert(0, str(W / "lbt-repo-wp61/src"))
-os.environ["OCM_SURFACE_ROOT"] = str(W / "lbt-local-data-v6-full/ocm_surface")
-os.environ["OCM_NATIVE_ROOT"] = str(W / "lbt-local-data-v6-full/ocm_native")
-os.environ["NWW_ANALYSIS_ROOT"] = str(W / "lbt-local-data-v6/nww3_analysis")
+W = Path(os.environ.get("LBT_WORKSPACE", "/home/mustlab/Workspace"))
+# WP-63：資料根、母體、程式碼與輸出位置可由環境變數覆寫；未設定時與 run08 版完全相同。
+# run09 用：LBT_STAGE1_SURFACE_ROOT=<v7-surface-fix202511-12/ocm_surface>、LBT_STAGE1_OCM_ROOT=<v6-full/ocm_native>、
+# LBT_STAGE1_NWW_ROOT=<NAS 24 個月 nww3_analysis>、LBT_STAGE1_NWW_FIRST_MONTH=202401、LBT_STAGE1_SEAM_FROM_MANIFEST=1。
+sys.path.insert(0, os.environ.get("LBT_CODE_SRC", str(W / "lbt-repo-wp61/src")))
+os.environ["OCM_SURFACE_ROOT"] = os.environ.get("LBT_STAGE1_SURFACE_ROOT", str(W / "lbt-local-data-v6-full/ocm_surface"))
+os.environ["OCM_NATIVE_ROOT"] = os.environ.get("LBT_STAGE1_OCM_ROOT", str(W / "lbt-local-data-v6-full/ocm_native"))
+os.environ["NWW_ANALYSIS_ROOT"] = os.environ.get("LBT_STAGE1_NWW_ROOT", str(W / "lbt-local-data-v6/nww3_analysis"))
 from lagrangian_backtracking import input_derivation as idv
 from lagrangian_backtracking.arrival_times import _rolling_rms
 from lagrangian_backtracking.config import load_config
 
-INP = W / "lbt-inputs/formal/v7-class-velocity/20261013_final-sites_h30-h60-h90_common_m10_v7"
-OUT = W / "lbt-wp61/data"
+INP = Path(
+    os.environ.get(
+        "LBT_ARRIVAL_POP",
+        str(W / "lbt-inputs/formal/v7-class-velocity/20261013_final-sites_h30-h60-h90_common_m10_v7"),
+    )
+)
+OUT = Path(os.environ.get("LBT_ARRIVAL_DATA", str(W / "lbt-wp61/data")))
 OUT.mkdir(parents=True, exist_ok=True)
 cfg = load_config(INP / "common-config.yaml", formal_release=False)
 months24 = idv._months_for_config(cfg)
@@ -30,11 +38,29 @@ meta = {}
 for r in arr["records"]:
     m = r["metadata"]
     meta.setdefault(r["study_site_id"], {})[m["observation_arrival_time_id"]] = m
+seam_excluded: dict[str, np.ndarray] = {}
+if os.environ.get("LBT_STAGE1_SEAM_FROM_MANIFEST") == "1":
+    # run09：接縫跳動排除清單取自母體 manifest 的 provenance（建置時實際使用的那份），並套用到 selector 與 valid 遮罩。
+    def _find(obj, key):
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj[key]
+            for v in obj.values():
+                r = _find(v, key)
+                if r is not None:
+                    return r
+        return None
+
+    _seam = _find(arr.get("provenance", {}), "seam_jump_exclusion")
+    if _seam is None:
+        raise SystemExit("LBT_STAGE1_SEAM_FROM_MANIFEST=1，但 manifest provenance 沒有 seam_jump_exclusion")
+    for _sid, _v in _seam["excluded_times_by_site"].items():
+        seam_excluded[_sid] = np.asarray(_v["utc_ns"], dtype=np.int64)
 roots = {
     k: idv._env_root(None, getattr(cfg.inputs, k + "_root_env"))
     for k in ("ocm_native", "ocm_surface", "nww_analysis")
 }
-nww_months = [m for m in months24 if m >= "202407"]
+nww_months = [m for m in months24 if m >= os.environ.get("LBT_STAGE1_NWW_FIRST_MONTH", "202407")]
 products = {}
 for dom in cfg.domains:
     region = dom.analysis_region_id
@@ -107,6 +133,7 @@ for site in cfg.study_sites:
         selection_policy=sel.policy,
         tidal_strength_window_hours=sel.tidal_strength_window_hours,
         allow_gap_censored_anchor=gap_on,
+        **({"excluded_times_ns": seam_excluded[sid]} if sid in seam_excluded else {}),
     )
     seconds = times.astype(np.float64) / 1e9
     nominal = float(np.median(np.diff(seconds)))
@@ -114,6 +141,8 @@ for site in cfg.study_sites:
     strength = _rolling_rms(eta, window)
     deriv = np.gradient(eta, seconds)
     valid = np.isfinite(eta) & np.isfinite(hs) & np.isfinite(spd) & nvalid & np.isin(times, expected)
+    if sid in seam_excluded:
+        valid &= ~np.isin(times, seam_excluded[sid])
     if not gap_on:
         valid &= idv._backward_window_mask(
             times,
@@ -149,7 +178,9 @@ for site in cfg.study_sites:
             and r.phase_or_event == m["observation_phase_or_event"]
         )
         i = int(np.searchsorted(times, t))
-        max_de = max(max_de, abs(eta[i] - m["elevation_m"]))
+        # 事件觀測（高浪／強流）沒有 elevation_m；run09 起龜山島自選事件，重跑選擇器的紀錄會含事件列。
+        if m.get("elevation_m") is not None:
+            max_de = max(max_de, abs(eta[i] - m["elevation_m"]))
     print(
         sid,
         "selector rerun set equal manifest:",

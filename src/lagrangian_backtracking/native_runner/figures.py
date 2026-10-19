@@ -1077,6 +1077,43 @@ def _load_receptor_anchors(path: Path) -> dict[str, tuple[float, float, float | 
     return result
 
 
+def _load_receptor_sampling_overrides(path: Path) -> dict[str, tuple[bool, float | None]]:
+    """WP-63：讀釋放設定的抽樣範圍覆寫，回傳 ``{站: (錨點是否由設定覆寫, 抽樣半徑 m 或 None)}``。
+
+    ``anchor_source: config_override_v1`` 的站不再與 :data:`SAMPLING_RANGE_ANCHORS_LONLAT` 逐項
+    核對（該表只是 run08 時的錨點快照）；``scenarios.horizontal_receptor_sampling.radius_m`` 存在時，
+    抽樣範圍圓改畫該半徑，而不是受體核心半徑。兩者都沒有時回傳 ``(False, None)``，行為與 run08 相同。
+    """
+
+    import yaml
+
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise FiguresError(f"無法讀取釋放設定檔：{exc}") from exc
+    sites = payload.get("study_sites") if isinstance(payload, dict) else None
+    if not isinstance(sites, list):
+        raise FiguresError("釋放設定檔缺少 study_sites 清單")
+    sampling_radius: float | None = None
+    scenarios = payload.get("scenarios") if isinstance(payload, dict) else None
+    block = scenarios.get("horizontal_receptor_sampling") if isinstance(scenarios, dict) else None
+    if block is not None:
+        try:
+            sampling_radius = float(block["radius_m"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FiguresError("scenarios.horizontal_receptor_sampling.radius_m 必須是數值") from exc
+        if not (math.isfinite(sampling_radius) and sampling_radius > 0.0):
+            raise FiguresError("scenarios.horizontal_receptor_sampling.radius_m 必須是有限正數")
+    result: dict[str, tuple[bool, float | None]] = {}
+    for item in sites:
+        if isinstance(item, dict) and "study_site_id" in item:
+            result[str(item["study_site_id"])] = (
+                item.get("anchor_source") == "config_override_v1",
+                sampling_radius,
+            )
+    return result
+
+
 def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInputs:
     """讀取並核對一次 native-figures 執行的全部輸入，回傳每站已就緒的繪圖資料。
 
@@ -1238,6 +1275,7 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
         )
     if config.receptor_config_path is not None:
         anchors = _load_receptor_anchors(config.receptor_config_path)
+        sampling_overrides = _load_receptor_sampling_overrides(config.receptor_config_path)
         if footprint_data is not None:
             missing = [sid for sid in footprint_data if sid not in anchors]
             if missing:
@@ -1247,6 +1285,8 @@ def load_native_figures_inputs(config: NativeFiguresConfig) -> NativeFiguresInpu
                     fp,
                     receptor_anchor=(anchors[sid][0], anchors[sid][1]),
                     receptor_core_radius_m=anchors[sid][2],
+                    anchor_is_config_override=sampling_overrides.get(sid, (False, None))[0],
+                    sampling_radius_m=sampling_overrides.get(sid, (False, None))[1],
                     receptor_source="release_config_anchor_lonlat",
                 )
                 for sid, fp in footprint_data.items()
@@ -3015,7 +3055,12 @@ def geodesic_distance_km(lon0: float, lat0: float, lons, lats) -> np.ndarray:
 
 
 def _sampling_range_circle(
-    site_id: str, anchor: tuple[float, float] | None, radius_m: float | None
+    site_id: str,
+    anchor: tuple[float, float] | None,
+    radius_m: float | None,
+    *,
+    sampling_radius_m: float | None = None,
+    anchor_is_config_override: bool = False,
 ) -> np.ndarray | None:
     """抽樣範圍圓（``(361, 2)`` 的經緯度頂點）；沒有錨點時回傳 ``None``。
 
@@ -3027,14 +3072,18 @@ def _sampling_range_circle(
     if anchor is None:
         return None
     radius = float(radius_m) if radius_m else SAMPLING_RANGE_RADIUS_M
+    if sampling_radius_m is not None:
+        radius = float(sampling_radius_m)
     expected = SAMPLING_RANGE_ANCHORS_LONLAT.get(site_id)
     if expected is not None:
-        if any(abs(float(a) - b) > 1e-7 for a, b in zip(anchor, expected, strict=True)):
+        if not anchor_is_config_override and any(
+            abs(float(a) - b) > 1e-7 for a, b in zip(anchor, expected, strict=True)
+        ):
             raise FiguresError(
                 f"站 {site_id} 的錨點 {tuple(anchor)} 與抽樣範圍常數表 {expected} 不一致；"
                 "釋放設定的錨點已改變，請同步更新 SAMPLING_RANGE_ANCHORS_LONLAT 與報告 3-4-3 的圖 1、圖 2"
             )
-        if abs(radius - SAMPLING_RANGE_RADIUS_M) > 1e-6:
+        if sampling_radius_m is None and abs(radius - SAMPLING_RANGE_RADIUS_M) > 1e-6:
             raise FiguresError(
                 f"站 {site_id} 的 receptor_core_radius_m={radius} 不是抽樣範圍所用的 "
                 f"{SAMPLING_RANGE_RADIUS_M} m"
@@ -3072,6 +3121,10 @@ class FootprintSiteFigureData:
     summary: Mapping[str, Any]
     receptor_anchor: tuple[float, float] | None = None
     receptor_core_radius_m: float | None = None
+    sampling_radius_m: float | None = None
+    """WP-63：新版分層抽樣的抽樣半徑（m）；None＝沿用受體核心半徑（run08 行為）。"""
+    anchor_is_config_override: bool = False
+    """WP-63：錨點由設定檔覆寫（``anchor_source: config_override_v1``）時不核對常數表。"""
     receptor_source: str = "postprocess_release_point_mean"
     release_points: np.ndarray | None = None
     """全部相異釋放點（受體水平位置）的經緯度，形狀 ``(n, 2)``；來自後處理的足跡幾何表。"""
@@ -3454,7 +3507,15 @@ def _sampling_range_record(fp: FootprintSiteFigureData) -> dict[str, Any] | None
     """圖上抽樣範圍圓的規格與「全部釋放點是否落在圓內」的核對（寫入 manifest）。"""
 
     radius_m = float(fp.receptor_core_radius_m) if fp.receptor_core_radius_m else SAMPLING_RANGE_RADIUS_M
-    circle = _sampling_range_circle(fp.site_id, fp.receptor_anchor, fp.receptor_core_radius_m)
+    if fp.sampling_radius_m is not None:
+        radius_m = float(fp.sampling_radius_m)
+    circle = _sampling_range_circle(
+        fp.site_id,
+        fp.receptor_anchor,
+        fp.receptor_core_radius_m,
+        sampling_radius_m=fp.sampling_radius_m,
+        anchor_is_config_override=fp.anchor_is_config_override,
+    )
     if circle is None:
         return None
     anchor = fp.receptor_anchor
@@ -3582,7 +3643,13 @@ def _draw_footprint_base_map(
     drawn = _draw_isobaths(ax, site_isobaths, extent, isobath_levels)
     for part in fp.open_boundary_parts:
         ax.plot(part[:, 0], part[:, 1], zorder=6, **_OPEN_BOUNDARY_STYLE)
-    circle = _sampling_range_circle(fp.site_id, fp.receptor_anchor, fp.receptor_core_radius_m)
+    circle = _sampling_range_circle(
+        fp.site_id,
+        fp.receptor_anchor,
+        fp.receptor_core_radius_m,
+        sampling_radius_m=fp.sampling_radius_m,
+        anchor_is_config_override=fp.anchor_is_config_override,
+    )
     if circle is not None:
         ax.plot(circle[:, 0], circle[:, 1], zorder=7, **_SAMPLING_RANGE_STYLE)
     receptor = fp.receptor_lonlat
@@ -4329,11 +4396,14 @@ def _receptor_text_zh(fp: FootprintSiteFigureData) -> str:
         return "受體位置未記錄"
     pos = f"{lonlat[0]:.4f}°E, {lonlat[1]:.4f}°N"
     if fp.receptor_anchor is not None:
-        radius = (
-            f"半徑 {fp.receptor_core_radius_m / 1000.0:g} km 的受體核心範圍內的各受體點"
-            if fp.receptor_core_radius_m
-            else "周圍的各受體點"
-        )
+        if fp.sampling_radius_m is not None:
+            radius = f"半徑 {fp.sampling_radius_m / 1000.0:g} km 的抽樣範圍內（方位×距離分層抽樣）的各受體點"
+        else:
+            radius = (
+                f"半徑 {fp.receptor_core_radius_m / 1000.0:g} km 的受體核心範圍內的各受體點"
+                if fp.receptor_core_radius_m
+                else "周圍的各受體點"
+            )
         return f"受體位置（星號）為研究點錨點 {pos}（取自正式釋放設定），粒子自錨點周圍{radius}釋放"
     return f"受體位置（星號）為各釋放點的平均位置 {pos}（本批圖未提供釋放設定，不是研究點錨點）"
 
@@ -4371,10 +4441,15 @@ def _footprint_caption_zh(
     arrival_zh = "回溯起點（到達時刻）的位置計入" if arrival_included else "回溯起點（到達時刻）的位置不計入"
     res = float(fp.grid["resolution_deg"])
     km = res * 111.19
-    circle_radius_km = (fp.receptor_core_radius_m or SAMPLING_RANGE_RADIUS_M) / 1000.0
+    circle_radius_km = (
+        fp.sampling_radius_m
+        if fp.sampling_radius_m is not None
+        else (fp.receptor_core_radius_m or SAMPLING_RANGE_RADIUS_M)
+    ) / 1000.0
+    circle_tail_zh = "即受體核心範圍" if fp.sampling_radius_m is None else "即受體抽樣範圍"
     release_zh = (
         f"深藍色虛線圓為抽樣範圍（以研究地點錨點為圓心、半徑 {circle_radius_km:g} km 的測地線圓，"
-        "即受體核心範圍）"
+        f"{circle_tail_zh}）"
         if fp.receptor_anchor is not None
         else "本批圖未提供釋放設定，未繪抽樣範圍"
     )

@@ -103,6 +103,16 @@ def window_slice(s: ac.SiteSeries, i: int) -> slice:
     return slice(i - HALF, i + HALF + 1)
 
 
+def window(arr: np.ndarray, i: int) -> np.ndarray:
+    """以第 i 點為中心、前後各 HALF 點的視窗；超出序列首尾的部分補 NaN（run09 的觀測時刻可靠近序列末端）。"""
+
+    lo, hi = i - HALF, i + HALF + 1
+    out = np.full(hi - lo, np.nan)
+    a, b = max(lo, 0), min(hi, len(arr))
+    out[a - lo : b - lo] = arr[a:b]
+    return out
+
+
 def site_stats(s: ac.SiteSeries, rows: list[dict], idx_of: dict, ref: ac.SiteSeries | None) -> dict:
     ym = s.valid & (s.year_of == ac.YEAR)
     e_lo, e_hi = np.inf, -np.inf
@@ -113,7 +123,7 @@ def site_stats(s: ac.SiteSeries, rows: list[dict], idx_of: dict, ref: ac.SiteSer
         for ser in (s, ref):
             if ser is None:
                 continue
-            w = ser.eta[window_slice(ser, i)]
+            w = window(ser.eta, i)
             e_lo, e_hi = min(e_lo, np.nanmin(w)), max(e_hi, np.nanmax(w))
     return {
         "eta": (float(e_lo), float(e_hi)),
@@ -440,19 +450,18 @@ def render_zoom(
                     continue
                 r = items[k]
                 i = idx_of[int(np.datetime64(r["utc"].replace("Z", ""), "ns").astype("int64"))]
-                sl = window_slice(s, i)
                 if lo < 0 < up:
                     ax.axhline(0, color="#cccccc", lw=0.4, zorder=0)
                 if ref is not None:
                     ax.plot(
                         hrs,
-                        ref.eta[window_slice(ref, i)],
+                        window(ref.eta, i),
                         color="#888888",
                         lw=0.7,
                         ls=(0, (3, 1.5)),
                         zorder=2,
                     )
-                ax.plot(hrs, s.eta[sl], color="#222222", lw=0.8, zorder=3)
+                ax.plot(hrs, window(s.eta, i), color="#222222", lw=0.8, zorder=3)
                 ax.axvline(0, color="#999999", lw=0.4, zorder=1)
                 ax.plot(
                     [0],
@@ -496,7 +505,7 @@ def render_zoom(
         p99 = float(np.nanpercentile(np.where(ym, ser, np.nan), 99))
         ymax = float(np.nanmax(np.where(ym, ser, np.nan)))
         col = COL_EVENT[ev]
-        ax.plot(hrs, ser[window_slice(s, i)], color=col, lw=0.9, zorder=3)
+        ax.plot(hrs, window(ser, i), color=col, lw=0.9, zorder=3)
         ax.axvline(0, color="#999999", lw=0.4, zorder=1)
         ax.plot([-HALF, HALF], [ymax] * 2, color="#555555", lw=0.8, ls=(0, (1, 1.5)), zorder=2)
         ax.plot([-HALF, HALF], [p99] * 2, color="#555555", lw=0.8, ls=(0, (4, 2)), zorder=2)

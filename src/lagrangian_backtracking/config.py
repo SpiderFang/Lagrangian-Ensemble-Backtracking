@@ -37,12 +37,17 @@ from .gap_policy import (
     OBSERVED_GAP_CENSORED_STOP_AT_FIRST_GAP_POLICY_ID,
     REJECT_UNAVAILABLE_DEPOSITION_HOUR_WITHIN_STRATUM_POLICY_ID,
 )
+from .receptor_stratified import (
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN_ID,
+)
 from .scenarios import (
     SETTLING_CANDIDATE_COUNT,
     SETTLING_VELOCITY_SAMPLING_CLASS_CANDIDATES_BALANCED,
     SETTLING_VELOCITY_SAMPLING_REPRESENTATIVE,
     validate_settling_velocity_sampling_mode,
 )
+from .bad_hour_rule import BadHourRuleParameters
+from .seam_jumps import SeamJumpParameters
 
 # 這組名稱取自海洋保育署 iOcean 海洋廢棄物管理頁於 2026-08-27 顯示的查詢類別。
 # 常數只用來驗證臺灣情境的分類追溯是否完整；該網站的清除重量與件數不含單體物性，
@@ -227,6 +232,21 @@ GUISHAN_ANCHOR_POLICY_ID = "snap_to_persistent_wet_mesh_within_priority_polygon"
 HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID = (
     "seeded_uniform_random_without_replacement_v1"
 )
+# WP-63（run09）：方位 × 距離等面積拉丁方格分層隨機抽樣。run08 以前的設定不明示它，
+# 預設仍是上面的舊 policy；兩者並存，設定檔明示哪一個就用哪一個（見 receptor_stratified.py）。
+HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN = (
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN_ID
+)
+SUPPORTED_HORIZONTAL_RECEPTOR_SELECTION_POLICY_IDS = frozenset(
+    {
+        HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+        HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN,
+    }
+)
+# WP-63：研究站錨點預設必須 exact 等於上方 FORMAL_STUDY_SITE_ANCHORS_LON_LAT；站點明示
+# ``anchor_source: config_override_v1`` 時改以設定檔為準（仍須是有限值、且受 flow-domain／
+# 受體核心等其他 gate 約束），讓新竹、南灣等錨點調整只需改設定檔。
+ANCHOR_SOURCE_CONFIG_OVERRIDE = "config_override_v1"
 VERTICAL_RECEPTOR_SELECTION_POLICY_ID = "seeded_uniform_random_open_interval_v1"
 RECEPTOR_SELECTION_SEED_POLICY_ID = "sha256_v1_pcg64dxsm"
 RANDOM_VERTICAL_RECEPTOR_ID_PREFIX = "random_vertical_draw"
@@ -487,6 +507,9 @@ class StudySiteConfig(StrictModel):
     formal_release_flow_domain_id: str | None = None
     anchor_lonlat: tuple[float, float] | None = None
     receptor_core_radius_m: float | None = None
+    # WP-63：明示 ``config_override_v1`` 時，current formal 不再要求此站 anchor 逐位等於
+    # FORMAL_STUDY_SITE_ANCHORS_LON_LAT（預設 None＝維持 run08 的 exact 核對）。
+    anchor_source: Literal["config_override_v1"] | None = None
     local_domain_baseline_radius_m: float | None = None
     local_domain_sensitivity_radii_m: list[float] = Field(default_factory=list)
     local_domain_policy: str | None = None
@@ -759,6 +782,32 @@ class BedResidenceTimeConfig(StrictModel):
     formal_release_backtrack_modes: tuple[
         Literal["fixed_calendar_window", "full_horizon_from_deposition"], ...
     ] | None = None
+    # WP-63：「NWW 壞時刻」的沉底可用時刻排除掛勾（預設關閉）。兩個欄位擇一提供：
+    # 設定檔內嵌 ``{站點: [UTC 時刻…]}``，或指向外部 JSON 檔（同樣的 mapping）。時刻可寫 ISO-8601
+    # UTC 字串（例如 ``2025-03-01T05:00:00Z``）或 UTC 奈秒整數。套用位置與
+    # ``nww_metric_location_exact_hour_support_v1`` 的條件化同一層（見 bed_residence.py）。
+    deposition_exclusion_hours_by_site: dict[str, list[StrictInt | str]] | None = None
+    deposition_exclusion_hours_file: str | None = None
+    # WP-63：由失敗矩陣確定性導出壞時刻（預設關閉；與上面兩個清單欄位互斥）。
+    deposition_bad_hour_rule: DepositionBadHourRuleConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_deposition_exclusion_hours(self) -> BedResidenceTimeConfig:
+        if (
+            self.deposition_exclusion_hours_by_site is not None
+            and self.deposition_exclusion_hours_file is not None
+        ):
+            raise ValueError("deposition_exclusion_hours_by_site 與 deposition_exclusion_hours_file 只能擇一")
+        if self.deposition_bad_hour_rule is not None and (
+            self.deposition_exclusion_hours_by_site is not None
+            or self.deposition_exclusion_hours_file is not None
+        ):
+            raise ValueError("deposition_bad_hour_rule 與壞時刻清單欄位互斥")
+        if self.deposition_exclusion_hours_file is not None and not str(
+            self.deposition_exclusion_hours_file
+        ).strip():
+            raise ValueError("deposition_exclusion_hours_file 不可為空字串")
+        return self
 
     @model_validator(mode="after")
     def validate_bed_residence_contract(self) -> BedResidenceTimeConfig:
@@ -865,6 +914,109 @@ class BedResidenceTimeConfig(StrictModel):
         )
 
 
+class DepositionBadHourRuleConfig(StrictModel):
+    """WP-63：沉底「壞時刻」規則（見 ``bad_hour_rule.py``）。區塊存在即啟用。
+
+    ``radius_m``（必填）是錨點周圍計入失敗矩陣的圓半徑；其餘預設值是 WP-62 診斷採用的規則：只失敗 1 至 5 個
+    整點的面，合計牽連面積 >= 1 km^2 的整點就從沉底可用整點排除。與
+    ``deposition_exclusion_hours_by_site`` / ``deposition_exclusion_hours_file`` 互斥。
+    """
+
+    radius_m: float
+    min_failed_hours: StrictInt = 1
+    max_failed_hours: StrictInt = 5
+    area_threshold_km2: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_parameters(self) -> DepositionBadHourRuleConfig:
+        self.to_parameters()
+        return self
+
+    def to_parameters(self) -> BadHourRuleParameters:
+        return BadHourRuleParameters(
+            radius_m=float(self.radius_m),
+            min_failed_hours=int(self.min_failed_hours),
+            max_failed_hours=int(self.max_failed_hours),
+            area_threshold_km2=float(self.area_threshold_km2),
+        )
+
+
+class SeamJumpExclusionConfig(StrictModel):
+    """WP-63：OCM 日檔接縫跳動前後的到達時刻候選排除（見 ``seam_jumps.py``）。
+
+    區塊存在即啟用；預設值就是 WP-61 的 V1 定義。排除清單與 SHA-256 會寫進 arrival manifest
+    provenance。未明示此區塊的設定（run08 以前）完全不排除，selector 位元不變。
+    """
+
+    ratio_threshold: float = 5.0
+    p95_multiplier: float = 1.5
+    percentile: float = 95.0
+    neighbour_half_width_hours: StrictInt = 12
+    exclusion_radius_hours: StrictInt = 1
+    scope: Literal["union_of_sites", "own_site"] = "union_of_sites"
+
+    @model_validator(mode="after")
+    def validate_parameters(self) -> SeamJumpExclusionConfig:
+        self.to_parameters()  # 數值範圍檢查集中在 SeamJumpParameters
+        return self
+
+    def to_parameters(self) -> SeamJumpParameters:
+        return SeamJumpParameters(
+            ratio_threshold=float(self.ratio_threshold),
+            p95_multiplier=float(self.p95_multiplier),
+            percentile=float(self.percentile),
+            neighbour_half_width_hours=int(self.neighbour_half_width_hours),
+            exclusion_radius_hours=int(self.exclusion_radius_hours),
+            scope=self.scope,
+        )
+
+
+class AzimuthAllocationConfig(StrictModel):
+    """WP-63：某站點的方位區間分配（西半 180°–360°、東半 0°–180° 各幾個等面積方位區間）。"""
+
+    west_180_360: StrictInt
+    east_0_180: StrictInt
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> AzimuthAllocationConfig:
+        if self.west_180_360 < 1 or self.east_0_180 < 1:
+            raise ValueError("西半與東半的方位區間數都必須 >= 1")
+        return self
+
+
+class HorizontalReceptorSamplingConfig(StrictModel):
+    """WP-63：方位 × 距離等面積拉丁方格分層抽樣的參數（只在該 policy 下使用）。
+
+    ``radius_m`` 是抽樣圓的半徑（公尺），必須不大於站點的 ``receptor_core_radius_m``；
+    ``strata_count`` 是水平受體數（方位區間數＝距離區間數），目前固定 5。
+    """
+
+    radius_m: float
+    strata_count: StrictInt = 5
+    # 選用：個別站點的方位分層改為「西半（180°–360°）／東半（0°–180°）各切指定個數的等面積方位區間」。
+    # 例：{guishan: {west_180_360: 3, east_0_180: 2}}。未列出的站點維持隨機起始方位等分。
+    azimuth_allocation_by_site: dict[str, AzimuthAllocationConfig] | None = None
+
+    def azimuth_sectors_for(self, site_id: str) -> tuple[tuple[float, float, int], ...] | None:
+        """回傳 ``[(起始方位, 結束方位, 區間數), ...]``（東半在前）；未指定者回傳 ``None``。"""
+
+        if not self.azimuth_allocation_by_site or site_id not in self.azimuth_allocation_by_site:
+            return None
+        spec = self.azimuth_allocation_by_site[site_id]
+        return ((0.0, 180.0, int(spec.east_0_180)), (180.0, 360.0, int(spec.west_180_360)))
+
+    @model_validator(mode="after")
+    def validate_sampling(self) -> HorizontalReceptorSamplingConfig:
+        for site_id, spec in (self.azimuth_allocation_by_site or {}).items():
+            if int(spec.east_0_180) + int(spec.west_180_360) != int(self.strata_count):
+                raise ValueError(f"azimuth_allocation_by_site[{site_id}] 的區間數總和必須等於 strata_count")
+        if not math.isfinite(float(self.radius_m)) or float(self.radius_m) <= 0.0:
+            raise ValueError("scenarios.horizontal_receptor_sampling.radius_m 必須是有限正數")
+        if self.strata_count != 5:
+            raise ValueError("scenarios.horizontal_receptor_sampling.strata_count 目前必須是 5")
+        return self
+
+
 class ArrivalTimeSelectionConfig(StrictModel):
     """到達時次母體的分層、年份範圍與 replicate 契約。
 
@@ -900,6 +1052,8 @@ class ArrivalTimeSelectionConfig(StrictModel):
     # 改變 14 天長窗的既有 manifest 位元。normalized_payload 會在舊 YAML 未明示
     # 此欄位時移除 Pydantic 補出的 None，維持既有 config hash。
     tidal_strength_window_hours: float | None = None
+    # WP-63：接縫跳動排除（None＝不排除，run08 行為）。
+    seam_jump_exclusion: SeamJumpExclusionConfig | None = None
 
     @model_validator(mode="after")
     def validate_selection_contract(self) -> ArrivalTimeSelectionConfig:
@@ -949,7 +1103,18 @@ class ArrivalTimeSelectionConfig(StrictModel):
                 )
         elif self.policy is not None and self.policy != ARRIVAL_SELECTION_POLICY_LEGACY_TWO_YEAR_V1:
             raise ValueError(f"不支援的 arrival_time_selection.policy：{self.policy!r}")
+        if self.seam_jump_exclusion is not None and self.policy not in {
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V1,
+            ARRIVAL_SELECTION_POLICY_OBSERVATION_YEAR_V2,
+        }:
+            raise ValueError("arrival_time_selection.seam_jump_exclusion 只支援 observation year policy")
         return self
+
+    @property
+    def pairs_northeast_utc(self) -> bool:
+        """A 區兩站是否共用同一組到達 UTC（預設 true＝run08 行為；false＝兩站各自獨立選取）。"""
+
+        return bool(self.northeast_pair_utc_when_coverage_allows)
 
 
 class ScenarioConfig(StrictModel):
@@ -979,6 +1144,9 @@ class ScenarioConfig(StrictModel):
     vertical_receptor_selection_policy: str | None = None
     receptor_selection_seed_policy: str | None = None
     bed_residence_time: BedResidenceTimeConfig | None = None
+    # WP-63：方位 × 距離等面積分層抽樣的參數；只在 horizontal_receptor_selection_policy 為該
+    # policy 時必填，否則必須省略。
+    horizontal_receptor_sampling: HorizontalReceptorSamplingConfig | None = None
 
 
 class ExecutionConfig(StrictModel):
@@ -1194,7 +1362,7 @@ class ProjectConfig(StrictModel):
                     if site.anchor_lonlat is not None
                     else None
                 )
-                if actual_anchor != expected_anchor:
+                if actual_anchor != expected_anchor and site.anchor_source != ANCHOR_SOURCE_CONFIG_OVERRIDE:
                     raise ValueError(f"{site_id} anchor 必須 exact 沿用四區五站核對圖")
             nanwan = sites_by_id["nanwan"]
             if nanwan.study_site_name_zh != "南灣":
@@ -1235,7 +1403,12 @@ class ProjectConfig(StrictModel):
             }
             for field_name, expected_policy in expected_receptor_policies.items():
                 actual_policy = getattr(self.scenarios, field_name)
-                if actual_policy != expected_policy:
+                allowed_policies = (
+                    SUPPORTED_HORIZONTAL_RECEPTOR_SELECTION_POLICY_IDS
+                    if field_name == "horizontal_receptor_selection_policy"
+                    else frozenset({expected_policy})
+                )
+                if actual_policy not in allowed_policies:
                     raise ValueError(
                         f"scenarios.{field_name} 必須是 current formal random policy "
                         f"{expected_policy!r}"
@@ -1821,6 +1994,26 @@ class ProjectConfig(StrictModel):
                 and "age_sampling_seed" not in bed_model.model_fields_set
             ):
                 del bed_payload["age_sampling_seed"]
+            # WP-63：壞時刻排除掛勾是新增的 optional 欄位（預設關閉）。未明示時不進 hash，
+            # run08 以前的 config hash 位元不變。
+            for field_name in (
+                "deposition_exclusion_hours_by_site",
+                "deposition_exclusion_hours_file",
+                "deposition_bad_hour_rule",
+            ):
+                if (
+                    bed_model is not None
+                    and field_name in bed_payload
+                    and field_name not in bed_model.model_fields_set
+                ):
+                    del bed_payload[field_name]
+        if (
+            isinstance(scenarios_payload, dict)
+            and "horizontal_receptor_sampling" in scenarios_payload
+            and "horizontal_receptor_sampling" not in self.scenarios.model_fields_set
+        ):
+            # WP-63：分層抽樣參數只在明示該 policy 的設定中出現。
+            del scenarios_payload["horizontal_receptor_sampling"]
         if isinstance(scenarios_payload, dict) and self.design_version != CURRENT_DESIGN_VERSION:
             # random receptor policy 是本期 current formal 的新契約；舊 v2／v3 設定即使
             # 由新版範例複製後殘留這些 extra key，也不能讓歷史 config hash 改變，或讓
@@ -1852,6 +2045,12 @@ class ProjectConfig(StrictModel):
                     and field_name not in self.arrival_time_selection.model_fields_set
                 ):
                     del selection_payload[field_name]
+            # WP-63：接縫跳動排除區塊只在來源 YAML 明示時進 canonical payload。
+            if (
+                "seam_jump_exclusion" in selection_payload
+                and "seam_jump_exclusion" not in self.arrival_time_selection.model_fields_set
+            ):
+                del selection_payload["seam_jump_exclusion"]
         execution_payload = payload.get("execution")
         if (
             isinstance(execution_payload, dict)
@@ -1908,6 +2107,7 @@ class ProjectConfig(StrictModel):
                 "horizontal_receptor_coordinate_tolerance_m",
                 "receptor_priority_polygon",
                 "receptor_priority_selection",
+                "anchor_source",
             )
             for site, site_payload in zip(self.study_sites, site_payloads, strict=False):
                 if not isinstance(site_payload, dict):

@@ -65,6 +65,9 @@ class HorizontalReceptorCandidatePool:
     candidate_lon: np.ndarray
     candidate_lat: np.ndarray
     tie_break_keys: tuple[tuple[float, float, int], ...]
+    # WP-63：各候選 face 的公尺制面積（方位×距離等面積分層用）。舊政策完全不讀它，也不進
+    # candidate_pool_fingerprint，所以舊 manifest 的指紋與抽樣結果位元不變。
+    candidate_area_m2: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +205,33 @@ def _excluded_face_set(excluded_face_indices: Iterable[int]) -> frozenset[int]:
     if any(int(value) < 0 for value in values):
         raise ValueError("excluded_face_indices 不可為負數")
     return frozenset(int(value) for value in values)
+
+
+def horizontal_receptor_from_pool_position(
+    pool: HorizontalReceptorCandidatePool, position: int
+) -> HorizontalReceptor:
+    """由候選池的陣列位置建立 ``HorizontalReceptor``（身分字串與舊 random selector 完全相同）。"""
+
+    x_m, y_m = pool.candidate_xy_m[position]
+    return HorizontalReceptor(
+        horizontal_receptor_id=stable_identifier(
+            "hr",
+            [
+                pool.study_site_id.split(":", 1)[0],
+                str(int(pool.candidate_face_global_indices[position])),
+                f"{x_m:.6f}",
+                f"{y_m:.6f}",
+            ],
+        ),
+        study_site_id=pool.study_site_id.split(":", 1)[0],
+        x_m=float(x_m),
+        y_m=float(y_m),
+        lon=float(pool.candidate_lon[position]),
+        lat=float(pool.candidate_lat[position]),
+        source_face_local_index=int(pool.candidate_face_local_indices[position]),
+        source_face_global_index=int(pool.candidate_face_global_indices[position]),
+        anchor_snap_distance_m=None,
+    )
 
 
 def select_horizontal_receptors_random_from_pool(
@@ -439,6 +469,14 @@ def prepare_horizontal_receptor_candidates(
         (float(lon[index]), float(lat[index]), int(mesh.source_face_global_index[face_index]))
         for index, face_index in enumerate(indices)
     ]
+    area = np.empty(indices.size, dtype=np.float64)
+    for position, face_index in enumerate(indices):
+        node_count = int(mesh.face_node_count[face_index])
+        xy = mesh.node_xy[mesh.face_nodes_local[face_index, :node_count]]
+        x_coord, y_coord = xy[:, 0], xy[:, 1]
+        area[position] = 0.5 * abs(
+            float(np.dot(x_coord, np.roll(y_coord, -1)) - np.dot(y_coord, np.roll(x_coord, -1)))
+        )
     return HorizontalReceptorCandidatePool(
         study_site_id=study_site_id,
         anchor_xy=(float(anchor_xy[0]), float(anchor_xy[1])),
@@ -453,6 +491,7 @@ def prepare_horizontal_receptor_candidates(
         candidate_lon=_readonly_copy(lon),
         candidate_lat=_readonly_copy(lat),
         tie_break_keys=tuple(tie_keys),
+        candidate_area_m2=_readonly_copy(area),
     )
 
 

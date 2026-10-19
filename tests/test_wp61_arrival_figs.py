@@ -36,3 +36,16 @@ def test_season_spans_cover_year_exactly_once() -> None:
     assert [s[0] for s in spans] == ["DJF", "MAM", "JJA", "SON", "DJF"]
     ticks, labels = af.month_starts_days()
     assert ticks[0] == 0 and ticks[-1] == 365 and ticks[3] == 90 and len(labels) == 13
+
+
+def test_window_pads_nan_beyond_series_ends() -> None:
+    """WP-63：觀測時刻靠近序列首尾時，視窗長度固定為 2*HALF+1，缺的部分補 NaN。"""
+
+    arr = np.arange(100, dtype=float)
+    full = af.window(arr, 50)
+    assert full.shape == (2 * af.HALF + 1,) and np.array_equal(full, np.arange(50 - af.HALF, 50 + af.HALF + 1))
+    end = af.window(arr, 98)
+    assert end.shape == (2 * af.HALF + 1,)
+    assert np.isnan(end[-1]) and end[af.HALF] == 98.0 and np.isnan(end[af.HALF + 2])
+    start = af.window(arr, 3)
+    assert np.isnan(start[0]) and start[af.HALF] == 3.0 and start[af.HALF - 3] == 0.0

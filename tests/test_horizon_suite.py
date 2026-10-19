@@ -12,6 +12,7 @@ import copy
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +148,11 @@ def _load_manifest(path: Path) -> tuple[dict[str, Any], Path]:
     return payload, manifest_path
 
 
+# WP-63：fixture 的支援日數預設 180／90（H90 套件）；H180 測試暫時改成 270／180。
+_FIXTURE_SELECTION_DAYS = [180]
+_FIXTURE_RUNTIME_DAYS = [90.0]
+
+
 def _install_small_suite_doubles(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -185,11 +191,15 @@ def _install_small_suite_doubles(
                     Path(kwargs["config_path"]).read_text(encoding="utf-8")
                 )
                 bed = config_payload["scenarios"].get("bed_residence_time")
-                payload["max_backtrack_days"] = 90
-                payload["support_days"] = 90
+                # WP-63：fixture 的支援日數取自 common config，讓 H90（180／90）與 H180（270／180）共用。
+                runtime_days = (
+                    int(float(config_payload["boundaries"]["max_backtrack_days"])) if bed is not None else 90
+                )
+                payload["max_backtrack_days"] = runtime_days
+                payload["support_days"] = runtime_days
                 if bed is not None:
-                    payload["selection_support_days"] = 180
-                    payload["runtime_support_days"] = 90
+                    payload["selection_support_days"] = int(config_payload["inputs"]["backtrack_support_days"])
+                    payload["runtime_support_days"] = runtime_days
             fingerprint = write_canonical_json(destination / filename, payload)
             component_records.append({"kind": kind, **fingerprint})
         index_fingerprint = write_canonical_json(
@@ -296,7 +306,7 @@ def _install_small_suite_doubles(
                 "source_backtrack_support_days": payload["inputs"].get(
                     "backtrack_support_days"
                 ) or 90,
-                "artifact_backtrack_support_days": 90.0,
+                "artifact_backtrack_support_days": _FIXTURE_RUNTIME_DAYS[0],
                 "requested_max_backtrack_days": float(days),
                 "requested_maximum_step_count": int(kwargs["maximum_step_count"]),
             },
@@ -304,10 +314,10 @@ def _install_small_suite_doubles(
         if bed is not None:
             payload["release_binding"]["backtrack_horizon_binding"].update(
                 {
-                    "selection_support_days": 180,
-                    "runtime_support_days": 90,
-                    "artifact_selection_support_days": 180,
-                    "artifact_runtime_support_days": 90,
+                    "selection_support_days": _FIXTURE_SELECTION_DAYS[0],
+                    "runtime_support_days": _FIXTURE_RUNTIME_DAYS[0],
+                    "artifact_selection_support_days": _FIXTURE_SELECTION_DAYS[0],
+                    "artifact_runtime_support_days": _FIXTURE_RUNTIME_DAYS[0],
                     "backtrack_mode": mode,
                 }
             )
@@ -1682,3 +1692,38 @@ def test_yaml_snapshot_rejects_symlink_leaf_without_path_read_race(tmp_path: Pat
     link.symlink_to(target)
     with pytest.raises(horizon_suite.HorizonSuiteError):
         horizon_suite._read_yaml_snapshot(link, "snapshot", "link.yaml")
+
+
+def test_h180_suite_has_270_day_selection_support_and_single_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP-63：回溯上限 180 日；90 日最大沉底年齡加 180 日＝270 日 selection support，只發布 H180。"""
+
+    monkeypatch.setattr(sys.modules[__name__], "_FIXTURE_SELECTION_DAYS", [270])
+    monkeypatch.setattr(sys.modules[__name__], "_FIXTURE_RUNTIME_DAYS", [180.0])
+    calls = _install_small_suite_doubles(monkeypatch)
+    template = tmp_path / "bed-template.yaml"
+    _write_bed_template(template)
+    destination = tmp_path / "bed-suite-180"
+    result = horizon_suite.build_horizon_suite(
+        template,
+        [180],
+        destination,
+        tmp_path / "ocm",
+        tmp_path / "surface",
+        tmp_path / "nww",
+        formal=False,
+    )
+    assert result["horizons_days"] == [180]
+    assert result["selection_support_days"] == 270
+    assert result["runtime_support_days"] == 180
+    assert len(calls["build"]) == 1
+    common_payload = yaml.safe_load((destination / "common-config.yaml").read_text(encoding="utf-8"))
+    assert common_payload["inputs"]["backtrack_support_days"] == 270
+    assert common_payload["boundaries"]["max_backtrack_days"] == 180.0
+    release = yaml.safe_load(
+        (destination / "release-configs" / "release-180d-full_horizon_from_deposition.yaml").read_text(encoding="utf-8")
+    )
+    assert release["boundaries"]["max_backtrack_days"] == 180.0
+    assert release["inputs"]["backtrack_support_days"] == 270
+    assert horizon_suite.validate_horizon_suite(destination, formal=False)["valid"] is True

@@ -47,6 +47,13 @@ from shapely.ops import unary_union
 
 from . import bed_residence as _bed_residence_module
 from .arrival_times import select_arrival_times
+from .bad_hour_rule import (
+    BAD_HOUR_RULE_POLICY_ID,
+    BadHourRuleParameters,
+    derivation_audit,
+    derive_bad_hours_from_failure_matrix,
+    hours_sha256,
+)
 from .bed_residence import (
     BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_MEMBER,
     BED_RESIDENCE_AGE_SAMPLING_SCOPE_PER_PARTICLE,
@@ -58,6 +65,7 @@ from .bed_residence import (
     BED_RESIDENCE_SAMPLING_POLICY_ID,
     apply_bed_residence_member_sampling,
     apply_bed_residence_sampling,
+    load_deposition_exclusion_hours,
     restrict_available_times_to_supported,
     sample_bed_residence_age_hours,
     sample_bed_residence_member_ages_conditioned_on_availability,
@@ -73,6 +81,7 @@ from .config import (
     FORMAL_DOMAIN_POLICY_V3_LOCAL20KM_20260909_V1,
     FORMAL_RELEASE_DOMAIN_STATUS_V3_FAIL_CLOSED_NO_EXPANSION,
     GUISHAN_SOFT_PRIORITY_POLICY_ID,
+    HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN,
     HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
     NORTHEAST_V3_BBOX_LON_LAT,
     NORTHEAST_V3_FLOW_DOMAIN_ID,
@@ -83,6 +92,7 @@ from .config import (
     RUNTIME_SPATIAL_SUPPORT_POLICY_V3_FAIL_CLOSED_NO_EXPANSION_V1,
     VERTICAL_RECEPTOR_SELECTION_POLICY_ID,
     BedResidenceTimeConfig,
+    DepositionBadHourRuleConfig,
     DomainConfig,
     ProjectConfig,
     StudySiteConfig,
@@ -127,6 +137,7 @@ from .preflight import PreflightReport, run_preflight
 from .receptors import (
     HorizontalReceptorCandidatePool,
     RandomVerticalDraw,
+    _face_centers,
     VerticalTarget,
     build_vertical_targets,
     candidate_pool_fingerprint,
@@ -138,7 +149,14 @@ from .receptors import (
     select_horizontal_receptors_random_from_pool,
     validate_random_vertical_fractions,
 )
+from .receptor_stratified import (
+    AZIMUTH_DISTANCE_LATIN_SELECTION_SCOPE,
+    AZIMUTH_DISTANCE_LATIN_STREAM_SCOPE,
+    geodesic_azimuth_distance,
+    select_horizontal_receptors_azimuth_distance_latin,
+)
 from .scenarios import BASELINE_BEHAVIORS, ArrivalTime, Receptor, stable_identifier
+from .seam_jumps import build_seam_jump_exclusion
 from .time_axis import CanonicalTimeAxis, TimeChunk, canonicalize_time_chunks
 
 DERIVED_INPUT_SCHEMA_VERSION = LEGACY_INPUT_SCHEMA_VERSION
@@ -1170,6 +1188,45 @@ def _load_npy(path: Path, *, dtype: np.dtype[Any] | None = None) -> np.ndarray:
     if dtype is not None and array.dtype != dtype:
         raise InputDerivationError(f"NPY dtype 不符：{path}；{array.dtype} != {dtype}")
     return array
+
+
+SPARSE_PLACEHOLDER_MIN_BYTES = 1 << 20
+"""小於此大小的 NPY 不做稀疏檢查（小檔的區塊配置沒有診斷力）。"""
+SPARSE_PLACEHOLDER_MAX_ALLOCATED_FRACTION = 0.05
+"""實際配置區塊／檔案大小低於此比例即視為稀疏占位檔（內容全為 0 的假檔）。"""
+_DENSE_ARRAY_CHECKED: dict[str, bool] = {}
+
+
+def _assert_dense_array(array: Any, *, label: str) -> None:
+    """WP-63：讀「數值」前確認 memory-map 背後不是稀疏占位檔，否則 fail closed。
+
+    母體建置只讀 OCM native 的 zcor／elev／wetdry_elem 於實際沉底整點；若來源月份是只有檔頭的稀疏
+    占位檔（``st_blocks * 512`` 遠小於檔案大小），讀出的 0 值會被當成真實的乾濕與垂向座標。這裡以檔案
+    系統的實際配置量偵測，結果依路徑快取（每個檔案只 ``stat`` 一次）。沒有 ``filename`` 的陣列
+    （例如測試用的記憶體陣列）略過。只檢查「實際被讀取的月份」，所以不影響其他月份是占位檔的來源根。
+    """
+
+    filename = getattr(array, "filename", None)
+    if filename is None:
+        return
+    key = str(filename)
+    if _DENSE_ARRAY_CHECKED.get(key):
+        return
+    try:
+        status = os.stat(key)
+    except OSError as exc:
+        raise InputDerivationError(f"無法檢查來源檔案是否為稀疏占位檔：{key}；{exc}") from exc
+    if (
+        status.st_size >= SPARSE_PLACEHOLDER_MIN_BYTES
+        and status.st_blocks * 512 < SPARSE_PLACEHOLDER_MAX_ALLOCATED_FRACTION * status.st_size
+    ):
+        raise InputDerivationError(
+            f"{label} 讀到稀疏占位檔（內容全為 0，不是真實資料）：{key}；"
+            f"檔案大小 {status.st_size} bytes，實際配置 {status.st_blocks * 512} bytes。"
+            "母體建置的 OCM native 根必須是含實際數值的根（例如 lbt-local-data-v7-full 或 lbt-local-data-v6），"
+            "lbt-local-data-v6-full 只在其實檔月份可用。"
+        )
+    _DENSE_ARRAY_CHECKED[key] = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -3142,6 +3199,7 @@ def _face_times(
         if month_values is None:
             raise InputDerivationError(f"OCM cache 缺少月份 wetdry：{month.label}")
         wetdry = month_values.wetdry
+        _assert_dense_array(wetdry, label=f"OCM {month.label} wetdry_elem")
         frame = np.asarray(wetdry[local], dtype=np.float64)
         if frame.shape != (face_count,):
             raise InputDerivationError("OCM wetdry_elem face 維度與網格不符")
@@ -3202,6 +3260,7 @@ def _select_arrivals_for_site(
     selection_policy: str | None = None,
     tidal_strength_window_hours: float | None = None,
     allow_gap_censored_anchor: bool = False,
+    excluded_times_ns: Sequence[int] | None = None,
 ) -> list[ArrivalTime]:
     """依版本化 observation policy 產生單站 48+2 arrival。
 
@@ -3246,6 +3305,10 @@ def _select_arrivals_for_site(
     )
     valid = np.isfinite(values) & np.isfinite(waves) & np.isfinite(speeds) & nww_available
     valid &= np.isin(times, expected_axis)
+    if excluded_times_ns is not None and len(excluded_times_ns) > 0:
+        # WP-63：接縫跳動前後 ±1 小時的候選直接移出 valid；selector 以 valid 計算季內潮汐強度
+        # 中位數，所以中位數是在「排除後的候選集合」上重算，不需要另外處理。
+        valid &= ~np.isin(times, np.asarray(excluded_times_ns, dtype=np.int64))
     try:
         return select_arrival_times(
             study_site_id=site_id,
@@ -3923,6 +3986,7 @@ def _select_arrivals_with_nww_metric_location(
     tidal_strength_window_hours: float | None = None,
     allow_gap_censored_anchor: bool = False,
     maximum_snap_distance_m: float | None = None,
+    excluded_arrival_times_ns: Sequence[int] | None = None,
 ) -> tuple[list[ArrivalTime], _SiteArrivalSelectionContext]:
     """以 anchor-first policy 選出 arrival 並保存 NWW metric location binding。
 
@@ -3994,6 +4058,7 @@ def _select_arrivals_with_nww_metric_location(
             selection_policy=selection_policy,
             tidal_strength_window_hours=tidal_strength_window_hours,
             allow_gap_censored_anchor=allow_gap_censored_anchor,
+            excluded_times_ns=excluded_arrival_times_ns,
         )
         binding = _nww_metric_location_binding(
             nww_cache,
@@ -4307,6 +4372,403 @@ def _receptor_priority_polygon_metric(
     return clipped, coordinates
 
 
+# ---------------------------------------------------------------------------
+# WP-63：沉底「壞時刻」規則的資料面（失敗矩陣）。規則本身是 bad_hour_rule.py 的純函式。
+#
+# 順序（避開「失敗矩陣依賴沉底時刻、沉底時刻又依賴可用時刻」的循環）：
+#   1. 觀測到達時刻（arrival selector）已完成；
+#   2. 對每站，候選沉底整點 = OCM canonical 時間軸 ∩ 站點 NWW 支撐整點 ∩ 任一觀測往前 maximum_age 內的整點，
+#      也就是年齡抽樣器「理論上可能抽到」的全部整點（與抽到哪些無關）；
+#   3. 在這個候選整點集合上，對錨點 radius_m 內的 persistent-wet 候選面，逐面逐整點算失敗矩陣
+#      （NWW exact-hour 四角 ∪ OCM 垂向，與受體閘門 ``face_support`` 同一套判斷）；
+#   4. 套規則得到排除清單，交給 ``restrict_available_times_to_supported`` 從可用整點扣除；
+#   5. 之後才抽沉底年齡、再做受體閘門。
+# 因此排除清單不依賴任何已抽出的沉底整點。
+# ---------------------------------------------------------------------------
+
+_BAD_HOUR_CTX: dict[str, Any] = {}
+
+
+def _bad_hour_ocm_worker(face_index: int) -> np.ndarray:
+    """單一面在全部候選整點的 OCM 垂向失敗向量（True=失敗）。"""
+
+    ctx = _BAD_HOUR_CTX
+    mesh = ctx["mesh"]
+    depth = ctx["depth"]
+    hour_count = int(ctx["hour_count"])
+    node_count = int(mesh.face_node_count[face_index])
+    nodes = np.asarray(mesh.face_nodes_local[face_index, :node_count])
+    failed = np.zeros(hour_count, dtype=bool)
+    if np.any(nodes < 0) or np.any(nodes >= depth.size):
+        failed[:] = True
+        return failed
+    node_depth = np.asarray(depth[nodes], dtype=np.float64)
+    if node_depth.size != node_count or not np.all(np.isfinite(node_depth)):
+        failed[:] = True
+        return failed
+    draws: Sequence[RandomVerticalDraw] | None = None
+    if ctx["design_version"] == CURRENT_DESIGN_VERSION:
+        draws = sample_random_vertical_draws(
+            master_seed=int(ctx["master_seed"]),
+            study_site_id=str(ctx["site_id"]),
+            design_version=str(ctx["design_version"]),
+            source_face_local_index=int(face_index),
+            source_face_global_index=int(mesh.source_face_global_index[face_index]),
+        )
+    for month_values, rows, positions, _label in ctx["groups"]:
+        zcor_block = np.asarray(month_values.zcor[rows[:, None], nodes[None, :]], dtype=np.float64)
+        elev_block = np.asarray(month_values.elev[rows[:, None], nodes[None, :]], dtype=np.float64)
+        for k in range(rows.size):
+            try:
+                if draws is None:
+                    _build_face_vertical_support(
+                        zcor_node_layer=zcor_block[k],
+                        node_elev_m=elev_block[k],
+                        node_depth_m=node_depth,
+                        vertical_ids=_VERTICAL_TARGET_IDS,
+                    )
+                else:
+                    _build_face_vertical_support(
+                        zcor_node_layer=zcor_block[k],
+                        node_elev_m=elev_block[k],
+                        node_depth_m=node_depth,
+                        vertical_draws=draws,
+                    )
+            except InputDerivationError:
+                failed[int(positions[k])] = True
+    return failed
+
+
+def _bad_hour_group_sources(
+    pair_cache: _OCMPairCache, hours_ns: np.ndarray, *, site_id: str
+) -> list[tuple[_OCMMonthPairArrays, np.ndarray, np.ndarray, str]]:
+    """把候選整點依 OCM 月份分組：回傳 (月份陣列, local rows, 整點軸位置, 月份標籤)。"""
+
+    by_month: dict[str, tuple[list[int], list[int]]] = {}
+    for position, value in enumerate(hours_ns):
+        source = pair_cache.utc_prefer_last_index.get(int(value))
+        if source is None:
+            raise InputDerivationError(f"{site_id} 候選沉底整點不在 OCM source time：{int(value)}")
+        month, local = source
+        rows, positions = by_month.setdefault(month.label, ([], []))
+        rows.append(int(local))
+        positions.append(position)
+    groups = []
+    for label in sorted(by_month):
+        month_values = pair_cache.monthly_arrays.get(label)
+        if month_values is None:
+            raise InputDerivationError(f"{site_id} OCM cache 缺少月份：{label}")
+        _assert_dense_array(month_values.zcor, label=f"OCM {label} zcor")
+        _assert_dense_array(month_values.elev, label=f"OCM {label} elev")
+        _assert_dense_array(month_values.wetdry, label=f"OCM {label} wetdry_elem")
+        rows_array = np.asarray(by_month[label][0], dtype=np.int64)
+        positions_array = np.asarray(by_month[label][1], dtype=np.int64)
+        order = np.argsort(rows_array, kind="stable")
+        groups.append((month_values, rows_array[order], positions_array[order], label))
+    return groups
+
+
+def _bad_hour_workers() -> int:
+    raw = os.environ.get("LBT_BAD_HOUR_WORKERS")
+    if raw is None:
+        return max(1, min(8, os.cpu_count() or 1))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise InputDerivationError(f"LBT_BAD_HOUR_WORKERS 必須是正整數：{raw!r}") from exc
+    if value < 1:
+        raise InputDerivationError(f"LBT_BAD_HOUR_WORKERS 必須是正整數：{raw!r}")
+    return value
+
+
+def _site_flow_margin_m(site: StudySiteConfig, mesh: NativeMesh) -> float:
+    """與 ``_receptor_payload`` 相同的邊界緩衝公尺數（網格尺度 × 網格中位邊長）。"""
+
+    margin = float(
+        site.model_extra.get("minimum_flow_domain_margin_local_grid_scales", 0.0)
+        if site.model_extra
+        else 0.0
+    )
+    if margin > 0:
+        triangle_edges = np.linalg.norm(
+            mesh.node_xy[mesh.triangle_nodes] - np.roll(mesh.node_xy[mesh.triangle_nodes], -1, axis=1),
+            axis=2,
+        )
+        margin *= float(np.median(triangle_edges[triangle_edges > 0])) if np.any(triangle_edges > 0) else 0.0
+    return margin
+
+
+def _bad_hour_failure_matrix_for_site(
+    *,
+    config: ProjectConfig,
+    parameters: BadHourRuleParameters,
+    site: StudySiteConfig,
+    mesh: NativeMesh,
+    projection: DomainProjection,
+    pair_cache: _OCMPairCache,
+    nww_cache: _NWWRuntimeCache,
+    local_polygon_lonlat: Polygon,
+    anchor_lonlat: tuple[float, float],
+    hours_ns: np.ndarray,
+    workers: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """回傳 (失敗矩陣 [面, 整點], 面 local index, 面面積 m^2, 額外稽核)。"""
+
+    site_id = site.study_site_id
+    groups = _bad_hour_group_sources(pair_cache, hours_ns, site_id=site_id)
+    face_total = int(mesh.face_nodes_local.shape[0])
+    centers = _face_centers(mesh)
+    anchor_x, anchor_y = projection.project(*anchor_lonlat)
+    metric_distance = np.hypot(centers[:, 0] - float(anchor_x), centers[:, 1] - float(anchor_y))
+    near = np.flatnonzero(metric_distance <= 1.1 * float(parameters.radius_m) + 1000.0)
+    if near.size == 0:
+        raise InputDerivationError(f"{site_id} 錨點 {parameters.radius_m:g} m 附近沒有 OCM 面")
+    # persistent-wet：只對錨點附近的面逐月讀 wetdry（整列讀取後取子集，分塊避免記憶體暴增）。
+    persistent = np.ones(near.size, dtype=bool)
+    for month_values, rows, _positions, label in groups:
+        for start in range(0, rows.size, 128):
+            block = np.asarray(month_values.wetdry[rows[start : start + 128]], dtype=np.float64)
+            if block.ndim != 2 or block.shape[1] != face_total:
+                raise InputDerivationError(f"{site_id} OCM {label} wetdry_elem face 維度與網格不符")
+            sub = block[:, near]
+            persistent &= np.all(np.isfinite(sub) & np.isclose(sub, 0.0, atol=0.1), axis=0)
+    wet_flag = np.ones((1, face_total), dtype=np.float64)
+    wet_flag[0, near[persistent]] = 0.0
+    candidate_metric = _receptor_candidate_polygon_metric(
+        site=site, projection=projection, local_polygon_lonlat=local_polygon_lonlat
+    )
+    pool = prepare_horizontal_receptor_candidates(
+        study_site_id=site_id,
+        mesh=mesh,
+        candidate_polygon_metric=candidate_metric,
+        anchor_xy=(float(anchor_x), float(anchor_y)),
+        wetdry_at_arrivals=wet_flag,
+        boundary_margin_m=_site_flow_margin_m(site, mesh),
+        wet_value=0.0,
+    )
+    _az, distance = geodesic_azimuth_distance(
+        anchor_lonlat, np.asarray(pool.candidate_lon), np.asarray(pool.candidate_lat)
+    )
+    keep = np.flatnonzero(distance <= float(parameters.radius_m))
+    if keep.size == 0:
+        raise InputDerivationError(f"{site_id} 錨點 {parameters.radius_m:g} m 內沒有 persistent-wet 候選面")
+    face_ids = np.asarray(pool.candidate_face_local_indices, dtype=np.int64)[keep]
+    face_lon = np.asarray(pool.candidate_lon)[keep]
+    face_lat = np.asarray(pool.candidate_lat)[keep]
+    face_area = np.asarray(pool.candidate_area_m2, dtype=np.float64)[keep]
+    hour_count = int(hours_ns.size)
+    failed = np.zeros((face_ids.size, hour_count), dtype=bool)
+    # NWW exact-hour 四角：同一個 NWW cell（四角相同）結果相同，每 cell 只呼叫一次。
+    cell_ok: dict[tuple[tuple[int, ...], tuple[int, ...]], np.ndarray] = {}
+    hours_tuple = tuple(int(value) for value in hours_ns)
+    for row, (lon, lat) in enumerate(zip(face_lon, face_lat, strict=True)):
+        support = _nww_runtime_spatial_support(nww_cache, lon=float(lon), lat=float(lat))
+        if support is None:
+            failed[row, :] = True
+            continue
+        corner_y, corner_x, _weights, _static_valid = support
+        key = (tuple(int(v) for v in corner_y), tuple(int(v) for v in corner_x))
+        ok = cell_ok.get(key)
+        if ok is None:
+            _hs, valid = _nww_exact_hour_samples(
+                nww_cache, lon=float(lon), lat=float(lat), requested_times=hours_tuple
+            )
+            ok = np.fromiter((bool(valid.get(value, False)) for value in hours_tuple), dtype=bool, count=hour_count)
+            cell_ok[key] = ok
+        failed[row, :] = ~ok
+    nww_failed_faces = int(failed.any(axis=1).sum())
+    # OCM 垂向：只對 NWW 全數通過以外的格子也必須算（聯集），故對全部候選面逐面計算。
+    _BAD_HOUR_CTX.clear()
+    _BAD_HOUR_CTX.update(
+        mesh=mesh,
+        depth=pair_cache.depth,
+        hour_count=hour_count,
+        design_version=config.design_version,
+        master_seed=config.scenarios.master_seed,
+        site_id=site_id,
+        groups=groups,
+    )
+    try:
+        face_list = [int(value) for value in face_ids]
+        if workers > 1:
+            import multiprocessing
+
+            with multiprocessing.get_context("fork").Pool(workers) as pool_workers:
+                results = pool_workers.imap(_bad_hour_ocm_worker, face_list, chunksize=8)
+                for row, vector in enumerate(results):
+                    failed[row, :] |= vector
+        else:
+            for row, face in enumerate(face_list):
+                failed[row, :] |= _bad_hour_ocm_worker(face)
+    finally:
+        _BAD_HOUR_CTX.clear()
+    extra = {
+        "anchor_lonlat": [float(anchor_lonlat[0]), float(anchor_lonlat[1])],
+        "persistent_wet_face_count_near_anchor": int(persistent.sum()),
+        "nww_cell_count": len(cell_ok),
+        "faces_with_any_nww_failure": nww_failed_faces,
+        "ocm_month_labels": [label for _m, _r, _p, label in groups],
+        "candidate_hours_sha256": hours_sha256(hours_ns.tolist()),
+        "first_candidate_hour_utc_ns": int(hours_ns[0]),
+        "last_candidate_hour_utc_ns": int(hours_ns[-1]),
+    }
+    return failed, face_ids, face_area, extra
+
+
+def _bad_hour_cache_file(
+    *,
+    site_id: str,
+    anchor_lonlat: tuple[float, float],
+    radius_m: float,
+    hours_ns: np.ndarray,
+    face_count: int,
+) -> Path | None:
+    """失敗矩陣的續跑快取檔路徑（只在設定 ``LBT_BAD_HOUR_CACHE_DIR`` 時啟用；預設不啟用，行為不變）。
+
+    快取只是建置失敗後的續跑輔助：鍵含站、錨點、半徑、候選整點的 SHA-256、網格面數與
+    ``LBT_BAD_HOUR_CACHE_TAG``（呼叫端必須在資料根或程式碼改變時換標籤）。矩陣指紋仍會寫進 manifest。
+    """
+
+    root = os.environ.get("LBT_BAD_HOUR_CACHE_DIR")
+    if not root:
+        return None
+    key = sha256(
+        json.dumps(
+            {
+                "site": site_id,
+                "anchor": [round(float(v), 9) for v in anchor_lonlat],
+                "radius_m": float(radius_m),
+                "hours_sha256": sha256(np.asarray(hours_ns, dtype=np.int64).tobytes()).hexdigest(),
+                "face_count": int(face_count),
+                "tag": os.environ.get("LBT_BAD_HOUR_CACHE_TAG", ""),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return Path(root) / f"{site_id}_{key[:20]}.npz"
+
+
+def _bad_hour_cache_load(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]] | None:
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            shape = tuple(int(v) for v in data["shape"])
+            bits = np.unpackbits(data["failed_bits"])[: shape[0] * shape[1]]
+            failed = bits.reshape(shape).astype(bool)
+            extra = json.loads(str(data["extra_json"]))
+            return failed, np.asarray(data["face_ids"]), np.asarray(data["face_area"]), extra
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _bad_hour_cache_store(
+    path: Path, failed: np.ndarray, face_ids: np.ndarray, face_area: np.ndarray, extra: Mapping[str, Any]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}.npz")
+    np.savez(
+        tmp,
+        shape=np.asarray(failed.shape, dtype=np.int64),
+        failed_bits=np.packbits(np.asarray(failed, dtype=bool).ravel()),
+        face_ids=np.asarray(face_ids),
+        face_area=np.asarray(face_area),
+        extra_json=np.asarray(json.dumps(dict(extra), default=lambda o: o.item() if hasattr(o, "item") else str(o))),
+    )
+    os.replace(tmp, path)
+
+
+def _derive_bad_hours_by_rule(
+    *,
+    config: ProjectConfig,
+    rule: DepositionBadHourRuleConfig,
+    bed_residence: BedResidenceTimeConfig,
+    ocm_by_region: Mapping[str, _ProductData],
+    nww_runtime_caches: Mapping[str, _NWWRuntimeCache],
+    local_polygons: Mapping[str, Polygon],
+    arrivals_by_site: Mapping[str, Sequence[ArrivalTime]],
+    arrival_contexts: Mapping[str, _SiteArrivalSelectionContext],
+    canonical_available_by_site: Mapping[str, Sequence[int]],
+    ocm_pair_caches: dict[str, _OCMPairCache],
+) -> tuple[dict[str, tuple[int, ...]], dict[str, Any]]:
+    """依規則導出每站壞時刻，回傳值形狀與 ``load_deposition_exclusion_hours`` 相同。"""
+
+    parameters = rule.to_parameters()
+    workers = _bad_hour_workers()
+    hour_ns = 3_600_000_000_000
+    max_age_ns = int(round(float(bed_residence.maximum_age_days) * 24.0)) * hour_ns
+    domain_by_region = {domain.analysis_region_id: domain for domain in config.domains}
+    site_by_id = {site.study_site_id: site for site in config.study_sites}
+    meshes: dict[str, NativeMesh] = {}
+    by_site: dict[str, tuple[int, ...]] = {}
+    audits: dict[str, Any] = {}
+    for site_id in sorted(canonical_available_by_site):
+        site = site_by_id[site_id]
+        region = site.analysis_region_id
+        product = ocm_by_region[region]
+        domain = domain_by_region[region]
+        projection = DomainProjection(*domain.center_lonlat)
+        mesh = meshes.get(product.flow_domain_id)
+        if mesh is None:
+            mesh = _load_native_mesh(product, projection)
+            meshes[product.flow_domain_id] = mesh
+        pair_cache = ocm_pair_caches.get(region)
+        if pair_cache is None:
+            pair_cache = _load_ocm_pair_cache(product)
+            ocm_pair_caches[region] = pair_cache
+        pair_cache = _assert_ocm_pair_cache(product, pair_cache)
+        canonical = np.asarray(sorted({int(v) for v in canonical_available_by_site[site_id]}), dtype=np.int64)
+        supported_map = arrival_contexts[site_id].nww_valid
+        supported = np.fromiter(
+            (bool(supported_map.get(int(v), False)) for v in canonical), dtype=bool, count=canonical.size
+        )
+        observations = np.asarray(sorted(int(a.time_utc_ns) for a in arrivals_by_site[site_id]), dtype=np.int64)
+        position = np.searchsorted(observations, canonical, side="left")
+        reachable = position < observations.size
+        reachable[reachable] = (observations[position[reachable]] - canonical[reachable]) <= max_age_ns
+        hours = canonical[supported & reachable]
+        if hours.size == 0:
+            raise InputDerivationError(f"{site_id} 沒有任何候選沉底整點可供壞時刻規則使用")
+        anchor_lonlat = site.anchor_lonlat or domain.center_lonlat
+        cache_file = _bad_hour_cache_file(
+            site_id=site_id,
+            anchor_lonlat=(float(anchor_lonlat[0]), float(anchor_lonlat[1])),
+            radius_m=float(parameters.radius_m),
+            hours_ns=hours,
+            face_count=int(np.asarray(mesh.face_nodes_local).shape[0]),
+        )
+        cached = _bad_hour_cache_load(cache_file) if cache_file is not None else None
+        if cached is not None:
+            failed, face_ids, face_area, extra = cached
+        else:
+            failed, face_ids, face_area, extra = _bad_hour_failure_matrix_for_site(
+                config=config,
+                parameters=parameters,
+                site=site,
+                mesh=mesh,
+                projection=projection,
+                pair_cache=pair_cache,
+                nww_cache=nww_runtime_caches[region],
+                local_polygon_lonlat=local_polygons[site_id],
+                anchor_lonlat=(float(anchor_lonlat[0]), float(anchor_lonlat[1])),
+                hours_ns=hours,
+                workers=workers,
+            )
+            if cache_file is not None:
+                _bad_hour_cache_store(cache_file, failed, face_ids, face_area, extra)
+        derivation = derive_bad_hours_from_failure_matrix(failed, face_area, hours.tolist(), parameters)
+        audit = derivation_audit(derivation, parameters, face_ids=face_ids.tolist(), failed=failed, extra=extra)
+        by_site[site_id] = tuple(derivation.excluded_time_ns)
+        audits[site_id] = {key: value for key, value in audit.items() if key != "excluded_hours_utc_ns"}
+    source = {
+        "source": "derived_rule",
+        "policy_id": BAD_HOUR_RULE_POLICY_ID,
+        "parameters": parameters.to_dict(),
+        "by_site_audit": audits,
+    }
+    return by_site, source
+
+
 def _receptor_payload(
     *,
     config: ProjectConfig,
@@ -4416,6 +4878,14 @@ def _receptor_payload(
             meshes[product.flow_domain_id] = mesh
         polygon_lonlat = local_polygons[site_id]
         candidate_specs = _candidate_region_specs(site)
+        # WP-63：方位×距離等面積拉丁方格分層抽樣只在 current formal 且設定檔明示該 policy 時啟用。
+        use_latin_policy = (
+            config.design_version == CURRENT_DESIGN_VERSION
+            and config.scenarios.horizontal_receptor_selection_policy
+            == HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN
+        )
+        if use_latin_policy and candidate_specs:
+            raise InputDerivationError(f"{site_id} 分層抽樣 policy 不支援紅框候選區")
         if candidate_specs:
             # 紅框候選是新的研究空間契約：先與 approved local/flow geometry 求交，
             # 但不再套用舊版 12,500 m 圓形核心。核心欄位仍由 config 保留作舊版
@@ -4598,6 +5068,8 @@ def _receptor_payload(
                     )
                 zcor = month_values.zcor
                 elev = month_values.elev
+                _assert_dense_array(zcor, label=f"OCM {source_month.label} zcor")
+                _assert_dense_array(elev, label=f"OCM {source_month.label} elev")
                 support_key: _VerticalSupportCacheKey = (
                     analysis_region_id,
                     site_id,
@@ -4773,7 +5245,7 @@ def _receptor_payload(
             priority_pool: HorizontalReceptorCandidatePool | None = None
             priority_coordinates: tuple[tuple[float, float], ...] = ()
             priority_fallback_reason: str | None = None
-            if site.receptor_priority_polygon is not None:
+            if site.receptor_priority_polygon is not None and not use_latin_policy:
                 priority_metric, priority_coordinates = _receptor_priority_polygon_metric(
                     site=site,
                     projection=projection,
@@ -4803,7 +5275,94 @@ def _receptor_payload(
                             f"{priority_count} < 5"
                         )
             fixed_coordinates = site.horizontal_receptor_coordinates
-            if fixed_coordinates is not None:
+            if use_latin_policy:
+                # 分層抽樣：候選池是既有的 persistent-wet／邊界緩衝核心池（priority polygon 在此 policy
+                # 下不使用），在錨點為圓心、radius_m 的測地線圓內做方位×距離等面積分層；閘門仍是
+                # 原本的 face_support（NWW exact-hour 四角支撐與 OCM 垂向支撐），沒通過者依隨機順序遞補。
+                sampling_cfg = config.scenarios.horizontal_receptor_sampling
+                if sampling_cfg is None:
+                    raise InputDerivationError(
+                        f"{site_id} 使用分層抽樣 policy，但設定檔沒有 scenarios.horizontal_receptor_sampling"
+                    )
+                if (
+                    site.receptor_core_radius_m is not None
+                    and float(sampling_cfg.radius_m) > float(site.receptor_core_radius_m)
+                ):
+                    raise InputDerivationError(
+                        f"{site_id} 抽樣半徑 {sampling_cfg.radius_m:g} m 不得大於受體核心半徑 "
+                        f"{site.receptor_core_radius_m:g} m"
+                    )
+                latin_master_seed = config.scenarios.master_seed
+                if latin_master_seed is None:
+                    raise InputDerivationError(f"{site_id} 分層抽樣需要 scenarios.master_seed")
+
+                def latin_gate(
+                    horizontal_item: Any,
+                    *,
+                    _face_support: Any = face_support,
+                    _cache: dict[int, _FaceVerticalSupport | None] = face_support_cache,
+                    _errors: dict[int, str] = face_support_errors,
+                    _templates: dict[int, _FaceVerticalSupport] = template_supports,
+                    _blacklist: set[int] = blacklisted_faces,
+                ) -> bool:
+                    face_index = int(horizontal_item.source_face_local_index)
+                    if face_index in _blacklist:
+                        return False
+                    try:
+                        support = _face_support(horizontal_item)
+                    except InputDerivationError as exc:
+                        _cache[face_index] = None
+                        _errors[face_index] = str(exc)
+                        _blacklist.add(face_index)
+                        return False
+                    _cache[face_index] = support
+                    _templates[face_index] = support
+                    return True
+
+                try:
+                    horizontal, latin_record = select_horizontal_receptors_azimuth_distance_latin(
+                        core_candidate_pool,
+                        anchor_lonlat=(float(anchor_lonlat[0]), float(anchor_lonlat[1])),
+                        master_seed=int(latin_master_seed),
+                        design_version=config.design_version,
+                        radius_m=float(sampling_cfg.radius_m),
+                        count=int(sampling_cfg.strata_count),
+                        is_supported=latin_gate,
+                        selection_policy_id=config.scenarios.horizontal_receptor_selection_policy,
+                        azimuth_sectors=sampling_cfg.azimuth_sectors_for(site_id),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise InputDerivationError(
+                        f"{site_id} 方位×距離分層抽樣失敗（fail closed，不放寬、不補點）：{exc}"
+                    ) from exc
+                selection_scope = AZIMUTH_DISTANCE_LATIN_SELECTION_SCOPE
+                random_horizontal_selection_by_site[site_id] = {
+                    "selection_policy": config.scenarios.horizontal_receptor_selection_policy,
+                    "seed_policy": RECEPTOR_SELECTION_SEED_POLICY_ID,
+                    "master_seed": int(latin_master_seed),
+                    "streams": [
+                        {
+                            "stream_scope": AZIMUTH_DISTANCE_LATIN_STREAM_SCOPE,
+                            "derived_seed_hex": latin_record["derived_seed_hex"],
+                            "seed_derivation_sha256": latin_record["seed_derivation_sha256"],
+                            "candidate_pool_sha256": candidate_pool_fingerprint(core_candidate_pool),
+                        }
+                    ],
+                    "selection_scope": selection_scope,
+                    "candidate_face_count_persistent_wet_margin": int(candidate_count),
+                    "priority_candidate_face_count_persistent_wet_margin": 0,
+                    "selected_draw_order_local_indices": [
+                        int(item.source_face_local_index) for item in horizontal
+                    ],
+                    "selected_draw_order_global_indices": [
+                        int(item.source_face_global_index) for item in horizontal
+                    ],
+                    "priority_selected_count": 0,
+                    "core_fallback_selected_count": len(horizontal),
+                    "face_support_failure_summary": _summarize_face_support_failures(face_support_errors),
+                    "stratified_sampling": latin_record,
+                }
+            elif fixed_coordinates is not None:
                 # 固定受體必須由相同 OCM mesh 的五個 persistent-wet face 逐點對應；
                 # 一旦某點不在候選池，或 50 個 arrival 的 OCM/NWW 支援失敗，直接
                 # fail closed。此分支刻意不執行 maximin blacklist fallback，避免把
@@ -5173,7 +5732,7 @@ def _receptor_payload(
                     # random stream 的 draw order。此 index 不是空間優先序。
                     metadata.update(
                         {
-                            "horizontal_selection_policy": HORIZONTAL_RECEPTOR_SELECTION_POLICY_ID,
+                            "horizontal_selection_policy": config.scenarios.horizontal_receptor_selection_policy,
                             "horizontal_selection_draw_order": int(horizontal_order),
                         }
                     )
@@ -5242,6 +5801,14 @@ def _receptor_payload(
     elif priority_selection_by_site:
         receptor_method_id = (
             "server_v3_persistent_wet_face_seeded_random_soft_priority_or_core_fallback_5x4x4_ocm_nww_runtime_support_v1"
+        )
+    elif (
+        random_horizontal_selection_by_site
+        and config.scenarios.horizontal_receptor_selection_policy
+        == HORIZONTAL_RECEPTOR_SELECTION_POLICY_AZIMUTH_DISTANCE_LATIN
+    ):
+        receptor_method_id = (
+            "server_v3_persistent_wet_face_azimuth_distance_equal_area_latin_5x4x4_ocm_nww_runtime_support_v1"
         )
     elif random_horizontal_selection_by_site:
         receptor_method_id = (
@@ -5530,6 +6097,9 @@ def _dynamic_initial_payload(
             zcor = month_values.zcor
             elev = month_values.elev
             wetdry = month_values.wetdry
+            _assert_dense_array(zcor, label=f"OCM {month.label} zcor")
+            _assert_dense_array(elev, label=f"OCM {month.label} elev")
+            _assert_dense_array(wetdry, label=f"OCM {month.label} wetdry_elem")
             # dynamic 只需要目前 receptor 所在 face 的濕乾狀態；直接以二維索引取一個
             # scalar，避免先把整個 time row materialize 成 float64。receptor 階段仍需
             # 整列 wetdry 建立 horizontal candidate pool，兩者資料需求不同，不能以此
@@ -5687,6 +6257,7 @@ def _arrival_payload(
     pilot_selection: Mapping[str, Any] | None = None,
     deposition_label_provenance: Mapping[str, Any] | None = None,
     deposition_support_provenance: Mapping[str, Any] | None = None,
+    seam_jump_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """將 ArrivalTime dataclass 轉成 strict schema 1 manifest。
 
@@ -5792,6 +6363,9 @@ def _arrival_payload(
                     else {}
                 ),
             }
+    if seam_jump_provenance is not None:
+        # WP-63：排除清單（每站 UTC ns）與其 SHA-256 進 manifest provenance，載入器重新核對。
+        provenance_extra["seam_jump_exclusion"] = json.loads(json.dumps(seam_jump_provenance))
     if pilot_selection is not None:
         provenance_extra["pilot_selection_scope"] = dict(pilot_selection)
     if horizon_settings is not None and horizon_settings.is_generic:
@@ -7697,6 +8271,31 @@ def build_input_derivatives(
     sites_by_region: dict[str, list[str]] = {}
     for site in config.study_sites:
         sites_by_region.setdefault(site.analysis_region_id, []).append(site.study_site_id)
+    # WP-63：OCM 日檔接縫跳動排除。啟用時先對全部站點的錨點水位序列做 V1 判準，五站聯集後
+    # 每站前後各 ±exclusion_radius 小時的時刻從候選移除；預設（設定檔未明示）完全不排除。
+    seam_config = arrival_selection.seam_jump_exclusion if arrival_selection is not None else None
+    seam_exclusion = None
+    surface_series_cache: dict[str, tuple[Mapping[int, float], Mapping[int, float]]] = {}
+    if seam_config is not None:
+        seam_series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for site in sorted(config.study_sites, key=lambda item: item.study_site_id):
+            site_domain = next(item for item in config.domains if item.analysis_region_id == site.analysis_region_id)
+            lon0, lat0 = site.anchor_lonlat or site_domain.center_lonlat
+            series = _surface_series_for_location(
+                products_by_region[site.analysis_region_id][1], lon=float(lon0), lat=float(lat0)
+            )
+            surface_series_cache[site.study_site_id] = series
+            seam_series[site.study_site_id] = (
+                np.asarray(expected_axis, dtype=np.int64),
+                np.asarray(
+                    [float(series[0].get(int(t), float("nan"))) for t in expected_axis], dtype=np.float64
+                ),
+            )
+        seam_exclusion = build_seam_jump_exclusion(
+            seam_series,
+            reference_years=observation_years if observation_years is not None else tuple(int(y) for y in config.inputs.years),
+            parameters=seam_config.to_parameters(),
+        )
     for region, site_ids in sorted(sites_by_region.items()):
         nww = nww_by_region[region]
         ocm = ocm_by_region[region]
@@ -7715,11 +8314,14 @@ def build_input_derivatives(
                 else float(site.receptor_core_radius_m)
             )
             surface = products_by_region[region][1]
-            elevation, speed = _surface_series_for_location(
-                surface,
-                lon=float(site_lon),
-                lat=float(site_lat),
-            )
+            if site_id in surface_series_cache:
+                elevation, speed = surface_series_cache[site_id]
+            else:
+                elevation, speed = _surface_series_for_location(
+                    surface,
+                    lon=float(site_lon),
+                    lat=float(site_lat),
+                )
             selected, context = _select_arrivals_with_nww_metric_location(
                 site_id=site_id,
                 anchor_lon=float(site_lon),
@@ -7741,6 +8343,9 @@ def build_input_derivatives(
                 tidal_strength_window_hours=selection_tidal_strength_window_hours,
                 allow_gap_censored_anchor=gap_censoring_enabled,
                 maximum_snap_distance_m=maximum_metric_snap_distance_m,
+                excluded_arrival_times_ns=(
+                    seam_exclusion.excluded_time_ns_by_site[site_id] if seam_exclusion is not None else None
+                ),
             )
             explicit = pilot_arrivals.get(site_id)
             # A 區 exact pair 必須先建立共同 UTC，再各自套用明示 replacement；若在
@@ -7765,7 +8370,10 @@ def build_input_derivatives(
             arrival_contexts[site_id] = context
     # A 區共用同一套 forcing 時，只要兩站都能支援，使用同一組 UTC；站點 ID 重新 hash，
     # 但 stratum/時間保持一致，避免兩個相連站點因代表 scalar 微小差異失去可比較性。
-    if "gongliao" in arrivals_by_site and "guishan" in arrivals_by_site:
+    pair_northeast_utc = arrival_selection is None or arrival_selection.pairs_northeast_utc
+    if not pair_northeast_utc and set(pilot_arrivals) == {"gongliao", "guishan"}:
+        raise InputDerivationError("pilot exact pair 需要 A 區 paired UTC；獨立選時設定不能與 pilot pair 並用")
+    if pair_northeast_utc and "gongliao" in arrivals_by_site and "guishan" in arrivals_by_site:
         guishan_context = arrival_contexts["guishan"]
         guishan_product = ocm_by_region[
             next(site.analysis_region_id for site in config.study_sites if site.study_site_id == "guishan")
@@ -7804,6 +8412,8 @@ def build_input_derivatives(
         raise InputDerivationError(f"arrival 應有 250 筆，實際 {len(all_arrivals)}")
     deposition_label_provenance: dict[str, Any] | None = None
     deposition_support_provenance: dict[str, Any] | None = None
+    # WP-63：壞時刻規則需要在沉底年齡抽樣之前讀 OCM；pair cache 提前建立並與後續階段共用（內容不變）。
+    ocm_pair_caches: dict[str, _OCMPairCache] = {}
     if bed_residence is not None:
         # 五站先各完成 50 筆 observation-anchor selector，A 區的 paired UTC 也已定案；
         # 現在才依單一 seed 產生共用的 50 個整點沉底年齡，並把 runtime 起點轉為沉底 UTC。
@@ -7823,6 +8433,25 @@ def build_input_derivatives(
                 # （與觀測錨點選取同一個 gate、同一份序列）時，整個候選池都無法通過，所以把它
                 # 當成不可用整點，由抽樣器在缺口拒絕時一併排除（可重現、寫進拒絕稽核），而不是
                 # 放寬受體檢核。per_observation 維持原行為（只有 50 個沉底整點，未見此問題）。
+                external_exclusion = load_deposition_exclusion_hours(
+                    bed_residence, site_ids=canonical_available_by_site
+                )
+                bad_hour_rule = getattr(bed_residence, "deposition_bad_hour_rule", None)
+                if bad_hour_rule is not None:
+                    if external_exclusion is not None:
+                        raise InputDerivationError("deposition_bad_hour_rule 與壞時刻清單欄位互斥")
+                    external_exclusion = _derive_bad_hours_by_rule(
+                        config=config,
+                        rule=bad_hour_rule,
+                        bed_residence=bed_residence,
+                        ocm_by_region=ocm_by_region,
+                        nww_runtime_caches=nww_runtime_caches,
+                        local_polygons=local_polygons,
+                        arrivals_by_site=arrivals_by_site,
+                        arrival_contexts=arrival_contexts,
+                        canonical_available_by_site=canonical_available_by_site,
+                        ocm_pair_caches=ocm_pair_caches,
+                    )
                 canonical_available_by_site, deposition_support_provenance = (
                     restrict_available_times_to_supported(
                         canonical_available_by_site,
@@ -7834,8 +8463,20 @@ def build_input_derivatives(
                             ]
                             for site_id in canonical_available_by_site
                         },
+                        extra_excluded_time_ns_by_site=(
+                            external_exclusion[0] if external_exclusion is not None else None
+                        ),
+                        extra_exclusion_source=(
+                            external_exclusion[1] if external_exclusion is not None else None
+                        ),
                     )
                 )
+            elif (
+                getattr(bed_residence, "deposition_exclusion_hours_by_site", None) is not None
+                or getattr(bed_residence, "deposition_exclusion_hours_file", None) is not None
+                or getattr(bed_residence, "deposition_bad_hour_rule", None) is not None
+            ):
+                raise InputDerivationError("壞時刻排除清單只支援 per_member 沉底年齡抽樣")
             # helper 逐站傳入一樣的年齡向量，並以回傳 mapping 完整取代 observation
             # rows；後續 receptor/dynamic、arrival manifest 與 gap gate 因而共同使用
             # deposition UTC，不會只有 all_arrivals 改了、站點 mapping 卻仍留觀測時刻。
@@ -7883,9 +8524,9 @@ def build_input_derivatives(
     # pair cache；receptor 需要整列 wetdry 來選水平 face，dynamic 只取 selected face scalar，
     # 但兩階段共用同一批 memory-map 與 prefer-last UTC index。外層 key 統一使用
     # analysis_region_id，避免把不同 region 的產品因 flow-domain 字串碰巧相同而錯接。
-    ocm_pair_caches = {
-        region: _load_ocm_pair_cache(product) for region, product in sorted(ocm_by_region.items())
-    }
+    for region, product in sorted(ocm_by_region.items()):
+        if region not in ocm_pair_caches:
+            ocm_pair_caches[region] = _load_ocm_pair_cache(product)
     vertical_support_cache: dict[_VerticalSupportCacheKey, _FaceVerticalSupport] = {}
     receptor_payload, receptor_index, receptor_objects, meshes, projections = _receptor_payload(
         config=config,
@@ -7922,6 +8563,7 @@ def build_input_derivatives(
         pilot_selection=pilot_selection,
         deposition_label_provenance=deposition_label_provenance,
         deposition_support_provenance=deposition_support_provenance,
+        seam_jump_provenance=seam_exclusion.provenance if seam_exclusion is not None else None,
     )
     dynamic_payload = _dynamic_initial_payload(
         config=config,
