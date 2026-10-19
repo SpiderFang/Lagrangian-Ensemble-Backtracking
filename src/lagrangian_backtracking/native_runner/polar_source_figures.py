@@ -6,7 +6,8 @@
 在地圖上是真正的圓，因為地圖長寬比已依緯度校正）；圓分成 36 個各寬 10° 的扇區，扇區以 0°、10°、…、350°
 為中心。每個扇區的值是「來源方位落在該扇區的虛擬質點占該組全部虛擬質點的比例（%）」，36 個值依序連成
 **封閉的極座標折線**（半徑 = 比例，不是玫瑰圖的扇形長條）。折線的半徑與比例的對照由同心圓與半徑刻度
-（如 5%、10%、…）給出。來源方位的計算、擱淺與其他終止類別的處理見 :mod:`polar_source`。
+（如 5%、10%、…）給出。來源方位的計算見 :mod:`polar_source`：穿越開放邊界者用離開點，其餘全部（未穿越者）以最終位置的方位計入，視為海岸來源，
+每組 36 扇區合計 100%；總曲線就是這一條，兩種來源的拆分只寫在統計表與副標。
 
 每案每地點 13 張圖（含文字版與無文字版各一套，各自輸出 PNG 與 SVG）：
 
@@ -251,7 +252,6 @@ class PolarFigurePlan:
     n_totals: list[int]
     radius_max_pct: float
     radius_ticks_pct: list[float]
-    stranded_lonlat: np.ndarray  # (n, 2)
     caption_zh: str
 
 
@@ -266,17 +266,14 @@ def _line_colors(kind: str, group_ids: Sequence[str]) -> list[Any]:
     return [cm.viridis(0.88 * (i / max(k - 1, 1))) for i in range(k)]
 
 
-def _coverage(an: SiteAnalysis, grouping: str, members: Sequence[int]) -> tuple[int, float, float, float]:
+def _coverage(an: SiteAnalysis, grouping: str, members: Sequence[int]) -> tuple[int, float, float]:
+    """所選組別全部質點數，與穿越開放邊界、海岸來源（未穿越者）各占的百分比（兩者合計 100）。"""
+
     gs = an.group_sets[grouping]
     sel = np.isin(gs.group_code, list(members))
     n = int(sel.sum())
-    kinds = an.sample.kind[sel]
-    return (
-        n,
-        100.0 * float(np.count_nonzero(kinds == ps.KIND_CROSSED)) / n,
-        100.0 * float(np.count_nonzero(kinds == ps.KIND_STRANDED)) / n,
-        100.0 * float(np.count_nonzero(kinds == ps.KIND_OTHER)) / n,
-    )
+    crossed = 100.0 * float(np.count_nonzero(an.sample.kind[sel] == ps.KIND_CROSSED)) / n
+    return n, crossed, 100.0 - crossed
 
 
 def _thousands(n: int) -> str:
@@ -308,7 +305,7 @@ def build_figure_plans(
         else:
             subsets = [("", list(range(len(gs.group_ids))))]
         for material, members in subsets:
-            n, crossed, stranded, other = _coverage(an, grouping, members)
+            n, crossed, coast = _coverage(an, grouping, members)
             ids = [gs.group_ids[i] for i in members]
             if kind == "A":
                 labels = [gs.labels_zh[i] for i in members]
@@ -341,23 +338,20 @@ def build_figure_plans(
                 scope = "全部虛擬質點依大小潮分組"
             subtitle_zh = (
                 f"圓心為研究地點錨點｜36 個 10° 扇區，正北扇區為 355°–5°，方位自正北順時針｜"
-                f"半徑為來源方位落在該扇區的比例（%）\n{per_line}｜扇區合計為穿越開放邊界與擱淺：穿越 {crossed:.1f}%、"
-                f"擱淺 {stranded:.1f}%，其餘 {other:.1f}% 未計入扇區（回溯達上限、沉底等）"
+                f"半徑為來源方位落在該扇區的比例（%），36 扇區合計 100%\n{per_line}｜"
+                f"穿越開放邊界 {crossed:.1f}%｜海岸來源（未穿越者以最終位置方位計入）{coast:.1f}%"
             )
             subtitle_en = (
-                f"Centre: site anchor | 36 sectors of 10 deg, bearing clockwise from north | radius: share in sector (%)\n"
-                f"crossed {crossed:.1f}%, stranded {stranded:.1f}%, not counted {other:.1f}%"
+                f"Centre: site anchor | 36 sectors of 10 deg, bearing clockwise from north | radius: share in sector (%), sectors sum to 100%\n"
+                f"crossed open boundary {crossed:.1f}% | coast source (non-crossing, counted by final-position bearing) {coast:.1f}%"
             )
-            stranded_ll = np.zeros((0, 2))
-            sel = np.isin(gs.group_code, members) & (an.sample.kind == ps.KIND_STRANDED)
-            if sel.any():
-                stranded_ll = np.column_stack([an.sample.source_lon[sel], an.sample.source_lat[sel]])
             caption = (
                 f"{site_label}，{case_text}。{scope}（{n:,} 顆虛擬質點，{len(members)} 條線；{per_line}）。"
                 "以研究地點錨點為圓心，把每顆虛擬質點的來源點相對錨點的方位角（大圓初始方位角，自正北順時針）分到 36 個"
                 "各寬 10° 的扇區（0°、10°、…、350° 為中心，正北扇區涵蓋 355°–5°），折線的半徑為落在該扇區的比例（%），"
-                "36 個值連成封閉折線。來源點為穿越開放邊界者的離開點，與擱淺者的擱淺位置；其餘終止類別不計入扇區但留在分母。"
-                f"本圖穿越 {crossed:.2f}%、擱淺 {stranded:.2f}%、未計入 {other:.2f}%。"
+                "36 個值連成封閉折線，合計 100%。來源點：穿越開放邊界者為開放邊界離開點；未穿越者（達回溯上限而仍在流場範圍內、"
+                "擱淺、沉底等其他所有非穿越狀態）一律以最終位置的方位計入，視為海岸來源，不設距海岸距離門檻。"
+                f"本圖穿越開放邊界 {crossed:.2f}%、海岸來源 {coast:.2f}%。"
                 f"半徑上限 {top:g}%。比例描述條件式來源足跡的相對分配，不是絕對來源量化，也不可解讀為因果歸因。"
             )
             plans.append(
@@ -377,7 +371,6 @@ def build_figure_plans(
                     n_totals=[int(gs.n_total[i]) for i in members],
                     radius_max_pct=top,
                     radius_ticks_pct=list(ticks),
-                    stranded_lonlat=stranded_ll,
                     caption_zh=caption,
                 )
             )
@@ -523,7 +516,7 @@ def render_figure(
         )
         handles.append(Line2D([], [], color=plan.colors[i], linestyle=plan.styles[i], linewidth=1.8, label=label))
 
-    # 錨點（圓心）與擱淺點標記。
+    # 錨點（圓心）。
     ax.plot(
         lon0, lat0, marker="*", markersize=13, markerfacecolor="#ffd92f", markeredgecolor="black", markeredgewidth=0.7,
         linestyle="none", zorder=8,
@@ -532,20 +525,6 @@ def render_figure(
         Line2D([], [], marker="*", markersize=12, markerfacecolor="#ffd92f", markeredgecolor="black", linestyle="none",
                label=t.t("研究地點錨點（圓心）", "Site anchor (centre)"))
     ]  # fmt: skip
-    if plan.stranded_lonlat.shape[0]:
-        inside = (
-            (plan.stranded_lonlat[:, 0] >= x0) & (plan.stranded_lonlat[:, 0] <= x1)
-            & (plan.stranded_lonlat[:, 1] >= y0) & (plan.stranded_lonlat[:, 1] <= y1)
-        )  # fmt: skip
-        if inside.any():
-            ax.plot(
-                plan.stranded_lonlat[inside, 0], plan.stranded_lonlat[inside, 1], marker="v", markersize=4.5,
-                markerfacecolor="#e45756", markeredgecolor="black", markeredgewidth=0.4, linestyle="none", zorder=7,
-            )  # fmt: skip
-        extra.append(
-            Line2D([], [], marker="v", markersize=6, markerfacecolor="#e45756", markeredgecolor="black", linestyle="none",
-                   label=t.t(f"擱淺點（共 {plan.stranded_lonlat.shape[0]:,} 顆）", f"Stranded points ({plan.stranded_lonlat.shape[0]:,})"))
-        )  # fmt: skip
     for depth in sorted(drawn):
         k = _ISOBATH_LINESTYLES.index(_isobath_linestyle(depth, levels))
         extra.append(
@@ -563,7 +542,7 @@ def render_figure(
         lab.set_fontsize(9)
 
     # 主圖例（折線）用 ax.legend 建立，使 bbox_inches="tight" 一定把它納入裁切範圍；
-    # 次圖例（錨點、擱淺點、等深線）較短，以 add_artist 加入。
+    # 次圖例（錨點、等深線）較短，以 add_artist 加入。
     from matplotlib.legend import Legend
 
     leg = ax.legend(
@@ -666,10 +645,12 @@ def summary_markdown(
         "",
         "- 圓心為研究地點錨點；36 個各寬 10° 的扇區，以 0°、10°、…、350° 為中心（正北扇區為 355°–5°），方位自正北順時針；"
         "方位角用大圓初始方位角計算。",
-        "- 來源點：穿越開放邊界者用開放邊界離開點；擱淺者用擱淺位置（朝向陸地一側）；其餘終止類別不計入扇區但留在分母。"
-        "因此 36 扇區合計 = 穿越比例 + 擱淺比例。",
+        "- 來源點（PI 定案規則）：穿越開放邊界者用開放邊界離開點；**凡是沒有穿越開放邊界的虛擬質點**（達回溯上限而仍在流場範圍內、"
+        "擱淺、沉底及其他所有非穿越狀態）一律以最終位置相對錨點的方位角計入 36 扇區，視為海岸來源；不設距海岸距離門檻。"
+        "沒有「未計入」類別，每組 36 扇區比例合計為 100%（程式以浮點容差檢查，不符即失敗）。圖上的總曲線就是這一條；"
+        "穿越開放邊界與海岸來源兩種來源的拆分寫在 `tables/termination_by_group.csv` 與 `tables/sector_shares_long.csv`（欄位分開）。",
         "- 季節與大小潮使用沉底時刻計算的 `deposition_season`、`deposition_tide_class`。",
-        f"- 可區辨性：每組以 37 格向量（36 扇區 + 未計入）描述；兩組距離用總變異距離（TVD）。雜訊基準 = 同組內依到達時刻單元"
+        f"- 可區辨性：每組以 36 格向量（36 個扇區，合計 1）描述；兩組距離用總變異距離（TVD）。雜訊基準 = 同組內依到達時刻單元"
         f"（`arrival_time_id`）整單元隨機對半切後兩半的 TVD，重抽 {config.params.n_resamples} 次，同一比較範圍內各組合併後取第 99 百分位為門檻；"
         "某組對的 TVD 超過門檻即判定超過雜訊。對半切每半只有一半樣本，門檻偏保守。"
         "判定：至少半數組對超過門檻為「明顯超過雜訊」；有超過但不到半數為「僅部分組對超過」；沒有組對超過為「在雜訊內」。",
@@ -684,17 +665,38 @@ def summary_markdown(
     for an in analyses:
         site = SITE_LABELS_ZH.get(an.site_id, an.site_id)
         lines.append(f"- **{site}（`{an.site_id}`）**：{_site_conclusion(an)}")
-    lines += ["", "## 終止類別（每地點 10 萬顆虛擬質點）", ""]
-    lines.append("| 地點 | 穿越開放邊界 | 擱淺 | " + " | ".join(ps.STATUS_NAME_ZH[c] for c in ps._OTHER_STATUS_CODES) + " | 計入扇區比例 |")
-    lines.append("|" + "---|" * (4 + len(ps._OTHER_STATUS_CODES)))
+    lines += ["", "## 穿越開放邊界與海岸來源（每地點 10 萬顆虛擬質點；括號為比例）", ""]
+    coast_names = [ps.STATUS_NAME_ZH[c] for c in ps._COAST_STATUS_CODES]
+    lines.append("| 地點 | 穿越開放邊界 | 海岸來源合計 | " + " | ".join(f"其中：{nm}" for nm in coast_names) + " | 36 扇區合計 |")
+    lines.append("|" + "---|" * (4 + len(coast_names)))
     for an in analyses:
         site = SITE_LABELS_ZH.get(an.site_id, an.site_id)
         st = an.sample.status
         n = st.size
         cnt = {c: int(np.count_nonzero(st == c)) for c in ps._STATUS_CODES}
-        cells = [f"{cnt[c]:,}" for c in ps._OTHER_STATUS_CODES]
-        counted = cnt[1] + cnt[3]
-        lines.append(f"| {site} | {cnt[1]:,} | {cnt[3]:,} | " + " | ".join(cells) + f" | {100.0 * counted / n:.2f}% |")
+        n_coast = n - cnt[1]
+        cells = [f"{cnt[c]:,}（{100.0 * cnt[c] / n:.3f}%）" for c in ps._COAST_STATUS_CODES]
+        sector_sum = 100.0 * float(np.count_nonzero((an.sample.sector >= 0) & (an.sample.sector < ps.N_SECTORS))) / n
+        lines.append(
+            f"| {site} | {cnt[1]:,}（{100.0 * cnt[1] / n:.3f}%） | {n_coast:,}（{100.0 * n_coast / n:.3f}%） | "
+            + " | ".join(cells)
+            + f" | {sector_sum:.4f}% |"
+        )
+    lines += ["", "## 各地點最大 TVD 與雜訊 p99（格式：最大 TVD／雜訊 p99）", ""]
+    lines.append("| 地點 | 季節之間 | 大小潮之間 | 十類之間 | 同類 10 速度之間（取十類中最大者） |")
+    lines.append("|---|---|---|---|---|")
+    for an in analyses:
+        site = SITE_LABELS_ZH.get(an.site_id, an.site_id)
+        cells = []
+        for kind in ("season", "tide", "class", "velocity_within_class"):
+            cs = [c for c in an.comparisons if c.kind == kind]
+            if not cs:
+                cells.append("—")
+                continue
+            c = max(cs, key=lambda x: x.max_tvd)
+            suffix = f"（{material_display_name_zh(c.scope_material)}）" if kind == "velocity_within_class" else ""
+            cells.append(f"{c.max_tvd:.3f}／{c.noise_tvd['p99']:.3f}{suffix}")
+        lines.append(f"| {site} | " + " | ".join(cells) + " |")
     lines += ["", "## 可區辨性明細", ""]
     for an in analyses:
         site = SITE_LABELS_ZH.get(an.site_id, an.site_id)
@@ -809,7 +811,6 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
             ps.write_termination_csv(all_an, case.case_id, tdir / "termination_by_group.csv")
             ps.write_pairs_csv(all_an, case.case_id, tdir / "distinguishability_pairs.csv")
             ps.write_comparison_csv(all_an, case.case_id, tdir / "distinguishability_summary.csv")
-            ps.write_stranded_csv(all_an, case.case_id, tdir / "stranded_points.csv")
             _write_text_exclusive(case.text_dir / "summary.md", summary_markdown(case.case_id, all_an, scales, config))
 
     written: list[str] = []
@@ -847,6 +848,11 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
             "radius_scale_override_pct": config.radius_max_pct,
             "sector": {"count": ps.N_SECTORS, "width_deg": ps.SECTOR_WIDTH_DEG, "center_azimuths_deg": [10 * k for k in range(36)]},
             "bearing": "great_circle_initial_bearing_from_anchor_clockwise_from_north",
+            "source_rule": "crossed: open-boundary departure point; all non-crossing statuses: final position (coast source); no distance threshold; 36 sectors sum to 100%",
+            "crossed_share_pct_by_site": {
+                an.site_id: 100.0 * float(np.count_nonzero(an.sample.kind == ps.KIND_CROSSED)) / an.sample.n_rows
+                for an in analyses[case.case_id]
+            },
             "anchors_lonlat": {an.site_id: list(an.sample.anchor_lonlat) for an in analyses[case.case_id]},
             "params": {"n_resamples": config.params.n_resamples, "seed": config.params.seed, "dpi": config.dpi},
             "font": dict(font_res.manifest_record),
@@ -869,7 +875,7 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
             "# 圓形來源方位圖（WP-60）\n\n"
             f"案例：`{case.case_id}`。本目錄由 `lbt native-polar-source` 產生，只讀取 `native-postprocess` 的 `departures.parquet`。\n\n"
             "- 含文字版圖：本目錄 `<地點>/`；無文字版圖：同層的 `figures-polar-notext/<地點>/`。\n"
-            "- `tables/`：扇區比例長表、終止類別表、可區辨性組對與摘要表、擱淺點清單。\n"
+            "- `tables/`：扇區比例長表（含穿越開放邊界與海岸來源分欄）、穿越／海岸來源比例表、可區辨性組對與摘要表。\n"
             "- `summary.md`：統計摘要與每地點結論；`captions.md`：圖說；`manifest.json`：參數與檢核碼。\n\n"
             f"重建命令：\n\n```\n{command}\n```\n",
         )

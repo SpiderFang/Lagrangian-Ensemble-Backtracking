@@ -1,4 +1,4 @@
-"""圓形來源方位圖（WP-60）的測試：扇區邊界、方位角方向、擱淺點計入、比例加總、無文字版不含地點名稱（合成資料）。"""
+"""圓形來源方位圖（WP-60）的測試：扇區邊界、方位角方向、非穿越質點以最終位置計入、36 扇區合計 100%、無文字版不含地點名稱（合成資料）。"""
 
 from __future__ import annotations
 
@@ -65,24 +65,34 @@ def test_bearing_east_at_study_latitude_is_close_to_90_and_in_range():
     assert int(ps.sector_index(az)[0]) == 9
 
 
-# ── 擱淺點與其他終止類別 ─────────────────────────────────────────────────
+# ── 非穿越質點（海岸來源）：以最終位置的方位計入 ─────────────────────────
 
 
-def test_stranded_particles_are_counted_by_bearing_to_stranding_point():
-    status = np.array([1, 3, 3, 2, 4])
-    lon = np.array([ANCHOR[0] + 0.5, ANCHOR[0] - 0.05, ANCHOR[0] - 0.05, ANCHOR[0], np.nan])
-    lat = np.array([ANCHOR[1], ANCHOR[1], ANCHOR[1] + 0.001, ANCHOR[1], np.nan])
+def test_all_non_crossing_particles_are_counted_by_bearing_of_final_position():
+    status = np.array([1, 3, 3, 2, 4, 5, 7])
+    lon = np.array(
+        [ANCHOR[0] + 0.5, ANCHOR[0] - 0.05, ANCHOR[0] - 0.05, ANCHOR[0], ANCHOR[0], ANCHOR[0] + 0.3, ANCHOR[0] - 0.3]
+    )
+    lat = np.array([ANCHOR[1], ANCHOR[1], ANCHOR[1] + 0.001, ANCHOR[1] + 0.2, ANCHOR[1] - 0.2, ANCHOR[1], ANCHOR[1]])
     kind, az, bins = ps.classify_sources(status, lon, lat, ANCHOR)
-    assert list(kind) == [ps.KIND_CROSSED, ps.KIND_STRANDED, ps.KIND_STRANDED, ps.KIND_OTHER, ps.KIND_OTHER]
-    assert bins[0] == 9  # 東
-    assert bins[1] == 27 and bins[2] == 27  # 擱淺點在西方（陸地一側），計入 270° 扇區
-    assert bins[3] == ps.UNCOUNTED_BIN and bins[4] == ps.UNCOUNTED_BIN  # 其他終止類別不計入扇區
-    assert np.isnan(az[3]) and np.isnan(az[4])
+    assert list(kind) == [ps.KIND_CROSSED] + [ps.KIND_COAST] * 6
+    assert bins[0] == 9  # 穿越者，東
+    assert bins[1] == 27 and bins[2] == 27  # 擱淺點在西方，計入 270° 扇區
+    assert bins[3] == 0  # 達回溯上限，最終位置在正北
+    assert bins[4] == 18  # 沉底，最終位置在正南
+    assert bins[5] == 9 and bins[6] == 27  # 其他狀態碼同樣以最終位置計入
+    assert np.all(np.isfinite(az)) and np.all((bins >= 0) & (bins < 36))  # 沒有「未計入」
 
 
-def test_missing_position_of_counted_particle_fails_closed():
+@pytest.mark.parametrize("status", [1, 2, 3, 4])
+def test_missing_position_fails_closed_for_every_status(status):
     with pytest.raises(ps.PolarSourceError):
-        ps.classify_sources(np.array([1]), np.array([np.nan]), np.array([25.0]), ANCHOR)
+        ps.classify_sources(np.array([status]), np.array([np.nan]), np.array([25.0]), ANCHOR)
+
+
+def test_no_uncounted_bin_in_module():
+    assert ps.N_BINS == ps.N_SECTORS == 36
+    assert not hasattr(ps, "UNCOUNTED_BIN") and not hasattr(ps, "KIND_OTHER")
 
 
 # ── 合成後處理資料 ───────────────────────────────────────────────────────
@@ -182,36 +192,54 @@ def _samples(synthetic):
     return ps.load_site_polar_samples(pp, {SITE: ANCHOR})
 
 
-def test_sector_shares_sum_to_counted_share_and_all_bins_sum_to_one(synthetic):
+def test_sector_shares_sum_to_100_percent_for_every_group(synthetic):
     sample = _samples(synthetic)[SITE]
     an = ps.analyze_site(sample, "case", ps.PolarParams(n_resamples=50))
     for grouping, gs in an.group_sets.items():
         pct = gs.pct_sectors()
         assert pct.shape == (len(gs.group_ids), 36)
-        assert np.allclose(gs.proportions37().sum(axis=1), 1.0)
+        assert np.allclose(pct.sum(axis=1), 100.0, rtol=0.0, atol=ps.SECTOR_SUM_TOL_PCT)
+        assert np.allclose(gs.proportions().sum(axis=1), 1.0, rtol=0.0, atol=1e-12)
+        by_kind = gs.pct_sectors_by_kind()
+        assert by_kind.shape == (len(gs.group_ids), 2, 36)
+        assert np.allclose(by_kind.sum(axis=1), pct, rtol=0.0, atol=1e-9)
         for i in range(len(gs.group_ids)):
             sel = gs.group_code == i
-            counted = np.count_nonzero(sample.kind[sel] != ps.KIND_OTHER)
-            assert pct[i].sum() == pytest.approx(100.0 * counted / sel.sum(), rel=1e-12)
+            crossed = np.count_nonzero(sample.kind[sel] == ps.KIND_CROSSED)
+            assert by_kind[i, ps.KIND_CROSSED].sum() == pytest.approx(100.0 * crossed / sel.sum(), rel=1e-12)
+            assert by_kind[i, ps.KIND_COAST].sum() == pytest.approx(100.0 * (sel.sum() - crossed) / sel.sum(), rel=1e-12)
         assert int(gs.n_total.sum()) == sample.n_rows
     # 每組粒子數：類別×速度 4 組各 60、類別 2 組各 120。
     assert list(an.group_sets["class_velocity"].n_total) == [60] * 4
     assert list(an.group_sets["class"].n_total) == [120, 120]
 
 
-def test_stranded_particles_land_in_the_west_sector_of_the_counts(synthetic):
+def test_check_sector_sums_fails_closed_when_counts_are_inconsistent(synthetic):
+    sample = _samples(synthetic)[SITE]
+    gs = ps.build_group_set(sample, "class")
+    ps.check_sector_sums(gs)
+    gs.counts[0, 0, 0] += 1  # 少算一顆的對照：合計不再是 100%
+    with pytest.raises(ps.PolarSourceError):
+        ps.check_sector_sums(gs)
+
+
+def test_non_crossing_particles_land_in_the_counts_and_split_columns_are_separate(synthetic):
     sample = _samples(synthetic)[SITE]
     an = ps.analyze_site(sample, "case", ps.PolarParams(n_resamples=50))
     gs = an.group_sets["class"]
-    stranded_per_class = 3  # j % 20 == 0 的粒子，每個 (類別, 速度) 60 顆中有 3 顆，每類 2 個速度共 6 顆
+    stranded_per_class = 6  # j % 20 == 0 的粒子：每個 (類別, 速度) 60 顆中有 3 顆，每類 2 個速度共 6 顆
     sector_counts = gs.counts.sum(axis=1)
-    assert np.all(sector_counts[:, 27] >= 2 * stranded_per_class)
-    assert int(np.count_nonzero(sample.kind == ps.KIND_STRANDED)) == 4 * stranded_per_class
+    assert np.all(sector_counts[:, 27] >= stranded_per_class)
+    assert np.all(gs.kind_counts[:, ps.KIND_COAST, 27] >= stranded_per_class)
     rows = ps.termination_rows(an, "case")
     site_row = next(r for r in rows if r["grouping"] == "site_all")
-    assert site_row["n_stranded"] == 12
-    assert site_row["n_crossed"] + site_row["n_stranded"] + site_row["n_uncounted"] == sample.n_rows
+    assert site_row["n_status_3"] == 12
+    assert site_row["n_crossed"] + site_row["n_coast"] == sample.n_rows
+    assert site_row["n_coast"] == sum(site_row[f"n_status_{c}"] for c in ps._COAST_STATUS_CODES)
     assert site_row["n_status_2"] > 0 and site_row["n_status_4"] > 0
+    assert site_row["crossed_pct"] + site_row["coast_pct"] == pytest.approx(100.0)
+    assert all(r["sector_sum_pct"] == pytest.approx(100.0) for r in rows)
+    assert "n_uncounted" not in site_row and "uncounted_pct" not in site_row
 
 
 def test_half_split_noise_is_reproducible_and_bounded():
@@ -301,6 +329,9 @@ def test_figure_text_has_no_site_name_or_code(monkeypatch, synthetic, tmp_path, 
         assert all("比例" not in s for s in texts)
     else:
         assert any("來源方位的比例" in s for s in texts)
+        assert any("穿越開放邊界" in s and "海岸來源（未穿越者以最終位置方位計入）" in s for s in texts)
+        for banned in ("回溯達上限", "擱淺", "未計入"):
+            assert banned not in joined
     assert "機率" not in joined
     # 半徑刻度仍在：地圖上的文字含「%」。
     assert any(s.endswith("%") for s in texts)
@@ -346,7 +377,7 @@ def test_circle_is_round_on_the_map():
 # ── 端到端 ───────────────────────────────────────────────────────────────
 
 
-def test_end_to_end_outputs_and_stranded_marker(synthetic, tmp_path):
+def test_end_to_end_outputs_and_split_tables(synthetic, tmp_path):
     pp, cfg, coast = synthetic
     case = psf.PolarCase("no_stokes", pp, tmp_path / "out" / "figures-polar", tmp_path / "out" / "figures-polar-notext")
     config = psf.PolarConfig(
@@ -367,13 +398,30 @@ def test_end_to_end_outputs_and_stranded_marker(synthetic, tmp_path):
     tables = case.text_dir / "tables"
     for name in (
         "sector_shares_long.csv", "termination_by_group.csv", "distinguishability_pairs.csv",
-        "distinguishability_summary.csv", "stranded_points.csv",
+        "distinguishability_summary.csv",
     ):  # fmt: skip
         assert (tables / name).is_file()
-    stranded = (tables / "stranded_points.csv").read_text(encoding="utf-8-sig").strip().splitlines()
-    assert len(stranded) == 1 + 12  # 標頭 + 12 顆擱淺
+    assert not (tables / "stranded_points.csv").exists()
+    import csv
+
+    with (tables / "sector_shares_long.csv").open(encoding="utf-8-sig", newline="") as f:
+        long_rows = list(csv.DictReader(f))
+    sums: dict[tuple[str, str], list[float]] = {}
+    for r in long_rows:
+        key = (r["grouping"], r["group_id"])
+        acc = sums.setdefault(key, [0.0, 0.0, 0.0])
+        acc[0] += float(r["pct_of_group"])
+        acc[1] += float(r["pct_crossed"])
+        acc[2] += float(r["pct_coast"])
+        assert int(r["count"]) == int(r["count_crossed"]) + int(r["count_coast"])
+    assert sums and all(abs(v[0] - 100.0) < 1e-4 and abs(v[1] + v[2] - 100.0) < 1e-4 for v in sums.values())
+    with (tables / "termination_by_group.csv").open(encoding="utf-8-sig", newline="") as f:
+        term = list(csv.DictReader(f))
+    assert {"n_crossed", "n_coast", "crossed_pct", "coast_pct", "sector_sum_pct"} <= set(term[0])
+    assert all(abs(float(r["sector_sum_pct"]) - 100.0) < 1e-4 for r in term)
     summary = (case.text_dir / "summary.md").read_text(encoding="utf-8")
     assert "每地點結論" in summary and "機率" not in summary
+    assert "最大 TVD 與雜訊 p99" in summary and "未計入扇區比例" not in summary
     manifest = json.loads((case.text_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status_counts_by_site"][SITE]["3"] == 12
     with pytest.raises(psf.PolarSourceError):

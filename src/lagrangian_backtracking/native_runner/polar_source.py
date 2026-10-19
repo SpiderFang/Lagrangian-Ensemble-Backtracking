@@ -3,7 +3,7 @@
 這個模組回答什麼問題
 --------------------
 逆向系集把虛擬質點從受體（研究點）往回追，每顆質點最後會以某種方式「終止」：穿越流場範圍的
-開放邊界、擱淺在海岸、回溯到上限仍在域內、沉底等。本模組把每顆質點的「來源點」換算成
+開放邊界、回溯到上限仍在域內、擱淺在海岸、沉底等。本模組把每顆質點的「來源點」換算成
 **相對於研究點錨點的方位角**（自正北順時針，單位度），再把方位角分到 36 個各寬 10° 的扇區，
 求各扇區占該組虛擬質點的百分比。這些百分比連成封閉的極座標折線，就是 PI 構想的
 「圓形來源方位圖」（繪圖見 :mod:`polar_source_figures`）。
@@ -12,13 +12,12 @@
 ------------------------
 1. **穿越開放邊界**（狀態碼 1，``NATIVE_STATUS_LEFT_FLOW_DOMAIN``）：來源點是它的開放邊界離開點
    （欄位 ``departure_lon_deg``、``departure_lat_deg``）。
-2. **擱淺**（狀態碼 3，``NATIVE_STATUS_STRANDED``）：質點卡在海岸（所在元素被判定為乾）。PI 的指示是
-   「內插到陸地，表示它確實沉積在海岸」：以擱淺位置（同樣是 ``departure_lon_deg``、``departure_lat_deg``，
-   即質點停止時的位置，已在海岸或陸地一側）計算相對錨點的方位角並計入該方位扇區；
-   繪圖時另以小標記畫出擱淺點，讓海岸來源可辨認。
-3. **其他終止類別**（達回溯上限仍在域內、沉底、流場缺值、數值失敗、回溯窗外沉底）：沒有可靠的
-   「來源方向」，**不計入 36 個扇區**，但仍留在分母（分母永遠是該組全部虛擬質點），
-   並在統計表中逐類記錄其比例。因此 36 扇區合計 =（穿越 + 擱淺）的比例，不一定是 100%。
+2. **其他所有非穿越狀態**（達回溯上限而仍在流場範圍內、擱淺、沉底、流場缺值、數值失敗、回溯窗外沉底……）：
+   一律視為**海岸來源**，以質點終止時的**最終位置**（同樣是 ``departure_lon_deg``、``departure_lat_deg``）相對錨點的
+   方位角計入扇區。不設距海岸距離門檻，全部計入；位置缺值或非有限值則失敗即停（不得以零值替代）。
+   PI 的規則是「凡是沒有穿越開放邊界的虛擬質點，都以最終位置的方位計入 36 扇區」，所以**沒有「未計入」類別**，
+   每組 36 扇區比例合計恆為 100%（以浮點容差檢查，不符即失敗）。
+   統計表把兩種來源（穿越開放邊界、海岸來源）的比例分欄記錄，海岸來源另依終止狀態碼逐類拆分。
 
 方位角算法（程式註解即設計說明）
 --------------------------------
@@ -35,8 +34,8 @@
 
 可區辨性檢定（沿用 WP-55 的雜訊基準概念）
 ------------------------------------------
-每組虛擬質點的方位分布寫成 37 格向量：36 個扇區加第 37 格「未計入」（分母為該組全部質點，
-因此向量總和為 1，與圖上折線畫的比例一致）。兩組分布的距離用總變異距離（total variation
+每組虛擬質點的方位分布寫成 36 格向量（36 個扇區，分母為該組全部質點，因此向量總和為 1，
+與圖上折線畫的比例一致；沒有「未計入」格）。兩組分布的距離用總變異距離（total variation
 distance，TVD，兩向量差絕對值總和之半，範圍 0–1），另附最大扇區差（百分點）。
 
 雜訊基準：先前已證實抽樣不確定性主要來自「到達時刻」的選取而非系集成員，所以把同一組內的虛擬質點
@@ -85,12 +84,12 @@ __all__ = [
     "N_SECTORS",
     "SECTOR_WIDTH_DEG",
     "N_BINS",
-    "UNCOUNTED_BIN",
+    "N_KINDS",
+    "SECTOR_SUM_TOL_PCT",
     "POLAR_GROUPINGS",
     "STATUS_NAME_ZH",
     "KIND_CROSSED",
-    "KIND_STRANDED",
-    "KIND_OTHER",
+    "KIND_COAST",
     "PolarSourceError",
     "PolarParams",
     "SitePolarSample",
@@ -110,7 +109,7 @@ __all__ = [
     "write_termination_csv",
     "write_pairs_csv",
     "write_comparison_csv",
-    "write_stranded_csv",
+    "check_sector_sums",
 ]
 
 
@@ -124,17 +123,19 @@ N_SECTORS = 36
 SECTOR_WIDTH_DEG = 10.0
 """每個扇區的角寬（度）。"""
 
-UNCOUNTED_BIN = N_SECTORS
-"""第 37 格（編號 36）：不計入任何扇區的質點（其他終止類別），只在檢定與統計表使用。"""
+N_BINS = N_SECTORS
+"""檢定向量的格數 = 36（只有扇區；每顆質點都計入某一個扇區，沒有「未計入」格）。"""
 
-N_BINS = N_SECTORS + 1
+N_KINDS = 2
+"""來源種類數：穿越開放邊界、海岸來源。"""
 
 KIND_CROSSED = 0
-"""來源點種類：穿越開放邊界。"""
-KIND_STRANDED = 1
-"""來源點種類：擱淺（計入方位扇區）。"""
-KIND_OTHER = 2
-"""來源點種類：其他終止類別（不計入扇區）。"""
+"""來源點種類：穿越開放邊界（用開放邊界離開點的方位）。"""
+KIND_COAST = 1
+"""來源點種類：海岸來源＝沒有穿越開放邊界者（達回溯上限、擱淺、沉底等），用最終位置的方位。"""
+
+SECTOR_SUM_TOL_PCT = 1e-9
+"""每組 36 扇區比例合計與 100% 的容許誤差（百分點，浮點誤差等級）；超過即失敗。"""
 
 STATUS_NAME_ZH: Mapping[int, str] = {
     NATIVE_STATUS_LEFT_FLOW_DOMAIN: "穿越開放邊界",
@@ -148,9 +149,8 @@ STATUS_NAME_ZH: Mapping[int, str] = {
 """終止狀態碼 → 中文名稱（狀態碼定義見 ``backward_driver.NATIVE_STATUS_*``）。"""
 
 _STATUS_CODES: tuple[int, ...] = tuple(sorted(STATUS_NAME_ZH))
-_OTHER_STATUS_CODES: tuple[int, ...] = tuple(
-    c for c in _STATUS_CODES if c not in (NATIVE_STATUS_LEFT_FLOW_DOMAIN, NATIVE_STATUS_STRANDED)
-)
+_COAST_STATUS_CODES: tuple[int, ...] = tuple(c for c in _STATUS_CODES if c != NATIVE_STATUS_LEFT_FLOW_DOMAIN)
+"""海岸來源涵蓋的終止狀態碼（所有非穿越狀態）；統計表逐碼拆分。"""
 
 POLAR_GROUPINGS: tuple[str, ...] = ("class_velocity", "class", "season", "tide")
 """四種分組：類別×候選速度（每組 1,000 顆）、類別（每組 1 萬顆）、季節、大小潮。"""
@@ -228,35 +228,30 @@ def classify_sources(
     lat_deg: np.ndarray,
     anchor_lonlat: tuple[float, float],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """依終止狀態與位置，求每顆質點的 ``(來源種類, 方位角, 格編號 0–36)``。
+    """依終止狀態與位置，求每顆質點的 ``(來源種類, 方位角, 扇區編號 0–35)``。
 
-    * 狀態 1（穿越）、3（擱淺）：用離開／擱淺位置算方位角並分扇區；位置缺值或非有限時拋出錯誤
-      （不得以零值替代，見 ``AGENTS.md``）。
-    * 其他狀態：種類為 :data:`KIND_OTHER`，方位角為 NaN，格編號為 :data:`UNCOUNTED_BIN`。
+    * 狀態 1（穿越開放邊界）：種類 :data:`KIND_CROSSED`，用開放邊界離開點算方位角。
+    * 其他任何狀態：種類 :data:`KIND_COAST`（海岸來源），用最終位置算方位角；不設距海岸距離門檻。
+    * 每顆質點都計入某一個扇區；任何一顆位置缺值或非有限時拋出錯誤（不得以零值替代，見 ``AGENTS.md``）。
     """
 
     st = np.asarray(status)
-    kind = np.full(st.shape, KIND_OTHER, dtype=np.int8)
-    kind[st == NATIVE_STATUS_LEFT_FLOW_DOMAIN] = KIND_CROSSED
-    kind[st == NATIVE_STATUS_STRANDED] = KIND_STRANDED
-    counted = kind != KIND_OTHER
+    kind = np.where(st == NATIVE_STATUS_LEFT_FLOW_DOMAIN, KIND_CROSSED, KIND_COAST).astype(np.int8)
     lon = np.asarray(lon_deg, dtype=np.float64)
     lat = np.asarray(lat_deg, dtype=np.float64)
-    if counted.any() and not (np.all(np.isfinite(lon[counted])) and np.all(np.isfinite(lat[counted]))):
-        raise PolarSourceError("穿越或擱淺的質點位置含缺值或非有限值，fail-closed")
-    az = np.full(st.shape, np.nan, dtype=np.float64)
-    bins = np.full(st.shape, UNCOUNTED_BIN, dtype=np.int64)
-    if counted.any():
-        az[counted] = bearing_deg(anchor_lonlat[0], anchor_lonlat[1], lon[counted], lat[counted])
-        bins[counted] = sector_index(az[counted])
-    return kind, az, bins
+    if not (np.all(np.isfinite(lon)) and np.all(np.isfinite(lat))):
+        raise PolarSourceError("有虛擬質點的來源位置（離開點或最終位置）缺值或非有限值，fail-closed")
+    az = bearing_deg(anchor_lonlat[0], anchor_lonlat[1], lon, lat)
+    return kind, az, sector_index(az)
 
 
 def tvd_and_max_sector(p: np.ndarray, q: np.ndarray) -> tuple[float, float]:
-    """兩個 37 格比例向量的 ``(總變異距離, 最大扇區差百分點)``；最大扇區差只看前 36 格。"""
+    """兩個 36 格（扇區）比例向量的 ``(總變異距離, 最大扇區差百分點)``。"""
 
     d = np.abs(np.asarray(p, dtype=np.float64) - np.asarray(q, dtype=np.float64))
-    return 0.5 * float(d.sum()), 100.0 * float(d[:N_SECTORS].max())
+    if d.shape != (N_BINS,):
+        raise PolarSourceError(f"比例向量必須是 {N_BINS} 格，實得 {d.shape}")
+    return 0.5 * float(d.sum()), 100.0 * float(d.max())
 
 
 def _stable_seed(seed: int, *labels: str) -> list[int]:
@@ -268,7 +263,7 @@ def half_split_noise(
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """同組依到達時刻單元隨機對半切的雜訊基準，全向量化。
 
-    ``counts_unit_bin``：形狀 ``(單元數, 37)`` 的計數，列為到達時刻單元、欄為 37 格。只有「有質點的單元」
+    ``counts_unit_bin``：形狀 ``(單元數, 36)`` 的計數，列為到達時刻單元、欄為 36 個扇區。只有「有質點的單元」
     參與切分；每次重抽隨機選出其中 ``單元數 // 2`` 個單元為第一半，其餘為第二半。
     回傳 ``(每次重抽的 TVD, 每次重抽的最大扇區差百分點)``；有質點的單元少於 ``min_units`` 時回傳 ``None``。
     """
@@ -287,7 +282,7 @@ def half_split_noise(
     p1 = h1 / h1.sum(axis=1, keepdims=True)
     p2 = h2 / h2.sum(axis=1, keepdims=True)
     d = np.abs(p1 - p2)
-    return 0.5 * d.sum(axis=1), 100.0 * d[:, :N_SECTORS].max(axis=1)
+    return 0.5 * d.sum(axis=1), 100.0 * d.max(axis=1)
 
 
 # ── 單站樣本 ─────────────────────────────────────────────────────────────
@@ -295,15 +290,15 @@ def half_split_noise(
 
 @dataclass(slots=True)
 class SitePolarSample:
-    """單站全部虛擬質點的來源方位資料（所有質點，含未計入者）。
+    """單站全部虛擬質點的來源方位資料（每顆質點都計入某一個扇區）。
 
     ``anchor_lonlat``：研究點錨點（正式釋放設定的 ``anchor_lonlat``），方位角的原點。
     ``material_id``、``candidate_index``、``speed_abs_mps``：類別、該類 10 個候選速度的編號（依速度由小到大）
     與質點實際使用的沉降速度絕對值（m/s）；``class_speed_abs_mps``：類別代表速度絕對值（排序用）。
     ``season``、``tide``：沉底時刻的季節與大小潮標籤（``deposition_*``）。``unit``：到達時刻單元編號。
-    ``status``：終止狀態碼。``kind``：來源點種類（穿越、擱淺、其他）。``azimuth_deg``：方位角（未計入者 NaN）。
-    ``bin37``：格編號（0–35 扇區，36 未計入）。``source_lon``、``source_lat``：來源點經緯度（用於地圖上的擱淺標記）。
-    ``particle_id``：質點識別碼（擱淺點清單用）。
+    ``status``：終止狀態碼。``kind``：來源點種類（穿越開放邊界、海岸來源）。``azimuth_deg``：來源點方位角（每顆都有）。
+    ``sector``：扇區編號 0–35（每顆都有）。``source_lon``、``source_lat``：來源點經緯度（穿越者為離開點，其餘為最終位置）。
+    ``particle_id``：質點識別碼。
     """
 
     site_id: str
@@ -320,7 +315,7 @@ class SitePolarSample:
     status: np.ndarray
     kind: np.ndarray
     azimuth_deg: np.ndarray
-    bin37: np.ndarray
+    sector: np.ndarray
     source_lon: np.ndarray
     source_lat: np.ndarray
     particle_id: np.ndarray
@@ -394,7 +389,6 @@ def load_site_polar_samples(
         if not np.all(np.isfinite(speed)):
             raise PolarSourceError(f"站 {site}：逐粒子沉降速度含缺值或非有限值，fail-closed")
         _, unit = np.unique(col("arrival_time_id").astype(str), return_inverse=True)
-        counted = kind != KIND_OTHER
         result[site] = SitePolarSample(
             site_id=site,
             anchor_lonlat=(float(anchors[site][0]), float(anchors[site][1])),
@@ -410,9 +404,9 @@ def load_site_polar_samples(
             status=status,
             kind=kind,
             azimuth_deg=az,
-            bin37=bins,
-            source_lon=np.where(counted, lon, np.nan),
-            source_lat=np.where(counted, lat, np.nan),
+            sector=bins,
+            source_lon=lon,
+            source_lat=lat,
             particle_id=col("particle_id").astype(str),
         )
     return result
@@ -429,7 +423,7 @@ class GroupSet:
     ``material_id``：各組所屬類別（只有類別×速度與類別分組有意義，其餘為空字串）。
     ``speed_abs_mps``：各組代表速度絕對值（類別×速度為該速度；類別為實際速度中位數）；``speed_min_mps``、
     ``speed_max_mps``：各組實際速度絕對值的最小、最大。``n_total``：各組全部質點數（分母）。
-    ``counts``：形狀 ``(組數, 到達時刻單元數, 37)``。``group_code``：每顆質點的組別編號（不在任何組者為 -1）。
+    ``counts``：形狀 ``(組數, 到達時刻單元數, 36)``。``kind_counts``：形狀 ``(組數, 2, 36)``，依來源種類（0 穿越開放邊界、1 海岸來源）拆分的扇區計數。``group_code``：每顆質點的組別編號（不在任何組者為 -1）。
     """
 
     grouping: str
@@ -442,18 +436,34 @@ class GroupSet:
     speed_max_mps: np.ndarray
     n_total: np.ndarray
     counts: np.ndarray
+    kind_counts: np.ndarray
     group_code: np.ndarray
 
     def pct_sectors(self) -> np.ndarray:
-        """各組 36 扇區比例（%），形狀 ``(組數, 36)``；分母為該組全部質點（含未計入者）。"""
+        """各組 36 扇區比例（%），形狀 ``(組數, 36)``；分母為該組全部質點，每組合計 100%。"""
 
         total = self.counts.sum(axis=1)
-        return 100.0 * total[:, :N_SECTORS] / self.n_total[:, None]
+        return 100.0 * total / self.n_total[:, None]
 
-    def proportions37(self) -> np.ndarray:
-        """各組 37 格比例（總和 1），形狀 ``(組數, 37)``。"""
+    def pct_sectors_by_kind(self) -> np.ndarray:
+        """各組、各來源種類的扇區比例（%），形狀 ``(組數, 2, 36)``；分母同為該組全部質點（兩種合計等於 :meth:`pct_sectors`）。"""
+
+        return 100.0 * self.kind_counts / self.n_total[:, None, None]
+
+    def proportions(self) -> np.ndarray:
+        """各組 36 格比例（總和 1），形狀 ``(組數, 36)``。"""
 
         return self.counts.sum(axis=1) / self.n_total[:, None]
+
+
+def check_sector_sums(gs: GroupSet, tol_pct: float = SECTOR_SUM_TOL_PCT) -> None:
+    """檢查每組 36 扇區比例合計為 100%（浮點容差內）且兩種來源拆分與總數一致；不符即失敗。"""
+
+    err = np.abs(gs.pct_sectors().sum(axis=1) - 100.0)
+    if err.size and float(err.max()) > tol_pct:
+        raise PolarSourceError(f"站 {gs.site_id}／{gs.grouping}：36 扇區比例合計與 100% 差 {float(err.max()):.3g} 個百分點，fail-closed")
+    if not np.array_equal(gs.kind_counts.sum(axis=1), gs.counts.sum(axis=1)):
+        raise PolarSourceError(f"站 {gs.site_id}／{gs.grouping}：來源種類拆分與扇區總數不一致，fail-closed")
 
 
 def _speed_label(value: float) -> str:
@@ -461,7 +471,7 @@ def _speed_label(value: float) -> str:
 
 
 def build_group_set(sample: SitePolarSample, grouping: str) -> GroupSet:
-    """依分組方式建立 :class:`GroupSet`（含 ``(組, 到達時刻單元, 37 格)`` 計數張量）。"""
+    """依分組方式建立 :class:`GroupSet`（含 ``(組, 到達時刻單元, 36 扇區)`` 計數張量與依來源種類拆分的計數）。"""
 
     if grouping not in POLAR_GROUPINGS:
         raise PolarSourceError(f"未知的分組代號：{grouping!r}（合法值：{POLAR_GROUPINGS}）")
@@ -493,10 +503,12 @@ def build_group_set(sample: SitePolarSample, grouping: str) -> GroupSet:
     code = np.fromiter((index_of.get(k, -1) for k in key.tolist()), dtype=np.int64, count=key.size)
     g_n = len(raw_ids)
     u_n = max(sample.n_units, 1)
-    flat = (code * u_n + sample.unit) * N_BINS + sample.bin37
     if (code < 0).any():
         raise PolarSourceError("出現不在分組清單內的標籤，fail-closed")
+    flat = (code * u_n + sample.unit) * N_BINS + sample.sector
     counts = np.bincount(flat, minlength=g_n * u_n * N_BINS).reshape(g_n, u_n, N_BINS)
+    kflat = (code * N_KINDS + sample.kind.astype(np.int64)) * N_BINS + sample.sector
+    kind_counts = np.bincount(kflat, minlength=g_n * N_KINDS * N_BINS).reshape(g_n, N_KINDS, N_BINS)
     n_total = counts.sum(axis=(1, 2)).astype(np.int64)
 
     labels: list[str] = []
@@ -529,6 +541,7 @@ def build_group_set(sample: SitePolarSample, grouping: str) -> GroupSet:
         speed_max_mps=smax,
         n_total=n_total,
         counts=counts,
+        kind_counts=kind_counts,
         group_code=code,
     )
 
@@ -604,11 +617,11 @@ def _compare_groups(
         return None
     noise_tvd = _pct_summary(np.concatenate(tvd_pool))
     noise_max = _pct_summary(np.concatenate(max_pool))
-    p = gs.proportions37()[list(members)]
+    p = gs.proportions()[list(members)]
     diff = np.abs(p[:, None, :] - p[None, :, :])
     tvd_m = 0.5 * diff.sum(axis=-1)
-    max_m = 100.0 * diff[:, :, :N_SECTORS].max(axis=-1)
-    argmax_sector = diff[:, :, :N_SECTORS].argmax(axis=-1)
+    max_m = 100.0 * diff.max(axis=-1)
+    argmax_sector = diff.argmax(axis=-1)
     pairs: list[dict[str, Any]] = []
     for a in range(len(members)):
         for b in range(a + 1, len(members)):
@@ -673,6 +686,8 @@ def analyze_site(sample: SitePolarSample, case_id: str, params: PolarParams) -> 
     """建立四種分組並執行 :data:`POLAR_GROUPINGS` 對應的全部可區辨性比較。"""
 
     sets = {g: build_group_set(sample, g) for g in POLAR_GROUPINGS}
+    for gs in sets.values():
+        check_sector_sums(gs)
     comps: list[Comparison] = []
     cv = sets["class_velocity"]
     for material in dict.fromkeys(sets["class"].group_ids):
@@ -689,10 +704,10 @@ def analyze_site(sample: SitePolarSample, case_id: str, params: PolarParams) -> 
 
 
 def termination_rows(analysis: SiteAnalysis, case_id: str) -> list[dict[str, Any]]:
-    """每組（含「全站」一組）的終止類別計數與比例，供 CSV。
+    """每組（含「全站」一組）的來源種類計數與比例，供 CSV。
 
-    欄位：全部質點數、穿越數、擱淺數、其他終止類別各自的數量，以及各項占該組全部質點的百分比，
-    ``counted_pct`` = 計入扇區（穿越＋擱淺）的比例 = 36 扇區比例合計。
+    欄位：全部質點數、穿越開放邊界數（``n_crossed``）、海岸來源數（``n_coast``＝全部非穿越者）、海岸來源依終止狀態碼的拆分
+    （``n_status_<碼>``），以及各項占該組全部質點的百分比；``sector_sum_pct`` 為 36 扇區比例合計（恆為 100）。
     """
 
     s = analysis.sample
@@ -700,6 +715,7 @@ def termination_rows(analysis: SiteAnalysis, case_id: str) -> list[dict[str, Any
 
     def one(grouping: str, gid: str, label: str, material: str, speed: float | None, sel: np.ndarray | slice) -> None:
         st = s.status[sel]
+        sec = s.sector[sel]
         n = int(st.size)
         rec: dict[str, Any] = {
             "case": case_id,
@@ -713,17 +729,14 @@ def termination_rows(analysis: SiteAnalysis, case_id: str) -> list[dict[str, Any
         }
         counts = {c: int(np.count_nonzero(st == c)) for c in _STATUS_CODES}
         rec["n_crossed"] = counts[NATIVE_STATUS_LEFT_FLOW_DOMAIN]
-        rec["n_stranded"] = counts[NATIVE_STATUS_STRANDED]
-        rec["n_counted"] = rec["n_crossed"] + rec["n_stranded"]
-        rec["n_uncounted"] = n - rec["n_counted"]
-        for c in _OTHER_STATUS_CODES:
+        rec["n_coast"] = n - rec["n_crossed"]
+        for c in _COAST_STATUS_CODES:
             rec[f"n_status_{c}"] = counts[c]
         rec["crossed_pct"] = 100.0 * rec["n_crossed"] / n
-        rec["stranded_pct"] = 100.0 * rec["n_stranded"] / n
-        rec["counted_pct"] = 100.0 * rec["n_counted"] / n
-        rec["uncounted_pct"] = 100.0 * rec["n_uncounted"] / n
-        for c in _OTHER_STATUS_CODES:
+        rec["coast_pct"] = 100.0 * rec["n_coast"] / n
+        for c in _COAST_STATUS_CODES:
             rec[f"status_{c}_pct"] = 100.0 * counts[c] / n
+        rec["sector_sum_pct"] = 100.0 * float(np.count_nonzero((sec >= 0) & (sec < N_SECTORS))) / n
         rows.append(rec)
 
     one("site_all", "all", "全部虛擬質點", "", None, slice(None))
@@ -745,7 +758,11 @@ def _write_csv(path: Path, header: Sequence[str], rows: Sequence[Mapping[str, An
 
 
 def write_sector_long_csv(analyses: Sequence[SiteAnalysis], case_id: str, path: Path) -> None:
-    """各案/地點/分組/扇區的粒子數與比例長表（四種分組：類別×速度、類別、季節、大小潮）。"""
+    """各案/地點/分組/扇區的粒子數與比例長表（四種分組：類別×速度、類別、季節、大小潮）。
+
+    ``count``／``pct_of_group`` 為兩種來源合計（圖上的總曲線，每組 36 扇區合計 100%）；``count_crossed``／``pct_crossed``
+    為穿越開放邊界者，``count_coast``／``pct_coast`` 為海岸來源（未穿越者以最終位置方位計入），兩者分母同為該組全部質點。
+    """
 
     rows: list[dict[str, Any]] = []
     for an in analyses:
@@ -765,30 +782,35 @@ def write_sector_long_csv(analyses: Sequence[SiteAnalysis], case_id: str, path: 
                             "sector_index": k,
                             "sector_center_azimuth_deg": SECTOR_WIDTH_DEG * k,
                             "count": int(tot[i, k]),
+                            "count_crossed": int(gs.kind_counts[i, KIND_CROSSED, k]),
+                            "count_coast": int(gs.kind_counts[i, KIND_COAST, k]),
                             "group_total": int(gs.n_total[i]),
                             "pct_of_group": f"{100.0 * tot[i, k] / gs.n_total[i]:.6f}",
+                            "pct_crossed": f"{100.0 * gs.kind_counts[i, KIND_CROSSED, k] / gs.n_total[i]:.6f}",
+                            "pct_coast": f"{100.0 * gs.kind_counts[i, KIND_COAST, k] / gs.n_total[i]:.6f}",
                         }
                     )
     header = [
         "case", "site", "grouping", "group_id", "group_label_zh", "material_id", "settling_speed_abs_mps",
-        "sector_index", "sector_center_azimuth_deg", "count", "group_total", "pct_of_group",
+        "sector_index", "sector_center_azimuth_deg", "count", "count_crossed", "count_coast", "group_total",
+        "pct_of_group", "pct_crossed", "pct_coast",
     ]  # fmt: skip
     _write_csv(path, header, rows)
 
 
 def write_termination_csv(analyses: Sequence[SiteAnalysis], case_id: str, path: Path) -> None:
-    """各案/地點/分組的擱淺比例與其他終止類別比例表。"""
+    """各案/地點/分組的穿越開放邊界與海岸來源比例表（海岸來源另依終止狀態碼拆分）。"""
 
     rows = [r for an in analyses for r in termination_rows(an, case_id)]
     header = [
         "case", "site", "grouping", "group_id", "group_label_zh", "material_id", "settling_speed_abs_mps",
-        "n_total", "n_crossed", "n_stranded", "n_counted", "n_uncounted",
-        *[f"n_status_{c}" for c in _OTHER_STATUS_CODES],
-        "crossed_pct", "stranded_pct", "counted_pct", "uncounted_pct",
-        *[f"status_{c}_pct" for c in _OTHER_STATUS_CODES],
+        "n_total", "n_crossed", "n_coast",
+        *[f"n_status_{c}" for c in _COAST_STATUS_CODES],
+        "crossed_pct", "coast_pct", "sector_sum_pct",
+        *[f"status_{c}_pct" for c in _COAST_STATUS_CODES],
     ]  # fmt: skip
     for r in rows:
-        for key in ("crossed_pct", "stranded_pct", "counted_pct", "uncounted_pct", *[f"status_{c}_pct" for c in _OTHER_STATUS_CODES]):
+        for key in ("crossed_pct", "coast_pct", "sector_sum_pct", *[f"status_{c}_pct" for c in _COAST_STATUS_CODES]):
             r[key] = f"{r[key]:.6f}"
     _write_csv(path, header, rows)
 
@@ -863,25 +885,3 @@ def write_comparison_csv(analyses: Sequence[SiteAnalysis], case_id: str, path: P
             )
     header = list(rows[0].keys()) if rows else ["case"]
     _write_csv(path, header, rows)
-
-
-def write_stranded_csv(analyses: Sequence[SiteAnalysis], case_id: str, path: Path) -> None:
-    """全部擱淺質點清單（地圖上畫小標記的依據）；沒有擱淺時只有標頭。"""
-
-    rows: list[dict[str, Any]] = []
-    for an in analyses:
-        s = an.sample
-        for i in np.flatnonzero(s.kind == KIND_STRANDED):
-            rows.append(
-                {
-                    "case": case_id,
-                    "site": s.site_id,
-                    "particle_id": s.particle_id[i],
-                    "material_id": s.material_id[i],
-                    "lon_deg": f"{s.source_lon[i]:.6f}",
-                    "lat_deg": f"{s.source_lat[i]:.6f}",
-                    "azimuth_deg": f"{s.azimuth_deg[i]:.4f}",
-                    "sector_index": int(s.bin37[i]),
-                }
-            )
-    _write_csv(path, ["case", "site", "particle_id", "material_id", "lon_deg", "lat_deg", "azimuth_deg", "sector_index"], rows)

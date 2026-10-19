@@ -1,5 +1,6 @@
 #!/bin/bash
 # WP-60：對 run08（v7）兩案產出「圓形來源方位圖」（每案每地點 13 張，含文字版與無文字版）與統計表、summary.md。
+# 規則（2026-10-19 PI 定案）：未穿越開放邊界者一律以最終位置方位計入（海岸來源），每組 36 扇區合計 100%。
 # 一行執行：bash ~/Workspace/lbt-repo-wp60/scripts/wp60_deploy/run_polar_run08.sh
 # 只「讀」run08 兩案的 postprocess/departures.parquet 與釋放設定，輸出到各案目錄下的新子目錄
 #   <run08>/<案例>/figures-polar（含文字版與表、summary.md）與 <run08>/<案例>/figures-polar-notext（無文字版）。
