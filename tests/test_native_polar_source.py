@@ -291,7 +291,7 @@ def _render_capture(monkeypatch, synthetic, tmp_path, mode):
     t = native_figures._Labeler(font_res.cjk_available)
     captured = {}
 
-    def fake_save(fig, path, *, dpi):
+    def fake_save(fig, path, *, dpi, **_kw):
         captured["fig"] = fig
 
     monkeypatch.setattr(psf, "_save_fixed_canvas", fake_save)
@@ -461,12 +461,14 @@ def test_all_pngs_same_size_and_edges_blank(synthetic, tmp_path):
     psf.build_polar_source(config, command="lbt native-polar-source test")
     pngs = sorted(case.text_dir.rglob("*.png")) + sorted(case.notext_dir.rglob("*.png"))
     assert len(pngs) == 10
-    shapes = set()
+    full_shapes, none_shapes = set(), set()
     for p in pngs:
         img = _read_png(p)
-        shapes.add(img.shape[:2])
+        (none_shapes if "notext" in str(p) else full_shapes).add(img.shape[:2])
         _assert_edges_blank(img, p.name)
-    assert shapes == {(round(psf.CANVAS_H_IN * 100), round(psf.CANVAS_W_IN * 100))}  # 全部相同，且等於固定畫布
+    x0, y0, x1, y1 = psf.NOTEXT_CROP_IN
+    assert full_shapes == {(round(psf.CANVAS_H_IN * 100), round(psf.CANVAS_W_IN * 100))}  # 含文字版：固定畫布
+    assert none_shapes == {(round((y1 - y0) * 100), round((x1 - x0) * 100))}  # 無文字版：共同裁切框，全部相同
 
 
 def test_longest_legend_fits_inside_fixed_canvas(monkeypatch, synthetic, tmp_path):
@@ -484,7 +486,7 @@ def test_longest_legend_fits_inside_fixed_canvas(monkeypatch, synthetic, tmp_pat
     land = native_figures._load_coastline(synthetic[2])
     font_res = native_figures._resolve_font(None)
     t = native_figures._Labeler(font_res.cjk_available)
-    for mode in ("full", "none"):
+    for mode in ("full",):  # 無文字版另有共同裁切框（以真實最長圖例為準），見下方專屬測試
         for site, anchor in REAL_ANCHORS.items():
             site_map = psf._build_site_map(anchor, 25.0, land, {})
             out = tmp_path / f"{mode}_{site}.png"
@@ -500,7 +502,7 @@ def test_circle_has_same_size_and_position_for_every_site(monkeypatch, synthetic
     font_res = native_figures._resolve_font(None)
     t = native_figures._Labeler(font_res.cjk_available)
     captured = {}
-    monkeypatch.setattr(psf, "_save_fixed_canvas", lambda fig, path, *, dpi: captured.__setitem__("fig", fig))
+    monkeypatch.setattr(psf, "_save_fixed_canvas", lambda fig, path, *, dpi, **_kw: captured.__setitem__("fig", fig))
     import matplotlib.pyplot as plt
 
     monkeypatch.setattr(plt, "close", lambda fig=None: None)
@@ -522,3 +524,39 @@ def test_circle_has_same_size_and_position_for_every_site(monkeypatch, synthetic
 def test_site_map_outside_canvas_envelope_fails_closed():
     with pytest.raises(psf.PolarSourceError):
         psf._axes_rect(ANCHOR, 25.0, (ANCHOR[0] - 1.0, ANCHOR[0] + 0.1, ANCHOR[1] - 0.1, ANCHOR[1] + 0.1))
+
+
+def test_notext_common_crop_is_tight_for_the_widest_legend_and_circle_stays_put(tmp_path):
+    """無文字版共同裁切框：以最長圖例（十類圖）為準，四邊留白不超過約 0.15 英寸；圓心像素位置各地點一致。"""
+
+    import dataclasses
+
+    from lagrangian_backtracking.native_runner.display_names import MATERIAL_DISPLAY_NAME_ZH
+
+    font_res = native_figures._resolve_font(None)
+    t = native_figures._Labeler(font_res.cjk_available)
+    labels = [f"{name}　0.000897–0.108 m/s" for name in list(MATERIAL_DISPLAY_NAME_ZH.values())[:10]]
+    n = len(labels)
+    base = psf.PolarFigurePlan(
+        kind="B", stem="polar_source_by_class", title_zh="", title_en="", subtitle_zh="", subtitle_en="",
+        legend_title_zh="類別　沉降速度範圍", legend_title_en="Class", labels=labels, colors=["#440154"] * n,
+        styles=["-"] * n, pct=np.full((n, 36), 100.0 / 36), n_totals=[1000] * n, radius_max_pct=30.0,
+        radius_ticks_pct=[10.0, 20.0, 30.0], caption_zh="",
+    )  # fmt: skip
+    dpi = 100
+    margins = []
+    centers = set()
+    for site, anchor in REAL_ANCHORS.items():
+        site_map = psf._build_site_map(anchor, 25.0, [], {})
+        out = tmp_path / f"{site}.png"
+        psf.render_figure(base, site_map, t, font_res.font_properties, out, dpi, "none")
+        img = _read_png(out)
+        _assert_edges_blank(img, site)
+        nonwhite = (img[..., :3] != 1.0).any(axis=-1)
+        rows = np.flatnonzero(nonwhite.any(axis=1))
+        cols = np.flatnonzero(nonwhite.any(axis=0))
+        h, w = nonwhite.shape
+        margins.append((rows[0], h - 1 - rows[-1], cols[0], w - 1 - cols[-1]))
+    union = np.array(margins).min(axis=0) / dpi  # 各邊在五個地點中最小的留白（英寸）= 聯集外框到邊緣的距離
+    assert np.all(union <= 0.15), union
+    assert np.all(union >= 0.0)

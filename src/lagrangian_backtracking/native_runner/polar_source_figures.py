@@ -25,6 +25,9 @@
 * 含中文的刻度、圖例、文字一律傳入字型物件（``fontproperties`` 置於 ``fontsize`` 之前）。
 * 用詞：「比例（%）」「虛擬質點」「研究地點」；不使用「機率」。
 * 無文字版不畫標題與副標，保留經緯度刻度、方位刻度、半徑刻度與圖例。
+* **無文字版共同裁切框**：無文字版沿用含文字版的畫面版型（圓的位置與大小一致），落檔時以同一個固定裁切框
+  ``NOTEXT_CROP_IN``（英寸，由 130 張無文字版內容外框的聯集加約 0.08 英寸邊界決定）裁掉上方標題空白與右側多餘的圖例欄寬，
+  使報告中固定寬度時地圖主體較大。裁切框是常數，不依各圖內容裁切，因此 130 張尺寸相同、圓心與半徑的像素位置相同。
 * **固定畫布**：含文字版與無文字版、全部地點與圖種的畫布尺寸完全相同（``CANVAS_W_IN`` × ``CANVAS_H_IN`` 英寸，
   600 dpi 時 7560 × 4920 像素），落檔不使用 ``bbox_inches="tight"``（那會依內容裁切，使各圖寬度不一，
   也曾把圖例裁到畫布之外）。錨點（圓心）在畫布上的位置與圓的半徑像素數對每張圖都一樣；地圖框依各地點整齊刻度的範圍
@@ -395,6 +398,9 @@ _TOP_FRAC = 0.855
 """地圖區頂端占畫布高度的比例（其上為標題與副標的空間；無文字版沿用同一版面，使圓的位置一致）。"""
 _LEGEND_X_IN = 7.25
 """圖例欄左緣（英寸）；欄寬到畫布右緣前 0.25 英寸，約 5.1 英寸，足以容納最長圖例。"""
+NOTEXT_CROP_IN = (0.26, 0.43, 10.21, 7.08)
+"""無文字版的共同裁切框 ``(x0, y0, x1, y1)``（英寸，自畫布左下角起算）。由 run08 兩案 130 張無文字版（含最長的十類圖圖例）
+非白色像素外框的聯集，四邊各加約 0.08 英寸而得；600 dpi 時為 5970 × 3990 像素。"""
 _ENVELOPE_KM = {"left": 43.0, "right": 39.0, "down": 45.0, "up": 40.0}
 """半徑 25 km 時，各地點「整齊刻度範圍」自錨點向四方延伸公里數的包絡上限（五個研究地點的實測最大值為
 左 42.5、右 38.0、下 44.1、上 39.3 km）；超出即失敗，以保證地圖框與圖例不超出固定畫布。"""
@@ -429,13 +435,20 @@ def _axes_rect(anchor: tuple[float, float], radius_km: float, extent: tuple[floa
     return left / CANVAS_W_IN, bottom / CANVAS_H_IN, width / CANVAS_W_IN, height / CANVAS_H_IN
 
 
-def _save_fixed_canvas(fig: Any, path: Path, *, dpi: int) -> None:
-    """排他建立 PNG 與同名 SVG；**不使用 ``bbox_inches="tight"``**，畫布尺寸即 ``figsize``。"""
+def _save_fixed_canvas(fig: Any, path: Path, *, dpi: int, crop_in: tuple[float, float, float, float] | None = None) -> None:
+    """排他建立 PNG 與同名 SVG；**不使用 ``bbox_inches="tight"``**（不依內容裁切）。
 
+    ``crop_in`` 為 ``None`` 時輸出整張畫布（``figsize``）；給定時以這個固定的共同裁切框（英寸）輸出，
+    同一版本全部圖使用同一個框，所以尺寸相同。
+    """
+
+    from matplotlib.transforms import Bbox
+
+    box = None if crop_in is None else Bbox([[crop_in[0], crop_in[1]], [crop_in[2], crop_in[3]]])
     with path.open("xb") as stream:
-        fig.savefig(stream, format="png", dpi=dpi)
+        fig.savefig(stream, format="png", dpi=dpi, bbox_inches=box)
     with path.with_suffix(".svg").open("xb") as stream:
-        fig.savefig(stream, format="svg", dpi=dpi)
+        fig.savefig(stream, format="svg", dpi=dpi, bbox_inches=box)
 
 
 @dataclass(slots=True)
@@ -613,7 +626,7 @@ def render_figure(
     _add_two_line_title(
         fig, t, font, t.t(plan.title_zh, plan.title_en), t.t(plan.subtitle_zh, plan.subtitle_en), figure_text=figure_text
     )
-    _save_fixed_canvas(fig, path, dpi=dpi)
+    _save_fixed_canvas(fig, path, dpi=dpi, crop_in=NOTEXT_CROP_IN if figure_text == "none" else None)
     plt.close(fig)
 
 
