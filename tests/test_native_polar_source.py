@@ -294,7 +294,7 @@ def _render_capture(monkeypatch, synthetic, tmp_path, mode):
     def fake_save(fig, path, *, dpi):
         captured["fig"] = fig
 
-    monkeypatch.setattr(psf, "_save_exclusive", fake_save)
+    monkeypatch.setattr(psf, "_save_fixed_canvas", fake_save)
     plan = next(p for p in plans if p.kind == "C")
     import matplotlib.pyplot as plt
 
@@ -426,3 +426,99 @@ def test_end_to_end_outputs_and_split_tables(synthetic, tmp_path):
     assert manifest["status_counts_by_site"][SITE]["3"] == 12
     with pytest.raises(psf.PolarSourceError):
         psf.build_polar_source(config, command="again")  # 輸出目錄已存在，拒絕覆寫
+
+
+# ── 固定畫布：尺寸一致、四邊無內容被裁切、圓同大同位置 ─────────────────────
+
+REAL_ANCHORS = {  # 五個研究地點的實際錨點（經度, 緯度）
+    "gongliao": (121.9224, 25.0964),
+    "guishan": (121.9391, 24.8503),
+    "hsinchu": (120.45, 24.75),
+    "nanwan": (120.7632, 21.9466),
+    "lienchiang": (119.95, 26.2),
+}
+
+
+def _read_png(path: Path) -> np.ndarray:
+    import matplotlib.image as mpimg
+
+    return mpimg.imread(path)
+
+
+def _assert_edges_blank(img: np.ndarray, label: str, n: int = 3) -> None:
+    rgb = img[..., :3]
+    for name, strip in (("top", rgb[:n]), ("bottom", rgb[-n:]), ("left", rgb[:, :n]), ("right", rgb[:, -n:])):
+        assert np.all(strip == 1.0), f"{label}：{name} 邊最外 {n} 像素有非背景內容（疑似被裁切）"
+
+
+def test_all_pngs_same_size_and_edges_blank(synthetic, tmp_path):
+    pp, cfg, coast = synthetic
+    case = psf.PolarCase("no_stokes", pp, tmp_path / "o" / "figures-polar", tmp_path / "o" / "figures-polar-notext")
+    config = psf.PolarConfig(
+        cases=(case,), release_config=cfg, coastline=coast, bathymetry=None,
+        params=ps.PolarParams(n_resamples=20), dpi=100, workers=1,
+    )  # fmt: skip
+    psf.build_polar_source(config, command="lbt native-polar-source test")
+    pngs = sorted(case.text_dir.rglob("*.png")) + sorted(case.notext_dir.rglob("*.png"))
+    assert len(pngs) == 10
+    shapes = set()
+    for p in pngs:
+        img = _read_png(p)
+        shapes.add(img.shape[:2])
+        _assert_edges_blank(img, p.name)
+    assert shapes == {(round(psf.CANVAS_H_IN * 100), round(psf.CANVAS_W_IN * 100))}  # 全部相同，且等於固定畫布
+
+
+def test_longest_legend_fits_inside_fixed_canvas(monkeypatch, synthetic, tmp_path):
+    import dataclasses
+
+    sample = _samples(synthetic)[SITE]
+    an = ps.analyze_site(sample, "case", ps.PolarParams(n_resamples=20))
+    scales = psf.plan_radius_scales({"c": [an]})
+    plan = next(p for p in psf.build_figure_plans(an, "測試案例", scales) if p.kind == "B")
+    long_labels = [f"不可回收塑膠軟片　0.000{i}23–0.00{i}456 m/s" for i in range(10)]
+    big = dataclasses.replace(
+        plan, labels=long_labels, colors=[plan.colors[0]] * 10, styles=[plan.styles[0]] * 10,
+        pct=np.tile(plan.pct[:1], (10, 1)), n_totals=[1000] * 10,
+    )  # fmt: skip
+    land = native_figures._load_coastline(synthetic[2])
+    font_res = native_figures._resolve_font(None)
+    t = native_figures._Labeler(font_res.cjk_available)
+    for mode in ("full", "none"):
+        for site, anchor in REAL_ANCHORS.items():
+            site_map = psf._build_site_map(anchor, 25.0, land, {})
+            out = tmp_path / f"{mode}_{site}.png"
+            psf.render_figure(big, site_map, t, font_res.font_properties, out, 100, mode)
+            _assert_edges_blank(_read_png(out), out.name)
+
+
+def test_circle_has_same_size_and_position_for_every_site(monkeypatch, synthetic, tmp_path):
+    sample = _samples(synthetic)[SITE]
+    an = ps.analyze_site(sample, "case", ps.PolarParams(n_resamples=20))
+    scales = psf.plan_radius_scales({"c": [an]})
+    plan = next(p for p in psf.build_figure_plans(an, "測試案例", scales) if p.kind == "C")
+    font_res = native_figures._resolve_font(None)
+    t = native_figures._Labeler(font_res.cjk_available)
+    captured = {}
+    monkeypatch.setattr(psf, "_save_fixed_canvas", lambda fig, path, *, dpi: captured.__setitem__("fig", fig))
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setattr(plt, "close", lambda fig=None: None)
+    seen = []
+    for site, anchor in REAL_ANCHORS.items():
+        site_map = psf._build_site_map(anchor, 25.0, [], {})
+        psf.render_figure(plan, site_map, t, font_res.font_properties, tmp_path / f"{site}.png", 50, "full")
+        fig = captured["fig"]
+        ax = fig.axes[0]
+        cx, cy = ax.transData.transform(anchor)
+        lo, la = psf.polar_xy_to_lonlat(anchor, 25.0, np.array([90.0, 0.0]))
+        ex, ey = ax.transData.transform((lo[0], la[0]))
+        nx, ny = ax.transData.transform((lo[1], la[1]))
+        seen.append((tuple(fig.get_size_inches()), round(cx, 3), round(cy, 3), round(ex - cx, 3), round(ny - cy, 3)))
+        assert abs((ex - cx) - (ny - cy)) < 0.01  # 正圓
+    assert len(set(seen)) == 1, seen
+
+
+def test_site_map_outside_canvas_envelope_fails_closed():
+    with pytest.raises(psf.PolarSourceError):
+        psf._axes_rect(ANCHOR, 25.0, (ANCHOR[0] - 1.0, ANCHOR[0] + 0.1, ANCHOR[1] - 0.1, ANCHOR[1] + 0.1))

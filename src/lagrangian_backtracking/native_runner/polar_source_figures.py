@@ -25,6 +25,10 @@
 * 含中文的刻度、圖例、文字一律傳入字型物件（``fontproperties`` 置於 ``fontsize`` 之前）。
 * 用詞：「比例（%）」「虛擬質點」「研究地點」；不使用「機率」。
 * 無文字版不畫標題與副標，保留經緯度刻度、方位刻度、半徑刻度與圖例。
+* **固定畫布**：含文字版與無文字版、全部地點與圖種的畫布尺寸完全相同（``CANVAS_W_IN`` × ``CANVAS_H_IN`` 英寸，
+  600 dpi 時 7560 × 4920 像素），落檔不使用 ``bbox_inches="tight"``（那會依內容裁切，使各圖寬度不一，
+  也曾把圖例裁到畫布之外）。錨點（圓心）在畫布上的位置與圓的半徑像素數對每張圖都一樣；地圖框依各地點整齊刻度的範圍
+  決定大小，落在固定的包絡內（見 :func:`_axes_rect`）；圖例放在右側固定欄位，欄寬足以容納最長圖例。
 """
 
 from __future__ import annotations
@@ -64,9 +68,7 @@ from .figures import (
     _lon_formatter,
     _nice_ceiling_axis,
     _resolve_font,
-    _save_exclusive,
     _tick_font_kwargs,
-    _title_top_margin,
 )
 from .polar_source import PolarParams, PolarSourceError, SiteAnalysis
 
@@ -383,6 +385,58 @@ _LAND_COLOR = "#d9d9d9"
 _WINDOW_FACTOR = 1.32
 """地圖視窗半寬 = 圓半徑 × 此倍數（留出方位刻度與標籤的空間）。"""
 
+CANVAS_W_IN = 12.6
+CANVAS_H_IN = 8.2
+"""固定畫布尺寸（英寸）；PNG 以 600 dpi 輸出時為 7560 × 4920 像素，全部圖相同。"""
+
+_LEFT_MARGIN_IN = 0.85
+_BOTTOM_MARGIN_IN = 0.65
+_TOP_FRAC = 0.855
+"""地圖區頂端占畫布高度的比例（其上為標題與副標的空間；無文字版沿用同一版面，使圓的位置一致）。"""
+_LEGEND_X_IN = 7.25
+"""圖例欄左緣（英寸）；欄寬到畫布右緣前 0.25 英寸，約 5.1 英寸，足以容納最長圖例。"""
+_ENVELOPE_KM = {"left": 43.0, "right": 39.0, "down": 45.0, "up": 40.0}
+"""半徑 25 km 時，各地點「整齊刻度範圍」自錨點向四方延伸公里數的包絡上限（五個研究地點的實測最大值為
+左 42.5、右 38.0、下 44.1、上 39.3 km）；超出即失敗，以保證地圖框與圖例不超出固定畫布。"""
+_IN_PER_KM_25 = (_TOP_FRAC * CANVAS_H_IN - _BOTTOM_MARGIN_IN) / (_ENVELOPE_KM["down"] + _ENVELOPE_KM["up"])
+"""半徑 25 km 時地圖每公里的英寸數（圓半徑 = 25 × 此值）；半徑不是 25 km 時反比縮放，使圓的像素大小不變。"""
+_ANCHOR_X_IN = _LEFT_MARGIN_IN + _ENVELOPE_KM["left"] * _IN_PER_KM_25
+_ANCHOR_Y_IN = _BOTTOM_MARGIN_IN + _ENVELOPE_KM["down"] * _IN_PER_KM_25
+"""錨點（圓心）在畫布上的固定位置（自左下角起算的英寸）。"""
+
+
+def _axes_rect(anchor: tuple[float, float], radius_km: float, extent: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """地圖框在固定畫布上的位置 ``(left, bottom, width, height)``（畫布比例）。
+
+    把錨點固定放在畫布的 ``(_ANCHOR_X_IN, _ANCHOR_Y_IN)``，比例尺固定（圓半徑像素數不變），
+    框的四邊依該地點整齊刻度範圍到錨點的實際公里數決定；經緯度的公里換算與圖面長寬比校正一致
+    （緯度每度 111.195 km、經度再乘 cos 緯度），所以圓是正圓。範圍超出包絡時失敗。
+    """
+
+    lon0, lat0 = anchor
+    x0, x1, y0, y1 = extent
+    kx = _KM_PER_DEG * math.cos(math.radians(lat0))
+    km = {"left": (lon0 - x0) * kx, "right": (x1 - lon0) * kx, "down": (lat0 - y0) * _KM_PER_DEG, "up": (y1 - lat0) * _KM_PER_DEG}
+    scale = radius_km / 25.0
+    for side, value in km.items():
+        if value > _ENVELOPE_KM[side] * scale + 1e-6:
+            raise PolarSourceError(f"地圖範圍超出固定畫布包絡（{side} {value:.1f} km > {_ENVELOPE_KM[side] * scale:.1f} km）")
+    s_in = _IN_PER_KM_25 / scale
+    left = _ANCHOR_X_IN - km["left"] * s_in
+    bottom = _ANCHOR_Y_IN - km["down"] * s_in
+    width = (km["left"] + km["right"]) * s_in
+    height = (km["down"] + km["up"]) * s_in
+    return left / CANVAS_W_IN, bottom / CANVAS_H_IN, width / CANVAS_W_IN, height / CANVAS_H_IN
+
+
+def _save_fixed_canvas(fig: Any, path: Path, *, dpi: int) -> None:
+    """排他建立 PNG 與同名 SVG；**不使用 ``bbox_inches="tight"``**，畫布尺寸即 ``figsize``。"""
+
+    with path.open("xb") as stream:
+        fig.savefig(stream, format="png", dpi=dpi)
+    with path.with_suffix(".svg").open("xb") as stream:
+        fig.savefig(stream, format="svg", dpi=dpi)
+
 
 @dataclass(slots=True)
 class _SiteMap:
@@ -412,6 +466,7 @@ def _build_site_map(
     xticks = _axis_ticks(lon0 - dlon, lon0 + dlon, max_intervals=8)
     yticks = _axis_ticks(lat0 - dlat, lat0 + dlat, max_intervals=8)
     extent = (float(xticks[0]), float(xticks[-1]), float(yticks[0]), float(yticks[-1]))
+    _axes_rect(anchor, radius_km, extent)  # 範圍超出固定畫布包絡時及早失敗
     land: list[Any] = []
     for geom in land_geometries:
         clipped = shapely.clip_by_rect(geom, extent[0], extent[2], extent[1], extent[3])
@@ -444,14 +499,12 @@ def render_figure(
     lon0, lat0 = site_map.anchor
     radius_km = site_map.radius_km
     rmax = plan.radius_max_pct
-    fig = plt.figure(figsize=(13.4, 7.6), dpi=150)
-    fig.subplots_adjust(left=0.075, right=0.66, bottom=0.075, top=_title_top_margin(figure_text, full=0.855, none=0.97))
-    ax = fig.add_subplot(1, 1, 1)
-    ax.set_anchor("W")
+    fig = plt.figure(figsize=(CANVAS_W_IN, CANVAS_H_IN), dpi=150)
+    ax = fig.add_axes(_axes_rect(site_map.anchor, radius_km, site_map.extent))
     x0, x1, y0, y1 = site_map.extent
     ax.set_xlim(x0, x1)
     ax.set_ylim(y0, y1)
-    ax.set_aspect(1.0 / math.cos(math.radians(lat0)), adjustable="box")
+    ax.set_aspect("auto")  # 框的長寬已依公里比例尺算好（見 _axes_rect），圓為正圓
     ax.set_facecolor("white")
 
     # 底圖：陸地（灰）與海岸線（黑），等深線（中灰細線）。
@@ -541,24 +594,26 @@ def render_figure(
         lab.set_fontproperties(font)
         lab.set_fontsize(9)
 
-    # 主圖例（折線）用 ax.legend 建立，使 bbox_inches="tight" 一定把它納入裁切範圍；
+    # 主圖例（折線）用 ax.legend 建立；兩個圖例都放在畫布右側固定欄位（畫布比例座標），不依內容裁切；
     # 次圖例（錨點、等深線）較短，以 add_artist 加入。
     from matplotlib.legend import Legend
 
     leg = ax.legend(
-        handles=handles, loc="upper left", bbox_to_anchor=(1.03, 1.0), frameon=False, prop=font,
+        handles=handles, loc="upper left", bbox_to_anchor=(_LEGEND_X_IN / CANVAS_W_IN, _TOP_FRAC), bbox_transform=fig.transFigure,
+        frameon=False, prop=font,
         title=t.t(plan.legend_title_zh, plan.legend_title_en), handlelength=3.4, borderaxespad=0.0, alignment="left",
     )  # fmt: skip
     leg.get_title().set_fontproperties(font)
     leg2 = Legend(
-        ax, extra, [h.get_label() for h in extra], loc="lower left", bbox_to_anchor=(1.03, 0.0),
-        bbox_transform=ax.transAxes, frameon=False, prop=font, handlelength=3.4, borderaxespad=0.0,
+        ax, extra, [h.get_label() for h in extra], loc="lower left",
+        bbox_to_anchor=(_LEGEND_X_IN / CANVAS_W_IN, _BOTTOM_MARGIN_IN / CANVAS_H_IN),
+        bbox_transform=fig.transFigure, frameon=False, prop=font, handlelength=3.4, borderaxespad=0.0,
     )  # fmt: skip
     ax.add_artist(leg2)
     _add_two_line_title(
         fig, t, font, t.t(plan.title_zh, plan.title_en), t.t(plan.subtitle_zh, plan.subtitle_en), figure_text=figure_text
     )
-    _save_exclusive(fig, path, dpi=dpi)
+    _save_fixed_canvas(fig, path, dpi=dpi)
     plt.close(fig)
 
 
