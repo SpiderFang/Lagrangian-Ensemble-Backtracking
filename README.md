@@ -50,6 +50,8 @@
 
 沿開放邊界的相對來源權重曲線（WP-55）：`lbt native-arc-by-group` 讀取後處理輸出，依沉降速度類別、沉底時刻的季節、沉底時刻的大潮／小潮分線，輸出沿邊界弧長的相對來源權重曲線（含文字與無文字兩版）與量化表（各邊占比、組間總變異距離、抽樣雜訊基準）。圖上類別名稱由顯示名稱對照表決定（`native_runner/display_names.py`），不改動材質識別碼與材質清冊。規則見[成圖規則 6.1 節](docs/results/17_native_figures_formal_output_rules.md)。
 
+圓形來源方位圖（WP-60）：`lbt native-polar-source` 讀取後處理的逐質點表 `departures.parquet` 與正式釋放設定的錨點，以研究地點錨點為圓心，把每顆虛擬質點的來源點（穿越開放邊界者用離開點，擱淺者用擱淺位置，其他終止類別不計入扇區但留在分母）換算成大圓初始方位角，分到 36 個 10° 扇區，畫成地圖上的封閉極座標折線（半徑為比例，%），依「類別內十速度、十類、季節、大小潮」分線；另輸出扇區比例、終止類別與可區辨性檢定表（同組依到達時刻單元對半切的雜訊基準）與 `summary.md`。規則見[成圖規則 6.3 節](docs/results/17_native_figures_formal_output_rules.md)。
+
 貢寮與龜山島共用 A 區流場資料與最外層開放邊界，但各自保存局部區域入口、跨站診斷、情境身分與統計分母；穿越另一站局部區域不會轉移粒子所屬站點。A 區沿用 `northeast_taiwan_common_cache_v3`、以 anchor 半徑 12.5 km 受體核心與 20 km 局部區域建立 `formal_domain_policy=v3_local20km_20260909_v1`；龜山島另有核定的 soft-priority 走廊，只在同一 12.5 km core 的 persistent-wet 候選中優先選點。A 區正式空間支援採 `runtime_spatial_support_policy=runtime_stage_fail_closed_no_expansion_v1`：OCM 或 NWW3 在實際查詢位置／時間無有效支援時立即停止，保留 `data_gap` 等原始狀態，不以零值、最近值或擴張資料域補齊。完整範圍歷史沿革、既有 24 小時 DEMO 產物邊界與正式 30 天重建需求見[全部可得資料與時間重建](docs/operations/10_available_data_time_reconstruction_and_a_expansion.md)。
 
 每個受體×到達配對的實際初始深度來自到達 UTC 的已驗證動態紀錄；不以模板深度代替所有到達時間。投影座標、公尺距離、步長限制、統計網格與軌跡計算使用公尺制座標，圖面可將公尺座標轉為經緯度顯示，但經緯度不進入粒子物理運算。

@@ -68,6 +68,8 @@ from .native_runner import backtrack_horizon as native_backtrack_horizon
 from .native_runner import bed_no_deposition_case as native_bed_no_deposition_case
 from .native_runner import arc_by_group as native_arc_by_group
 from .native_runner import arc_by_group_figures as native_arc_by_group_figures
+from .native_runner import polar_source as native_polar_source
+from .native_runner import polar_source_figures as native_polar_source_figures
 from .native_runner import figures as native_figures
 from .native_runner import horizon_derivation as native_horizon_derivation
 from .native_runner import hour_major_provider as native_hour_major_provider
@@ -2487,6 +2489,79 @@ def run_native_arc_by_group_command(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _native_polar_source_parser() -> argparse.ArgumentParser:
+    """建立 ``lbt native-polar-source`` parser（WP-60：圓形來源方位圖）。
+
+    只讀 ``native-postprocess`` 已寫出的逐質點表 ``departures.parquet``（不需要足跡產品）與正式釋放設定的錨點；
+    不讀 forcing、不重新積分、不改寫任何輸入。可一次給多個案例（重複 ``--case``），半徑刻度由全部案例、
+    全部地點共同決定。每個案例的含文字版與無文字版輸出目錄都必須尚不存在。
+    """
+
+    parser = argparse.ArgumentParser(
+        description="由 native 後處理輸出繪製每地點的圓形來源方位圖（36 個 10 度扇區，依類別／速度／季節／大小潮分線）與統計表"
+    )
+    parser.add_argument(
+        "--case", nargs=4, action="append", required=True,
+        metavar=("CASE_ID", "POSTPROCESS_DIR", "TEXT_OUTPUT_DIR", "NOTEXT_OUTPUT_DIR"),
+        help="案例代號、native-postprocess 輸出目錄（只讀）、含文字版輸出目錄、無文字版輸出目錄（皆須尚不存在）；可重複",
+    )
+    parser.add_argument("--release-config", type=Path, required=True, help="正式釋放設定 YAML（取各地點錨點 anchor_lonlat）")
+    parser.add_argument("--coastline", type=Path, required=True, help="海岸線 GeoJSON（CRS84）")
+    parser.add_argument("--bathymetry", type=Path, default=None, help="等深線 GeoJSON（可省略）")
+    parser.add_argument("--radius-km", type=float, default=25.0, help="地圖上圓的半徑（公里，預設 25）")
+    parser.add_argument(
+        "--radius-max-pct", type=float, default=None,
+        help="所有圖種共用的半徑上限（%%）；省略時 A、B、D 與 C 各依實際最大值取整",
+    )
+    parser.add_argument("--sites", nargs="+", default=None, help="只畫指定地點（不影響半徑上限與統計）")
+    parser.add_argument("--only-cases", nargs="+", default=None, help="只輸出指定案例（其餘案例仍讀入以決定半徑上限）")
+    parser.add_argument("--kinds", nargs="+", choices=list(native_polar_source_figures.FIGURE_KINDS),
+                        default=list(native_polar_source_figures.FIGURE_KINDS), help="圖種 A 類別內十速度、B 十類、C 季節、D 大小潮")
+    parser.add_argument("--classes", nargs="+", default=None, help="A 圖只畫指定的 material_id")
+    parser.add_argument("--modes", nargs="+", choices=["full", "none"], default=["full", "none"], help="含文字版 full、無文字版 none")
+    parser.add_argument("--no-tables", action="store_true", help="不輸出統計表與 summary.md（試作用）")
+    parser.add_argument("--resamples", type=int, default=1000, help="雜訊基準的隨機對半切重抽次數（預設 1000）")
+    parser.add_argument("--seed", type=int, default=20261019, help="雜訊基準的亂數種子（預設 20261019）")
+    parser.add_argument("--workers", type=int, default=8, help="繪圖子行程數（預設 8）")
+    parser.add_argument("--font-path", type=Path, default=None, help="可選：自備中文字型檔")
+    parser.add_argument("--dpi", type=int, default=600, help="輸出 PNG 解析度（預設 600；同名 SVG 一併輸出）")
+    return parser
+
+
+def run_native_polar_source_command(argv: Sequence[str] | None = None) -> int:
+    """執行一次 native-polar-source：每案每地點 13 張圖（含文字與無文字兩版）與統計表。"""
+
+    args = _native_polar_source_parser().parse_args(argv)
+    command_argv = list(argv if argv is not None else sys.argv[1:])
+    command = shlex.join(["lbt", "native-polar-source", *command_argv])
+    config = native_polar_source_figures.PolarConfig(
+        cases=tuple(
+            native_polar_source_figures.PolarCase(
+                case_id=c[0], postprocess_dir=Path(c[1]), text_dir=Path(c[2]), notext_dir=Path(c[3])
+            )
+            for c in args.case
+        ),
+        release_config=args.release_config,
+        coastline=args.coastline,
+        bathymetry=args.bathymetry,
+        radius_km=args.radius_km,
+        radius_max_pct=args.radius_max_pct,
+        sites=tuple(args.sites) if args.sites is not None else None,
+        only_cases=tuple(args.only_cases) if args.only_cases is not None else None,
+        kinds=tuple(args.kinds),
+        classes=tuple(args.classes) if args.classes is not None else None,
+        modes=tuple(args.modes),
+        params=native_polar_source.PolarParams(n_resamples=args.resamples, seed=args.seed),
+        font_path=args.font_path,
+        dpi=args.dpi,
+        workers=args.workers,
+        write_tables=not args.no_tables,
+    )
+    output_dirs = native_polar_source_figures.build_polar_source(config, command=command)
+    print(json.dumps({"output_dirs": [str(p) for p in output_dirs]}, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _report_spec_create_parser() -> argparse.ArgumentParser:
     """建立 report spec parser，所有 renderer／抽樣研究值都必須明示。
 
@@ -4188,6 +4263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     subparsers.add_parser("native-figures", parents=[_native_figures_parser()], add_help=False)
     subparsers.add_parser("native-arc-by-group", parents=[_native_arc_by_group_parser()], add_help=False)
+    subparsers.add_parser("native-polar-source", parents=[_native_polar_source_parser()], add_help=False)
     parsed, remainder = parser.parse_known_args(argv)
     # 重新交給共用 handler 解析完整參數，確保獨立與整合 entry point 行為一致。
     command_argv = list(argv if argv is not None else sys.argv[1:])[1:]
@@ -4273,6 +4349,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_native_figures_command(command_argv)
     if parsed.command == "native-arc-by-group":
         return run_native_arc_by_group_command(command_argv)
+    if parsed.command == "native-polar-source":
+        return run_native_polar_source_command(command_argv)
     parser.error(f"未知命令：{parsed.command}; 其餘參數={remainder}")
     return 2
 
