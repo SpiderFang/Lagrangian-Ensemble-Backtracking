@@ -562,17 +562,20 @@ def render_figure(
         lab.set_fontproperties(font)
         lab.set_fontsize(9)
 
+    # 主圖例（折線）用 ax.legend 建立，使 bbox_inches="tight" 一定把它納入裁切範圍；
+    # 次圖例（錨點、擱淺點、等深線）較短，以 add_artist 加入。
+    from matplotlib.legend import Legend
+
     leg = ax.legend(
         handles=handles, loc="upper left", bbox_to_anchor=(1.03, 1.0), frameon=False, prop=font,
         title=t.t(plan.legend_title_zh, plan.legend_title_en), handlelength=3.4, borderaxespad=0.0, alignment="left",
     )  # fmt: skip
     leg.get_title().set_fontproperties(font)
-    ax.add_artist(leg)
-    leg2 = ax.legend(
-        handles=extra, loc="lower left", bbox_to_anchor=(1.03, 0.0), frameon=False, prop=font, handlelength=3.4,
-        borderaxespad=0.0,
+    leg2 = Legend(
+        ax, extra, [h.get_label() for h in extra], loc="lower left", bbox_to_anchor=(1.03, 0.0),
+        bbox_transform=ax.transAxes, frameon=False, prop=font, handlelength=3.4, borderaxespad=0.0,
     )  # fmt: skip
-    _ = leg2
+    ax.add_artist(leg2)
     _add_two_line_title(
         fig, t, font, t.t(plan.title_zh, plan.title_en), t.t(plan.subtitle_zh, plan.subtitle_en), figure_text=figure_text
     )
