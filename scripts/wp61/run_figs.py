@@ -13,6 +13,8 @@ sites = sys.argv[1].split(",") if len(sys.argv) > 1 else list(ac.SITES)
 outroot = Path(sys.argv[2] if len(sys.argv) > 2 else "/home/mustlab/Workspace/lbt-wp61/figures")
 # run09：貢寮與龜山島各依自己的潮位選時刻，不再以貢寮序列作為龜山島的挑選依據參考（LBT_ARRIVAL_PAIRED=0）。
 PAIRED = __import__("os").environ.get("LBT_ARRIVAL_PAIRED", "1") != "0"
+# 只出無文字版：LBT_FIGS_NOTEXT_ONLY=1（預設兩版都出）
+TEXTS = (False,) if __import__("os").environ.get("LBT_FIGS_NOTEXT_ONLY", "0") == "1" else (True, False)
 fonts = af.Fonts()
 print(fonts.record)
 recs = ac.load_manifest_records()
@@ -33,7 +35,7 @@ for site in sites:
     for variant in ("U", "S"):
         plan = af.axis_plan(stats, variant, site)
         print(site, variant, plan["eta"], plan["strength"], plan["hs"], plan["speed"])
-        for text in (True, False):
+        for text in TEXTS:
             tag = "text" if text else "notext"
             t = time.time()
             for kind in ("overview", "zoom"):

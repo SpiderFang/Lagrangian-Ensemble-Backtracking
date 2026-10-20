@@ -228,9 +228,9 @@ def _legend_handles(fonts: Fonts, *, guishan: bool, zoom: bool):
         for e in ("high_wave_event", "strong_current_event")
     ]
     thr = Line2D([], [], color="black", ls=(0, (4, 2)), lw=0.9, label="季內中位數（大小潮分界）")
-    p99 = Line2D([], [], color="#555555", ls=(0, (4, 2)), lw=0.8, label="年 p99")
-    mx = Line2D([], [], color="#555555", ls=(0, (1, 1.5)), lw=0.9, label="年最大")
-    curve = Line2D([], [], color="#222222", lw=0.9, label="OCM 海面水位")
+    p99 = Line2D([], [], color="#555555", ls=(0, (4, 2)), lw=0.8, label="全年第 99 百分位")
+    mx = Line2D([], [], color="#555555", ls=(0, (1, 1.5)), lw=0.9, label="全年最大值")
+    curve = Line2D([], [], color="#222222", lw=0.9, label="模式海面水位")
     ref = Line2D([], [], color="#888888", lw=0.8, ls=(0, (3, 1.5)), label="挑選依據序列（另一地點）")
     return g_season, g_class, g_phase, g_event, thr, p99, mx, curve, ref
 
@@ -328,11 +328,11 @@ def render_overview(
         )
         _style_axes(ax, fonts, 6.5, xlim=(0, 365), ylim=(lo, up), yticks=axis_ticks(lo, up, st))
     ax_h.tick_params(labelbottom=False)
-    ax_h.set_ylabel("Hs（m）", fontproperties=fonts(7), labelpad=2)
+    ax_h.set_ylabel("示性波高（m）", fontproperties=fonts(7), labelpad=2)
     ax_c.set_ylabel("流速（m/s）", fontproperties=fonts(7), labelpad=2)
     ax_c.set_xticks(mticks)
     ax_c.set_xticklabels(mlabels, fontproperties=fonts(6.5))
-    ax_c.set_xlabel("2025 年（UTC，月/日）", fontproperties=fonts(7), labelpad=1)
+    ax_c.set_xlabel("2025 年（世界時，月/日）", fontproperties=fonts(7), labelpad=1)
     idx_of = res["idx_of"]
     for r in rows:
         i = idx_of[int(np.datetime64(r["utc"].replace("Z", ""), "ns").astype("int64"))]
@@ -480,7 +480,7 @@ def render_zoom(
                     l1 = f"{SEASON_ZH[sn]} {CLASS_ZH[cl]} {PHASE_ZH[ph_name]} #{k + 1}"
                     l2 = (
                         r["utc"][5:16].replace("T", " ")
-                        + "Z"
+                        + " 世界時"
                         + (f" 距高低潮{ex:.1f}h" if ph_name == "slack_proxy" else "")
                     )
                     ax.set_title(
@@ -516,12 +516,12 @@ def render_zoom(
             ax, fonts, 5.6, xlim=(-HALF, HALF), ylim=(elo, eup), yticks=axis_ticks(elo, eup, est), xticks=xt
         )
         ax.set_ylabel(
-            "Hs（m）" if ev == "high_wave_event" else "流速（m/s）", fontproperties=fonts(5.8), labelpad=1
+            "示性波高（m）" if ev == "high_wave_event" else "流速（m/s）", fontproperties=fonts(5.8), labelpad=1
         )
         if text:
             unit = "m" if ev == "high_wave_event" else "m/s"
             ax.set_title(
-                f"{EVENT_ZH[ev]}  {r['utc'][:16].replace('T', ' ')}Z  峰值 {ser[i]:.2f} {unit}（年最大 {ymax:.2f}，年 p99 {p99:.2f}）",
+                f"{EVENT_ZH[ev]}  {r['utc'][:16].replace('T', ' ')} 世界時  峰值 {ser[i]:.2f} {unit}（全年最大值 {ymax:.2f}，全年第 99 百分位 {p99:.2f}）",
                 fontproperties=fonts(5.6),
                 loc="left",
                 pad=2,
@@ -539,7 +539,7 @@ def render_zoom(
         fig.text(
             left / W,
             1 - 0.06 / H,
-            "50 個到達時刻前後 ±13 h：48 個分層時刻為 OCM 海面水位，2 個事件時刻為挑選所用的波高與流速",
+            "50 個到達時刻前後 ±13 h：48 個分層時刻為模式海面水位，2 個事件時刻為挑選所用的波高與流速",
             ha="left",
             va="top",
             fontproperties=fonts(8, "bold"),
