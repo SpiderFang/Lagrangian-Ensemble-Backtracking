@@ -2525,6 +2525,19 @@ def _native_polar_source_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=8, help="繪圖子行程數（預設 8）")
     parser.add_argument("--font-path", type=Path, default=None, help="可選：自備中文字型檔")
     parser.add_argument("--dpi", type=int, default=600, help="輸出 PNG 解析度（預設 600；同名 SVG 一併輸出）")
+    envelope = parser.add_mutually_exclusive_group()
+    envelope.add_argument(
+        "--envelope-km", nargs=4, type=float, metavar=("LEFT", "RIGHT", "DOWN", "UP"), default=None,
+        help="固定畫布包絡（半徑 25 km 時錨點向四方的公里數）；省略時沿用 run08 的 43 39 45 40",
+    )
+    envelope.add_argument(
+        "--envelope-auto", action="store_true",
+        help="依本次全部錨點自動決定包絡（取各方向最大值向上取整）；無文字版共同裁切框改由本次無文字版圖量測",
+    )
+    parser.add_argument(
+        "--notext-crop-in", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"), default=None,
+        help="無文字版共同裁切框（英寸，自畫布左下角起算）；省略時 run08 包絡用既定值，其他包絡自動量測",
+    )
     return parser
 
 
@@ -2556,6 +2569,13 @@ def run_native_polar_source_command(argv: Sequence[str] | None = None) -> int:
         dpi=args.dpi,
         workers=args.workers,
         write_tables=not args.no_tables,
+        envelope_km=(
+            dict(zip(native_polar_source_figures.ENVELOPE_SIDES, args.envelope_km, strict=True))
+            if args.envelope_km is not None
+            else None
+        ),
+        envelope_auto=bool(args.envelope_auto),
+        notext_crop_in=tuple(args.notext_crop_in) if args.notext_crop_in is not None else None,
     )
     output_dirs = native_polar_source_figures.build_polar_source(config, command=command)
     print(json.dumps({"output_dirs": [str(p) for p in output_dirs]}, ensure_ascii=False, indent=2, sort_keys=True))

@@ -86,6 +86,11 @@ __all__ = [
     "polar_xy_to_lonlat",
     "build_figure_plans",
     "render_figure",
+    "FigureLayout",
+    "RUN08_LAYOUT",
+    "ENVELOPE_SIDES",
+    "make_layout",
+    "plan_envelope",
     "summary_markdown",
 ]
 
@@ -146,6 +151,11 @@ class PolarConfig:
     省略時 A、B、D 與 C 各依實際最大值取整（見 :func:`plan_radius_scales`）。
     ``sites`` / ``only_cases`` / ``kinds`` / ``classes``：只畫指定子集（不影響半徑上限的計算，
     試作與全量因此用同一組刻度）。``modes``：``full`` 含文字、``none`` 無文字。``write_tables``：是否輸出表與摘要。
+
+    版面（固定畫布的包絡）：預設沿用 run08 的包絡（左 43、右 39、下 45、上 40 km，半徑 25 km 時）與無文字版共同裁切框，
+    run08 的圖因此可逐位元重現。``envelope_km``（四個方向的公里數）明示包絡；``envelope_auto`` 依本次全部錨點自動決定包絡
+    （:func:`plan_envelope`）。包絡不是 run08 預設時，無文字版共同裁切框由本次全部無文字版圖的內容外框聯集量測決定
+    （四邊各加 0.08 英寸），也可用 ``notext_crop_in`` 明示。
     """
 
     cases: tuple[PolarCase, ...]
@@ -164,8 +174,15 @@ class PolarConfig:
     dpi: int = 600
     workers: int = 8
     write_tables: bool = True
+    envelope_km: Mapping[str, float] | None = None
+    envelope_auto: bool = False
+    notext_crop_in: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
+        if self.envelope_km is not None and self.envelope_auto:
+            raise PolarSourceError("envelope_km 與 envelope_auto 只能擇一")
+        if self.envelope_km is not None:
+            make_layout(self.envelope_km)  # 提早驗證
         if not self.cases:
             raise PolarSourceError("至少需要一個案例")
         if len({c.case_id for c in self.cases}) != len(self.cases):
@@ -410,8 +427,64 @@ _ANCHOR_X_IN = _LEFT_MARGIN_IN + _ENVELOPE_KM["left"] * _IN_PER_KM_25
 _ANCHOR_Y_IN = _BOTTOM_MARGIN_IN + _ENVELOPE_KM["down"] * _IN_PER_KM_25
 """錨點（圓心）在畫布上的固定位置（自左下角起算的英寸）。"""
 
+ENVELOPE_SIDES = ("left", "right", "down", "up")
+_NOTEXT_MARGIN_IN = 0.08
+"""無文字版共同裁切框在內容聯集外各加的邊界（英寸）。"""
+_MAP_TO_LEGEND_GAP_IN = 0.2
+"""地圖框右緣與圖例欄左緣之間至少保留的間距（英寸）。"""
 
-def _axes_rect(anchor: tuple[float, float], radius_km: float, extent: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+
+@dataclass(frozen=True, slots=True)
+class FigureLayout:
+    """固定畫布版面：包絡（半徑 25 km 時各方向公里數）、比例尺、錨點位置與無文字版共同裁切框。
+
+    預設版面 :data:`RUN08_LAYOUT` 與 run08（WP-60）逐位元相同。包絡可由設定給定或依一次執行的全部錨點自動決定
+    （:func:`plan_envelope`）；包絡改變時比例尺與錨點位置隨之改變，但同一次執行內的全部圖仍使用同一個版面
+    （圓心與圓半徑的像素位置一致、畫布尺寸一致）。``notext_crop_in`` 為 ``None`` 表示輸出整張畫布（量測用）。
+    """
+
+    left: float
+    right: float
+    down: float
+    up: float
+    in_per_km_25: float
+    anchor_x_in: float
+    anchor_y_in: float
+    notext_crop_in: tuple[float, float, float, float] | None
+
+    def envelope(self) -> dict[str, float]:
+        return {"left": self.left, "right": self.right, "down": self.down, "up": self.up}
+
+
+def make_layout(
+    envelope_km: Mapping[str, float],
+    notext_crop_in: tuple[float, float, float, float] | None = NOTEXT_CROP_IN,
+) -> FigureLayout:
+    """由包絡（半徑 25 km 時各方向公里數）建立版面；包絡不合理（缺方向、非正數）時失敗；比例尺取垂直放得下與不壓到圖例欄兩者較小者。"""
+
+    if set(envelope_km) != set(ENVELOPE_SIDES):
+        raise PolarSourceError(f"包絡必須恰有 {ENVELOPE_SIDES} 四個方向")
+    env = {k: float(envelope_km[k]) for k in ENVELOPE_SIDES}
+    if any(not (math.isfinite(v) and v > 0.0) for v in env.values()):
+        raise PolarSourceError("包絡各方向必須是有限正數（公里）")
+    fit_v = (_TOP_FRAC * CANVAS_H_IN - _BOTTOM_MARGIN_IN) / (env["down"] + env["up"])
+    fit_h = (_LEGEND_X_IN - _MAP_TO_LEGEND_GAP_IN - _LEFT_MARGIN_IN) / (env["left"] + env["right"])
+    in_per_km = min(fit_v, fit_h)  # 垂直方向放得下為準；左右很寬時改以不壓到圖例欄為準（run08 包絡由垂直方向決定）
+    anchor_x = _LEFT_MARGIN_IN + env["left"] * in_per_km
+    anchor_y = _BOTTOM_MARGIN_IN + env["down"] * in_per_km
+    return FigureLayout(env["left"], env["right"], env["down"], env["up"], in_per_km, anchor_x, anchor_y, notext_crop_in)
+
+
+RUN08_LAYOUT = make_layout(_ENVELOPE_KM, NOTEXT_CROP_IN)
+"""run08（WP-60）的版面；預設值，行為與改版前完全相同。"""
+
+
+def _axes_rect(
+    anchor: tuple[float, float],
+    radius_km: float,
+    extent: tuple[float, float, float, float],
+    layout: FigureLayout | None = None,
+) -> tuple[float, float, float, float]:
     """地圖框在固定畫布上的位置 ``(left, bottom, width, height)``（畫布比例）。
 
     把錨點固定放在畫布的 ``(_ANCHOR_X_IN, _ANCHOR_Y_IN)``，比例尺固定（圓半徑像素數不變），
@@ -419,23 +492,27 @@ def _axes_rect(anchor: tuple[float, float], radius_km: float, extent: tuple[floa
     （緯度每度 111.195 km、經度再乘 cos 緯度），所以圓是正圓。範圍超出包絡時失敗。
     """
 
+    lay = RUN08_LAYOUT if layout is None else layout
+    env = lay.envelope()
     lon0, lat0 = anchor
     x0, x1, y0, y1 = extent
     kx = _KM_PER_DEG * math.cos(math.radians(lat0))
     km = {"left": (lon0 - x0) * kx, "right": (x1 - lon0) * kx, "down": (lat0 - y0) * _KM_PER_DEG, "up": (y1 - lat0) * _KM_PER_DEG}
     scale = radius_km / 25.0
     for side, value in km.items():
-        if value > _ENVELOPE_KM[side] * scale + 1e-6:
-            raise PolarSourceError(f"地圖範圍超出固定畫布包絡（{side} {value:.1f} km > {_ENVELOPE_KM[side] * scale:.1f} km）")
-    s_in = _IN_PER_KM_25 / scale
-    left = _ANCHOR_X_IN - km["left"] * s_in
-    bottom = _ANCHOR_Y_IN - km["down"] * s_in
+        if value > env[side] * scale + 1e-6:
+            raise PolarSourceError(f"地圖範圍超出固定畫布包絡（{side} {value:.1f} km > {env[side] * scale:.1f} km）")
+    s_in = lay.in_per_km_25 / scale
+    left = lay.anchor_x_in - km["left"] * s_in
+    bottom = lay.anchor_y_in - km["down"] * s_in
     width = (km["left"] + km["right"]) * s_in
     height = (km["down"] + km["up"]) * s_in
     return left / CANVAS_W_IN, bottom / CANVAS_H_IN, width / CANVAS_W_IN, height / CANVAS_H_IN
 
 
-def _save_fixed_canvas(fig: Any, path: Path, *, dpi: int, crop_in: tuple[float, float, float, float] | None = None) -> None:
+def _save_fixed_canvas(
+    fig: Any, path: Path, *, dpi: int, crop_in: tuple[float, float, float, float] | None = None, svg: bool = True
+) -> None:
     """排他建立 PNG 與同名 SVG；**不使用 ``bbox_inches="tight"``**（不依內容裁切）。
 
     ``crop_in`` 為 ``None`` 時輸出整張畫布（``figsize``）；給定時以這個固定的共同裁切框（英寸）輸出，
@@ -447,8 +524,9 @@ def _save_fixed_canvas(fig: Any, path: Path, *, dpi: int, crop_in: tuple[float, 
     box = None if crop_in is None else Bbox([[crop_in[0], crop_in[1]], [crop_in[2], crop_in[3]]])
     with path.open("xb") as stream:
         fig.savefig(stream, format="png", dpi=dpi, bbox_inches=box)
-    with path.with_suffix(".svg").open("xb") as stream:
-        fig.savefig(stream, format="svg", dpi=dpi, bbox_inches=box)
+    if svg:
+        with path.with_suffix(".svg").open("xb") as stream:
+            fig.savefig(stream, format="svg", dpi=dpi, bbox_inches=box)
 
 
 @dataclass(slots=True)
@@ -469,6 +547,7 @@ def _build_site_map(
     radius_km: float,
     land_geometries: Sequence[Any],
     site_isobaths: Mapping[float, list[np.ndarray]],
+    layout: FigureLayout | None = None,
 ) -> _SiteMap:
     import shapely
 
@@ -479,7 +558,7 @@ def _build_site_map(
     xticks = _axis_ticks(lon0 - dlon, lon0 + dlon, max_intervals=8)
     yticks = _axis_ticks(lat0 - dlat, lat0 + dlat, max_intervals=8)
     extent = (float(xticks[0]), float(xticks[-1]), float(yticks[0]), float(yticks[-1]))
-    _axes_rect(anchor, radius_km, extent)  # 範圍超出固定畫布包絡時及早失敗
+    _axes_rect(anchor, radius_km, extent, layout)  # 範圍超出固定畫布包絡時及早失敗
     land: list[Any] = []
     for geom in land_geometries:
         clipped = shapely.clip_by_rect(geom, extent[0], extent[2], extent[1], extent[3])
@@ -498,6 +577,8 @@ def render_figure(
     path: Path,
     dpi: int,
     figure_text: str,
+    layout: FigureLayout | None = None,
+    png_only: bool = False,
 ) -> None:
     """畫單張圓形來源方位圖（含地圖底圖、圓與扇區刻度、半徑刻度、10 條以內折線與圖例），並落檔（PNG＋SVG）。"""
 
@@ -513,7 +594,8 @@ def render_figure(
     radius_km = site_map.radius_km
     rmax = plan.radius_max_pct
     fig = plt.figure(figsize=(CANVAS_W_IN, CANVAS_H_IN), dpi=150)
-    ax = fig.add_axes(_axes_rect(site_map.anchor, radius_km, site_map.extent))
+    lay = RUN08_LAYOUT if layout is None else layout
+    ax = fig.add_axes(_axes_rect(site_map.anchor, radius_km, site_map.extent, lay))
     x0, x1, y0, y1 = site_map.extent
     ax.set_xlim(x0, x1)
     ax.set_ylim(y0, y1)
@@ -626,7 +708,7 @@ def render_figure(
     _add_two_line_title(
         fig, t, font, t.t(plan.title_zh, plan.title_en), t.t(plan.subtitle_zh, plan.subtitle_en), figure_text=figure_text
     )
-    _save_fixed_canvas(fig, path, dpi=dpi, crop_in=NOTEXT_CROP_IN if figure_text == "none" else None)
+    _save_fixed_canvas(fig, path, dpi=dpi, crop_in=lay.notext_crop_in if figure_text == "none" else None, svg=not png_only)
     plt.close(fig)
 
 
@@ -643,14 +725,114 @@ def _render_job(job: Mapping[str, Any]) -> list[str]:
     t = _Labeler(font_res.cjk_available)
     land = _load_coastline(Path(job["coastline"]))
     iso_all, _ = _load_isobaths(Path(job["bathymetry"]) if job["bathymetry"] else None)
-    site_map = _build_site_map(tuple(job["anchor"]), job["radius_km"], land, iso_all.get(job["site"], {}))
+    layout = job.get("layout")
+    site_map = _build_site_map(tuple(job["anchor"]), job["radius_km"], land, iso_all.get(job["site"], {}), layout)
     written: list[str] = []
     out_dir = Path(job["out_dir"])
     for plan in job["plans"]:
         path = out_dir / f"{plan.stem}.png"
-        render_figure(plan, site_map, t, font_res.font_properties, path, job["dpi"], job["mode"])
+        render_figure(plan, site_map, t, font_res.font_properties, path, job["dpi"], job["mode"], layout)
         written.append(str(path))
     return written
+
+
+MEASURE_DPI = 60
+
+
+def union_content_box_in(png_paths: Sequence[Path], dpi: int, canvas_in: tuple[float, float]) -> tuple[float, float, float, float]:
+    """整張畫布 PNG 的非白色像素外框聯集（英寸，自左下角起算 ``(x0, y0, x1, y1)``）。"""
+
+    import matplotlib.image as mpimg
+
+    x0 = y0 = math.inf
+    x1 = y1 = -math.inf
+    for path in png_paths:
+        img = np.asarray(mpimg.imread(str(path)))
+        mask = np.any(img[..., :3] < 0.99, axis=-1)
+        if img.shape[-1] == 4:
+            mask |= img[..., 3] < 0.99
+        rows = np.flatnonzero(mask.any(axis=1))
+        cols = np.flatnonzero(mask.any(axis=0))
+        if rows.size == 0 or cols.size == 0:
+            continue
+        h = img.shape[0]
+        x0 = min(x0, cols[0] / dpi)
+        x1 = max(x1, (cols[-1] + 1) / dpi)
+        y0 = min(y0, (h - rows[-1] - 1) / dpi)
+        y1 = max(y1, (h - rows[0]) / dpi)
+    if not math.isfinite(x0):
+        raise PolarSourceError("量測無文字版內容外框失敗：圖是空白的")
+    return x0, y0, x1, y1
+
+
+def crop_from_content_box(box: tuple[float, float, float, float], canvas_in: tuple[float, float]) -> tuple[float, float, float, float]:
+    """內容聯集外框 → 共同裁切框：四邊各加 :data:`_NOTEXT_MARGIN_IN`，再向外取整到 0.01 英寸，並限制在畫布內。"""
+
+    x0, y0, x1, y1 = box
+    m = _NOTEXT_MARGIN_IN
+    out = (
+        max(0.0, math.floor((x0 - m) * 100.0 + 1e-6) / 100.0),
+        max(0.0, math.floor((y0 - m) * 100.0 + 1e-6) / 100.0),
+        min(canvas_in[0], math.ceil((x1 + m) * 100.0 - 1e-6) / 100.0),
+        min(canvas_in[1], math.ceil((y1 + m) * 100.0 - 1e-6) / 100.0),
+    )
+    return out
+
+
+def _measure_job(job: Mapping[str, Any]) -> list[str]:
+    """子行程：以低解析度把一個無文字版工作的全部圖畫成整張畫布（不裁切）PNG，供量測共同裁切框。"""
+
+    import dataclasses
+
+    measured = dict(job)
+    measured["layout"] = dataclasses.replace(job["layout"], notext_crop_in=None)
+    measured["dpi"] = MEASURE_DPI
+    # 沿用 _render_job 的版面建立邏輯，但只存 PNG
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    font_res = _resolve_font(Path(measured["font_path"]) if measured["font_path"] else None)
+    t = _Labeler(font_res.cjk_available)
+    land = _load_coastline(Path(measured["coastline"]))
+    iso_all, _ = _load_isobaths(Path(measured["bathymetry"]) if measured["bathymetry"] else None)
+    layout = measured["layout"]
+    site_map = _build_site_map(tuple(measured["anchor"]), measured["radius_km"], land, iso_all.get(measured["site"], {}), layout)
+    out_dir = Path(measured["measure_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    for plan in measured["plans"]:
+        path = out_dir / f"{measured['case']}__{measured['site']}__{plan.stem}.png"
+        render_figure(plan, site_map, t, font_res.font_properties, path, MEASURE_DPI, "none", layout, png_only=True)
+        written.append(str(path))
+    return written
+
+
+def plan_envelope(anchors: Mapping[str, tuple[float, float]], radius_km: float) -> dict[str, float]:
+    """依一次執行的全部錨點決定包絡（半徑 25 km 時各方向公里數）。
+
+    每個地點的整齊刻度範圍（與 :func:`_build_site_map` 同一規則）到錨點的公里數，換算成半徑 25 km 的等價值後，
+    各方向取全部地點的最大值，再向上取整到整數公里。只依錨點與半徑，不依資料。
+    """
+
+    if not anchors:
+        raise PolarSourceError("沒有錨點，無法決定包絡")
+    env = dict.fromkeys(ENVELOPE_SIDES, 0.0)
+    half = radius_km * _WINDOW_FACTOR
+    for lon0, lat0 in anchors.values():
+        dlat = half / _KM_PER_DEG
+        dlon = half / (_KM_PER_DEG * math.cos(math.radians(lat0)))
+        xt = _axis_ticks(lon0 - dlon, lon0 + dlon, max_intervals=8)
+        yt = _axis_ticks(lat0 - dlat, lat0 + dlat, max_intervals=8)
+        kx = _KM_PER_DEG * math.cos(math.radians(lat0))
+        km = {
+            "left": (lon0 - float(xt[0])) * kx,
+            "right": (float(xt[-1]) - lon0) * kx,
+            "down": (lat0 - float(yt[0])) * _KM_PER_DEG,
+            "up": (float(yt[-1]) - lat0) * _KM_PER_DEG,
+        }
+        for side, value in km.items():
+            env[side] = max(env[side], value * 25.0 / radius_km)
+    return {side: float(math.ceil(value - 1e-6)) for side, value in env.items()}
 
 
 # ── 摘要 ─────────────────────────────────────────────────────────────────
@@ -823,6 +1005,20 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
             raise PolarSourceError(f"輸出目錄必須是尚不存在的全新目錄，但已存在：{case.text_dir}")
 
     anchors = {k: (v[0], v[1]) for k, v in _load_receptor_anchors(config.release_config).items()}
+    if config.envelope_km is not None:
+        envelope, envelope_source = {k: float(config.envelope_km[k]) for k in ENVELOPE_SIDES}, "explicit"
+    elif config.envelope_auto:
+        envelope, envelope_source = plan_envelope(anchors, config.radius_km), "auto_from_anchors"
+    else:
+        envelope, envelope_source = dict(_ENVELOPE_KM), "run08_default"
+    is_default_envelope = envelope == dict(_ENVELOPE_KM)
+    if config.notext_crop_in is not None:
+        layout_crop, crop_source = tuple(config.notext_crop_in), "explicit"
+    elif is_default_envelope:
+        layout_crop, crop_source = NOTEXT_CROP_IN, "run08_default"
+    else:
+        layout_crop, crop_source = None, "measured_from_notext_figures"
+    layout = make_layout(envelope, layout_crop if layout_crop is not None else NOTEXT_CROP_IN)
     hashes_before = {c.case_id: sha256_file(c.postprocess_dir / "departures.parquet") for c in config.cases}
     analyses: dict[str, list[SiteAnalysis]] = {}
     for case in config.cases:
@@ -868,6 +1064,7 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
                         "bathymetry": str(config.bathymetry) if config.bathymetry else None,
                         "font_path": str(config.font_path) if config.font_path else None,
                         "dpi": config.dpi,
+                        "layout": layout,
                     }
                 )
         case_info[case.case_id] = {"shown": shown, "captions": captions, "case_text": case_text}
@@ -881,6 +1078,39 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
             ps.write_comparison_csv(all_an, case.case_id, tdir / "distinguishability_summary.csv")
             _write_text_exclusive(case.text_dir / "summary.md", summary_markdown(case.case_id, all_an, scales, config))
 
+    if crop_source == "measured_from_notext_figures":
+        none_jobs = [j for j in render_jobs if j["mode"] == "none"]
+        if none_jobs:
+            import dataclasses
+            import tempfile
+
+            with tempfile.TemporaryDirectory(prefix="polar-measure-") as tmp:
+                mjobs = [dict(j, measure_dir=str(Path(tmp) / f"j{i}")) for i, j in enumerate(none_jobs)]
+                if config.workers <= 1 or len(mjobs) <= 1:
+                    measured = [p for j in mjobs for p in _measure_job(j)]
+                else:
+                    import multiprocessing as mp
+
+                    with ProcessPoolExecutor(
+                        max_workers=min(config.workers, len(mjobs)), mp_context=mp.get_context("fork")
+                    ) as pool:
+                        measured = [p for out in pool.map(_measure_job, mjobs) for p in out]
+                box = union_content_box_in([Path(p) for p in measured], MEASURE_DPI, (CANVAS_W_IN, CANVAS_H_IN))
+                layout_crop = crop_from_content_box(box, (CANVAS_W_IN, CANVAS_H_IN))
+            layout = dataclasses.replace(layout, notext_crop_in=layout_crop)
+            for j in render_jobs:
+                j["layout"] = layout
+        else:
+            crop_source = "not_needed_no_notext_mode"
+    figure_layout_record = {
+        "envelope_km_at_radius_25": layout.envelope(),
+        "envelope_source": envelope_source,
+        "notext_crop_in": list(layout.notext_crop_in) if layout.notext_crop_in is not None else None,
+        "notext_crop_source": crop_source,
+        "canvas_in": [CANVAS_W_IN, CANVAS_H_IN],
+        "in_per_km_at_radius_25": layout.in_per_km_25,
+        "anchor_position_in": [layout.anchor_x_in, layout.anchor_y_in],
+    }
     written: list[str] = []
     if config.workers <= 1 or len(render_jobs) <= 1:
         for job in render_jobs:
@@ -912,6 +1142,7 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
             "kinds": list(config.kinds),
             "modes": list(config.modes),
             "radius_km": config.radius_km,
+            "figure_layout": figure_layout_record,
             "radius_scales_pct": {k: {"max": v[0], "ticks": v[1]} for k, v in scales.items()},
             "radius_scale_override_pct": config.radius_max_pct,
             "sector": {"count": ps.N_SECTORS, "width_deg": ps.SECTOR_WIDTH_DEG, "center_azimuths_deg": [10 * k for k in range(36)]},

@@ -22,7 +22,7 @@ step_polar() {
   for d in figures-polar figures-polar-notext; do [ ! -e "$R/$d" ] || { log "$R/$d 已存在，略過 polar"; return 0; }; done
   "$LBT" native-polar-source --case "$CASE" "$R/postprocess" "$R/figures-polar" "$R/figures-polar-notext" \
     --release-config "$CFG" --coastline "$COAST" --bathymetry "$ISO" --dpi "${LBT_POLAR_DPI:-600}" \
-    --workers "${LBT_POLAR_WORKERS:-20}"
+    --workers "${LBT_POLAR_WORKERS:-20}" --envelope-auto
 }
 
 step_fraction() {

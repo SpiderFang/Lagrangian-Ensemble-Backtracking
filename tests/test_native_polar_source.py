@@ -560,3 +560,123 @@ def test_notext_common_crop_is_tight_for_the_widest_legend_and_circle_stays_put(
     union = np.array(margins).min(axis=0) / dpi  # 各邊在五個地點中最小的留白（英寸）= 聯集外框到邊緣的距離
     assert np.all(union <= 0.15), union
     assert np.all(union >= 0.0)
+
+
+# ── WP-63：固定畫布包絡可設定（run08 預設不變）─────────────────────────────
+
+_RUN09_NANWAN = (120.770675, 21.92041)  # 南灣錨點外推後：地圖上緣 42.2 km，超出 run08 預設包絡 40 km
+
+
+def test_default_layout_equals_run08_constants():
+    lay = psf.RUN08_LAYOUT
+    assert lay.envelope() == psf._ENVELOPE_KM == {"left": 43.0, "right": 39.0, "down": 45.0, "up": 40.0}
+    assert lay.in_per_km_25 == psf._IN_PER_KM_25
+    assert (lay.anchor_x_in, lay.anchor_y_in) == (psf._ANCHOR_X_IN, psf._ANCHOR_Y_IN)
+    assert lay.notext_crop_in == psf.NOTEXT_CROP_IN
+    ext = (ANCHOR[0] - 0.3, ANCHOR[0] + 0.3, ANCHOR[1] - 0.3, ANCHOR[1] + 0.3)
+    assert psf._axes_rect(ANCHOR, 25.0, ext) == psf._axes_rect(ANCHOR, 25.0, ext, psf.RUN08_LAYOUT)
+
+
+def test_make_layout_rejects_bad_envelope():
+    with pytest.raises(psf.PolarSourceError):
+        psf.make_layout({"left": 43, "right": 39, "down": 45})
+    with pytest.raises(psf.PolarSourceError):
+        psf.make_layout({"left": 43, "right": -1, "down": 45, "up": 40})
+    wide = psf.make_layout({"left": 80, "right": 80, "down": 20, "up": 20})  # 左右很寬：比例尺改由圖例欄界線決定
+    assert wide.anchor_x_in + 80 * wide.in_per_km_25 <= psf._LEGEND_X_IN - psf._MAP_TO_LEGEND_GAP_IN + 1e-9
+
+
+def test_plan_envelope_covers_every_site_and_run09_nanwan_needs_larger_up():
+    anchors = dict(REAL_ANCHORS)
+    base = psf.plan_envelope(anchors, 25.0)
+    assert base["left"] <= 43 and base["down"] <= 45 and base["up"] <= 40  # run08 的五個錨點落在 run08 包絡內
+    anchors["nanwan"] = _RUN09_NANWAN
+    env = psf.plan_envelope(anchors, 25.0)
+    assert env["up"] == 43.0 and env["left"] == 43.0 and env["down"] == 45.0
+    lay = psf.make_layout(env, None)
+    for anchor in anchors.values():
+        half = 25.0 * psf._WINDOW_FACTOR
+        import math
+
+        dlat = half / psf._KM_PER_DEG
+        dlon = half / (psf._KM_PER_DEG * math.cos(math.radians(anchor[1])))
+        xt = psf._axis_ticks(anchor[0] - dlon, anchor[0] + dlon, max_intervals=8)
+        yt = psf._axis_ticks(anchor[1] - dlat, anchor[1] + dlat, max_intervals=8)
+        ext = (float(xt[0]), float(xt[-1]), float(yt[0]), float(yt[-1]))
+        psf._axes_rect(anchor, 25.0, ext, lay)  # 不拋例外
+        if anchor == _RUN09_NANWAN:
+            with pytest.raises(psf.PolarSourceError, match="up"):
+                psf._axes_rect(anchor, 25.0, ext)  # 預設（run08）包絡擋下
+
+
+def test_plan_envelope_covers_the_circle_for_any_radius():
+    a = {"s": ANCHOR}
+    e25 = psf.plan_envelope(a, 25.0)
+    e10 = psf.plan_envelope(a, 10.0)
+    assert all(v >= 25.0 * psf._WINDOW_FACTOR - 1.0 for v in e25.values())  # 至少涵蓋圓與視窗（以 25 km 半徑換算）
+    assert all(v >= 25.0 * psf._WINDOW_FACTOR - 1.0 for v in e10.values())
+
+
+def test_crop_from_content_box_adds_margin_and_rounds_outward():
+    box = (0.2051, 0.4012, 9.8, 7.0)
+    got = psf.crop_from_content_box(box, (12.6, 8.2))
+    assert got == (0.12, 0.32, 9.88, 7.08)
+    near_edge = psf.crop_from_content_box((0.01, 0.0, 12.59, 8.2), (12.6, 8.2))
+    assert near_edge == (0.0, 0.0, 12.6, 8.2)  # 限制在畫布內
+
+
+def test_union_content_box_in_measures_nonwhite_pixels(tmp_path):
+    import matplotlib.image as mpimg
+
+    img = np.ones((100, 200, 4))
+    img[10:30, 40:90, :3] = 0.0  # 第 10–29 列、第 40–89 欄
+    img[60:70, 150:160, :3] = 0.0
+    path = tmp_path / "a.png"
+    mpimg.imsave(str(path), img)
+    x0, y0, x1, y1 = psf.union_content_box_in([path], 10, (20.0, 10.0))
+    assert (x0, x1) == (4.0, 16.0)
+    assert (y0, y1) == (10.0 - 7.0, 10.0 - 1.0)  # 畫布高 10 英寸；列 69 -> 底 3.0，列 10 -> 頂 9.0
+    assert (y0, y1) == (3.0, 9.0)
+
+
+def test_end_to_end_default_records_run08_layout(synthetic, tmp_path):
+    pp, cfg, coast = synthetic
+    case = psf.PolarCase("no_stokes", pp, tmp_path / "o" / "figures-polar", tmp_path / "o" / "figures-polar-notext")
+    config = psf.PolarConfig(
+        cases=(case,), release_config=cfg, coastline=coast, bathymetry=None,
+        params=ps.PolarParams(n_resamples=20), dpi=100, workers=1,
+    )  # fmt: skip
+    psf.build_polar_source(config, command="lbt native-polar-source test")
+    lay = json.loads((case.text_dir / "manifest.json").read_text(encoding="utf-8"))["figure_layout"]
+    assert lay["envelope_source"] == "run08_default" and lay["notext_crop_source"] == "run08_default"
+    assert lay["envelope_km_at_radius_25"] == psf._ENVELOPE_KM and lay["notext_crop_in"] == list(psf.NOTEXT_CROP_IN)
+
+
+def test_end_to_end_auto_envelope_measures_common_crop(synthetic, tmp_path):
+    pp, cfg, coast = synthetic
+    case = psf.PolarCase("no_stokes", pp, tmp_path / "o" / "figures-polar", tmp_path / "o" / "figures-polar-notext")
+    config = psf.PolarConfig(
+        cases=(case,), release_config=cfg, coastline=coast, bathymetry=None,
+        params=ps.PolarParams(n_resamples=20), dpi=100, workers=1, envelope_auto=True,
+    )  # fmt: skip
+    psf.build_polar_source(config, command="lbt native-polar-source test")
+    lay = json.loads((case.text_dir / "manifest.json").read_text(encoding="utf-8"))["figure_layout"]
+    assert lay["envelope_source"] == "auto_from_anchors" and lay["notext_crop_source"] == "measured_from_notext_figures"
+    x0, y0, x1, y1 = lay["notext_crop_in"]
+    assert 0.0 <= x0 < x1 <= psf.CANVAS_W_IN and 0.0 <= y0 < y1 <= psf.CANVAS_H_IN
+    full_shapes, none_shapes = set(), set()
+    for p in sorted(case.text_dir.rglob("*.png")) + sorted(case.notext_dir.rglob("*.png")):
+        img = _read_png(p)
+        (none_shapes if "notext" in str(p) else full_shapes).add(img.shape[:2])
+        _assert_edges_blank(img, p.name)  # 四邊不被裁切（邊緣留白）
+    assert full_shapes == {(round(psf.CANVAS_H_IN * 100), round(psf.CANVAS_W_IN * 100))}
+    assert none_shapes == {(round((y1 - y0) * 100), round((x1 - x0) * 100))}
+
+
+def test_envelope_options_are_exclusive():
+    case = psf.PolarCase("c", Path("a"), Path("b"), Path("c2"))
+    with pytest.raises(psf.PolarSourceError):
+        psf.PolarConfig(
+            cases=(case,), release_config=Path("r"), coastline=Path("c"), bathymetry=None,
+            envelope_km={"left": 43, "right": 39, "down": 45, "up": 43}, envelope_auto=True,
+        )  # fmt: skip
