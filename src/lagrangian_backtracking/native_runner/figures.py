@@ -1823,7 +1823,15 @@ def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
     return f"{base}{extra}"
 
 
-def _save_exclusive(fig, path: Path, *, dpi: int) -> None:
+# 水平總覽 v2 版面常數（單位：英吋）。軸框配置區 9.79 x 5.695 即原版
+# figsize=(11, 8.5)、left=0.08、right=0.97、bottom=0.30、top=0.97 所得的大小，
+# 因此主圖（軸框）尺寸與原版相同。
+_HO_V2_FIGSIZE = (9.48, 6.81)
+_HO_V2_AXES_BOX_IN = (0.10, 0.12, 9.79, 5.695)  # 左緣、上緣距離、寬、高
+_HO_V2_LEGEND_GAP_IN = 0.12
+
+
+def _save_exclusive(fig, path: Path, *, dpi: int, tight: bool = True) -> None:
     """以排他建立方式落檔（``xb``），輸出目錄若已存在同名檔一律 fail-closed。
 
     WP-25：對齊 OCM-SVD-Analysis 正式成圖規範「PNG 600 dpi ＋ SVG 都出」的
@@ -1834,11 +1842,12 @@ def _save_exclusive(fig, path: Path, *, dpi: int) -> None:
     PNG 排他建立失敗時整個函式直接拋例外，不會嘗試寫 SVG。
     """
 
+    bbox = "tight" if tight else None
     with path.open("xb") as stream:
-        fig.savefig(stream, format="png", dpi=dpi, bbox_inches="tight")
+        fig.savefig(stream, format="png", dpi=dpi, bbox_inches=bbox)
     svg_path = path.with_suffix(".svg")
     with svg_path.open("xb") as stream:
-        fig.savefig(stream, format="svg", dpi=dpi, bbox_inches="tight")
+        fig.savefig(stream, format="svg", dpi=dpi, bbox_inches=bbox)
 
 
 def _land_lonlat_patches(land_geometries: Sequence[Polygon | MultiPolygon]):
@@ -1871,15 +1880,28 @@ def _plot_horizontal_overview(
     path: Path,
     dpi: int,
     figure_text: str,
+    layout: str = "legacy",
 ) -> None:
-    """代表粒子水平軌跡總覽（整個 flow domain 範圍，經緯度顯示）。"""
+    """代表粒子水平軌跡總覽（整個 flow domain 範圍，經緯度顯示）。
+
+    ``layout="legacy"``（預設）維持原版版面：圖例固定在畫面下方、輸出時以
+    ``bbox_inches="tight"`` 裁切，各站輸出尺寸因圖例寬度與軸標籤而略有不同。
+    ``layout="v2"``（run09 圖面修訂）：主圖軸框的大小、位置規則、座標範圍、顏色與
+    字級全部沿用原版；圖例改為緊貼在主圖（含刻度標籤與座標軸標籤）正下方，並且以
+    固定畫布尺寸（:data:`_HO_V2_FIGSIZE`）輸出、不做 tight 裁切，因此各站影像尺寸
+    完全一致、四邊皆不裁切。``layout="v2"`` 只支援 ``figure_text="none"``。
+    """
 
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(11, 8.5), dpi=150)
+    if layout not in ("legacy", "v2"):
+        raise FiguresError(f"horizontal_overview layout 必須是 legacy 或 v2，收到 {layout!r}")
+    if layout == "v2" and figure_text != "none":
+        raise FiguresError("horizontal_overview layout=v2 只支援 figure_text='none'")
+    fig, ax = plt.subplots(figsize=_HO_V2_FIGSIZE if layout == "v2" else (11, 8.5), dpi=150)
     ax.set_facecolor("#eaf3f8")
     _land_lonlat_patches(land_geometries)(ax)
     boundary_lines = _resolve_dashed_open_boundary_lines(site)
@@ -1983,15 +2005,16 @@ def _plot_horizontal_overview(
                 label=t.t(_STATUS_LABELS_ZH.get(code, str(code)), _STATUS_LABELS_EN.get(code, str(code))),
             )
         )
-    fig.legend(
-        handles=handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.05),
-        ncol=4,
-        prop=font,
-        frameon=True,
-        fontsize=8,
-    )
+    if layout == "legacy":
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.05),
+            ncol=4,
+            prop=font,
+            frameon=True,
+            fontsize=8,
+        )
 
     _add_two_line_title(
         fig,
@@ -2007,9 +2030,113 @@ def _plot_horizontal_overview(
     # ax.set_aspect(..., adjustable="box") 併用時，在某些「經緯度範圍很扁」的
     # 站點（例如本圖含寬闊 flow_open_boundary 外框）會於內部多重繪製階段留下
     # 殘影（已實測，圖例列會疊到一個淡灰色殘影字元），改用固定邊界可穩定避免。
-    fig.subplots_adjust(left=0.08, bottom=0.30, right=0.97, top=_title_top_margin(figure_text, full=0.84))
-    _save_exclusive(fig, path, dpi=dpi)
+    if layout == "v2":
+        _layout_horizontal_overview_v2(fig, ax, handles, font)
+    else:
+        fig.subplots_adjust(left=0.08, bottom=0.30, right=0.97, top=_title_top_margin(figure_text, full=0.84))
+    _save_exclusive(fig, path, dpi=dpi, tight=(layout != "v2"))
     plt.close(fig)
+
+
+def _layout_horizontal_overview_v2(fig, ax, handles, font) -> None:
+    """水平總覽 v2 版面：主圖軸框沿用原版尺寸，圖例緊貼在主圖正下方。
+
+    原版以 ``bottom=0.30`` 替圖例預留固定的下方空間，但等比例軸（``adjustable="box"``）
+    實際高度受限於軸框高度，軸框與圖例之間因此留下一段空白。這裡改為：先把軸框放在
+    與原版相同大小的配置區（:data:`_HO_V2_AXES_BOX_IN`，單位英吋），呼叫
+    ``ax.apply_aspect()`` 取得實際軸框，再以 ``ax.get_tightbbox`` 取得含刻度標籤與
+    座標軸標籤的下緣，圖例上緣放在其下方 :data:`_HO_V2_LEGEND_GAP_IN`，水平置中於主圖。
+    """
+
+    fig_w, fig_h = fig.get_size_inches()
+    left, top, box_w, box_h = _HO_V2_AXES_BOX_IN
+    ax.set_position([left / fig_w, 1.0 - (top + box_h) / fig_h, box_w / fig_w, box_h / fig_h])
+    ax.apply_aspect()
+    pos = ax.get_position()
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    tight = ax.get_tightbbox(renderer)
+    (_, y0), _ = fig.transFigure.inverted().transform([[tight.x0, tight.y0], [tight.x1, tight.y1]])
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=((pos.x0 + pos.x1) / 2.0, y0 - _HO_V2_LEGEND_GAP_IN / fig_h),
+        ncol=4,
+        prop=font,
+        frameon=True,
+        fontsize=8,
+    )
+
+
+def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str) -> Path:
+    """只重畫水平軌跡總覽（``layout="v2"``）到全新的輸出目錄。
+
+    輸入、字型、海岸線、軌跡抽樣、dpi 與 ``figure_text`` 的處理方式與
+    :func:`build_native_figures` 相同（共用同一組載入函式），只是不畫其餘圖種；
+    輸出每站 ``horizontal_overview.png／.svg`` 與 ``manifest.json``（記錄命令、
+    輸入檔 SHA-256、輸出檔 SHA-256、畫布尺寸與版面常數）。
+    """
+
+    if config.figure_text != "none":
+        raise FiguresError("build_horizontal_overview_v2 只支援 figure_text='none'")
+    output_dir = config.output_dir
+    if output_dir.exists():
+        raise FiguresError(f"--output-dir 必須是尚不存在的全新目錄，但已存在：{output_dir}")
+    inputs = load_native_figures_inputs(config)
+    land_geometries = _load_coastline(config.coastline_path)
+    font_resolution = _resolve_font(config.font_path)
+    labeler = _Labeler(font_resolution.cjk_available)
+    output_dir.mkdir(parents=True)
+    png_records: dict[str, Any] = {}
+    svg_records: dict[str, Any] = {}
+    for site in inputs.sites:
+        site_dir = output_dir / site.site_id
+        site_dir.mkdir()
+        png_path = site_dir / "horizontal_overview.png"
+        _plot_horizontal_overview(
+            site,
+            land_geometries,
+            labeler,
+            font_resolution.font_properties,
+            png_path,
+            config.dpi,
+            config.figure_text,
+            layout="v2",
+        )
+        png_records[f"{site.site_id}/horizontal_overview.png"] = {
+            "sha256": sha256_file(png_path),
+            "size_bytes": png_path.stat().st_size,
+        }
+        svg_path = png_path.with_suffix(".svg")
+        svg_records[f"{site.site_id}/horizontal_overview.svg"] = {
+            "sha256": sha256_file(svg_path),
+            "size_bytes": svg_path.stat().st_size,
+        }
+    sources_after = _snapshot_sources(inputs.source_paths)
+    if sources_after != dict(inputs.sources_before):
+        raise FiguresError("輸入檔在繪圖過程中被改動，前後 SHA-256 不一致，fail-closed")
+    manifest = {
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "command": command,
+        "layout": "v2",
+        "figure_stems": ["horizontal_overview"],
+        "sites": [s.site_id for s in inputs.sites],
+        "figsize_in": list(_HO_V2_FIGSIZE),
+        "axes_box_in_left_top_w_h": list(_HO_V2_AXES_BOX_IN),
+        "legend_gap_in": _HO_V2_LEGEND_GAP_IN,
+        "dpi": config.dpi,
+        "figure_text": config.figure_text,
+        "max_trajectories_per_site": config.max_trajectories_per_site,
+        "font": dict(font_resolution.manifest_record),
+        "inputs_sha256_before": dict(inputs.sources_before),
+        "inputs_sha256_after": sources_after,
+        "output_png_sha256": png_records,
+        "output_svg_sha256": svg_records,
+    }
+    with (output_dir / "manifest.json").open("x", encoding="utf-8") as stream:
+        json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    return output_dir
 
 
 def _plot_horizontal_local(
