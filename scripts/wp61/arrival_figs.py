@@ -8,7 +8,7 @@ y 軸版本：U＝五站共用整齊上下界；S＝各站各自整齊上下界�
 
 WP-64（3-4-3 圖 3–7）：全年總覽改為寬 6.2667 英寸（＝嵌入 Word 之文字區寬，1:1）、高約 6 英寸、圖內文字 9 pt、中英並列
 （潮汐強度主圖加大；顯著波高、流速兩小圖各自加標題；日期軸以 2025/MM/DD 標示；標記加大並加深色邊框、略透明，
-50 個時刻都在真實位置；圖例附各類數量，各季色塊頂端標該季大潮／小潮數量；圖例置於下方）。
+50 個時刻都在真實位置；圖例只列類別名稱（不附數量），各季色塊頂端標該季大潮／小潮數量；圖例置於下方）。
 逐時刻放大圖程式保留，但 3-4-3 不再使用（run_figs.py 以 LBT_FIGS_KINDS=overview 只出總覽）。
 """
 
@@ -341,26 +341,25 @@ def _ov_legend_sets(rows: list[dict]):
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
-    n = _ov_counts(rows)
     seasons = [Patch(facecolor=BAND[k], edgecolor="#999999", linewidth=0.4, label=BI_SEASON[k]) for k in ac.SEASONS]
     cls = [
         Line2D(
             [], [], ls="", marker="o", ms=7.5, mfc=_rgba(COL_CLASS[c], MARK_ALPHA), mec="#111111", mew=0.7,
-            label=f"{BI_CLASS[c]}（{n['class'].get(c, 0)}）",
+            label=BI_CLASS[c],
         )
         for c in ac.CLASSES
     ]
     phase = [
         Line2D(
             [], [], ls="", marker=MARK_PHASE[p], ms=7.5, mfc=_rgba("#bbbbbb", MARK_ALPHA), mec="#111111", mew=0.7,
-            label=f"{BI_PHASE[p]}（{n['phase'].get(p, 0)}）",
+            label=BI_PHASE[p],
         )
         for p in PHASE_ORDER
     ]
     event = [
         Line2D(
             [], [], ls="", marker="*", ms=12, mfc=COL_EVENT[e], mec="#111111", mew=0.6,
-            label=f"{BI_EVENT[e]}（{n['event'].get(e, 0)}）",
+            label=BI_EVENT[e],
         )
         for e in ("high_wave_event", "strong_current_event")
     ]
