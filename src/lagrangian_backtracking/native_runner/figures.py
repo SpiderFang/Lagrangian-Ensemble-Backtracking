@@ -241,7 +241,7 @@ _KDE_STATUS_LABELS_ZH: Mapping[str, str] = {
 # 與對應的英文標籤、順序、顏色、標記，讓 native-figures 的八張圖與 postprocess
 # 輸出表共用完全相同的狀態語意，不創造另一套分類。
 
-_CROSSED_LABEL_ZH = "穿越開放邊界（正常結束）"
+_CROSSED_LABEL_ZH = "穿越點"
 _CROSSED_LABEL_EN = "Crossed open boundary"
 
 _STATUS_LABELS_ZH: Mapping[int, str] = {
@@ -253,6 +253,8 @@ _STATUS_LABELS_ZH: Mapping[int, str] = {
     # 稽核），所以不能改 postprocess；但圖面是對外交付文件，不宜出現程式識別字串，
     # 因此只在圖例這一層改成純中文。兩者的分工：欄位命名保留識別字、圖面只用中文。
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "固定日曆回溯窗之外的沉底",
+    # 報告用語（2026-10-21 第三輪）：回溯途中碰到海床而停止追蹤稱「觸底」，以免與「沉底時刻」（回溯起點）混淆。
+    NATIVE_STATUS_DEPOSITED: "觸底",
 }
 
 _STATUS_LABELS_EN: Mapping[int, str] = {
@@ -1981,7 +1983,7 @@ def _plot_horizontal_overview(
                 [],
                 [],
                 **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
-                label=t.t("流場範圍開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
+                label=t.t("流場範圍邊界", "Flow-domain open boundary (terminal)"),
             )
         )
     if "other" in boundary_kinds_present:
@@ -2252,7 +2254,7 @@ def _plot_horizontal_local(
                 [],
                 [],
                 **_BOUNDARY_LINE_STYLE_BY_KIND["flow"],
-                label=t.t("流場範圍開放邊界（終止邊界）", "Flow-domain open boundary (terminal)"),
+                label=t.t("流場範圍邊界", "Flow-domain open boundary (terminal)"),
             )
         )
     fig.legend(
@@ -3096,7 +3098,7 @@ _HDR_LINE_STYLES: tuple[Mapping[str, Any], ...] = (
 )
 
 _OPEN_BOUNDARY_STYLE: Mapping[str, Any] = {"color": "#d0009f", "linewidth": 1.2, "linestyle": "--"}
-_OPEN_BOUNDARY_LABEL_ZH = "流場範圍開放邊界（終止邊界）"
+_OPEN_BOUNDARY_LABEL_ZH = "流場範圍邊界"
 _OPEN_BOUNDARY_LABEL_EN = "Flow-domain open boundary (terminating boundary)"
 _LAND_COLOR = "#d9d9d9"
 _ISOBATH_COLOR = "#7f7f7f"

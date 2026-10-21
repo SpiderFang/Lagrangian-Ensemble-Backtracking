@@ -254,7 +254,7 @@ def test_figure_text_none_omits_title_but_keeps_legend_and_panel_titles(
     joined = "\n".join(texts["all"])
     assert "停留時數密度｜" not in joined and "回溯快照的條件式來源足跡｜" not in joined
     assert "穿越位置沿開放邊界的分布｜" not in joined
-    assert "高密度區間 50%" in joined and "流場範圍開放邊界（終止邊界）" in joined
+    assert "高密度區間 50%" in joined and "流場範圍邊界" in joined
     assert "回溯 72 h" in joined  # 面板標題保留
     texts.clear()
     _build(tmp_path, postprocess_dir, coastline, isobaths, text="full", name="full")

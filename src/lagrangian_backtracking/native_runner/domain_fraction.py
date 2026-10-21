@@ -195,7 +195,7 @@ def render_site_figure(
             lab.set_fontproperties(font)
         lab.set_fontsize(10)
     ax.set_xlabel(t.t("回溯時間（天）", "Backtrack time (days)"), fontproperties=font, fontsize=11)
-    ax.set_ylabel(t.t("仍在流場區域內的比例（%）", "Fraction still inside flow domain (%)"), fontproperties=font, fontsize=11)
+    ax.set_ylabel(t.t("仍在流場範圍內的比例（%）", "Fraction still inside flow domain (%)"), fontproperties=font, fontsize=11)
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(handles[::-1], labels[::-1], loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False,
               prop=font, fontsize=9)

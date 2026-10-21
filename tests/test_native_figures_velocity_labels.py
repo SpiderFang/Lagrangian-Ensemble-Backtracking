@@ -273,5 +273,5 @@ def test_terminal_status_present_lists_only_observed_codes_and_deposited_has_zh_
     codes = np.array([NATIVE_STATUS_LEFT_INTEREST_REGION] * 98 + [NATIVE_STATUS_DEPOSITED] * 2)
     present = native_figures._status_codes_present({"final_status_code": codes})
     assert present == (NATIVE_STATUS_LEFT_INTEREST_REGION, NATIVE_STATUS_DEPOSITED)
-    assert native_figures._STATUS_LABELS_ZH[NATIVE_STATUS_DEPOSITED] == "沉底"
+    assert native_figures._STATUS_LABELS_ZH[NATIVE_STATUS_DEPOSITED] == "觸底"
     assert native_figures._STATUS_LABELS_EN[NATIVE_STATUS_DEPOSITED] == "Deposited"
