@@ -85,7 +85,7 @@ def _run(
     captured: dict[str, dict[str, list[str]]] = {}
     original_save = native_figures._save_exclusive
 
-    def _spy(fig, path, *, dpi):
+    def _spy(fig, path, *, dpi, **kw):
         key = f"{path.parent.name}/{path.stem}"
         if path.stem == "settling_velocity_breakdown":
             ax_bar, ax_heat = fig.axes[0], fig.axes[1]
@@ -94,7 +94,7 @@ def _run(
                 "bar_ticks": [t.get_text() for t in ax_bar.get_yticklabels()],
                 "heat_ticks": [t.get_text() for t in ax_heat.get_yticklabels()],
             }
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _spy)
     output_dir = tmp_path / f"out-{figure_text}"

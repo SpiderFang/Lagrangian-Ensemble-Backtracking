@@ -1475,6 +1475,21 @@ def _status_counts(departures: Mapping[str, np.ndarray]) -> dict[int, int]:
     return counts
 
 
+def _trajectory_status_codes_present(site: "SiteData") -> tuple[int, ...]:
+    """水平軌跡總覽實際畫出之代表軌跡的終止類別（動態圖例用），依 _STATUS_ORDER 排序。
+
+    圖例只列圖中實際出現之終止標記：全站計數大於 0 但未被抽入代表軌跡之類別（例如 24 條代表軌跡
+    皆穿越邊界時之「觸底」「達回溯上限」）不列入。沒有任何代表軌跡時退回全站計數規則。
+    """
+
+    drawn = {int(sample.final_status_code) for sample in site.trajectories}
+    if not drawn:
+        return _status_codes_present(site.departures)
+    ordered = [code for code in _STATUS_ORDER if code in drawn]
+    ordered.extend(sorted(drawn - set(ordered)))
+    return tuple(ordered)
+
+
 def _status_codes_present(departures: Mapping[str, np.ndarray]) -> tuple[int, ...]:
     """本站實際出現（計數大於 0）的終止類別，依 _STATUS_ORDER 排序。
 
@@ -1995,7 +2010,7 @@ def _plot_horizontal_overview(
                 label=t.t("未分類開放邊界", "Unclassified open boundary"),
             )
         )
-    for code in _status_codes_present(site.departures):
+    for code in _trajectory_status_codes_present(site):
         handles.append(
             Line2D(
                 [],

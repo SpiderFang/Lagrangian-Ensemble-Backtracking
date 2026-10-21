@@ -1132,11 +1132,11 @@ def test_arc_distribution_and_snapshot_use_fixed_limits_for_every_site(tmp_path,
     seen: dict[str, dict[str, tuple]] = {}
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         if path.stem == "boundary_departure_along_arc":
             ax = fig.axes[0]
             seen.setdefault("arc", {})[path.parent.name] = (ax.get_ylim(), [float(v) for v in ax.get_yticks()])
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
     postprocess_dir, coastline, isobaths, _ = footprint_inputs

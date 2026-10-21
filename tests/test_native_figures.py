@@ -983,14 +983,14 @@ def test_full_mode_figures_carry_no_disclaimer_text_object(
 
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         nonlocal checked_figures
         checked_figures += 1
         for text_obj in fig.texts:
             assert text_obj.get_color() != "#b3261e", f"{path.name} 仍有紅字警語顏色的文字物件"
             assert "警語" not in text_obj.get_text()
             assert "不得解讀為" not in text_obj.get_text()
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
 
@@ -1054,12 +1054,12 @@ def test_figure_text_none_mode_omits_titles_and_subtitles(
     checked_figures = 0
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         nonlocal checked_figures
         checked_figures += 1
         assert fig._suptitle is None, f"{path.name} 在 figure_text=none 模式下不應有標題"
         assert fig.texts == [], f"{path.name} 在 figure_text=none 模式下不應有額外文字物件"
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
 
@@ -1095,11 +1095,11 @@ def test_figure_text_full_mode_draws_a_title_for_at_least_one_figure(
     saw_suptitle = False
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         nonlocal saw_suptitle
         if fig._suptitle is not None:
             saw_suptitle = True
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
 
@@ -1282,7 +1282,7 @@ def test_weight_colorbar_labels_have_no_parenthetical_and_fixed_ticks(
     seen: dict[str, dict] = {}
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         if path.stem in ("boundary_azimuth_rose", "settling_velocity_breakdown"):
             cax = fig.axes[-1]
             seen[path.stem] = {
@@ -1290,7 +1290,7 @@ def test_weight_colorbar_labels_have_no_parenthetical_and_fixed_ticks(
                 "ticks": [float(t.get_text().replace("\u2212", "-")) for t in cax.get_yticklabels() if t.get_text()],
                 "ylim": cax.get_ylim(),
             }
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
     config = native_figures.NativeFiguresConfig(
@@ -1312,14 +1312,14 @@ def test_arc_segments_and_kde_colorbar_titles_have_no_shared_scale_wording(
     seen: dict[str, list[str]] = {}
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         if path.stem in ("boundary_arc_segments", "source_footprint_kde"):
             texts = []
             for ax in fig.axes:
                 texts.extend([ax.get_ylabel(), ax.get_xlabel(), ax.get_title()])
             texts.extend(t.get_text() for t in fig.texts)
             seen.setdefault(path.stem, []).extend(texts)
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
     config = native_figures.NativeFiguresConfig(
@@ -1344,7 +1344,7 @@ def test_numeric_axes_use_the_same_fixed_limits_for_every_site(
     seen: dict[str, dict[str, dict]] = {}
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         stem, site = path.stem, path.parent.name
         rec = None
         if stem == "terminal_counts":
@@ -1364,7 +1364,7 @@ def test_numeric_axes_use_the_same_fixed_limits_for_every_site(
             rec = {"ylim": ax_bar.get_ylim(), "yticks": [round(float(v), 6) for v in ax_bar.get_yticks()]}
         if rec is not None:
             seen.setdefault(stem, {})[site] = rec
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
     config = native_figures.NativeFiguresConfig(
@@ -1432,11 +1432,11 @@ def test_kde_plot_uses_identical_color_limits_across_sites(
     clims: dict[str, tuple[float, float]] = {}
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         if path.name == "source_footprint_kde.png":
             mesh = fig.axes[0].collections[0]
             clims[path.parent.name] = mesh.get_clim()
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
 
@@ -1648,6 +1648,39 @@ def test_status_codes_present_lists_only_nonzero_categories_in_fixed_order() -> 
     assert native_figures._status_codes_present(empty) == (NATIVE_STATUS_LEFT_INTEREST_REGION,)
 
 
+def test_trajectory_status_codes_present_lists_only_drawn_trajectory_categories() -> None:
+    """水平軌跡總覽圖例（動態圖例）只列代表軌跡實際畫出的終止類別，不看全站計數。"""
+    from types import SimpleNamespace
+
+    departures = {
+        "final_status_code": np.array(
+            [
+                NATIVE_STATUS_LEFT_INTEREST_REGION,
+                NATIVE_STATUS_MAX_BACKTRACK,
+                NATIVE_STATUS_DEPOSITED,
+            ],
+            dtype=np.int64,
+        )
+    }
+    site = SimpleNamespace(
+        departures=departures,
+        trajectories=[SimpleNamespace(final_status_code=NATIVE_STATUS_LEFT_INTEREST_REGION)] * 3,
+    )
+    # 全站有達回溯上限與觸底，但代表軌跡皆穿越邊界：圖例只列穿越一類
+    assert native_figures._trajectory_status_codes_present(site) == (NATIVE_STATUS_LEFT_INTEREST_REGION,)
+    site.trajectories = [
+        SimpleNamespace(final_status_code=NATIVE_STATUS_DEPOSITED),
+        SimpleNamespace(final_status_code=NATIVE_STATUS_LEFT_INTEREST_REGION),
+    ]
+    assert native_figures._trajectory_status_codes_present(site) == (
+        NATIVE_STATUS_LEFT_INTEREST_REGION,
+        NATIVE_STATUS_DEPOSITED,
+    )
+    # 沒有代表軌跡時退回全站計數規則
+    site.trajectories = []
+    assert native_figures._trajectory_status_codes_present(site) == native_figures._status_codes_present(departures)
+
+
 def test_terminal_status_legend_and_bars_omit_zero_count_categories(
     tmp_path: Path, synthetic_inputs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1679,14 +1712,14 @@ def test_terminal_status_legend_and_bars_omit_zero_count_categories(
     seen: dict[str, list[str]] = {"legend": [], "ticks": [], "bar_texts": []}
     original_save = native_figures._save_exclusive
 
-    def _checking_save(fig, path, *, dpi):
+    def _checking_save(fig, path, *, dpi, **kw):
         if path.stem == "horizontal_overview":
             seen["legend"] += [t.get_text() for leg in fig.legends for t in leg.get_texts()]
         if path.stem == "terminal_counts":
             ax = fig.axes[0]
             seen["ticks"] += [t.get_text() for t in ax.get_xticklabels()]
             seen["bar_texts"] += [t.get_text() for t in ax.texts]
-        return original_save(fig, path, dpi=dpi)
+        return original_save(fig, path, dpi=dpi, **kw)
 
     monkeypatch.setattr(native_figures, "_save_exclusive", _checking_save)
     config = native_figures.NativeFiguresConfig(
