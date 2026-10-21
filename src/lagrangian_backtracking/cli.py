@@ -2535,6 +2535,10 @@ def _native_polar_source_parser() -> argparse.ArgumentParser:
         help="依本次全部錨點自動決定包絡（取各方向最大值向上取整）；無文字版共同裁切框改由本次無文字版圖量測",
     )
     parser.add_argument(
+        "--report-layout", action="store_true",
+        help="報告版面：畫布寬 6.27 英寸（＝報告插入寬度）、字級 8 pt、圖例在主圖下方、A 類十圖併成一張多格圖；只輸出無文字版（需 --modes none）",
+    )
+    parser.add_argument(
         "--notext-crop-in", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"), default=None,
         help="無文字版共同裁切框（英寸，自畫布左下角起算）；省略時 run08 包絡用既定值，其他包絡自動量測",
     )
@@ -2576,6 +2580,7 @@ def run_native_polar_source_command(argv: Sequence[str] | None = None) -> int:
         ),
         envelope_auto=bool(args.envelope_auto),
         notext_crop_in=tuple(args.notext_crop_in) if args.notext_crop_in is not None else None,
+        report_layout=bool(args.report_layout),
     )
     output_dirs = native_polar_source_figures.build_polar_source(config, command=command)
     print(json.dumps({"output_dirs": [str(p) for p in output_dirs]}, ensure_ascii=False, indent=2, sort_keys=True))
