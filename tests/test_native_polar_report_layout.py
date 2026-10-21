@@ -28,7 +28,8 @@ def test_report_geometry_fits_canvas_and_page():
     assert F._RO_LEFT + F._RO_FRAME + F._RO_RIGHT_MARGIN == pytest.approx(F.REPORT_W_IN)
     assert F._RG_LEFT + 3 * F._RG_P + 2 * F._RG_GAP + F._RG_RIGHT_MARGIN == pytest.approx(F.REPORT_W_IN)
     assert F.REPORT_PANELS_H <= 9.0  # 版心高約 9.7 英寸，圖加圖說須在一頁內
-    assert F.REPORT_OVERVIEW_H <= 9.0
+    assert max(F.report_overview_height(k) for k in 'BCD') <= 9.0
+    assert F.report_overview_height('D') < F.report_overview_height('C') < F.report_overview_height('B')
     assert set(F.REPORT_STEMS) == set(F.FIGURE_KINDS)
 
 

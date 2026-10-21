@@ -753,9 +753,18 @@ _RO_FRAME = REPORT_W_IN - _RO_LEFT - _RO_RIGHT_MARGIN
 _RO_TOP = 0.08
 _RO_XLAB = 0.30
 _RO_LEGEND_GAP = 0.08
-_RO_LEGEND_H = 0.92
+_RO_LEGEND_H_BY_KIND: Mapping[str, float] = {"B": 0.92, "C": 0.76, "D": 0.52}
+"""圖例帶高度（英寸）：B 十類（兩欄 5 列＋右側 6 列）、C 季節（4 列）、D 大小潮（2 列）；C、D 的錨點與等深線圖例改兩欄。"""
 _RO_BOTTOM = 0.04
-REPORT_OVERVIEW_H = round(_RO_TOP + _RO_FRAME + _RO_XLAB + _RO_LEGEND_GAP + _RO_LEGEND_H + _RO_BOTTOM, 3)
+
+
+def report_overview_height(kind: str) -> float:
+    """總覽圖（B、C、D）的畫布高度（英寸）；同一圖種五地點相同，圖例帶依圖種的列數決定，不留大片空白。"""
+
+    return round(_RO_TOP + _RO_FRAME + _RO_XLAB + _RO_LEGEND_GAP + _RO_LEGEND_H_BY_KIND[kind] + _RO_BOTTOM, 3)
+
+
+REPORT_OVERVIEW_H = report_overview_height("B")
 
 # 多格圖（A）：3 欄 × 4 列，第 10 格在第 4 列第 1 欄，其右兩格放共用圖例。
 _RG_COLS = 3
@@ -997,7 +1006,7 @@ def render_report_overview(
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    w, h = REPORT_W_IN, REPORT_OVERVIEW_H
+    w, h = REPORT_W_IN, report_overview_height(plan.kind)
     fig = plt.figure(figsize=(w, h), dpi=150)
     ax = fig.add_axes([_RO_LEFT / w, 1.0 - (_RO_TOP + _RO_FRAME) / h, _RO_FRAME / w, _RO_FRAME / h])
     xt = _report_ticks(site_map.extent[0], site_map.extent[1], (0.1, 0.2, 0.25, 0.5), 5, inner=(0.055, 0.945))
@@ -1013,7 +1022,7 @@ def render_report_overview(
     leg1 = _fig_legend(fig, handles, font, loc="upper left", x_in=_RO_LEFT, y_top_in=y_leg, h_in=h, w_in=w,
                        title=legend_title, ncol=ncol)  # fmt: skip
     leg2 = _fig_legend(fig, _report_base_handles(t, drawn, levels), font, loc="upper right", x_in=_RO_LEFT + _RO_FRAME, y_top_in=y_leg,
-                       h_in=h, w_in=w, title=None, ncol=1)  # fmt: skip
+                       h_in=h, w_in=w, title=None, ncol=(1 if plan.kind == "B" else 2))  # fmt: skip
     _assert_report_layout(fig, [leg1, leg2], [ax], w, h, what=plan.stem)
     _save_fixed_canvas(fig, path, dpi=dpi, crop_in=None, svg=not png_only)
     plt.close(fig)
@@ -1490,7 +1499,7 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
     if config.report_layout:
         figure_layout_record = {
             "report_layout": True,
-            "canvas_in": {"overview": [REPORT_W_IN, REPORT_OVERVIEW_H], "panels": [REPORT_W_IN, REPORT_PANELS_H]},
+            "canvas_in": {**{k: [REPORT_W_IN, report_overview_height(k)] for k in ("B", "C", "D")}, "panels": [REPORT_W_IN, REPORT_PANELS_H]},
             "window_half_km": config.radius_km * REPORT_WINDOW_FACTOR,
             "overview_frame_in": _RO_FRAME,
             "panel_frame_in": _RG_P,
