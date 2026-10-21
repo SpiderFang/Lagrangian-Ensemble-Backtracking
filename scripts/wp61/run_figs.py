@@ -15,6 +15,8 @@ outroot = Path(sys.argv[2] if len(sys.argv) > 2 else "/home/mustlab/Workspace/lb
 PAIRED = __import__("os").environ.get("LBT_ARRIVAL_PAIRED", "1") != "0"
 # 只出無文字版：LBT_FIGS_NOTEXT_ONLY=1（預設兩版都出）
 TEXTS = (False,) if __import__("os").environ.get("LBT_FIGS_NOTEXT_ONLY", "0") == "1" else (True, False)
+# 只出哪幾種圖：LBT_FIGS_KINDS=overview（WP-64：3-4-3 只用全年總覽；預設 overview,zoom 與舊版相同）
+KINDS = tuple(__import__("os").environ.get("LBT_FIGS_KINDS", "overview,zoom").split(","))
 fonts = af.Fonts()
 print(fonts.record)
 recs = ac.load_manifest_records()
@@ -32,13 +34,13 @@ stats = {
 for site in sites:
     d = outroot / site
     d.mkdir(parents=True, exist_ok=True)
-    for variant in ("U", "S"):
+    for variant in __import__("os").environ.get("LBT_FIGS_VARIANTS", "U,S").split(","):
         plan = af.axis_plan(stats, variant, site)
         print(site, variant, plan["eta"], plan["strength"], plan["hs"], plan["speed"])
         for text in TEXTS:
             tag = "text" if text else "notext"
             t = time.time()
-            for kind in ("overview", "zoom"):
+            for kind in KINDS:
                 out = d / f"wp61_{site}_{kind}_{variant}_{tag}.png"
                 for p in (out, out.with_suffix(".svg")):
                     if p.exists():
