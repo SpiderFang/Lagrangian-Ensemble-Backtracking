@@ -35,6 +35,10 @@ DAY_NS = 86_400_000_000_000
 HALF = 13
 
 OV_W = 6.2667  # 總覽畫布寬（英寸）＝嵌入 Word 之寬度（1:1）；高度由版面決定（見 render_overview）
+OV_LEFT = 0.74  # 左側留給垂直軸標題（兩行）與刻度字
+OV_HEIGHTS = (2.3, 0.80, 0.80)
+OV_YLAB_X = 0.17  # 縱軸標題中心離畫布左緣（英寸）
+OV_GAP = 0.13  # 面板間距（縱軸標題移到 Y 軸後，面板上方不再放標題）
 OV_TITLE = 0.24  # 有文字版上方標題區；無文字版畫布不含此區（圖內位置不變）
 ZM_W = 8.4
 ZM_TITLE = 0.42
@@ -285,22 +289,26 @@ def season_spans() -> list[tuple[str, float, float]]:
 
 FS_OV = 9.0  # 圖內文字字級（pt）。畫布寬 = 嵌入寬，不縮放，故在 Word 裡也是 9 pt。
 
-# 中英並列用語（依據見 WP-64 用語對照表）
-BI_SEASON = {"DJF": "冬 Winter", "MAM": "春 Spring", "JJA": "夏 Summer", "SON": "秋 Autumn"}
-BI_CLASS = {"spring_proxy": "大潮 Spring tide", "neap_proxy": "小潮 Neap tide"}
+# 圖內用語（WP-64 v3）：依服務建議書（工項 2-4）用詞「有效波高」「流速」「大/小潮」；
+# 圖例、季節、軸名只用中文，僅專有名詞或符號（Hs、m、m/s）保留英文。
+BI_SEASON = {"DJF": "冬季", "MAM": "春季", "JJA": "夏季", "SON": "秋季"}
+BI_CLASS = {"spring_proxy": "大潮", "neap_proxy": "小潮"}
 CLASS_SHORT = {"spring_proxy": "大潮", "neap_proxy": "小潮"}
 BI_PHASE = {
-    "fastest_rising": "漲潮最快 Fastest rising",
-    "fastest_falling": "退潮最快 Fastest falling",
-    "slack_proxy": "近平潮 Near slack",
+    "fastest_rising": "漲潮最快",
+    "fastest_falling": "退潮最快",
+    "slack_proxy": "近平潮",
 }
-BI_EVENT = {"high_wave_event": "高浪事件 High-wave event", "strong_current_event": "強流事件 Strong-current event"}
-BI_MEDIAN = "季內中位數 Seasonal median"
-BI_P99 = "全年第 99 百分位 Annual 99th percentile (p99)"
-BI_TITLE_STRENGTH = "潮汐強度 Tidal strength（25 小時海面高度 η 均方根 25-h RMS of η, m）"
-BI_TITLE_HS = "顯著波高 Significant wave height, Hs（m）"
-BI_TITLE_SPEED = "流速 Current speed（m/s）"
-BI_XLABEL = "日期 Date（2025 年/月/日，UTC）"
+BI_EVENT = {"high_wave_event": "高浪事件", "strong_current_event": "強流事件"}
+BI_MEDIAN = "季內中位數"
+BI_P99 = "全年第 99 百分位"
+# 縱軸標題（垂直、兩行：量名／單位），潮汐強度之定義寫在 3-4-3 導引句，不寫在圖上
+YLAB_STRENGTH = "潮汐強度\n（m）"
+YLAB_HS = "有效波高 Hs\n（m）"
+YLAB_SPEED = "流速\n（m/s）"
+BI_XLABEL = "日期（年/月/日）"
+LINE_MEDIAN = dict(color="black", lw=1.7, ls=(0, (7, 3)))  # 季內中位數：黑色粗長虛線
+LINE_P99 = dict(color="#b2182b", lw=1.5, ls=(0, (1, 1.6)))  # 全年第 99 百分位：深紅點線
 OV_TICK_MONTHS = (1, 3, 5, 7, 9, 11)  # 日期刻度：每兩個月 1 日，再加全年末端（2026/01/01）
 
 
@@ -356,15 +364,15 @@ def _ov_legend_sets(rows: list[dict]):
         )
         for e in ("high_wave_event", "strong_current_event")
     ]
-    med = Line2D([], [], color="black", ls=(0, (4, 2)), lw=1.0, label=BI_MEDIAN)
-    p99 = Line2D([], [], color="#333333", ls=(0, (4, 2)), lw=0.8, label=BI_P99)
+    med = Line2D([], [], label=BI_MEDIAN, **LINE_MEDIAN)
+    p99 = Line2D([], [], label=BI_P99, **LINE_P99)
     return seasons, [*cls, *phase], [*event, med, p99]
 
 
 def _ov_make_legends(fig, fonts: Fonts, rows: list[dict]):
     seasons, left_col, right_col = _ov_legend_sets(rows)
     common = dict(
-        prop=fonts(FS_OV), frameon=False, handlelength=1.5, labelspacing=0.18, borderaxespad=0, borderpad=0,
+        prop=fonts(FS_OV), frameon=False, handlelength=2.4, labelspacing=0.18, borderaxespad=0, borderpad=0,
         handletextpad=0.5, loc="lower left",
     )
     legs = [
@@ -390,9 +398,9 @@ def render_overview(
 ) -> None:
     plt = _setup_mpl().pyplot
     W = OV_W
-    left, right = 0.52, 0.42
-    heights = (2.2, 0.68, 0.68)  # 潮汐強度主圖、顯著波高、流速（英寸）
-    title_h, gap = 0.20, 0.05
+    left, right = OV_LEFT, 0.42
+    heights = OV_HEIGHTS  # 潮汐強度主圖、有效波高、流速（英寸）
+    title_h, gap = 0.0, OV_GAP
     season_h = 0.34  # 主圖上方：各季名稱與大潮／小潮數量（兩行）
     xaxis_h = 0.50
     top_margin = 0.05 + (OV_TITLE if text else 0.0)
@@ -424,7 +432,7 @@ def render_overview(
             ax.axvspan(a, b, facecolor=BAND[name], edgecolor="none", zorder=0)
     ax_s.plot(days[sel], s.strength[sel], color="#444444", lw=0.6, zorder=2)
     for name, a, b in season_spans():
-        ax_s.plot([a, b], [res["ind"]["thresholds"][name]] * 2, color="black", lw=1.0, ls=(0, (4, 2)), zorder=3)
+        ax_s.plot([a, b], [res["ind"]["thresholds"][name]] * 2, zorder=3, **LINE_MEDIAN)
     lo, up, st = axes_plan["strength"]
     _style_axes(ax_s, fonts, FS_OV, xlim=(0, 365), ylim=(lo, up), yticks=axis_ticks(lo, up, st))
     ax_s.tick_params(labelbottom=False)
@@ -433,19 +441,20 @@ def render_overview(
     ym = s.valid & (s.year_of == ac.YEAR)
     for ax, key, ser in ((ax_h, "hs", s.hs), (ax_c, "speed", s.speed)):
         lo, up, st = axes_plan[key]
-        ax.plot([0, 365], [np.nanpercentile(np.where(ym, ser, np.nan), 99)] * 2, color="#333333", lw=0.8, ls=(0, (4, 2)), zorder=3)
+        ax.plot([0, 365], [np.nanpercentile(np.where(ym, ser, np.nan), 99)] * 2, zorder=3, **LINE_P99)
         _style_axes(ax, fonts, FS_OV, xlim=(0, 365), ylim=(lo, up), yticks=axis_ticks(lo, up, st))
     ax_h.tick_params(labelbottom=False)
     tpos, tlab = _ov_date_ticks()
     ax_c.set_xticks(tpos)
     ax_c.set_xticklabels(tlab, fontproperties=fonts(FS_OV))
     ax_c.set_xlabel(BI_XLABEL, fontproperties=fonts(FS_OV), labelpad=2)
-    # 標題：潮汐強度主圖的標題在季節標籤之上
-    y0, hh = rects["s"]
-    fig.text(left / W, (y0 + hh + season_h + 0.025) / H, BI_TITLE_STRENGTH, ha="left", va="bottom", fontproperties=fonts(FS_OV))
-    for key, ttl in (("h", BI_TITLE_HS), ("c", BI_TITLE_SPEED)):
+    # 縱軸標題：垂直、置於 Y 軸位置（各面板中央），兩行（量名／單位）
+    for key, ylab in (("s", YLAB_STRENGTH), ("h", YLAB_HS), ("c", YLAB_SPEED)):
         y0, hh = rects[key]
-        fig.text(left / W, (y0 + hh + 0.025) / H, ttl, ha="left", va="bottom", fontproperties=fonts(FS_OV))
+        fig.text(
+            OV_YLAB_X / W, (y0 + hh / 2) / H, ylab, rotation=90, ha="center", va="center",
+            fontproperties=fonts(FS_OV), linespacing=1.1,
+        )
     # 各季名稱與該季大潮／小潮數量（標在季節色塊頂端）
     cnt = _ov_counts(rows)
     y0, hh = rects["s"]
@@ -484,7 +493,7 @@ def render_overview(
         n_drawn += 1
     assert n_drawn == cnt["total"], (n_drawn, cnt["total"])
     if text:
-        fig.text(left / W, 1 - 0.05 / H, f"{cnt['total']} 個到達時間 arrival times", ha="left", va="top", fontproperties=fonts(FS_OV, "bold"))
+        fig.text(left / W, 1 - 0.05 / H, f"{cnt['total']} 個到達時間", ha="left", va="top", fontproperties=fonts(FS_OV, "bold"))
     legs = _ov_make_legends(fig, fonts, rows)
     (lg_l, w_l, h_l), (lg_r, w_r, h_r) = legs
     x_l = 0.04
@@ -614,7 +623,7 @@ def render_zoom(
             ax, fonts, 5.6, xlim=(-HALF, HALF), ylim=(elo, eup), yticks=axis_ticks(elo, eup, est), xticks=xt
         )
         ax.set_ylabel(
-            "示性波高（m）" if ev == "high_wave_event" else "流速（m/s）", fontproperties=fonts(5.8), labelpad=1
+            "有效波高 Hs（m）" if ev == "high_wave_event" else "流速（m/s）", fontproperties=fonts(5.8), labelpad=1
         )
         if text:
             unit = "m" if ev == "high_wave_event" else "m/s"
