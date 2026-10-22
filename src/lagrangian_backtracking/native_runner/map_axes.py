@@ -6,7 +6,8 @@
 所以五地點的經度跨度、緯度跨度、刻度間隔與刻度小數位數都不同，軸的兩端也不一定有數字。
 本模組提供「同一圖種五地點共用」的軸規格：
 
-* 刻度標籤一律一位小數、含方位字母（例如「25.0°N」「121.4°E」）；
+* 刻度標籤一律只寫數字、一位小數（例如「25.0」「121.4」），單位與方位寫在軸標題「經度 (°E)」「緯度 (°N)」
+  （半形括號，括號前空一格；2026-10-22 WP-71 第二版，ax2；第一版 ax1 的刻度標籤含「°E」「°N」，軸標題只有「經度」「緯度」）；
 * 同一圖種的五個地點，經度跨度（度）相同、緯度跨度（度）相同、刻度間隔相同；
 * 每個地點的軸範圍上下限都落在刻度（間隔的整數倍）上，所以軸兩端各有一個數字；
 * 軸範圍必須完整包住該地點要呈現的內容（外框、軌跡等），多出來的空間盡量均分在兩側；
@@ -24,6 +25,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 __all__ = [
+    "AXIS_TITLE_LON_EN",
+    "AXIS_TITLE_LAT_EN",
     "AXIS_TITLE_LON_ZH",
     "AXIS_TITLE_LAT_ZH",
     "AxisSpec",
@@ -35,28 +38,30 @@ __all__ = [
     "window_for_content",
 ]
 
-AXIS_TITLE_LON_ZH = "經度"
-AXIS_TITLE_LAT_ZH = "緯度"
-"""座標軸標題（全報告統一；單位與方位已在刻度標籤中，不再重複）。"""
+AXIS_TITLE_LON_ZH = "經度 (°E)"
+AXIS_TITLE_LAT_ZH = "緯度 (°N)"
+AXIS_TITLE_LON_EN = "Longitude (°E)"
+AXIS_TITLE_LAT_EN = "Latitude (°N)"
+"""座標軸標題（全報告統一；單位與方位寫在軸標題，刻度標籤只寫數字）。"""
 
 _EPS = 1e-9
 
 
 def format_lon(value: float, _pos: int | None = None) -> str:
-    """經度刻度標籤：一位小數加「°E」，例如 ``121.4°E``。
+    """經度刻度標籤：只寫數字、一位小數，例如 ``121.4``（單位在軸標題「經度 (°E)」）。
 
     刻度必須是 0.1 度的整數倍；不是整數倍的值若被四捨五入成一位小數會誤導讀者，所以直接報錯。
     """
 
     _require_tenth(value)
-    return f"{value:.1f}°E"
+    return f"{value:.1f}"
 
 
 def format_lat(value: float, _pos: int | None = None) -> str:
-    """緯度刻度標籤：一位小數加「°N」，例如 ``25.0°N``（規則同 :func:`format_lon`）。"""
+    """緯度刻度標籤：只寫數字、一位小數，例如 ``25.0``（規則同 :func:`format_lon`；單位在軸標題「緯度 (°N)」）。"""
 
     _require_tenth(value)
-    return f"{value:.1f}°N"
+    return f"{value:.1f}"
 
 
 def _require_tenth(value: float) -> None:

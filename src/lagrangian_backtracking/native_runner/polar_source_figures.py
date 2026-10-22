@@ -959,7 +959,7 @@ def _draw_report_polar(
     for lab in ax.get_xticklabels() + ax.get_yticklabels():
         lab.set_fontproperties(f8)
     if one_decimal:
-        # 座標軸標題全報告統一為「經度」「緯度」；只在有刻度標籤的邊畫
+        # 座標軸標題全報告統一為「經度 (°E)」「緯度 (°N)」（刻度標籤只寫數字）；只在有刻度標籤的邊畫
         if label_x:
             ax.set_xlabel(_map_axes.AXIS_TITLE_LON_ZH, fontproperties=f8, fontsize=REPORT_TEXT_PT, labelpad=1.5)
         if label_y:

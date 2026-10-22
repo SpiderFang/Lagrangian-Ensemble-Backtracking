@@ -19,9 +19,12 @@ _NEEDS = {
 
 
 def test_format_one_decimal_and_rejects_non_tenths() -> None:
-    assert ma.format_lat(25.0) == "25.0°N"
-    assert ma.format_lon(121.4) == "121.4°E"
-    assert ma.format_lon(119.6 + 1e-12) == "119.6°E"
+    # ax2：刻度標籤只寫數字、一位小數（單位與方位在軸標題）
+    assert ma.format_lat(25.0) == "25.0"
+    assert ma.format_lon(121.4) == "121.4"
+    assert ma.format_lon(119.6 + 1e-12) == "119.6"
+    assert ma.AXIS_TITLE_LON_ZH == "經度 (°E)" and ma.AXIS_TITLE_LAT_ZH == "緯度 (°N)"  # 半形括號，括號前空一格
+    assert ma.AXIS_TITLE_LON_EN == "Longitude (°E)" and ma.AXIS_TITLE_LAT_EN == "Latitude (°N)"
     with pytest.raises(ValueError):
         ma.format_lat(24.79)  # 不可把非整刻度四捨五入成 24.8 標示
     with pytest.raises(ValueError):
@@ -48,7 +51,7 @@ def test_spec_and_windows_are_identical_in_span_and_step() -> None:
         assert w.lon_ticks[0] == w.lon_lo and w.lon_ticks[-1] == w.lon_hi
         assert w.lat_ticks[0] == w.lat_lo and w.lat_ticks[-1] == w.lat_hi
         # 每個刻度標籤都可一位小數表示
-        assert all(ma.format_lon(v).endswith("°E") for v in w.lon_ticks)
+        assert all(len(ma.format_lon(v).split(".")[1]) == 1 and "°" not in ma.format_lon(v) for v in w.lon_ticks)
 
 
 def test_window_is_centered_when_slack_is_even() -> None:

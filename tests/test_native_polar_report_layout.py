@@ -56,6 +56,6 @@ def test_one_decimal_style_config_and_geometry():
     from lagrangian_backtracking.native_runner import map_axes as ma
 
     t = F._report_ticks(24.4194, 25.0806, (0.1,), 5, inner=(0.03, 0.97))
-    assert [ma.format_lat(v) for v in t][0].endswith("°N") and all(abs(v * 10 - round(v * 10)) < 1e-6 for v in t)
+    assert "°" not in ma.format_lat(t[0]) and len(ma.format_lat(t[0]).split(".")[1]) == 1 and all(abs(v * 10 - round(v * 10)) < 1e-6 for v in t)
     with pytest.raises(ValueError):
         ma.format_lat(24.79)

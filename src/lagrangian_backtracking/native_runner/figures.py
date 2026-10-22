@@ -2032,8 +2032,8 @@ def _plot_horizontal_overview(
         ax.set_yticks(window.lat_ticks)
         ax.xaxis.set_major_formatter(FuncFormatter(_map_axes.format_lon))
         ax.yaxis.set_major_formatter(FuncFormatter(_map_axes.format_lat))
-        ax.set_xlabel(t.t(_map_axes.AXIS_TITLE_LON_ZH, "Longitude"), fontproperties=font)
-        ax.set_ylabel(t.t(_map_axes.AXIS_TITLE_LAT_ZH, "Latitude"), fontproperties=font)
+        ax.set_xlabel(t.t(_map_axes.AXIS_TITLE_LON_ZH, _map_axes.AXIS_TITLE_LON_EN), fontproperties=font)
+        ax.set_ylabel(t.t(_map_axes.AXIS_TITLE_LAT_ZH, _map_axes.AXIS_TITLE_LAT_EN), fontproperties=font)
         ax.grid(False)
     else:
         lon_margin = max((all_lon.max() - all_lon.min()) * 0.08, 0.01)
@@ -4431,8 +4431,12 @@ def _plot_source_footprint_residence(
     lon_c, lat_c = fp.center_coords()
     _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
 
-    ax.set_xlabel(t.t(_map_axes.AXIS_TITLE_LON_ZH, "Longitude"), fontproperties=font)
-    ax.set_ylabel(t.t(_map_axes.AXIS_TITLE_LAT_ZH, "Latitude"), fontproperties=font)
+    if axes_unified is not None:  # WP-71 ax2：軸標題「經度 (°E)」「緯度 (°N)」
+        ax.set_xlabel(t.t(_map_axes.AXIS_TITLE_LON_ZH, _map_axes.AXIS_TITLE_LON_EN), fontproperties=font)
+        ax.set_ylabel(t.t(_map_axes.AXIS_TITLE_LAT_ZH, _map_axes.AXIS_TITLE_LAT_EN), fontproperties=font)
+    else:
+        ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
+        ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
     ax.legend(
         handles=_footprint_legend_handles(
             t,
