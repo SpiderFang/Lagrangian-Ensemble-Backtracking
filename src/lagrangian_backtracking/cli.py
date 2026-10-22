@@ -2431,6 +2431,14 @@ def _native_figures_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--footprint-colormap-scheme", choices=list(native_figures.RESIDENCE_COLORMAP_SCHEMES), default=None,
+        help=(
+            "WP-70：停留時數密度圖（跨站共用版）配色方案，須搭配 --footprint-colorbar-range："
+            "nonuniform＝非均勻連續配色（僅 1e-3 1e3）；steps＝每個 10 的次方分 2 段的階梯色。"
+            "省略時用預設配色"
+        ),
+    )
+    parser.add_argument(
         "--allow-unanchored-receptor", action="store_true",
         help=(
             "WP-38 診斷用：允許省略 --config，星號退回後處理由釋放點反推的平均位置；"
@@ -2461,6 +2469,7 @@ def run_native_figures_command(argv: Sequence[str] | None = None) -> int:
         receptor_config_path=args.config,
         allow_unanchored_receptor=args.allow_unanchored_receptor,
         footprint_colormap_trim=args.footprint_colormap_trim,
+        footprint_colormap_scheme=args.footprint_colormap_scheme,
         footprint_colorbar_range=(
             tuple(args.footprint_colorbar_range) if args.footprint_colorbar_range else None
         ),

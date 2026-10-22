@@ -117,6 +117,7 @@ def _build(
     allow_unanchored: bool = True,
     colorbar_range=None,
     colormap_trim=None,
+    colormap_scheme=None,
 ):
     config = native_figures.NativeFiguresConfig(
         postprocess_dir=postprocess_dir,
@@ -130,6 +131,7 @@ def _build(
         allow_unanchored_receptor=receptor_config is None and allow_unanchored,
         footprint_colorbar_range=colorbar_range,
         footprint_colormap_trim=colormap_trim,
+        footprint_colormap_scheme=colormap_scheme,
     )
     native_figures.build_native_figures(config, command="lbt native-figures --test")
     return tmp_path / name
@@ -1287,3 +1289,99 @@ def test_colormap_trim_cuts_the_lightest_part_only_for_the_shared_residence_figu
     assert rec["layout"]["colorbar"]["ticks"] == pytest.approx([10.0**k for k in range(-3, 4)])  # 7 個刻度
     site_scale = fig["figures"][f"{SITES[0]}/source_footprint_residence_site_scale.png"]
     assert "colormap_trim_lower_fraction" not in site_scale
+
+
+# ── WP-70：配色方案（nonuniform／steps） ─────────────────────────────────────
+
+
+def test_colormap_scheme_option_is_validated(tmp_path):
+    ok = _cfg(tmp_path, footprint_colorbar_range=(1e-3, 1e3), footprint_colormap_scheme="nonuniform")
+    assert ok.footprint_colormap_scheme == "nonuniform"
+    assert _cfg(tmp_path).footprint_colormap_scheme is None
+    bad_kwargs = [
+        {"footprint_colormap_scheme": "steps"},  # 缺色階範圍
+        {"footprint_colorbar_range": (1e-3, 1e3), "footprint_colormap_scheme": "rainbow"},
+        {"footprint_colorbar_range": (1e-3, 1e1), "footprint_colormap_scheme": "nonuniform"},  # 僅 1e-3–1e3
+        {
+            "footprint_colorbar_range": (1e-3, 1e3),
+            "footprint_colormap_scheme": "steps",
+            "footprint_colormap_trim": 0.15,
+        },
+    ]
+    for kw in bad_kwargs:
+        with pytest.raises(native_figures.FiguresError):
+            _cfg(tmp_path, **kw)
+
+
+def test_nonuniform_colormap_anchors_and_steps_colormap_levels():
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
+
+    base = plt.get_cmap(native_figures._RESIDENCE_CMAP)
+    nu = native_figures._residence_colormap(None, "nonuniform", 1e-3, 1e3)
+    # log10 值 -3 → YlGnBu 0.0；+1 → 0.90；+2 → 1.0；+3 → 近黑深藍
+    assert tuple(nu(0.0)) == pytest.approx(tuple(base(0.0)), abs=2e-3)
+    assert tuple(nu(4 / 6)) == pytest.approx(tuple(base(0.90)), abs=3e-3)
+    assert tuple(nu(5 / 6)) == pytest.approx(tuple(base(1.0)), abs=3e-3)
+    assert tuple(nu(1.0)) == pytest.approx(tuple(to_rgba("#04102e")), abs=3e-3)
+    # 10^-3–10^1 之間與預設配色（取 0–0.9 區段）一致
+    for u in (0.1, 0.3, 0.5):
+        assert tuple(nu(u)) == pytest.approx(tuple(base(u / (4 / 6) * 0.90)), abs=4e-3)
+    with pytest.raises(native_figures.FiguresError):
+        native_figures._residence_colormap(None, "nonuniform", 1e-3, 1e1)
+    steps = native_figures._residence_colormap(None, "steps", 1e-3, 1e3)
+    assert steps.N == 12
+    colors = [tuple(steps(i)) for i in range(12)]
+    assert colors[0] == pytest.approx(tuple(base(0.0)), abs=2e-3)
+    assert colors[-1] == pytest.approx(tuple(base(1.0)), abs=2e-3)
+    assert len(set(colors)) == 12
+    assert native_figures._residence_colormap(None, "steps", 1e-3, 1e1).N == 8  # 每個數量級 2 段
+
+
+@pytest.mark.parametrize("scheme", ["nonuniform", "steps"])
+def test_colormap_scheme_applies_to_shared_residence_figure_only(
+    tmp_path, footprint_inputs, monkeypatch, scheme
+):
+    import matplotlib.axes
+    import matplotlib.pyplot as plt
+
+    seen: list[tuple[str, float]] = []
+    original = matplotlib.axes.Axes.pcolormesh
+
+    def spy(self, *args, **kwargs):
+        norm, cmap = kwargs.get("norm"), kwargs.get("cmap")
+        if norm is not None and cmap is not None and getattr(norm, "vmin", None) is not None:
+            seen.append((cmap.name, float(norm.vmin)))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "pcolormesh", spy)
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    out = _build(
+        tmp_path,
+        postprocess_dir,
+        coastline,
+        isobaths,
+        name=scheme,
+        colorbar_range=(1e-3, 1e3),
+        colormap_scheme=scheme,
+    )
+    suffix = "_nonuniform" if scheme == "nonuniform" else "_steps12"
+    special = [s for s in seen if s[0].endswith(suffix)]
+    assert len(special) == 2 * len(SITES)  # 每地點地圖與色條各一次
+    assert all(s[1] == pytest.approx(1e-3) for s in special)
+    assert any(s[0] == native_figures._RESIDENCE_CMAP for s in seen)  # 其他圖維持預設配色
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    fig = manifest["footprint_figures"]
+    variant = fig["residence_color_scale"]["variants"]["source_footprint_residence"]
+    assert (variant["lower_limit"], variant["upper_limit"], variant["colormap_scheme"]) == (1e-3, 1e3, scheme)
+    assert manifest["config"]["footprint_colormap_scheme"] == scheme
+    for site in SITES:
+        rec = fig["figures"][f"{site}/source_footprint_residence.png"]
+        assert rec["colormap_scheme"] == scheme
+        ticks = rec["layout"]["colorbar"]["ticks"]
+        assert ticks == pytest.approx([10.0**k for k in range(-3, 4)])  # 7 個刻度，等距（對數）
+        assert rec["layout"]["colorbar"]["extend"] == "neither"
+        assert abs(rec["layout"]["top_diff_px"]) <= 1.0 and abs(rec["layout"]["bottom_diff_px"]) <= 1.0
+        site_scale = fig["figures"][f"{site}/source_footprint_residence_site_scale.png"]
+        assert "colormap_scheme" not in site_scale
+    assert plt is not None

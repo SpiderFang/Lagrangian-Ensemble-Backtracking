@@ -387,8 +387,22 @@ class NativeFiguresConfig:
     # WP-70：停留時數密度圖（跨站共用版）配色只取 [trim, 1] 區段（trim＝裁掉最淺的比例，0≤trim<1），
     # 使色階下限附近不接近白色。None＝完整配色（預設，圖面不變）。
     footprint_colormap_trim: float | None = None
+    # WP-70：停留時數密度圖（跨站共用版）配色方案 nonuniform／steps（見 RESIDENCE_COLORMAP_SCHEMES），
+    # 須同時指定 footprint_colorbar_range，且不得與 footprint_colormap_trim 併用；None＝預設配色。
+    footprint_colormap_scheme: str | None = None
 
     def __post_init__(self) -> None:
+        if self.footprint_colormap_scheme is not None:
+            if self.footprint_colormap_scheme not in RESIDENCE_COLORMAP_SCHEMES:
+                raise FiguresError(f"footprint_colormap_scheme 必須是 {RESIDENCE_COLORMAP_SCHEMES} 之一")
+            if self.footprint_colorbar_range is None:
+                raise FiguresError("footprint_colormap_scheme 必須同時指定 footprint_colorbar_range")
+            if self.footprint_colormap_trim:
+                raise FiguresError("footprint_colormap_scheme 不得與 footprint_colormap_trim 併用")
+            if self.footprint_colormap_scheme == "nonuniform" and tuple(
+                round(math.log10(v)) for v in self.footprint_colorbar_range
+            ) != (-3, 3):
+                raise FiguresError("配色方案 nonuniform 需搭配色階範圍 10^-3–10^3")
         if self.footprint_colormap_trim is not None:
             trim = float(self.footprint_colormap_trim)
             if not math.isfinite(trim) or not 0.0 <= trim < 1.0:
@@ -3128,6 +3142,11 @@ RESIDENCE_COLOR_FLOOR_FRACTION = 1.0e-4
 """對數色階的下限占上限的比例；低於下限的網格不著色（透明）。"""
 
 _RESIDENCE_CMAP = "YlGnBu"
+# WP-70：停留時數密度圖（共用版）可選的配色方案（需搭配明示色階範圍）
+RESIDENCE_COLORMAP_SCHEMES = ("nonuniform", "steps")
+# nonuniform：以 log10 值為錨點的連續配色。-3→YlGnBu 0.0、+1→YlGnBu 0.90、+2→YlGnBu 1.0、+3→近黑深藍
+_NONUNIFORM_ANCHORS = ((-3.0, 0.0), (1.0, 0.90), (2.0, 1.0))
+_NONUNIFORM_DARKEST = "#04102e"
 
 # 高密度區間（HDR）50%／75%／90%：同一色系（棕色）由深到淺，線型為實線／虛線／點線。
 _HDR_LINE_STYLES: tuple[Mapping[str, Any], ...] = (
@@ -4182,6 +4201,45 @@ def _mesh_arrays(
     return x[r0 : r1 + 1, c0 : c1 + 1], y[r0 : r1 + 1, c0 : c1 + 1], masked[r0:r1, c0:c1]
 
 
+def _residence_colormap(
+    trim: float | None, scheme: str | None, vmin: float, vmax: float
+):
+    """停留時數密度圖共用版的配色（不含 bad 色）。預設＝完整 YlGnBu；``trim`` 只取 [trim, 1] 區段；
+    ``scheme='nonuniform'``：以 log10 值為錨點的連續配色（10⁻³→YlGnBu 0、10¹→YlGnBu 0.90、10²→YlGnBu 1、
+    10³→近黑深藍），色階範圍須為 10⁻³–10³；``scheme='steps'``：每個數量級 2 段，色序取自 YlGnBu 全段
+    均勻取色（階梯色，搭配對數色階等距切段）。"""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap, ListedColormap, to_rgba
+
+    base = plt.get_cmap(_RESIDENCE_CMAP)
+    if scheme == "nonuniform":
+        lo, hi = math.log10(vmin), math.log10(vmax)
+        if abs(lo + 3.0) > 1e-9 or abs(hi - 3.0) > 1e-9:
+            raise FiguresError("配色方案 nonuniform 需搭配色階範圍 10^-3–10^3")
+        xs = [(a - lo) / (hi - lo) for a, _ in _NONUNIFORM_ANCHORS]
+        vs = [v for _, v in _NONUNIFORM_ANCHORS]
+        u = np.linspace(0.0, 1.0, 1024)
+        # 錨點之間沿 YlGnBu 本身取色（位置 v 對 log10 值分段線性），不在錨點色之間做 RGB 內插
+        pos = np.interp(u, xs, vs)
+        rgba = np.asarray(base(pos), dtype=float)
+        last = xs[-1]
+        tail = u > last
+        if tail.any():  # 最後一個錨點（YlGnBu 1.0）之後線性加深到近黑深藍
+            w = ((u[tail] - last) / (1.0 - last))[:, None]
+            rgba[tail] = (1.0 - w) * np.asarray(base(1.0)) + w * np.asarray(to_rgba(_NONUNIFORM_DARKEST))
+        return LinearSegmentedColormap.from_list(f"{_RESIDENCE_CMAP}_nonuniform", rgba, N=1024)
+    if scheme == "steps":
+        n_steps = 2 * round(math.log10(vmax / vmin))
+        return ListedColormap(base(np.linspace(0.0, 1.0, n_steps)), name=f"{_RESIDENCE_CMAP}_steps{n_steps}")
+    if trim:
+        # 只取配色的 [trim, 1] 區段（裁掉最淺的一段），仍取 256 級
+        return LinearSegmentedColormap.from_list(
+            f"{_RESIDENCE_CMAP}_trim{trim:g}", base(np.linspace(trim, 1.0, 256)), N=256
+        )
+    return base
+
+
 def _plot_source_footprint_residence(
     site: SiteData,
     fp: FootprintSiteFigureData,
@@ -4198,6 +4256,7 @@ def _plot_source_footprint_residence(
     isobath_levels: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
     limits: tuple[float, float] | None = None,
     cmap_trim: float | None = None,
+    cmap_scheme: str | None = None,
 ) -> dict[str, Any]:
     """停留時數密度圖：對數色階（上限取 10 的整數次方、下限為上限的 1/10000）、HDR 50／75／90%、
     底圖與受體。色條與地圖軸同高。回傳繪圖紀錄（含色階越界統計與版面量測）。"""
@@ -4219,14 +4278,7 @@ def _plot_source_footprint_residence(
     # limits 明示時（WP-70）：上下限固定、高於上限者以最深色顯示（clip）；None＝沿用自動規則（位元不變）。
     vmin, vmax_used = limits if limits is not None else _residence_color_limits(vmax)
     masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
-    base_cmap = plt.get_cmap(_RESIDENCE_CMAP)
-    if cmap_trim:
-        from matplotlib.colors import LinearSegmentedColormap
-
-        # 只取配色的 [trim, 1] 區段（裁掉最淺的一段），仍取 256 級
-        base_cmap = LinearSegmentedColormap.from_list(
-            f"{_RESIDENCE_CMAP}_trim{cmap_trim:g}", base_cmap(np.linspace(cmap_trim, 1.0, 256)), N=256
-        )
+    base_cmap = _residence_colormap(cmap_trim, cmap_scheme, vmin, vmax_used)
     cmap = base_cmap.with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
     mesh_x, mesh_y, mesh_c = _mesh_arrays(fp, masked)
     mesh = ax.pcolormesh(
@@ -4304,6 +4356,8 @@ def _plot_source_footprint_residence(
         record["above_upper_limit_drawn_as"] = "deepest_color"
     if cmap_trim:
         record["colormap_trim_lower_fraction"] = float(cmap_trim)
+    if cmap_scheme:
+        record["colormap_scheme"] = cmap_scheme
     return record
 
 
@@ -4693,6 +4747,7 @@ def _footprint_caption_zh(
     isobath_requested: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
     colorbar_range: tuple[float, float] | None = None,
     colormap_trim: float | None = None,
+    colormap_scheme: str | None = None,
 ) -> str:
     """WP-38 三種新圖的圖說。全部用直述句，不出現程式識別字與檔名。"""
 
@@ -4788,6 +4843,16 @@ def _footprint_caption_zh(
                 f"配色（{_RESIDENCE_CMAP}）只取自 {colormap_trim * 100:g}% 起至最深色的區段"
                 "（裁掉最淺的一段）。"
             )
+        if colormap_scheme and stem == "source_footprint_residence":
+            if colormap_scheme == "nonuniform":
+                scale_rule_zh += (
+                    f"配色為以 {_RESIDENCE_CMAP} 為基底的非均勻連續配色：10^-3 對應最淺色、10^1 對應 "
+                    f"{_RESIDENCE_CMAP} 的 90% 處、10^2 對應 {_RESIDENCE_CMAP} 最深色，10^3 為近黑深藍。"
+                )
+            else:
+                scale_rule_zh += (
+                    f"色階分段：每個 10 的次方分 2 段，色序取自 {_RESIDENCE_CMAP} 全段均勻取色。"
+                )
         body = (
             "停留時數密度圖，呈現回溯過程中這一站全部粒子逐小時所在位置的累計分布。"
             "停留時數的定義：每顆粒子在回溯的每個整點時刻，只要仍在漂流（尚未穿越開放邊界、擱淺、沉底或因其他原因"
@@ -5080,6 +5145,7 @@ class _FootprintFigurePlan:
     isobath_levels_requested: tuple[float, ...] = ISOBATH_LEVELS_DEFAULT
     colorbar_range: tuple[float, float] | None = None
     colormap_trim: float | None = None
+    colormap_scheme: str | None = None
 
 
 def _isobath_levels_in_extent(
@@ -5137,6 +5203,7 @@ def _plan_footprint_figures(
         isobath_levels_requested=tuple(config.isobath_levels_m),
         colorbar_range=config.footprint_colorbar_range,
         colormap_trim=config.footprint_colormap_trim,
+        colormap_scheme=config.footprint_colormap_scheme,
     )
 
 
@@ -5169,6 +5236,7 @@ def _build_captions(inputs: NativeFiguresInputs, plan: _FootprintFigurePlan | No
                     isobath_requested=plan.isobath_levels_requested,
                     colorbar_range=plan.colorbar_range,
                     colormap_trim=plan.colormap_trim,
+                    colormap_scheme=plan.colormap_scheme,
                 )
     return captions
 
@@ -5546,6 +5614,7 @@ def _build_footprint_figures_manifest(
                         if plan.colormap_trim
                         else {}
                     ),
+                    **({"colormap_scheme": plan.colormap_scheme} if plan.colormap_scheme else {}),
                     **(
                         {
                             "range_source": "explicit_option",
@@ -5703,6 +5772,7 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
                         isobath_levels=config.isobath_levels_m,
                         limits=footprint_plan.colorbar_range,
                         cmap_trim=footprint_plan.colormap_trim,
+                        cmap_scheme=footprint_plan.colormap_scheme,
                     )
                 elif stem == "source_footprint_residence_site_scale":
                     record = _plot_source_footprint_residence(
@@ -5795,6 +5865,11 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
             **(
                 {"footprint_colormap_trim": config.footprint_colormap_trim}
                 if config.footprint_colormap_trim
+                else {}
+            ),
+            **(
+                {"footprint_colormap_scheme": config.footprint_colormap_scheme}
+                if config.footprint_colormap_scheme
                 else {}
             ),
             "receptor_config_basename": config.receptor_config_path.name

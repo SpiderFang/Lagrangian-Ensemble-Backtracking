@@ -4,6 +4,7 @@
 #         run_fp1km.sh figures   用 postprocess-fp1km/ 出圖：figures-fp1km/（full）、figures-fp1km-notext/（none）
 #         run_fp1km.sh figures_c3  同上，但色階固定 1e-3–1e1：figures-fp1km-c3/、figures-fp1km-c3-notext/
 #         run_fp1km.sh figures_sym3  對稱色階比較版：1e-3–1e3、配色裁切 0.15：figures-fp1km-sym3/、figures-fp1km-sym3-notext/
+#         run_fp1km.sh figures_b1|figures_b2  1e-3–1e3 改良配色（非均勻連續／12 段）：figures-fp1km-b1[-notext]/、figures-fp1km-b2[-notext]/
 #         run_fp1km.sh regress   回歸檢查：用既有的 postprocess/（0.02° 網格）以目前程式碼出 none 版圖，
 #                                輸出到 lbt-runs/scratch/wp70-regress/，供與 figures-notext-r3 逐位元比對
 #   後處理與出圖的指令、參數、環境變數逐項沿用 run_formal_v8.sh，只多 --footprint-grid-km 1.0。
@@ -87,6 +88,22 @@ case "$STEP" in
       "$LBT" native-figures --postprocess-dir "$PP" --coastline "$COAST" \
         --bathymetry "$ISO" --config "$CFG" --output-dir "$R/$NAME" --figure-text $MODE \
         --footprint-colorbar-range 1e-3 1e3 --footprint-colormap-trim 0.15 > "$R/logs/$LOGN" 2>&1 &
+    done
+    wait
+    log "出圖結束"
+    ;;
+  figures_b1|figures_b2)
+    # 對稱色階 10^-3–10^3 的改良配色比較版：b1＝非均勻連續配色、b2＝每個數量級 2 段的階梯色；供比較，不進報告
+    [ -d "$PP" ] || die "找不到 $PP，請先執行 post"
+    if [ "$STEP" = figures_b1 ]; then TAG=b1; SCHEME=nonuniform; else TAG=b2; SCHEME=steps; fi
+    for MODE in full none; do
+      NAME=figures-fp1km-$TAG; LOGN=figures-fp1km-$TAG.log
+      [ $MODE = none ] && { NAME=figures-fp1km-$TAG-notext; LOGN=figures-fp1km-$TAG-notext.log; }
+      [ -e "$R/$NAME" ] && die "$R/$NAME 已存在，為避免覆蓋而中止"
+      log "出圖（$MODE，色階 1e-3–1e3、配色 $SCHEME）→ $R/$NAME"
+      "$LBT" native-figures --postprocess-dir "$PP" --coastline "$COAST" \
+        --bathymetry "$ISO" --config "$CFG" --output-dir "$R/$NAME" --figure-text $MODE \
+        --footprint-colorbar-range 1e-3 1e3 --footprint-colormap-scheme $SCHEME > "$R/logs/$LOGN" 2>&1 &
     done
     wait
     log "出圖結束"
