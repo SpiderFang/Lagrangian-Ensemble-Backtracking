@@ -1954,6 +1954,29 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
         "--footprint-grid-deg", type=float, default=0.02, help="WP-38：停留時數網格解析度（度），預設 0.02"
     )
     parser.add_argument(
+        "--footprint-grid-km",
+        type=float,
+        default=None,
+        help=(
+            "WP-70：改用邊長此值（km）的規則公尺網格（流場區域局部等距方位平面，每格面積正好 km²），"
+            "取代經緯度網格；指定時 --footprint-grid-deg 與 --footprint-padding-deg 不使用。"
+            "未指定時行為與過去逐位元相同"
+        ),
+    )
+    parser.add_argument(
+        "--footprint-sensitivity-km",
+        type=float,
+        nargs="+",
+        default=[0.5, 2.0],
+        help="WP-70：公尺網格模式下網格敏感度的其他格寬（km，不含主網格），預設 0.5 2.0",
+    )
+    parser.add_argument(
+        "--footprint-padding-km",
+        type=float,
+        default=5.0,
+        help="WP-70：公尺網格範圍在 flow domain 外框之外的外擴量（km），預設 5.0",
+    )
+    parser.add_argument(
         "--footprint-padding-deg",
         type=float,
         default=0.05,
@@ -2149,6 +2172,15 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
             arc_bin_km=args.footprint_arc_bin_km,
             snapshot_smoothing_km=args.footprint_snapshot_smoothing_km,
             snapshot_minimum_particle_count=args.footprint_snapshot_min_particles,
+            **(
+                {
+                    "grid_cell_km": args.footprint_grid_km,
+                    "sensitivity_cells_km": tuple(args.footprint_sensitivity_km),
+                    "padding_km": args.footprint_padding_km,
+                }
+                if args.footprint_grid_km is not None
+                else {}
+            ),
         )
         if args.footprint_land_geojson is None:
             raise ValueError("--with-footprint 必須提供 --footprint-land-geojson（回溯快照的海域遮罩）")

@@ -3272,6 +3272,57 @@ class FootprintSiteFigureData:
     receptor_source: str = "postprocess_release_point_mean"
     release_points: np.ndarray | None = None
     """全部相異釋放點（受體水平位置）的經緯度，形狀 ``(n, 2)``；來自後處理的足跡幾何表。"""
+    grid_corners_lonlat: np.ndarray | None = None
+    """WP-70：公尺網格的格角經緯度，形狀 ``(ny + 1, nx + 1, 2)``（經度、緯度）；經緯度網格為 ``None``。"""
+
+    @property
+    def is_meter_grid(self) -> bool:
+        """WP-70：網格是否為規則公尺網格（``footprint_grid_by_site`` 有 ``cell_m``）。"""
+
+        return self.grid.get("cell_m") is not None
+
+    @property
+    def cell_km(self) -> float | None:
+        return float(self.grid["cell_m"]) / 1000.0 if self.is_meter_grid else None
+
+    def mesh_edges(self) -> tuple[np.ndarray, np.ndarray]:
+        """``pcolormesh`` 用的格角座標：經緯度網格為一維邊界，公尺網格為二維格角經緯度。"""
+
+        if self.grid_corners_lonlat is not None:
+            return self.grid_corners_lonlat[..., 0], self.grid_corners_lonlat[..., 1]
+        return self.lon_edges, self.lat_edges
+
+    def center_coords(self) -> tuple[np.ndarray, np.ndarray]:
+        """``contour`` 用的格心經緯度：經緯度網格為一維，公尺網格為二維（四個格角的平均）。"""
+
+        if self.grid_corners_lonlat is not None:
+            c = self.grid_corners_lonlat
+            lon = 0.25 * (c[:-1, :-1, 0] + c[:-1, 1:, 0] + c[1:, :-1, 0] + c[1:, 1:, 0])
+            lat = 0.25 * (c[:-1, :-1, 1] + c[:-1, 1:, 1] + c[1:, :-1, 1] + c[1:, 1:, 1])
+            return lon, lat
+        return (
+            0.5 * (self.lon_edges[:-1] + self.lon_edges[1:]),
+            0.5 * (self.lat_edges[:-1] + self.lat_edges[1:]),
+        )
+
+    def cell_area_km2_rows(self) -> np.ndarray:
+        """每格面積（km²），形狀 ``(ny, 1)``，可與 ``(ny, nx)`` 的密度場相乘。"""
+
+        ny = int(self.grid["ny"])
+        if self.is_meter_grid:
+            return np.full((ny, 1), (float(self.grid["cell_m"]) / 1000.0) ** 2, dtype=np.float64)
+        res = float(self.grid["resolution_deg"])
+        lat_centers = float(self.grid["lat0_deg"]) + (np.arange(ny) + 0.5) * res
+        return cell_area_km2_by_row(lat_centers, res, res)[:, None]
+
+    def grid_text(self, t: Any) -> str:
+        """圖面副標與圖說用的網格描述。"""
+
+        if self.is_meter_grid:
+            km = float(self.grid["cell_m"]) / 1000.0
+            return t.t(f"網格 {km:g} km × {km:g} km", f"grid {km:g} km x {km:g} km")
+        resolution = float(self.grid["resolution_deg"])
+        return t.t(f"網格 {resolution:.2f}°", f"grid {resolution:.2f} deg")
 
     @property
     def receptor_lonlat(self) -> tuple[float, float] | None:
@@ -3315,6 +3366,11 @@ def _load_footprint_figure_inputs(
         tables[stem] = pq.read_table(path)
         paths[path.name] = path
 
+    corner_path = postprocess_dir / "footprint_grid_corners_by_site.parquet"
+    if corner_path.is_file():
+        tables["footprint_grid_corners_by_site"] = pq.read_table(corner_path)
+        paths[corner_path.name] = corner_path
+
     result: dict[str, FootprintSiteFigureData] = {}
     for site_id in site_ids:
         grid_rows = _rows_for_site(tables["footprint_grid_by_site"], site_id)
@@ -3322,6 +3378,20 @@ def _load_footprint_figure_inputs(
             raise FiguresError(f"footprint_grid_by_site 對站 {site_id} 應恰有一列，實際 {len(grid_rows)} 列")
         grid = grid_rows[0]
         nx, ny = int(grid["nx"]), int(grid["ny"])
+        grid_corners: np.ndarray | None = None
+        if grid.get("cell_m") is not None:
+            if "footprint_grid_corners_by_site" not in tables:
+                raise FiguresError("公尺網格的後處理目錄缺少 footprint_grid_corners_by_site.parquet")
+            corner_table = _filter_site(tables["footprint_grid_corners_by_site"], site_id)
+            cix = corner_table.column("corner_ix").to_numpy()
+            ciy = corner_table.column("corner_iy").to_numpy()
+            if cix.size != (nx + 1) * (ny + 1):
+                raise FiguresError(f"footprint_grid_corners_by_site 對站 {site_id} 的格角數與網格大小不符")
+            grid_corners = np.full((ny + 1, nx + 1, 2), np.nan, dtype=np.float64)
+            grid_corners[ciy, cix, 0] = corner_table.column("lon_deg").to_numpy()
+            grid_corners[ciy, cix, 1] = corner_table.column("lat_deg").to_numpy()
+            if not np.all(np.isfinite(grid_corners)):
+                raise FiguresError(f"footprint_grid_corners_by_site 對站 {site_id} 的格角經緯度含非有限值")
 
         residence = [
             r
@@ -3438,6 +3508,7 @@ def _load_footprint_figure_inputs(
             receptor_center=receptor_center,
             summary=summary_rows[0],
             release_points=release_points,
+            grid_corners_lonlat=grid_corners,
         )
     return result, paths
 
@@ -3941,9 +4012,7 @@ def _limit_stats(
     色階不做視覺裁切（低於下限者透明、高於上限者本應為 0），越界情形只記錄在這裡。
     """
 
-    res = float(fp.grid["resolution_deg"])
-    lat_centers = float(fp.grid["lat0_deg"]) + (np.arange(int(fp.grid["ny"])) + 0.5) * res
-    area = cell_area_km2_by_row(lat_centers, res, res)[:, None]
+    area = fp.cell_area_km2_rows()
     mass = np.where(np.isfinite(density), density, 0.0) * area
     total = float(mass.sum())
     positive = density > 0
@@ -4071,6 +4140,24 @@ def _draw_hdr_contours(
             contour.set_clip_path(clip_patch)
 
 
+def _mesh_arrays(
+    fp: FootprintSiteFigureData, masked: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``pcolormesh`` 的 ``(X, Y, C)``。經緯度網格原樣回傳；公尺網格把範圍裁到有著色格子的外包列行
+    （其餘格子全是透明，裁掉只減少繪製量，畫面不變）。"""
+
+    x, y = fp.mesh_edges()
+    if not fp.is_meter_grid:
+        return x, y, masked
+    shown = ~np.ma.getmaskarray(masked)
+    if not shown.any():
+        return x, y, masked
+    rows = np.flatnonzero(shown.any(axis=1))
+    cols = np.flatnonzero(shown.any(axis=0))
+    r0, r1, c0, c1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+    return x[r0 : r1 + 1, c0 : c1 + 1], y[r0 : r1 + 1, c0 : c1 + 1], masked[r0:r1, c0:c1]
+
+
 def _plot_source_footprint_residence(
     site: SiteData,
     fp: FootprintSiteFigureData,
@@ -4106,10 +4193,11 @@ def _plot_source_footprint_residence(
     vmin, vmax_used = _residence_color_limits(vmax)
     masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
     cmap = plt.get_cmap(_RESIDENCE_CMAP).with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
+    mesh_x, mesh_y, mesh_c = _mesh_arrays(fp, masked)
     mesh = ax.pcolormesh(
-        fp.lon_edges,
-        fp.lat_edges,
-        masked,
+        mesh_x,
+        mesh_y,
+        mesh_c,
         cmap=cmap,
         norm=LogNorm(vmin=vmin, vmax=vmax_used),
         shading="flat",
@@ -4126,8 +4214,7 @@ def _plot_source_footprint_residence(
         label=t.t("停留時數密度（% 停留時數/km²）", "Residence density (% of particle-hours / km^2)"),
         font=font,
     )
-    lon_c = 0.5 * (fp.lon_edges[:-1] + fp.lon_edges[1:])
-    lat_c = 0.5 * (fp.lat_edges[:-1] + fp.lat_edges[1:])
+    lon_c, lat_c = fp.center_coords()
     _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
 
     ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
@@ -4148,7 +4235,6 @@ def _plot_source_footprint_residence(
         frameon=True,
     )
     total_hours = int(fp.grid["total_particle_hours"])
-    resolution = float(fp.grid["resolution_deg"])
     # 跨站共用色階為預設，副標不另標示；只有本站自訂色階版本才標明。
     scale_text = "" if scale_kind == "shared" else "｜" + t.t("本研究地點自訂色階", "per-site scale")
     _add_two_line_title(
@@ -4160,8 +4246,8 @@ def _plot_source_footprint_residence(
             site,
             t,
             extra=t.t(
-                f"\n總停留時數：{total_hours:,} 虛擬質點·h｜網格 {resolution:.2f}°{scale_text}",
-                f"\n{total_hours:,} particle-hours | grid {resolution:.2f} deg{scale_text}",
+                f"\n總停留時數：{total_hours:,} 虛擬質點·h｜{fp.grid_text(t)}{scale_text}",
+                f"\n{total_hours:,} particle-hours | {fp.grid_text(t)}{scale_text}",
             ),
         ),
         figure_text=figure_text,
@@ -4222,8 +4308,7 @@ def _plot_lookback_snapshot(
     drawn_levels: list[float] = []
     panel_stats: list[dict[str, Any]] = []
     levels = sorted(fp.hdr_threshold_pct_per_km2) or [0.5, 0.75, 0.9]
-    lon_c = 0.5 * (fp.lon_edges[:-1] + fp.lon_edges[1:])
-    lat_c = 0.5 * (fp.lat_edges[:-1] + fp.lat_edges[1:])
+    lon_c, lat_c = fp.center_coords()
 
     for ax, snap, density in zip(flat_axes, snapshots, densities, strict=False):
         masks: list[np.ndarray] = []
@@ -4248,10 +4333,11 @@ def _plot_lookback_snapshot(
         )
         if density is not None:
             masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
+            mesh_x, mesh_y, mesh_c = _mesh_arrays(fp, masked)
             mesh = ax.pcolormesh(
-                fp.lon_edges,
-                fp.lat_edges,
-                masked,
+                mesh_x,
+                mesh_y,
+                mesh_c,
                 cmap=cmap,
                 norm=LogNorm(vmin=vmin, vmax=vmax),
                 shading="flat",
@@ -4583,8 +4669,20 @@ def _footprint_caption_zh(
     if footprint_manifest is not None:
         arrival_included = bool(footprint_manifest.get("arrival_sample_included", True))
     arrival_zh = "回溯起點（到達時刻）的位置計入" if arrival_included else "回溯起點（到達時刻）的位置不計入"
-    res = float(fp.grid["resolution_deg"])
-    km = res * 111.19
+    if fp.is_meter_grid:
+        cell_km = float(fp.cell_km)
+        grid_zh = (
+            f"網格為各流場區域局部平面（以區域中心為原點的等距方位投影）上的規則公尺網格，"
+            f"每格邊長 {cell_km:g} km、面積 {cell_km**2:g} km²，各格面積相同。"
+        )
+        grid_short_zh = f"{cell_km:g} km × {cell_km:g} km"
+    else:
+        res = float(fp.grid["resolution_deg"])
+        km = res * 111.19
+        grid_zh = (
+            f"網格為經緯度規則網格，解析度 {res:.2f}°（約 {km:.1f} km），面積依緯度以 cos φ 計算。"
+        )
+        grid_short_zh = f"{res:.2f}°"
     circle_radius_km = (
         fp.sampling_radius_m
         if fp.sampling_radius_m is not None
@@ -4634,7 +4732,7 @@ def _footprint_caption_zh(
             f"終止），就在它所在的網格記 1 個粒子小時；{arrival_zh}；粒子終止之後凍結的位置不再計入。"
             "各網格的粒子小時數除以本站粒子小時總數，再除以網格面積（km²），單位為「% 停留時數／km²」，"
             "全部網格對面積積分為 100%。"
-            f"網格為經緯度規則網格，解析度 {res:.2f}°（約 {km:.1f} km），面積依緯度以 cos φ 計算。"
+            f"{grid_zh}"
             f"色階為對數色階，上限為最大值向上取整到 10 的整數次方（{_pow10_text(hi_c)}），"
             f"下限為上限的 1/10000（{_pow10_text(lo_c)}），每個 10 的次方標一個刻度，色條與地圖同高；"
             f"低於下限的網格不著色（其數量與所占停留時數比例記錄在 manifest）{scale_tail}"
@@ -4649,11 +4747,11 @@ def _footprint_caption_zh(
         sigma = float(fp.snapshots[0]["smoothing_sigma_km"]) if fp.snapshots else 0.0
         min_n = int(fp.snapshots[0]["minimum_active_particle_count"]) if fp.snapshots else 0
         smooth_zh = (
-            f"密度先累加到與停留時數密度相同的 {res:.2f}° 網格，再以寬度 {sigma:g} km 的高斯核做輕度平滑；"
+            f"密度先累加到與停留時數密度相同的 {grid_short_zh} 網格，再以寬度 {sigma:g} km 的高斯核做輕度平滑；"
             "平滑只在海域內進行（分子分母都乘上海域遮罩，陸地與流場範圍外的格不參與也不會得到密度），"
             "平滑後總質量重新正規化為 1。"
             if sigma > 0
-            else f"密度直接累加到與停留時數密度相同的 {res:.2f}° 網格，不做平滑。"
+            else f"密度直接累加到與停留時數密度相同的 {grid_short_zh} 網格，不做平滑。"
         )
         lo_s, hi_s = _snapshot_color_limits(fp)
         body = (

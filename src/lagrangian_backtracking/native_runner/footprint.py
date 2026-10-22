@@ -55,6 +55,18 @@
 - 雜訊底：（a）把成員隨機分成大小相同的兩半，重複多次；（b）把到達單元隨機分成
   大小相同的兩半，重複多次。兩者的 TVD 平均與第 95 百分位數，作為分半 TVD 的參照值。
 - 網格敏感度：0.01°／0.02°／0.04° 三種解析度的 HDR50 與 HDR90 面積。
+
+公尺網格（WP-70）
+-----------------
+``FootprintConfig.grid_cell_km`` 不為 ``None`` 時，改用「流場區域局部等距方位座標」下的 km 級規則公尺
+網格取代經緯度網格。粒子軌跡座標 ``(x, y)`` 本來就是各流場區域以區域中心為投影中心的等距方位
+（AEQD）平面座標（公尺），網格直接切在這個平面上：格線落在 ``x``、``y`` 為格寬整數倍之處（原點
+＝投影中心＝流場區域中心，是一個格角），每格在該平面上是邊長 ``grid_cell_km`` 的正方形，面積正好
+``grid_cell_km`` 平方公里，不依緯度而變，也不需要查表（粒子座標直接取整數索引）。網格涵蓋流場區域外框
+加 ``padding_km``，邊緣對齊最大格寬的整數倍，所以敏感度網格（預設 0.5 與 2 km）與主網格巢狀對齊。
+密度、正規化、HDR、回溯快照、海域遮罩的定義與經緯度網格版本相同，只是面積恆為常數；格心與格角的經緯度
+由區域投影反轉換得到，寫進表格供繪圖與水深查詢使用。未指定 ``grid_cell_km`` 時，所有行為與輸出與本
+修改之前位元相同。
 """
 
 from __future__ import annotations
@@ -79,6 +91,7 @@ __all__ = [
     "FootprintConfig",
     "FootprintSiteSpec",
     "FootprintGrid",
+    "FootprintMeterGrid",
     "FootprintProducts",
     "FootprintAccumulator",
     "EARTH_RADIUS_KM",
@@ -95,6 +108,9 @@ EARTH_RADIUS_KM = 6371.0088
 
 NORMALIZED_SUM_TOLERANCE = 1.0e-9
 """正規化停留場總和與 1 的容許誤差；超過即 fail-closed。"""
+
+METER_GRID_KIND = "regular_meter_local_aeqd"
+"""WP-70：公尺網格在 ``footprint_grid_by_site`` 與 manifest 的種類識別。"""
 
 GROUP_ALL = "all"
 GROUP_SETTLING_VELOCITY = "settling_velocity"
@@ -134,8 +150,23 @@ class FootprintConfig:
     noise_floor_seed: int = 20260929
     depth_threshold_m: float = 200.0
     count_arrival_sample: bool = True
+    grid_cell_km: float | None = None
+    """WP-70：不為 ``None`` 時改用邊長此值（km）的規則公尺網格，``grid_resolution_deg`` 與
+    ``sensitivity_resolutions_deg`` 在公尺網格模式下不使用。"""
+    sensitivity_cells_km: tuple[float, ...] = (0.5, 2.0)
+    """WP-70：公尺網格模式的敏感度格寬（km，不含主網格）。"""
+    padding_km: float = 5.0
+    """WP-70：公尺網格涵蓋範圍＝流場區域外框外推的距離（km）。"""
 
     def __post_init__(self) -> None:
+        if self.grid_cell_km is not None:
+            if not (0.0 < float(self.grid_cell_km) <= 100.0):
+                raise FootprintError("grid_cell_km 必須介於 0（不含）與 100 km 之間")
+            for cell in self.sensitivity_cells_km:
+                if not (0.0 < float(cell) <= 100.0):
+                    raise FootprintError("sensitivity_cells_km 每個值都必須介於 0（不含）與 100 km 之間")
+            if self.padding_km < 0.0:
+                raise FootprintError("padding_km 不可為負")
         if not (0.0 < self.grid_resolution_deg <= 1.0):
             raise FootprintError("grid_resolution_deg 必須介於 0 與 1 度之間")
         for res in self.sensitivity_resolutions_deg:
@@ -165,6 +196,15 @@ class FootprintConfig:
             raise FootprintError("noise_floor_repeats 必須為正整數")
 
     def to_manifest_dict(self) -> dict[str, Any]:
+        out = self._base_manifest_dict()
+        if self.grid_cell_km is not None:
+            # 公尺網格欄位只在啟用時才出現，預設模式的 manifest 與修改前完全相同。
+            out["grid_cell_km"] = float(self.grid_cell_km)
+            out["sensitivity_cells_km"] = [float(v) for v in self.sensitivity_cells_km]
+            out["padding_km"] = float(self.padding_km)
+        return out
+
+    def _base_manifest_dict(self) -> dict[str, Any]:
         return {
             "grid_resolution_deg": self.grid_resolution_deg,
             "sensitivity_resolutions_deg": list(self.sensitivity_resolutions_deg),
@@ -262,6 +302,128 @@ def make_grid(
     nx = max(1, int(math.ceil((lon_max - lon0) / resolution_deg - 1e-9)))
     ny = max(1, int(math.ceil((lat_max - lat0) / resolution_deg - 1e-9)))
     return FootprintGrid(lon0=lon0, lat0=lat0, resolution_deg=resolution_deg, nx=nx, ny=ny)
+
+
+class FootprintMeterGrid:
+    """WP-70：流場區域局部等距方位平面上的規則公尺網格。
+
+    ``x0_m``／``y0_m`` 是西南角（公尺，區域投影平面座標），格寬 ``cell_m`` 公尺，格 ``(ix, iy)`` 涵蓋
+    ``[x0 + ix·cell, x0 + (ix+1)·cell) × [y0 + iy·cell, y0 + (iy+1)·cell)``。每格面積是常數
+    ``(cell_m/1000)²`` km²。經緯度只用於輸出與繪圖：``project`` 是把平面公尺轉成 ``(lon, lat)`` 的函式
+    （該區域投影的反轉換），格心與格角的經緯度第一次用到時才計算並快取。
+    """
+
+    kind = "meter"
+
+    def __init__(
+        self,
+        *,
+        x0_m: float,
+        y0_m: float,
+        cell_m: float,
+        nx: int,
+        ny: int,
+        project: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]],
+    ) -> None:
+        self.x0_m = float(x0_m)
+        self.y0_m = float(y0_m)
+        self.cell_m = float(cell_m)
+        self.nx = int(nx)
+        self.ny = int(ny)
+        self._project = project
+        self._centers_lonlat: tuple[np.ndarray, np.ndarray] | None = None
+        self._corners_lonlat: tuple[np.ndarray, np.ndarray] | None = None
+
+    @property
+    def cell_count(self) -> int:
+        return self.nx * self.ny
+
+    @property
+    def cell_km(self) -> float:
+        return self.cell_m / 1000.0
+
+    def flat_index_xy(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """平面公尺座標到網格編號（``iy * nx + ix``，int32）；網格外為 ``-1``。"""
+
+        fx = np.floor((np.asarray(x, dtype=np.float64) - self.x0_m) / self.cell_m)
+        fy = np.floor((np.asarray(y, dtype=np.float64) - self.y0_m) / self.cell_m)
+        ok = (fx >= 0) & (fx < self.nx) & (fy >= 0) & (fy < self.ny)
+        flat = np.where(ok, fy * self.nx + fx, -1.0)
+        return flat.astype(np.int32)
+
+    def cell_area_km2(self) -> np.ndarray:
+        """攤平成 ``iy * nx + ix`` 順序的每格面積（km²，全部相同）。"""
+
+        return np.full(self.cell_count, self.cell_km**2, dtype=np.float64)
+
+    def centers_xy(self) -> tuple[np.ndarray, np.ndarray]:
+        """攤平成 ``iy * nx + ix`` 順序的格心平面座標（m）。"""
+
+        xs = self.x0_m + (np.arange(self.nx) + 0.5) * self.cell_m
+        ys = self.y0_m + (np.arange(self.ny) + 0.5) * self.cell_m
+        return np.tile(xs, self.ny), np.repeat(ys, self.nx)
+
+    def corners_xy(self) -> tuple[np.ndarray, np.ndarray]:
+        """格角平面座標（m），形狀 ``(ny + 1, nx + 1)``。"""
+
+        xs = self.x0_m + np.arange(self.nx + 1) * self.cell_m
+        ys = self.y0_m + np.arange(self.ny + 1) * self.cell_m
+        xx, yy = np.meshgrid(xs, ys)
+        return xx, yy
+
+    def cell_centers_lonlat(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._centers_lonlat is None:
+            xc, yc = self.centers_xy()
+            lon, lat = self._project(xc, yc)
+            self._centers_lonlat = (np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64))
+        return self._centers_lonlat
+
+    def corners_lonlat(self) -> tuple[np.ndarray, np.ndarray]:
+        """格角經緯度，形狀 ``(ny + 1, nx + 1)``。"""
+
+        if self._corners_lonlat is None:
+            xx, yy = self.corners_xy()
+            lon, lat = self._project(xx.ravel(), yy.ravel())
+            self._corners_lonlat = (
+                np.asarray(lon, dtype=np.float64).reshape(xx.shape),
+                np.asarray(lat, dtype=np.float64).reshape(xx.shape),
+            )
+        return self._corners_lonlat
+
+    def cell_boxes_lonlat(self) -> Any:
+        """每格四個格角在經緯度上連成的多邊形（shapely 陣列，``iy * nx + ix`` 順序）。"""
+
+        lon, lat = self.corners_lonlat()
+        ring = np.stack(
+            [
+                np.stack([lon[:-1, :-1].ravel(), lat[:-1, :-1].ravel()], axis=-1),
+                np.stack([lon[:-1, 1:].ravel(), lat[:-1, 1:].ravel()], axis=-1),
+                np.stack([lon[1:, 1:].ravel(), lat[1:, 1:].ravel()], axis=-1),
+                np.stack([lon[1:, :-1].ravel(), lat[1:, :-1].ravel()], axis=-1),
+                np.stack([lon[:-1, :-1].ravel(), lat[:-1, :-1].ravel()], axis=-1),
+            ],
+            axis=1,
+        )
+        return shapely.polygons(ring)
+
+
+def make_meter_grid(
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    *,
+    cell_m: float,
+    align_m: float,
+    project: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]],
+) -> FootprintMeterGrid:
+    """建立涵蓋指定平面範圍的公尺網格，西南角對齊 ``align_m`` 的整數倍（巢狀對齊）。"""
+
+    x0 = round(math.floor(x_min / align_m + 1e-9) * align_m, 6)
+    y0 = round(math.floor(y_min / align_m + 1e-9) * align_m, 6)
+    nx = max(1, int(math.ceil((x_max - x0) / cell_m - 1e-9)))
+    ny = max(1, int(math.ceil((y_max - y0) / cell_m - 1e-9)))
+    return FootprintMeterGrid(x0_m=x0, y0_m=y0, cell_m=cell_m, nx=nx, ny=ny, project=project)
 
 
 # ── 純函式：HDR、TVD、大圓距離 ───────────────────────────────────────────
@@ -396,6 +558,12 @@ def _fmt_res(res: float) -> str:
     return f"{res:.2f}".replace(".", "p")
 
 
+def _fmt_km(cell_km: float) -> str:
+    """公尺網格敏感度欄位名稱用的格寬字串，例如 0.5 km -> ``0p50km``。"""
+
+    return f"{cell_km:.2f}".replace(".", "p") + "km"
+
+
 # ── 每站狀態 ─────────────────────────────────────────────────────────────
 
 
@@ -425,9 +593,9 @@ class _Lut:
 class _SiteState:
     site_id: str
     spec: FootprintSiteSpec
-    grid: FootprintGrid
-    sens_grids: dict[float, FootprintGrid]
-    lut: _Lut
+    grid: FootprintGrid | FootprintMeterGrid
+    sens_grids: dict[float, Any]
+    lut: _Lut | None
     velocities: np.ndarray
     members: np.ndarray
     unit_count: int
@@ -517,22 +685,47 @@ class FootprintAccumulator:
             unit_count = int(unit_inverse.max()) + 1
 
             bounds = self._domain_lonlat_bounds(site, spec)
-            pad = config.padding_deg
-            lon_min, lon_max, lat_min, lat_max = bounds
-            grids = {
-                res: make_grid(
-                    lon_min - pad,
-                    lon_max + pad,
-                    lat_min - pad,
-                    lat_max + pad,
-                    resolution_deg=res,
-                    align_deg=align,
+            if config.grid_cell_km is not None:
+                # WP-70：公尺網格。粒子的平面座標直接取整數索引，不需要查表。
+                cells_km = sorted(
+                    {float(config.grid_cell_km), *(float(c) for c in config.sensitivity_cells_km)}
                 )
-                for res in resolutions
-            }
-            grid = grids[config.grid_resolution_deg]
-            lut = self._build_lut(site, spec, grids, bounds)
-            sens = {res: grids[res] for res in resolutions if res != config.grid_resolution_deg}
+                x_min, y_min, x_max, y_max = spec.flow_domain.bounds
+                pad_m = config.padding_km * 1000.0
+                align_m = max(cells_km) * 1000.0
+                project = self._site_project(site)
+                mgrids = {
+                    c: make_meter_grid(
+                        x_min - pad_m,
+                        x_max + pad_m,
+                        y_min - pad_m,
+                        y_max + pad_m,
+                        cell_m=c * 1000.0,
+                        align_m=align_m,
+                        project=project,
+                    )
+                    for c in cells_km
+                }
+                grid = mgrids[float(config.grid_cell_km)]
+                lut = None
+                sens = {c: mgrids[c] for c in cells_km if c != float(config.grid_cell_km)}
+            else:
+                pad = config.padding_deg
+                lon_min, lon_max, lat_min, lat_max = bounds
+                grids = {
+                    res: make_grid(
+                        lon_min - pad,
+                        lon_max + pad,
+                        lat_min - pad,
+                        lat_max + pad,
+                        resolution_deg=res,
+                        align_deg=align,
+                    )
+                    for res in resolutions
+                }
+                grid = grids[config.grid_resolution_deg]
+                lut = self._build_lut(site, spec, grids, bounds)
+                sens = {res: grids[res] for res in resolutions if res != config.grid_resolution_deg}
             self._states[site] = _SiteState(
                 site_id=site,
                 spec=spec,
@@ -555,6 +748,16 @@ class FootprintAccumulator:
             )
 
     # -- 建構輔助 ---------------------------------------------------------
+
+    def _site_project(self, site: str) -> Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+        """該站的「平面公尺 → (lon, lat)」函式（包住 ``lonlat_projector``）。"""
+
+        def project(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            x = np.asarray(x, dtype=np.float64)
+            y = np.asarray(y, dtype=np.float64)
+            return self._projector(np.full(x.shape, site), x, y)
+
+        return project
 
     def _domain_lonlat_bounds(self, site: str, spec: FootprintSiteSpec) -> tuple[float, float, float, float]:
         coords = np.asarray(shapely.get_coordinates(spec.flow_domain.boundary), dtype=np.float64)
@@ -632,8 +835,11 @@ class FootprintAccumulator:
             y = ty[t_idx, c_idx]
             if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
                 raise FootprintError(f"{state.site_id}：status==0 的樣本含非有限座標")
-            primary = state.grid.resolution_deg
-            cell, in_lut = state.lut.lookup(x, y, primary)
+            if state.lut is None:
+                cell = state.grid.flat_index_xy(x, y).astype(np.int64)
+                in_lut = np.ones(cell.shape, dtype=bool)
+            else:
+                cell, in_lut = state.lut.lookup(x, y, state.grid.resolution_deg)
             state.hours_outside_lut += int(np.count_nonzero(~in_lut))
             in_grid = cell >= 0
             state.hours_outside_grid += int(np.count_nonzero(in_lut & ~in_grid))
@@ -644,7 +850,10 @@ class FootprintAccumulator:
             state.hours_vm += np.bincount(slot_pts * ncell + cell_ok, minlength=state.hours_vm.size)
             state.hours_unit += np.bincount(unit_pts * ncell + cell_ok, minlength=state.hours_unit.size)
             for res, hours in state.sens_hours.items():
-                cell_r, _ = state.lut.lookup(x, y, res)
+                if state.lut is None:
+                    cell_r = state.sens_grids[res].flat_index_xy(x, y)
+                else:
+                    cell_r, _ = state.lut.lookup(x, y, res)
                 cell_r = cell_r[cell_r >= 0]
                 hours += np.bincount(cell_r, minlength=hours.size)
 
@@ -658,7 +867,10 @@ class FootprintAccumulator:
                 xs, ys = tx[h][sel], ty[h][sel]
                 if not (np.all(np.isfinite(xs)) and np.all(np.isfinite(ys))):
                     raise FootprintError(f"{state.site_id}：快照 {h} 小時 status==0 的樣本含非有限座標")
-                snap_cell, _ = state.lut.lookup(xs, ys, state.grid.resolution_deg)
+                if state.lut is None:
+                    snap_cell = state.grid.flat_index_xy(xs, ys).astype(np.int64)
+                else:
+                    snap_cell, _ = state.lut.lookup(xs, ys, state.grid.resolution_deg)
                 inside = snap_cell >= 0
                 state.snapshot_hist[h] += np.bincount(snap_cell[inside], minlength=state.grid.cell_count)
                 state.snapshot_outside[h] += int(np.count_nonzero(~inside))
@@ -690,6 +902,7 @@ class FootprintAccumulator:
             "residence_half": [],
             "hdr": [],
             "grid": [],
+            "grid_corners": [],
             "arc": [],
             "edge": [],
             "geometry": [],
@@ -730,6 +943,8 @@ class FootprintAccumulator:
             "boundary_edge_intervals_by_site": _edge_table(tables_rows["edge"]),
             "footprint_geometry_by_site": _geometry_table(tables_rows["geometry"]),
         }
+        if cfg.grid_cell_km is not None:
+            tables["footprint_grid_corners_by_site"] = _grid_corners_table(tables_rows["grid_corners"])
         manifest = {
             "definition_zh": (
                 "停留時數＝逐小時、仍在漂流（status==0）的粒子樣本數；終止後凍結的位置不計入；"
@@ -756,6 +971,12 @@ class FootprintAccumulator:
                 "missing_sites": sorted(set(self._site_names) - set(self._bathymetry)),
             },
         }
+        if cfg.grid_cell_km is not None:
+            manifest["grid_definition_zh"] = (
+                f"網格＝流場區域局部等距方位（AEQD）平面上邊長 {cfg.grid_cell_km:g} km 的正方形規則網格，"
+                f"格線落在平面座標 x、y 為 {cfg.grid_cell_km:g} km 整數倍之處（原點為投影中心），"
+                f"每格面積正好 {cfg.grid_cell_km**2:g} km²；格心與格角的經緯度由區域投影反轉換得到。"
+            )
         return FootprintProducts(tables=tables, summary_rows=summary_rows, manifest=manifest)
 
     # -- 單站收尾 ---------------------------------------------------------
@@ -912,16 +1133,19 @@ class FootprintAccumulator:
 
         # 網格敏感度。
         sens_hdr: dict[float, dict[float, float | None]] = {}
+        is_meter = isinstance(grid, FootprintMeterGrid)
+        primary_key = grid.cell_km if is_meter else grid.resolution_deg
         all_grids = {
-            grid.resolution_deg: (grid, hours_all),
+            primary_key: (grid, hours_all),
             **{r: (g, state.sens_hours[r]) for r, g in state.sens_grids.items()},
         }
         for res, (g, hrs) in sorted(all_grids.items()):
             g_area = g.cell_area_km2()
             sens_hdr[res] = {lv: _hdr_area(hrs, g_area, lv) for lv in (0.5, 0.9)}
-            if int(hrs.sum()) != total_hours and res != grid.resolution_deg:
+            if int(hrs.sum()) != total_hours and res != primary_key:
+                unit_text = f"{res:g} km" if is_meter else f"{res}°"
                 warnings.append(
-                    f"{site}：{res}° 網格的總停留時數 {int(hrs.sum())} 與主網格 {total_hours} 不同"
+                    f"{site}：{unit_text} 網格的總停留時數 {int(hrs.sum())} 與主網格 {total_hours} 不同"
                     "（部分停留時數落在該解析度網格外）"
                 )
 
@@ -934,24 +1158,56 @@ class FootprintAccumulator:
         # 幾何：flow domain、受體。
         self._emit_geometry(state, rows_out["geometry"], receptor_lonlat, receptor_xy)
 
-        rows_out["grid"].append(
-            {
-                "study_site_id": site,
-                "resolution_deg": grid.resolution_deg,
-                "lon0_deg": grid.lon0,
-                "lat0_deg": grid.lat0,
-                "nx": grid.nx,
-                "ny": grid.ny,
-                "domain_lon_min_deg": state.domain_lonlat_bounds[0],
-                "domain_lon_max_deg": state.domain_lonlat_bounds[1],
-                "domain_lat_min_deg": state.domain_lonlat_bounds[2],
-                "domain_lat_max_deg": state.domain_lonlat_bounds[3],
-                "total_particle_hours": total_hours,
-                "hours_outside_grid": state.hours_outside_grid,
-                "hours_outside_lookup": state.hours_outside_lut,
-                "lookup_cell_m": cfg.lut_cell_m,
-            }
-        )
+        if is_meter:
+            rows_out["grid"].append(
+                {
+                    "study_site_id": site,
+                    "grid_kind": METER_GRID_KIND,
+                    "cell_m": grid.cell_m,
+                    "x0_m": grid.x0_m,
+                    "y0_m": grid.y0_m,
+                    "nx": grid.nx,
+                    "ny": grid.ny,
+                    "domain_lon_min_deg": state.domain_lonlat_bounds[0],
+                    "domain_lon_max_deg": state.domain_lonlat_bounds[1],
+                    "domain_lat_min_deg": state.domain_lonlat_bounds[2],
+                    "domain_lat_max_deg": state.domain_lonlat_bounds[3],
+                    "total_particle_hours": total_hours,
+                    "hours_outside_grid": state.hours_outside_grid,
+                    "hours_outside_lookup": 0,
+                }
+            )
+            corner_lon, corner_lat = grid.corners_lonlat()
+            for iy in range(grid.ny + 1):
+                for ix in range(grid.nx + 1):
+                    rows_out["grid_corners"].append(
+                        {
+                            "study_site_id": site,
+                            "corner_ix": ix,
+                            "corner_iy": iy,
+                            "lon_deg": float(corner_lon[iy, ix]),
+                            "lat_deg": float(corner_lat[iy, ix]),
+                        }
+                    )
+        else:
+            rows_out["grid"].append(
+                {
+                    "study_site_id": site,
+                    "resolution_deg": grid.resolution_deg,
+                    "lon0_deg": grid.lon0,
+                    "lat0_deg": grid.lat0,
+                    "nx": grid.nx,
+                    "ny": grid.ny,
+                    "domain_lon_min_deg": state.domain_lonlat_bounds[0],
+                    "domain_lon_max_deg": state.domain_lonlat_bounds[1],
+                    "domain_lat_min_deg": state.domain_lonlat_bounds[2],
+                    "domain_lat_max_deg": state.domain_lonlat_bounds[3],
+                    "total_particle_hours": total_hours,
+                    "hours_outside_grid": state.hours_outside_grid,
+                    "hours_outside_lookup": state.hours_outside_lut,
+                    "lookup_cell_m": cfg.lut_cell_m,
+                }
+            )
         if state.hours_outside_grid or state.hours_outside_lut:
             warnings.append(
                 f"{site}：有 {state.hours_outside_grid + state.hours_outside_lut} 筆有效停留時數落在網格外，"
@@ -964,7 +1220,11 @@ class FootprintAccumulator:
             "ensemble_member_count": int(member_count) if member_count is not None else int(M),
             "total_particle_count": state.total_particles,
             "total_particle_hours": total_hours,
-            "grid_resolution_deg": grid.resolution_deg,
+            **(
+                {"grid_cell_km": grid.cell_km}
+                if is_meter
+                else {"grid_resolution_deg": grid.resolution_deg}
+            ),
             "hdr50_area_km2": hdr_area.get(0.5),
             "hdr75_area_km2": hdr_area.get(0.75),
             "hdr90_area_km2": hdr_area.get(0.9),
@@ -994,18 +1254,30 @@ class FootprintAccumulator:
             }
         )
         for res, values in sens_hdr.items():
-            tag = _fmt_res(res)
+            tag = _fmt_km(res) if is_meter else _fmt_res(res)
             summary[f"grid_sensitivity_hdr50_area_km2_{tag}"] = values[0.5]
             summary[f"grid_sensitivity_hdr90_area_km2_{tag}"] = values[0.9]
 
         manifest = {
-            "grid": {
-                "resolution_deg": grid.resolution_deg,
-                "lon0_deg": grid.lon0,
-                "lat0_deg": grid.lat0,
-                "nx": grid.nx,
-                "ny": grid.ny,
-            },
+            "grid": (
+                {
+                    "kind": METER_GRID_KIND,
+                    "cell_m": grid.cell_m,
+                    "x0_m": grid.x0_m,
+                    "y0_m": grid.y0_m,
+                    "nx": grid.nx,
+                    "ny": grid.ny,
+                    "cell_area_km2": grid.cell_km**2,
+                }
+                if is_meter
+                else {
+                    "resolution_deg": grid.resolution_deg,
+                    "lon0_deg": grid.lon0,
+                    "lat0_deg": grid.lat0,
+                    "nx": grid.nx,
+                    "ny": grid.ny,
+                }
+            ),
             "total_particle_hours": total_hours,
             "normalized_sum": norm_sum_all,
             "hours_outside_grid": state.hours_outside_grid,
@@ -1056,22 +1328,36 @@ class FootprintAccumulator:
         cfg = self._config
         grid = state.grid
         n = grid.cell_count
-        idx = np.arange(n)
-        ix, iy = idx % grid.nx, idx // grid.nx
-        res = grid.resolution_deg
-        boxes = shapely.box(
-            grid.lon0 + ix * res, grid.lat0 + iy * res, grid.lon0 + (ix + 1) * res, grid.lat0 + (iy + 1) * res
-        )
-        sea = self._domain_lonlat_polygon(state)
-        if self._land is not None:
+        if isinstance(grid, FootprintMeterGrid):
+            boxes = grid.cell_boxes_lonlat()
+            corner_lon, corner_lat = grid.corners_lonlat()
+            margin = 0.05
+            clip_rect = (
+                float(corner_lon.min()) - margin,
+                float(corner_lat.min()) - margin,
+                float(corner_lon.max()) + margin,
+                float(corner_lat.max()) + margin,
+            )
+        else:
+            idx = np.arange(n)
+            ix, iy = idx % grid.nx, idx // grid.nx
+            res = grid.resolution_deg
+            boxes = shapely.box(
+                grid.lon0 + ix * res,
+                grid.lat0 + iy * res,
+                grid.lon0 + (ix + 1) * res,
+                grid.lat0 + (iy + 1) * res,
+            )
             lon_min, lat_min = grid.lon0, grid.lat0
-            clip = shapely.clip_by_rect(
-                self._land,
+            clip_rect = (
                 lon_min - res,
                 lat_min - res,
                 lon_min + (grid.nx + 1) * res,
                 lat_min + (grid.ny + 1) * res,
             )
+        sea = self._domain_lonlat_polygon(state)
+        if self._land is not None:
+            clip = shapely.clip_by_rect(self._land, *clip_rect)
             if not clip.is_empty:
                 sea = shapely.difference(sea, clip)
         fraction = np.zeros(n, dtype=np.float64)
@@ -1129,10 +1415,13 @@ class FootprintAccumulator:
             )
 
         # 平滑核：公里 -> 格。緯度方向每格 res°×111.195 km，經度方向再乘 cos(平均緯度)。
-        dy_km = grid.resolution_deg * math.radians(1.0) * EARTH_RADIUS_KM
-        mean_lat = float(lat_c.mean())
-        dx_km = dy_km * math.cos(math.radians(mean_lat))
-        sigma_cells = (cfg.snapshot_smoothing_km / dy_km, cfg.snapshot_smoothing_km / dx_km)
+        if isinstance(grid, FootprintMeterGrid):
+            sigma_cells = (cfg.snapshot_smoothing_km / grid.cell_km, cfg.snapshot_smoothing_km / grid.cell_km)
+        else:
+            dy_km = grid.resolution_deg * math.radians(1.0) * EARTH_RADIUS_KM
+            mean_lat = float(lat_c.mean())
+            dx_km = dy_km * math.cos(math.radians(mean_lat))
+            sigma_cells = (cfg.snapshot_smoothing_km / dy_km, cfg.snapshot_smoothing_km / dx_km)
         sea_info = {
             **sea_info,
             "smoothing_sigma_km": cfg.snapshot_smoothing_km,
@@ -1499,6 +1788,19 @@ def _snapshot_density_table(rows: list[dict[str, Any]]) -> pa.Table:
             ("particle_count", pa.int64()),
             ("fraction_of_active", pa.float64()),
             ("density_fraction_per_km2", pa.float64()),
+        ],
+    )
+
+
+def _grid_corners_table(rows: list[dict[str, Any]]) -> pa.Table:
+    return _table_from_rows(
+        rows,
+        [
+            ("study_site_id", pa.string()),
+            ("corner_ix", pa.int32()),
+            ("corner_iy", pa.int32()),
+            ("lon_deg", pa.float64()),
+            ("lat_deg", pa.float64()),
         ],
     )
 
