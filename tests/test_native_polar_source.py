@@ -329,7 +329,7 @@ def test_figure_text_has_no_site_name_or_code(monkeypatch, synthetic, tmp_path, 
         assert all("比例" not in s for s in texts)
     else:
         assert any("來源方位的比例" in s for s in texts)
-        assert any("穿越開放邊界" in s and "海岸來源（未穿越者以最終位置方位計入）" in s for s in texts)
+        assert any("穿越開放邊界" in s and "海岸來源（抵達海岸者以抵達位置方位計入）" in s for s in texts)
         for banned in ("回溯達上限", "擱淺", "未計入"):
             assert banned not in joined
     assert "機率" not in joined

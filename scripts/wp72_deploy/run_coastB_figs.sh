@@ -33,7 +33,7 @@ case "$STEP" in
   polar)
     for d in figures-polar-v3-ax2-coastB figures-polar-v3-ax2-notext-coastB; do [ -e "$R/$d" ] && die "$R/$d 已存在"; done
     "$LBT" native-polar-source --case "$CASE" "$PP" "$R/figures-polar-v3-ax2-coastB" "$R/figures-polar-v3-ax2-notext-coastB" \
-      --release-config "$CFG" --coastline "$COAST" --bathymetry "$ISO" --dpi 600 --workers 20 --envelope-auto --modes none --report-layout --report-axes-style one_decimal \
+      --release-config "$CFG" --coastline "$COAST" --bathymetry "$ISO" --dpi 600 --workers 20 --modes none --report-layout --report-axes-style one_decimal \
       > "$R/logs/figures-polar-v3-ax2-coastB.log" 2>&1; log "polar 結束，離開碼 $?" ;;
   *) die "未知步驟 $STEP" ;;
 esac
