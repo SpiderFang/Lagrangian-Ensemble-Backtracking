@@ -183,6 +183,7 @@ from .backward_driver import (
     NATIVE_STATUS_STRANDED,
 )
 from .display_names import material_display_name_zh
+from . import map_axes as _map_axes
 from .footprint import cell_area_km2_by_row
 from .postprocess import (
     DEFAULT_AZIMUTH_SECTOR_COUNT,
@@ -390,6 +391,9 @@ class NativeFiguresConfig:
     # WP-70：停留時數密度圖（跨站共用版）配色方案 nonuniform／steps（見 RESIDENCE_COLORMAP_SCHEMES），
     # 須同時指定 footprint_colorbar_range，且不得與 footprint_colormap_trim 併用；None＝預設配色。
     footprint_colormap_scheme: str | None = None
+    # WP-71：座標軸統一（一位小數刻度、五地點跨度與間隔相同、上下限落在刻度上；見 map_axes 模組）。
+    # 目前只作用於條件式來源足跡圖（source_footprint_residence）；False＝沿用既有座標軸規則（圖面位元不變）。
+    axes_unified: bool = False
 
     def __post_init__(self) -> None:
         if self.footprint_colormap_scheme is not None:
@@ -1884,6 +1888,9 @@ def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
 _HO_V2_FIGSIZE = (9.48, 6.81)
 _HO_V2_AXES_BOX_IN = (0.10, 0.12, 9.79, 5.695)  # 左緣、上緣距離、寬、高
 _HO_V2_LEGEND_GAP_IN = 0.12
+_HO_V3_LEFT_IN = 1.0  # WP-71：v3 主圖框左緣（英寸），留給縱軸刻度標籤（如「25.2°N」）與座標軸標題
+_HO_V3_NEED_MARGIN_DEG = 0.04  # WP-71：軸範圍必須在流場範圍外框與軌跡之外多留的餘量（度），避免終止標記被框邊切掉
+_HO_V3_STEP_DEG = 0.2  # WP-71：水平軌跡總覽的刻度間隔（經緯向相同）
 
 
 def _save_exclusive(fig, path: Path, *, dpi: int, tight: bool = True) -> None:
@@ -1936,7 +1943,8 @@ def _plot_horizontal_overview(
     dpi: int,
     figure_text: str,
     layout: str = "legacy",
-) -> None:
+    axes_unified: tuple[_map_axes.AxisSpec, _map_axes.AxisWindow] | None = None,
+) -> dict[str, Any] | None:
     """代表粒子水平軌跡總覽（整個 flow domain 範圍，經緯度顯示）。
 
     ``layout="legacy"``（預設）維持原版版面：圖例固定在畫面下方、輸出時以
@@ -1945,6 +1953,9 @@ def _plot_horizontal_overview(
     字級全部沿用原版；圖例改為緊貼在主圖（含刻度標籤與座標軸標籤）正下方，並且以
     固定畫布尺寸（:data:`_HO_V2_FIGSIZE`）輸出、不做 tight 裁切，因此各站影像尺寸
     完全一致、四邊皆不裁切。``layout="v2"`` 只支援 ``figure_text="none"``。
+    ``layout="v3"``（WP-71，座標軸統一）：版面同 v2，但座標軸範圍、刻度、長寬比改用 ``axes_unified``
+    給定的共用規格與該地點窗口（一位小數刻度標籤、上下限在刻度上、五地點跨度與間隔相同、主圖框大小相同），
+    座標軸標題統一為「經度」「緯度」，且不畫格線（原版的白色格線拿掉，背景色保留）；回傳座標軸紀錄（供 manifest）。
     """
 
     import matplotlib
@@ -1952,11 +1963,13 @@ def _plot_horizontal_overview(
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    if layout not in ("legacy", "v2"):
-        raise FiguresError(f"horizontal_overview layout 必須是 legacy 或 v2，收到 {layout!r}")
-    if layout == "v2" and figure_text != "none":
-        raise FiguresError("horizontal_overview layout=v2 只支援 figure_text='none'")
-    fig, ax = plt.subplots(figsize=_HO_V2_FIGSIZE if layout == "v2" else (11, 8.5), dpi=150)
+    if layout not in ("legacy", "v2", "v3"):
+        raise FiguresError(f"horizontal_overview layout 必須是 legacy、v2 或 v3，收到 {layout!r}")
+    if layout in ("v2", "v3") and figure_text != "none":
+        raise FiguresError(f"horizontal_overview layout={layout} 只支援 figure_text='none'")
+    if (layout == "v3") != (axes_unified is not None):
+        raise FiguresError("horizontal_overview：layout=v3 必須且只能在 layout=v3 時提供 axes_unified")
+    fig, ax = plt.subplots(figsize=_HO_V2_FIGSIZE if layout in ("v2", "v3") else (11, 8.5), dpi=150)
     ax.set_facecolor("#eaf3f8")
     _land_lonlat_patches(land_geometries)(ax)
     boundary_lines = _resolve_dashed_open_boundary_lines(site)
@@ -2007,15 +2020,30 @@ def _plot_horizontal_overview(
     for lon, lat in boundary_lines.values():
         all_lon = np.concatenate([all_lon, lon])
         all_lat = np.concatenate([all_lat, lat])
-    lon_margin = max((all_lon.max() - all_lon.min()) * 0.08, 0.01)
-    lat_margin = max((all_lat.max() - all_lat.min()) * 0.08, 0.01)
-    ax.set_xlim(all_lon.min() - lon_margin, all_lon.max() + lon_margin)
-    ax.set_ylim(all_lat.min() - lat_margin, all_lat.max() + lat_margin)
-    center_lat = float(np.mean(all_lat))
-    ax.set_aspect(1.0 / math.cos(math.radians(center_lat)), adjustable="box")
-    ax.set_xlabel(t.t("經度（°E）", "Longitude (deg E)"), fontproperties=font)
-    ax.set_ylabel(t.t("緯度（°N）", "Latitude (deg N)"), fontproperties=font)
-    ax.grid(color="white", linewidth=0.7, alpha=0.8)
+    if layout == "v3":
+        from matplotlib.ticker import FuncFormatter
+
+        spec, window = axes_unified
+        ax.set_xlim(window.lon_lo, window.lon_hi)
+        ax.set_ylim(window.lat_lo, window.lat_hi)
+        ax.set_aspect(spec.aspect, adjustable="box")
+        ax.set_xticks(window.lon_ticks)
+        ax.set_yticks(window.lat_ticks)
+        ax.xaxis.set_major_formatter(FuncFormatter(_map_axes.format_lon))
+        ax.yaxis.set_major_formatter(FuncFormatter(_map_axes.format_lat))
+        ax.set_xlabel(t.t(_map_axes.AXIS_TITLE_LON_ZH, "Longitude"), fontproperties=font)
+        ax.set_ylabel(t.t(_map_axes.AXIS_TITLE_LAT_ZH, "Latitude"), fontproperties=font)
+        ax.grid(False)
+    else:
+        lon_margin = max((all_lon.max() - all_lon.min()) * 0.08, 0.01)
+        lat_margin = max((all_lat.max() - all_lat.min()) * 0.08, 0.01)
+        ax.set_xlim(all_lon.min() - lon_margin, all_lon.max() + lon_margin)
+        ax.set_ylim(all_lat.min() - lat_margin, all_lat.max() + lat_margin)
+        center_lat = float(np.mean(all_lat))
+        ax.set_aspect(1.0 / math.cos(math.radians(center_lat)), adjustable="box")
+        ax.set_xlabel(t.t("經度（°E）", "Longitude (deg E)"), fontproperties=font)
+        ax.set_ylabel(t.t("緯度（°N）", "Latitude (deg N)"), fontproperties=font)
+        ax.grid(color="white", linewidth=0.7, alpha=0.8)
 
     from matplotlib.lines import Line2D
 
@@ -2085,15 +2113,32 @@ def _plot_horizontal_overview(
     # ax.set_aspect(..., adjustable="box") 併用時，在某些「經緯度範圍很扁」的
     # 站點（例如本圖含寬闊 flow_open_boundary 外框）會於內部多重繪製階段留下
     # 殘影（已實測，圖例列會疊到一個淡灰色殘影字元），改用固定邊界可穩定避免。
+    record: dict[str, Any] | None = None
     if layout == "v2":
         _layout_horizontal_overview_v2(fig, ax, handles, font)
+    elif layout == "v3":
+        _layout_horizontal_overview_v2(fig, ax, handles, font, frame_w_over_h=axes_unified[0].frame_width_over_height)
+        fig.canvas.draw()
+        record = {
+            "xlim": [float(v) for v in ax.get_xlim()],
+            "ylim": [float(v) for v in ax.get_ylim()],
+            "xticks": [float(v) for v in ax.get_xticks()],
+            "yticks": [float(v) for v in ax.get_yticks()],
+            "xtick_labels": [tl.get_text() for tl in ax.get_xticklabels()],
+            "ytick_labels": [tl.get_text() for tl in ax.get_yticklabels()],
+            "xlabel": ax.get_xlabel(),
+            "ylabel": ax.get_ylabel(),
+            "grid_lines_drawn": bool(any(gl.get_visible() for gl in ax.get_xgridlines() + ax.get_ygridlines())),
+            "frame_size_in": [float(v) for v in (ax.get_position().width * fig.get_size_inches()[0], ax.get_position().height * fig.get_size_inches()[1])],
+        }
     else:
         fig.subplots_adjust(left=0.08, bottom=0.30, right=0.97, top=_title_top_margin(figure_text, full=0.84))
-    _save_exclusive(fig, path, dpi=dpi, tight=(layout != "v2"))
+    _save_exclusive(fig, path, dpi=dpi, tight=(layout == "legacy"))
     plt.close(fig)
+    return record
 
 
-def _layout_horizontal_overview_v2(fig, ax, handles, font) -> None:
+def _layout_horizontal_overview_v2(fig, ax, handles, font, *, frame_w_over_h: float | None = None) -> None:
     """水平總覽 v2 版面：主圖軸框沿用原版尺寸，圖例緊貼在主圖正下方。
 
     原版以 ``bottom=0.30`` 替圖例預留固定的下方空間，但等比例軸（``adjustable="box"``）
@@ -2105,6 +2150,11 @@ def _layout_horizontal_overview_v2(fig, ax, handles, font) -> None:
 
     fig_w, fig_h = fig.get_size_inches()
     left, top, box_w, box_h = _HO_V2_AXES_BOX_IN
+    if frame_w_over_h is not None:
+        # WP-71（layout v3）：主圖框高度取配置區高度，寬度由共用長寬比決定（五地點相同）；
+        # 框的左緣留出縱軸刻度標籤與標題的寬度（_HO_V3_LEFT_IN），其餘空白在右側。
+        box_w = min(box_h * frame_w_over_h, box_w)
+        left = _HO_V3_LEFT_IN
     ax.set_position([left / fig_w, 1.0 - (top + box_h) / fig_h, box_w / fig_w, box_h / fig_h])
     ax.apply_aspect()
     pos = ax.get_position()
@@ -2123,8 +2173,19 @@ def _layout_horizontal_overview_v2(fig, ax, handles, font) -> None:
     )
 
 
-def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str) -> Path:
-    """只重畫水平軌跡總覽（``layout="v2"``）到全新的輸出目錄。
+def _horizontal_overview_content_bounds(site: SiteData) -> tuple[float, float, float, float]:
+    """水平軌跡總覽必須呈現的範圍：全部代表軌跡與全部開放邊界線的經緯度外框（不含餘量）。"""
+
+    boundary_lines = _resolve_dashed_open_boundary_lines(site)
+    lons = [s.lon_deg for s in site.trajectories] + [lon for lon, _ in boundary_lines.values()]
+    lats = [s.lat_deg for s in site.trajectories] + [lat for _, lat in boundary_lines.values()]
+    all_lon = np.concatenate(lons)
+    all_lat = np.concatenate(lats)
+    return float(all_lon.min()), float(all_lon.max()), float(all_lat.min()), float(all_lat.max())
+
+
+def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str, layout: str = "v2") -> Path:
+    """只重畫水平軌跡總覽（``layout="v2"``；``layout="v3"`` 為 WP-71 座標軸統一版）到全新的輸出目錄。
 
     輸入、字型、海岸線、軌跡抽樣、dpi 與 ``figure_text`` 的處理方式與
     :func:`build_native_figures` 相同（共用同一組載入函式），只是不畫其餘圖種；
@@ -2141,14 +2202,27 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str) -
     land_geometries = _load_coastline(config.coastline_path)
     font_resolution = _resolve_font(config.font_path)
     labeler = _Labeler(font_resolution.cjk_available)
+    if layout not in ("v2", "v3"):
+        raise FiguresError(f"build_horizontal_overview_v2 的 layout 必須是 v2 或 v3，收到 {layout!r}")
+    axes_spec: _map_axes.AxisSpec | None = None
+    axes_windows: dict[str, _map_axes.AxisWindow] = {}
+    if layout == "v3":
+        m = _HO_V3_NEED_MARGIN_DEG
+        needs = {}
+        for site in inputs.sites:
+            a, b, c, d = _horizontal_overview_content_bounds(site)
+            needs[site.site_id] = (a - m, b + m, c - m, d + m)
+        axes_spec = _map_axes.plan_axis_spec(needs, step_deg=_HO_V3_STEP_DEG)
+        axes_windows = {k: _map_axes.window_for_content(axes_spec, v) for k, v in needs.items()}
     output_dir.mkdir(parents=True)
     png_records: dict[str, Any] = {}
     svg_records: dict[str, Any] = {}
+    axes_records: dict[str, Any] = {}
     for site in inputs.sites:
         site_dir = output_dir / site.site_id
         site_dir.mkdir()
         png_path = site_dir / "horizontal_overview.png"
-        _plot_horizontal_overview(
+        axes_record = _plot_horizontal_overview(
             site,
             land_geometries,
             labeler,
@@ -2156,8 +2230,11 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str) -
             png_path,
             config.dpi,
             config.figure_text,
-            layout="v2",
+            layout=layout,
+            axes_unified=(axes_spec, axes_windows[site.site_id]) if layout == "v3" else None,
         )
+        if axes_record is not None:
+            axes_records[site.site_id] = axes_record
         png_records[f"{site.site_id}/horizontal_overview.png"] = {
             "sha256": sha256_file(png_path),
             "size_bytes": png_path.stat().st_size,
@@ -2173,7 +2250,7 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str) -
     manifest = {
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "command": command,
-        "layout": "v2",
+        "layout": layout,
         "figure_stems": ["horizontal_overview"],
         "sites": [s.site_id for s in inputs.sites],
         "figsize_in": list(_HO_V2_FIGSIZE),
@@ -2188,6 +2265,17 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str) -
         "output_png_sha256": png_records,
         "output_svg_sha256": svg_records,
     }
+    if layout == "v3":
+        manifest["axes_unified"] = {
+            **_map_axes.window_record(
+                axes_spec,
+                axes_windows,
+                {s.site_id: (axes_windows[s.site_id].lat_lo + axes_windows[s.site_id].lat_hi) / 2.0 for s in inputs.sites},
+            ),
+            "need_margin_deg": _HO_V3_NEED_MARGIN_DEG,
+            "need_rule": "全部代表軌跡與開放邊界線之經緯度外框各邊外加 need_margin_deg",
+            "drawn": axes_records,
+        }
     with (output_dir / "manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
         stream.write("\n")
@@ -3729,7 +3817,7 @@ def _draw_isobaths(
     return drawn
 
 
-def _lon_formatter(value: float, _pos: int | None = None) -> str:
+def _lon_formatter(value: float, _pos: int | None = None) -> str:  # 既有規則：二位小數
     return f"{value:.2f}°E"
 
 
@@ -3870,6 +3958,7 @@ def _draw_footprint_base_map(
     isobath_levels: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
     max_intervals: int = _RESIDENCE_MAX_INTERVALS,
     tick_fontsize: float = 8.0,
+    axes_unified: tuple[_map_axes.AxisSpec, _map_axes.AxisWindow] | None = None,
 ) -> tuple[tuple[float, float, float, float], list[float]]:
     """陸地（灰）、海岸線（黑 0.5 pt）、等深線、開放邊界（洋紅虛線）、抽樣範圍（深藍虛線圓）與錨點星號。
 
@@ -3883,7 +3972,16 @@ def _draw_footprint_base_map(
     from matplotlib.ticker import FuncFormatter
     from shapely.plotting import plot_polygon
 
-    xticks, yticks = _site_axis_ticks(fp, max_intervals=max_intervals)
+    if axes_unified is not None:
+        # WP-71：共用規格——五地點跨度、間隔相同，上下限在刻度上，刻度標籤一位小數，等比例係數相同。
+        xticks = np.asarray(axes_unified[1].lon_ticks, dtype=np.float64)
+        yticks = np.asarray(axes_unified[1].lat_ticks, dtype=np.float64)
+        lon_fmt, lat_fmt = _map_axes.format_lon, _map_axes.format_lat
+        aspect = axes_unified[0].aspect
+    else:
+        xticks, yticks = _site_axis_ticks(fp, max_intervals=max_intervals)
+        lon_fmt, lat_fmt = _lon_formatter, _lat_formatter
+        aspect = None
     extent = (float(xticks[0]), float(xticks[-1]), float(yticks[0]), float(yticks[-1]))
     for land in land_geometries:
         plot_polygon(
@@ -3897,7 +3995,10 @@ def _draw_footprint_base_map(
         )
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
-    ax.set_aspect(1.0 / math.cos(math.radians((extent[2] + extent[3]) / 2.0)), adjustable="box")
+    ax.set_aspect(
+        aspect if aspect is not None else 1.0 / math.cos(math.radians((extent[2] + extent[3]) / 2.0)),
+        adjustable="box",
+    )
     drawn = _draw_isobaths(ax, site_isobaths, extent, isobath_levels)
     for part in fp.open_boundary_parts:
         ax.plot(part[:, 0], part[:, 1], zorder=6, **_OPEN_BOUNDARY_STYLE)
@@ -3925,8 +4026,8 @@ def _draw_footprint_base_map(
         )
     ax.set_xticks(xticks)
     ax.set_yticks(yticks)
-    ax.xaxis.set_major_formatter(FuncFormatter(_lon_formatter))
-    ax.yaxis.set_major_formatter(FuncFormatter(_lat_formatter))
+    ax.xaxis.set_major_formatter(FuncFormatter(lon_fmt))
+    ax.yaxis.set_major_formatter(FuncFormatter(lat_fmt))
     ax.tick_params(labelsize=tick_fontsize)
     ax.set_facecolor("white")
     return extent, drawn
@@ -4257,6 +4358,7 @@ def _plot_source_footprint_residence(
     limits: tuple[float, float] | None = None,
     cmap_trim: float | None = None,
     cmap_scheme: str | None = None,
+    axes_unified: tuple[_map_axes.AxisSpec, _map_axes.AxisWindow] | None = None,
 ) -> dict[str, Any]:
     """停留時數密度圖：對數色階（上限取 10 的整數次方、下限為上限的 1/10000）、HDR 50／75／90%、
     底圖與受體。色條與地圖軸同高。回傳繪圖紀錄（含色階越界統計與版面量測）。"""
@@ -4273,7 +4375,7 @@ def _plot_source_footprint_residence(
     levels = sorted(fp.hdr_threshold_pct_per_km2)
     masks = _hdr_masks(density, fp.hdr_threshold_pct_per_km2)
     _extent, drawn = _draw_footprint_base_map(
-        ax, fp, land_geometries, site_isobaths, isobath_levels=isobath_levels
+        ax, fp, land_geometries, site_isobaths, isobath_levels=isobath_levels, axes_unified=axes_unified
     )
     # limits 明示時（WP-70）：上下限固定、高於上限者以最深色顯示（clip）；None＝沿用自動規則（位元不變）。
     vmin, vmax_used = limits if limits is not None else _residence_color_limits(vmax)
@@ -4304,8 +4406,8 @@ def _plot_source_footprint_residence(
     lon_c, lat_c = fp.center_coords()
     _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
 
-    ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
-    ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
+    ax.set_xlabel(t.t(_map_axes.AXIS_TITLE_LON_ZH, "Longitude"), fontproperties=font)
+    ax.set_ylabel(t.t(_map_axes.AXIS_TITLE_LAT_ZH, "Latitude"), fontproperties=font)
     ax.legend(
         handles=_footprint_legend_handles(
             t,
@@ -4358,6 +4460,8 @@ def _plot_source_footprint_residence(
         record["colormap_trim_lower_fraction"] = float(cmap_trim)
     if cmap_scheme:
         record["colormap_scheme"] = cmap_scheme
+    if axes_unified is not None:
+        record["axes_unified"] = True
     return record
 
 
@@ -5146,6 +5250,28 @@ class _FootprintFigurePlan:
     colorbar_range: tuple[float, float] | None = None
     colormap_trim: float | None = None
     colormap_scheme: str | None = None
+    # WP-71：座標軸統一（config.axes_unified）時的共用規格與各站窗口；None＝沿用既有規則。
+    axes_spec: _map_axes.AxisSpec | None = None
+    axes_windows: Mapping[str, _map_axes.AxisWindow] | None = None
+    axes_need_margin_fraction: float = 0.04
+
+
+def _footprint_axes_plan(
+    inputs: NativeFiguresInputs, margin_fraction: float = 0.04
+) -> tuple[_map_axes.AxisSpec, dict[str, _map_axes.AxisWindow]]:
+    """足跡圖座標軸統一：各站必須包住的範圍＝流場範圍外框外加其跨度的 ``margin_fraction``（與既有規則相同的餘量），
+    刻度間隔 0.2°（經緯向相同）；回傳共用規格與各站窗口。"""
+
+    needs: dict[str, tuple[float, float, float, float]] = {}
+    for site in inputs.sites:
+        fp = inputs.footprint[site.site_id]
+        lon = fp.domain_lonlat[:, 0]
+        lat = fp.domain_lonlat[:, 1]
+        dx = (float(lon.max()) - float(lon.min())) * margin_fraction
+        dy = (float(lat.max()) - float(lat.min())) * margin_fraction
+        needs[site.site_id] = (float(lon.min()) - dx, float(lon.max()) + dx, float(lat.min()) - dy, float(lat.max()) + dy)
+    spec = _map_axes.plan_axis_spec(needs, step_deg=0.2)
+    return spec, {k: _map_axes.window_for_content(spec, v) for k, v in needs.items()}
 
 
 def _isobath_levels_in_extent(
@@ -5169,17 +5295,19 @@ def _plan_footprint_figures(
     isobaths, record = _load_isobaths(config.bathymetry_path)
     levels: dict[str, tuple[float, ...]] = {}
     reasons: dict[str, str | None] = {}
+    axes_spec, axes_windows = _footprint_axes_plan(inputs) if config.axes_unified else (None, None)
     for site in inputs.sites:
         fp = inputs.footprint[site.site_id]
         site_isobaths = isobaths.get(site.site_id, {})
+        extents = [_site_extent(fp, max_intervals=m) for m in (_RESIDENCE_MAX_INTERVALS, _SNAPSHOT_MAX_INTERVALS)]
+        if axes_windows is not None:
+            extents.append(axes_windows[site.site_id].extent)
         found = tuple(
             sorted(
                 {
                     depth
-                    for max_intervals in (_RESIDENCE_MAX_INTERVALS, _SNAPSHOT_MAX_INTERVALS)
-                    for depth in _isobath_levels_in_extent(
-                        site_isobaths, _site_extent(fp, max_intervals=max_intervals), config.isobath_levels_m
-                    )
+                    for extent in extents
+                    for depth in _isobath_levels_in_extent(site_isobaths, extent, config.isobath_levels_m)
                 }
             )
         )
@@ -5204,6 +5332,8 @@ def _plan_footprint_figures(
         colorbar_range=config.footprint_colorbar_range,
         colormap_trim=config.footprint_colormap_trim,
         colormap_scheme=config.footprint_colormap_scheme,
+        axes_spec=axes_spec,
+        axes_windows=axes_windows,
     )
 
 
@@ -5652,6 +5782,22 @@ def _build_footprint_figures_manifest(
             "land_geometry_for_sea_check": "海岸線 GeoJSON 的陸地多邊形；點落在任一多邊形內即視為在陸上",
         },
         "axes_rule": "座標軸範圍向外擴到刻度間距（0.1／0.2／0.5°）的整數倍，首末刻度即框邊，四個端點都標值",
+        **(
+            {
+                "axes_unified": {
+                    **_map_axes.window_record(
+                        plan.axes_spec,
+                        plan.axes_windows,
+                        {k: (w.lat_lo + w.lat_hi) / 2.0 for k, w in plan.axes_windows.items()},
+                    ),
+                    "need_margin_fraction_of_domain_span": plan.axes_need_margin_fraction,
+                    "applies_to": "source_footprint_residence",
+                    "need_rule": "流場範圍外框各邊外加其跨度的 need_margin_fraction_of_domain_span",
+                }
+            }
+            if plan.axes_spec is not None
+            else {}
+        ),
         "colorbar_alignment_tolerance_px": COLORBAR_ALIGNMENT_TOLERANCE_PX,
         "snapshot_color_scale": {
             "unit": "% 仍在漂流虛擬質點/km²",
@@ -5773,6 +5919,11 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
                         limits=footprint_plan.colorbar_range,
                         cmap_trim=footprint_plan.colormap_trim,
                         cmap_scheme=footprint_plan.colormap_scheme,
+                        axes_unified=(
+                            (footprint_plan.axes_spec, footprint_plan.axes_windows[site.site_id])
+                            if footprint_plan.axes_spec is not None
+                            else None
+                        ),
                     )
                 elif stem == "source_footprint_residence_site_scale":
                     record = _plot_source_footprint_residence(

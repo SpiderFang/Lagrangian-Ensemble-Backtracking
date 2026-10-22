@@ -38,3 +38,24 @@ def test_report_ticks_regular_and_inner():
     assert np.allclose(np.diff(t), 0.1) and t[0] > 121.6 and t[-1] < 122.2
     with pytest.raises(PolarSourceError):
         F._report_ticks(121.6, 121.7, (0.5,), 2)
+
+
+def test_one_decimal_style_config_and_geometry():
+    """WP-71：one_decimal 樣式只能搭配報告版面；畫布寬仍為報告插入寬度；刻度一位小數且不把非整刻度四捨五入。"""
+    _cfg(report_layout=True, modes=("none",), report_axes_style="one_decimal")
+    with pytest.raises(PolarSourceError):
+        _cfg(report_axes_style="one_decimal")
+    with pytest.raises(PolarSourceError):
+        _cfg(report_layout=True, modes=("none",), report_axes_style="two_decimal")
+    assert F._RO_LEFT_1D + F._RO_FRAME_1D + F._RO_RIGHT_MARGIN == pytest.approx(F.REPORT_W_IN)
+    assert F._RG_LEFT_1D + 3 * F._RG_P_1D + 2 * F._RG_GAP + F._RG_RIGHT_MARGIN == pytest.approx(F.REPORT_W_IN)
+    assert F.report_panels_height(True) <= 9.0 and max(F.report_overview_height(k, True) for k in "BCD") <= 9.0
+    # 預設樣式之尺寸不變（舊版圖可逐位元重現）
+    assert F.report_panels_height(False) == F.REPORT_PANELS_H
+    # 刻度：0.1 度步距、只含框內整 0.1 度倍數；格式化函式拒絕非整刻度
+    from lagrangian_backtracking.native_runner import map_axes as ma
+
+    t = F._report_ticks(24.4194, 25.0806, (0.1,), 5, inner=(0.03, 0.97))
+    assert [ma.format_lat(v) for v in t][0].endswith("°N") and all(abs(v * 10 - round(v * 10)) < 1e-6 for v in t)
+    with pytest.raises(ValueError):
+        ma.format_lat(24.79)

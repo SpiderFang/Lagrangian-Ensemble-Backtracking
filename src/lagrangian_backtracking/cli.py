@@ -2439,6 +2439,13 @@ def _native_figures_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--axes-unified", action="store_true",
+        help=(
+            "WP-71：條件式來源足跡圖座標軸統一——刻度標籤一位小數（例：25.0°N）、五地點經緯度跨度與刻度間隔相同、"
+            "軸範圍上下限落在刻度上並標出數字、主圖框大小相同；省略時沿用既有座標軸規則"
+        ),
+    )
+    parser.add_argument(
         "--allow-unanchored-receptor", action="store_true",
         help=(
             "WP-38 診斷用：允許省略 --config，星號退回後處理由釋放點反推的平均位置；"
@@ -2470,6 +2477,7 @@ def run_native_figures_command(argv: Sequence[str] | None = None) -> int:
         allow_unanchored_receptor=args.allow_unanchored_receptor,
         footprint_colormap_trim=args.footprint_colormap_trim,
         footprint_colormap_scheme=args.footprint_colormap_scheme,
+        axes_unified=bool(args.axes_unified),
         footprint_colorbar_range=(
             tuple(args.footprint_colorbar_range) if args.footprint_colorbar_range else None
         ),
@@ -2598,6 +2606,13 @@ def _native_polar_source_parser() -> argparse.ArgumentParser:
         help="報告版面：畫布寬 6.27 英寸（＝報告插入寬度）、字級 8 pt、圖例在主圖下方、A 類十圖併成一張多格圖；只輸出無文字版（需 --modes none）",
     )
     parser.add_argument(
+        "--report-axes-style", choices=["legacy", "one_decimal"], default="legacy",
+        help=(
+            "WP-71：報告版面座標軸樣式（需 --report-layout）。one_decimal＝刻度標籤一位小數、只標框內的 0.1°／0.2° 整數倍刻度、"
+            "加座標軸標題「經度」「緯度」；圓在框正中，兩端不強制落在刻度上。預設 legacy（既有樣式）"
+        ),
+    )
+    parser.add_argument(
         "--notext-crop-in", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"), default=None,
         help="無文字版共同裁切框（英寸，自畫布左下角起算）；省略時 run08 包絡用既定值，其他包絡自動量測",
     )
@@ -2640,6 +2655,7 @@ def run_native_polar_source_command(argv: Sequence[str] | None = None) -> int:
         envelope_auto=bool(args.envelope_auto),
         notext_crop_in=tuple(args.notext_crop_in) if args.notext_crop_in is not None else None,
         report_layout=bool(args.report_layout),
+        report_axes_style=args.report_axes_style,
     )
     output_dirs = native_polar_source_figures.build_polar_source(config, command=command)
     print(json.dumps({"output_dirs": [str(p) for p in output_dirs]}, ensure_ascii=False, indent=2, sort_keys=True))

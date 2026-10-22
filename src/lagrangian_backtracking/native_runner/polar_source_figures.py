@@ -73,6 +73,7 @@ from .figures import (
     _resolve_font,
     _tick_font_kwargs,
 )
+from . import map_axes as _map_axes
 from .polar_source import PolarParams, PolarSourceError, SiteAnalysis
 
 __all__ = [
@@ -179,8 +180,16 @@ class PolarConfig:
     envelope_auto: bool = False
     notext_crop_in: tuple[float, float, float, float] | None = None
     report_layout: bool = False
+    # WP-71：報告版面的座標軸樣式。legacy＝沿用既有（刻度二位小數、無座標軸標題）；
+    # one_decimal＝刻度標籤一位小數（只標框內 0.1°／0.2° 整數倍的刻度，不把非整刻度四捨五入標示）、
+    # 加座標軸標題「經度」「緯度」。圓一律在框正中（框以錨點為中心、五地點同為 ±34 km），兩端不強制落在刻度上。
+    report_axes_style: str = "legacy"
 
     def __post_init__(self) -> None:
+        if self.report_axes_style not in ("legacy", "one_decimal"):
+            raise PolarSourceError("report_axes_style 必須是 legacy 或 one_decimal")
+        if self.report_axes_style != "legacy" and not self.report_layout:
+            raise PolarSourceError("report_axes_style=one_decimal 只能搭配 report_layout")
         if self.report_layout:
             if self.modes != ("none",):
                 raise PolarSourceError("report_layout 只輸出無文字版：modes 必須是 ('none',)")
@@ -758,10 +767,17 @@ _RO_LEGEND_H_BY_KIND: Mapping[str, float] = {"B": 0.92, "C": 0.76, "D": 0.52}
 _RO_BOTTOM = 0.04
 
 
-def report_overview_height(kind: str) -> float:
+# WP-71（one_decimal 樣式）：多一條縱軸標題（左側加寬）與橫軸標題（下方加高），畫布寬仍為 6.27 英寸。
+_RO_LEFT_1D = 0.75
+_RO_FRAME_1D = REPORT_W_IN - _RO_LEFT_1D - _RO_RIGHT_MARGIN
+_RO_XLAB_1D = 0.50
+
+
+def report_overview_height(kind: str, one_decimal: bool = False) -> float:
     """總覽圖（B、C、D）的畫布高度（英寸）；同一圖種五地點相同，圖例帶依圖種的列數決定，不留大片空白。"""
 
-    return round(_RO_TOP + _RO_FRAME + _RO_XLAB + _RO_LEGEND_GAP + _RO_LEGEND_H_BY_KIND[kind] + _RO_BOTTOM, 3)
+    frame, xlab = (_RO_FRAME_1D, _RO_XLAB_1D) if one_decimal else (_RO_FRAME, _RO_XLAB)
+    return round(_RO_TOP + frame + xlab + _RO_LEGEND_GAP + _RO_LEGEND_H_BY_KIND[kind] + _RO_BOTTOM, 3)
 
 
 REPORT_OVERVIEW_H = report_overview_height("B")
@@ -780,13 +796,26 @@ _RG_BOTTOM = 0.04
 _RG_P = (REPORT_W_IN - _RG_LEFT - _RG_RIGHT_MARGIN - (_RG_COLS - 1) * _RG_GAP) / _RG_COLS
 
 
-def _rg_row_top(r: int) -> float:
+_RG_LEFT_1D = 0.75
+_RG_P_1D = (REPORT_W_IN - _RG_LEFT_1D - _RG_RIGHT_MARGIN - (_RG_COLS - 1) * _RG_GAP) / _RG_COLS
+_RG_XLAB_1D = 0.42
+
+
+def _rg_row_top(r: int, one_decimal: bool = False) -> float:
     """第 r 列（0 起算）標題帶上緣，自畫布頂端起算（英寸）；第 4 列前多留一條 x 軸刻度標籤帶（第 8、9 格在其上方）。"""
 
-    return _RG_TOP + r * (_RG_TITLE + _RG_P + _RG_ROWGAP) + (_RG_XLAB if r == _RG_ROWS - 1 else 0.0)
+    p, xlab = (_RG_P_1D, _RG_XLAB_1D) if one_decimal else (_RG_P, _RG_XLAB)
+    return _RG_TOP + r * (_RG_TITLE + p + _RG_ROWGAP) + (xlab if r == _RG_ROWS - 1 else 0.0)
 
 
-REPORT_PANELS_H = round(_rg_row_top(_RG_ROWS - 1) + _RG_TITLE + _RG_P + _RG_XLAB + _RG_BOTTOM, 3)
+def report_panels_height(one_decimal: bool = False) -> float:
+    """多格圖的畫布高度（英寸）。"""
+
+    p, xlab = (_RG_P_1D, _RG_XLAB_1D) if one_decimal else (_RG_P, _RG_XLAB)
+    return round(_rg_row_top(_RG_ROWS - 1, one_decimal) + _RG_TITLE + p + xlab + _RG_BOTTOM, 3)
+
+
+REPORT_PANELS_H = report_panels_height()
 
 
 def _report_ticks(lo: float, hi: float, steps: Sequence[float], min_count: int, inner: tuple[float, float] = (0.0, 1.0)) -> np.ndarray:
@@ -849,6 +878,7 @@ def _draw_report_polar(
     yticks: np.ndarray,
     label_x: bool,
     label_y: bool,
+    one_decimal: bool = False,
 ) -> tuple[list[Any], list[float], list[float]]:
     """在 ``ax``（正方形主圖框）畫底圖、圓與刻度、折線與錨點；回傳（折線圖例柄、實際畫出的等深線水深、全部等深線水深）。
 
@@ -921,13 +951,19 @@ def _draw_report_polar(
 
     ax.set_xticks(xticks)
     ax.set_yticks(yticks)
-    ax.xaxis.set_major_formatter(FuncFormatter(_lon_formatter))
-    ax.yaxis.set_major_formatter(FuncFormatter(_lat_formatter))
+    ax.xaxis.set_major_formatter(FuncFormatter(_map_axes.format_lon if one_decimal else _lon_formatter))
+    ax.yaxis.set_major_formatter(FuncFormatter(_map_axes.format_lat if one_decimal else _lat_formatter))
     ax.tick_params(axis="both", length=2.5, width=0.6, pad=2, labelsize=REPORT_TEXT_PT)
     ax.tick_params(axis="x", labelbottom=label_x)
     ax.tick_params(axis="y", labelleft=label_y)
     for lab in ax.get_xticklabels() + ax.get_yticklabels():
         lab.set_fontproperties(f8)
+    if one_decimal:
+        # 座標軸標題全報告統一為「經度」「緯度」；只在有刻度標籤的邊畫
+        if label_x:
+            ax.set_xlabel(_map_axes.AXIS_TITLE_LON_ZH, fontproperties=f8, fontsize=REPORT_TEXT_PT, labelpad=1.5)
+        if label_y:
+            ax.set_ylabel(_map_axes.AXIS_TITLE_LAT_ZH, fontproperties=f8, fontsize=REPORT_TEXT_PT, labelpad=1.5)
     for spine in ax.spines.values():
         spine.set_linewidth(0.8)
     return handles, drawn, levels
@@ -997,7 +1033,8 @@ def _assert_report_layout(fig: Any, legends: Sequence[Any], axes: Sequence[Any],
 
 
 def render_report_overview(
-    plan: PolarFigurePlan, site_map: _SiteMap, t: _Labeler, font: Any, path: Path, dpi: int, png_only: bool = False
+    plan: PolarFigurePlan, site_map: _SiteMap, t: _Labeler, font: Any, path: Path, dpi: int, png_only: bool = False,
+    one_decimal: bool = False,
 ) -> None:
     """報告版面的總覽圖（B 十類、C 季節、D 大小潮）：正方形主圖占滿寬度，圖例全部在主圖正下方。"""
 
@@ -1006,22 +1043,25 @@ def render_report_overview(
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    w, h = REPORT_W_IN, report_overview_height(plan.kind)
+    ro_left, ro_frame, ro_xlab = (_RO_LEFT_1D, _RO_FRAME_1D, _RO_XLAB_1D) if one_decimal else (_RO_LEFT, _RO_FRAME, _RO_XLAB)
+    w, h = REPORT_W_IN, report_overview_height(plan.kind, one_decimal)
     fig = plt.figure(figsize=(w, h), dpi=150)
-    ax = fig.add_axes([_RO_LEFT / w, 1.0 - (_RO_TOP + _RO_FRAME) / h, _RO_FRAME / w, _RO_FRAME / h])
-    xt = _report_ticks(site_map.extent[0], site_map.extent[1], (0.1, 0.2, 0.25, 0.5), 5, inner=(0.055, 0.945))
-    yt = _report_ticks(site_map.extent[2], site_map.extent[3], (0.1, 0.2, 0.25, 0.5), 5, inner=(0.03, 0.97))
-    handles, drawn, levels = _draw_report_polar(ax, plan, site_map, font, compact=False, xticks=xt, yticks=yt, label_x=True, label_y=True)
-    y_leg = _RO_TOP + _RO_FRAME + _RO_XLAB + _RO_LEGEND_GAP
+    ax = fig.add_axes([ro_left / w, 1.0 - (_RO_TOP + ro_frame) / h, ro_frame / w, ro_frame / h])
+    steps = (0.1,) if one_decimal else (0.1, 0.2, 0.25, 0.5)
+    xt = _report_ticks(site_map.extent[0], site_map.extent[1], steps, 5, inner=(0.055, 0.945))
+    yt = _report_ticks(site_map.extent[2], site_map.extent[3], steps, 5, inner=(0.03, 0.97))
+    handles, drawn, levels = _draw_report_polar(ax, plan, site_map, font, compact=False, xticks=xt, yticks=yt, label_x=True, label_y=True,
+                                                one_decimal=one_decimal)  # fmt: skip
+    y_leg = _RO_TOP + ro_frame + ro_xlab + _RO_LEGEND_GAP
     ncol = 2 if len(handles) > 5 else 1
     legend_title = t.t(plan.legend_title_zh, plan.legend_title_en)
     if plan.kind == "B":  # 單位移到圖例標題，每列少寫一次 m/s，兩欄圖例才放得進主圖下方
         for hd in handles:
             hd.set_label(hd.get_label().removesuffix(" m/s"))
         legend_title += t.t("（m/s）", " (m/s)")
-    leg1 = _fig_legend(fig, handles, font, loc="upper left", x_in=_RO_LEFT, y_top_in=y_leg, h_in=h, w_in=w,
+    leg1 = _fig_legend(fig, handles, font, loc="upper left", x_in=ro_left, y_top_in=y_leg, h_in=h, w_in=w,
                        title=legend_title, ncol=ncol)  # fmt: skip
-    leg2 = _fig_legend(fig, _report_base_handles(t, drawn, levels), font, loc="upper right", x_in=_RO_LEFT + _RO_FRAME, y_top_in=y_leg,
+    leg2 = _fig_legend(fig, _report_base_handles(t, drawn, levels), font, loc="upper right", x_in=ro_left + ro_frame, y_top_in=y_leg,
                        h_in=h, w_in=w, title=None, ncol=(1 if plan.kind == "B" else 2))  # fmt: skip
     _assert_report_layout(fig, [leg1, leg2], [ax], w, h, what=plan.stem)
     _save_fixed_canvas(fig, path, dpi=dpi, crop_in=None, svg=not png_only)
@@ -1029,7 +1069,8 @@ def render_report_overview(
 
 
 def render_report_panels(
-    plans: Sequence[PolarFigurePlan], site_map: _SiteMap, t: _Labeler, font: Any, path: Path, dpi: int, png_only: bool = False
+    plans: Sequence[PolarFigurePlan], site_map: _SiteMap, t: _Labeler, font: Any, path: Path, dpi: int, png_only: bool = False,
+    one_decimal: bool = False,
 ) -> None:
     """報告版面的多格圖：每類一格（格內十條線依沉降速度由慢至快），3 欄 × 4 列，共用一個圖例（沉降速度序位）。"""
 
@@ -1041,22 +1082,25 @@ def render_report_panels(
 
     if len(plans) != 10 or any(p.kind != "A" for p in plans):
         raise PolarSourceError("多格圖需要十張 A 圖計畫（每類一張）")
-    w, h = REPORT_W_IN, REPORT_PANELS_H
-    p = _RG_P
-    col_x = [_RG_LEFT + c * (p + _RG_GAP) for c in range(_RG_COLS)]
+    w, h = REPORT_W_IN, report_panels_height(one_decimal)
+    p = _RG_P_1D if one_decimal else _RG_P
+    rg_left = _RG_LEFT_1D if one_decimal else _RG_LEFT
+    col_x = [rg_left + c * (p + _RG_GAP) for c in range(_RG_COLS)]
     fig = plt.figure(figsize=(w, h), dpi=150)
     f8 = _text_font(font)
-    xt = _report_ticks(site_map.extent[0], site_map.extent[1], (0.2, 0.25, 0.5), 2, inner=(0.17, 0.83))
-    yt = _report_ticks(site_map.extent[2], site_map.extent[3], (0.2, 0.25, 0.5), 2, inner=(0.1, 0.9))
+    steps = (0.2, 0.5) if one_decimal else (0.2, 0.25, 0.5)
+    xt = _report_ticks(site_map.extent[0], site_map.extent[1], steps, 2, inner=(0.17, 0.83))
+    yt = _report_ticks(site_map.extent[2], site_map.extent[3], steps, 2, inner=(0.1, 0.9))
     axes: list[Any] = []
     drawn: list[float] = []
     levels: list[float] = []
     for idx, plan in enumerate(plans):
         r, c = divmod(idx, _RG_COLS)
-        top = _rg_row_top(r) + _RG_TITLE
+        top = _rg_row_top(r, one_decimal) + _RG_TITLE
         ax = fig.add_axes([col_x[c] / w, 1.0 - (top + p) / h, p / w, p / h])
         bottom_most = (r == _RG_ROWS - 1) or (idx + _RG_COLS >= len(plans))
-        _, drawn, levels = _draw_report_polar(ax, plan, site_map, font, compact=True, xticks=xt, yticks=yt, label_x=bottom_most, label_y=(c == 0))
+        _, drawn, levels = _draw_report_polar(ax, plan, site_map, font, compact=True, xticks=xt, yticks=yt, label_x=bottom_most, label_y=(c == 0),
+                                              one_decimal=one_decimal)  # fmt: skip
         cname = material_display_name_zh(plan.stem.removeprefix("polar_source_velocity_"))
         ax.set_title(f"{cname}　{plan.labels[0]}–{plan.labels[-1]}", loc="left", fontproperties=f8, fontsize=REPORT_TEXT_PT, pad=2.5)
         axes.append(ax)
@@ -1065,11 +1109,11 @@ def render_report_panels(
         label = f"第 {i + 1}" + ("（最慢）" if i == 0 else "（最快）" if i == 9 else "")
         ranks.append(Line2D([], [], color=plans[0].colors[i], linestyle=plans[0].styles[i], linewidth=1.4, label=label))
     x_leg = col_x[1]
-    y_leg = _rg_row_top(_RG_ROWS - 1) + 0.02
+    y_leg = _rg_row_top(_RG_ROWS - 1, one_decimal) + 0.02
     title = t.t("格內十條線之沉降速度序位", "Rank of settling speed") + "\n" + t.t("格標題數字為該類十個沉降速度之範圍（m/s）", "Panel title: range (m/s)")
     leg1 = _fig_legend(fig, ranks, font, loc="upper left", x_in=x_leg, y_top_in=y_leg, h_in=h, w_in=w, title=title, ncol=2)
     leg2 = _fig_legend(fig, _report_base_handles(t, drawn, levels), font, loc="lower left", x_in=x_leg,
-                       y_top_in=_rg_row_top(_RG_ROWS - 1) + _RG_TITLE + _RG_P, h_in=h, w_in=w, title=None, ncol=2)  # fmt: skip
+                       y_top_in=_rg_row_top(_RG_ROWS - 1, one_decimal) + _RG_TITLE + p, h_in=h, w_in=w, title=None, ncol=2)  # fmt: skip
     _assert_report_layout(fig, [leg1, leg2], axes, w, h, what="polar_source_v2_velocity_panels")
     _save_fixed_canvas(fig, path, dpi=dpi, crop_in=None, svg=not png_only)
     plt.close(fig)
@@ -1093,11 +1137,11 @@ def _render_report_job(job: Mapping[str, Any]) -> list[str]:
         if plan.kind == "A":
             continue
         path = out_dir / f"{REPORT_STEMS[plan.kind]}.png"
-        render_report_overview(plan, site_map, t, font_res.font_properties, path, job["dpi"])
+        render_report_overview(plan, site_map, t, font_res.font_properties, path, job["dpi"], one_decimal=job.get("axes_style") == "one_decimal")
         written.append(str(path))
     if a_plans:
         path = out_dir / f"{REPORT_STEMS['A']}.png"
-        render_report_panels(a_plans, site_map, t, font_res.font_properties, path, job["dpi"])
+        render_report_panels(a_plans, site_map, t, font_res.font_properties, path, job["dpi"], one_decimal=job.get("axes_style") == "one_decimal")
         written.append(str(path))
     return written
 
@@ -1459,6 +1503,7 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
                         "font_path": str(config.font_path) if config.font_path else None,
                         "dpi": config.dpi,
                         "layout": layout,
+                        "axes_style": config.report_axes_style,
                     }
                 )
         case_info[case.case_id] = {"shown": shown, "captions": captions, "case_text": case_text}
@@ -1497,12 +1542,14 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
         else:
             crop_source = "not_needed_no_notext_mode"
     if config.report_layout:
+        one_dec = config.report_axes_style == "one_decimal"
         figure_layout_record = {
             "report_layout": True,
-            "canvas_in": {**{k: [REPORT_W_IN, report_overview_height(k)] for k in ("B", "C", "D")}, "panels": [REPORT_W_IN, REPORT_PANELS_H]},
+            "axes_style": config.report_axes_style,
+            "canvas_in": {**{k: [REPORT_W_IN, report_overview_height(k, one_dec)] for k in ("B", "C", "D")}, "panels": [REPORT_W_IN, report_panels_height(one_dec)]},
             "window_half_km": config.radius_km * REPORT_WINDOW_FACTOR,
-            "overview_frame_in": _RO_FRAME,
-            "panel_frame_in": _RG_P,
+            "overview_frame_in": _RO_FRAME_1D if one_dec else _RO_FRAME,
+            "panel_frame_in": _RG_P_1D if one_dec else _RG_P,
             "text_pt": REPORT_TEXT_PT,
             "stems": dict(REPORT_STEMS),
         }

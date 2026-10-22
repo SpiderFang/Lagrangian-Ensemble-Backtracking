@@ -5,6 +5,7 @@
 #         run_fp1km.sh figures_c3  同上，但色階固定 1e-3–1e1：figures-fp1km-c3/、figures-fp1km-c3-notext/
 #         run_fp1km.sh figures_sym3  對稱色階比較版：1e-3–1e3、配色裁切 0.15：figures-fp1km-sym3/、figures-fp1km-sym3-notext/
 #         run_fp1km.sh figures_b1|figures_b2  1e-3–1e3 改良配色（非均勻連續／12 段）：figures-fp1km-b1[-notext]/、figures-fp1km-b2[-notext]/
+#         run_fp1km.sh figures_b1_ax1  b1 配色加座標軸統一（WP-71）：figures-fp1km-b1-ax1-notext/
 #         run_fp1km.sh regress   回歸檢查：用既有的 postprocess/（0.02° 網格）以目前程式碼出 none 版圖，
 #                                輸出到 lbt-runs/scratch/wp70-regress/，供與 figures-notext-r3 逐位元比對
 #   後處理與出圖的指令、參數、環境變數逐項沿用 run_formal_v8.sh，只多 --footprint-grid-km 1.0。
@@ -107,6 +108,19 @@ case "$STEP" in
     done
     wait
     log "出圖結束"
+    ;;
+  figures_b1_ax1)
+    # WP-71：與 figures_b1 相同的色階與配色（1e-3–1e3、nonuniform），另加 --axes-unified（座標軸統一：一位小數刻度、
+    # 五地點跨度與間隔相同、上下限在刻度上）；只出無文字版：figures-fp1km-b1-ax1-notext/。
+    [ -d "$PP" ] || die "找不到 $PP，請先執行 post"
+    NAME=figures-fp1km-b1-ax1-notext
+    [ -e "$R/$NAME" ] && die "$R/$NAME 已存在，為避免覆蓋而中止"
+    log "出圖（none，色階 1e-3–1e3、配色 nonuniform、座標軸統一）→ $R/$NAME"
+    "$LBT" native-figures --postprocess-dir "$PP" --coastline "$COAST" \
+      --bathymetry "$ISO" --config "$CFG" --output-dir "$R/$NAME" --figure-text none \
+      --footprint-colorbar-range 1e-3 1e3 --footprint-colormap-scheme nonuniform --axes-unified \
+      > "$R/logs/figures-fp1km-b1-ax1-notext.log" 2>&1
+    log "出圖結束，離開碼 $?"
     ;;
   regress)
     OUT=$W/lbt-runs/scratch/wp70-regress
