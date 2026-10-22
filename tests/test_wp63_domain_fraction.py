@@ -13,12 +13,12 @@ from lagrangian_backtracking.native_runner import domain_fraction as df
 def test_inside_fraction_is_exact_step_function() -> None:
     day = 86400.0
     dur = np.array([1.0, 2.0, 2.0, 5.0, 10.0, 10.0]) * day
-    status = np.array([1, 1, 1, 1, 2, 4])  # 前四顆離開開放邊界；後兩顆沒有
+    status = np.array([1, 1, 1, 1, 2, 4])  # 前四顆離開開放邊界；第五顆達回溯上限（碼 2）；第六顆觸底（碼 4，10 天時停止追蹤）
     grid = np.array([0.0, 1.0, 1.5, 2.0, 4.99, 5.0, 180.0])
     got = df.inside_fraction(dur, status, grid)
-    # 離開時間 <= τ 的顆數：0、1、1、3、3、4、4；總顆數 6
-    assert got == pytest.approx(1.0 - np.array([0, 1, 1, 3, 3, 4, 4]) / 6.0)
-    assert got[-1] == pytest.approx(2.0 / 6.0)  # 未離開者永遠算在域內
+    # 停止追蹤時間 <= τ 的顆數：0、1、1、3、3、4、5；總顆數 6（觸底者 10 天起不再計入，碼 2 者永遠算在追蹤中）
+    assert got == pytest.approx(1.0 - np.array([0, 1, 1, 3, 3, 4, 5]) / 6.0)
+    assert got[-1] == pytest.approx(1.0 / 6.0)
 
 
 def test_inside_fraction_rejects_bad_input() -> None:
@@ -81,14 +81,15 @@ def test_longer_than_axis_fails_closed(tmp_path: Path) -> None:
 
 
 def test_coast_arrival_status_8_counts_as_stop_tracking() -> None:
-    """方法 B：狀態碼 8（抵達海岸）與 1（穿越邊界）一樣停止追蹤；其他碼仍算在追蹤中。"""
+    """狀態碼 8（抵達海岸）、4（觸底）與 1（穿越邊界）一樣停止追蹤；碼 2（達回溯上限）仍算在追蹤中。"""
 
     day = 86400.0
     dur = np.array([1.0, 2.0, 3.0, 10.0, 10.0]) * day
     status = np.array([1, 8, 8, 2, 4])
     grid = np.array([0.0, 1.0, 2.0, 3.0, 180.0])
+    grid = np.array([0.0, 1.0, 2.0, 3.0, 9.99, 10.0, 180.0])
     got = df.inside_fraction(dur, status, grid)
-    assert got == pytest.approx(1.0 - np.array([0, 1, 2, 3, 3]) / 5.0)
+    assert got == pytest.approx(1.0 - np.array([0, 1, 2, 3, 3, 5 - 1, 5 - 1]) / 5.0)  # 碼 4 於 10 天停止追蹤，碼 2 仍在追蹤
     only_exit = df.inside_fraction(dur, status, grid, exit_codes=(1,))
     assert only_exit[-1] == pytest.approx(1.0 - 1 / 5.0)
 
