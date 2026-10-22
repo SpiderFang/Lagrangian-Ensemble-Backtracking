@@ -456,7 +456,6 @@ _NON_CROSSING_STATUS_CODES: tuple[int, ...] = (
     NATIVE_STATUS_FORCING_MISSING,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
-    NATIVE_STATUS_REACHED_COAST,
 )
 
 NON_CROSSING_STATUS_CATEGORY_ZH: Mapping[int, str] = MappingProxyType(
@@ -467,7 +466,6 @@ NON_CROSSING_STATUS_CATEGORY_ZH: Mapping[int, str] = MappingProxyType(
         NATIVE_STATUS_FORCING_MISSING: "流場缺值",
         NATIVE_STATUS_NUMERICAL_FAILURE: "數值失敗",
         NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "固定日曆回溯窗之外的沉底（pre_window_deposition）",
-        NATIVE_STATUS_REACHED_COAST: "海岸來源（抵達海岸）",
     }
 )
 """六種「未穿越關注區域邊界」終止原因的中文分類標籤，鍵為
@@ -486,6 +484,9 @@ _FLUX_STATUS_ORDER: tuple[int, ...] = (
     NATIVE_STATUS_LEFT_FLOW_DOMAIN,
     *_NON_CROSSING_STATUS_CODES,
 )
+_FLUX_STATUS_ORDER_WITH_COAST: tuple[int, ...] = (*_FLUX_STATUS_ORDER, NATIVE_STATUS_REACHED_COAST)
+"""WP-72 方法 B（``--coast-arrival``）時的狀態欄位順序：在既有七欄之後多一欄 ``status_8``（海岸來源，抵達海岸）。
+未啟用方法 B 時一律用 ``_FLUX_STATUS_ORDER``，既有輸出逐位元不變。"""
 """邊界通量統計表固定的狀態欄位順序：第一欄永遠是成功穿越，其餘六欄依
 ``NON_CROSSING_STATUS_CATEGORY_ZH`` 的分類順序排列，讓不同分組輸出的欄位順序
 一致，方便下游程式直接依位置讀取，不需要每次都查欄名。"""
@@ -1169,11 +1170,14 @@ def _insert_share_column(table: pa.Table, denominator: int, name: str) -> pa.Tab
 
 
 def _label_flux_table(
-    group_values: np.ndarray, group_column_name: str, final_status: np.ndarray
+    group_values: np.ndarray,
+    group_column_name: str,
+    final_status: np.ndarray,
+    status_order: tuple[int, ...] = _FLUX_STATUS_ORDER,
 ) -> pa.Table:
     """標籤分組的邊界通量表：既有欄位＋各組占全部粒子的比例 ``particle_fraction_of_total``。"""
 
-    table = _flux_table_for_grouping(group_values, group_column_name, final_status)
+    table = _flux_table_for_grouping(group_values, group_column_name, final_status, status_order)
     return _insert_share_column(table, int(final_status.shape[0]), "particle_fraction_of_total")
 
 
@@ -1182,6 +1186,7 @@ def _label_flux_table_by_site(
     group_values: np.ndarray,
     group_column_name: str,
     final_status: np.ndarray,
+    status_order: tuple[int, ...] = _FLUX_STATUS_ORDER,
 ) -> pa.Table:
     """逐站再分組的標籤通量表（標籤的大小潮、事件門檻都是逐站定義，分組在站內才可比）。
 
@@ -1191,7 +1196,7 @@ def _label_flux_table_by_site(
     tables: list[pa.Table] = []
     for site in np.unique(site_values):
         mask = site_values == site
-        table = _flux_table_for_grouping(group_values[mask], group_column_name, final_status[mask])
+        table = _flux_table_for_grouping(group_values[mask], group_column_name, final_status[mask], status_order)
         table = table.add_column(0, "study_site_id", pa.array([str(site)] * table.num_rows))
         tables.append(_insert_share_column(table, int(mask.sum()), "particle_fraction_within_site"))
     return pa.concat_tables(tables)
@@ -1869,6 +1874,7 @@ def _flux_table_for_grouping(
     group_values: np.ndarray,
     group_column_name: str,
     final_status: np.ndarray,
+    status_order: tuple[int, ...] = _FLUX_STATUS_ORDER,
 ) -> pa.Table:
     """依單一分組欄位（例如 ``study_site_id``）建立邊界通量統計表。
 
@@ -1881,8 +1887,8 @@ def _flux_table_for_grouping(
 
     unique_groups, group_codes = np.unique(group_values, return_inverse=True)
     n_groups = unique_groups.shape[0]
-    n_status = len(_FLUX_STATUS_ORDER)
-    status_index = {code: index for index, code in enumerate(_FLUX_STATUS_ORDER)}
+    n_status = len(status_order)
+    status_index = {code: index for index, code in enumerate(status_order)}
     status_codes = np.asarray([status_index[int(value)] for value in final_status], dtype=np.int64)
     flat_index = group_codes.astype(np.int64) * n_status + status_codes
     counts = np.bincount(flat_index, minlength=n_groups * n_status).reshape(n_groups, n_status)
@@ -1893,7 +1899,7 @@ def _flux_table_for_grouping(
 
     columns: dict[str, Any] = {group_column_name: pa.array(unique_groups)}
     columns["total_particle_count"] = pa.array(totals.astype(np.int64))
-    for status_position, status_code in enumerate(_FLUX_STATUS_ORDER):
+    for status_position, status_code in enumerate(status_order):
         count_column = counts[:, status_position].astype(np.int64)
         fraction_column = count_column.astype(np.float64) / totals.astype(np.float64)
         suffix = "crossed" if status_code == NATIVE_STATUS_LEFT_FLOW_DOMAIN else f"status_{status_code}"
@@ -2007,6 +2013,7 @@ class PostprocessAccumulator:
         self._identity_table = identity_table
         # WP-72 方法 B：逐顆終止列覆寫（首次抵達海岸）。None 時輸出與既有版本逐位元相同。
         self._coast_arrival = coast_arrival
+        self._flux_status_order = _FLUX_STATUS_ORDER if coast_arrival is None else _FLUX_STATUS_ORDER_WITH_COAST
         self._config = config if config is not None else PostprocessConfig()
         self._lonlat_projector = lonlat_projector
         self._boundary_geometries = boundary_geometries
@@ -2720,7 +2727,7 @@ class PostprocessAccumulator:
             )
 
         status_counts = {
-            int(code): int(np.count_nonzero(self._final_status == code)) for code in _FLUX_STATUS_ORDER
+            int(code): int(np.count_nonzero(self._final_status == code)) for code in self._flux_status_order
         }
         if sum(status_counts.values()) != self._n_total:
             raise PostprocessError("各狀態計數總和與粒子總數不一致，這是嚴重的內部錯誤")
@@ -2766,7 +2773,7 @@ class PostprocessAccumulator:
             particle_count_total=self._n_total,
             batches=tuple(self._batches),
             status_counts=status_counts,
-            status_descriptions_zh={code: _describe_status(code) for code in _FLUX_STATUS_ORDER},
+            status_descriptions_zh={code: _describe_status(code) for code in self._flux_status_order},
             output_files_sha256=output_files_sha256,
             code_provenance=code_provenance,
             config={
@@ -2877,7 +2884,7 @@ class PostprocessAccumulator:
             ("season", self._season, "boundary_flux_by_season"),
         )
         for column_name, values, stem in groupings:
-            table = _flux_table_for_grouping(values, column_name, self._final_status)
+            table = _flux_table_for_grouping(values, column_name, self._final_status, self._flux_status_order)
             _write_table_with_csv(table, self._output_dir, stem)
 
         if self._label_columns:
@@ -2915,9 +2922,9 @@ class PostprocessAccumulator:
         sites = self._identity_table.study_site_id
         summary: dict[str, Any] = {}
         for column_name, values in _label_groupings(labels):
-            table = _label_flux_table(values, column_name, self._final_status)
+            table = _label_flux_table(values, column_name, self._final_status, self._flux_status_order)
             _write_table_with_csv(table, self._output_dir, f"boundary_flux_by_{column_name}")
-            by_site = _label_flux_table_by_site(sites, values, column_name, self._final_status)
+            by_site = _label_flux_table_by_site(sites, values, column_name, self._final_status, self._flux_status_order)
             _write_table_with_csv(by_site, self._output_dir, f"boundary_flux_by_site_{column_name}")
             groups = table.column(column_name).to_pylist()
             counts = table.column("total_particle_count").to_pylist()
@@ -3008,7 +3015,7 @@ class PostprocessAccumulator:
         """
 
         table = _flux_table_for_grouping(
-            self._identity_table.study_site_id, "study_site_id", self._final_status
+            self._identity_table.study_site_id, "study_site_id", self._final_status, self._flux_status_order
         )
         rows = table.to_pylist()
         summary_rows: list[dict[str, Any]] = []
@@ -3027,7 +3034,11 @@ class PostprocessAccumulator:
                     "fraction_pre_window_deposition": (
                         row[f"fraction_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"]
                     ),
-                    "fraction_reached_coast": row[f"fraction_status_{NATIVE_STATUS_REACHED_COAST}"],
+                    **(
+                        {"fraction_reached_coast": row[f"fraction_status_{NATIVE_STATUS_REACHED_COAST}"]}
+                        if self._coast_arrival is not None
+                        else {}
+                    ),
                     "ensemble_member_count": self._ensemble_member_count_by_site[site_id],
                 }
             )
@@ -3044,7 +3055,6 @@ class PostprocessAccumulator:
                 pa.field("fraction_forcing_missing", pa.float64()),
                 pa.field("fraction_numerical_failure", pa.float64()),
                 pa.field("fraction_pre_window_deposition", pa.float64()),
-                pa.field("fraction_reached_coast", pa.float64()),
                 pa.field("ensemble_member_count", pa.int64()),
             ]
             summary_table = pa.table(
