@@ -21,9 +21,10 @@ def main() -> int:
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--font-path", type=Path, default=None)
     ap.add_argument("--case-text", default="")
+    ap.add_argument("--report-fs8", action="store_true", help="WP-73：報告版（6.27 吋畫布、8 pt，與 TRAPs 規格一致），只輸出無文字版")
     args = ap.parse_args()
     out = build_domain_fraction(args.postprocess_dir, args.out_full, args.out_notext, max_days=args.max_days,
-                                marks_days=args.marks, dpi=args.dpi, font_path=args.font_path, case_text=args.case_text)
+                                marks_days=args.marks, dpi=args.dpi, font_path=args.font_path, case_text=args.case_text, report_fs8=args.report_fs8)
     print(f"完成：{len(out)} 張圖")
     return 0
 

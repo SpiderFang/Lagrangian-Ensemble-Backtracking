@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,8 @@ import numpy as np
 
 from ..outputs import sha256_file
 from .display_names import material_display_name_zh
-from .figures import FiguresError, _Labeler, _resolve_font, _tick_font_kwargs
+from . import report_style as _rs
+from .figures import FiguresError, _Labeler, _lines_fingerprint, _resolve_font, _tick_font_kwargs
 
 __all__ = [
     "DomainFractionError",
@@ -46,6 +48,10 @@ STOP_STATUS_CODES = (1, 8, 4)
 """停止追蹤的狀態碼：1 穿越流場範圍邊界、8 回溯途中抵達海岸（方法 B）、4 觸底。"""
 SECONDS_PER_DAY = 86400.0
 CANVAS_IN = (8.0, 5.2)
+CURVE_FS8_LEGEND_ROWS = 3
+"""WP-73：報告版曲線圖圖例列數（十一項、每列 4 項）；畫布高度由此決定。"""
+CURVE_FS8_FRAME_W_OVER_H = 1.8 * math.cos(math.radians(24.1)) / 1.2
+"""WP-73：報告版曲線圖主圖框寬高比，與地圖主圖框（4.080 × 2.98 吋，1.8°×1.2° 窗口、參考緯度 24.1°）相同。"""
 _GRID_STEP_DAYS = 0.25
 
 
@@ -149,8 +155,14 @@ def render_site_figure(
     dpi: int = 300,
     case_text: str = "",
     yscale: str = "linear",
-) -> None:
-    """畫單張圖並排他落檔（PNG 與 SVG）。``mode`` 為 ``full``（含標題、標註）或 ``none``（無文字）。"""
+    report_fs8: bool = False,
+) -> dict[str, Any] | None:
+    """畫單張圖並排他落檔（PNG 與 SVG）。``mode`` 為 ``full``（含標題、標註）或 ``none``（無文字）。
+
+    ``report_fs8=True``（WP-73）：報告版——畫布寬 6.27 吋（＝報告插入寬度，不縮放）、主圖框與足跡圖、軌跡圖相同（左緣 0.91 吋、
+    高 2.98 吋）、字級 8 pt、框線／刻度／圖例外框同 TRAPs、不畫格線，圖例（十一項）置於主圖框正下方；只支援 ``mode="none"``，
+    必須在 :func:`report_style.report_rc` 內呼叫。回傳版面與字級紀錄（舊版面只回傳 ``data_fingerprint``，供「數值未變」比對）。
+    """
 
     import matplotlib
 
@@ -170,8 +182,17 @@ def render_site_figure(
         v = 100.0 * cur
         return np.maximum(v, floor_pct) if yscale == "log" else v
 
-    fig = plt.figure(figsize=CANVAS_IN, dpi=150)
-    ax = fig.add_axes((0.10, 0.12, 0.66, 0.74 if mode == "full" else 0.84))
+    if report_fs8:
+        if mode != "none":
+            raise DomainFractionError("report_fs8 只支援 mode='none'")
+        _rs.require_report_rc(font)
+        fig = plt.figure(figsize=_rs.canvas_in(CURVE_FS8_LEGEND_ROWS), dpi=150)
+        _fw, _fh = fig.get_size_inches()
+        _bx, _by, _bw, _bh = _rs.frame_box_in(CURVE_FS8_FRAME_W_OVER_H, CURVE_FS8_LEGEND_ROWS)
+        ax = fig.add_axes((_bx / _fw, _by / _fh, _bw / _fw, _bh / _fh))
+    else:
+        fig = plt.figure(figsize=CANVAS_IN, dpi=150)
+        ax = fig.add_axes((0.10, 0.12, 0.66, 0.74 if mode == "full" else 0.84))
     grid = curves.grid_days
     k = len(curves.class_ids)
     for i, (cid, cur) in enumerate(zip(curves.class_ids, curves.class_curves, strict=True)):
@@ -191,7 +212,8 @@ def render_site_figure(
         ax.set_yticks(np.arange(0.0, 100.0 + 1e-9, 20.0))
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.0f}"))
     ax.set_xticks(np.arange(0.0, top + 1e-9, 30.0))
-    ax.grid(True, color="#DDDDDD", linewidth=0.5, zorder=1)
+    if not report_fs8:
+        ax.grid(True, color="#DDDDDD", linewidth=0.5, zorder=1)
     tick_kw = _tick_font_kwargs(t, font)
     ax.tick_params(labelsize=10)
     for lab in ax.get_xticklabels() + ax.get_yticklabels():
@@ -201,8 +223,30 @@ def render_site_figure(
     ax.set_xlabel(t.t("回溯時間（天）", "Backtrack time (days)"), fontproperties=font, fontsize=11)
     ax.set_ylabel(t.t("回溯期間仍在追蹤之虛擬質點比例（%）", "Fraction of particles still tracked during backtracking (%)"), fontproperties=font, fontsize=11)
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles[::-1], labels[::-1], loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False,
-              prop=font, fontsize=9)
+    fs8_record: dict[str, Any] | None = None
+    if report_fs8:
+        f8 = _rs.text_font(font)
+        _rs.scale_print_effect(ax.get_children(), _rs.PRINT_SCALE_CURVE)
+        _rs.scale_print_effect(handles, _rs.PRINT_SCALE_CURVE)
+        _rs.style_map_axes(ax, f8)
+        _rs.set_axis_titles(ax, ax.get_xlabel(), ax.get_ylabel(), f8)
+        leg = _rs.framed_legend(fig, ax, handles[::-1], f8, rows=CURVE_FS8_LEGEND_ROWS)
+        fig.canvas.draw()
+        _pos = ax.get_position()
+        fs8_record = {
+            "canvas_in": [float(_fw), float(_fh)],
+            "frame_box_in_left_bottom_w_h": [float(_pos.x0 * _fw), float(_pos.y0 * _fh), float(_pos.width * _fw), float(_pos.height * _fh)],
+            "print_scale_applied_to_linewidth_and_markers": _rs.PRINT_SCALE_CURVE,
+            "grid": False,
+            "legend": _rs.legend_geometry(fig, leg, ax),
+            "legend_labels": [tx.get_text() for tx in leg.get_texts()],
+            "text_audit": _rs.text_audit(fig),
+            "data_fingerprint": _lines_fingerprint(ax),
+        }
+        fs8_record["text_summary"] = _rs.audit_summary(fs8_record["text_audit"])
+    else:
+        ax.legend(handles[::-1], labels[::-1], loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False,
+                  prop=font, fontsize=9)
     if mode == "full":
         fig.suptitle(t.t("回溯期間仍在追蹤之虛擬質點比例", "Fraction of particles still tracked during backtracking"),
                      fontproperties=font, fontsize=15, y=0.975)
@@ -221,7 +265,9 @@ def render_site_figure(
         fig.savefig(stream, format="png", dpi=dpi)
     with path.with_suffix(".svg").open("xb") as stream:
         fig.savefig(stream, format="svg", dpi=dpi)
+    data_fp = _lines_fingerprint(ax)
     plt.close(fig)
+    return fs8_record if fs8_record is not None else {"data_fingerprint": data_fp}
 
 
 THRESHOLD_PCTS = (50.0, 10.0, 1.0, 0.0)
@@ -268,8 +314,13 @@ def build_domain_fraction(
     font_path: Path | None = None,
     case_text: str = "",
     sites: Sequence[str] | None = None,
+    report_fs8: bool = False,
 ) -> list[Path]:
-    """產出整個案例的曲線圖（含文字版與無文字版）、表與 manifest；輸出目錄必須是全新目錄。"""
+    """產出整個案例的曲線圖（含文字版與無文字版）、表與 manifest；輸出目錄必須是全新目錄。
+
+    ``report_fs8=True``（WP-73）：只輸出報告版（見 :func:`render_site_figure`）的無文字版（線性與對數縱軸各一張）到 ``out_notext``；
+    ``out_full`` 只放摘要表與 manifest。
+    """
 
     for d in (out_full, out_notext):
         if d.exists():
@@ -287,12 +338,21 @@ def build_domain_fraction(
     written: list[Path] = []
     out_full.mkdir(parents=True)
     out_notext.mkdir(parents=True)
+    fs8_records: dict[str, Any] = {}
+    import contextlib
+
     for sid, c in curves.items():
         for mode, base in (("full", out_full), ("none", out_notext)):
+            if report_fs8 and mode != "none":
+                continue
             for ys, suffix in (("linear", ""), ("log", "_logy")):
                 p = base / sid / f"domain_fraction_vs_backtrack_time{suffix}.png"
-                render_site_figure(c, p, mode=mode, font=font_res.font_properties, t=t, marks_days=marks_days,
-                                   dpi=dpi, case_text=case_text, yscale=ys)
+                ctx = _rs.report_rc(font_res.font_properties.get_name()) if report_fs8 else contextlib.nullcontext()
+                with ctx:
+                    rec = render_site_figure(c, p, mode=mode, font=font_res.font_properties, t=t, marks_days=marks_days,
+                                             dpi=dpi, case_text=case_text, yscale=ys, report_fs8=report_fs8)
+                if report_fs8:
+                    fs8_records[str(p.relative_to(out_full.parent))] = rec
                 written.append(p)
     write_table(curves, out_full / "inside_fraction_summary.csv", marks_days)
     if sha256_file(dep) != before:
@@ -306,6 +366,9 @@ def build_domain_fraction(
         "sites": {sid: {"particles": c.n_particles, "max_backtrack_days": c.max_duration_days} for sid, c in curves.items()},
         "outputs": {str(p.relative_to(out_full.parent)): sha256_file(p) for p in written},
     }
+    if report_fs8:
+        manifest["report_fs8"] = {"records": fs8_records, "legend_rows": CURVE_FS8_LEGEND_ROWS,
+                                  "canvas_in": list(_rs.canvas_in(CURVE_FS8_LEGEND_ROWS)), "dpi": int(dpi)}
     with (out_full / "manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
     return written

@@ -185,6 +185,7 @@ from .backward_driver import (
 )
 from .display_names import material_display_name_zh
 from . import map_axes as _map_axes
+from . import report_style as _rs
 from .footprint import cell_area_km2_by_row
 from .postprocess import (
     DEFAULT_AZIMUTH_SECTOR_COUNT,
@@ -1898,6 +1899,7 @@ _HO_V2_LEGEND_GAP_IN = 0.12
 _HO_V3_LEFT_IN = 1.08  # WP-71：v3 主圖框左緣（英寸），留給縱軸刻度標籤（如「25.2°N」）與座標軸標題
 _HO_V3_NEED_MARGIN_DEG = 0.04  # WP-71：軸範圍必須在流場範圍外框與軌跡之外多留的餘量（度），避免終止標記被框邊切掉
 _HO_V3_STEP_DEG = 0.2  # WP-71：水平軌跡總覽的刻度間隔（經緯向相同）
+_HO_V4_LEGEND_ROWS = 2  # WP-73：報告版（fs8）圖例列數（畫布高度由此決定，五地點相同）
 
 
 def _save_exclusive(fig, path: Path, *, dpi: int, tight: Any = True) -> None:
@@ -1971,13 +1973,21 @@ def _plot_horizontal_overview(
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    if layout not in ("legacy", "v2", "v3"):
-        raise FiguresError(f"horizontal_overview layout 必須是 legacy、v2 或 v3，收到 {layout!r}")
-    if layout in ("v2", "v3") and figure_text != "none":
+    if layout not in ("legacy", "v2", "v3", "v4"):
+        raise FiguresError(f"horizontal_overview layout 必須是 legacy、v2、v3 或 v4，收到 {layout!r}")
+    if layout in ("v2", "v3", "v4") and figure_text != "none":
         raise FiguresError(f"horizontal_overview layout={layout} 只支援 figure_text='none'")
-    if (layout == "v3") != (axes_unified is not None):
-        raise FiguresError("horizontal_overview：layout=v3 必須且只能在 layout=v3 時提供 axes_unified")
-    fig, ax = plt.subplots(figsize=_HO_V2_FIGSIZE if layout in ("v2", "v3") else (11, 8.5), dpi=150)
+    if (layout in ("v3", "v4")) != (axes_unified is not None):
+        raise FiguresError("horizontal_overview：layout=v3／v4 必須且只能在 layout=v3／v4 時提供 axes_unified")
+    if layout == "v4":
+        # WP-73：報告版（與 TRAPs 規格一致）：畫布寬 6.27 吋＝插入寬度、不縮放，主圖框 2.98 吋高、左緣 0.91 吋，字級 8 pt。
+        _rs.require_report_rc(font)
+        fig = plt.figure(figsize=_rs.canvas_in(_HO_V4_LEGEND_ROWS), dpi=150)
+        _bx, _by, _bw, _bh = _rs.frame_box_in(axes_unified[0].frame_width_over_height, _HO_V4_LEGEND_ROWS)
+        _fw, _fh = fig.get_size_inches()
+        ax = fig.add_axes((_bx / _fw, _by / _fh, _bw / _fw, _bh / _fh))
+    else:
+        fig, ax = plt.subplots(figsize=_HO_V2_FIGSIZE if layout in ("v2", "v3") else (11, 8.5), dpi=150)
     ax.set_facecolor("#eaf3f8")
     _land_lonlat_patches(land_geometries)(ax)
     boundary_lines = _resolve_dashed_open_boundary_lines(site)
@@ -2028,7 +2038,7 @@ def _plot_horizontal_overview(
     for lon, lat in boundary_lines.values():
         all_lon = np.concatenate([all_lon, lon])
         all_lat = np.concatenate([all_lat, lat])
-    if layout == "v3":
+    if layout in ("v3", "v4"):
         from matplotlib.ticker import FuncFormatter
 
         spec, window = axes_unified
@@ -2106,6 +2116,16 @@ def _plot_horizontal_overview(
             frameon=True,
             fontsize=8,
         )
+    legend_v4 = None
+    if layout == "v4":
+        # WP-73：先把線寬、記號大小乘上「印出縮放比」（舊圖 9.48 吋畫布縮至 6.27 吋），再套 TRAPs 的框線、刻度與 8 pt 字級。
+        _scale = _rs.PRINT_SCALE_TRAJ
+        _rs.scale_print_effect(ax.get_children(), _scale)
+        _rs.scale_print_effect(handles, _scale)
+        _f8 = _rs.text_font(font)
+        _rs.style_map_axes(ax, _f8)
+        _rs.set_axis_titles(ax, ax.get_xlabel(), ax.get_ylabel(), _f8)
+        legend_v4 = _rs.framed_legend(fig, ax, handles, _f8, rows=_HO_V4_LEGEND_ROWS)
 
     _add_two_line_title(
         fig,
@@ -2124,8 +2144,9 @@ def _plot_horizontal_overview(
     record: dict[str, Any] | None = None
     if layout == "v2":
         _layout_horizontal_overview_v2(fig, ax, handles, font)
-    elif layout == "v3":
-        _layout_horizontal_overview_v2(fig, ax, handles, font, frame_w_over_h=axes_unified[0].frame_width_over_height)
+    elif layout in ("v3", "v4"):
+        if layout == "v3":
+            _layout_horizontal_overview_v2(fig, ax, handles, font, frame_w_over_h=axes_unified[0].frame_width_over_height)
         fig.canvas.draw()
         record = {
             "xlim": [float(v) for v in ax.get_xlim()],
@@ -2139,11 +2160,50 @@ def _plot_horizontal_overview(
             "grid_lines_drawn": bool(any(gl.get_visible() for gl in ax.get_xgridlines() + ax.get_ygridlines())),
             "frame_size_in": [float(v) for v in (ax.get_position().width * fig.get_size_inches()[0], ax.get_position().height * fig.get_size_inches()[1])],
         }
+        # 畫出的資料指紋（線條座標，與版面無關）：舊版與報告版逐位元相同才表示數值未動。
+        record["data_fingerprint"] = _lines_fingerprint(ax)
+        if layout == "v4":
+            _pos = ax.get_position()
+            _w, _h = fig.get_size_inches()
+            record["report_fs8"] = {
+                "canvas_in": [float(_w), float(_h)],
+                "frame_box_in_left_bottom_w_h": [float(_pos.x0 * _w), float(_pos.y0 * _h), float(_pos.width * _w), float(_pos.height * _h)],
+                "print_scale_applied_to_linewidth_and_markers": _rs.PRINT_SCALE_TRAJ,
+                "legend": _rs.legend_geometry(fig, legend_v4, ax),
+                "legend_labels": [tx.get_text() for tx in legend_v4.get_texts()],
+                "text_audit": _rs.text_audit(fig),
+            }
+            record["report_fs8"]["text_summary"] = _rs.audit_summary(record["report_fs8"]["text_audit"])
     else:
         fig.subplots_adjust(left=0.08, bottom=0.30, right=0.97, top=_title_top_margin(figure_text, full=0.84))
     _save_exclusive(fig, path, dpi=dpi, tight=(layout == "legacy"))
     plt.close(fig)
     return record
+
+
+def _lines_fingerprint(ax) -> dict[str, Any]:
+    """主圖軸上全部線條資料（x、y 座標，float64 位元組，依繪製順序）的 SHA-256 與線條數；與畫布、線寬無關。"""
+
+    import hashlib
+
+    from matplotlib.lines import Line2D
+
+    h = hashlib.sha256()
+    n = 0
+    for ln in ax.get_lines():
+        if not isinstance(ln, Line2D):
+            continue
+        x, y = ln.get_data(orig=True)
+        h.update(np.ascontiguousarray(np.asarray(x, dtype=np.float64)).tobytes())
+        h.update(np.ascontiguousarray(np.asarray(y, dtype=np.float64)).tobytes())
+        n += 1
+    patches = hashlib.sha256()
+    for pt in ax.patches:
+        try:
+            patches.update(np.ascontiguousarray(np.asarray(pt.get_path().vertices, dtype=np.float64)).tobytes())
+        except Exception:  # noqa: BLE001
+            pass
+    return {"lines": n, "sha256": h.hexdigest(), "patches": len(ax.patches), "patches_sha256": patches.hexdigest()}
 
 
 def _layout_horizontal_overview_v2(fig, ax, handles, font, *, frame_w_over_h: float | None = None) -> None:
@@ -2210,11 +2270,11 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str, l
     land_geometries = _load_coastline(config.coastline_path)
     font_resolution = _resolve_font(config.font_path)
     labeler = _Labeler(font_resolution.cjk_available)
-    if layout not in ("v2", "v3"):
-        raise FiguresError(f"build_horizontal_overview_v2 的 layout 必須是 v2 或 v3，收到 {layout!r}")
+    if layout not in ("v2", "v3", "v4"):
+        raise FiguresError(f"build_horizontal_overview_v2 的 layout 必須是 v2、v3 或 v4，收到 {layout!r}")
     axes_spec: _map_axes.AxisSpec | None = None
     axes_windows: dict[str, _map_axes.AxisWindow] = {}
-    if layout == "v3":
+    if layout in ("v3", "v4"):
         m = _HO_V3_NEED_MARGIN_DEG
         needs = {}
         for site in inputs.sites:
@@ -2230,17 +2290,26 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str, l
         site_dir = output_dir / site.site_id
         site_dir.mkdir()
         png_path = site_dir / "horizontal_overview.png"
-        axes_record = _plot_horizontal_overview(
-            site,
-            land_geometries,
-            labeler,
-            font_resolution.font_properties,
-            png_path,
-            config.dpi,
-            config.figure_text,
-            layout=layout,
-            axes_unified=(axes_spec, axes_windows[site.site_id]) if layout == "v3" else None,
-        )
+        if layout == "v4":
+            import contextlib
+
+            _ctx = _rs.report_rc(font_resolution.font_properties.get_name())
+        else:
+            import contextlib
+
+            _ctx = contextlib.nullcontext()
+        with _ctx:
+            axes_record = _plot_horizontal_overview(
+                site,
+                land_geometries,
+                labeler,
+                font_resolution.font_properties,
+                png_path,
+                config.dpi,
+                config.figure_text,
+                layout=layout,
+                axes_unified=(axes_spec, axes_windows[site.site_id]) if layout in ("v3", "v4") else None,
+            )
         if axes_record is not None:
             axes_records[site.site_id] = axes_record
         png_records[f"{site.site_id}/horizontal_overview.png"] = {
@@ -2261,9 +2330,9 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str, l
         "layout": layout,
         "figure_stems": ["horizontal_overview"],
         "sites": [s.site_id for s in inputs.sites],
-        "figsize_in": list(_HO_V2_FIGSIZE),
+        "figsize_in": list(_rs.canvas_in(_HO_V4_LEGEND_ROWS)) if layout == "v4" else list(_HO_V2_FIGSIZE),
         "axes_box_in_left_top_w_h": list(_HO_V2_AXES_BOX_IN),
-        "legend_gap_in": _HO_V2_LEGEND_GAP_IN,
+        "legend_gap_in": _rs.LEGEND_GAP_IN if layout == "v4" else _HO_V2_LEGEND_GAP_IN,
         "dpi": config.dpi,
         "figure_text": config.figure_text,
         "max_trajectories_per_site": config.max_trajectories_per_site,
@@ -2273,7 +2342,7 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str, l
         "output_png_sha256": png_records,
         "output_svg_sha256": svg_records,
     }
-    if layout == "v3":
+    if layout in ("v3", "v4"):
         manifest["axes_unified"] = {
             **_map_axes.window_record(
                 axes_spec,
@@ -2284,6 +2353,102 @@ def build_horizontal_overview_v2(config: NativeFiguresConfig, *, command: str, l
             "need_rule": "全部代表軌跡與開放邊界線之經緯度外框各邊外加 need_margin_deg",
             "drawn": axes_records,
         }
+    with (output_dir / "manifest.json").open("x", encoding="utf-8") as stream:
+        json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    return output_dir
+
+
+def build_footprint_fs8(config: NativeFiguresConfig, *, command: str, report_layout: bool = True) -> Path:
+    """只重畫條件式來源足跡圖（``source_footprint_residence``）的報告版（WP-73，與 TRAPs 規格一致）到全新的輸出目錄。
+
+    輸入、色階、配色、座標軸統一與等深線的處理方式與 :func:`build_native_figures` 相同（共用同一組載入與規劃函式），
+    只改畫布與字級（見 :mod:`report_style`）；輸出每站 ``source_footprint_residence.png／.svg`` 與 ``manifest.json``
+    （含版面、字級稽核、資料指紋）。需要 ``figure_text='none'`` 與 ``axes_unified=True``。
+    ``report_layout=False`` 只供「數值未變」的比對：以舊版面（畫布 9.6×8.6 吋、tight 裁切）畫同一組圖，只取其資料指紋與紀錄。
+    """
+
+    if config.figure_text != "none" or not config.axes_unified:
+        raise FiguresError("build_footprint_fs8 需要 figure_text='none' 且 axes_unified=True")
+    output_dir = config.output_dir
+    if output_dir.exists():
+        raise FiguresError(f"--output-dir 必須是尚不存在的全新目錄，但已存在：{output_dir}")
+    inputs = load_native_figures_inputs(config)
+    land_geometries = _load_coastline(config.coastline_path)
+    font_resolution = _resolve_font(config.font_path)
+    labeler = _Labeler(font_resolution.cjk_available)
+    plan = _plan_footprint_figures(inputs, config)
+    if plan is None or plan.axes_spec is None:
+        raise FiguresError("build_footprint_fs8：輸入沒有足跡產品或座標軸統一規格")
+    output_dir.mkdir(parents=True)
+    records: dict[str, Any] = {}
+    png_records: dict[str, Any] = {}
+    svg_records: dict[str, Any] = {}
+    for site in inputs.sites:
+        site_dir = output_dir / site.site_id
+        site_dir.mkdir()
+        png_path = site_dir / "source_footprint_residence.png"
+        import contextlib
+
+        with (_rs.report_rc(font_resolution.font_properties.get_name()) if report_layout else contextlib.nullcontext()):
+            records[site.site_id] = _plot_source_footprint_residence(
+                site,
+                inputs.footprint[site.site_id],
+                land_geometries,
+                plan.isobaths.get(site.site_id, {}),
+                labeler,
+                font_resolution.font_properties,
+                png_path,
+                config.dpi,
+                config.figure_text,
+                plan.shared_vmax,
+                scale_kind="shared",
+                isobath_levels=config.isobath_levels_m,
+                limits=plan.colorbar_range,
+                cmap_trim=plan.colormap_trim,
+                cmap_scheme=plan.colormap_scheme,
+                axes_unified=(plan.axes_spec, plan.axes_windows[site.site_id]),
+                report_fs8=report_layout,
+            )
+        png_records[f"{site.site_id}/source_footprint_residence.png"] = {
+            "sha256": sha256_file(png_path),
+            "size_bytes": png_path.stat().st_size,
+        }
+        svg_path = png_path.with_suffix(".svg")
+        svg_records[f"{site.site_id}/source_footprint_residence.svg"] = {
+            "sha256": sha256_file(svg_path),
+            "size_bytes": svg_path.stat().st_size,
+        }
+    sources_after = _snapshot_sources(inputs.source_paths)
+    if sources_after != dict(inputs.sources_before):
+        raise FiguresError("輸入檔在繪圖過程中被改動，前後 SHA-256 不一致，fail-closed")
+    manifest = {
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "command": command,
+        "layout": "report_fs8" if report_layout else "legacy_compare",
+        "figure_stems": ["source_footprint_residence"],
+        "sites": [s.site_id for s in inputs.sites],
+        "canvas_in": list(_rs.canvas_in(_FP_FS8_LEGEND_ROWS)) if report_layout else None,
+        "legend_rows": _FP_FS8_LEGEND_ROWS,
+        "dpi": config.dpi,
+        "figure_text": config.figure_text,
+        "font": dict(font_resolution.manifest_record),
+        "inputs_sha256_before": dict(inputs.sources_before),
+        "inputs_sha256_after": sources_after,
+        "output_png_sha256": png_records,
+        "output_svg_sha256": svg_records,
+        "axes_unified": {
+            **_map_axes.window_record(
+                plan.axes_spec,
+                plan.axes_windows,
+                {k: (w.lat_lo + w.lat_hi) / 2.0 for k, w in plan.axes_windows.items()},
+            ),
+            "need_margin_fraction_of_domain_span": plan.axes_need_margin_fraction,
+        },
+        "colorbar_range": list(plan.colorbar_range) if plan.colorbar_range else None,
+        "colormap_scheme": plan.colormap_scheme,
+        "figures": records,
+    }
     with (output_dir / "manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
         stream.write("\n")
@@ -4350,6 +4515,7 @@ def _residence_colormap(
 
 
 _UNIFIED_FOOTPRINT_LEGEND_ROWS = 3
+_FP_FS8_LEGEND_ROWS = 2  # WP-73：報告版足跡圖圖例列數（畫布高度由此決定，五地點相同）
 _UNIFIED_FOOTPRINT_CROP_PAD_IN = 0.1  # 與 savefig(bbox_inches="tight") 預設的 pad_inches 相同
 
 
@@ -4391,6 +4557,7 @@ def _plot_source_footprint_residence(
     cmap_trim: float | None = None,
     cmap_scheme: str | None = None,
     axes_unified: tuple[_map_axes.AxisSpec, _map_axes.AxisWindow] | None = None,
+    report_fs8: bool = False,
 ) -> dict[str, Any]:
     """停留時數密度圖：對數色階（上限取 10 的整數次方、下限為上限的 1/10000）、HDR 50／75／90%、
     底圖與受體。色條與地圖軸同高。回傳繪圖紀錄（含色階越界統計與版面量測）。"""
@@ -4401,8 +4568,20 @@ def _plot_source_footprint_residence(
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
 
-    fig, ax = plt.subplots(figsize=(9.6, 8.6), dpi=150)
-    fig.subplots_adjust(left=0.1, bottom=0.14, right=0.86, top=_title_top_margin(figure_text, full=0.86))
+    if report_fs8:
+        # WP-73：報告版（與 TRAPs 規格一致，見 report_style 模組說明）：畫布寬 6.27 吋、不縮放、不裁切，字級 8 pt。
+        if axes_unified is None or figure_text != "none":
+            raise FiguresError("report_fs8 必須搭配 axes_unified 與 figure_text='none'")
+        _rs.require_report_rc(font)
+        fig = plt.figure(figsize=_rs.canvas_in(_FP_FS8_LEGEND_ROWS), dpi=150)
+        _bx, _by, _bw, _bh = _rs.frame_box_in(axes_unified[0].frame_width_over_height, _FP_FS8_LEGEND_ROWS)
+        _fw, _fh = fig.get_size_inches()
+        ax = fig.add_axes((_bx / _fw, _by / _fh, _bw / _fw, _bh / _fh))
+        f8 = _rs.text_font(font)
+    else:
+        fig, ax = plt.subplots(figsize=(9.6, 8.6), dpi=150)
+        fig.subplots_adjust(left=0.1, bottom=0.14, right=0.86, top=_title_top_margin(figure_text, full=0.86))
+        f8 = font
     density = fp.density_pct_per_km2
     levels = sorted(fp.hdr_threshold_pct_per_km2)
     masks = _hdr_masks(density, fp.hdr_threshold_pct_per_km2)
@@ -4433,32 +4612,50 @@ def _plot_source_footprint_residence(
         vmin=vmin,
         vmax=vmax_used,
         label=t.t("停留時數密度（% 停留時數/km²）", "Residence density (% of particle-hours / km^2)"),
-        font=font,
+        font=f8,
+        **({"width": _rs.CBAR_W_IN / _fw, "pad": _rs.CBAR_PAD_IN / _fw} if report_fs8 else {}),
     )
     lon_c, lat_c = fp.center_coords()
     _draw_hdr_contours(ax, lon_c, lat_c, masks, clip_patch)
 
-    if axes_unified is not None:  # WP-71 ax2：軸標題「經度 (°E)」「緯度 (°N)」
+    if report_fs8:
+        pass  # 軸標題在下方與刻度、框線一併以 8 pt 設定
+    elif axes_unified is not None:  # WP-71 ax2：軸標題「經度 (°E)」「緯度 (°N)」
         ax.set_xlabel(t.t(_map_axes.AXIS_TITLE_LON_ZH, _map_axes.AXIS_TITLE_LON_EN), fontproperties=font)
         ax.set_ylabel(t.t(_map_axes.AXIS_TITLE_LAT_ZH, _map_axes.AXIS_TITLE_LAT_EN), fontproperties=font)
     else:
         ax.set_xlabel(t.t("經度", "Longitude"), fontproperties=font)
         ax.set_ylabel(t.t("緯度", "Latitude"), fontproperties=font)
-    ax.legend(
-        handles=_footprint_legend_handles(
-            t,
-            levels,
-            isobath_levels_drawn=drawn,
-            isobath_levels=isobath_levels,
-            receptor_is_anchor=fp.receptor_anchor is not None,
-            has_sampling_range=fp.receptor_anchor is not None,
-        ),
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.09),
-        ncol=3,
-        prop=font,
-        frameon=True,
+    legend_handles = _footprint_legend_handles(
+        t,
+        levels,
+        isobath_levels_drawn=drawn,
+        isobath_levels=isobath_levels,
+        receptor_is_anchor=fp.receptor_anchor is not None,
+        has_sampling_range=fp.receptor_anchor is not None,
     )
+    legend_fs8 = None
+    if report_fs8:
+        _rs.scale_print_effect(ax.get_children(), _rs.PRINT_SCALE_FOOTPRINT)
+        _rs.scale_print_effect(legend_handles, _rs.PRINT_SCALE_FOOTPRINT)
+        _rs.style_map_axes(ax, f8)
+        _rs.set_axis_titles(
+            ax,
+            t.t(_map_axes.AXIS_TITLE_LON_ZH, _map_axes.AXIS_TITLE_LON_EN),
+            t.t(_map_axes.AXIS_TITLE_LAT_ZH, _map_axes.AXIS_TITLE_LAT_EN),
+            f8,
+        )
+        _rs.style_colorbar(cbar, cbar.ax.yaxis.label.get_text(), f8)
+        legend_fs8 = _rs.framed_legend(fig, ax, legend_handles, f8, rows=_FP_FS8_LEGEND_ROWS)
+    else:
+        ax.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.09),
+            ncol=3,
+            prop=font,
+            frameon=True,
+        )
     total_hours = int(fp.grid["total_particle_hours"])
     # 跨站共用色階為預設，副標不另標示；只有本站自訂色階版本才標明。
     scale_text = "" if scale_kind == "shared" else "｜" + t.t("本研究地點自訂色階", "per-site scale")
@@ -4478,7 +4675,30 @@ def _plot_source_footprint_residence(
         figure_text=figure_text,
     )
     layout = _layout_record(fig, [ax], ax, cbar)
-    crop = _unified_footprint_crop(fig, ax, font) if axes_unified is not None else True
+    if report_fs8:
+        crop = False  # 不裁切、不縮放：畫布即輸出尺寸
+    else:
+        crop = _unified_footprint_crop(fig, ax, font) if axes_unified is not None else True
+    data_fp = {
+        "mesh_array_sha256": __import__("hashlib").sha256(
+            np.ascontiguousarray(np.ma.filled(np.ma.asarray(mesh.get_array(), dtype=np.float64), np.nan)).tobytes()
+        ).hexdigest(),
+        **_lines_fingerprint(ax),
+    }
+    fs8_record = None
+    if report_fs8:
+        _pos = ax.get_position()
+        _cb = cbar.ax.get_position()
+        fs8_record = {
+            "canvas_in": [float(_fw), float(_fh)],
+            "frame_box_in_left_bottom_w_h": [float(_pos.x0 * _fw), float(_pos.y0 * _fh), float(_pos.width * _fw), float(_pos.height * _fh)],
+            "colorbar_box_in_left_bottom_w_h": [float(_cb.x0 * _fw), float(_cb.y0 * _fh), float(_cb.width * _fw), float(_cb.height * _fh)],
+            "print_scale_applied_to_linewidth_and_markers": _rs.PRINT_SCALE_FOOTPRINT,
+            "legend": _rs.legend_geometry(fig, legend_fs8, ax),
+            "legend_labels": [tx.get_text() for tx in legend_fs8.get_texts()],
+            "text_audit": _rs.text_audit(fig),
+        }
+        fs8_record["text_summary"] = _rs.audit_summary(fs8_record["text_audit"])
     _save_exclusive(fig, path, dpi=dpi, tight=crop)
     plt.close(fig)
     record = {
@@ -4499,6 +4719,9 @@ def _plot_source_footprint_residence(
         record["colormap_scheme"] = cmap_scheme
     if axes_unified is not None:
         record["axes_unified"] = True
+    record["data_fingerprint"] = data_fp
+    if fs8_record is not None:
+        record["report_fs8"] = fs8_record
     return record
 
 
