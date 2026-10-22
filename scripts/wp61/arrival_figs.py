@@ -6,6 +6,10 @@
 有文字版與無文字版版面完全相同，無文字版只是不畫標題、季節文字、逐格說明文字，保留座標軸、刻度、圖例。
 y 軸版本：U＝五站共用整齊上下界；S＝各站各自整齊上下界。
 
+WP-74（3-4-3 圖 3–7 字級與字型）：圖內文字改為 8 pt（TRAPs 報告圖規格；畫布寬＝嵌入寬、不縮放，印出即 8 pt），
+框線、刻度依 TRAPs 慣例（左、下框線 1.1 pt #222222；刻度朝外、長 3.5、寬 0.8、pad 2）；畫布寬與高（像素）與前版相同，
+文字變小而多出的高度併入主圖（潮汐強度）面板；資料、範圍、圖例項目與用語不變。
+
 WP-64（3-4-3 圖 3–7）：全年總覽改為寬 6.2667 英寸（＝嵌入 Word 之文字區寬，1:1）、高約 6 英寸、圖內文字 9 pt、中英並列
 （潮汐強度主圖加大；顯著波高、流速兩小圖各自加標題；日期軸以 2025/MM/DD 標示；標記加大並加深色邊框、略透明，
 50 個時刻都在真實位置；圖例只列類別名稱（不附數量），各季色塊頂端標該季大潮／小潮數量；圖例置於下方）。
@@ -34,6 +38,10 @@ T0 = np.datetime64("2025-01-01T00:00:00", "ns").astype("int64")
 DAY_NS = 86_400_000_000_000
 HALF = 13
 
+OV_H_PX = 1753  # WP-74：總覽畫布高（像素）維持前版（1880 x 1753，300 dpi），使 3-4-3 版面不跑動
+OV_H = (OV_H_PX + 0.5) / 300  # 略加半像素，避免浮點截斷少 1 像素
+TRAPS_SPINE_LW, TRAPS_SPINE_COLOR = 1.1, "#222222"  # TRAPs figure_standard／concise_style 之框線
+TRAPS_TICK_LEN, TRAPS_TICK_W, TRAPS_TICK_PAD = 3.5, 0.8, 2.0
 OV_W = 6.2667  # 總覽畫布寬（英寸）＝嵌入 Word 之寬度（1:1）；高度由版面決定（見 render_overview）
 OV_LEFT = 0.74  # 左側留給垂直軸標題（兩行）與刻度字
 OV_HEIGHTS = (2.3, 0.80, 0.80)
@@ -179,7 +187,7 @@ def _setup_mpl():
 
 
 def _style_axes(
-    ax, fonts: Fonts, size: float, *, xlim=None, ylim=None, yticks=None, xticks=None, xticklabels=None
+    ax, fonts: Fonts, size: float, *, xlim=None, ylim=None, yticks=None, xticks=None, xticklabels=None, traps=False
 ) -> None:
     if xlim is not None:
         ax.set_xlim(*xlim)
@@ -194,7 +202,13 @@ def _style_axes(
             xticklabels if xticklabels is not None else [fmt_tick(v) for v in xticks],
             fontproperties=fonts(size),
         )
-    ax.tick_params(length=2.0, width=0.5, pad=1.5)
+    if traps:
+        ax.tick_params(length=TRAPS_TICK_LEN, width=TRAPS_TICK_W, pad=TRAPS_TICK_PAD, direction="out")
+        for sp in ("left", "bottom"):
+            ax.spines[sp].set_linewidth(TRAPS_SPINE_LW)
+            ax.spines[sp].set_edgecolor(TRAPS_SPINE_COLOR)
+    else:
+        ax.tick_params(length=2.0, width=0.5, pad=1.5)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
 
@@ -288,7 +302,7 @@ def season_spans() -> list[tuple[str, float, float]]:
 
 # ── 全年總覽（WP-64：3-4-3 圖 3–7 用；寬＝嵌入 Word 之文字區寬、1:1、圖內文字 9 pt、中英並列）──
 
-FS_OV = 9.0  # 圖內文字字級（pt）。畫布寬 = 嵌入寬，不縮放，故在 Word 裡也是 9 pt。
+FS_OV = 8.0  # 圖內文字字級（pt）。畫布寬 = 嵌入寬，不縮放，故在 Word 裡也是 8 pt（WP-74：9 → 8，同 TRAPs）。
 
 # 圖內用語（WP-64 v3）：依服務建議書（工項 2-4）用詞「有效波高」「流速」「大/小潮」；
 # 圖例、季節、軸名只用中文，僅專有名詞或符號（Hs、m、m/s）保留英文。
@@ -433,6 +447,11 @@ def render_overview(
     rows_h = max(h_l, h_r)
     legend_h = pad_leg + rows_h + 0.04
     H = legend_h + xaxis_h + sum(heights) + 3 * title_h + season_h + 2 * gap + top_margin
+    # WP-74：畫布高固定為 OV_H（像素與前版相同）；字級變小而多出的高度併入主圖（潮汐強度）面板，其餘面板與間距不變
+    extra = OV_H - H
+    assert extra >= -1e-9, (H, OV_H)
+    heights = (heights[0] + extra, *heights[1:])
+    H = OV_H
     fig = plt.figure(figsize=(W, H), dpi=DPI)
     y = legend_h + xaxis_h
     rects = {}
@@ -454,7 +473,7 @@ def render_overview(
     for name, a, b in season_spans():
         ax_s.plot([a, b], [res["ind"]["thresholds"][name]] * 2, zorder=3, **LINE_MEDIAN)
     lo, up, st = axes_plan["strength"]
-    _style_axes(ax_s, fonts, FS_OV, xlim=(0, 365), ylim=(lo, up), yticks=axis_ticks(lo, up, st))
+    _style_axes(ax_s, fonts, FS_OV, xlim=(0, 365), ylim=(lo, up), yticks=axis_ticks(lo, up, st), traps=True)
     ax_s.tick_params(labelbottom=False)
     ax_h.plot(days[sel], s.hs[sel], color="#555555", lw=0.5, zorder=2)
     ax_c.plot(days[sel], s.speed[sel], color="#555555", lw=0.5, zorder=2)
@@ -462,12 +481,12 @@ def render_overview(
     for ax, key, ser in ((ax_h, "hs", s.hs), (ax_c, "speed", s.speed)):
         lo, up, st = axes_plan[key]
         ax.plot([0, 365], [np.nanpercentile(np.where(ym, ser, np.nan), 99)] * 2, zorder=3, **LINE_P99)
-        _style_axes(ax, fonts, FS_OV, xlim=(0, 365), ylim=(lo, up), yticks=axis_ticks(lo, up, st))
+        _style_axes(ax, fonts, FS_OV, xlim=(0, 365), ylim=(lo, up), yticks=axis_ticks(lo, up, st), traps=True)
     ax_h.tick_params(labelbottom=False)
     tpos, tlab = _ov_date_ticks()
     ax_c.set_xticks(tpos)
     ax_c.set_xticklabels(tlab, fontproperties=fonts(FS_OV))
-    ax_c.set_xlabel(BI_XLABEL, fontproperties=fonts(FS_OV), labelpad=2)
+    ax_c.set_xlabel(BI_XLABEL, fontproperties=fonts(FS_OV), labelpad=2)  # TRAPs labelpad 2
     # 縱軸標題：垂直、置於 Y 軸位置（各面板中央），兩行（量名／單位）
     for key, ylab in (("s", YLAB_STRENGTH), ("h", YLAB_HS), ("c", YLAB_SPEED)):
         y0, hh = rects[key]
