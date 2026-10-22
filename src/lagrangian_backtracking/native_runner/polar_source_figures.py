@@ -379,7 +379,7 @@ def build_figure_plans(
             subtitle_zh = (
                 f"圓心為研究地點錨點｜36 個 10° 扇區，正北扇區為 355°–5°，方位自正北順時針｜"
                 f"半徑為來源方位落在該扇區的比例（%），36 扇區合計 100%\n{per_line}｜"
-                f"穿越開放邊界 {crossed:.1f}%｜海岸來源（未穿越者以最終位置方位計入）{coast:.1f}%"
+                f"穿越開放邊界 {crossed:.1f}%｜海岸來源（抵達海岸者以抵達位置方位計入）{coast:.1f}%"
             )
             subtitle_en = (
                 f"Centre: site anchor | 36 sectors of 10 deg, bearing clockwise from north | radius: share in sector (%), sectors sum to 100%\n"
@@ -389,8 +389,8 @@ def build_figure_plans(
                 f"{site_label}，{case_text}。{scope}（{n:,} 顆虛擬質點，{len(members)} 條線；{per_line}）。"
                 "以研究地點錨點為圓心，把每顆虛擬質點的來源點相對錨點的方位角（大圓初始方位角，自正北順時針）分到 36 個"
                 "各寬 10° 的扇區（0°、10°、…、350° 為中心，正北扇區涵蓋 355°–5°），折線的半徑為落在該扇區的比例（%），"
-                "36 個值連成封閉折線，合計 100%。來源點：穿越開放邊界者為開放邊界離開點；未穿越者（達回溯上限而仍在流場範圍內、"
-                "擱淺、沉底等其他所有非穿越狀態）一律以最終位置的方位計入，視為海岸來源，不設距海岸距離門檻。"
+                "36 個值連成封閉折線，合計 100%。來源點：穿越開放邊界者為開放邊界離開點；回溯途中抵達海岸者（狀態碼 8，方法 B）為首次抵達位置，視為海岸來源；其餘未穿越者（沉底、達回溯上限）"
+                "一律以最終位置的方位計入。不設距海岸距離門檻。"
                 f"本圖穿越開放邊界 {crossed:.2f}%、海岸來源 {coast:.2f}%。"
                 f"半徑上限 {top:g}%。比例描述條件式來源足跡的相對分配，不是絕對來源量化，也不可解讀為因果歸因。"
             )
@@ -1600,7 +1600,7 @@ def build_polar_source(config: PolarConfig, *, command: str) -> list[Path]:
             "radius_scale_override_pct": config.radius_max_pct,
             "sector": {"count": ps.N_SECTORS, "width_deg": ps.SECTOR_WIDTH_DEG, "center_azimuths_deg": [10 * k for k in range(36)]},
             "bearing": "great_circle_initial_bearing_from_anchor_clockwise_from_north",
-            "source_rule": "crossed: open-boundary departure point; all non-crossing statuses: final position (coast source); no distance threshold; 36 sectors sum to 100%",
+            "source_rule": "crossed: flow-domain boundary crossing point; reached coast (status 8, method B): first-arrival position (coast source); other non-crossing statuses (deposited, max backtrack): final position; no distance threshold; 36 sectors sum to 100%",
             "crossed_share_pct_by_site": {
                 an.site_id: 100.0 * float(np.count_nonzero(an.sample.kind == ps.KIND_CROSSED)) / an.sample.n_rows
                 for an in analyses[case.case_id]

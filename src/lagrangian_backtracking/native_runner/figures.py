@@ -180,6 +180,7 @@ from .backward_driver import (
     NATIVE_STATUS_MAX_BACKTRACK,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+    NATIVE_STATUS_REACHED_COAST,
     NATIVE_STATUS_STRANDED,
 )
 from .display_names import material_display_name_zh
@@ -256,6 +257,8 @@ _STATUS_LABELS_ZH: Mapping[int, str] = {
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "固定日曆回溯窗之外的沉底",
     # 報告用語（2026-10-21 第三輪）：回溯途中碰到海床而停止追蹤稱「觸底」，以免與「沉底時刻」（回溯起點）混淆。
     NATIVE_STATUS_DEPOSITED: "觸底",
+    # 方法 B（2026-10-22）：回溯途中首次抵達海岸即停止追蹤，稱「抵達海岸」。
+    NATIVE_STATUS_REACHED_COAST: "抵達海岸",
 }
 
 _STATUS_LABELS_EN: Mapping[int, str] = {
@@ -266,6 +269,7 @@ _STATUS_LABELS_EN: Mapping[int, str] = {
     NATIVE_STATUS_FORCING_MISSING: "Forcing data gap",
     NATIVE_STATUS_NUMERICAL_FAILURE: "Numerical failure",
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "Pre-window deposition",
+    NATIVE_STATUS_REACHED_COAST: "Reached coast",
 }
 
 # 固定順序：成功穿越永遠第一欄，其餘六種依 postprocess 既有分類順序排列，讓多張
@@ -278,6 +282,7 @@ _STATUS_ORDER: tuple[int, ...] = (
     NATIVE_STATUS_FORCING_MISSING,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+    NATIVE_STATUS_REACHED_COAST,
 )
 
 _STATUS_COLORS: Mapping[int, str] = {
@@ -288,6 +293,7 @@ _STATUS_COLORS: Mapping[int, str] = {
     NATIVE_STATUS_FORCING_MISSING: "#ff9da6",
     NATIVE_STATUS_NUMERICAL_FAILURE: "#d62728",
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "#b279a2",
+    NATIVE_STATUS_REACHED_COAST: "#e45756",
 }
 
 _STATUS_MARKERS: Mapping[int, str] = {
@@ -298,6 +304,7 @@ _STATUS_MARKERS: Mapping[int, str] = {
     NATIVE_STATUS_FORCING_MISSING: "h",
     NATIVE_STATUS_NUMERICAL_FAILURE: "X",
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "v",
+    NATIVE_STATUS_REACHED_COAST: "D",
 }
 
 FIGURE_STEMS: tuple[str, ...] = (

@@ -5,9 +5,10 @@
 對每一顆虛擬質點，回溯結束狀態 ``final_status_code``：
 
 * 1＝已離開流場區域（flow_domain）開放邊界；``backtrack_duration_seconds`` 就是離開的回溯時間；
-* 其他（2＝達回溯上限仍在域內、4＝沉底停留等）＝整段回溯期間都沒有離開開放邊界。
+* 8＝回溯途中首次抵達海岸（方法 B，後處理覆寫）；``backtrack_duration_seconds`` 就是抵達海岸的回溯時間；
+* 其他（2＝達回溯上限、4＝觸底等）＝整段回溯期間既沒有穿越邊界也沒有抵達海岸。
 
-回溯時間 τ 時仍在流場區域內的比例 ``inside(τ) = 1 - (離開時間 <= τ 的顆數) / 總顆數``。
+回溯時間 τ 時仍在追蹤的比例 ``inside(τ) = 1 - (停止追蹤時間 <= τ 的顆數) / 總顆數``，停止追蹤＝穿越流場範圍邊界（碼 1）或抵達海岸（碼 8）。
 曲線是階梯函式的精確值（不分箱），在 0 ～ ``max_days`` 天的格點上取值；90 天與 180 天（可設定）畫垂直標線。
 每個地點畫「全部」一條粗線與「十類」十條細線（類別顏色與圓形來源方位圖 B 圖的 viridis 取色一致）。
 
@@ -40,6 +41,8 @@ __all__ = [
 ]
 
 EXIT_STATUS_CODE = 1
+STOP_STATUS_CODES = (1, 8)
+"""停止追蹤的狀態碼：1 穿越流場範圍邊界、8 回溯途中抵達海岸（方法 B）。"""
 SECONDS_PER_DAY = 86400.0
 CANVAS_IN = (8.0, 5.2)
 _GRID_STEP_DAYS = 0.25
@@ -50,7 +53,7 @@ class DomainFractionError(RuntimeError):
 
 
 def inside_fraction(
-    duration_s: np.ndarray, status: np.ndarray, grid_days: np.ndarray, *, exit_code: int = EXIT_STATUS_CODE
+    duration_s: np.ndarray, status: np.ndarray, grid_days: np.ndarray, *, exit_codes: Sequence[int] = STOP_STATUS_CODES
 ) -> np.ndarray:
     """``inside(τ)``：``grid_days`` 各點（天）上仍在流場區域內的比例（0～1）。純函式。"""
 
@@ -64,7 +67,7 @@ def inside_fraction(
     if not np.all(np.isfinite(dur)) or np.any(dur < 0.0):
         raise DomainFractionError("backtrack_duration_seconds 必須是有限非負數")
     grid = np.asarray(grid_days, dtype=np.float64)
-    exits = np.sort(dur[st == exit_code] / SECONDS_PER_DAY)
+    exits = np.sort(dur[np.isin(st, tuple(exit_codes))] / SECONDS_PER_DAY)
     exited = np.searchsorted(exits, grid, side="right")
     return 1.0 - exited.astype(np.float64) / float(n)
 
@@ -195,12 +198,12 @@ def render_site_figure(
             lab.set_fontproperties(font)
         lab.set_fontsize(10)
     ax.set_xlabel(t.t("回溯時間（天）", "Backtrack time (days)"), fontproperties=font, fontsize=11)
-    ax.set_ylabel(t.t("仍在流場範圍內的比例（%）", "Fraction still inside flow domain (%)"), fontproperties=font, fontsize=11)
+    ax.set_ylabel(t.t("回溯期間仍在追蹤之虛擬質點比例（%）", "Fraction of particles still tracked during backtracking (%)"), fontproperties=font, fontsize=11)
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(handles[::-1], labels[::-1], loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False,
               prop=font, fontsize=9)
     if mode == "full":
-        fig.suptitle(t.t("回溯時間內仍留在流場區域的比例", "Fraction still inside the flow domain vs backtrack time"),
+        fig.suptitle(t.t("回溯期間仍在追蹤之虛擬質點比例", "Fraction of particles still tracked during backtracking"),
                      fontproperties=font, fontsize=15, y=0.975)
         sub = t.t(f"虛擬質點 {curves.n_particles:,} 顆；紅色虛線為 ", f"{curves.n_particles:,} particles; dashed red at ")
         sub += "、".join(f"{d:g}" for d in marks_days) + t.t(" 天", " d")
@@ -220,14 +223,37 @@ def render_site_figure(
     plt.close(fig)
 
 
+THRESHOLD_PCTS = (50.0, 10.0, 1.0, 0.0)
+"""天數門檻：仍在追蹤比例首次降到此百分比（含）以下的回溯天數；0 表示全部質點都已停止追蹤。"""
+
+
+def first_day_at_or_below(curve: np.ndarray, grid_days: np.ndarray, pct: float) -> float:
+    """``curve``（0～1）首次 <= ``pct``% 的格點天數；整段都沒有則回傳 nan。"""
+
+    hit = np.flatnonzero(100.0 * np.asarray(curve) <= float(pct) + 1e-9)
+    return float(grid_days[hit[0]]) if hit.size else float("nan")
+
+
 def write_table(curves_by_site: Mapping[str, SiteCurves], path: Path, marks_days: Sequence[float]) -> None:
     with path.open("x", newline="", encoding="utf-8") as stream:
         w = csv.writer(stream)
-        w.writerow(["study_site_id", "group", "particles"] + [f"inside_pct_at_{d:g}d" for d in marks_days])
+        w.writerow(
+            ["study_site_id", "group", "particles"]
+            + [f"inside_pct_at_{d:g}d" for d in marks_days]
+            + [f"first_day_at_or_below_{t:g}pct" for t in THRESHOLD_PCTS]
+        )
+
+        def thr(c: SiteCurves, cur: np.ndarray) -> list[str]:
+            out = []
+            for t in THRESHOLD_PCTS:
+                v = first_day_at_or_below(cur, c.grid_days, t)
+                out.append("" if np.isnan(v) else f"{v:.2f}")
+            return out
+
         for sid, c in curves_by_site.items():
-            w.writerow([sid, "all", c.n_particles] + [f"{100.0 * value_at(c.all_curve, c.grid_days, d):.4f}" for d in marks_days])
+            w.writerow([sid, "all", c.n_particles] + [f"{100.0 * value_at(c.all_curve, c.grid_days, d):.4f}" for d in marks_days] + thr(c, c.all_curve))
             for cid, n, cur in zip(c.class_ids, c.class_counts, c.class_curves, strict=True):
-                w.writerow([sid, cid, n] + [f"{100.0 * value_at(cur, c.grid_days, d):.4f}" for d in marks_days])
+                w.writerow([sid, cid, n] + [f"{100.0 * value_at(cur, c.grid_days, d):.4f}" for d in marks_days] + thr(c, cur))
 
 
 def build_domain_fraction(
@@ -275,7 +301,7 @@ def build_domain_fraction(
         "departures_sha256": before,
         "max_days": float(max_days),
         "marks_days": [float(d) for d in marks_days],
-        "exit_status_code": EXIT_STATUS_CODE,
+        "stop_status_codes": list(STOP_STATUS_CODES),
         "sites": {sid: {"particles": c.n_particles, "max_backtrack_days": c.max_duration_days} for sid, c in curves.items()},
         "outputs": {str(p.relative_to(out_full.parent)): sha256_file(p) for p in written},
     }
