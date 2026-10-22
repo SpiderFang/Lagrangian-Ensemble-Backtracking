@@ -115,6 +115,8 @@ def _build(
     isobath_levels=native_figures.ISOBATH_LEVELS_DEFAULT,
     receptor_config: Path | None = None,
     allow_unanchored: bool = True,
+    colorbar_range=None,
+    colormap_trim=None,
 ):
     config = native_figures.NativeFiguresConfig(
         postprocess_dir=postprocess_dir,
@@ -126,6 +128,8 @@ def _build(
         isobath_levels_m=tuple(isobath_levels),
         receptor_config_path=receptor_config,
         allow_unanchored_receptor=receptor_config is None and allow_unanchored,
+        footprint_colorbar_range=colorbar_range,
+        footprint_colormap_trim=colormap_trim,
     )
     native_figures.build_native_figures(config, command="lbt native-figures --test")
     return tmp_path / name
@@ -1149,3 +1153,137 @@ def test_arc_distribution_and_snapshot_use_fixed_limits_for_every_site(tmp_path,
     assert len({(v["lower_limit"], v["upper_limit"]) for v in limits.values()}) == 1
     for v in limits.values():
         assert v["lower_limit"] == pytest.approx(1e-4) and v["upper_limit"] == pytest.approx(10.0)
+
+
+# ── WP-70：明示色階範圍（--footprint-colorbar-range） ────────────────────────
+
+
+def _cfg(tmp_path, **kw):
+    return native_figures.NativeFiguresConfig(
+        postprocess_dir=tmp_path, coastline_path=tmp_path, output_dir=tmp_path / "o", **kw
+    )
+
+
+@pytest.mark.parametrize(
+    "bad", [(1e-3, 1e-3), (1e1, 1e-3), (0.0, 10.0), (-1.0, 10.0), (2e-3, 1e1), (1e-3, 5.0)]
+)
+def test_colorbar_range_option_is_validated(tmp_path, bad):
+    with pytest.raises(native_figures.FiguresError):
+        _cfg(tmp_path, footprint_colorbar_range=bad)
+    assert _cfg(tmp_path, footprint_colorbar_range=(1e-3, 1e1)).footprint_colorbar_range == (1e-3, 10.0)
+    assert _cfg(tmp_path).footprint_colorbar_range is None
+
+
+def test_explicit_colorbar_range_fixes_limits_for_all_sites_and_keeps_default_unchanged(
+    tmp_path, footprint_inputs
+):
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    out_auto = _build(tmp_path, postprocess_dir, coastline, isobaths, name="auto")
+    default = json.loads((out_auto / "manifest.json").read_text(encoding="utf-8"))
+    default_variant = default["footprint_figures"]["residence_color_scale"]["variants"]
+    assert "range_source" not in default_variant["source_footprint_residence"]
+    assert "footprint_colorbar_range" not in default["config"]
+
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths, name="fixed", colorbar_range=(1e-3, 1e1))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    fig = manifest["footprint_figures"]
+    variant = fig["residence_color_scale"]["variants"]["source_footprint_residence"]
+    assert (variant["lower_limit"], variant["upper_limit"]) == (1e-3, 10.0)
+    assert variant["range_source"] == "explicit_option"
+    assert manifest["config"]["footprint_colorbar_range"] == [1e-3, 10.0]
+    assert fig["residence_color_scale"]["colorbar"]["extend"] == "neither"
+    for site in SITES:
+        rec = fig["figures"][f"{site}/source_footprint_residence.png"]
+        assert (rec["vmin"], rec["vmax"], rec["colorbar_range"]) == (1e-3, 10.0, "explicit")
+        bar = rec["layout"]["colorbar"]
+        assert bar["extend"] == "neither"
+        assert bar["ticks"] == pytest.approx([1e-3, 1e-2, 1e-1, 1.0, 10.0])
+        assert bar["tick_labels"][0] == "$10^{-3}$" and bar["tick_labels"][-1] == "$10^{1}$"
+        assert abs(rec["layout"]["top_diff_px"]) <= 1.0 and abs(rec["layout"]["bottom_diff_px"]) <= 1.0
+        # 各站自訂色階版與快照圖不受影響
+        key = f"{site}/source_footprint_residence_site_scale.png"
+        auto_site = default["footprint_figures"]["figures"][key]
+        fixed_site = fig["figures"][key]
+        assert (fixed_site["vmin"], fixed_site["vmax"]) == (auto_site["vmin"], auto_site["vmax"])
+        assert "colorbar_range" not in fixed_site
+    captions = (out / "captions.md").read_text(encoding="utf-8")
+    assert "上限固定為 10^1、下限固定為 10^-3" in captions and "最深色" in captions
+
+
+def test_values_above_explicit_upper_limit_are_drawn_with_deepest_color_and_counted(
+    tmp_path, footprint_inputs
+):
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    # 範圍刻意壓到 1e-9–1e-8（遠低於合成密度）：所有有密度的格都高於上限
+    out = _build(tmp_path, postprocess_dir, coastline, isobaths, name="over", colorbar_range=(1e-9, 1e-8))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    deepest = np.asarray(plt.get_cmap(native_figures._RESIDENCE_CMAP)(1.0)[:3]) * 255
+    for site in SITES:
+        record = manifest["footprint_figures"]["figures"][f"{site}/source_footprint_residence.png"]
+        stats = record["limit_stats"]
+        assert stats["cells_above_upper_limit"] > 0
+        assert stats["mass_fraction_above_upper_limit"] == pytest.approx(1.0)
+        assert stats["cells_below_lower_limit"] == 0
+        png = Image.open(out / site / "source_footprint_residence.png").convert("RGB")
+        img = np.asarray(png).astype(float)
+        near = np.all(np.abs(img - deepest) <= 3, axis=2)
+        assert near.sum() > 50, "高於上限的格應以色階最深色顯示"
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.0, 1.5, float("nan")])
+def test_colormap_trim_option_is_validated(tmp_path, bad):
+    with pytest.raises(native_figures.FiguresError):
+        _cfg(tmp_path, footprint_colormap_trim=bad)
+    assert _cfg(tmp_path, footprint_colormap_trim=0.15).footprint_colormap_trim == 0.15
+    assert _cfg(tmp_path).footprint_colormap_trim is None
+
+
+def test_colormap_trim_cuts_the_lightest_part_only_for_the_shared_residence_figure(
+    tmp_path, footprint_inputs, monkeypatch
+):
+    import matplotlib.axes
+    import matplotlib.pyplot as plt
+
+    seen: list[tuple[float, tuple[float, ...], tuple[float, ...]]] = []
+    original = matplotlib.axes.Axes.pcolormesh
+
+    def spy(self, *args, **kwargs):
+        norm, cmap = kwargs.get("norm"), kwargs.get("cmap")
+        if norm is not None and cmap is not None and getattr(norm, "vmin", None) is not None:
+            seen.append((float(norm.vmin), tuple(cmap(0.0)), tuple(cmap(1.0))))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "pcolormesh", spy)
+    postprocess_dir, coastline, isobaths, _ = footprint_inputs
+    out = _build(
+        tmp_path,
+        postprocess_dir,
+        coastline,
+        isobaths,
+        name="trim",
+        colorbar_range=(1e-3, 1e3),
+        colormap_trim=0.15,
+    )
+    base = plt.get_cmap(native_figures._RESIDENCE_CMAP)
+    is_trimmed = [s[1] == pytest.approx(base(0.15), abs=2e-3) for s in seen]
+    trimmed = [s for s, flag in zip(seen, is_trimmed, strict=True) if flag]
+    others = [s for s, flag in zip(seen, is_trimmed, strict=True) if not flag]
+    assert len(trimmed) == 2 * len(SITES)  # 只有跨站共用版：每地點地圖與色條各一次
+    assert all(s[0] == pytest.approx(1e-3) and s[2] == pytest.approx(base(1.0), abs=2e-3) for s in trimmed)
+    same_family = [s for s in others if s[2] == pytest.approx(base(1.0), abs=2e-3)]  # 同配色的其他圖
+    assert same_family  # 維持完整配色
+    assert all(s[1] == pytest.approx(base(0.0), abs=2e-3) for s in same_family)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    fig = manifest["footprint_figures"]
+    variant = fig["residence_color_scale"]["variants"]["source_footprint_residence"]
+    got = (variant["lower_limit"], variant["upper_limit"], variant["colormap_trim_lower_fraction"])
+    assert got == (1e-3, 1e3, 0.15)
+    assert manifest["config"]["footprint_colormap_trim"] == 0.15
+    rec = fig["figures"][f"{SITES[0]}/source_footprint_residence.png"]
+    assert rec["colormap_trim_lower_fraction"] == 0.15
+    assert rec["layout"]["colorbar"]["ticks"] == pytest.approx([10.0**k for k in range(-3, 4)])  # 7 個刻度
+    site_scale = fig["figures"][f"{SITES[0]}/source_footprint_residence_site_scale.png"]
+    assert "colormap_trim_lower_fraction" not in site_scale

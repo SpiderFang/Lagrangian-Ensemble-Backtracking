@@ -2417,6 +2417,20 @@ def _native_figures_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--footprint-colorbar-range", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+        help=(
+            "WP-70：停留時數密度圖（跨站共用版）明示色階範圍（% 停留時數/km²，兩端須為 10 的整數次方，"
+            "例：1e-3 1e1）。高於上限者以最深色顯示、低於下限者不著色；省略時沿用自動規則"
+        ),
+    )
+    parser.add_argument(
+        "--footprint-colormap-trim", type=float, default=None, metavar="FRACTION",
+        help=(
+            "WP-70：停留時數密度圖（跨站共用版）配色只取 [FRACTION, 1] 區段（裁掉最淺的比例，例：0.15），"
+            "使色階下限附近不接近白色；省略時使用完整配色"
+        ),
+    )
+    parser.add_argument(
         "--allow-unanchored-receptor", action="store_true",
         help=(
             "WP-38 診斷用：允許省略 --config，星號退回後處理由釋放點反推的平均位置；"
@@ -2446,6 +2460,10 @@ def run_native_figures_command(argv: Sequence[str] | None = None) -> int:
         isobath_levels_m=tuple(args.isobath_levels),
         receptor_config_path=args.config,
         allow_unanchored_receptor=args.allow_unanchored_receptor,
+        footprint_colormap_trim=args.footprint_colormap_trim,
+        footprint_colorbar_range=(
+            tuple(args.footprint_colorbar_range) if args.footprint_colorbar_range else None
+        ),
     )
     output_dir = native_figures.build_native_figures(config, command=command)
     report = {

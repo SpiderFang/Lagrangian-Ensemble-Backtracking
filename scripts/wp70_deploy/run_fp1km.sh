@@ -2,6 +2,8 @@
 # WP-70：run09（含斯托克斯漂流）停留時數密度改用 1 km × 1 km 規則公尺網格的重算。
 #   用法：run_fp1km.sh post      後處理（含足跡產品）輸出到 postprocess-fp1km/
 #         run_fp1km.sh figures   用 postprocess-fp1km/ 出圖：figures-fp1km/（full）、figures-fp1km-notext/（none）
+#         run_fp1km.sh figures_c3  同上，但色階固定 1e-3–1e1：figures-fp1km-c3/、figures-fp1km-c3-notext/
+#         run_fp1km.sh figures_sym3  對稱色階比較版：1e-3–1e3、配色裁切 0.15：figures-fp1km-sym3/、figures-fp1km-sym3-notext/
 #         run_fp1km.sh regress   回歸檢查：用既有的 postprocess/（0.02° 網格）以目前程式碼出 none 版圖，
 #                                輸出到 lbt-runs/scratch/wp70-regress/，供與 figures-notext-r3 逐位元比對
 #   後處理與出圖的指令、參數、環境變數逐項沿用 run_formal_v8.sh，只多 --footprint-grid-km 1.0。
@@ -54,6 +56,37 @@ case "$STEP" in
       log "出圖（$MODE）→ $R/$NAME"
       "$LBT" native-figures --postprocess-dir "$PP" --coastline "$COAST" \
         --bathymetry "$ISO" --config "$CFG" --output-dir "$R/$NAME" --figure-text $MODE > "$R/logs/$LOGN" 2>&1 &
+    done
+    wait
+    log "出圖結束"
+    ;;
+  figures_c3)
+    # 色階固定 10^-3–10^1（與 0.02° 舊版報告圖相同）；高於上限者以最深色顯示，低於下限者不著色
+    [ -d "$PP" ] || die "找不到 $PP，請先執行 post"
+    RC=0
+    for MODE in full none; do
+      NAME=figures-fp1km-c3; LOGN=figures-fp1km-c3.log
+      [ $MODE = none ] && { NAME=figures-fp1km-c3-notext; LOGN=figures-fp1km-c3-notext.log; }
+      [ -e "$R/$NAME" ] && die "$R/$NAME 已存在，為避免覆蓋而中止"
+      log "出圖（$MODE，色階 1e-3–1e1）→ $R/$NAME"
+      "$LBT" native-figures --postprocess-dir "$PP" --coastline "$COAST" \
+        --bathymetry "$ISO" --config "$CFG" --output-dir "$R/$NAME" --figure-text $MODE \
+        --footprint-colorbar-range 1e-3 1e1 > "$R/logs/$LOGN" 2>&1 &
+    done
+    wait
+    log "出圖結束"
+    ;;
+  figures_sym3)
+    # 對稱色階比較版：10^-3–10^3（7 個刻度），配色只取 15%–100% 區段；供比較，不進報告
+    [ -d "$PP" ] || die "找不到 $PP，請先執行 post"
+    for MODE in full none; do
+      NAME=figures-fp1km-sym3; LOGN=figures-fp1km-sym3.log
+      [ $MODE = none ] && { NAME=figures-fp1km-sym3-notext; LOGN=figures-fp1km-sym3-notext.log; }
+      [ -e "$R/$NAME" ] && die "$R/$NAME 已存在，為避免覆蓋而中止"
+      log "出圖（$MODE，色階 1e-3–1e3、配色裁切 0.15）→ $R/$NAME"
+      "$LBT" native-figures --postprocess-dir "$PP" --coastline "$COAST" \
+        --bathymetry "$ISO" --config "$CFG" --output-dir "$R/$NAME" --figure-text $MODE \
+        --footprint-colorbar-range 1e-3 1e3 --footprint-colormap-trim 0.15 > "$R/logs/$LOGN" 2>&1 &
     done
     wait
     log "出圖結束"

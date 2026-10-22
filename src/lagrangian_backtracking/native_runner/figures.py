@@ -381,8 +381,32 @@ class NativeFiguresConfig:
     isobath_levels_m: tuple[float, ...] = ISOBATH_LEVELS_DEFAULT
     receptor_config_path: Path | None = None
     allow_unanchored_receptor: bool = False
+    # WP-70：明示指定停留時數密度圖（跨站共用版）的色階範圍 (下限, 上限)，單位 % 停留時數/km²，
+    # 兩端須為 10 的整數次方。None＝沿用自動規則（上限取大於等於最大值的 10 的整數次方、下限為其 1/10000）。
+    footprint_colorbar_range: tuple[float, float] | None = None
+    # WP-70：停留時數密度圖（跨站共用版）配色只取 [trim, 1] 區段（trim＝裁掉最淺的比例，0≤trim<1），
+    # 使色階下限附近不接近白色。None＝完整配色（預設，圖面不變）。
+    footprint_colormap_trim: float | None = None
 
     def __post_init__(self) -> None:
+        if self.footprint_colormap_trim is not None:
+            trim = float(self.footprint_colormap_trim)
+            if not math.isfinite(trim) or not 0.0 <= trim < 1.0:
+                raise FiguresError("footprint_colormap_trim 必須在 [0, 1) 之間")
+            object.__setattr__(self, "footprint_colormap_trim", trim)
+        if self.footprint_colorbar_range is not None:
+            rng = tuple(float(v) for v in self.footprint_colorbar_range)
+            if len(rng) != 2 or any(not math.isfinite(v) or v <= 0 for v in rng) or not rng[0] < rng[1]:
+                raise FiguresError(
+                    "footprint_colorbar_range 必須是 (下限, 上限)，兩者為有限正數且下限小於上限"
+                )
+            if any(abs(math.log10(v) - round(math.log10(v))) > 1e-9 for v in rng):
+                raise FiguresError(
+                    "footprint_colorbar_range 兩端必須是 10 的整數次方（色條每個 10 的次方一個刻度）"
+                )
+            object.__setattr__(
+                self, "footprint_colorbar_range", tuple(10.0 ** round(math.log10(v)) for v in rng)
+            )
         object.__setattr__(self, "postprocess_dir", Path(self.postprocess_dir))
         object.__setattr__(self, "coastline_path", Path(self.coastline_path))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
@@ -4172,6 +4196,8 @@ def _plot_source_footprint_residence(
     *,
     scale_kind: str,
     isobath_levels: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
+    limits: tuple[float, float] | None = None,
+    cmap_trim: float | None = None,
 ) -> dict[str, Any]:
     """停留時數密度圖：對數色階（上限取 10 的整數次方、下限為上限的 1/10000）、HDR 50／75／90%、
     底圖與受體。色條與地圖軸同高。回傳繪圖紀錄（含色階越界統計與版面量測）。"""
@@ -4190,16 +4216,25 @@ def _plot_source_footprint_residence(
     _extent, drawn = _draw_footprint_base_map(
         ax, fp, land_geometries, site_isobaths, isobath_levels=isobath_levels
     )
-    vmin, vmax_used = _residence_color_limits(vmax)
+    # limits 明示時（WP-70）：上下限固定、高於上限者以最深色顯示（clip）；None＝沿用自動規則（位元不變）。
+    vmin, vmax_used = limits if limits is not None else _residence_color_limits(vmax)
     masked = np.ma.masked_less(np.ma.masked_invalid(density), vmin)
-    cmap = plt.get_cmap(_RESIDENCE_CMAP).with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
+    base_cmap = plt.get_cmap(_RESIDENCE_CMAP)
+    if cmap_trim:
+        from matplotlib.colors import LinearSegmentedColormap
+
+        # 只取配色的 [trim, 1] 區段（裁掉最淺的一段），仍取 256 級
+        base_cmap = LinearSegmentedColormap.from_list(
+            f"{_RESIDENCE_CMAP}_trim{cmap_trim:g}", base_cmap(np.linspace(cmap_trim, 1.0, 256)), N=256
+        )
+    cmap = base_cmap.with_extremes(bad=(1.0, 1.0, 1.0, 0.0))
     mesh_x, mesh_y, mesh_c = _mesh_arrays(fp, masked)
     mesh = ax.pcolormesh(
         mesh_x,
         mesh_y,
         mesh_c,
         cmap=cmap,
-        norm=LogNorm(vmin=vmin, vmax=vmax_used),
+        norm=LogNorm(vmin=vmin, vmax=vmax_used, clip=limits is not None),
         shading="flat",
         zorder=2,
     )
@@ -4255,7 +4290,7 @@ def _plot_source_footprint_residence(
     layout = _layout_record(fig, [ax], ax, cbar)
     _save_exclusive(fig, path, dpi=dpi)
     plt.close(fig)
-    return {
+    record = {
         "isobath_levels_m": drawn,
         "vmin": vmin,
         "vmax": vmax_used,
@@ -4264,6 +4299,12 @@ def _plot_source_footprint_residence(
         "limit_stats": _limit_stats(fp, density, vmin, vmax_used),
         "layout": layout,
     }
+    if limits is not None:
+        record["colorbar_range"] = "explicit"
+        record["above_upper_limit_drawn_as"] = "deepest_color"
+    if cmap_trim:
+        record["colormap_trim_lower_fraction"] = float(cmap_trim)
+    return record
 
 
 def _plot_lookback_snapshot(
@@ -4650,6 +4691,8 @@ def _footprint_caption_zh(
     shared_vmax: float,
     site_vmax: float,
     isobath_requested: Sequence[float] = ISOBATH_LEVELS_DEFAULT,
+    colorbar_range: tuple[float, float] | None = None,
+    colormap_trim: float | None = None,
 ) -> str:
     """WP-38 三種新圖的圖說。全部用直述句，不出現程式識別字與檔名。"""
 
@@ -4725,7 +4768,26 @@ def _footprint_caption_zh(
             )
         scale_tail = f"；{scale_zh}。" if scale_zh else "。"
         scale_vmax = shared_vmax if stem == "source_footprint_residence" else site_vmax
-        lo_c, hi_c = _residence_color_limits(scale_vmax)
+        explicit = colorbar_range is not None and stem == "source_footprint_residence"
+        lo_c, hi_c = colorbar_range if explicit else _residence_color_limits(scale_vmax)
+        if explicit:
+            scale_rule_zh = (
+                f"色階為對數色階，上限固定為 {_pow10_text(hi_c)}、下限固定為 {_pow10_text(lo_c)}，"
+                "每個 10 的次方標一個刻度，色條與地圖同高；"
+                "高於上限的網格以色階最深色顯示，"
+                f"低於下限的網格不著色（其數量與所占停留時數比例記錄在 manifest）{scale_tail}"
+            )
+        else:
+            scale_rule_zh = (
+                f"色階為對數色階，上限為最大值向上取整到 10 的整數次方（{_pow10_text(hi_c)}），"
+                f"下限為上限的 1/10000（{_pow10_text(lo_c)}），每個 10 的次方標一個刻度，色條與地圖同高；"
+                f"低於下限的網格不著色（其數量與所占停留時數比例記錄在 manifest）{scale_tail}"
+            )
+        if colormap_trim and stem == "source_footprint_residence":
+            scale_rule_zh += (
+                f"配色（{_RESIDENCE_CMAP}）只取自 {colormap_trim * 100:g}% 起至最深色的區段"
+                "（裁掉最淺的一段）。"
+            )
         body = (
             "停留時數密度圖，呈現回溯過程中這一站全部粒子逐小時所在位置的累計分布。"
             "停留時數的定義：每顆粒子在回溯的每個整點時刻，只要仍在漂流（尚未穿越開放邊界、擱淺、沉底或因其他原因"
@@ -4733,9 +4795,7 @@ def _footprint_caption_zh(
             "各網格的粒子小時數除以本站粒子小時總數，再除以網格面積（km²），單位為「% 停留時數／km²」，"
             "全部網格對面積積分為 100%。"
             f"{grid_zh}"
-            f"色階為對數色階，上限為最大值向上取整到 10 的整數次方（{_pow10_text(hi_c)}），"
-            f"下限為上限的 1/10000（{_pow10_text(lo_c)}），每個 10 的次方標一個刻度，色條與地圖同高；"
-            f"低於下限的網格不著色（其數量與所占停留時數比例記錄在 manifest）{scale_tail}"
+            f"{scale_rule_zh}"
             "圖上的線為高密度區間（Highest Density Region, HDR）50%、75%、90%：依密度由高到低累加網格，"
             f"累計到該比例的停留時數所需的最小面積範圍；本站三個區間的面積依序為 {_hdr_area_text(fp)}。"
             "與舊版邊界核密度圖的差別：舊圖的輸入只有粒子穿越開放邊界的那一個點，這些點全部落在一維的邊界線上，"
@@ -5018,6 +5078,8 @@ class _FootprintFigurePlan:
     shared_vmax: float
     site_vmax: Mapping[str, float]
     isobath_levels_requested: tuple[float, ...] = ISOBATH_LEVELS_DEFAULT
+    colorbar_range: tuple[float, float] | None = None
+    colormap_trim: float | None = None
 
 
 def _isobath_levels_in_extent(
@@ -5073,6 +5135,8 @@ def _plan_footprint_figures(
         shared_vmax=shared_vmax,
         site_vmax=site_vmax,
         isobath_levels_requested=tuple(config.isobath_levels_m),
+        colorbar_range=config.footprint_colorbar_range,
+        colormap_trim=config.footprint_colormap_trim,
     )
 
 
@@ -5103,6 +5167,8 @@ def _build_captions(inputs: NativeFiguresInputs, plan: _FootprintFigurePlan | No
                     shared_vmax=plan.shared_vmax,
                     site_vmax=plan.site_vmax[site.site_id],
                     isobath_requested=plan.isobath_levels_requested,
+                    colorbar_range=plan.colorbar_range,
+                    colormap_trim=plan.colormap_trim,
                 )
     return captions
 
@@ -5446,6 +5512,9 @@ def _build_footprint_figures_manifest(
     """``manifest.json`` 的 ``footprint_figures`` 區塊：色階類型與上下限、等深線狀態。"""
 
     lower = RESIDENCE_COLOR_FLOOR_FRACTION
+    shared_lo, shared_hi = (
+        plan.colorbar_range if plan.colorbar_range is not None else _decade_limits(plan.shared_vmax)
+    )
     return {
         "residence_color_scale": {
             "unit": "% 停留時數/km²",
@@ -5456,14 +5525,40 @@ def _build_footprint_figures_manifest(
             ),
             "cells_below_lower_limit": "transparent",
             "out_of_limit_handling": "metadata_only_no_visual_clipping",
+            **(
+                {
+                    "limit_rule_applies_to": "source_footprint_residence_site_scale",
+                    "out_of_limit_handling_applies_to": "source_footprint_residence_site_scale",
+                }
+                if plan.colorbar_range is not None
+                else {}
+            ),
             "colorbar": {"shape": "rectangular", "extend": "neither"},
             "colormap": _RESIDENCE_CMAP,
             "variants": {
                 "source_footprint_residence": {
                     "scale": "shared_across_sites",
                     "raw_max": plan.shared_vmax,
-                    "upper_limit": _decade_limits(plan.shared_vmax)[1],
-                    "lower_limit": _decade_limits(plan.shared_vmax)[0],
+                    "upper_limit": shared_hi,
+                    "lower_limit": shared_lo,
+                    **(
+                        {"colormap_trim_lower_fraction": plan.colormap_trim}
+                        if plan.colormap_trim
+                        else {}
+                    ),
+                    **(
+                        {
+                            "range_source": "explicit_option",
+                            "limit_rule": (
+                                "明示指定（選項 --footprint-colorbar-range），"
+                                "兩端為 10 的整數次方，每個 10 的次方一個刻度"
+                            ),
+                            "above_upper_limit": "drawn_with_deepest_color_clip",
+                            "below_lower_limit": "transparent",
+                        }
+                        if plan.colorbar_range is not None
+                        else {}
+                    ),
                 },
                 "source_footprint_residence_site_scale": {
                     "scale": "per_site",
@@ -5606,6 +5701,8 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
                         footprint_plan.shared_vmax,
                         scale_kind="shared",
                         isobath_levels=config.isobath_levels_m,
+                        limits=footprint_plan.colorbar_range,
+                        cmap_trim=footprint_plan.colormap_trim,
                     )
                 elif stem == "source_footprint_residence_site_scale":
                     record = _plot_source_footprint_residence(
@@ -5690,6 +5787,16 @@ def build_native_figures(config: NativeFiguresConfig, *, command: str) -> Path:
             "figure_text": config.figure_text,
             "isobath_levels_m": list(config.isobath_levels_m),
             "allow_unanchored_receptor": config.allow_unanchored_receptor,
+            **(
+                {"footprint_colorbar_range": list(config.footprint_colorbar_range)}
+                if config.footprint_colorbar_range is not None
+                else {}
+            ),
+            **(
+                {"footprint_colormap_trim": config.footprint_colormap_trim}
+                if config.footprint_colormap_trim
+                else {}
+            ),
             "receptor_config_basename": config.receptor_config_path.name
             if config.receptor_config_path is not None
             else None,
