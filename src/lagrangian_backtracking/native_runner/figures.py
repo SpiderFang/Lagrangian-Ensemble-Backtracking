@@ -1893,7 +1893,7 @@ _HO_V3_NEED_MARGIN_DEG = 0.04  # WP-71：軸範圍必須在流場範圍外框與
 _HO_V3_STEP_DEG = 0.2  # WP-71：水平軌跡總覽的刻度間隔（經緯向相同）
 
 
-def _save_exclusive(fig, path: Path, *, dpi: int, tight: bool = True) -> None:
+def _save_exclusive(fig, path: Path, *, dpi: int, tight: Any = True) -> None:
     """以排他建立方式落檔（``xb``），輸出目錄若已存在同名檔一律 fail-closed。
 
     WP-25：對齊 OCM-SVD-Analysis 正式成圖規範「PNG 600 dpi ＋ SVG 都出」的
@@ -1904,7 +1904,8 @@ def _save_exclusive(fig, path: Path, *, dpi: int, tight: bool = True) -> None:
     PNG 排他建立失敗時整個函式直接拋例外，不會嘗試寫 SVG。
     """
 
-    bbox = "tight" if tight else None
+    # tight：True＝依內容裁切；False＝不裁切；也可直接給 matplotlib Bbox（英寸）作固定裁切框（WP-71）。
+    bbox = "tight" if tight is True else (None if tight is False else tight)
     with path.open("xb") as stream:
         fig.savefig(stream, format="png", dpi=dpi, bbox_inches=bbox)
     svg_path = path.with_suffix(".svg")
@@ -4341,6 +4342,30 @@ def _residence_colormap(
     return base
 
 
+_UNIFIED_FOOTPRINT_LEGEND_ROWS = 3
+_UNIFIED_FOOTPRINT_CROP_PAD_IN = 0.1  # 與 savefig(bbox_inches="tight") 預設的 pad_inches 相同
+
+
+def _unified_footprint_crop(fig, ax, font):
+    """座標軸統一時的固定裁切框（英寸）：左、右、上依內容（五地點的主圖框、色條與軸標籤位置相同，所以相同），
+    下緣取「圖例列數固定為 3 列」時的下緣（圖例列數因該站畫出的等深線數而異，最多 3 列），
+    使五地點的圖檔尺寸完全相同、主圖框在圖檔內的位置相同；圖例本身仍只畫該站實有的項目。"""
+
+    from matplotlib.legend import Legend
+    from matplotlib.lines import Line2D
+    from matplotlib.transforms import Bbox
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    tight = fig.get_tightbbox(renderer)
+    dummy = [Line2D([], [], color="black", label="高密度區間") for _ in range(3 * _UNIFIED_FOOTPRINT_LEGEND_ROWS)]
+    ref = Legend(ax, dummy, [h.get_label() for h in dummy], loc="upper center", bbox_to_anchor=(0.5, -0.09), ncol=3, prop=font, frameon=True)
+    ref.set_figure(fig)
+    ref_bb = ref.get_window_extent(renderer).transformed(fig.dpi_scale_trans.inverted())
+    pad = _UNIFIED_FOOTPRINT_CROP_PAD_IN
+    return Bbox([[tight.x0 - pad, min(tight.y0, ref_bb.y0) - pad], [tight.x1 + pad, tight.y1 + pad]])
+
+
 def _plot_source_footprint_residence(
     site: SiteData,
     fp: FootprintSiteFigureData,
@@ -4442,7 +4467,8 @@ def _plot_source_footprint_residence(
         figure_text=figure_text,
     )
     layout = _layout_record(fig, [ax], ax, cbar)
-    _save_exclusive(fig, path, dpi=dpi)
+    crop = _unified_footprint_crop(fig, ax, font) if axes_unified is not None else True
+    _save_exclusive(fig, path, dpi=dpi, tight=crop)
     plt.close(fig)
     record = {
         "isobath_levels_m": drawn,
