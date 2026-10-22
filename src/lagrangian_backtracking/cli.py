@@ -2033,6 +2033,15 @@ def _native_postprocess_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--coast-arrival",
+        action="store_true",
+        help=(
+            "WP-72 方法 B：逐顆終止列覆寫。質點回溯途中首次抵達海岸（所在元素有網格海岸邊）即視為找到來源並停止，"
+            "終止狀態碼 8「海岸來源（抵達海岸）」；離開紀錄寫入抵達時刻與位置，軌跡抵達列起凍結並不計停留時數。"
+            "需要 --config、--bathymetry-grid-root 與 --region-flow-domain-map（取各網域網格）。輸入結果檔不改。"
+        ),
+    )
+    parser.add_argument(
         "--trial-subset-from-results",
         action="store_true",
         help=(
@@ -2209,6 +2218,34 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
                     loaded[grid_dir] = native_bathymetry.load_ocm_grid_bathymetry(grid_dir)
                 bathymetry_by_site[site_id] = loaded[grid_dir]
 
+    coast_arrival_override = None
+    if args.coast_arrival:
+        if config is None or args.bathymetry_grid_root is None or args.region_flow_domain_map is None:
+            raise ValueError("--coast-arrival 必須同時提供 --config、--bathymetry-grid-root 與 --region-flow-domain-map")
+        from .native_runner import bathymetry as native_bathymetry
+        from .native_runner import coast_arrival as native_coast_arrival
+
+        region_map_ca = json.loads(Path(args.region_flow_domain_map).read_text(encoding="utf-8"))
+        site_to_region_ca = {
+            str(site): str(region)
+            for site, region in zip(
+                identity_table.study_site_id.tolist(), identity_table.analysis_region_id.tolist(), strict=True
+            )
+        }
+        grid_dirs_ca = native_bathymetry.resolve_site_grid_dirs(site_to_region_ca, region_map_ca, args.bathymetry_grid_root)
+        domain_by_region_ca = {d.analysis_region_id: d for d in config.domains}
+        geometry_cache: dict[tuple[Any, ...], Any] = {}
+        geometry_by_site = {}
+        for site_id, grid_dir in grid_dirs_ca.items():
+            dom = domain_by_region_ca[site_to_region_ca[site_id]]
+            cache_key = (str(grid_dir), tuple(dom.center_lonlat), tuple(dom.bbox_lon_lat))
+            if cache_key not in geometry_cache:
+                geometry_cache[cache_key] = native_coast_arrival.load_coast_geometry(
+                    grid_dir, tuple(dom.center_lonlat), tuple(dom.bbox_lon_lat)
+                )
+            geometry_by_site[site_id] = geometry_cache[cache_key]
+        coast_arrival_override = native_coast_arrival.CoastArrivalOverride(geometry_by_site)
+
     postprocess_config = native_postprocess.PostprocessConfig(
         trajectory_sample_size_per_group=args.trajectory_sample_size_per_group,
         trajectory_sample_seed=args.trajectory_sample_seed,
@@ -2235,6 +2272,7 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         bathymetry_by_site=bathymetry_by_site,
         footprint_land_lonlat=land_lonlat,
         footprint_land_source=land_source,
+        coast_arrival=coast_arrival_override,
     )
 
     for result_path in result_paths:
@@ -2247,6 +2285,20 @@ def run_native_postprocess_command(argv: Sequence[str] | None = None) -> int:
         accumulator.add_batch(unit_id, driver_result)
 
     manifest = accumulator.finalize()
+    if coast_arrival_override is not None:
+        (Path(args.output) / "coast_arrival_summary.json").write_text(
+            json.dumps(
+                {
+                    "method": "B：回溯途中首次抵達海岸（所在元素有網格海岸邊）即視為找到來源",
+                    "status_code": 8,
+                    "by_site": coast_arrival_override.summary(),
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
     report = {
         "output": str(args.output),
         "batch_count": len(manifest.batches),

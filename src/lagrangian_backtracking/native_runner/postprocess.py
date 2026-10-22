@@ -400,6 +400,7 @@ from .backward_driver import (
     NATIVE_STATUS_MAX_BACKTRACK,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+    NATIVE_STATUS_REACHED_COAST,
     NATIVE_STATUS_STRANDED,
     BackwardDriverResult,
 )
@@ -411,6 +412,7 @@ from .footprint import (
     load_land_lonlat,
     summary_table,
 )
+from .coast_arrival import CoastArrivalOverride
 from .particle_input import ParticleIdentityTable
 
 __all__ = [
@@ -454,6 +456,7 @@ _NON_CROSSING_STATUS_CODES: tuple[int, ...] = (
     NATIVE_STATUS_FORCING_MISSING,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+    NATIVE_STATUS_REACHED_COAST,
 )
 
 NON_CROSSING_STATUS_CATEGORY_ZH: Mapping[int, str] = MappingProxyType(
@@ -464,6 +467,7 @@ NON_CROSSING_STATUS_CATEGORY_ZH: Mapping[int, str] = MappingProxyType(
         NATIVE_STATUS_FORCING_MISSING: "流場缺值",
         NATIVE_STATUS_NUMERICAL_FAILURE: "數值失敗",
         NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "固定日曆回溯窗之外的沉底（pre_window_deposition）",
+        NATIVE_STATUS_REACHED_COAST: "海岸來源（抵達海岸）",
     }
 )
 """六種「未穿越關注區域邊界」終止原因的中文分類標籤，鍵為
@@ -1998,8 +2002,11 @@ class PostprocessAccumulator:
         bathymetry_by_site: Mapping[str, Any] | None = None,
         footprint_land_lonlat: Any = None,
         footprint_land_source: Mapping[str, Any] | None = None,
+        coast_arrival: CoastArrivalOverride | None = None,
     ) -> None:
         self._identity_table = identity_table
+        # WP-72 方法 B：逐顆終止列覆寫（首次抵達海岸）。None 時輸出與既有版本逐位元相同。
+        self._coast_arrival = coast_arrival
         self._config = config if config is not None else PostprocessConfig()
         self._lonlat_projector = lonlat_projector
         self._boundary_geometries = boundary_geometries
@@ -2107,6 +2114,19 @@ class PostprocessAccumulator:
             ]
             self._departure_schema = pa.schema([*self._departure_schema, *settle_fields])
             self._local_departure_schema = pa.schema([*self._local_departure_schema, *settle_fields])
+        self._coast_hit_row = np.full(n, -1, dtype=np.int32)
+        self._coast_x_m = np.full(n, np.nan, dtype=np.float64)
+        self._coast_y_m = np.full(n, np.nan, dtype=np.float64)
+        if self._coast_arrival is not None:
+            coast_fields = [
+                pa.field("coast_arrival", pa.bool_(), nullable=False),
+                pa.field("coast_arrival_hour", pa.int32(), nullable=True),
+                pa.field("coast_arrival_x_m", pa.float64(), nullable=True),
+                pa.field("coast_arrival_y_m", pa.float64(), nullable=True),
+                pa.field("coast_arrival_lon_deg", pa.float64(), nullable=True),
+                pa.field("coast_arrival_lat_deg", pa.float64(), nullable=True),
+            ]
+            self._departure_schema = pa.schema([*self._departure_schema, *coast_fields])
         self._depth_quartile = _assign_depth_quartile(
             identity_table, bin_count=self._config.depth_quartile_count
         )
@@ -2177,6 +2197,16 @@ class PostprocessAccumulator:
             raise PostprocessError(f"批次 {batch_id!r} 的 row_particle_index 必須是非空一維陣列")
         if np.any((rows < 0) | (rows >= self._n_total)):
             raise PostprocessError(f"批次 {batch_id!r} 出現超出身分表範圍的 row_particle_index")
+        if self._coast_arrival is not None:
+            # WP-72 方法 B：先把「首次抵達海岸」覆寫進結果，之後所有檢查與產品都用覆寫後的結果。
+            site_ids = np.unique(self._identity_table.study_site_id[rows])
+            if site_ids.size != 1:
+                raise PostprocessError(f"批次 {batch_id!r} 含多個研究地點，方法 B 無法判定海岸幾何")
+            result, hit_row = self._coast_arrival.apply(str(site_ids[0]), result)
+            hit = hit_row >= 0
+            self._coast_hit_row[rows[hit]] = hit_row[hit].astype(np.int32)
+            self._coast_x_m[rows[hit]] = np.asarray(result.final_x_m, dtype=np.float64)[hit]
+            self._coast_y_m[rows[hit]] = np.asarray(result.final_y_m, dtype=np.float64)[hit]
         if np.unique(rows).size != rows.size:
             raise PostprocessError(f"批次 {batch_id!r} 內部出現重複的 row_particle_index")
         if np.any(self._seen[rows]):
@@ -2477,6 +2507,16 @@ class PostprocessAccumulator:
             columns[name] = pa.array(array[rows])
         for name, array, _kind in self._particle_settling_columns:
             columns[name] = pa.array(array[rows])
+        if self._coast_arrival is not None:
+            hit_rows = self._coast_hit_row[rows]
+            hit_mask = hit_rows >= 0
+            columns["coast_arrival"] = pa.array(hit_mask)
+            columns["coast_arrival_hour"] = pa.array(np.where(hit_mask, hit_rows, 0).astype(np.int32), mask=~hit_mask)
+            cx, cy = self._coast_x_m[rows], self._coast_y_m[rows]
+            columns["coast_arrival_x_m"] = pa.array(cx, mask=~hit_mask)
+            columns["coast_arrival_y_m"] = pa.array(cy, mask=~hit_mask)
+            columns["coast_arrival_lon_deg"] = pa.array(np.asarray(lon_array.to_numpy(zero_copy_only=False), dtype=np.float64), mask=~hit_mask)
+            columns["coast_arrival_lat_deg"] = pa.array(np.asarray(lat_array.to_numpy(zero_copy_only=False), dtype=np.float64), mask=~hit_mask)
         table = pa.table(columns, schema=self._departure_schema)
         self._departure_writer.write_table(table)
 
@@ -2987,6 +3027,7 @@ class PostprocessAccumulator:
                     "fraction_pre_window_deposition": (
                         row[f"fraction_status_{NATIVE_STATUS_PRE_WINDOW_DEPOSITION}"]
                     ),
+                    "fraction_reached_coast": row[f"fraction_status_{NATIVE_STATUS_REACHED_COAST}"],
                     "ensemble_member_count": self._ensemble_member_count_by_site[site_id],
                 }
             )
@@ -3003,6 +3044,7 @@ class PostprocessAccumulator:
                 pa.field("fraction_forcing_missing", pa.float64()),
                 pa.field("fraction_numerical_failure", pa.float64()),
                 pa.field("fraction_pre_window_deposition", pa.float64()),
+                pa.field("fraction_reached_coast", pa.float64()),
                 pa.field("ensemble_member_count", pa.int64()),
             ]
             summary_table = pa.table(

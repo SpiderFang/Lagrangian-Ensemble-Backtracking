@@ -527,6 +527,7 @@ __all__ = [
     "NATIVE_STATUS_FORCING_MISSING",
     "NATIVE_STATUS_NUMERICAL_FAILURE",
     "NATIVE_STATUS_PRE_WINDOW_DEPOSITION",
+    "NATIVE_STATUS_REACHED_COAST",
     "NATIVE_STATUS_DESCRIPTIONS",
     "BayTraceModuleHandles",
     "load_baytrace_modules",
@@ -625,6 +626,11 @@ NATIVE_STATUS_PRE_WINDOW_DEPOSITION = 7
 定義。這類粒子從有效來源比例的分母排除，但仍保留在固定的情境／成員 outcome 總分母中單獨計數
 （見 ``native_runner.postprocess`` 對這個狀態碼的分母處理）。"""
 
+NATIVE_STATUS_REACHED_COAST = 8
+"""WP-72 方法 B（後處理覆寫，不是積分器產生）：回溯途中首次抵達海岸（所在元素有網格海岸邊）即視為找到來源，
+該質點的回溯到此結束。見 ``native_runner.coast_arrival``。積分器本身不會輸出這個狀態碼；只有後處理加上
+``--coast-arrival`` 時才會出現。"""
+
 NATIVE_STATUS_DESCRIPTIONS: dict[int, str] = {
     NATIVE_STATUS_ACTIVE: "仍在追蹤中，尚未終止。",
     NATIVE_STATUS_LEFT_FLOW_DOMAIN: "已離開流場區域（flow_domain）開放邊界，正常結束。",
@@ -637,6 +643,7 @@ NATIVE_STATUS_DESCRIPTIONS: dict[int, str] = {
         "固定日曆回溯窗之外的沉底（pre_window_deposition）：沉底時刻早於觀測日往前 H 天，"
         "未進入運算。"
     ),
+    NATIVE_STATUS_REACHED_COAST: "海岸來源（抵達海岸）：回溯途中首次抵達海岸，視為找到來源並停止（後處理覆寫）。",
 }
 
 

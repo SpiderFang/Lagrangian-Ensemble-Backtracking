@@ -76,6 +76,7 @@ from .backward_driver import (
     NATIVE_STATUS_MAX_BACKTRACK,
     NATIVE_STATUS_NUMERICAL_FAILURE,
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION,
+    NATIVE_STATUS_REACHED_COAST,
     NATIVE_STATUS_STRANDED,
 )
 from .display_names import material_display_name_zh
@@ -145,6 +146,7 @@ STATUS_NAME_ZH: Mapping[int, str] = {
     NATIVE_STATUS_FORCING_MISSING: "流場缺值",
     NATIVE_STATUS_NUMERICAL_FAILURE: "數值失敗",
     NATIVE_STATUS_PRE_WINDOW_DEPOSITION: "固定日曆回溯窗之外的沉底",
+    NATIVE_STATUS_REACHED_COAST: "抵達海岸",
 }
 """終止狀態碼 → 中文名稱（狀態碼定義見 ``backward_driver.NATIVE_STATUS_*``）。"""
 
