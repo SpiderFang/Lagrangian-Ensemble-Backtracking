@@ -37,6 +37,7 @@ HALF = 13
 OV_W = 6.2667  # 總覽畫布寬（英寸）＝嵌入 Word 之寬度（1:1）；高度由版面決定（見 render_overview）
 OV_LEFT = 0.74  # 左側留給垂直軸標題（兩行）與刻度字
 OV_HEIGHTS = (2.3, 0.80, 0.80)
+OV_LEGEND_HL = 2.4  # 總覽圖例符號框長（以字級為單位）
 OV_YLAB_X = 0.17  # 縱軸標題中心離畫布左緣（英寸）
 OV_GAP = 0.13  # 面板間距（縱軸標題移到 Y 軸後，面板上方不再放標題）
 OV_TITLE = 0.24  # 有文字版上方標題區；無文字版畫布不含此區（圖內位置不變）
@@ -371,7 +372,7 @@ def _ov_legend_sets(rows: list[dict]):
 def _ov_make_legends(fig, fonts: Fonts, rows: list[dict]):
     seasons, left_col, right_col = _ov_legend_sets(rows)
     common = dict(
-        prop=fonts(FS_OV), frameon=False, handlelength=2.4, labelspacing=0.18, borderaxespad=0, borderpad=0,
+        prop=fonts(FS_OV), frameon=False, handlelength=OV_LEGEND_HL, labelspacing=0.18, borderaxespad=0, borderpad=0,
         handletextpad=0.5, loc="lower left",
     )
     legs = [
@@ -383,6 +384,26 @@ def _ov_make_legends(fig, fonts: Fonts, rows: list[dict]):
     fig.canvas.draw()
     rend = fig.canvas.get_renderer()
     return [(lg, lg.get_window_extent(rend).width / fig.dpi, lg.get_window_extent(rend).height / fig.dpi) for lg in legs]
+
+
+def _ov_ink_offset_in(handles: list, handlelength: float, size_pt: float) -> float:
+    """圖例欄中最左側可見墨跡離圖例框左緣的距離（吋）。
+
+    線條類圖例符號從符號框最左端畫起（距離 0）；點狀符號置於符號框正中央，墨跡左緣＝框中心減去標記左伸量
+    （標記路徑最左點 × 標記大小＋邊框線寬的一半）。取全欄最小者，供把「最左側墨跡」對齊主圖軸框左緣。
+    """
+    from matplotlib.markers import MarkerStyle
+
+    box = handlelength * size_pt
+    best = box
+    for h in handles:
+        if h.get_linestyle() not in ("None", "none", "", " "):
+            best = 0.0
+            continue
+        mk = MarkerStyle(h.get_marker())
+        xs = mk.get_path().transformed(mk.get_transform()).vertices[:, 0]
+        best = min(best, box / 2.0 - (-xs.min() * h.get_markersize() + h.get_markeredgewidth() / 2.0))
+    return best / 72.0
 
 
 def _ov_date_ticks() -> tuple[np.ndarray, list[str]]:
@@ -495,8 +516,13 @@ def render_overview(
         fig.text(left / W, 1 - 0.05 / H, f"{cnt['total']} 個到達時間", ha="left", va="top", fontproperties=fonts(FS_OV, "bold"))
     legs = _ov_make_legends(fig, fonts, rows)
     (lg_l, w_l, h_l), (lg_r, w_r, h_r) = legs
-    x_l = 0.04
-    x_r = x_l + w_l + max(0.25, (W - 0.08 - w_l - w_r) / 2.0)
+    # 圖例與主圖對齊：左欄最左側標記的墨跡左緣＝主圖軸框（左脊線）的左緣；右欄最左側墨跡起於主圖水平中央。
+    _, ink_l, ink_r = _ov_legend_sets(rows)
+    d_l = _ov_ink_offset_in(ink_l, OV_LEGEND_HL, FS_OV)
+    d_r = _ov_ink_offset_in(ink_r, OV_LEGEND_HL, FS_OV)
+    spine_half = ax_c.spines["left"].get_linewidth() / 72.0 / 2.0
+    x_l = left - spine_half - d_l
+    x_r = left + (W - left - right) / 2.0 - d_r
     lg_l.set_bbox_to_anchor((x_l / W, (pad_leg + (rows_h - h_l)) / H), transform=fig.transFigure)
     lg_r.set_bbox_to_anchor((x_r / W, (pad_leg + (rows_h - h_r)) / H), transform=fig.transFigure)
     _save(fig, out)
