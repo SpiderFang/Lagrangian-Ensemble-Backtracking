@@ -1888,7 +1888,7 @@ def _site_subtitle(site: SiteData, t: _Labeler, *, extra: str = "") -> str:
 _HO_V2_FIGSIZE = (9.48, 6.81)
 _HO_V2_AXES_BOX_IN = (0.10, 0.12, 9.79, 5.695)  # 左緣、上緣距離、寬、高
 _HO_V2_LEGEND_GAP_IN = 0.12
-_HO_V3_LEFT_IN = 1.0  # WP-71：v3 主圖框左緣（英寸），留給縱軸刻度標籤（如「25.2°N」）與座標軸標題
+_HO_V3_LEFT_IN = 1.08  # WP-71：v3 主圖框左緣（英寸），留給縱軸刻度標籤（如「25.2°N」）與座標軸標題
 _HO_V3_NEED_MARGIN_DEG = 0.04  # WP-71：軸範圍必須在流場範圍外框與軌跡之外多留的餘量（度），避免終止標記被框邊切掉
 _HO_V3_STEP_DEG = 0.2  # WP-71：水平軌跡總覽的刻度間隔（經緯向相同）
 
