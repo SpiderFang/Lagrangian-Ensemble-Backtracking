@@ -18,13 +18,36 @@ def test_pct2_half_up_from_integer_counts() -> None:
     assert sf.pct2(100000, 100000) == "100.00"
 
 
-def test_side_label_rules() -> None:
-    assert sa.side_label(0, 100000) == "0.00"
-    assert sa.side_label(4, 100000) == "<0.01"  # 有顆數但四捨五入為 0.00
-    assert sa.side_label(5, 100000) == "0.01"
-    assert sa.side_label(23158, 100000) == "23.16"
-    assert sa.side_label(23158, 100000, decimals=0) == "23"
-    assert sa.side_label(500, 100000, decimals=0) == "1"  # 0.5 → 1（half-up）
+def test_side_text_rules() -> None:
+    assert sa.side_text(0, Decimal("0.00")) == "0.00"
+    assert sa.side_text(4, Decimal("0.00")) == "<0.01"  # 有顆數但顯示值為 0.00
+    assert sa.side_text(5, Decimal("0.01")) == "0.01"
+    assert sa.side_text(23158, Decimal("23.16")) == "23.16"
+    assert sa.side_text(23158, Decimal("23"), decimals=0) == "23"
+
+
+def test_largest_remainder_sums_exactly() -> None:
+    # 南灣全年四邊：逐邊四捨五入（half-up）合計 68.93，但穿越比例為 68.91；最大餘數法要恰為 68.91
+    c = {"N": 10675, "E": 5105, "S": 9479, "W": 43655}
+    v = sa.largest_remainder(c, sum(c.values()), 100000, 2)
+    assert v == {"N": Decimal("10.67"), "E": Decimal("5.10"), "S": Decimal("9.48"), "W": Decimal("43.66")}
+    assert sum(v.values()) == Decimal("68.91")
+    assert sum(Decimal(sf.pct2(x, 100000)) for x in c.values()) == Decimal("68.93")
+    # 0 位小數：目標為 round(總比例)
+    v0 = sa.largest_remainder(
+        {"N": 2500, "E": 100, "S": 4500, "W": 400}, 7500, 10000, 0
+    )  # 25.00、1.00、45.00、4.00
+    assert sum(v0.values()) == 75
+    v1 = sa.largest_remainder(
+        {"N": 2349, "E": 51, "S": 4551, "W": 349}, 7300, 10000, 0
+    )  # 23.49、0.51、45.51、3.49
+    assert sum(v1.values()) == 73 and v1["S"] == 46 and v1["E"] == 1 and v1["N"] == 23 and v1["W"] == 3
+    # 單一值仍是 half-up
+    assert sf.pct2(10675, 100000) == "10.68"
+
+
+def test_circled_numbers() -> None:
+    assert sa.circled(1) == "①" and sa.circled(3) == "③"
 
 
 def test_merge_stretches_threshold_cap_and_wraparound() -> None:

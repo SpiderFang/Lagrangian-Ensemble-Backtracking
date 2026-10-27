@@ -1,5 +1,11 @@
 # ruff: noqa: E501
-"""WP-75：單一地點的全部圖（單張、季節、大小潮、十類；邊界與海岸）與註記表格列。"""
+"""WP-75：單一地點的全部圖（單張、季節、大小潮、十類；邊界與海岸）與註記表格列。
+
+* 邊界單張：邊小計在邊界內側、集中段括號在外側。
+* 邊界多面板：面板標題第三行寫四邊小計（整數、最大餘數法）、不畫括號。
+* 海岸單張：引線＋％；連江另有南竿北竿放大小圖，兩個集中段的引線標籤放在小圖內。
+* 海岸多面板（季節、大小潮）：小圈號 ①②③ 標在開放海面，數值寫在面板標題最後一行；十類不標。
+"""
 
 from __future__ import annotations
 
@@ -11,37 +17,40 @@ import numpy as np
 from lagrangian_backtracking.native_runner import segprob_annot as SA
 from lagrangian_backtracking.native_runner import segprob_figures as SF
 
-SEASON_ORDER = ("DJF", "MAM", "JJA", "SON")
-TIDE_ORDER = ("spring_proxy", "neap_proxy")
+SEASON_ORDER = ("DJF", "MAM", "JJA", "SON")  # 同舊版圓形圖與主檔文字的順序：冬、春、夏、秋
+TIDE_ORDER = ("spring_proxy", "neap_proxy")  # 大潮、小潮
 KIND_ZH = {"boundary": "穿越", "coast": "海岸來源"}
-INSET_LC = (119.9, 120.2, 26.1, 26.3)  # 連江：南竿、北竿放大插圖視窗
+INSET_HINT_LC = (119.88, 120.06, 26.10, 26.26)  # 連江：南竿＋北竿所在範圍（用來找上色線段）
+INSET_MIN_MAG = 4.0  # 放大小圖至少 4 倍
 
-# 多面板註記模式：annot＝面板內註記（邊小計＋集中段）；title＝邊小計寫在面板標題、不畫集中段；none＝只有比例
-DEFAULT_PANEL_MODE = {
-    "boundary": {"season": "title", "tide": "title", "class": "title"},
-    "coast": {"season": "annot", "tide": "annot", "class": "none"},
-}
+
+def inset_window_for(sd, dr, seg_counts, hint=INSET_HINT_LC, pad_deg=0.006):
+    """南竿＋北竿放大小圖視窗：包住提示範圍內全部上色海岸線與星號，外加邊距，再向外取到 0.01°。"""
+
+    pts = []
+    for i, parts in enumerate(dr.c_lines):
+        if seg_counts[i] <= 0:
+            continue
+        allp = np.vstack(parts)
+        c = allp.mean(axis=0)
+        if hint[0] <= c[0] <= hint[1] and hint[2] <= c[1] <= hint[3]:
+            pts.append(allp)
+    pts.append(np.array([sd.anchor]))
+    xy = np.vstack(pts)
+    lo = np.floor((xy.min(axis=0) - pad_deg) * 100) / 100
+    hi = np.ceil((xy.max(axis=0) + pad_deg) * 100) / 100
+    return (float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]))
+
+
+def _in_window(lonlat, w):
+    return w[0] <= lonlat[0] <= w[1] and w[2] <= lonlat[1] <= w[3]
 
 
 def render_site(
-    sd,
-    dr,
-    grp,
-    label,
-    mats,
-    bcount,
-    ccount,
-    gn,
-    out: Path,
-    font,
-    *,
-    panel_mode=None,
-    only=None,
-    lienchiang_inset=True,
-):
+    sd, dr, grp, label, mats, bcount, ccount, gn, out: Path, font, *, only=None, lienchiang_inset=True,
+):  # fmt: skip
     """輸出該地點的全部圖；回傳 ``(manifest 紀錄, 集中段表格列)``。``only`` 可限定 (kind, name) 清單。"""
 
-    mode = panel_mode or DEFAULT_PANEL_MODE
     out.mkdir(parents=True, exist_ok=True)
     recs: dict = {}
     stretch_rows: list = []
@@ -51,30 +60,12 @@ def render_site(
         cnt = bcount[k] if kind == "boundary" else ccount[k]
         return cnt, SF.pct2(int(cnt.sum()), gn[k])
 
-    def ann(kind, k, stretches=True, sides=True):
-        cnt, _ = tot(k, kind)
-        n = gn[k]
-
-        def f(ax, fig, f8):
-            if kind == "boundary":
-                r = SA.annotate_boundary(
-                    ax, fig, sd, cnt, side_cnt[k], n, font=f8, stretches=stretches, side_labels=sides
-                )
-            else:
-                r = (
-                    SA.annotate_coast(
-                        ax, fig, sd, cnt, n, font=f8, land_ll=dr.land_union, star_lonlat=sd.anchor
-                    )
-                    if stretches
-                    else {"stretches": []}
-                )
-            for rank, s in enumerate(r["stretches"], start=1):
-                stretch_rows.append([sd.site_id, kind, k, rank, s["pct"], s["count"], len(s["segments"]),
-                                     f"{s['start_lonlat'][0]:.4f}", f"{s['start_lonlat'][1]:.4f}",
-                                     f"{s['end_lonlat'][0]:.4f}", f"{s['end_lonlat'][1]:.4f}", s["segments"][0], s["segments"][-1]])  # fmt: skip
-            return r
-
-        return f
+    def rows_from(kind, k, rec, where):
+        for rank, s in enumerate(rec["stretches"], start=1):
+            stretch_rows.append([sd.site_id, kind, k, rank, s["pct"], s["count"], len(s["segments"]),
+                                 f"{s['start_lonlat'][0]:.4f}", f"{s['start_lonlat'][1]:.4f}",
+                                 f"{s['end_lonlat'][0]:.4f}", f"{s['end_lonlat'][1]:.4f}", s["segments"][0], s["segments"][-1],
+                                 s.get("marker", ""), where])  # fmt: skip
 
     for kind in ("boundary", "coast"):
         for name, keys, layout in (
@@ -87,51 +78,90 @@ def render_site(
                 continue
             if name == "all":
                 cnt, t = tot("all", kind)
+                n = gn["all"]
                 total_text = f"{'穿越比例' if kind == 'boundary' else '海岸來源比例'} {t}%"
-                kw = {}
-                if sd.site_id == "lienchiang" and kind == "coast" and lienchiang_inset:
-                    kw = {"inset_window": INSET_LC}
+                kw: dict = {}
+                if kind == "boundary":
+
+                    def ann(ax, fig, f8, avoid, cnt=cnt, n=n):
+                        r = SA.annotate_boundary(
+                            ax, fig, sd, dr, cnt, side_cnt["all"], n, font=f8, avoid=avoid
+                        )
+                        rows_from("boundary", "all", r, "main")
+                        return r
+
+                else:
+                    st = SA.coast_stretches(sd, cnt, n)
+                    iw = None
+                    if sd.site_id == "lienchiang" and lienchiang_inset:
+                        iw = inset_window_for(sd, dr, cnt)
+                        kw = {"inset_window": iw, "inset_min_mag": INSET_MIN_MAG}
+                    st_in = [s for s in st if iw is not None and _in_window(SA.stretch_mid_lonlat(sd, s), iw)]
+                    st_main = [s for s in st if s not in st_in]
+
+                    def ann(ax, fig, f8, avoid, cnt=cnt, n=n, st_main=st_main):
+                        r = SA.annotate_coast_labels(
+                            ax, fig, sd, dr, cnt, st_main, n, font=f8, star_lonlat=sd.anchor, avoid=avoid
+                        )
+                        rows_from("coast", "all", r, "main")
+                        return r
+
+                    if st_in:
+
+                        def ann_in(iax, fig, f8, avoid, cnt=cnt, n=n, st_in=st_in):
+                            r = SA.annotate_coast_labels(
+                                iax, fig, sd, dr, cnt, st_in, n, font=f8, star_lonlat=sd.anchor, avoid=avoid
+                            )
+                            rows_from("coast", "all", r, "inset")
+                            return r
+
+                        kw["inset_annotate"] = ann_in
                 recs[f"{kind}_all"] = SF.render_single(
                     sd,
                     dr,
                     kind,
-                    cnt / gn["all"] * 100.0,
+                    cnt / n * 100.0,
                     total_text,
                     out / f"{kind}_all.png",
                     font,
-                    annotate=ann(kind, "all"),
+                    annotate=ann,
                     **kw,
                 )
-                if kw:
-                    recs[f"{kind}_all_noinset"] = SF.render_single(
-                        sd,
-                        dr,
-                        kind,
-                        cnt / gn["all"] * 100.0,
-                        total_text,
-                        out / f"{kind}_all_noinset.png",
-                        font,
-                        annotate=ann(kind, "all"),
-                    )
                 continue
-            m = mode[kind][name]
             lay = layout
             panels = []
             for k in keys:
                 cnt, t = tot(k, kind)
-                title = f"{label[k]}\n{KIND_ZH[kind]} {t}%"
+                n = gn[k]
+                base = f"{label[k]}\n{KIND_ZH[kind]} {t}%"
                 annotate = None
-                if kind == "boundary" and m == "title":
-                    parts = SA.side_title_string(sd, side_cnt[k], gn[k])
+                variants: tuple[str, ...] = ()
+                title = base
+                if kind == "boundary":
+                    vs = SA.side_title_variants(sd, side_cnt[k], n)
                     if name == "class":
-                        title += "\n" + "｜".join(parts[:2]) + "\n" + "｜".join(parts[2:])
+                        variants = tuple(f"{base}\n{v}" for v in vs)
+                        title = variants[0]
                     else:
-                        title += "\n" + "｜".join(parts)
-                elif m == "annot":
-                    annotate = ann(kind, k)
-                panels.append(SF.Panel(title, cnt / gn[k] * 100.0, annotate))
-            if kind == "boundary" and m == "title":
-                lay = replace(lay, title_h=0.58 if name == "class" else 0.45)
+                        title = f"{base}\n{vs[0]}"
+                elif name in ("season", "tide"):
+                    st = SA.coast_stretches(sd, cnt, n)
+                    if st:
+                        title = f"{base}\n{SA.marker_title_line(sd, st, n)}"
+
+                        def annotate(ax, fig, f8, cnt=cnt, n=n, st=st, k=k, lay=lay):
+                            r = SA.annotate_coast_markers(
+                                ax, fig, sd, dr, cnt, st, n, font=f8, star_lonlat=sd.anchor,
+                                star_size=lay.star_size, lw_pt=SF.LW_COAST * lay.lw_scale,
+                            )  # fmt: skip
+                            rows_from("coast", k, r, "panel")
+                            return r
+
+                panels.append(SF.Panel(title, cnt / n * 100.0, annotate, variants))
+            if kind == "boundary":  # noqa: SIM114
+                lay = replace(lay, title_h=0.46)
+            elif name in ("season", "tide"):
+                lay = replace(lay, title_h=0.46)
             fname = f"{kind}_{name}.png"
             recs[f"{kind}_{name}"] = SF.render_panels(sd, dr, kind, panels, lay, out / fname, font)
     return recs, stretch_rows

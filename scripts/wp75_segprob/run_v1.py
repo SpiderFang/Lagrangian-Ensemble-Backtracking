@@ -10,6 +10,7 @@ import csv
 import json
 import sys
 from datetime import UTC, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,6 @@ from lagrangian_backtracking.native_runner.display_names import material_display
 SEASON_ORDER = ("DJF", "MAM", "JJA", "SON")  # 同舊版圓形圖的順序
 TIDE_ORDER = ("spring_proxy", "neap_proxy")
 KIND_ZH = {"boundary": "穿越", "coast": "海岸來源"}
-INSET_LC = (119.85, 120.15, 26.05, 26.25)  # 連江：南竿、北竿放大插圖視窗
 
 
 def build_groups(cols: dict) -> tuple[dict[str, np.ndarray], dict[str, str], list[str]]:
@@ -85,7 +85,8 @@ def main(fig_root: Path, tab_dir: Path) -> int:
         "percent_rule": "整數顆數 ÷ 分母 × 100，Decimal ROUND_HALF_UP 到小數 2 位",
         "figures": {},
     }
-    group_rows, verification, stretch_all, side_rows = [], [], [], []
+    group_rows, verification, stretch_all, side_rows, lr_rows = [], [], [], [], []
+    collision_log: list = []
     for sid in C.SITES:
         sd = C.build_site(sid, land, regions, sites, anchors)
         sd.cols = C.load_site_columns(sid)
@@ -169,12 +170,38 @@ def main(fig_root: Path, tab_dir: Path) -> int:
         recs, srows = M.render_site(sd, dr, grp, label, mats, bcount, ccount, gn, fig_root / sid, font)
         manifest["figures"][sid] = recs
         stretch_all.extend(srows)
-        # 四邊合計（各分組）
+
+        def _collect(x, path):
+            if isinstance(x, dict):
+                for c in x.get("collisions", []) or []:
+                    collision_log.append([sid, path, c["label"], ",".join(c["violations"])])  # noqa: B023
+                for kk, y in x.items():
+                    if kk != "collisions":
+                        _collect(y, path)
+            elif isinstance(x, list):
+                for y in x:
+                    _collect(y, path)
+
+        for fname, rec_ in recs.items():
+            _collect(rec_, fname)
+        # 四邊合計（各分組）：逐邊四捨五入值與最大餘數法（圖上顯示值）；圖上顯示的位數：全年 2 位、其他分組 0 位
+        geoms_sea = SA.side_sea_geoms(sd)
         for k, m in grp.items():
             sc = SA.side_counts(sd, np.where(m, sd.b_s, np.nan))
-            side_rows.append(
-                [sid, k, label[k], gn[k]] + [v for kk in "NESW" for v in (sc[kk], SF.pct2(sc[kk], gn[k]))]
-            )
+            v2 = SA.side_values(sc, gn[k], 2)
+            v0 = SA.side_values(sc, gn[k], 0)
+            row = [sid, k, label[k], gn[k]]
+            for kk in "NESW":
+                h0 = int(
+                    (Decimal(sc[kk]) * 100 / Decimal(gn[k])).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+                )
+                row += [sc[kk], SF.pct2(sc[kk], gn[k]), f"{v2[kk]:.2f}", h0, f"{v0[kk]:.0f}"]
+                dec = 2 if k == "all" else 0
+                plain = SF.pct2(sc[kk], gn[k]) if dec == 2 else str(h0)
+                shown = f"{v2[kk]:.2f}" if dec == 2 else f"{v0[kk]:.0f}"
+                if shown != plain and geoms_sea[kk][1].length >= SA.SIDE_SEA_MIN_LENGTH_M:
+                    lr_rows.append([sid, k, label[k], kk, sc[kk], dec, plain, shown])
+            side_rows.append(row)
         print(sid, "figures done", flush=True)
         # 所有上色分段必須在可見範圍內（窗口）
         w = SF.WINDOWS[sid]
@@ -224,6 +251,8 @@ def main(fig_root: Path, tab_dir: Path) -> int:
             "end_lat",
             "first_segment",
             "last_segment",
+            "marker",
+            "where",
         ],
         stretch_all,
     )
@@ -242,9 +271,36 @@ def main(fig_root: Path, tab_dir: Path) -> int:
             "S_pct",
             "W_count",
             "W_pct",
+        ]
+        if False
+        else [
+            "site",
+            "group",
+            "label",
+            "n",
+            *[
+                f"{kk}_{c}"
+                for kk in "NESW"
+                for c in ("count", "pct2_halfup", "pct2_lr", "pct0_halfup", "pct0_lr")
+            ],
         ],
         side_rows,
     )
+    write_csv(
+        tab_dir / "side_totals_largest_remainder_changes.csv",
+        [
+            "site",
+            "group",
+            "label",
+            "side",
+            "count",
+            "decimals_shown",
+            "halfup_value",
+            "largest_remainder_value",
+        ],
+        lr_rows,
+    )
+    write_csv(tab_dir / "label_collisions.csv", ["site", "figure", "label", "violations"], collision_log)
     manifest["stretch_thresholds"] = {
         "boundary_min_segment_pct": str(SA.STRETCH_BOUNDARY_MIN_SEG_PCT),
         "boundary_min_total_pct": str(SA.STRETCH_BOUNDARY_MIN_TOTAL_PCT),

@@ -191,16 +191,23 @@ def _format_axes(
     f8,
     titles: bool = True,
     rotate_x: bool = False,
+    inward_x: bool = False,
+    xlabel_fmt=None,
+    ylabel_fmt=None,
 ) -> None:
     from matplotlib.ticker import FuncFormatter
 
     ax.set_xticks(_ticks(window[0], window[1], step_lon))
     ax.set_yticks(_ticks(window[2], window[3], step_lat))
-    ax.xaxis.set_major_formatter(FuncFormatter(ma.format_lon))
-    ax.yaxis.set_major_formatter(FuncFormatter(ma.format_lat))
+    ax.xaxis.set_major_formatter(FuncFormatter(xlabel_fmt or ma.format_lon))
+    ax.yaxis.set_major_formatter(FuncFormatter(ylabel_fmt or ma.format_lat))
     rs.style_map_axes(ax, f8)
     ax.tick_params(axis="x", labelbottom=xlabels)
     ax.tick_params(axis="y", labelleft=ylabels)
+    if inward_x:  # 兩端刻度標籤向內靠齊（避免相鄰面板的端點標籤相撞），中間置中
+        labs = ax.get_xticklabels()
+        for j, lab in enumerate(labs):
+            lab.set_ha("left" if j == 0 else ("right" if j == len(labs) - 1 else "center"))
     if rotate_x:
         for lab in ax.get_xticklabels():
             lab.set_rotation(90)
@@ -255,22 +262,32 @@ def _finish(fig, path: Path, record: dict[str, Any], dpi: int) -> dict[str, Any]
     return record
 
 
-def _free_inset_box(sd, dr: Drawing, kind: str, pct: np.ndarray, window, w_frac: float, frame_w_h: float):
+def _free_inset_box(sd, dr: Drawing, kind: str, pct: np.ndarray, window, w_frac: float, h_frac: float):
     """在主圖右下方找一個不蓋到任何上色海岸線的位置（回傳軸比例座標 ``(x0, y0, w, h)``，含刻度標籤需要的邊）；找不到回傳 None。"""  # noqa: E501
 
     lon_span, lat_span = window[1] - window[0], window[3] - window[2]
-    h_frac = w_frac / frame_w_h
     colored = [a for i, parts in enumerate(dr.c_lines) if pct[i] > 0 for a in parts]
     pts = np.vstack(colored) if colored else np.zeros((0, 2))
     fx = (pts[:, 0] - window[0]) / lon_span
     fy = (pts[:, 1] - window[2]) / lat_span
-    for x0 in np.arange(0.99 - w_frac, 0.5, -0.01):
-        for y0 in np.arange(0.10, 0.5, 0.01):
-            # 保留左側 0.11（y 刻度標籤）與下側 0.09（x 刻度標籤）
-            rx0, rx1, ry0, ry1 = x0 - 0.11, x0 + w_frac + 0.005, y0 - 0.09, y0 + h_frac + 0.005
+    star = ((sd.anchor[0] - window[0]) / lon_span, (sd.anchor[1] - window[2]) / lat_span)
+    for x0 in np.arange(0.995 - w_frac, 0.45, -0.005):
+        for y0 in np.arange(0.10, 0.55, 0.01):
+            # 保留左側 0.095（y 刻度標籤）與下側 0.09（x 刻度標籤）
+            rx0, rx1, ry0, ry1 = x0 - 0.095, x0 + w_frac + 0.004, y0 - 0.09, y0 + h_frac + 0.004
+            if y0 + h_frac > 0.97:
+                continue
+            if rx0 <= star[0] <= rx1 and ry0 <= star[1] <= ry1:
+                continue
             if not ((fx >= rx0) & (fx <= rx1) & (fy >= ry0) & (fy <= ry1)).any():
                 return (float(x0), float(y0), w_frac, h_frac)
     return None
+
+
+def inset_format(v: float, _pos: int | None = None) -> str:
+    """放大小圖的刻度標籤：兩位小數（視窗界限不是 0.1 度的整數倍）。"""
+
+    return f"{v:.2f}"
 
 
 def render_single(
@@ -285,8 +302,10 @@ def render_single(
     dpi: int = 600,
     window: tuple[float, float, float, float] | None = None,
     inset_window: tuple[float, float, float, float] | None = None,
-    inset_w_frac: float = 0.27,
+    inset_min_mag: float = 4.0,
+    inset_max_mag: float = 5.5,
     annotate=None,
+    inset_annotate=None,
 ) -> dict[str, Any]:
     import matplotlib
 
@@ -306,38 +325,63 @@ def render_single(
         draw_map(ax, sd, dr, kind, pct, window=win)
         _format_axes(ax, win, SPEC.step_deg, SPEC.step_deg, xlabels=True, ylabels=True, f8=f8)
         inset_rec = None
+        avoid: list = []
+        iax = None
         if inset_window is not None:
-            pos = _free_inset_box(sd, dr, kind, pct, win, inset_w_frac, SPEC.frame_width_over_height)
-            if pos is None:
-                raise RuntimeError("找不到不蓋到上色海岸線的插圖位置")
-            iax = ax.inset_axes(pos)
-            draw_map(iax, sd, dr, kind, pct, window=inset_window, star=False, lw_scale=0.9)
             iw = inset_window
+            lon_span, lat_span = win[1] - win[0], win[3] - win[2]
+            h_over_w = (lon_span / lat_span) * ((iw[3] - iw[2]) / (iw[1] - iw[0]))
+            pos = None
+            mag = inset_max_mag
+            while mag >= inset_min_mag - 1e-9 and pos is None:
+                w_frac = mag * (iw[1] - iw[0]) / lon_span
+                pos = _free_inset_box(sd, dr, kind, pct, win, w_frac, w_frac * h_over_w)
+                if pos is None:
+                    mag -= 0.1
+            if pos is None:
+                raise RuntimeError(f"找不到不蓋到上色海岸線的放大小圖位置（放大倍率 >= {inset_min_mag:.1f}）")
+            iax = ax.inset_axes(pos)
+            draw_map(iax, sd, dr, kind, pct, window=iw, star=True, lw_scale=1.0)
             iax.set_xticks([iw[0], iw[1]])
             iax.set_yticks([iw[2], iw[3]])
             from matplotlib.ticker import FuncFormatter
 
-            iax.xaxis.set_major_formatter(FuncFormatter(ma.format_lon))
-            iax.yaxis.set_major_formatter(FuncFormatter(ma.format_lat))
+            iax.xaxis.set_major_formatter(FuncFormatter(inset_format))
+            iax.yaxis.set_major_formatter(FuncFormatter(inset_format))
             rs.style_map_axes(iax, f8)
-            for s in iax.spines.values():
-                s.set_linewidth(0.8)
+            for j, lab in enumerate(iax.get_xticklabels()):  # 兩端標籤向內靠齊，右端不伸出主圖框
+                lab.set_ha("left" if j == 0 else "right")
+            for sp_ in iax.spines.values():
+                sp_.set_linewidth(0.8)
             iax.set_zorder(30)
             from matplotlib.patches import Rectangle
 
             ax.add_patch(
                 Rectangle(
-                    (iw[0], iw[2]),
-                    iw[1] - iw[0],
-                    iw[3] - iw[2],
-                    fill=False,
-                    edgecolor="#222222",
-                    linewidth=0.8,
-                    zorder=12,
+                    (iw[0], iw[2]), iw[1] - iw[0], iw[3] - iw[2], fill=False, edgecolor="#222222",
+                    linewidth=0.6, zorder=12,
                 )
+            )  # fmt: skip
+            fig.canvas.draw()
+            r_ = fig.canvas.get_renderer()
+            avoid.append(iax.get_tightbbox(r_))
+            (rx0, ry0), (rx1, ry1) = (
+                ax.transData.transform((iw[0], iw[2])),
+                ax.transData.transform((iw[1], iw[3])),
             )
-            inset_rec = {"window_lon_lat": list(iw), "axes_fraction_box": list(pos)}
-        ann_rec = annotate(ax, fig, f8) if annotate is not None else None
+            from matplotlib.transforms import Bbox
+
+            avoid.append(Bbox([[rx0 - 2, ry0 - 2], [rx1 + 2, ry1 + 2]]))
+            inset_rec = {
+                "window_lon_lat": list(iw), "axes_fraction_box": list(pos),
+                "magnification": float(pos[2] * lon_span / (iw[1] - iw[0])),
+            }  # fmt: skip
+        ann_rec = annotate(ax, fig, f8, avoid) if annotate is not None else None
+        inset_ann = (
+            inset_annotate(iax, fig, f8, []) if (inset_annotate is not None and iax is not None) else None
+        )
+        if inset_rec is not None:
+            inset_rec["annotations"] = inset_ann
         _discrete_colorbar(fig, (bx + bw + rs.CBAR_PAD_IN, by, rs.CBAR_W_IN, bh), f8)
         handles = _legend_handles(kind, total_text, dr.has_land_boundary)
         leg = rs.framed_legend(fig, ax, handles, f8, rows=legend_rows)
@@ -361,6 +405,7 @@ class Panel:
     title: str
     pct: np.ndarray
     annotate: Any = None  # 可選：``f(ax, fig, f8) -> 紀錄``，在面板畫完後加註記
+    title_variants: tuple[str, ...] = ()  # 標題候選（由寬到窄）；有給時，相鄰面板標題相撞就換下一個
 
 
 @dataclass(frozen=True)
@@ -379,14 +424,16 @@ class PanelLayout:
     star_size: float = 9.0
     rotate_x: bool = False
     shared_axis_titles: bool = False
+    tick_lon: float | None = None  # 經度刻度間隔（None 用 PANEL_TICK_LON）
+    inward_x: bool = False  # 經度刻度標籤兩端向內靠齊
 
 
 LAYOUT_2x2 = PanelLayout(2, 2, title_h=0.30)
 LAYOUT_1x2 = PanelLayout(1, 2, title_h=0.30)
-# 2×5：面板很小，內側不留刻度標籤間距；經度刻度標籤旋轉 90°避免相鄰面板的端點標籤相撞；軸標題改為整張圖共用一組。  # noqa: E501
+# 2×5：面板很小——經度只標 3 個刻度（界限與中點，間隔 0.9°），兩端標籤向內靠齊；軸標題改為整張圖共用一組。
 LAYOUT_2x5 = PanelLayout(
-    2, 5, left=0.72, right_strip=0.82, gap_x=0.22, title_h=0.30, gap_y=0.10, bottom_axes=0.62, legend_band=0.40,  # noqa: E501
-    lw_scale=0.5, star_size=6.0, rotate_x=True, shared_axis_titles=True,
+    2, 5, left=0.60, right_strip=0.82, gap_x=0.09, title_h=0.30, gap_y=0.10, bottom_axes=0.40, legend_band=0.40,  # noqa: E501
+    lw_scale=0.5, star_size=6.0, shared_axis_titles=True, tick_lon=0.9, inward_x=True,
 )  # fmt: skip
 
 
@@ -422,6 +469,7 @@ def render_panels(
         fig = plt.figure(figsize=(rs.REPORT_WIDTH_IN, fh), dpi=150)
         fw = rs.REPORT_WIDTH_IN
         axes = []
+        title_arts: list = []
         ann_recs: list = []
         for i, p in enumerate(panels):
             r, c = divmod(i, ncol)
@@ -431,13 +479,42 @@ def render_panels(
             draw_map(ax, sd, dr, kind, p.pct, window=win, lw_scale=L.lw_scale, star_size=L.star_size)
             last_row = (r == nrow - 1) or (i + ncol >= len(panels))
             _format_axes(
-                ax, win, PANEL_TICK_LON, PANEL_TICK_LAT, xlabels=last_row, ylabels=(c == 0), f8=f8,
-                titles=not L.shared_axis_titles, rotate_x=L.rotate_x,
+                ax, win, L.tick_lon or PANEL_TICK_LON, PANEL_TICK_LAT, xlabels=last_row, ylabels=(c == 0), f8=f8,  # noqa: E501
+                titles=not L.shared_axis_titles, rotate_x=L.rotate_x, inward_x=L.inward_x,
             )  # fmt: skip
-            ax.set_title(p.title, fontproperties=f8, fontsize=rs.TEXT_PT, pad=2.0, linespacing=1.0)
+            title_arts.append(
+                ax.set_title(p.title, fontproperties=f8, fontsize=rs.TEXT_PT, pad=2.0, linespacing=1.0)
+            )
             axes.append(ax)
             if p.annotate is not None:
                 ann_recs.append(p.annotate(ax, fig, f8))
+        k_px = fig.dpi / 72.0
+
+        def _title_collisions():
+            fig.canvas.draw()
+            r_ = fig.canvas.get_renderer()
+            bbs = [t.get_window_extent(r_) for t in title_arts]
+            pad = 2.0 * k_px
+            return [
+                (i, j) for i in range(len(bbs)) for j in range(i + 1, len(bbs))
+                if bbs[i].x0 < bbs[j].x1 + pad and bbs[j].x0 < bbs[i].x1 + pad
+                and bbs[i].y0 < bbs[j].y1 and bbs[j].y0 < bbs[i].y1
+            ]  # fmt: skip
+
+        n_var = min((len(p.title_variants) for p in panels if p.title_variants), default=0)
+        vi = 0
+        while n_var and vi < n_var - 1 and _title_collisions():
+            vi += 1
+            for t, p in zip(title_arts, panels, strict=True):
+                t.set_text(p.title_variants[vi])
+        title_overlaps = _title_collisions()
+        # 底列經度刻度標籤的最小水平間距（pt）
+        r_ = fig.canvas.get_renderer()
+        xl = []
+        for ax_ in axes:
+            xl += [t.get_window_extent(r_) for t in ax_.get_xticklabels() if t.get_visible() and t.get_text()]
+        xl.sort(key=lambda b: (round(b.y0), b.x0))
+        gaps = [(b2.x0 - b1.x1) / k_px for b1, b2 in zip(xl, xl[1:], strict=False) if abs(b1.y0 - b2.y0) < 2]
         block_w = ncol * w + (ncol - 1) * L.gap_x
         cb_top = fh - L.top - L.title_h
         cb_bottom = cb_top - (nrow * h + (nrow - 1) * (L.gap_y + L.title_h))
@@ -465,5 +542,8 @@ def render_panels(
             "n_panels": len(panels), "layout": [nrow, ncol], "window_lon_lat": list(win),
             "ticks_step_lon_lat": [PANEL_TICK_LON, PANEL_TICK_LAT], "panel_titles": [p.title for p in panels],
             "legend_labels": [t.get_text() for t in leg.get_texts()], "annotations": ann_recs,
+            "title_variant_index": vi, "title_overlaps": title_overlaps,
+            "panel_titles_final": [t.get_text() for t in title_arts],
+            "xtick_min_gap_pt": (min(gaps) if gaps else None),
         }  # fmt: skip
         return _finish(fig, path, rec, dpi)
