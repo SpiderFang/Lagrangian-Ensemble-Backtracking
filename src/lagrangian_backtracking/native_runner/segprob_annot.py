@@ -35,6 +35,7 @@ BRACKET_OFFSETS_M = (4_000.0, 3_000.0, 2_200.0)  # 括號離邊界的距離（�
 BRACKET_TICK_FRAC = 0.6  # 括號端點短線長度 = 偏移距離 × 此值
 SIDE_NAME_ZH = {"N": "北", "E": "東", "S": "南", "W": "西"}
 SIDE_LABEL_COLOR = "#555555"  # 邊小計（邊界內側）字色，比括號合計稍淺
+LAND_CLEARANCE_PT = 2.5  # 標籤與陸地、島嶼海岸線的最小距離（pt）
 SIDE_LABEL_INSET_PT = 4.0  # 邊小計離邊界線的距離（pt）
 CIRCLED = "①②③④⑤⑥⑦⑧⑨"
 
@@ -216,7 +217,17 @@ class Scene:
     """某個座標軸上的障礙物（顯示座標，像素）：星號、上色線段、其他標籤、陸地、圖框。"""
 
     def __init__(
-        self, fig, ax, *, lines_ll, line_lw_pt, star_lonlat=None, star_size=10.0, avoid_boxes=(), land_ll=None
+        self,
+        fig,
+        ax,
+        *,
+        lines_ll,
+        line_lw_pt,
+        star_lonlat=None,
+        star_size=10.0,
+        avoid_boxes=(),
+        land_ll=None,
+        land_pad_pt=0.0,
     ):
         fig.canvas.draw()
         self.fig, self.ax = fig, ax
@@ -235,8 +246,31 @@ class Scene:
         av = [sbox(b.x0, b.y0, b.x1, b.y1) for b in avoid_boxes]
         self.avoid = unary_union(av) if av else None
         self.land = prep(land_ll) if land_ll is not None else None
+        self.land_pad_pt = land_pad_pt
+        self.land_ll = land_ll
+        self._land_disp = None
         self.placed: list = []
         self.log: list[dict] = []
+
+    def land_clearance_pt(self, bb) -> float | None:
+        """文字外框到最近陸地（含島嶼）海岸線的距離（pt）；窗內沒有陸地回傳 None。"""
+
+        if self.land_ll is None:
+            return None
+        if self._land_disp is None:
+            import shapely
+
+            ax0, ay0 = self.inv.transform((self.axbb.x0, self.axbb.y0))
+            ax1, ay1 = self.inv.transform((self.axbb.x1, self.axbb.y1))
+            clip = self.land_ll.intersection(
+                sbox(min(ax0, ax1) - 0.2, min(ay0, ay1) - 0.2, max(ax0, ax1) + 0.2, max(ay0, ay1) + 0.2)
+            )
+            self._land_disp = (
+                shapely.transform(clip, lambda c: self.tr.transform(c)) if not clip.is_empty else False
+            )
+        if self._land_disp is False:
+            return None
+        return float(sbox(bb.x0, bb.y0, bb.x1, bb.y1).distance(self._land_disp) / self.k)
 
     def violations(self, bb, anchor=None, leader=True) -> set[str]:
         tags: set[str] = set()
@@ -254,8 +288,9 @@ class Scene:
         if any(bp.intersects(g) for g in self.placed):
             tags.add("label")
         if self.land is not None:
-            x0, y0 = self.inv.transform((bb.x0, bb.y0))
-            x1, y1 = self.inv.transform((bb.x1, bb.y1))
+            pad = self.land_pad_pt * self.k  # 文字外框與陸地（含島嶼）海岸線至少留此距離
+            x0, y0 = self.inv.transform((bb.x0 - pad, bb.y0 - pad))
+            x1, y1 = self.inv.transform((bb.x1 + pad, bb.y1 + pad))
             if self.land.intersects(sbox(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))):
                 tags.add("land")
         if leader and anchor is not None:
@@ -547,7 +582,7 @@ def annotate_boundary(
     lines = list(dr.b_sea_flat) if hasattr(dr, "b_sea_flat") else [a for parts in dr.b_sea for a in parts]
     lines += list(dr.b_land)
     scene = Scene(fig, ax, lines_ll=lines, line_lw_pt=lw_pt, star_lonlat=sd.anchor, star_size=star_size,
-                  avoid_boxes=avoid, land_ll=dr.land_union)  # fmt: skip
+                  avoid_boxes=avoid, land_ll=dr.land_union, land_pad_pt=LAND_CLEARANCE_PT)  # fmt: skip
     # 括號與合計（外側）
     for s in boundary_stretches(sd, seg_counts, n_total):
         sea = _boundary_sea_line(sd, s)
@@ -648,4 +683,5 @@ def annotate_boundary(
         if tags:
             rec["collisions"].append({"label": txt, "violations": sorted(tags)})
         rec.setdefault("side_label_violations", {})[k] = sorted(tags)
+        rec.setdefault("side_label_land_clearance_pt", {})[k] = scene.land_clearance_pt(bb)
     return rec
