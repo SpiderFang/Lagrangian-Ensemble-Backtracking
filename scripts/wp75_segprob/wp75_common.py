@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """WP-75：分段機率圖的資料準備（讀釋放設定、海岸線、departures，算每站分段與逐顆歸屬）。"""
 
 from __future__ import annotations
