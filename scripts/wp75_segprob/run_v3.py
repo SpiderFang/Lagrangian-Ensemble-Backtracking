@@ -1,4 +1,4 @@
-# ruff: noqa: E501
+# ruff: noqa: E501, B023
 """WP-75 v3：五地點全部分段機率圖（全年、十類 2×5、季節 2×2、大小潮 1×2；邊界與海岸各一張）與統計表。
 
 v3：邊界圖移除邊小計、括號標出全部集中段（單張寫 %、多面板編圈號並把數值放進標題）；海岸圖加流場範圍細線。
@@ -89,6 +89,8 @@ def main(fig_root: Path, tab_dir: Path) -> int:
     }
     group_rows, verification, stretch_all, title_all, cov_rows = [], [], [], [], []
     collision_log: list = []
+    bracket_log: list = []
+    bracket_panel: dict = {}
     for sid in C.SITES:
         sd = C.build_site(sid, land, regions, sites, anchors)
         sd.cols = C.load_site_columns(sid)
@@ -183,6 +185,40 @@ def main(fig_root: Path, tab_dir: Path) -> int:
             if isinstance(x, dict):
                 for c in x.get("collisions", []) or []:
                     collision_log.append([sid, path, c["label"], ",".join(c["violations"])])  # noqa: B023
+                if path.startswith("boundary") and any("bracket_side" in t for t in x.get("stretches", [])):
+                    pi = bracket_panel.get((sid, path), 0)  # noqa: B023
+                    bracket_panel[(sid, path)] = pi + 1  # noqa: B023
+                    for rk, t in enumerate(x["stretches"], start=1):
+                        e_start = max(
+                            abs(a - b)
+                            for a, b in zip(t["bracket_foot_start_lonlat"], t["start_lonlat"], strict=True)
+                        )
+                        e_end = max(
+                            abs(a - b)
+                            for a, b in zip(t["bracket_foot_end_lonlat"], t["end_lonlat"], strict=True)
+                        )
+                        ok = max(e_start, e_end) <= 1e-4 and t["bracket_span_err_m"] <= 1.0
+                        bracket_log.append(
+                            [
+                                sid,
+                                path,
+                                pi + 1,
+                                rk,
+                                t["pct"],
+                                t["bracket_side"],
+                                f"{t['start_lonlat'][0]:.4f}",
+                                f"{t['start_lonlat'][1]:.4f}",
+                                f"{t['end_lonlat'][0]:.4f}",
+                                f"{t['end_lonlat'][1]:.4f}",
+                                f"{max(e_start, e_end):.2e}",
+                                t["bracket_span_err_m"],
+                                t["sea_clip_m"],
+                                t["bracket_over_islet"],
+                                t["marker"],
+                                t["marker_where"],
+                                "ok" if ok else "FAIL",
+                            ]
+                        )  # noqa: B023,E501
                 for kk, y in x.items():
                     if kk != "collisions":
                         _collect(y, path)
@@ -275,6 +311,30 @@ def main(fig_root: Path, tab_dir: Path) -> int:
         ],
         title_all,
     )
+    write_csv(
+        tab_dir / "bracket_check.csv",
+        [
+            "site",
+            "figure",
+            "panel",
+            "rank",
+            "pct",
+            "bracket_side",
+            "stretch_start_lon",
+            "stretch_start_lat",
+            "stretch_end_lon",
+            "stretch_end_lat",
+            "max_foot_diff_deg",
+            "span_err_m",
+            "sea_clip_m",
+            "over_islet",
+            "marker",
+            "marker_where",
+            "span_check",
+        ],
+        bracket_log,
+    )
+    assert all(r_[-1] == "ok" for r_ in bracket_log), "括號與集中段起訖不一致"
     write_csv(tab_dir / "label_collisions.csv", ["site", "figure", "label", "violations"], collision_log)
     manifest["stretch_thresholds"] = {
         "boundary_min_segment_pct": str(SA.STRETCH_BOUNDARY_MIN_SEG_PCT),

@@ -13,11 +13,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from types import SimpleNamespace
 
 import numpy as np
 from matplotlib import patheffects
 from matplotlib.text import Text
-from shapely.geometry import LineString, MultiLineString, Point
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.geometry import box as sbox
 from shapely.ops import linemerge, substring, unary_union
 from shapely.prepared import prep
@@ -364,14 +365,14 @@ def _marker_bb(a, renderer):
     return Bbox([[cx - h, cy - h], [cx + h, cy + h]])
 
 
-def _place(scene: Scene, cands, make, anchor, *, leader=True, bbfun=_text_bb):
+def _place(scene: Scene, cands, make, anchor, *, leader=True, bbfun=_text_bb, ignore=frozenset()):
     """依序試候選位置；回傳 ``(artist, bbox, 違規標籤集合)``（無違規即停；全部違規則取最輕者）。"""
 
     best = None
     for c in cands:
         a = make(c)
         bb = bbfun(a, scene.r)
-        tags = scene.violations(bb, anchor, leader)
+        tags = scene.violations(bb, anchor, leader) - set(ignore)
         if not tags:
             return a, bb, set()
         sev = sum(_W[t] for t in tags)
@@ -385,6 +386,10 @@ def _place(scene: Scene, cands, make, anchor, *, leader=True, bbfun=_text_bb):
 def _lonlat(sd, xs, ys):
     lon, lat = sd.proj.unproject(np.asarray(xs), np.asarray(ys))
     return np.asarray(lon), np.asarray(lat)
+
+
+def _halo_bracket(lw: float):
+    return [patheffects.withStroke(linewidth=lw + 1.6, foreground="white")]
 
 
 def _halo():
@@ -546,9 +551,17 @@ def annotate_coast_markers(
 
 
 # ── 邊界 ──────────────────────────────────────────────────────────────────
-def _offset_outward(sd, line: LineString, dist_m: float) -> LineString | None:
-    """把折線向流場範圍外側平移 ``dist_m``（用離中心較遠的一側）。"""
+def _ring_polygon(sd):
+    cache = sd.__dict__
+    if "_ring_poly" not in cache:
+        cache["_ring_poly"] = Polygon(sd.ring.line.coords)
+    return cache["_ring_poly"]
 
+
+def _offset_side(sd, line: LineString, dist_m: float, outward: bool) -> LineString | None:
+    """把折線平移 ``dist_m``：``outward`` 為 True 取流場範圍外側，否則取內側（海面側）。"""
+
+    poly = _ring_polygon(sd)
     for sign in (1, -1):
         try:
             off = line.offset_curve(sign * dist_m)
@@ -560,28 +573,51 @@ def _offset_outward(sd, line: LineString, dist_m: float) -> LineString | None:
             off = linemerge(off)
             if isinstance(off, MultiLineString):
                 off = max(off.geoms, key=lambda g: g.length)
-        mid = off.interpolate(0.5, normalized=True)
-        mid0 = line.interpolate(0.5, normalized=True)
-        if np.hypot(mid.x, mid.y) > np.hypot(mid0.x, mid0.y):
+        if off.geom_type != "LineString":
+            continue
+        if poly.contains(off.interpolate(0.5, normalized=True)) != outward:
             return off
     return None
 
 
-def _boundary_sea_line(sd, s: Stretch):
-    geoms = [sd.bseg[i].geom for i in s.indices]
-    line = linemerge(geoms) if len(geoms) > 1 else geoms[0]
-    if isinstance(line, MultiLineString):
-        line = linemerge(list(line.geoms))
-        if isinstance(line, MultiLineString):
-            line = max(line.geoms, key=lambda g: g.length)
-    sea = line if sd.land_proj is None or sd.land_proj.is_empty else line.difference(sd.land_proj)
-    if sea.is_empty:
-        return None
-    if isinstance(sea, MultiLineString):
-        sea = linemerge(sea)
-        if isinstance(sea, MultiLineString):
-            sea = max(sea.geoms, key=lambda g: g.length)
-    return sea
+def _boundary_stretch_line(sd, s: Stretch) -> LineString:
+    """集中段的完整邊界線（依分段順序串接，不剪陸地）；括號必須恰好涵蓋這條線。"""
+
+    segs = [list(sd.bseg[i].geom.coords) for i in s.indices]
+    if len(segs) > 1:  # 第一段的方向要朝向第二段
+        nxt = np.array(segs[1][0])
+        if np.hypot(*(np.array(segs[0][0]) - nxt)) < np.hypot(*(np.array(segs[0][-1]) - nxt)):
+            segs[0] = segs[0][::-1]
+    pts: list = list(segs[0])
+    for c in segs[1:]:
+        last = np.array(pts[-1])
+        if np.hypot(*(np.array(c[0]) - last)) > np.hypot(*(np.array(c[-1]) - last)):
+            c = c[::-1]
+        if np.hypot(*(np.array(c[0]) - last)) < 1e-6:
+            c = c[1:]
+        pts.extend(c)
+    full = LineString(pts)
+    lp = sd.land_proj
+    if (
+        lp is not None and not lp.is_empty and full.intersects(lp)
+    ):  # 分段端點若在陸地上，括號只涵蓋畫得出顏色的海上部分
+        sea = full.difference(lp)
+        pieces = [g for g in getattr(sea, "geoms", [sea]) if not g.is_empty and g.length > 0]
+        if pieces:
+            ps = [full.project(Point(c)) for g in pieces for c in (g.coords[0], g.coords[-1])]
+            if max(ps) - min(ps) > 1.0:
+                full = substring(full, min(ps), max(ps))
+    return full
+
+
+def _span_error_m(full: LineString, off: LineString) -> float:
+    """括號平行線兩端在邊界線上的垂足，離集中段兩端點的最大距離（公尺）；兩端須對應到不同端點。"""
+
+    length = full.length
+    s0, s1 = full.project(Point(off.coords[0])), full.project(Point(off.coords[-1]))
+    if abs(s0 - s1) < 0.99 * length:
+        return float(length)
+    return float(max(min(s0, length - s0), min(s1, length - s1)))
 
 
 def _m_per_pt(sd, ax, scene: Scene) -> float:
@@ -610,39 +646,20 @@ def _land_local(sd, buf_m: float):
     return cache[buf_m]
 
 
-def _bracket_candidate(sd, sea, off_m: float, land_buf_m: float | None = None):
-    """外側括號（投影公尺）：平行線＋兩端向邊界的短端線；偏移失敗回傳 None。
+def _bracket_candidate(sd, line, off_m: float, outward: bool):
+    """括號（投影公尺）：與集中段邊界線等長的平行線＋兩端向邊界線的短端線；偏移失敗回傳 None。"""
 
-    ``land_buf_m`` 給定時，把括號平行線上落在陸地（外擴 ``land_buf_m``）內的部分剪掉（海岸正好在集中段端點外側時），
-    端線改接在剪完的兩端。回傳 ``(平行線, 端線列表, 保留比例)``。
-    """
-
-    off = _offset_outward(sd, sea, off_m)
+    off = _offset_side(sd, line, off_m, outward)
     if off is None:
         return None
-    keep = 1.0
-    if land_buf_m is not None:
-        lb = _land_local(sd, land_buf_m)
-        if lb is not None:
-            cut = off.difference(lb)
-            if cut.is_empty:
-                return None
-            if isinstance(cut, MultiLineString):
-                cut = linemerge(cut)
-                if isinstance(cut, MultiLineString):
-                    cut = max(cut.geoms, key=lambda g: g.length)
-            if cut.geom_type != "LineString":
-                return None
-            keep = float(cut.length / off.length)
-            off = cut
     tick = off_m * BRACKET_TICK_FRAC
     ticks = []
     for p_off in (off.coords[0], off.coords[-1]):
-        near = sea.interpolate(sea.project(Point(p_off)))
+        near = line.interpolate(line.project(Point(p_off)))
         v = np.array([near.x, near.y]) - np.array(p_off)
         v = v / (np.hypot(*v) or 1.0) * tick
         ticks.append(LineString([(p_off[0], p_off[1]), (p_off[0] + v[0], p_off[1] + v[1])]))
-    return off, ticks, keep
+    return off, ticks
 
 
 def _to_ll(sd, g: LineString) -> LineString:
@@ -712,21 +729,21 @@ def annotate_boundary(
     ax, fig, sd, dr, seg_counts, n_total, *, font, star_size=10.0, lw_pt=SF.LW_BOUNDARY, avoid=(),
     mode="label", levels_pt=BRACKET_LEVELS_SINGLE_PT, br_lw=0.8, land_pad_pt=LAND_CLEARANCE_PT,
 ) -> dict:  # fmt: skip
-    """邊界圖：每個集中段（連續分段各 ≥ 門檻、合計 ≥ 門檻）畫外側括號。
+    """邊界圖：每個集中段（連續分段各 ≥ 門檻、合計 ≥ 門檻）畫一條與該段**等長**的括號。
 
-    ``mode="label"``（單張圖）：括號旁寫該段合計 %。``mode="marker"``（多面板）：只在合計最大的前
-    ``STRETCH_BOUNDARY_MAX_NUMBERED`` 段標小圈號（數值寫在面板標題），其餘只畫括號。
-    相鄰集中段的括號交錯兩個偏移；括號不得與其他括號、陸地（含島嶼）、圖框重疊，否則改用其他偏移。
-    單張圖的 % 優先放括號外側（放不下才放內側）；多面板的圈號放在同一段邊界線內側的開放海面（括號外側餘地太小），
-    放不下才改放外側。
+    括號永遠涵蓋整段（不為避讓陸地而截短）：先試邊界外側；外側有陸地或島嶼、與其他括號或圖框衝突時改放內側（海面側）；
+    都放不下才讓括號壓過極小島嶼（加白色光暈，記錄於 ``bracket_over_islet``）。
+
+    ``mode="label"``（單張圖）：括號正中央、開放海面一側寫該段合計 %。``mode="marker"``（多面板）：只對合計最大的前
+    ``STRETCH_BOUNDARY_MAX_NUMBERED`` 段在括號旁（約 6 pt 內）標小圈號（數值寫在面板標題），其餘只畫括號；
+    括號旁放不下才放到最靠近該括號的圖框外緣。
     """
 
-    rec: dict = {"stretches": [], "collisions": [], "mode": mode}
+    rec: dict = {"stretches": [], "collisions": [], "mode": mode, "bracket_over_islet": 0}
     lines = list(dr.b_sea_flat) if hasattr(dr, "b_sea_flat") else [a for parts in dr.b_sea for a in parts]
     lines += list(dr.b_land)
     scene = Scene(fig, ax, lines_ll=lines, line_lw_pt=lw_pt, star_lonlat=sd.anchor, star_size=star_size,
                   avoid_boxes=avoid, land_ll=dr.land_union, land_pad_pt=land_pad_pt)  # fmt: skip
-    scene.leader_cross_ok = True
     stretches = boundary_stretches(sd, seg_counts, n_total)  # 依合計由大到小
     mpp = _m_per_pt(sd, ax, scene)
     clear_m = BRACKET_CLEAR_PT * mpp
@@ -736,50 +753,109 @@ def annotate_boundary(
     )
     ring_order = sorted(range(len(stretches)), key=lambda j: stretches[j].indices[0])
     pref = {j: p % 2 for p, j in enumerate(ring_order)}  # 沿邊界相鄰的集中段交錯偏移
-    chosen: dict[int, tuple] = {}
+    land_pref_m = BRACKET_LAND_CLEAR_DEG * 111_320.0
+    land_min_m = BRACKET_LAND_CLEAR_MIN_DEG * 111_320.0
+    lb_pref, lb_min = _land_local(sd, land_pref_m), _land_local(sd, land_min_m)
+    chosen: dict[int, dict] = {}
     placed_br: list = []  # 已定括號（投影公尺）
     for j in sorted(range(len(stretches)), key=lambda j: -stretches[j].count):
         s = stretches[j]
-        sea = _boundary_sea_line(sd, s)
-        if sea is None:
-            continue
+        full = _boundary_stretch_line(sd, s)
+        tw_pt = text_width_pt(font, f"{SF.pct2(s.count, n_total)}%") + 1.0
         p = pref[j]
         lv = [
             levels_pt[p],
             levels_pt[1 - p],
             levels_pt[p] * 0.75,
             levels_pt[1 - p] * 0.75,
-            levels_pt[p] * 0.55,
-            levels_pt[p] * 0.4,
+            max(levels_pt) * 1.4,
         ]
-        pick = None
-        # 先要求與陸地至少 0.004°（約 450 m）；整串都做不到時，退而求其次只要求不與陸地相交（約 50 m）
-        for buf_m in (BRACKET_LAND_CLEAR_DEG * 111_320.0, BRACKET_LAND_CLEAR_MIN_DEG * 111_320.0):
+        evals: list[dict] = []
+        for outward in (True, False):
             for lv_pt in lv:
-                cand = _bracket_candidate(sd, sea, lv_pt * mpp, buf_m)
+                cand = _bracket_candidate(sd, full, lv_pt * mpp, outward)
                 if cand is None:
                     continue
-                off, ticks, keep = cand
+                off, ticks = cand
                 geo_m = unary_union([off, *ticks])
-                geo_ll = unary_union([_to_ll(sd, g) for g in (off, *ticks)])
-                hit_land = keep < 0.6 or (
-                    dr.land_union is not None
-                    and geo_ll.buffer(BRACKET_LAND_CLEAR_MIN_DEG * 0.5).intersects(dr.land_union)
-                )
+                # 只看平行線；集中段端點本來就貼著海岸，兩端各 6 pt 內的重疊不算
+                ends = unary_union([Point(off.coords[0]), Point(off.coords[-1])]).buffer(6.0 * mpp)
+                core = off.difference(full.buffer(1.5 * mpp)).difference(ends)
+                land_pref = 0.0 if lb_pref is None else core.intersection(lb_pref).length
+                land_min = 0.0 if lb_min is None else core.intersection(lb_min).length
                 hit_br = any(geo_m.buffer(clear_m).intersects(g) for g in placed_br)
                 disp = unary_union(
                     [LineString(scene.tr.transform(np.asarray(_to_ll(sd, g).coords))) for g in (off, *ticks)]
                 )
+                disp_off = LineString(scene.tr.transform(np.asarray(_to_ll(sd, off).coords)))
                 hit_frame = not inner.contains(disp)
-                pick = (lv_pt, off, ticks, geo_m, disp, hit_land, hit_br, hit_frame)
-                if not (hit_land or hit_br or hit_frame):
+                hit_col = scene.colored is not None and disp_off.intersects(scene.colored)
+                room = True
+                if mode == "label":  # 括號外（開放海面側）要放得下置中的 % 文字
+                    pm_ = off.interpolate(0.5, normalized=True)
+                    ps_ = full.interpolate(0.5, normalized=True)
+                    pm_d = np.array(
+                        scene.tr.transform(tuple(float(v[0]) for v in _lonlat(sd, [pm_.x], [pm_.y])))
+                    )
+                    ps_d = np.array(
+                        scene.tr.transform(tuple(float(v[0]) for v in _lonlat(sd, [ps_.x], [ps_.y])))
+                    )
+                    dd_ = pm_d.ravel() - ps_d.ravel()
+                    dd_ = dd_ / (np.hypot(*dd_) or 1.0)
+                    horiz_ = abs(dd_[0]) < abs(dd_[1])
+                    w_, h_ = (tw_pt, 8.0) if horiz_ else (8.0, tw_pt)
+                    cx_, cy_ = pm_d.ravel() + dd_ * (2.5 + 4.0) * scene.k
+                    rb = SimpleNamespace(
+                        x0=cx_ - w_ / 2 * scene.k,
+                        x1=cx_ + w_ / 2 * scene.k,
+                        y0=cy_ - h_ / 2 * scene.k,
+                        y1=cy_ + h_ / 2 * scene.k,
+                    )
+                    room = not scene.violations(rb, None, False)
+                evals.append({
+                    "outward": outward, "lv": lv_pt, "off": off, "ticks": ticks, "geo_m": geo_m, "disp": disp,
+                    "land_pref": land_pref, "land_min": land_min, "hit_br": hit_br, "hit_frame": hit_frame,
+                    "hit_col": hit_col, "room": room,
+                })  # fmt: skip
+        pick = None
+        far_lv = max(levels_pt) * 1.4
+        # 先要求括號外放得下置中的 % 文字（僅單張圖），再要求一般偏移；都不行才放寬
+        for need_room, far in ((True, False), (True, True), (False, False), (False, True)):
+            if need_room and mode != "label":
+                continue
+            for outward, key in (
+                (True, "land_pref"),
+                (True, "land_min"),
+                (False, "land_pref"),
+                (False, "land_min"),
+            ):
+                for e in evals:
+                    if (
+                        e["outward"] == outward
+                        and (e["lv"] == far_lv) == far
+                        and e[key] <= 0
+                        and (e["room"] or not need_room)
+                        and not (e["hit_br"] or e["hit_frame"] or e["hit_col"])
+                    ):
+                        pick = e
+                        break
+                if pick is not None:
                     break
-            if pick is not None and not (pick[5] or pick[6] or pick[7]):
+            if pick is not None:
                 break
+        islet = False
+        if pick is None:  # 兩側、各種偏移都被陸地擋住：讓括號壓過最少的島嶼（加白色光暈）
+            ok = [e for e in evals if not (e["hit_br"] or e["hit_frame"] or e["hit_col"])]
+            if ok:
+                pick = min(ok, key=lambda e: (e["land_min"], not e["outward"], e["lv"]))
+                islet = pick["land_min"] > 0
+        if pick is None and evals:  # 連括號互疊、圖框也避不開：取最輕者並記為違規
+            pick = min(evals, key=lambda e: (e["hit_br"] + e["hit_frame"] + e["hit_col"], e["land_min"]))
         if pick is None:
             continue
-        placed_br.append(pick[3])
-        chosen[j] = (s, sea, *pick)
+        pick = dict(pick, full=full, islet=islet, span_err_m=_span_error_m(full, pick["off"]))
+        placed_br.append(pick["geo_m"])
+        chosen[j] = pick
     numbered = (
         {
             id(stretches[j]): k
@@ -789,21 +865,24 @@ def annotate_boundary(
         else {}
     )
     # 括號畫出；括號本身（顯示座標）先登錄為障礙
-    for _s, _sea, _lv, off, ticks, _g, disp, *_rest in chosen.values():
-        for g in (off, *ticks):
+    for c in chosen.values():
+        halo = _halo_bracket(br_lw) if c["islet"] else None
+        for g in (c["off"], *c["ticks"]):
             ll_ = _to_ll(sd, g)
             ax.plot(
-                *np.asarray(ll_.coords).T, color="#222222", linewidth=br_lw, solid_capstyle="butt", zorder=11
-            )
-        scene.placed.append(disp.buffer(0.8 * scene.k))
+                *np.asarray(ll_.coords).T, color="#222222", linewidth=br_lw, solid_capstyle="butt", zorder=11,
+                path_effects=halo,
+            )  # fmt: skip
+        if c["islet"]:
+            rec["bracket_over_islet"] += 1
+        scene.placed.append(c["disp"].buffer(0.8 * scene.k))
 
     def place_label(j):
-        anchor = None
-        a = bb = None
-        s, sea, lv_pt, off, ticks, geo_m, disp, hit_land, hit_br, hit_frame = chosen[j]
+        c = chosen[j]
+        s, sea, off = stretches[j], c["full"], c["off"]
         mid = off.interpolate(0.5, normalized=True)
         mid_in = sea.interpolate(0.5, normalized=True)
-        d = np.array([mid.x - mid_in.x, mid.y - mid_in.y])
+        d = np.array([mid.x - mid_in.x, mid.y - mid_in.y])  # 由邊界線指向括號（開放海面一側）
         d = d / (np.hypot(*d) or 1.0)
         mlon, mlat = _lonlat(sd, [mid.x], [mid.y])
         ilon, ilat = _lonlat(sd, [mid_in.x], [mid_in.y])
@@ -812,22 +891,31 @@ def annotate_boundary(
         marker = circled(numbered[id(s)]) if id(s) in numbered else ""
         txt = f"{SF.pct2(s.count, n_total)}%" if mode == "label" else marker
         tags: set[str] = set()
+        a = bb = None
+        where = ""
         if txt:
+            blen_pt = off.length / mpp
             if mode == "label":
-                shifts = [0, 24, -24, 48, -48, 80, -80, 120, -120]
-                cands = [("out", sh, q) for q in (3.0, 8.0) for sh in shifts] + [
-                    ("in", sh, q) for q in (4.0, 9.0) for sh in shifts
+                shifts = [0, 6, -6, 12, -12, 20, -20, 30, -30]
+                cands = [("A", sh, q) for q in (2.5, 5.5, 9.0) for sh in shifts] + [
+                    ("B", sh, q) for q in (4.0, 9.0) for sh in shifts
                 ]
             else:
-                shifts = [0, 8, -8, 16, -16, 26, -26, 40, -40, 60, -60]
-                cands = [("in", sh, q) for q in (6.5, 9.5) for sh in shifts] + [
-                    ("out", sh, q) for q in (4.5, 7.0) for sh in shifts[:5]
+                lim = max(4.0, 0.5 * blen_pt)
+                shifts = [sh for sh in (0, 4, -4, 8, -8, 12, -12, 16, -16, 22, -22) if abs(sh) <= lim]
+                cands = [("A", sh, q) for q in (5.0, 6.2, 7.6, 9.5) for sh in shifts] + [
+                    ("B", sh, q) for q in (6.5, 8.0, 10.0, 12.0) for sh in shifts
                 ]
 
-            def make(c, txt=txt, d=d, horiz=horiz, tang=tang, mlon=mlon, mlat=mlat, ilon=ilon, ilat=ilat):
-                side, sh, q = c
-                sgn = 1.0 if side == "out" else -1.0
-                lon0, lat0 = (mlon[0], mlat[0]) if side == "out" else (ilon[0], ilat[0])
+            def make(cd, txt=txt, d=d, horiz=horiz, tang=tang):
+                if cd[0] == "C":
+                    return ax.annotate(
+                        txt, xy=(cd[3], cd[4]), xycoords="axes fraction", xytext=(cd[5], cd[6]), textcoords="offset points",
+                        ha="center", va="center", fontproperties=font, fontsize=8, zorder=13, path_effects=_halo(),
+                    )  # fmt: skip
+                side, sh, q = cd
+                sgn = 1.0 if side == "A" else -1.0
+                lon0, lat0 = (mlon[0], mlat[0]) if side == "A" else (ilon[0], ilat[0])
                 off_pt = sgn * d * q + tang * sh
                 if mode == "marker":
                     return ax.annotate(
@@ -844,67 +932,50 @@ def annotate_boundary(
 
             bbf = _marker_bb if mode == "marker" else _text_bb
             a, bb, tags = _place(scene, cands, make, None, leader=False, bbfun=bbf)
-            if tags and mode == "marker":  # 直接放不下：改放開放海面並以細引線連回該段（同海岸圖的圈號）
+            where = "beside"
+            if tags and mode == "marker":  # 括號旁放不下：改放最靠近該括號的圖框外緣之外
                 a.remove()
-                lcands = sorted(((dist, ang) for dist in (6.5, 8, 9.5, 11, 13, 16, 20, 25, 31, 38, 47, 58) for ang in (0, 15, -15, 30, -30, 45, -45, 60, -60, 75, -75, 90, -90, 120, -120, 150, -150)),
-                                key=lambda c: (c[0], abs(c[1])))  # fmt: skip
-                best_l = None
-                old_pad = scene.land_pad_pt
-                for pad_l in (old_pad, 0.3):
-                    scene.land_pad_pt = pad_l
-                    for frac in (0.5, 0.3, 0.7, 0.12, 0.88):
-                        pm = sea.interpolate(frac, normalized=True)
-                        po = off.interpolate(frac, normalized=True)
-                        dv = np.array([pm.x - po.x, pm.y - po.y])
-                        dv = dv / (np.hypot(*dv) or 1.0)
-                        flon, flat = _lonlat(sd, [pm.x], [pm.y])
-                        anchor = tuple(scene.tr.transform((flon[0], flat[0])))
-
-                        def make_lead(c, txt=txt, dd_in=dv, ilon=flon, ilat=flat):
-                            v = _rot(dd_in, c[1])
-                            return ax.annotate(
-                                txt, xy=(ilon[0], ilat[0]), xytext=(v[0] * c[0], v[1] * c[0]), textcoords="offset points",
-                                ha="center", va="center", fontproperties=font, fontsize=8, zorder=13, path_effects=_halo(),
-                                arrowprops={"arrowstyle": "-", "lw": 0.5, "color": "#222222", "shrinkA": 0, "shrinkB": 0},
-                            )  # fmt: skip
-
-                        a_, bb_, tg_ = _place(scene, lcands, make_lead, anchor, leader=True, bbfun=_marker_bb)
-                        sev = sum(_W[t] for t in tg_)
-                        if best_l is None or sev < best_l[0]:
-                            if best_l is not None:
-                                best_l[1].remove()
-                            best_l = (sev, a_, bb_, tg_, anchor)
+                mx, my = scene.tr.transform((mlon[0], mlat[0]))
+                dists = {"L": mx - axbb.x0, "R": axbb.x1 - mx, "B": my - axbb.y0, "T": axbb.y1 - my}
+                edges = sorted(dists, key=dists.get)
+                ccands = []
+                for e in edges[:3]:
+                    fx, fy = (mx - axbb.x0) / axbb.width, (my - axbb.y0) / axbb.height
+                    for sh in (0, 4, -4, 8, -8, 14, -14):
+                        if e == "L":
+                            ccands.append(("C", 0, 0, 0.0, fy, -5.4, sh))
+                        elif e == "R":
+                            ccands.append(("C", 0, 0, 1.0, fy, 5.4, sh))
+                        elif e == "B":
+                            ccands.append(("C", 0, 0, fx, 0.0, sh, -5.4))
                         else:
-                            a_.remove()
-                        if not tg_:
-                            break
-                    if best_l[3] == set():
-                        break
-                scene.land_pad_pt = old_pad
-                _, a, bb, tags, anchor = best_l
-                scene.commit(bb, anchor)
-            else:
-                scene.commit(bb)
-        return a, bb, tags, anchor, txt, marker
+                            ccands.append(("C", 0, 0, fx, 1.0, sh, 5.4))
+                a, bb, tags = _place(
+                    scene, ccands, make, None, leader=False, bbfun=_marker_bb, ignore={"axes"}
+                )
+                where = "outside_axes"
+            scene.commit(bb)
+        return a, bb, tags, txt, marker, where
 
     # 標籤：先由大到小；若有碰撞且不只一個圈號，試其他放置順序，取總嚴重度最小者
     base_order = sorted(chosen, key=lambda j: -stretches[j].count)
-    num_js = [j for j in base_order if id(chosen[j][0]) in numbered]
+    num_js = [j for j in base_order if id(stretches[j]) in numbered]
 
     def run_order(order):
-        n_p, n_l = len(scene.placed), len(scene.leaders)
+        n_p = len(scene.placed)
         res = {j: place_label(j) for j in order}
-        sev = sum(_W[t] for r in res.values() for t in r[2])
-        return res, sev, n_p, n_l
+        sev = sum(_W[t] for r in res.values() for t in r[2]) + 0.1 * sum(
+            r[5] == "outside_axes" for r in res.values()
+        )
+        return res, sev, n_p
 
-    def undo(res, n_p, n_l):
+    def undo(res, n_p):
         for r in res.values():
             if r[0] is not None:
                 r[0].remove()
         del scene.placed[n_p:]
-        del scene.leaders[n_l:]
 
-    results, sev0, n_p0, n_l0 = run_order(base_order)
+    results, sev0, n_p0 = run_order(base_order)
     best_sev, best_order, last_order = sev0, base_order, base_order
     if mode == "marker" and sev0 > 0 and len(num_js) > 1:
         import itertools
@@ -913,41 +984,56 @@ def annotate_boundary(
         for perm in itertools.permutations(num_js):
             if list(perm) == num_js:
                 continue
-            undo(results, n_p0, n_l0)
+            undo(results, n_p0)
             last_order = list(perm) + others
-            results, sev, _, _ = run_order(last_order)
+            results, sev, _ = run_order(last_order)
             if sev < best_sev:
                 best_sev, best_order = sev, last_order
             if sev == 0:
                 break
         if last_order != best_order:
-            undo(results, n_p0, n_l0)
-            results, _, _, _ = run_order(best_order)
+            undo(results, n_p0)
+            results, _, _ = run_order(best_order)
     for j in base_order:
-        s, sea, lv_pt, off, ticks, geo_m, disp, hit_land, hit_br, hit_frame = chosen[j]
-        a, bb, tags, anchor, txt, marker = results[j]
-        if "xleader" in tags:
-            rec.setdefault("leader_crossings", []).append(marker)
-            tags = set(tags) - {"xleader"}
-        if hit_land:
-            tags = set(tags) | {"bracket_land"}
-        if hit_br:
-            tags = set(tags) | {"bracket_overlap"}
-        if hit_frame:
-            tags = set(tags) | {"bracket_axes"}
-        a0 = sd.bseg[s.indices[0]].geom.coords[0]
-        b0 = sd.bseg[s.indices[-1]].geom.coords[-1]
+        s, c = stretches[j], chosen[j]
+        a, bb, tags, txt, marker, where = results[j]
+        tags = set(tags)
+        if c["land_min"] > 0:
+            tags |= set()  # 壓過極小島嶼者不算碰撞，另行計數（bracket_over_islet）
+        if c["hit_br"]:
+            tags.add("bracket_overlap")
+        if c["hit_frame"]:
+            tags.add("bracket_axes")
+        if c["hit_col"]:
+            tags.add("bracket_colored")
+        if c["span_err_m"] > 1.0:
+            tags.add("bracket_span")
+        a0, b0 = c["full"].coords[0], c["full"].coords[-1]  # 集中段在海上的起訖（即括號涵蓋的範圍）
         (alon, alat), (blon, blat) = _lonlat(sd, [a0[0]], [a0[1]]), _lonlat(sd, [b0[0]], [b0[1]])
+        fa = c["full"].interpolate(c["full"].project(Point(c["off"].coords[0])))
+        fb = c["full"].interpolate(c["full"].project(Point(c["off"].coords[-1])))
+        if c["full"].project(fa) > c["full"].project(fb):
+            fa, fb = fb, fa
+        (fa_lon, fa_lat), (fb_lon, fb_lat) = _lonlat(sd, [fa.x], [fa.y]), _lonlat(sd, [fb.x], [fb.y])
+        seg_len = sum(sd.bseg[i].geom.length for i in s.indices)
         rec["stretches"].append(
             {"count": s.count, "pct": SF.pct2(s.count, n_total), "segments": [sd.bseg[i].seg_id for i in s.indices],  # noqa: E501
+             "bracket_foot_start_lonlat": [float(fa_lon[0]), float(fa_lat[0])],
+             "bracket_foot_end_lonlat": [float(fb_lon[0]), float(fb_lat[0])],
+             "sea_clip_m": round(max(0.0, seg_len - c["full"].length), 3),
              "start_lonlat": [float(alon[0]), float(alat[0])], "end_lonlat": [float(blon[0]), float(blat[0])],
-             "bracket_offset_pt": float(lv_pt), "marker": marker, "violations": sorted(tags)}
+             "bracket_offset_pt": float(c["lv"]), "bracket_side": "out" if c["outward"] else "in",
+             "bracket_over_islet": bool(c["islet"]), "bracket_span_err_m": round(c["span_err_m"], 6),
+             "marker_where": where, "marker": marker, "violations": sorted(tags)}
         )  # fmt: skip
         if tags:
             rec["collisions"].append(
                 {"label": txt or f"{SF.pct2(s.count, n_total)}%", "violations": sorted(tags)}
             )
     rec["n_stretches"] = len(stretches)
+    rec["n_brackets"] = len(chosen)
+    rec["n_inner"] = sum(1 for c in chosen.values() if not c["outward"])
     rec["n_numbered"] = len(numbered)
     rec["n_unnumbered"] = (len(stretches) - len(numbered)) if mode == "marker" else 0
+    rec["max_span_err_m"] = max((c["span_err_m"] for c in chosen.values()), default=0.0)
     return rec

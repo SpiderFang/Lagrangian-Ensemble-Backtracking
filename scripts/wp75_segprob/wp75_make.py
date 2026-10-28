@@ -136,7 +136,9 @@ def render_site(
                 annotate = None
                 variants: tuple[str, ...] = ()
                 title = base
-                if kind == "boundary":
+                if kind == "boundary" and name == "class":
+                    title_lines.append(2)  # 十類各類相近：不畫括號與圈號，標題只有類別名與穿越比例
+                elif kind == "boundary":
                     st = SA.boundary_stretches(sd, cnt, n)
                     pw = (
                         SF.rs.REPORT_WIDTH_IN - lay.left - lay.right_strip - lay.gap_x * (lay.ncol - 1)

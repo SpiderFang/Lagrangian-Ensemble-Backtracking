@@ -106,3 +106,16 @@ def test_boundary_value_variants_prefer_two_decimals_then_integers() -> None:
         [sa.Stretch("boundary", "邊界", [0], 25), sa.Stretch("boundary", "邊界", [3], 5)], 1000
     )
     assert h[1] == "① 3% ② 1%"
+
+
+def test_bracket_must_span_exactly_the_stretch() -> None:
+    from shapely.geometry import LineString
+    from shapely.ops import substring
+
+    line = LineString([(0, 0), (100, 0), (100, 100)])  # 含轉角的集中段
+    for side in (5.0, -5.0):
+        off = line.offset_curve(side)
+        assert sa._span_error_m(line, off) < 1e-6  # 平行線兩端垂足恰在集中段兩端
+    # 截短（例如為了閃避陸地）會被抓出來
+    short = substring(line.offset_curve(5.0), 10.0, 150.0)
+    assert sa._span_error_m(line, short) > 9.0
