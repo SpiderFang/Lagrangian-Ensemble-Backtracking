@@ -36,6 +36,7 @@ SIDE_SEA_MIN_LENGTH_M = 100.0  # 邊的海上長度小於此值視為純陸地�
 BRACKET_LEVELS_SINGLE_PT = (5.5, 9.0)  # 單張圖：括號離邊界（pt）的兩個交錯偏移；相鄰集中段輪流使用
 BRACKET_LEVELS_PANEL_PT = (2.2, 4.0)  # 多面板（餘地很小）的兩個交錯偏移（pt）
 BRACKET_TICK_FRAC = 0.6  # 括號端點短線長度 = 偏移距離 × 此值
+GAP_BRACKET_MIN_TOTAL_PCT = Decimal("1")  # 空檔括號：至少 2 段且合計 ≥ 1% 才畫，否則併入「未標示零星段」
 GAP_COLOR = "#8c8c8c"  # 空檔（低機率）括號的線色
 GAP_TEXT_COLOR = "#6b6b6b"  # 空檔括號的 % 字色
 GAP_LW_FRAC = 0.6  # 空檔括號線寬 = 主括號 × 此值
@@ -277,32 +278,37 @@ def _neighbour_kind(sd, i: int, step: int, in_main: set[int]) -> str:
 def boundary_gap_summary(sd, seg_counts: np.ndarray, n_total: int, main: list[Stretch] | None = None) -> dict:
     """單張邊界圖的數字：主括號、灰色空檔括號、未標示零星段，用最大餘數法湊到穿越比例（2 位小數）。
 
-    回傳 ``main``、``gaps``（要畫的空檔，合計 > 0）、``n_zero_gaps``、``tiny``（單段、> 0 的空檔）、
-    ``tiny_info``（位置與兩側鄰居）、``lr``（各項顯示值）、``tiny_text``（圖例行，沒有零星段則為空字串）。
+    空檔要同時「至少 2 段」且「合計 ≥ ``GAP_BRACKET_MIN_TOTAL_PCT``」才畫括號；其餘大於 0 的空檔
+    （單段，或兩段以上但不到門檻）都併入「未標示零星段」。
+
+    回傳 ``main``、``gaps``（要畫的空檔）、``n_zero_gaps``（全為 0 的空檔數）、``tiny``（未標示的空檔，
+    合計 > 0）、``tiny_info``（位置與兩側鄰居）、``lr``（各項顯示值）、``tiny_text``（圖例行，沒有則為空字串）。
     """
 
     main = boundary_stretches(sd, seg_counts, n_total) if main is None else main
     gl, tiny_all = boundary_gaps(sd, seg_counts, main)
-    gaps = [g for g in gl if g.count > 0]
-    tiny = [t for t in tiny_all if t.count > 0]
+    pos = [g for g in gl if g.count > 0]
+    gaps = [g for g in pos if Decimal(g.count) * 100 >= GAP_BRACKET_MIN_TOTAL_PCT * n_total]
+    tiny = [t for t in [*tiny_all, *(g for g in pos if g not in gaps)] if t.count > 0]
     items = {f"m{j}": s.count for j, s in enumerate(main)}
     items.update({f"g{k}": g.count for k, g in enumerate(gaps)})
-    items["tiny"] = sum(t.count for t in tiny_all)
+    items["tiny"] = sum(t.count for t in tiny)
     lr = largest_remainder(items, int(np.sum(seg_counts)), n_total, 2)
     in_main = {i for s in main for i in s.indices}
     info = []
     for t in tiny:
-        i = t.indices[0]
-        pt = sd.bseg[i].geom.interpolate(0.5, normalized=True)
+        i0, i1 = t.indices[0], t.indices[-1]
+        pt = _boundary_stretch_line(sd, t).interpolate(0.5, normalized=True)
         lon, lat = _lonlat(sd, [pt.x], [pt.y])
+        ids = sd.bseg[i0].seg_id if i0 == i1 else f"{sd.bseg[i0].seg_id}–{sd.bseg[i1].seg_id}"
         info.append({
-            "seg_id": sd.bseg[i].seg_id, "count": t.count, "pct2": SF.pct2(t.count, n_total),
+            "seg_id": ids, "n_seg": len(t.indices), "count": t.count, "pct2": SF.pct2(t.count, n_total),
             "lon": float(lon[0]), "lat": float(lat[0]),
-            "prev": _neighbour_kind(sd, i, -1, in_main), "next": _neighbour_kind(sd, i, 1, in_main),
+            "prev": _neighbour_kind(sd, i0, -1, in_main), "next": _neighbour_kind(sd, i1, 1, in_main),
         })  # fmt: skip
     tv = lr["tiny"]
     tiny_text = "" if not tiny else f"未標示零星段 {'<0.01' if tv == 0 else f'{tv:.2f}'}%"
-    return {"main": main, "gaps": gaps, "n_zero_gaps": len(gl) - len(gaps), "tiny": tiny, "tiny_info": info,
+    return {"main": main, "gaps": gaps, "n_zero_gaps": len(gl) - len(pos), "tiny": tiny, "tiny_info": info,
             "lr": lr, "tiny_text": tiny_text}  # fmt: skip
 
 
