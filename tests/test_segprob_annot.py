@@ -139,3 +139,12 @@ def test_gap_split_at_zero_runs_trims_and_splits():
     assert sa.split_at_zero_runs(run, counts) == [[2, 3], [7], [9, 10, 11]]
     assert sa.split_at_zero_runs([0, 1, 4], counts) == []
     assert sa.split_at_zero_runs([11, 12, 0, 1], counts) == [[11]]
+
+
+def test_label_anchor_uses_longest_leg_for_corner_brackets():
+    from shapely.geometry import LineString
+
+    pt, moved = sa._label_anchor(LineString([(0, 0), (0, 100)]), 1.0)
+    assert not moved and (pt.x, pt.y) == (0.0, 50.0)
+    pt, moved = sa._label_anchor(LineString([(0, 0), (0, 100), (40, 100)]), 1.0)
+    assert moved and abs(pt.x) < 1e-6 and 40 < pt.y < 60

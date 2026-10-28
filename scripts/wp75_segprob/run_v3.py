@@ -62,6 +62,9 @@ def lonlat_ends(sd, seg):
     return float(lon[0]), float(lat[0]), float(lon[1]), float(lat[1])
 
 
+LABEL_MAX_PT = 15.0  # 標籤中心到括號（直線取中點、繞角取括號線）的容許距離
+
+
 def write_csv(path: Path, header: list[str], rows: list[list]) -> None:
     with path.open("x", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
@@ -90,6 +93,7 @@ def main(fig_root: Path, tab_dir: Path) -> int:
     group_rows, verification, stretch_all, title_all, cov_rows = [], [], [], [], []
     collision_log: list = []
     bracket_log: list = []
+    label_log: list = []
     pct_diff_all: list = []
     tiny_all: list = []
     bracket_panel: dict = {}
@@ -204,6 +208,23 @@ def main(fig_root: Path, tab_dir: Path) -> int:
                             for a, b in zip(t["bracket_foot_end_lonlat"], t["end_lonlat"], strict=True)
                         )
                         ok = max(e_start, e_end) <= 1e-4 and t["bracket_span_err_m"] <= 1.0
+                        lp, la, cn = t["label_perp_pt"], t["label_along_pt"], t["bracket_has_corner"]
+                        has_lab = lp is not None  # 未編號的括號（多面板第 4 個以後）沒有標籤
+                        lab_ok = has_lab and lp <= LABEL_MAX_PT and (cn or la <= LABEL_MAX_PT)
+                        label_log.append(
+                            [
+                                sid,
+                                path,
+                                pi + 1,
+                                rk,
+                                t["marker"] or f"{t['shown_pct']}%",
+                                t["marker_where"],
+                                "繞角" if cn else "直線",
+                                lp,
+                                la,
+                                "ok" if lab_ok else ("無標籤" if not has_lab else "FAIL"),
+                            ]
+                        )  # noqa: B023
                         bracket_log.append(
                             [
                                 sid,
@@ -340,6 +361,24 @@ def main(fig_root: Path, tab_dir: Path) -> int:
             for sid in C.SITES
         ],
     )
+    write_csv(
+        tab_dir / "label_distance_check.csv",
+        [
+            "site",
+            "figure",
+            "panel",
+            "rank",
+            "label",
+            "label_where",
+            "bracket_shape",
+            "label_to_bracket_pt",
+            "label_from_mid_pt",
+            "label_check",
+        ],
+        label_log,
+    )
+    print("label distance FAIL:", sum(r_[-1] == "FAIL" for r_ in label_log), "of", len(label_log), flush=True)
+    assert not any(r_[-1] == "FAIL" for r_ in label_log), "標籤離括號太遠"
     write_csv(
         tab_dir / "bracket_check.csv",
         [
