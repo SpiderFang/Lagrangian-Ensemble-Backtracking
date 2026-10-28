@@ -47,7 +47,7 @@ def _in_window(lonlat, w):
 
 
 def render_site(
-    sd, dr, grp, label, mats, bcount, ccount, gn, out: Path, font, *, only=None, lienchiang_inset=True,
+    sd, dr, grp, label, mats, bcount, ccount, gn, out: Path, font, *, only=None, lienchiang_inset=True, gaps=False,
 ):  # fmt: skip
     """輸出該地點的全部圖；回傳 ``(manifest 紀錄, 集中段表格列, 多面板標題數值行紀錄)``。``only`` 可限定 (kind, name) 清單。"""
 
@@ -61,7 +61,7 @@ def render_site(
         return cnt, SF.pct2(int(cnt.sum()), gn[k])
 
     def rows_from(kind, k, rec, where):
-        for rank, s in enumerate(rec["stretches"], start=1):
+        for rank, s in enumerate((x for x in rec["stretches"] if x.get("style") != "gap"), start=1):
             stretch_rows.append([sd.site_id, kind, k, rank, s["pct"], s["count"], len(s["segments"]),
                                  f"{s['start_lonlat'][0]:.4f}", f"{s['start_lonlat'][1]:.4f}",
                                  f"{s['end_lonlat'][0]:.4f}", f"{s['end_lonlat'][1]:.4f}", s["segments"][0], s["segments"][-1],
@@ -84,7 +84,9 @@ def render_site(
                 if kind == "boundary":
 
                     def ann(ax, fig, f8, avoid, cnt=cnt, n=n):
-                        r = SA.annotate_boundary(ax, fig, sd, dr, cnt, n, font=f8, avoid=avoid, mode="label")
+                        r = SA.annotate_boundary(
+                            ax, fig, sd, dr, cnt, n, font=f8, avoid=avoid, mode="label", gaps=gaps
+                        )
                         rows_from("boundary", "all", r, "main")
                         return r
 

@@ -36,6 +36,9 @@ SIDE_SEA_MIN_LENGTH_M = 100.0  # 邊的海上長度小於此值視為純陸地�
 BRACKET_LEVELS_SINGLE_PT = (5.5, 9.0)  # 單張圖：括號離邊界（pt）的兩個交錯偏移；相鄰集中段輪流使用
 BRACKET_LEVELS_PANEL_PT = (2.2, 4.0)  # 多面板（餘地很小）的兩個交錯偏移（pt）
 BRACKET_TICK_FRAC = 0.6  # 括號端點短線長度 = 偏移距離 × 此值
+GAP_COLOR = "#8c8c8c"  # 空檔（低機率）括號的線色
+GAP_TEXT_COLOR = "#6b6b6b"  # 空檔括號的 % 字色
+GAP_LW_FRAC = 0.6  # 空檔括號線寬 = 主括號 × 此值
 BRACKET_CLEAR_PT = 1.0  # 括號之間的最小間距（pt）
 BRACKET_LAND_CLEAR_DEG = 0.004  # 括號與陸地（含島嶼）的偏好間距（度，約 0.45 km）
 BRACKET_LAND_CLEAR_MIN_DEG = 0.0005  # 做不到偏好間距時的最小間距（度，約 50 m）；仍相交才算與陸地重疊
@@ -213,6 +216,53 @@ def boundary_stretches(sd, seg_counts: np.ndarray, n_total: int) -> list[Stretch
         min_seg_pct=STRETCH_BOUNDARY_MIN_SEG_PCT, min_total_pct=STRETCH_BOUNDARY_MIN_TOTAL_PCT,
         max_n=None, kind="boundary",
     )  # fmt: skip
+
+
+def _segs_joined(sd, i: int, k: int, tol_m: float = 50.0) -> bool:
+    """兩個海上分段是否首尾相接（中間沒有陸地或缺口）。"""
+
+    a, b = sd.bseg[i].geom, sd.bseg[k].geom
+    pa = [Point(a.coords[0]), Point(a.coords[-1])]
+    pb = [Point(b.coords[0]), Point(b.coords[-1])]
+    return min(p.distance(q) for p in pa for q in pb) <= tol_m
+
+
+def _seg_is_sea(sd, i: int, min_sea_m: float = 100.0) -> bool:
+    """分段是否有海上部分（整段落在陸地上的分段屬於陸上邊界）。"""
+
+    cache = sd.__dict__.setdefault("_seg_sea_cache", {})
+    if i not in cache:
+        g, lp = sd.bseg[i].geom, sd.land_proj
+        cache[i] = lp is None or lp.is_empty or g.difference(lp).length >= min_sea_m
+    return cache[i]
+
+
+def boundary_gaps(sd, seg_counts: np.ndarray, main: list[Stretch]) -> tuple[list[Stretch], list[Stretch]]:
+    """主括號之間、不屬於任何集中段的海上邊界，依連續性切成「空檔」。
+
+    陸上邊界（整段落在陸地上的分段，或與鄰段不相接處）會切開空檔，但可繞過轉角。
+    回傳 ``(兩段以上的空檔, 只有一段的空檔)``。
+    """
+
+    m = len(sd.bseg)
+    in_main = {i for s in main for i in s.indices}
+    sea = [_seg_is_sea(sd, i) for i in range(m)]
+    joined = [
+        sea[i] and sea[(i + 1) % m] and _segs_joined(sd, i, (i + 1) % m) for i in range(m)
+    ]  # i 與 i+1 相接
+    free = [i for i in range(m) if i not in in_main and sea[i]]
+    starts = [i for i in free if (i - 1) % m in in_main or not joined[(i - 1) % m]]
+    if not starts:
+        starts = free[:1]
+    runs = []
+    for st in starts:
+        run, i = [st], st
+        while joined[i] and (i + 1) % m not in in_main and (i + 1) % m != st:
+            i = (i + 1) % m
+            run.append(i)
+        runs.append(run)
+    mk = lambda r: Stretch("boundary", "邊界", r, int(sum(int(seg_counts[i]) for i in r)))  # noqa: E731
+    return [mk(r) for r in runs if len(r) >= 2], [mk(r) for r in runs if len(r) == 1]
 
 
 def circled(k: int) -> str:
@@ -727,7 +777,7 @@ def pick_value_variant(variants: list[str], font, avail_pt: float) -> tuple[str,
 
 def annotate_boundary(
     ax, fig, sd, dr, seg_counts, n_total, *, font, star_size=10.0, lw_pt=SF.LW_BOUNDARY, avoid=(),
-    mode="label", levels_pt=BRACKET_LEVELS_SINGLE_PT, br_lw=0.8, land_pad_pt=LAND_CLEARANCE_PT,
+    mode="label", levels_pt=BRACKET_LEVELS_SINGLE_PT, br_lw=0.8, land_pad_pt=LAND_CLEARANCE_PT, gaps=False,
 ) -> dict:  # fmt: skip
     """邊界圖：每個集中段（連續分段各 ≥ 門檻、合計 ≥ 門檻）畫一條與該段**等長**的括號。
 
@@ -745,6 +795,28 @@ def annotate_boundary(
     scene = Scene(fig, ax, lines_ll=lines, line_lw_pt=lw_pt, star_lonlat=sd.anchor, star_size=star_size,
                   avoid_boxes=avoid, land_ll=dr.land_union, land_pad_pt=land_pad_pt)  # fmt: skip
     stretches = boundary_stretches(sd, seg_counts, n_total)  # 依合計由大到小
+    n_main = len(stretches)
+    label_txt = {j: f"{SF.pct2(s.count, n_total)}%" for j, s in enumerate(stretches)}
+    if gaps and mode == "label":  # 主括號之間的空檔畫灰色細括號，合計 % 與主括號一起用最大餘數法湊到穿越比例
+        gl, tiny = boundary_gaps(sd, seg_counts, stretches)
+        gl_draw = [g for g in gl if g.count > 0]
+        items = {f"m{j}": s.count for j, s in enumerate(stretches)}
+        items.update({f"g{k}": g.count for k, g in enumerate(gl_draw)})
+        items["tiny"] = sum(t.count for t in tiny)
+        lr = largest_remainder(items, int(np.sum(seg_counts)), n_total, 2)
+        label_txt = {j: f"{lr[f'm{j}']:.2f}%" for j in range(n_main)}
+        label_txt.update({n_main + k: f"{lr[f'g{k}']:.2f}%" for k in range(len(gl_draw))})
+        rec["gap_info"] = {
+            "main_pct": [label_txt[j][:-1] for j in range(n_main)],
+            "gap_pct": [label_txt[n_main + k][:-1] for k in range(len(gl_draw))],
+            "gap_zero_n": len(gl) - len(gl_draw),
+            "tiny_n": len(tiny),
+            "tiny_pct": f"{lr['tiny']:.2f}",
+            "tiny_pct_each": [SF.pct2(t.count, n_total) for t in tiny],
+            "sum_shown": f"{sum(lr.values()):.2f}",
+            "total_legend": SF.pct2(int(np.sum(seg_counts)), n_total),
+        }
+        stretches = stretches + gl_draw
     mpp = _m_per_pt(sd, ax, scene)
     clear_m = BRACKET_CLEAR_PT * mpp
     axbb = scene.axbb
@@ -758,10 +830,10 @@ def annotate_boundary(
     lb_pref, lb_min = _land_local(sd, land_pref_m), _land_local(sd, land_min_m)
     chosen: dict[int, dict] = {}
     placed_br: list = []  # 已定括號（投影公尺）
-    for j in sorted(range(len(stretches)), key=lambda j: -stretches[j].count):
+    for j in sorted(range(len(stretches)), key=lambda j: (j >= n_main, -stretches[j].count)):
         s = stretches[j]
         full = _boundary_stretch_line(sd, s)
-        tw_pt = text_width_pt(font, f"{SF.pct2(s.count, n_total)}%") + 1.0
+        tw_pt = text_width_pt(font, label_txt[j], 7.0 if j >= n_main else 8.0) + 1.0
         p = pref[j]
         lv = [
             levels_pt[p],
@@ -771,6 +843,7 @@ def annotate_boundary(
             max(levels_pt) * 1.4,
         ]
         evals: list[dict] = []
+        ends_pts = [Point(full.coords[0]), Point(full.coords[-1])]
         for outward in (True, False):
             for lv_pt in lv:
                 cand = _bracket_candidate(sd, full, lv_pt * mpp, outward)
@@ -783,7 +856,22 @@ def annotate_boundary(
                 core = off.difference(full.buffer(1.5 * mpp)).difference(ends)
                 land_pref = 0.0 if lb_pref is None else core.intersection(lb_pref).length
                 land_min = 0.0 if lb_min is None else core.intersection(lb_min).length
-                hit_br = any(geo_m.buffer(clear_m).intersects(g) for g in placed_br)
+                hit_br = False
+                for pb in placed_br:
+                    shared = [e for e in ends_pts if any(e.distance(e2) < 200.0 for e2 in pb["ends"])]
+                    if not shared:
+                        hit_br = hit_br or geo_m.buffer(clear_m).intersects(pb["geo_m"])
+                        continue
+                    # 端點相接的相鄰括號：同側且偏移太接近就會連成一條，否則只比較平行線（端點附近不算）
+                    if outward == pb["outward"] and abs(lv_pt - pb["lv"]) < 2.0 * (
+                        1.0 if levels_pt[0] > 4 else 0.45
+                    ):
+                        hit_br = True
+                        continue
+                    zone = unary_union([e.buffer(8.0 * mpp) for e in shared])
+                    hit_br = hit_br or off.difference(zone).buffer(clear_m).intersects(
+                        pb["off"].difference(zone)
+                    )
                 disp = unary_union(
                     [LineString(scene.tr.transform(np.asarray(_to_ll(sd, g).coords))) for g in (off, *ticks)]
                 )
@@ -853,8 +941,18 @@ def annotate_boundary(
             pick = min(evals, key=lambda e: (e["hit_br"] + e["hit_frame"] + e["hit_col"], e["land_min"]))
         if pick is None:
             continue
-        pick = dict(pick, full=full, islet=islet, span_err_m=_span_error_m(full, pick["off"]))
-        placed_br.append(pick["geo_m"])
+        pick = dict(
+            pick, full=full, islet=islet, gap=j >= n_main, span_err_m=_span_error_m(full, pick["off"])
+        )
+        placed_br.append(
+            {
+                "geo_m": pick["geo_m"],
+                "off": pick["off"],
+                "outward": pick["outward"],
+                "lv": pick["lv"],
+                "ends": ends_pts,
+            }
+        )
         chosen[j] = pick
     numbered = (
         {
@@ -870,7 +968,8 @@ def annotate_boundary(
         for g in (c["off"], *c["ticks"]):
             ll_ = _to_ll(sd, g)
             ax.plot(
-                *np.asarray(ll_.coords).T, color="#222222", linewidth=br_lw, solid_capstyle="butt", zorder=11,
+                *np.asarray(ll_.coords).T, color=GAP_COLOR if c["gap"] else "#222222",
+                linewidth=br_lw * GAP_LW_FRAC if c["gap"] else br_lw, solid_capstyle="butt", zorder=11,
                 path_effects=halo,
             )  # fmt: skip
         if c["islet"]:
@@ -889,7 +988,8 @@ def annotate_boundary(
         horiz = abs(d[0]) < abs(d[1])
         tang = np.array([1.0, 0.0]) if horiz else np.array([0.0, 1.0])
         marker = circled(numbered[id(s)]) if id(s) in numbered else ""
-        txt = f"{SF.pct2(s.count, n_total)}%" if mode == "label" else marker
+        txt = label_txt[j] if mode == "label" else marker
+        is_gap = j >= n_main
         tags: set[str] = set()
         a = bb = None
         where = ""
@@ -925,7 +1025,8 @@ def annotate_boundary(
                 dd = sgn * d
                 return ax.annotate(
                     txt, xy=(lon0, lat0), xytext=(off_pt[0], off_pt[1]), textcoords="offset points",
-                    fontproperties=font, fontsize=8, zorder=13, rotation=0 if horiz else 90,
+                    fontproperties=font, fontsize=7 if is_gap else 8, zorder=13, rotation=0 if horiz else 90,
+                    color=GAP_TEXT_COLOR if is_gap else "black",
                     ha="center" if horiz else ("left" if dd[0] > 0 else "right"),
                     va=("bottom" if dd[1] > 0 else "top") if horiz else "center", path_effects=_halo(),
                 )  # fmt: skip
@@ -958,7 +1059,7 @@ def annotate_boundary(
         return a, bb, tags, txt, marker, where
 
     # 標籤：先由大到小；若有碰撞且不只一個圈號，試其他放置順序，取總嚴重度最小者
-    base_order = sorted(chosen, key=lambda j: -stretches[j].count)
+    base_order = sorted(chosen, key=lambda j: (j >= n_main, -stretches[j].count))
     num_js = [j for j in base_order if id(stretches[j]) in numbered]
 
     def run_order(order):
@@ -1023,14 +1124,15 @@ def annotate_boundary(
              "sea_clip_m": round(max(0.0, seg_len - c["full"].length), 3),
              "start_lonlat": [float(alon[0]), float(alat[0])], "end_lonlat": [float(blon[0]), float(blat[0])],
              "bracket_offset_pt": float(c["lv"]), "bracket_side": "out" if c["outward"] else "in",
-             "bracket_over_islet": bool(c["islet"]), "bracket_span_err_m": round(c["span_err_m"], 6),
+             "bracket_over_islet": bool(c["islet"]), "style": "gap" if c["gap"] else "main",
+             "shown_pct": label_txt[j][:-1] if mode == "label" else SF.pct2(s.count, n_total), "bracket_span_err_m": round(c["span_err_m"], 6),
              "marker_where": where, "marker": marker, "violations": sorted(tags)}
         )  # fmt: skip
         if tags:
             rec["collisions"].append(
                 {"label": txt or f"{SF.pct2(s.count, n_total)}%", "violations": sorted(tags)}
             )
-    rec["n_stretches"] = len(stretches)
+    rec["n_stretches"] = n_main
     rec["n_brackets"] = len(chosen)
     rec["n_inner"] = sum(1 for c in chosen.values() if not c["outward"])
     rec["n_numbered"] = len(numbered)
