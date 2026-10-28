@@ -47,13 +47,15 @@ def _in_window(lonlat, w):
 
 
 def render_site(
-    sd, dr, grp, label, mats, bcount, ccount, gn, out: Path, font, *, only=None, lienchiang_inset=True, gaps=False,
+    sd, dr, grp, label, mats, bcount, ccount, gn, out: Path, font, *, only=None, lienchiang_inset=True, gaps=True,
 ):  # fmt: skip
-    """輸出該地點的全部圖；回傳 ``(manifest 紀錄, 集中段表格列, 多面板標題數值行紀錄)``。``only`` 可限定 (kind, name) 清單。"""
+    """輸出該地點的全部圖；回傳 ``(manifest 紀錄, 集中段表格列, 多面板標題數值行紀錄, 附表列（數字對照與零星段）)``。``only`` 可限定 (kind, name) 清單。"""
 
     out.mkdir(parents=True, exist_ok=True)
     recs: dict = {}
     stretch_rows: list = []
+    pct_diff: list = []  # 圖上數字（最大餘數法）與各自四捨五入（pct2）的對照
+    tiny_rows: list = []  # 未標示的零星段（單段空檔）位置
     title_log: list = []  # 多面板標題數值行：用了哪個候選、有幾個集中段
 
     def tot(k, kind):
@@ -80,6 +82,10 @@ def render_site(
                 cnt, t = tot("all", kind)
                 n = gn["all"]
                 total_text = f"{'穿越比例' if kind == 'boundary' else '海岸來源比例'} {t}%"
+                if kind == "boundary" and gaps:
+                    tt = SA.boundary_gap_summary(sd, cnt, n)["tiny_text"]
+                    if tt:
+                        total_text += "\n" + tt
                 kw: dict = {}
                 if kind == "boundary":
 
@@ -88,6 +94,28 @@ def render_site(
                             ax, fig, sd, dr, cnt, n, font=f8, avoid=avoid, mode="label", gaps=gaps
                         )
                         rows_from("boundary", "all", r, "main")
+                        gi = r.get("gap_info")
+                        if gi:
+                            for rk, (a, b) in enumerate(
+                                zip(gi["main_pct2"], gi["main_pct"], strict=True), start=1
+                            ):
+                                pct_diff.append([sd.site_id, "boundary_all", "全年", f"主括號{rk}", a, b])
+                            for rk, (a, b) in enumerate(
+                                zip(gi["gap_pct2"], gi["gap_pct"], strict=True), start=1
+                            ):
+                                pct_diff.append([sd.site_id, "boundary_all", "全年", f"空檔{rk}", a, b])
+                            for ti in gi["tiny_info"]:
+                                tiny_rows.append(
+                                    [
+                                        sd.site_id,
+                                        ti["seg_id"],
+                                        ti["pct2"],
+                                        f"{ti['lon']:.4f}",
+                                        f"{ti['lat']:.4f}",
+                                        ti["prev"],
+                                        ti["next"],
+                                    ]
+                                )
                         return r
 
                 else:
@@ -146,10 +174,15 @@ def render_site(
                         SF.rs.REPORT_WIDTH_IN - lay.left - lay.right_strip - lay.gap_x * (lay.ncol - 1)
                     ) / lay.ncol
                     val, vi = SA.pick_value_variant(
-                        SA.boundary_value_variants(st, n), SF.rs.text_font(font), pw * 72.0 + 3.0
+                        SA.boundary_value_variants(st, n, crossing=int(cnt.sum())),
+                        SF.rs.text_font(font),
+                        pw * 72.0 + 3.0,
                     )
                     title = f"{base}\n{val}" if val else base
                     title_lines.append(2 + (val.count("\n") + 1 if val else 0))
+                    if st:
+                        for nm, p2, plr in SA.title_value_table(st, n, int(cnt.sum())):
+                            pct_diff.append([sd.site_id, f"boundary_{name}", label[k], nm, p2, plr])
                     title_log.append([sd.site_id, name, k, label[k], len(st), min(len(st), SA.STRETCH_BOUNDARY_MAX_NUMBERED),
                                       max(0, len(st) - SA.STRETCH_BOUNDARY_MAX_NUMBERED), vi, val.replace("\n", " / ")])  # fmt: skip
 
@@ -183,4 +216,4 @@ def render_site(
             recs[f"{kind}_{name}"] = SF.render_panels(sd, dr, kind, panels, lay, out / fname, font)
             if kind == "boundary":
                 recs[f"{kind}_{name}"]["title_value_choices"] = [r[2:] for r in title_log if r[1] == name]
-    return recs, stretch_rows, title_log
+    return recs, stretch_rows, title_log, {"pct_diff": pct_diff, "tiny": tiny_rows}

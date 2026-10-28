@@ -30,7 +30,7 @@ nb, nc = len(sd.bseg), len(sd.cseg)
 bcount = {k: sp.counts_by_segment(sd.b_idx[m & (sd.b_idx >= 0)], nb) for k, m in grp.items()}
 ccount = {k: sp.counts_by_segment(sd.c_idx[m & (sd.c_idx >= 0)], nc) for k, m in grp.items()}
 dr = SF.prepare_drawing(sd, land)
-recs, rows, _tl = M.render_site(sd, dr, grp, label, mats, bcount, ccount, gn, out / sid, font, only=only)
+recs, rows, _tl, _ex = M.render_site(sd, dr, grp, label, mats, bcount, ccount, gn, out / sid, font, only=only)
 for k, v in recs.items():
     a = v.get("annotations")
     col = []

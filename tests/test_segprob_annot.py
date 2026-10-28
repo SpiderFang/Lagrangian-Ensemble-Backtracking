@@ -97,15 +97,27 @@ def test_boundary_value_variants_prefer_two_decimals_then_integers() -> None:
     ]  # noqa: E501
     v = sa.boundary_value_variants(st, 100_000)
     assert v[0] == "① 42.15%　② 17.78%　③ 5.12%"  # 只編前 3 段
-    assert v[1] == "① 42% ② 18% ③ 5%"
-    assert v[2] == "①42% ②18% ③5%"
+    assert v[1] == "① 42.15%　② 17.78%\n③ 5.12%"
+    assert v[2] == "① 42% ② 18% ③ 5%"
+    assert v[3] == "①42% ②18% ③5%"
     assert v[-1] == "①42% ②18%\n③5%"
     assert sa.boundary_value_variants([], 100) == [""]
     # 整數用 ROUND_HALF_UP：2.5 → 3、0.5 → 1
     h = sa.boundary_value_variants(
         [sa.Stretch("boundary", "邊界", [0], 25), sa.Stretch("boundary", "邊界", [3], 5)], 1000
     )
-    assert h[1] == "① 3% ② 1%"
+    assert "① 3% ② 1%" in h
+
+
+def test_title_values_add_rest_and_sum_to_crossing() -> None:
+    # 各自四捨五入會加成 5.01，最大餘數法補回 5.00
+    st = [sa.Stretch("boundary", "邊界", [0], 4285)]
+    v = sa.boundary_value_variants(st, 100_000, crossing=5000)
+    assert v[0] == "① 4.29%　其餘 0.71%"
+    tbl = sa.title_value_table(st, 100_000, 5000)
+    assert tbl == [("①", "4.29", "4.29"), ("其餘", "0.72", "0.71")]
+    st3 = [sa.Stretch("boundary", "邊界", [0], 42150), sa.Stretch("boundary", "邊界", [5], 17780)]
+    assert sa.boundary_value_variants(st3, 100_000, crossing=73402)[0] == "① 42.15%　② 17.78%　其餘 13.47%"
 
 
 def test_bracket_must_span_exactly_the_stretch() -> None:

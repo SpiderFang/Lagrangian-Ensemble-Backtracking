@@ -90,6 +90,8 @@ def main(fig_root: Path, tab_dir: Path) -> int:
     group_rows, verification, stretch_all, title_all, cov_rows = [], [], [], [], []
     collision_log: list = []
     bracket_log: list = []
+    pct_diff_all: list = []
+    tiny_all: list = []
     bracket_panel: dict = {}
     for sid in C.SITES:
         sd = C.build_site(sid, land, regions, sites, anchors)
@@ -176,8 +178,12 @@ def main(fig_root: Path, tab_dir: Path) -> int:
 
         # 圖
         dr = SF.prepare_drawing(sd, land)
-        recs, srows, tlog = M.render_site(sd, dr, grp, label, mats, bcount, ccount, gn, fig_root / sid, font)
+        recs, srows, tlog, extra = M.render_site(
+            sd, dr, grp, label, mats, bcount, ccount, gn, fig_root / sid, font
+        )
         title_all.extend(tlog)
+        pct_diff_all.extend(extra["pct_diff"])
+        tiny_all.extend(extra["tiny"])
         manifest["figures"][sid] = recs
         stretch_all.extend(srows)
 
@@ -310,6 +316,16 @@ def main(fig_root: Path, tab_dir: Path) -> int:
             "title_values_line",
         ],
         title_all,
+    )
+    write_csv(
+        tab_dir / "pct_lr_vs_rounded.csv",
+        ["site", "figure", "group", "item", "pct2_each_rounded", "figure_value_largest_remainder", "differs"],
+        [[*r_, "是" if r_[4] != r_[5] else ""] for r_ in pct_diff_all],
+    )
+    write_csv(
+        tab_dir / "unlabelled_small_gaps.csv",
+        ["site", "segment", "pct2", "lon", "lat", "prev_neighbour", "next_neighbour"],
+        tiny_all,
     )
     write_csv(
         tab_dir / "bracket_check.csv",

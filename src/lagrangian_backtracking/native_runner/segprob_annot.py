@@ -265,6 +265,47 @@ def boundary_gaps(sd, seg_counts: np.ndarray, main: list[Stretch]) -> tuple[list
     return [mk(r) for r in runs if len(r) >= 2], [mk(r) for r in runs if len(r) == 1]
 
 
+def _neighbour_kind(sd, i: int, step: int, in_main: set[int]) -> str:
+    m = len(sd.bseg)
+    j = (i + step) % m
+    a, b = (i, j) if step > 0 else (j, i)
+    if not (_seg_is_sea(sd, j) and _segs_joined(sd, a, b)):
+        return "陸地或斷點"
+    return "主括號" if j in in_main else "空檔"
+
+
+def boundary_gap_summary(sd, seg_counts: np.ndarray, n_total: int, main: list[Stretch] | None = None) -> dict:
+    """單張邊界圖的數字：主括號、灰色空檔括號、未標示零星段，用最大餘數法湊到穿越比例（2 位小數）。
+
+    回傳 ``main``、``gaps``（要畫的空檔，合計 > 0）、``n_zero_gaps``、``tiny``（單段、> 0 的空檔）、
+    ``tiny_info``（位置與兩側鄰居）、``lr``（各項顯示值）、``tiny_text``（圖例行，沒有零星段則為空字串）。
+    """
+
+    main = boundary_stretches(sd, seg_counts, n_total) if main is None else main
+    gl, tiny_all = boundary_gaps(sd, seg_counts, main)
+    gaps = [g for g in gl if g.count > 0]
+    tiny = [t for t in tiny_all if t.count > 0]
+    items = {f"m{j}": s.count for j, s in enumerate(main)}
+    items.update({f"g{k}": g.count for k, g in enumerate(gaps)})
+    items["tiny"] = sum(t.count for t in tiny_all)
+    lr = largest_remainder(items, int(np.sum(seg_counts)), n_total, 2)
+    in_main = {i for s in main for i in s.indices}
+    info = []
+    for t in tiny:
+        i = t.indices[0]
+        pt = sd.bseg[i].geom.interpolate(0.5, normalized=True)
+        lon, lat = _lonlat(sd, [pt.x], [pt.y])
+        info.append({
+            "seg_id": sd.bseg[i].seg_id, "count": t.count, "pct2": SF.pct2(t.count, n_total),
+            "lon": float(lon[0]), "lat": float(lat[0]),
+            "prev": _neighbour_kind(sd, i, -1, in_main), "next": _neighbour_kind(sd, i, 1, in_main),
+        })  # fmt: skip
+    tv = lr["tiny"]
+    tiny_text = "" if not tiny else f"未標示零星段 {'<0.01' if tv == 0 else f'{tv:.2f}'}%"
+    return {"main": main, "gaps": gaps, "n_zero_gaps": len(gl) - len(gaps), "tiny": tiny, "tiny_info": info,
+            "lr": lr, "tiny_text": tiny_text}  # fmt: skip
+
+
 def circled(k: int) -> str:
     """第 k 個（從 1 起）小圈號。"""
 
@@ -719,35 +760,61 @@ def _to_ll(sd, g: LineString) -> LineString:
 
 
 def boundary_value_variants(
-    stretches: list[Stretch], n_total: int, max_numbered: int | None = None
+    stretches: list[Stretch], n_total: int, max_numbered: int | None = None, crossing: int | None = None
 ) -> list[str]:
-    """多面板標題最後一行的候選（依序嘗試，取第一個放得下的）：
+    """多面板標題最後一行的候選（依序嘗試，取第一個放得下的）。
 
-    ① 兩位小數、一行（``① 42.15%　② 17.78%``）；② 整數、一行（``① 42% ② 18%``）；③ 整數、一行緊縮（``①42% ②18%``）；
-    ④ 整數、分兩行。只編前 ``max_numbered`` 個（依 % 由大到小）。
+    只編前 ``max_numbered`` 個（依 % 由大到小）。給定 ``crossing``（該面板穿越顆數）時，行尾加
+    「其餘 x.xx%」（= 穿越減去已編號各段），且各數字以最大餘數法湊成穿越比例；沒給時各段各自四捨五入。
+    候選：① 兩位小數、一行；② 兩位小數、分兩行；③ 整數、一行；④ 整數、一行緊縮；⑤ 整數、分兩行。
     """
 
     n_lab = STRETCH_BOUNDARY_MAX_NUMBERED if max_numbered is None else max_numbered
     items = list(stretches)[:n_lab]
     if not items:
         return [""]
+    rest = None if crossing is None else int(crossing) - sum(s.count for s in items)
 
-    def dec(s: Stretch, k: int) -> str:
-        return f"{circled(k)} {SF.pct2(s.count, n_total)}%"
+    def values(decimals: int) -> list[str]:
+        if rest is None:
+            q = Decimal(1).scaleb(-decimals)
+            return [
+                f"{(Decimal(s.count) * 100 / Decimal(n_total)).quantize(q, rounding=ROUND_HALF_UP):.{decimals}f}"
+                for s in items
+            ]
+        keys = {f"s{k}": s.count for k, s in enumerate(items)} | {"rest": rest}
+        lr = largest_remainder(keys, int(crossing), n_total, decimals)
+        return [f"{lr[k]:.{decimals}f}" for k in keys]
 
-    def integ(s: Stretch, k: int, sep: str) -> str:
-        v = (Decimal(s.count) * 100 / Decimal(n_total)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
-        return f"{circled(k)}{sep}{v:.0f}%"
+    def build(decimals: int, sep: str, glue: str, split: bool) -> str:
+        vals = values(decimals)
+        ents = [f"{circled(k)}{sep}{v}%" for k, v in enumerate(vals[: len(items)], start=1)]
+        if rest is not None:
+            ents.append(f"其餘{' ' if sep else ''}{vals[-1]}%")
+        if not split or len(ents) < 2:
+            return glue.join(ents)
+        half = (len(ents) + 1) // 2
+        return glue.join(ents[:half]) + "\n" + glue.join(ents[half:])
 
-    v0 = "　".join(dec(s, k) for k, s in enumerate(items, start=1))
-    v1 = " ".join(integ(s, k, " ") for k, s in enumerate(items, start=1))
-    v2 = " ".join(integ(s, k, "") for k, s in enumerate(items, start=1))
-    half = (len(items) + 1) // 2
-    v3 = " ".join(integ(s, k, "") for k, s in enumerate(items[:half], start=1))
-    if len(items) > half:
-        v3 += "\n" + " ".join(integ(s, k, "") for k, s in enumerate(items[half:], start=half + 1))
-    out = [v0, v1, v2, v3]
+    out = [
+        build(2, " ", "　", False),
+        build(2, " ", "　", True),
+        build(0, " ", " ", False),
+        build(0, "", " ", False),
+        build(0, "", " ", True),
+    ]
     return list(dict.fromkeys(out))
+
+
+def title_value_table(stretches: list[Stretch], n_total: int, crossing: int) -> list[tuple[str, str, str]]:
+    """多面板標題數值：``(編號或「其餘」, 各自四捨五入的 %, 最大餘數法的 %)``（2 位小數）。"""
+
+    items = list(stretches)[:STRETCH_BOUNDARY_MAX_NUMBERED]
+    rest = int(crossing) - sum(s.count for s in items)
+    keys = {f"s{k}": s.count for k, s in enumerate(items)} | {"rest": rest}
+    lr = largest_remainder(keys, int(crossing), n_total, 2)
+    names = [circled(k) for k in range(1, len(items) + 1)] + ["其餘"]
+    return [(nm, SF.pct2(c, n_total), f"{lr[k]:.2f}") for nm, (k, c) in zip(names, keys.items(), strict=True)]
 
 
 def text_width_pt(font, text: str, size: float = 8.0) -> float:
@@ -798,21 +865,21 @@ def annotate_boundary(
     n_main = len(stretches)
     label_txt = {j: f"{SF.pct2(s.count, n_total)}%" for j, s in enumerate(stretches)}
     if gaps and mode == "label":  # 主括號之間的空檔畫灰色細括號，合計 % 與主括號一起用最大餘數法湊到穿越比例
-        gl, tiny = boundary_gaps(sd, seg_counts, stretches)
-        gl_draw = [g for g in gl if g.count > 0]
-        items = {f"m{j}": s.count for j, s in enumerate(stretches)}
-        items.update({f"g{k}": g.count for k, g in enumerate(gl_draw)})
-        items["tiny"] = sum(t.count for t in tiny)
-        lr = largest_remainder(items, int(np.sum(seg_counts)), n_total, 2)
+        gs = boundary_gap_summary(sd, seg_counts, n_total, stretches)
+        lr = gs["lr"]
+        gl_draw = gs["gaps"]
         label_txt = {j: f"{lr[f'm{j}']:.2f}%" for j in range(n_main)}
         label_txt.update({n_main + k: f"{lr[f'g{k}']:.2f}%" for k in range(len(gl_draw))})
         rec["gap_info"] = {
             "main_pct": [label_txt[j][:-1] for j in range(n_main)],
+            "main_pct2": [SF.pct2(s.count, n_total) for s in stretches],
             "gap_pct": [label_txt[n_main + k][:-1] for k in range(len(gl_draw))],
-            "gap_zero_n": len(gl) - len(gl_draw),
-            "tiny_n": len(tiny),
+            "gap_pct2": [SF.pct2(g.count, n_total) for g in gl_draw],
+            "gap_zero_n": gs["n_zero_gaps"],
+            "tiny_n": len(gs["tiny"]),
             "tiny_pct": f"{lr['tiny']:.2f}",
-            "tiny_pct_each": [SF.pct2(t.count, n_total) for t in tiny],
+            "tiny_pct2": SF.pct2(sum(t.count for t in gs["tiny"]), n_total),
+            "tiny_info": gs["tiny_info"],
             "sum_shown": f"{sum(lr.values()):.2f}",
             "total_legend": SF.pct2(int(np.sum(seg_counts)), n_total),
         }
