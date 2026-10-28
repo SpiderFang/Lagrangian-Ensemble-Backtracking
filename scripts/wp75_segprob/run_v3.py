@@ -324,8 +324,21 @@ def main(fig_root: Path, tab_dir: Path) -> int:
     )
     write_csv(
         tab_dir / "unlabelled_small_gaps.csv",
-        ["site", "segment", "pct2", "lon", "lat", "prev_neighbour", "next_neighbour"],
+        ["site", "segment", "n_seg", "reason", "pct2", "lon", "lat", "prev_neighbour", "next_neighbour"],
         tiny_all,
+    )
+    rem: dict = {}
+    for r in tiny_all:
+        k = rem.setdefault(r[0], [0, 0])
+        k[0] += 1
+        k[1] += int(round(float(r[4]) * 100))
+    write_csv(
+        tab_dir / "unbracketed_remainder.csv",
+        ["site", "figure", "n_pieces", "sum_of_piece_pct2"],
+        [
+            [sid, "boundary_all", rem.get(sid, [0, 0])[0], f"{rem.get(sid, [0, 0])[1] / 100:.2f}"]
+            for sid in C.SITES
+        ],
     )
     write_csv(
         tab_dir / "bracket_check.csv",

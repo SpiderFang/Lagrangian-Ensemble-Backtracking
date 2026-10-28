@@ -270,11 +270,7 @@ def _legend_handles(kind: str, total_text: str | None, has_land_boundary: bool) 
     if kind == "boundary" and has_land_boundary:
         h.append(Line2D([], [], color=LAND_LINE, linewidth=LW_LAND_LINE * 1.6, label="陸上邊界（無法穿越）"))
     if total_text:
-        lines = total_text.split("\n")  # 第二行（如「未標示零星段 x.xx%」）排在穿越比例正下方
-        if len(lines) > 1 and not (kind == "boundary" and has_land_boundary):
-            h.append(Line2D([], [], linestyle="none", label=""))  # 補一格空白，讓兩行落在同一欄
-        for ln in lines:
-            h.append(Line2D([], [], linestyle="none", label=ln))
+        h.append(Line2D([], [], linestyle="none", label=total_text))
     return h
 
 

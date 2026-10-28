@@ -82,10 +82,6 @@ def render_site(
                 cnt, t = tot("all", kind)
                 n = gn["all"]
                 total_text = f"{'穿越比例' if kind == 'boundary' else '海岸來源比例'} {t}%"
-                if kind == "boundary" and gaps:
-                    tt = SA.boundary_gap_summary(sd, cnt, n)["tiny_text"]
-                    if tt:
-                        total_text += "\n" + tt
                 kw: dict = {}
                 if kind == "boundary":
 
@@ -109,6 +105,8 @@ def render_site(
                                     [
                                         sd.site_id,
                                         ti["seg_id"],
+                                        ti["n_seg"],
+                                        ti["reason"],
                                         ti["pct2"],
                                         f"{ti['lon']:.4f}",
                                         f"{ti['lat']:.4f}",

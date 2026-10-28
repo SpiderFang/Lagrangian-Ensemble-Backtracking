@@ -131,3 +131,11 @@ def test_bracket_must_span_exactly_the_stretch() -> None:
     # 截短（例如為了閃避陸地）會被抓出來
     short = substring(line.offset_curve(5.0), 10.0, 150.0)
     assert sa._span_error_m(line, short) > 9.0
+
+
+def test_gap_split_at_zero_runs_trims_and_splits():
+    counts = np.array([0, 0, 5, 3, 0, 0, 0, 2, 0, 4, 1, 6, 0])
+    run = list(range(13))
+    assert sa.split_at_zero_runs(run, counts) == [[2, 3], [7], [9, 10, 11]]
+    assert sa.split_at_zero_runs([0, 1, 4], counts) == []
+    assert sa.split_at_zero_runs([11, 12, 0, 1], counts) == [[11]]

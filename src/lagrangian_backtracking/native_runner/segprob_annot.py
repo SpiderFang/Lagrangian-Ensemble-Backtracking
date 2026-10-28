@@ -238,11 +238,11 @@ def _seg_is_sea(sd, i: int, min_sea_m: float = 100.0) -> bool:
     return cache[i]
 
 
-def boundary_gaps(sd, seg_counts: np.ndarray, main: list[Stretch]) -> tuple[list[Stretch], list[Stretch]]:
-    """主括號之間、不屬於任何集中段的海上邊界，依連續性切成「空檔」。
+def boundary_gaps(sd, seg_counts: np.ndarray, main: list[Stretch]) -> list[list[int]]:
+    """主括號之間、不屬於任何集中段的海上邊界，依連續性切成「空檔」（尚未依 0% 分段切開）。
 
     陸上邊界（整段落在陸地上的分段，或與鄰段不相接處）會切開空檔，但可繞過轉角。
-    回傳 ``(兩段以上的空檔, 只有一段的空檔)``。
+    回傳每個空檔的分段索引串列。
     """
 
     m = len(sd.bseg)
@@ -262,39 +262,63 @@ def boundary_gaps(sd, seg_counts: np.ndarray, main: list[Stretch]) -> tuple[list
             i = (i + 1) % m
             run.append(i)
         runs.append(run)
-    mk = lambda r: Stretch("boundary", "邊界", r, int(sum(int(seg_counts[i]) for i in r)))  # noqa: E731
-    return [mk(r) for r in runs if len(r) >= 2], [mk(r) for r in runs if len(r) == 1]
+    return runs
 
 
-def _neighbour_kind(sd, i: int, step: int, in_main: set[int]) -> str:
+def split_at_zero_runs(run: list[int], seg_counts: np.ndarray) -> list[list[int]]:
+    """把一個空檔在 0% 分段處切開，兩端與中間的 0% 分段都去掉；回傳剩下的非零連續片段。"""
+
+    pieces: list[list[int]] = []
+    cur: list[int] = []
+    for i in run:
+        if int(seg_counts[i]) > 0:
+            cur.append(i)
+        elif cur:
+            pieces.append(cur)
+            cur = []
+    if cur:
+        pieces.append(cur)
+    return pieces
+
+
+def _neighbour_kind(sd, i: int, step: int, in_main: set[int], zero: set[int] | None = None) -> str:
     m = len(sd.bseg)
     j = (i + step) % m
     a, b = (i, j) if step > 0 else (j, i)
     if not (_seg_is_sea(sd, j) and _segs_joined(sd, a, b)):
         return "陸地或斷點"
-    return "主括號" if j in in_main else "空檔"
+    if j in in_main:
+        return "主括號"
+    return "0%段" if zero and j in zero else "空檔"
 
 
 def boundary_gap_summary(sd, seg_counts: np.ndarray, n_total: int, main: list[Stretch] | None = None) -> dict:
-    """單張邊界圖的數字：主括號、灰色空檔括號、未標示零星段，用最大餘數法湊到穿越比例（2 位小數）。
+    """單張邊界圖的數字：主括號、灰色空檔括號與未畫括號的餘量，用最大餘數法湊到穿越比例（2 位小數）。
 
-    空檔要同時「至少 2 段」且「合計 ≥ ``GAP_BRACKET_MIN_TOTAL_PCT``」才畫括號；其餘大於 0 的空檔
-    （單段，或兩段以上但不到門檻）都併入「未標示零星段」。
+    空檔先在 0% 分段處切開（兩端與中間的 0% 都不納入），每個非零片段要同時「至少 2 段」且
+    「合計 ≥ ``GAP_BRACKET_MIN_TOTAL_PCT``」才畫灰色括號；不夠的片段不畫、也不在圖上說明，
+    只列在表中（``tiny``、``tiny_info``）。
 
-    回傳 ``main``、``gaps``（要畫的空檔）、``n_zero_gaps``（全為 0 的空檔數）、``tiny``（未標示的空檔，
-    合計 > 0）、``tiny_info``（位置與兩側鄰居）、``lr``（各項顯示值）、``tiny_text``（圖例行，沒有則為空字串）。
+    回傳 ``main``、``gaps``（要畫的片段）、``n_zero_gaps``（全為 0 的空檔數）、``tiny``（未畫括號的片段）、
+    ``tiny_info``（位置、段數、原因與兩側鄰居）、``lr``（各項顯示值，``tiny`` 為未畫括號的餘量）。
     """
 
     main = boundary_stretches(sd, seg_counts, n_total) if main is None else main
-    gl, tiny_all = boundary_gaps(sd, seg_counts, main)
-    pos = [g for g in gl if g.count > 0]
-    gaps = [g for g in pos if Decimal(g.count) * 100 >= GAP_BRACKET_MIN_TOTAL_PCT * n_total]
-    tiny = [t for t in [*tiny_all, *(g for g in pos if g not in gaps)] if t.count > 0]
+    runs = boundary_gaps(sd, seg_counts, main)
+    mk = lambda r: Stretch("boundary", "邊界", r, int(sum(int(seg_counts[i]) for i in r)))  # noqa: E731
+    pieces = [mk(q) for r in runs for q in split_at_zero_runs(r, seg_counts)]
+    gaps = [
+        g
+        for g in pieces
+        if len(g.indices) >= 2 and Decimal(g.count) * 100 >= GAP_BRACKET_MIN_TOTAL_PCT * n_total
+    ]
+    tiny = [t for t in pieces if t not in gaps]
     items = {f"m{j}": s.count for j, s in enumerate(main)}
     items.update({f"g{k}": g.count for k, g in enumerate(gaps)})
     items["tiny"] = sum(t.count for t in tiny)
     lr = largest_remainder(items, int(np.sum(seg_counts)), n_total, 2)
     in_main = {i for s in main for i in s.indices}
+    zero = {i for i in range(len(sd.bseg)) if int(seg_counts[i]) == 0}
     info = []
     for t in tiny:
         i0, i1 = t.indices[0], t.indices[-1]
@@ -303,13 +327,12 @@ def boundary_gap_summary(sd, seg_counts: np.ndarray, n_total: int, main: list[St
         ids = sd.bseg[i0].seg_id if i0 == i1 else f"{sd.bseg[i0].seg_id}–{sd.bseg[i1].seg_id}"
         info.append({
             "seg_id": ids, "n_seg": len(t.indices), "count": t.count, "pct2": SF.pct2(t.count, n_total),
+            "reason": "單段" if len(t.indices) < 2 else "不到 1%",
             "lon": float(lon[0]), "lat": float(lat[0]),
-            "prev": _neighbour_kind(sd, i0, -1, in_main), "next": _neighbour_kind(sd, i1, 1, in_main),
+            "prev": _neighbour_kind(sd, i0, -1, in_main, zero), "next": _neighbour_kind(sd, i1, 1, in_main, zero),
         })  # fmt: skip
-    tv = lr["tiny"]
-    tiny_text = "" if not tiny else f"未標示零星段 {'<0.01' if tv == 0 else f'{tv:.2f}'}%"
-    return {"main": main, "gaps": gaps, "n_zero_gaps": len(gl) - len(pos), "tiny": tiny, "tiny_info": info,
-            "lr": lr, "tiny_text": tiny_text}  # fmt: skip
+    return {"main": main, "gaps": gaps, "n_zero_gaps": sum(1 for r in runs if not split_at_zero_runs(r, seg_counts)),
+            "tiny": tiny, "tiny_info": info, "lr": lr}  # fmt: skip
 
 
 def circled(k: int) -> str:
