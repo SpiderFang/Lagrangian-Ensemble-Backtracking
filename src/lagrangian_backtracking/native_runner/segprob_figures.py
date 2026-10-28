@@ -38,6 +38,9 @@ STAR = dict(
 LW_BOUNDARY = 3.2
 LW_COAST = 2.4
 LW_LAND_LINE = 0.7
+DOMAIN_RECT_COLOR = "#9e9e9e"  # 海岸圖上的流場範圍（細灰線，含陸上部分）
+DOMAIN_RECT_LW = 0.6
+DOMAIN_RECT_LABEL = "流場範圍"
 COLORBAR_LABEL = "各段比例（% 虛擬質點）"
 
 # 單張圖窗口：與軌跡總覽、條件式來源足跡圖（ax2）相同（跨度 1.8°×1.2°、刻度 0.2°、參考緯度 24.1°）
@@ -85,6 +88,7 @@ class Drawing:
     land_polys: list[object]
     has_land_boundary: bool
     land_union: object = None  # 窗口內陸地（lon/lat），供註記避開陸地
+    ring_ll: np.ndarray | None = None  # 流場範圍矩形（lon/lat 閉合折線，含陸上部分）
 
 
 def _unproject_lines(sd, geom) -> list[np.ndarray]:
@@ -117,8 +121,15 @@ def prepare_drawing(sd, land_lonlat: Sequence[object]) -> Drawing:
             polys.extend(sp._polys_of(g))  # noqa: SLF001
     import shapely
 
+    ring_ll = _unproject_lines(sd, sd.ring.line)[0]
     return Drawing(
-        b_sea, b_land_parts, c_lines, polys, bool(b_land_parts), shapely.union_all(polys) if polys else None
+        b_sea,
+        b_land_parts,
+        c_lines,
+        polys,
+        bool(b_land_parts),
+        shapely.union_all(polys) if polys else None,
+        ring_ll,
     )
 
 
@@ -159,6 +170,16 @@ def draw_map(
         lw, lines = LW_BOUNDARY * lw_scale, dr.b_sea
     else:
         lw, lines = LW_COAST * lw_scale, dr.c_lines
+        if dr.ring_ll is not None:  # 流場範圍：細灰線，讓讀者知道只計範圍內的海岸
+            ax.add_collection(
+                LineCollection(
+                    [dr.ring_ll],
+                    colors=DOMAIN_RECT_COLOR,
+                    linewidths=DOMAIN_RECT_LW,
+                    zorder=3.2,
+                    capstyle="butt",
+                )
+            )
     for k in range(len(cols)):  # 先畫 0，再依色階由低到高，高值疊在上面
         segs = [a for i, parts in enumerate(lines) if cls[i] == k for a in parts]
         if segs:
@@ -242,6 +263,10 @@ def _legend_handles(kind: str, total_text: str | None, has_land_boundary: bool) 
     from matplotlib.lines import Line2D
 
     h = [Line2D([], [], label="研究地點錨點", **STAR)]
+    if kind == "coast":
+        h.append(
+            Line2D([], [], color=DOMAIN_RECT_COLOR, linewidth=DOMAIN_RECT_LW * 1.5, label=DOMAIN_RECT_LABEL)
+        )
     if kind == "boundary" and has_land_boundary:
         h.append(Line2D([], [], color=LAND_LINE, linewidth=LW_LAND_LINE * 1.6, label="陸上邊界（無法穿越）"))
     if total_text:

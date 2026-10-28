@@ -80,9 +80,29 @@ def test_merge_stretches_threshold_cap_and_wraparound() -> None:
 
 def test_thresholds_are_constants_in_one_place() -> None:
     assert (sa.STRETCH_BOUNDARY_MIN_SEG_PCT, sa.STRETCH_BOUNDARY_MIN_TOTAL_PCT) == (  # noqa: SIM300
-        Decimal("2"),
-        Decimal("10"),
+        Decimal("1"),
+        Decimal("3"),
     )
-    assert sa.STRETCH_BOUNDARY_MAX_PER_PANEL == 2
+    assert sa.STRETCH_BOUNDARY_MAX_NUMBERED == 3
     assert (sa.STRETCH_COAST_MIN_SEG_PCT, sa.STRETCH_COAST_MIN_TOTAL_PCT) == (Decimal("0.5"), Decimal("3"))  # noqa: SIM300
     assert sa.STRETCH_COAST_MAX_PER_PANEL == 3
+
+
+def test_boundary_value_variants_prefer_two_decimals_then_integers() -> None:
+    st = [
+        sa.Stretch("boundary", "邊界", [0], 42150),
+        sa.Stretch("boundary", "邊界", [5], 17780),
+        sa.Stretch("boundary", "邊界", [9], 5120),
+        sa.Stretch("boundary", "邊界", [12], 3010),
+    ]  # noqa: E501
+    v = sa.boundary_value_variants(st, 100_000)
+    assert v[0] == "① 42.15%　② 17.78%　③ 5.12%"  # 只編前 3 段
+    assert v[1] == "① 42% ② 18% ③ 5%"
+    assert v[2] == "①42% ②18% ③5%"
+    assert v[-1] == "①42% ②18%\n③5%"
+    assert sa.boundary_value_variants([], 100) == [""]
+    # 整數用 ROUND_HALF_UP：2.5 → 3、0.5 → 1
+    h = sa.boundary_value_variants(
+        [sa.Stretch("boundary", "邊界", [0], 25), sa.Stretch("boundary", "邊界", [3], 5)], 1000
+    )
+    assert h[1] == "① 3% ② 1%"

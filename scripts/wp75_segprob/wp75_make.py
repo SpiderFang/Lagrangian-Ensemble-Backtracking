@@ -49,12 +49,12 @@ def _in_window(lonlat, w):
 def render_site(
     sd, dr, grp, label, mats, bcount, ccount, gn, out: Path, font, *, only=None, lienchiang_inset=True,
 ):  # fmt: skip
-    """輸出該地點的全部圖；回傳 ``(manifest 紀錄, 集中段表格列)``。``only`` 可限定 (kind, name) 清單。"""
+    """輸出該地點的全部圖；回傳 ``(manifest 紀錄, 集中段表格列, 多面板標題數值行紀錄)``。``only`` 可限定 (kind, name) 清單。"""
 
     out.mkdir(parents=True, exist_ok=True)
     recs: dict = {}
     stretch_rows: list = []
-    side_cnt = {k: SA.side_counts(sd, np.where(m, sd.b_s, np.nan)) for k, m in grp.items()}
+    title_log: list = []  # 多面板標題數值行：用了哪個候選、有幾個集中段
 
     def tot(k, kind):
         cnt = bcount[k] if kind == "boundary" else ccount[k]
@@ -84,9 +84,7 @@ def render_site(
                 if kind == "boundary":
 
                     def ann(ax, fig, f8, avoid, cnt=cnt, n=n):
-                        r = SA.annotate_boundary(
-                            ax, fig, sd, dr, cnt, side_cnt["all"], n, font=f8, avoid=avoid
-                        )
+                        r = SA.annotate_boundary(ax, fig, sd, dr, cnt, n, font=f8, avoid=avoid, mode="label")
                         rows_from("boundary", "all", r, "main")
                         return r
 
@@ -130,6 +128,7 @@ def render_site(
                 continue
             lay = layout
             panels = []
+            title_lines: list = []
             for k in keys:
                 cnt, t = tot(k, kind)
                 n = gn[k]
@@ -138,12 +137,26 @@ def render_site(
                 variants: tuple[str, ...] = ()
                 title = base
                 if kind == "boundary":
-                    vs = SA.side_title_variants(sd, side_cnt[k], n)
-                    if name == "class":
-                        variants = tuple(f"{base}\n{v}" for v in vs)
-                        title = variants[0]
-                    else:
-                        title = f"{base}\n{vs[0]}"
+                    st = SA.boundary_stretches(sd, cnt, n)
+                    pw = (
+                        SF.rs.REPORT_WIDTH_IN - lay.left - lay.right_strip - lay.gap_x * (lay.ncol - 1)
+                    ) / lay.ncol
+                    val, vi = SA.pick_value_variant(
+                        SA.boundary_value_variants(st, n), SF.rs.text_font(font), pw * 72.0 + 3.0
+                    )
+                    title = f"{base}\n{val}" if val else base
+                    title_lines.append(2 + (val.count("\n") + 1 if val else 0))
+                    title_log.append([sd.site_id, name, k, label[k], len(st), min(len(st), SA.STRETCH_BOUNDARY_MAX_NUMBERED),
+                                      max(0, len(st) - SA.STRETCH_BOUNDARY_MAX_NUMBERED), vi, val.replace("\n", " / ")])  # fmt: skip
+
+                    def annotate(ax, fig, f8, cnt=cnt, n=n, k=k, lay=lay):
+                        r = SA.annotate_boundary(
+                            ax, fig, sd, dr, cnt, n, font=f8, star_size=lay.star_size, lw_pt=SF.LW_BOUNDARY * lay.lw_scale,
+                            mode="marker", levels_pt=SA.BRACKET_LEVELS_PANEL_PT, br_lw=max(0.4, 0.8 * lay.lw_scale), land_pad_pt=1.0,
+                        )  # fmt: skip
+                        rows_from("boundary", k, r, "panel")
+                        return r
+
                 elif name in ("season", "tide"):
                     st = SA.coast_stretches(sd, cnt, n)
                     if st:
@@ -159,9 +172,11 @@ def render_site(
 
                 panels.append(SF.Panel(title, cnt / n * 100.0, annotate, variants))
             if kind == "boundary":  # noqa: SIM114
-                lay = replace(lay, title_h=0.46)
+                lay = replace(lay, title_h={2: 0.30, 3: 0.46, 4: 0.60}[max(title_lines)])
             elif name in ("season", "tide"):
                 lay = replace(lay, title_h=0.46)
             fname = f"{kind}_{name}.png"
             recs[f"{kind}_{name}"] = SF.render_panels(sd, dr, kind, panels, lay, out / fname, font)
-    return recs, stretch_rows
+            if kind == "boundary":
+                recs[f"{kind}_{name}"]["title_value_choices"] = [r[2:] for r in title_log if r[1] == name]
+    return recs, stretch_rows, title_log
