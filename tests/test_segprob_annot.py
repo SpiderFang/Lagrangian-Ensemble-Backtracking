@@ -85,7 +85,7 @@ def test_thresholds_are_constants_in_one_place() -> None:
     )
     assert sa.STRETCH_BOUNDARY_MAX_NUMBERED == 3
     assert (sa.STRETCH_COAST_MIN_SEG_PCT, sa.STRETCH_COAST_MIN_TOTAL_PCT) == (Decimal("0.5"), Decimal("3"))  # noqa: SIM300
-    assert sa.STRETCH_COAST_MAX_PER_PANEL is None  # 2026-11-02：海岸集中段不設上限
+    assert sa.STRETCH_COAST_MAX_PER_PANEL == 3
 
 
 def test_boundary_value_variants_prefer_two_decimals_then_integers() -> None:
