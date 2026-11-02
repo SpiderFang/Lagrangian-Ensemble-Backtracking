@@ -229,10 +229,65 @@ def _pick_anchor_x(sd, line, scene):
         return _pa0(sd, line, scene)
     frac = PICK["fracs"][PICK["i"]]
     PICK["i"] += 1
+    if frac is None:  # None＝該集中段用程式原本的錨點規則
+        return _pa0(sd, line, scene)
     return SA._sea_dir(sd, line, frac)
 
 
 SA._pick_anchor = _pick_anchor_x
+
+_FR_CACHE: dict = {}
+
+
+def coast_labels_retry(ax, fig, sd, dr, ccnt, st_c, n, **kw):
+    """多面板海岸引線：先照原規則標；若某集中段的標籤有違規（壓陸地、壓上色線…），只對該段改試其他引線落點
+    （集中段上 0.5、0.4、0.6…0.9 比例處），取違規最輕者；其餘集中段不動。判定規則（哪些段要標）不變。"""
+    FR = (0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.1, 0.9)
+
+    def run(fracs):
+        n0 = len(ax.texts)
+        PICK["fracs"], PICK["i"] = list(fracs), 0
+        try:
+            r = SA.annotate_coast_labels(ax, fig, sd, dr, ccnt, st_c, n, **kw)
+        finally:
+            PICK["fracs"] = None
+        return r, n0
+
+    def sev(r):
+        return sum(SA._W.get(t, 0) for s_ in r["stretches"] for t in s_.get("label_violations", []))
+
+    def undo(n0):
+        for t_ in list(ax.texts)[n0:]:
+            t_.remove()
+
+    key = (sd.site_id, hash(np.asarray(ccnt).tobytes()), len(st_c))
+    fracs, exhausted = _FR_CACHE.get(key, ([None] * len(st_c), False))  # 版面收斂會反覆重畫：沿用上次選定的落點，已試遍者不再重試
+    r, n0 = run(fracs)
+    best = (sev(r), list(fracs), r["stretches"])
+    tried = 0
+    for j in range(len(st_c)):
+        if exhausted:
+            break
+        if not best[2][j].get("label_violations"):
+            continue
+        for fr in FR:
+            undo(n0)
+            f2 = list(best[1])
+            f2[j] = fr
+            r2, _ = run(f2)
+            tried += 1
+            if sev(r2) < best[0]:
+                best = (sev(r2), f2, r2["stretches"])
+            if not r2["stretches"][j].get("label_violations") and sev(r2) <= best[0]:
+                break
+        undo(n0)
+        r, _ = run(best[1])
+    undo(n0)
+    r, _ = run(best[1])
+    _FR_CACHE[key] = (best[1], True)
+    r["retry"] = {"tried": tried, "fracs": best[1]}
+    return r
+
 
 # ------------------------------------------------------------------ Scene 擴充：額外障礙（另一類上色線、已畫之括號與文字）
 _Scene0 = SA.Scene
@@ -465,8 +520,8 @@ def make_panels_c(S, kind, name, w, *, class_brackets=False):
                     if st_c:
                         HOOK["lines"] = _pos_lines(S.dr.b_sea, np.ones(len(S.dr.b_sea))) + list(S.dr.b_land)
                         HOOK["shapes"] = shapes_from_axes
-                        rc = SA.annotate_coast_labels(ax, fig, sd, S.dr, ccnt, st_c, n, font=f8_, star_lonlat=sd.anchor,
-                                                      star_size=star_size, lw_pt=SF.LW_COAST * lw_scale)
+                        rc = coast_labels_retry(ax, fig, sd, S.dr, ccnt, st_c, n, font=f8_, star_lonlat=sd.anchor,
+                                                star_size=star_size, lw_pt=SF.LW_COAST * lw_scale)
                 finally:
                     HOOK["lines"], HOOK["shapes"] = [], None
                     SA.PLABEL, SA.PLABEL_FS, SA.COAST_FS = False, 8.0, 8.0
