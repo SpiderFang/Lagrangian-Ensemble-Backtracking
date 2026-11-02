@@ -282,6 +282,29 @@ def coast_labels_retry(ax, fig, sd, dr, ccnt, st_c, n, **kw):
                 break
         undo(n0)
         r, _ = run(best[1])
+    if best[0] > 0 and not exhausted:
+        # 第二階段（連江大潮「3.25%」：自己的落點全試遍仍無解，因可用位置被另一段的引線佔住）：
+        # 逐段改試其他落點（含原本沒違規的段），只在總違規嚴重度「嚴格下降」時才採用；至多 2 輪，降到 0 即停
+        for _pass in range(2):
+            improved = False
+            for j in range(len(st_c)):
+                for fr in FR:
+                    if fr == best[1][j]:
+                        continue
+                    undo(n0)
+                    f2 = list(best[1])
+                    f2[j] = fr
+                    r2, _ = run(f2)
+                    tried += 1
+                    if sev(r2) < best[0]:
+                        best = (sev(r2), f2, r2["stretches"])
+                        improved = True
+                    if best[0] == 0:
+                        break
+                if best[0] == 0:
+                    break
+            if best[0] == 0 or not improved:
+                break
     undo(n0)
     r, _ = run(best[1])
     _FR_CACHE[key] = (best[1], True)
