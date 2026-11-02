@@ -1728,7 +1728,9 @@ def test_terminal_status_legend_and_bars_omit_zero_count_categories(
     native_figures.build_native_figures(config, command="lbt native-figures --test")
 
     assert seen["legend"] and seen["ticks"] and seen["bar_texts"]
+    # 水平軌跡總覽圖例用語（2026-11-02）：穿越點→域外來源；長條圖刻度沿用 _STATUS_LABELS_ZH
+    kept_legend_labels = kept_labels | {native_figures._OVERVIEW_STATUS_LABELS_ZH[NATIVE_STATUS_LEFT_INTEREST_REGION]}
     for group in ("legend", "ticks"):
         assert not (set(seen[group]) & dropped_labels), (group, seen[group])
-        assert kept_labels & set(seen[group]), (group, seen[group])
+        assert (kept_legend_labels if group == "legend" else kept_labels) & set(seen[group]), (group, seen[group])
     assert all(not text.startswith("0\n") for text in seen["bar_texts"]), seen["bar_texts"]
