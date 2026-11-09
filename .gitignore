@@ -54,6 +54,10 @@ data/settling_velocity_derivation/*
 !data/settling_velocity_derivation/derive.py
 !data/settling_velocity_derivation/results.csv
 !data/settling_velocity_derivation/scenario_parameters.md
+# 引用佐證目錄只保留可稽核的文字索引；原始 PDF 與標註圖檔不進版本庫。
+!data/settling_velocity_derivation/references/
+data/settling_velocity_derivation/references/*
+!data/settling_velocity_derivation/references/README.md
 # 成果呈現文獻的原始 PDF、紅框副本與暫存影像體積大且受各出版商授權限制；
 # 只追蹤可稽核的繁中索引 README，避免把全文或 QA PNG 誤提交至 Git。
 !data/results_visualization_literature/
@@ -74,3 +78,19 @@ data/time_reconstruction_literature/*
 .agent_prompts/
 .agent_logs/
 reports/
+
+# 參考資料 PDF、圖檔與報告文件屬附件，不加入版本庫；文字索引與程式文件不受影響。
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.tif
+*.tiff
+*.bmp
+*.webp
+*.avif
+*.heic
+*.doc
+*.docx
+*.docx.bak*

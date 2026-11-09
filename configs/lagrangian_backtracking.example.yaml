@@ -490,9 +490,10 @@ physics:
 
   horizontal_diffusion:
     # 常數 Kh 是解析／統計 reference；Smagorinsky 需通過空變 K 與 well-mixed 測試。
-    # runtime 的 finite_depth_stokes／no_stokes 只讀 constant_kh_m2ps；smagorinsky_cs_*
-    # 則只讀下方的 Smagorinsky mapping，因此兩組設定可以分開核定與執行。
-    # 當正式／pilot scalar gate 已提供有限非負 constant_kh_m2ps 時，前兩個常數案例仍
+    # 原生路徑（native-plan／native-run）的水平擴散一律採 Smagorinsky 型式，依流場與網格
+    # 尺度逐步計算，不讀取 constant_kh_m2ps；此常數僅供舊版引擎使用。舊版引擎的
+    # smagorinsky_cs_* 只讀下方的 Smagorinsky mapping，因此兩組設定可以分開核定與執行。
+    # 舊版引擎：當正式／pilot scalar gate 已提供有限非負 constant_kh_m2ps 時，前兩個常數案例仍
     # 可執行，即使下方 Smagorinsky floor/cap 尚未核定；本 example 本身仍因 placeholder
     # 與其他正式輸入未完成而維持 blocked。
     reference_method: constant
