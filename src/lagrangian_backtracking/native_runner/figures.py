@@ -262,6 +262,14 @@ _STATUS_LABELS_ZH: Mapping[int, str] = {
     NATIVE_STATUS_REACHED_COAST: "抵達海岸",
 }
 
+# 水平軌跡總覽（_plot_horizontal_overview）圖例用語（2026-11-02 PI 定案）：穿越點→域外來源、抵達海岸→海岸來源；
+# 只套用於這張圖，其餘圖（終止類別長條圖、追蹤比例曲線等）沿用 _STATUS_LABELS_ZH。
+_OVERVIEW_STATUS_LABELS_ZH: Mapping[int, str] = {
+    NATIVE_STATUS_LEFT_INTEREST_REGION: "域外來源",
+    NATIVE_STATUS_REACHED_COAST: "海岸來源",
+}
+_OVERVIEW_START_LABEL_ZH = "回溯起點（受體位置）"
+
 _STATUS_LABELS_EN: Mapping[int, str] = {
     NATIVE_STATUS_LEFT_INTEREST_REGION: _CROSSED_LABEL_EN,
     NATIVE_STATUS_MAX_BACKTRACK: "Max backtrack reached",
@@ -2073,7 +2081,7 @@ def _plot_horizontal_overview(
             color="#1a9850",
             markerfacecolor="#1a9850",
             linestyle="None",
-            label=t.t("回溯起點（受體到達位置）", "Backtrack start (receptor arrival)"),
+            label=t.t(_OVERVIEW_START_LABEL_ZH, "Backtrack start (receptor arrival)"),
         ),
     ]
     if "flow" in boundary_kinds_present:
@@ -2103,7 +2111,10 @@ def _plot_horizontal_overview(
                 color=_STATUS_COLORS.get(code, "#d62728"),
                 linestyle="None",
                 markersize=7,
-                label=t.t(_STATUS_LABELS_ZH.get(code, str(code)), _STATUS_LABELS_EN.get(code, str(code))),
+                label=t.t(
+                    _OVERVIEW_STATUS_LABELS_ZH.get(code, _STATUS_LABELS_ZH.get(code, str(code))),
+                    _STATUS_LABELS_EN.get(code, str(code)),
+                ),
             )
         )
     if layout == "legacy":
